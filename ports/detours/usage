@@ -1,0 +1,5 @@
+Link against detours by finding its library:
+
+    find_library(DETOURS_LIB detours)
+
+    target_link_libraries(main PRIVATE "${DETOURS_LIB}")

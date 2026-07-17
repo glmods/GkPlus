@@ -1,0 +1,9 @@
+{
+    "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg-configuration.schema.json",
+    "overlay-ports": [
+        "./ports/d3d8to9",
+        "./ports/detours",
+        "./ports/quickjs-ng",
+        "./ports/dear-bindings"
+    ]
+}

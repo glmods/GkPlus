@@ -1,0 +1,5 @@
+Link against d3d8to9 by looking for its library, and d3d9:
+
+    find_library(D3D8TO9_LIB d3d8to9)
+
+    target_link_libraries(main PRIVATE "${D3D8TO9_LIB}" d3d9)

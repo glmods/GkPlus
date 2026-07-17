@@ -1,0 +1,193 @@
+shape:
+    name
+    file
+    
+light:
+    red
+    green
+    blue
+    specular red
+    specular green
+    specular blue
+    range
+    
+pgenerator:
+    type
+    rate
+    x
+    y
+    z
+    red
+    green
+    blue
+    alpha
+    start scale
+    end scale
+    particle TTL
+    spin
+    generategenerators
+
+hierarchy:
+    name
+    file
+    hotspot
+    alternate hotspot
+    
+projectile:
+    damage
+    blast [damage]
+    blast range
+    max range
+    gravity
+    hit_light: Light
+    sound
+    
+character:
+    scan delay
+    scan acceptance angle
+    angular scan rate
+    mine laying time
+    walking speed
+    turning speed
+    strength
+    aim
+    sight angle
+    sight range
+    hearing range
+    alert radius
+    aggression
+    gun yaw angle
+    elevation angle
+    radius
+    height
+    size
+    damage multiplier
+    shot speed multiplier
+    target cycle time
+    weapon cycle time
+    weapon cycle time2
+    alarm delay
+    can turn
+    draw vision cone
+    draw hearing range
+    always cpu controlled
+    customisation hierarchy: hierarchy
+    shadow hierarchy: hierarchy
+    weapon
+    secondary weapon
+    status window u
+    status window v
+    generation limit
+    alertable
+    latch trigger
+    blob shadow
+    max weapon
+    max ammo
+    max module
+    initial first person range
+    maximum first person range
+
+destructibility:
+    type
+    
+frag data:
+    role: role
+    replace role: role
+    remove
+    scale
+    replace
+    symmetric
+    blast damage
+    blast range
+    
+???:
+    name
+    replace
+    
+????:
+    name
+    directory
+
+role:
+    character: character
+    shape: shape | hierarchy | pgenerator
+    inventory shape: shape | hierarchy
+    pgen: pgenerator
+    pgen2: pgenerator
+    light: light
+    projectile: projectile
+    identifier: string
+    sever point: string
+    description: integer
+    recon name: integer
+    recon ai short: integer
+    recon ai number: integer
+    recon ai long: integer
+    recon ai long2: integer
+    pickup name: int
+    ai: int
+    interface beam delay: int
+    interface beam effect: int
+    interface beam script: int
+    interface beam duration: int
+    resistance: integer
+    resistance factor: float [0, 1]
+    armour: float
+    shields: float
+    recharge rate: float
+    alpha fogging: bool
+    reflective: bool
+    per vertex fogging: bool
+    destructibility: destructibility | frag data | ???
+    destination selectable: bool
+    frag control: bool
+    destroy after collection: bool
+    moves on lifts: bool
+    status display: bool
+    hit test ignore: bool
+    nolighting: bool
+    limit: int
+    switch size: integer
+    alpha: float[0, 1]
+    action on death: int
+    pickup radius: float
+    meta sound: string
+    
+map:
+    name
+    file
+    bitmap
+    camera plane
+    max camera distance
+    max camera focus height
+    min camera focus height
+    shadow object rif
+    shadow object name
+    max vertices per section
+    
+ammo
+    ammo type
+    weapon type
+    round time
+    reload time
+    life timer
+    magazine size
+    salvo size
+    sound
+    name
+    file
+    projectile: role
+    firing speed
+    
+ammo info:
+    ammo type
+    description
+    ammo name
+    max per slot
+    
+camera track:
+    file
+    name
+    pgen: pgenerator
+    pgen2: pgenerator
+    

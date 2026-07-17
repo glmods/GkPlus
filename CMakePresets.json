@@ -1,0 +1,32 @@
+{
+    "$schema": "https://cmake.org/cmake/help/latest/_downloads/3e2d73bff478d88a7de0de736ba5e361/schema.json",
+    "version": 8,
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "generator": "Ninja Multi-Config",
+            "binaryDir": "build"
+        },
+        {
+            "name": "vcpkg",
+            "inherits": [
+                "base"
+            ],
+            "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+            "cacheVariables": {
+                "VCPKG_TARGET_TRIPLET": "x86-windows-static-md",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            }
+        },
+        {
+            "name": "builtin-vcpkg",
+            "inherits": [
+                "vcpkg"
+            ],
+            "environment": {
+                "VCPKG_ROOT": "${sourceDir}/vcpkg"
+            }
+        }
+    ]
+}

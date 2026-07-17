@@ -1,0 +1,14 @@
+.cache/
+.vscode/
+build/
+vcpkg/
+.clangd
+*.rif
+*.ll
+/*.h
+/*.c
+/*.cpp
+*.code-workspace
+/.mcp.json
+/.claude/settings.local.json
+CMakeUserPresets.json

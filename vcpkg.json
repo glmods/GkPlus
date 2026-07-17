@@ -1,0 +1,27 @@
+{
+    "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+    "dependencies": [
+        "lua",
+        {
+            "name": "imgui",
+            "features": [
+                "dx9-binding",
+                "win32-binding"
+            ]
+        },
+        "d3d8to9",
+        "detours",
+        "quickjs-ng",
+        "dear-bindings"
+    ],
+    "features": {
+        "rimutil": {
+            "description": "Utility to convert images to and from RIM files",
+            "dependencies": [
+                "libsquish",
+                "libspng"
+            ]
+        }
+    },
+    "supports": "windows & x86"
+}

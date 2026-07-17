@@ -1,0 +1,23 @@
+{
+    "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+    "name": "dear-bindings",
+    "version": "0.21",
+    "description": "C header (and language binding metadata) generator for Dear ImGui",
+    "homepage": "https://github.com/dearimgui/dear_bindings",
+    "license": "MIT",
+    "dependencies": [
+        {
+            "name": "vcpkg-cmake",
+            "host": true
+        },
+        {
+            "name": "vcpkg-cmake-config",
+            "host": true
+        },
+        {
+            "name": "vcpkg-get-python-packages",
+            "host": true
+        },
+        "imgui"
+    ]
+}
