@@ -8,7 +8,7 @@ filename. Triggers are evaluated every game tick by EvaluateTriggers (FUN_0050cc
 
 ## Global State
 
-- `FirstTrigger` @ `0x006af858` - Trigger2* sentinel node for the global trigger list
+- `FirstTrigger` @ `0x006af858` - Trigger* sentinel node for the global trigger list
 - `NumTriggers` @ `0x006af85c` - int, count of active triggers
 - `PTR_006af860` @ `0x006af860` - void*, cached array (freed on list changes)
 - `DAT_006af864` @ `0x006af864` - int, cache valid flag
@@ -23,21 +23,23 @@ filename. Triggers are evaluated every game tick by EvaluateTriggers (FUN_0050cc
 ```
 The sentinel node points to itself (next=prev=self) when the list is empty.
 
-### Trigger (0x10 = 16 bytes) - String-bearing linked list node
+### ActorNameNode (0x10 = 16 bytes) - String-bearing linked list node
 ```
 0x00: TriggerBase base         // inherits linked list node (vtbl @ TriggerVtbl 0x0065207c)
-0x0C: char*       name         // heap-allocated string (actor token name or other string)
+0x0C: char*       actor_name   // heap-allocated string (actor token name or other string)
 ```
-Used as nodes in TriggerList. Despite the Ghidra label `script_file`, this field
-stores **actor token names** when embedded in TriggerData's target list at 0x44.
-The field is a generic string whose semantics depend on context.
+Used as nodes in TriggerList. The field (Ghidra label `actor_name`) stores **actor token
+names** when embedded in TriggerData's target list at 0x44. It is a generic string whose
+semantics depend on context. (Formerly named `Trigger` - renamed to disambiguate from the
+real trigger node below.)
 
-### Trigger2 (0x10 = 16 bytes) - Global trigger linked list node
+### Trigger (0x10 = 16 bytes) - Global trigger linked list node
 ```
 0x00: TriggerBase   base      // inherits linked list node (vtbl @ TriggerVtbl2 0x00652094)
 0x0C: TriggerData*  data      // pointer to the 0x68-byte trigger data struct
 ```
-These nodes form the global trigger list anchored at FirstTrigger.
+These nodes form the global trigger list anchored at FirstTrigger. (Formerly named
+`Trigger2`.)
 
 ### TriggerList (0x10 = 16 bytes) - Container for a list of Trigger nodes
 ```
@@ -352,10 +354,11 @@ When triggers fire or reset, network broadcast messages are sent via FUN_00504bf
 3. **SaveGame?** @ 0x005083d6: References FirstTrigger. May contain trigger save/load
    logic that could reveal the purpose of padding fields.
 
-4. **TriggerList/Trigger naming**: The TriggerList and Trigger structs have misleading
-   names inherited from early analysis. TriggerList is really a generic string list,
-   and Trigger nodes store generic strings (not always scripts). Consider renaming
-   to StringList/StringNode or ActorNameList/ActorNameNode in future cleanup.
+4. **TriggerList/Trigger naming**: DONE for the node structs - the former `Trigger`
+   (string node) is now `ActorNameNode`, and the real global trigger node (formerly
+   `Trigger2`) now holds the clean name `Trigger`. `TriggerList` was left as-is: it is
+   a generic string/node container but the name is used broadly; rename to
+   `StringList`/`ActorNameList` remains optional future cleanup.
 
 5. **QueueScriptExecution**: The actual prototype and mechanism of script execution
    needs further analysis. Called at LAB_0051066d when a trigger fires.

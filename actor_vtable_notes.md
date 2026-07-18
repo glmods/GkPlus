@@ -53,8 +53,8 @@ Actor (0x120 = 288 bytes) vtbl @ 0x00667e30
 
 ## Actor Storage
 
-Actors are stored in a hash map at `struct_unk4_007ba0d8`, keyed by actor ID.
-- `GetActorByID` @ 0x0044e0b0 - looks up actor by ID via hash bucket.
+Actors are stored in a hash map at `actors` @ 0x007ba0d8 (type `Actors`), keyed by actor ID.
+- `GetActorById` @ 0x0044e0b0 - looks up actor by ID via hash bucket.
 - `num_actors` @ 0x007b9ffc - running count incremented in CreateActor.
 
 ## VTable Layout (83 entries)

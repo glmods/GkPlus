@@ -37,6 +37,9 @@ lua_Integer ConsolePrint = LUA_NOREF;
 lua_Integer ConsoleSetup = LUA_NOREF;
 
 void __fastcall HookedPrint(const char *what) {
+  // FIXME: gameplay code on the executor thread can plausibly reach ConsolePrint
+  // (unverified; see threading_model_notes.md) — the lua_call below would then
+  // race with main-thread Lua.
   if (ConsolePrint == LUA_NOREF || ConsolePrint == LUA_REFNIL) {
     return Print(what);
   }

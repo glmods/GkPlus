@@ -14,7 +14,7 @@ is actively being reverse engineered in Ghidra, accessible via MCP.
 - **Entry point offset**: `0x005e50c8` (used to compute base address at runtime)
 
 ```
-cmake --preset default
+cmake --preset builtin-vcpkg
 cmake --build build
 cmake --build build --target copy   # copies d3d8.dll to Gunlok's Steam directory
 ```
@@ -95,6 +95,7 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 ## Source Files
 
 ### Core Infrastructure
+
 | File | Purpose |
 |------|---------|
 | `src/entry.cpp` | DllMain, module instantiation order, global pointer setup |
@@ -105,6 +106,7 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 | `src/Varint.h` | Variable-length integer encode/decode (used for Lua refs in trigger scripts) |
 
 ### Game Object Wrappers (Lua userdata types)
+
 | File | Lua type | Key fields |
 |------|----------|------------|
 | `src/Actors.h/cpp` | `Actor` | id, position, orientation, team_id, role, center, ai_type, vulnerabilities, health |
@@ -113,10 +115,11 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 | `src/Math.h/cpp` | `Vec3`, `Vec4` | x, y, z [, w] (read-only fields) |
 
 ### Lua Modules (`require("gk.xxx")`)
+
 | File | Module name | Key API |
 |------|-------------|---------|
 | `src/Console.h/cpp` | `gk.console` | print(), set_text_color(), set_cursor_color(), execute(), register_command(), set_onprint(), set_onsetup() |
-| `src/Menu.h/cpp` | `gk.menu` | set_onsetup(callback) - callback receives {get=fn} to get Menu objects; Menu:add_item(label, callback) |
+| `src/Menu.h/cpp` | `gk.menu` | See "Menu module API" below |
 | `src/Tokens.h/cpp` | `gk.tokens` | Table-like: tokens.name = value, pairs(tokens), #tokens |
 | `src/Actors.h/cpp` | `gk.actors` | actors[id] returns Actor, pairs(actors) iterates all |
 | `src/Roles.h/cpp` | `gk.roles` | roles[id] or roles["name"], pairs(roles) iterates all |
@@ -129,20 +132,67 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 | `src/AI.h/cpp` | `gk.ai` | AI system access |
 
 ### Other
+
 | File | Purpose |
 |------|---------|
 | `src/Chunks.h/cpp` | ChunksModule - hooks chunk registration (debug logging only, no Lua API, currently commented out in entry.cpp) |
 | `src/ImGuiBindings.h/cpp` | ImGui C++ to Lua/JS bindings via imgui-quickjs |
-| `src/Menus.inc.h` | X-macro listing all 33 Gunlok menus with IDs (0-35, gaps at 11,14-20) |
+| `src/Menus.inc.h` | X-macro listing all 36 Gunlok menus: `GUNLOK_MENU(Name, Id, TitleResourceId, "English title")`. There are no gaps - ids 11 and 14-20 are identified in `menu_system_notes.md` |
 | `imgui-quickjs/` | Static library: QuickJS bindings for ImGui |
+
+### Menu module API (`require("gk.menu")`)
+
+| Member | Purpose |
+|--------|---------|
+| `set_onsetup(cb)` | Runs after `SetupMenus`; `cb` receives `{get=fn}` |
+| `menus` | Indexable by id **or** name (`menus[25]`, `menus.Audio`), `pairs`-iterable, `#menus` |
+| `get(id_or_name)` / `get_ingame(0..6)` | A `Menu` object, or nil |
+| `goto_menu(id_or_name[, remember_parent])` | Calls the game's `GoToMenu` |
+| `chosen_menu()` / `chosen_item()` / `set_chosen_item(n)` | Front-end selection state |
+| `ingame_menu_index()` / `ingame_selected_item()` | In-game (HUD) menu state |
+| `is_ingame_menu_open()` / `close_ingame_menu(kind)` | In-game menu lifecycle |
+| `resource_string(id)` | Resolve a `GL_RESOURCE_ID` through the active language DLL |
+| `ids` / `names` / `titles` | name->id, id->name, id->English title |
+| `item_type` / `pseudo_item` / `visible_rows` | `{plain,value,toggle,choice}`, `{none,back,scroll_up,scroll_down}`, `6` |
+
+`Menu` objects: `id`, `in_game`, `name`, `title`, `title_id`, `parent_id`, `num_items`,
+`num_nodes`, `scroll_offset` (rw), `items`, `item(i)`, `activate([remember])`,
+`add_item(label[, cb])`, `add_value_item(label, value[, cb])`,
+`add_toggle(label, initial[, cb])`, `add_choice(label, {resource_ids}[, initial[, cb]])`.
+
+`MenuItem` objects: `index`, `label`, `type`, `type_name`, `value_text`, `is_current_value`,
+`rect`, `get_value()`, `set_value(v)`.
+
+Strings and bound variables passed from Lua are copied into module-owned storage, because the
+game stores label pointers with `label_is_static = 1` and never copies or frees them.
 
 ## Reverse Engineering Reference
 
 ### Detailed Documentation Files
+
 - `actor_vtable_notes.md` - Actor class hierarchy, all 83+ vtable slots, subclass sizes, constructor addresses
 - `trigger_system_notes.md` - 22 trigger types, data structures, console command syntax, function addresses
 - `gls_system_notes.md` - GLS/GSH script parser: pipeline, ParsedThingBase layout, per-section field tables (types/ranges/defaults), ToXxx converters, C++ API is `src/GLS.h`
+- `threading_model_notes.md` - Two game threads (main "client" + executor "server"), loopback message queues, pause handshake, per-thread clocks/RNG, which GkPlus hooks run on which thread
+- `directplay_protocol_notes.md` - Multiplayer wire protocol: DirectPlay (`IDirectPlay4A`) COM/session setup, app GUID, SendEx/Receive framing & reliability, and the full command (client->server) and update (server->client) message-id tables with payload layouts and the `0x87` lock-step turn model
+- `menu_system_notes.md` - Both menu systems (front-end `Menus[36]` + in-game `InGameMenus[7]`): `Menu`/`MenuListItem` layouts, the four item constructors and the 4 item types, the full 0-35 menu inventory with titles and populators, the (menu, item) -> action transition map, navigation/rendering/input, key bindings, the localized string table, and the Ghidra DB defects that had to be repaired first
+- `save_system_notes.md` - `.sav`/`.msv` savegame format: full field-by-field stream layout, the header-only "carry to next level" variant, the team carry-over roster, and why the console `SAVE`/`LOAD` commands are the demo system instead
 - `gls.txt` - Game Level Structure file format quick field list (superseded by gls_system_notes.md)
+
+### Ghidra Database Hygiene
+
+Always leave the Ghidra database in a better state than you found it. Whenever you decompile
+something, write your understanding back into the database instead of keeping it in the chat:
+
+- Rename functions from `FUN_00xxxxxx` to descriptive names as soon as their purpose is clear
+- Rename locals and parameters from `uVar1`/`param_1` to meaningful names, and set their types
+- Define/refine structs and enums for the data being accessed, and apply them to the variables
+  that use them (prefer this over leaving raw `*(int *)(param_1 + 0x50)` offset arithmetic)
+- Name globals discovered along the way (`DAT_00xxxxxx` -> a real name)
+- Add a plate comment on non-obvious functions summarizing what they do and their calling convention
+
+Anything reusable (offsets, struct layouts, subsystem behavior) should also land in this file or
+the relevant `*_notes.md`.
 
 ### Game Binary Layout
 
@@ -155,6 +205,7 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 ### Key Global Addresses (offsets from base)
 
 **Trigger System:**
+
 | Offset | Type | Name |
 |--------|------|------|
 | 0x006af858 | Trigger** | FirstTrigger |
@@ -163,21 +214,25 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 | 0x007b9d38 | int* | NumDoors |
 
 **Actor System:**
+
 | Offset | Type | Name |
 |--------|------|------|
 | 0x007ba0d8 | Actors* | actors (hash table) |
 
 **Role System:**
+
 | Offset | Type | Name |
 |--------|------|------|
 | 0x007b48f0 | Roles* | roles (hash table) |
 
 **Token System:**
+
 | Offset | Type | Name |
 |--------|------|------|
 | 0x007b6af8 | Tokens* | tokens |
 
 **Console System:**
+
 | Offset | Type | Name |
 |--------|------|------|
 | 0x007b6958 | char* | CommandLine |
@@ -185,15 +240,27 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 | 0x007c149c | unsigned* | CursorColor |
 | 0x007b6aa8 | CommandList* | List (command list) |
 
-**Menu System:**
+**Menu System:** (see `menu_system_notes.md`)
+
 | Offset | Type | Name |
 |--------|------|------|
-| 0x007b76d0 | Menu[36]* | Menus |
+| 0x007b76d0 | Menu[36] | Menus (front-end) |
+| 0x007b7578 | Menu[7] | InGameMenus (HUD/pause; ends at 0x007b76ac) |
 | 0x007b732c | MenuIndex* | ChosenMenu |
-| 0x006a7d6c | int* | ChosenMenuItem |
-| 0x007b74dc | LevelList* | levelList |
+| 0x006a7d6c | int* | ChosenMenuItem (0x100 none, 0x101 back, 0x102/3 scroll) |
+| 0x007b7270 | int* | InGameMenuIndex |
+| 0x006a89b4 | int* | InGameMenuSelectedItem |
+| 0x007ba1dc | void*[7] | InGameMenuPanels |
+| 0x007b74dc | LevelList | levelList (0x10-byte list header, not 8) |
+| 0x007b74ec | float | MouseYNormalized |
+| 0x007b74d0 | float | MouseXNormalized |
+| 0x007b74f0 | LevelList[8] | KeyBindingCategories |
+| 0x007b76b0 | LevelList | MultiplayerLevelList |
+| 0x007b6f20 | LevelList | FileFindList (save-file enumeration) |
+| 0x00725664 | ResourceEntry** | LocalizedStrings |
 
 **Misc/Game State:**
+
 | Offset | Type | Name |
 |--------|------|------|
 | 0x007b9e28 | int* | GameMode |
@@ -206,9 +273,23 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 | 0x007b9c70 | Cheats* | Cheats |
 | 0x007b9df0 | int* | Foobar |
 
+**Save System:** (see `save_system_notes.md`)
+
+| Offset | Type | Name |
+|--------|------|------|
+| 0x007b6ef0 | char[0x29] | SaveFileNameBuf |
+| 0x007b6dcc | char* | ScriptFileName (level `.gls`) |
+| 0x007b6d70 | TeamCarryOverList | TeamCarryOverState |
+| 0x007b6d68 | TeamCarryOverList* | TeamCarryOverStateAux1 (nullable) |
+| 0x007b6d64 | TeamCarryOverList* | TeamCarryOverStateAux2 (nullable) |
+| 0x007b9c88 | byte[0x98] | SaveSettingsBlock (size doubles as format version) |
+| 0x007b6e48 | int* | NextInventoryItemId |
+| 0x007b9cf0 | int* | LevelLoadReason (3 = loading a full savegame) |
+
 ### Key Function Addresses (offsets from base)
 
 **Console:**
+
 | Offset | Signature | Name |
 |--------|-----------|------|
 | 0x004d4b50 | FastCall<void, const char*> | Print |
@@ -219,11 +300,13 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 | 0x0043f250 | FastCall<int, unsigned char*> | ExecuteCommandFile |
 
 **Actors:**
+
 | Offset | Signature | Name |
 |--------|-----------|------|
 | 0x0044e0b0 | FastCall<Actor*, int> | GetActorById |
 
 **Roles:**
+
 | Offset | Signature | Name |
 |--------|-----------|------|
 | 0x004ae030 | FastCall<Role*, const char*> | GetRoleByName |
@@ -231,11 +314,13 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 | 0x00503710 | FastCall<int, int, Role*, Vec3*, Vec4*, int> | SpawnRole |
 
 **Tokens:**
+
 | Offset | Signature | Name |
 |--------|-----------|------|
 | 0x004d35f0 | ThisCall<void, Tokens*, const char*, float> | CreateToken |
 
 **Triggers:**
+
 | Offset | Signature | Name |
 |--------|-----------|------|
 | 0x0043e240 | FastCall<void, TriggerKind, Vec3*, long long, TriggerList, const unsigned char*, int> | RegisterTriggers |
@@ -245,17 +330,57 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 | 0x0044c900 | ThisCall<TriggerList*, TriggerList*, const char**> | InitListWithActorName |
 | 0x0044e8c0 | ThisCall<ITrigger*, TriggerList*, const char**> | CreateTrigger |
 
-**Menu:**
+**Menu:** (see `menu_system_notes.md`)
+
 | Offset | Signature | Name |
 |--------|-----------|------|
-| 0x004f7a60 | ThisCall<void, Menu*, const char*> | AddMenu |
 | 0x004e95e0 | StdCall<void> | SetupMenus |
-| 0x004ecf10 | StdCall<void> | OnMenuItemClicked |
+| 0x004ecf10 | StdCall<void> | OnMenuItemClicked (action dispatch) |
+| 0x004fbfa0 | FastCall<void, MenuIndex, bool> | GoToMenu (ECX=target, DL=push parent) |
+| 0x004f94f0 | ThisCall<void, Menu*, unsigned, int, unsigned> | Menu::Menu (firstItemId, nLabels, titleId) |
+| 0x004f7a60 | ThisCall<void, Menu*, const char*> | Menu::AddItem (type 0) |
+| 0x004f7ae0 | ThisCall<void, Menu*, const char*, const char*, bool, bool> | Menu::AddValueItem (type 1) |
+| 0x004f7950 | ThisCall<void, Menu*, const char*, int*> | Menu::AddToggleItem (type 2) |
+| 0x004f79d0 | ThisCall<void, Menu*, const char*, int*, unsigned**> | Menu::AddMultiValueItem (type 3) |
+| 0x004f7750 | ThisCall<void*, Menu*, int> | Menu::GetItemData (cached; NO bounds check) |
+| 0x004f7cd0 | FastCall<void, Menu*> | Menu::ClearItems |
+| 0x004fbf10 | ThisCall<void, Menu*, void*> | Menu::AppendItemNode |
+| 0x004ea8e0 | StdCall<void> | UpdateAndDrawMenuScreen |
+| 0x004e7e50 | StdCall<void> | EnterMainMenuScreen |
+| 0x00470c70 | FastCall<void, void*> | MenuScreenInputHandler |
+| 0x00579000 | FastCall<const char*, void*, unsigned> | GetResourceString (ECX=&LocalizedStrings) |
+
+**In-game menus:**
+
+| Offset | Signature | Name |
+|--------|-----------|------|
+| 0x00563c30 | ThisCall (member) | InGameMenu::OnItemActivated |
+| 0x00567b60 | StdCall<void> | OpenInGamePauseMenu |
+| 0x00567f00 | StdCall<void> | OpenInGameOptionsMenu |
+| 0x005686b0 | StdCall<void> | OpenInGameLoadMenu |
+| 0x00568e40 | StdCall<void> | OpenInGameSaveMenu |
+| 0x0056a120 | FastCall<void, const char*, void*, void*> | OpenInGameConfirmDialog |
+| 0x005691f0 | FastCall<void, int> | CloseInGameMenu (kind 0/1/2/3/0x41/0x42/0x43) |
+| 0x00569550 | FastCall<char> | IsAnyInGameMenuOpen |
 
 **Misc:**
+
 | Offset | Signature | Name |
 |--------|-----------|------|
 | 0x00474540 | FastCall<Parsed*, const char*, int> | ParseGLS |
+
+**Save System:** (see `save_system_notes.md`)
+
+| Offset | Signature | Name |
+|--------|-----------|------|
+| 0x00507a80 | FastCall<char, const char*, bool> | SaveGame (path in ECX, `full` in DL) |
+| 0x00505730 | FastCall<void, const char*> | LoadGame |
+| 0x005055e0 | FastCall<int, const char*> | PeekSaveGameScriptName |
+| 0x004e6d30 | StdCall<void> | MenuSaveGame |
+| 0x004e6be0 | StdCall<int> | MenuLoadGame |
+| 0x004dad40 | ThisCall<int, void*, HANDLE> | WriteTeamCarryOverState |
+| 0x004da980 | CDecl<int, HANDLE> | ReadTeamCarryOverState |
+| 0x0044c8d0 | FastCall<int, const char*> | strlen_plus1 (length **includes** NUL) |
 
 ### Actor Class Hierarchy
 

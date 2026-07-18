@@ -61,6 +61,9 @@ static_assert(sizeof(TriggerData) == 0x68);
 TriggerData *(TriggerData::*RemoveTrigger)(char) = nullptr;
 
 TriggerData *TriggerData::HookedRemoveTrigger(char c) {
+  // FIXME: RemoveTrigger's only caller is EvaluateTriggers, which runs on the
+  // executor thread (see threading_model_notes.md) — luaL_unref here races with
+  // main-thread Lua. Defer the unref to the main thread instead.
   if (script_name && (*script_name & 0x80)) {
     lua_Integer ref = DecodeVarint(script_name);
     auto L = Lua::GetEngine();
