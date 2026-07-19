@@ -156,9 +156,18 @@ struct BlockerActor : Actor {
 static_assert(sizeof(BlockerActor) == 0x130);
 
 struct PickupActor : Actor {
-  char unk5[48];
+  char unk5[20];
+  char *associated_script;
+  char *unk_string0x138;
+  char unk6[20];
+
+  virtual void SetPickupEnabled(bool) = 0;
+  virtual void OnPickedUp(MobileActor *) = 0;
+  virtual void SetField0x138(const char *) = 0;
 };
 static_assert(sizeof(PickupActor) == 0x150);
+static_assert(offsetof(PickupActor, associated_script) == 0x134);
+static_assert(offsetof(PickupActor, unk_string0x138) == 0x138);
 
 struct TrackObjectActor : Actor {
   char unk5[152];

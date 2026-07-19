@@ -102,6 +102,16 @@ if (triggerData->script_name != NULL) {
 }
 ```
 
+> **Multiplayer:** only the **filename** is authoritative, never the file contents.
+> `QueueScriptExecution` @ 0x00505080 pushes the name onto the host's local `ScriptQueue`
+> *and* broadcasts it as update `0x67`, so every joining client runs `ExecuteCommandFile`
+> on its **own local copy** of that `.gcs`. Triggers themselves still only evaluate on the
+> host (`EvaluateTriggers` runs on the executor thread, which joiners never start), but the
+> resulting script runs everywhere. Clients whose `Scripts\` directory differs from the
+> host's will diverge — bounded by the `IsExecutorRunning()` gate in the `Command*` handlers,
+> which no-op on a joiner. See `directplay_protocol_notes.md` §8.11 and
+> `threading_model_notes.md`.
+
 **Evidence for field assignments:**
 - `trigger_kind` at 0x00: CommandRemoveTrigger compares `piVar2[0]` with 0x10 (TRIGGER_SHOT)
 - `coords` at 0x04: `_eh_vector_destructor_iterator_(piVar2 + 1, 0xc, 4, ...)` in CommandRemoveTrigger

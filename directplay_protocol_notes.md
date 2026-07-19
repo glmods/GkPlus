@@ -17,7 +17,7 @@ Two logical message streams share one framing but use **separate, direction-spec
 | Stream | Sender | Receiver | Transport | Dispatcher | id range |
 |--------|--------|----------|-----------|------------|----------|
 | **Commands** | client (`SendToServer`) | host executor | `SendEx` idTo=1 | `ExecutorThreadProc` switch @ `0x005092a4` | `0x04`-`0x3b` |
-| **Updates** | host executor (`BroadcastToPlayers`) | every client | `SendEx` per-player | `FUN_004fde70` switch (jmp @ `0x004fdec4`) | `0x00`,`0x01`,`0x03`,`0x1e`,`0x37`-`0xcb` |
+| **Updates** | host executor (`BroadcastToPlayers`) | every client | `SendEx` per-player | `ApplyUpdateMessage` switch (jmp @ `0x004fdec4`) | `0x00`,`0x01`,`0x03`,`0x1e`,`0x37`-`0xcb` |
 
 > **The same numeric id means different things in each direction.** e.g. `0x1e`, `0x3b`, `0x3d`
 > are movement/getter *commands* to the server but position/death *updates* from it. Always
@@ -169,7 +169,7 @@ else for each player p != server:
 Key transport behaviours:
 
 - **`coords`** is the world position used for *spatial relevance culling*. Callers that must reach
-  everyone pass `(0,0,0)` (the sentinel `DAT_007f5f40`, zero in BSS); position updates pass the
+  everyone pass `(0,0,0)` (the sentinel `FloatZero` @ `0x007f5f40`, zero in BSS); position updates pass the
   entity's real position so far-away players can be skipped.
 - **Reliability** = the `guaranteed` byte -> `DPSEND_GUARANTEED`. Reliable messages ignore the
   backlog throttle.
@@ -184,7 +184,8 @@ then a real receive (flags `0x2`). Returns `NULL` on `DPERR_NOMESSAGES` (`0x8877
 buffer on `DPERR_BUFFERTOOSMALL` (`0x8877001E`). Used by both:
 
 - executor: `DPlayReceive(ServerDPlay, 1)` in the thread loop, then the command switch;
-- client: `ClientReceivePump` @ `0x004fdc70` (once/frame, ≤50 msgs/frame), then `FUN_004fde70`.
+- client: `ClientReceivePump` @ `0x004fdc70` (once/frame; ≤50 msgs/frame **in MP only** — loopback
+  drains `UpdateQueue` until empty), then `ApplyUpdateMessage`.
 
 ---
 
@@ -274,7 +275,7 @@ if (IsExecutorRunning()) {
 
 ## 7. Update messages (server -> clients)
 
-Broadcast by the executor via `BroadcastToPlayers`; applied by the client switch `FUN_004fde70`
+Broadcast by the executor via `BroadcastToPlayers`; applied by the client switch `ApplyUpdateMessage`
 (valid ids `0..0xcb`; sparse jump via byte index-map `0x005028e8` -> pointer table `0x005026b8`).
 **151 ids are handled.** The table below lists every id with a decoded producer, its wire size,
 and the producing function (name conveys semantics). `R` = sent reliably (guaranteed) where known.
@@ -298,7 +299,7 @@ and the producing function (name conveys semantics). `R` = sent reliably (guaran
 | `0x48` | 56 | `MobileActor::Die` | **death** (non-destructible) `R` (see §8.5) |
 | `0x49` | 8 | `Delete` | delete actor |
 | `0x4d` | 9 | `FUN_005317b0` | (byte-flag update) |
-| `0x4f` | 25 | `EquipObject`, `FUN_00546440`, `SyncPositionAndBroadcast` | equip + position |
+| `0x4f` | 25 | `EquipObject`, `OnPickedUp`, `SyncPositionAndBroadcast` | equip + position |
 | `0x50` | 12 | `ChangeOwnerAndTeam`, `CommandGiveControl`, `ReleaseFromOwner`, `SyncPositionAndBroadcast` | owner/team change |
 | `0x51` | 16 | `EvaluateTriggers`, `SyncPositionAndBroadcast` | position (trigger-driven) |
 | `0x52` | 8 | `EvaluateTriggers` | trigger event |
@@ -309,23 +310,26 @@ and the producing function (name conveys semantics). `R` = sent reliably (guaran
 | `0x57` | 8 | `ClearTarget` | clear target |
 | `0x58` | 20 | `ChangeOwnerAndTeam` | owner+team+extra |
 | `0x59` | 8 | `ReleaseFromOwner` | release from owner |
-| `0x5a`-`0x5d` | 12 | `FUN_00532d40`/`e80`/`fe0`/`FUN_00533120` | CTF/objective state updates |
+| `0x5a`-`0x5d` | 12 | `FUN_00532d40`/`e80`/`fe0`/`OnFlagCaptured` | CTF/objective state updates; `0x5d` is **flag captured** `{actorId, playerIdx}` `R` |
 | `0x5f` | 60 | `FUN_00539ed0` | large actor state |
 | `0x60`/`0x61`/`0x63` | 8 | `FUN_00451220` | door/switch state variants |
 | `0x62` | 8 | `SyncPositionAndBroadcast` | position (short) |
 | `0x65` | 8 | `ExecutorThreadProc` (case 0x26) | team notification |
 | `0x66` | 8 | `FUN_004bdf90`, `FUN_00538930` | actor toggle |
+| `0x67` | var | `QueueScriptExecution` | **run script file** `'g'` + filename `R` (see §8.11) |
 | `0x68` | 16 | `FUN_00456c50`, `FUN_0045b620` | (world object update) |
 | `0x6b` | 12 | `Frag` | frag/score event |
 | `0x6e` | 20 | `FUN_0045a850` | (object update) |
 | `0x6f` | 40 | `SyncPositionAndBroadcast`, `CommandTeleport` | **position+orientation state** `'o'` (see §8.1) |
+| `0x70` | 40 | `CommandTeleportAndOrientate` | teleport + orientation `R` |
 | `0x71` | 12 | `SyncPositionAndBroadcast` | position delta |
 | `0x72` | 8 | `EquipObject` | unequip |
-| `0x74`/`0x75` | 12/8 | `FUN_00546440` | animation/turret state |
+| `0x74`/`0x75` | 12/8 | `OnPickedUp` | animation/turret state |
 | `0x78` | 12 | `FUN_00537db0`, `ReceiveObject` | receive/transfer object |
 | `0x7d` | 12 | `CommandRemoveItem`, `EquipObject`, `FUN_00538240` | remove inventory item |
 | `0x7e`/`0x7f` | 12/16 | `SyncPositionAndBroadcast` | position variants |
 | `0x80` | 12 | `ExecutorThreadProc` (case 0x15), `SyncPositionAndBroadcast` | item removed / position |
+| `0x81` | 24 | `FUN_00537db0` | object transfer variant `R` |
 | `0x82` | 12 | `ExecuteSpecialAbility` | special ability |
 | `0x83` | 12 | `OnMobileDamageReceived` | damage taken notification |
 | `0x84` | 8 | `Associate` | associate objects |
@@ -335,16 +339,18 @@ and the producing function (name conveys semantics). `R` = sent reliably (guaran
 | `0x88`/`0x89` | 12/8 | `FUN_00505380` | (session/turn control) |
 | `0x8a` | 12 | `InitPositionAndTiming` | initialise position + timing |
 | `0x8b` | 16 | `PresidentActor::ApplyDamage` | death/gib effect `{actorId, seq, variant}` |
-| `0x8c` | 8 | `FUN_00546440` | (turret state) |
+| `0x8c` | 8 | `OnPickedUp` | (turret state) |
 | `0x8d` | 259 | `ExecutorThreadProc` (case 0x28), `EvaluateTriggers` | **chat / name broadcast** (255-byte string) |
 | `0x8e` | 8 | `SyncPositionAndBroadcast` | position (short) |
+| `0x91` | 24 | `FUN_005046e0` | ownership/team transfer variant `R` |
 | `0x92` | 20 | `FUN_00541170` | special-ability state |
 | `0x93`/`0x95` | 12 | `CommandSetActorArmor`, `FUN_004da4a0` | armor/attribute set |
 | `0x96` | 8 | `SyncPositionAndBroadcast` | position (short) |
 | `0x97` | 8 | `Dissociate` | dissociate objects |
+| `0x98` | 32 | `ApplyTeamCarryOverState` | team carry-over roster entry `R` |
 | `0x99` | 12 | `ExecutorThreadProc` (case 0x31) | countdown start `{index, timer}` `R` |
 | `0x9a` | 4 | `ExecutorThreadProc` (case 0x32) | countdown tick/stop `R` |
-| `0x9b` | 8 | `ApplyDamage`, `FUN_00533120`, `SyncPositionAndBroadcast` | deathmatch frag credit `{killerId}` `R` |
+| `0x9b` | 8 | `ApplyDamage`, `OnFlagCaptured`, `SyncPositionAndBroadcast` | deathmatch frag credit `{killerId}` `R` |
 | `0x9c` | 10 | `FUN_00511150` | (player/session) |
 | `0x9d`/`0x9e` | 20/16 | `EquipObject` | equip variants |
 | `0x9f` | 8 | `FUN_004552a0` | (object update) |
@@ -357,8 +363,11 @@ and the producing function (name conveys semantics). `R` = sent reliably (guaran
 | `0xa6` | 12 | `ApplyArmorDamage`, `ApplyShieldDamage` | armor/shield value update |
 | `0xa7` | 16 | `ApplyShieldDamage` | shield damage |
 | `0xa8` | 16 | `ApplyArmorDamage` | armor damage |
+| `0xa9` | 73 | `CommandSetTrack` | set camera track: 4 parsed positions + carries-passengers flag `R` |
+| `0xaa` | 56 | `CommandCameraTrack` | camera track path (parsed positions + float) |
 | `0xab` | 12 | `CommandSetSpeed` | set track/animation speed |
 | `0xac` | 12 | `CommandSetLoopTime` | set loop time |
+| `0xaf` | 8 | `FUN_00548760` | (actor state) `R` |
 | `0xb0`/`0xb1` | 8 | `FUN_005488f0`/`f0` | (actor state) |
 | `0xb2` | 8 | `EvaluateTriggers` | trigger effect |
 | `0xb4` | 8 | `CommandTrack` | camera track |
@@ -373,6 +382,7 @@ and the producing function (name conveys semantics). `R` = sent reliably (guaran
 | `0xbe` | 8 | `FUN_00448640` | (particle/effect) |
 | `0xbf` | 8 | `CommandStopParticles` | stop particles |
 | `0xc0` | 40 | `CommandAddLight` | add light (position + colour) |
+| `0xc1` | 68 | `CommandAddBlinkingLight` | add blinking light |
 | `0xc2` | 28 | `CommandAirstrike` | airstrike |
 | `0xc3` | 8 | `CommandPlayerSelect` | player select |
 | `0xc4` | 8 | `CommandShadow` | shadow toggle |
@@ -382,9 +392,42 @@ and the producing function (name conveys semantics). `R` = sent reliably (guaran
 | `0xcb` | var | (client-only) | clock sync (`FUN_00571a20`) |
 
 Ids not individually decoded above but still handled by the client (from the jump table):
-`0x38,0x3f-0x43,0x47,0x4a-0x4e,0x5e,0x67,0x69,0x6c,0x6d,0x70,0x73,0x76,0x77,0x79-0x7c,0x81,0x8f-0x91,0x94,0x98,0xa9,0xaa,0xad-0xaf,0xb3,0xc1,0xc5-0xc7`
+`0x38,0x3f-0x43,0x47,0x4a-0x4c,0x4e,0x5e,0x69,0x6c,0x6d,0x73,0x76,0x77,0x79-0x7c,0x8f,0x90,0x94,0xad,0xae,0xb3,0xc5-0xc7`
 — these are additional actor/AI/effect updates in the same style (small fixed payloads, mostly
 `{actorId, …}`), several produced by helpers whose id constant is set via non-standard codegen.
+**Do not assume "small fixed payload" for anything on this list** — `0x67` sat here and turned out
+to be a variable-length script-execution message (§8.11).
+
+> **Producer names in this table are not unique.** Several are virtual overrides implemented once
+> per actor subclass, so the same name maps to many distinct functions: `SyncPositionAndBroadcast`
+> is **11** functions (`0x0052f8a0`, `0x00533720`, `0x0053d8d0`, `0x00544460`, `0x00546120`,
+> `0x00547520`, `0x00549cd0`, `0x0054a060`, `0x0054a8f0`, `0x0054b000`, `0x0054d4c0`), and `Frag`
+> (`0x0052e220`, `0x00548b00`) and `ApplyDamage` (`0x0052f3b0`, `0x00535ac0`) are two each. When a
+> row matters, resolve the producer by **address**, not by name.
+
+### How this table was verified
+
+The whole table was cross-checked against an exhaustive automated sweep of **every** caller of
+`BroadcastToPlayers` — 104 distinct functions, 183 reference sites, 163 parsed call sites — pulling
+the message id, size and `guaranteed` flag from each. Result: **the extraction agreed with every
+overlapping id already in this table**, and filled in 8 previously-undecoded ones
+(`0x70`, `0x81`, `0x91`, `0x98`, `0xa9`, `0xaa`, `0xaf`, `0xc1`).
+
+Two methodology notes for anyone repeating this:
+
+- Take the size and `guaranteed` literals from the **same source line** as the buffer variable.
+  An earlier pass read them from the decompiler's P-code and paired them to ids positionally,
+  which desynchronised in the multi-site functions (`ExecutorThreadProc`,
+  `SyncPositionAndBroadcast`, `EvaluateTriggers`) and produced 10 false "size disagreements" —
+  all of which evaporated once the pairing was fixed.
+- Where the size is a computed expression, read the **disassembly**, not the decompiler.
+  For `0xa9`/`0xaa` the decompiler renders `iVar + 0x48` / `iVar + 0x37` while the asm shows
+  `LEA EDX,[EDI + 0x49]` / `LEA EDX,[EDI + 0x38]` with `EDI == 0` (the same register is stored into
+  all three coords slots), giving the true sizes 73 and 56.
+
+26 call sites still have an unresolved id — the constant is not a simple literal store into the
+buffer's first field. They cluster in `SyncPositionAndBroadcast`, `EquipObject`, `OnPickedUp`
+(3 each) and 17 functions with one apiece.
 
 ---
 
@@ -503,6 +546,118 @@ skip, i.e. joiners apply it):
 `ExecutorThreadProc`. **Reliable**, broadcast to all. Payload is **just the id** (no body). Sent
 once at executor start and each time all tracked objects report idle (lock-step advance; see §9).
 
+### 8.11 Run script file - update `0x67` ('g'), variable length
+
+`QueueScriptExecution` @ `0x00505080`. **Reliable**, broadcast to every player, and it reaches
+all of them unconditionally — both of `BroadcastToPlayers`' drop mechanisms are bypassed:
+
+- **Relevance filtering**: the caller passes `coords = {0,0,0}`, and the filter's first branch is
+  `coords.x == FloatZero && .y == && .z ==`. `FloatZero` @ `0x007f5f40` lives in uninitialized `.data` and
+  has exactly one writer in the binary (`FUN_0043ab80` @ `0x0043ab9d`, a static initializer doing
+  `FILD 0` / `FSTP` / `MOVSS`), i.e. it is the shared **0.0f** sentinel. A zero vector therefore
+  always matches and `FUN_00511250` is never consulted.
+- **Backlog throttling**: the guard is `if ((backlog < limit) || (guaranteed != 0))`. This message
+  is sent with `guaranteed = 1`, so it short-circuits past the per-player backlog counters and the
+  ~1-in-10 random-sample path entirely. Script broadcasts are never dropped.
+
+```
++0x00 u32     id = 0x67          // 'g' in byte 0, bytes 1-3 explicitly zeroed
++0x04 char[]  script filename    // NUL-terminated; length from strlen_plus1 (INCLUDES the NUL)
+```
+
+Total size = `strlen(name) + 1 + 4`.
+
+**Only the filename travels; the file contents do not.** Every recipient resolves that name
+against its *own* `Scripts\` directory. The handler in the client update applier
+(`ApplyUpdateMessage`) is:
+
+```c
+case 0x67:
+    if (!IsExecutorRunning()) {            // non-host only
+      SetCurrentDirectoryToGLDir(GL_Scripts);
+      ExecuteCommandFile((char *)(param_1 + 1));
+      SetCurrentDirectory();
+    }
+    break;
+```
+
+The `IsExecutorRunning()` guard stops the **host** running the script twice: in the same
+function the host has already pushed the filename onto its local `ScriptQueue`, and runs it
+from `RunQueuedScript` on its own main thread one-per-frame. Note the client path does **not**
+go through `ScriptQueue` at all - it executes synchronously inside `ClientReceivePump`.
+
+Consequence: **trigger scripts execute on every machine, each from its own local copy.** A
+client whose `Scripts\` directory differs from the host's will diverge.
+
+The blast radius is bounded by the `IsExecutorRunning()` gate in the `Command*` handlers, but
+**that gate is far less comprehensive than it looks**. Counting transitively (a handler counts as
+gated if it or anything it calls consults `IsExecutorRunning`, `IsClientRoutingActive` or
+`IsMultiplayerActive`; converges at depth 2):
+
+| | count |
+|---|---|
+| `Command*` handlers | 249 |
+| gated | 97 |
+| **ungated — execute fully on a joining client** | **152** |
+
+The split tracks *actor/world authority*, not presentation:
+
+- **Gated:** `CommandSpawn`, `CommandSpawnTeam`, `CommandGive`, `CommandOpenDoor`,
+  `CommandTeleport`, `CommandSetActorArmor`, `CommandAddTrigger`
+- **Ungated:** `CommandSet`, `CommandInc` (**tokens**), `CommandCompleteObjective`,
+  `CommandDoor`, `CommandExplode`, and ~150 more
+
+So authoritative actor state does still arrive only from the host's update stream, but a divergent
+client script can freely mutate that client's **token table** — the script language's variable
+system — and `CommandIf` reads tokens, so the client's subsequent script control flow diverges
+too. `CommandSet` calls `SetTokenValue(&Tokens, …)` directly with no gate and no broadcast, behind
+only a `LevelLoadReason != 3` check.
+
+Those effects stay client-local: on a joiner `ServerDPlay == NULL`, so an ungated handler that
+calls `BroadcastToPlayers` pushes onto the joiner's *own* loopback `UpdateQueue` and self-applies.
+It never reaches the host.
+
+> Earlier revisions of this file claimed the ungated remainder was "the presentational half
+> (sounds, messages, camera, FMV)". That was never measured and is wrong. Note also that counting
+> only calls made *directly* inside each handler overstates the ungated set at 172 — `CommandSpawn`
+> for instance delegates to `DoSpawn`, which holds the gate.
+
+**`0x67` is the only update that can make a client execute a file, and `QueueScriptExecution` is
+the only thing that sends one.** Both halves were established exhaustively rather than by
+inspection:
+
+- *Only `0x67` reaches `ExecuteCommandFile`.* `ApplyUpdateMessage` contains exactly one call to it
+  (`0x004ff971`), and none of its 164 direct callees reaches `ExecuteCommandFile`,
+  `ExecuteCommandLine`, `ExecuteCommand` or `QueueScriptExecution` transitively. Resolving the
+  dispatch through the real jump table (index map `0x005028e8`, pointer table `0x005026b8`) puts
+  that call in the case block `0x004ff95a`..`0x004ff980`, and **`0x67` is the only id that
+  dispatches to it**.
+- *Only `QueueScriptExecution` builds a `0x67`.* Of the 104 functions that call
+  `BroadcastToPlayers`, exactly two contain an immediate `0x67`: `QueueScriptExecution`
+  (`0x005050db`, the `'g'` id byte) and `SyncPositionAndBroadcast` @ `0x00533720`. The latter is a
+  false positive twice over — one is `PUSH 0x67` into a virtual call `[ESI+0x11c]`, and the other
+  writes `0x67` at offset `+0x08` of a buffer whose leading dword is `0x4f`, sent as
+  `(id 0x4f, 25 bytes, unreliable)`. Neither is a message id.
+
+So the effective trigger set is the **seven callers of `QueueScriptExecution`** listed in
+`threading_model_notes.md`, not a broader family of messages.
+
+**Scheduling differs between host and joiner even when the script files are identical.** Both run
+the same tick `FUN_0046e6c0`, which calls `RunQueuedScript` @ `0x0046e6d4` *before*
+`ClientReceivePump` @ `0x0046e7ba`:
+
+| | Host / single-player | Joining client |
+|---|---|---|
+| Runs in | step 1, `RunQueuedScript` | step 2, inside `ClientReceivePump` |
+| Source | `ScriptQueue` pop | `case 0x67` payload |
+| Rate | **exactly one script per frame** | unthrottled within the batch (up to 50 msgs/frame) |
+| Relative to that frame's updates | *before* them | *interleaved* with them |
+
+So a host serialises scripts at one per frame and runs each before applying that frame's world
+updates, while a joiner can run several in a frame, interleaved with the very updates the host
+emitted alongside them. Ordering between a script's effects and neighbouring update messages is
+therefore **not** guaranteed to match across machines.
+
 ---
 
 ## 9. Turn / lock-step model
@@ -517,10 +672,20 @@ The executor's simulation is turn-based on top of the message stream. Each itera
 4. When every tracked object reports idle (`vcall +0x18`), broadcast **`0x87`** (turn advance) and
    compute the next deadline.
 
-Clients apply updates in `ClientReceivePump` (≤50/frame). Trigger scripts and console commands run
-on the **host main thread** only (queued via the script queue). A joining client never evaluates
-triggers, never runs the executor, and `IsExecutorRunning()` is false there, so its `Command*`
+Clients apply updates in `ClientReceivePump`. The **≤50-per-frame cap is multiplayer-only**: with
+a `ClientDPlay` session the pump reads the queue depth via vtable `+0xC8` and clamps it to `0x32`
+before that many `DPlayReceive` calls. In loopback (`ClientDPlay == NULL`, i.e. single-player) it
+instead calls `WakeExecutor` and then drains `UpdateQueue` **unbounded**, until `MsgQueue_Pop`
+returns NULL. A joining client never evaluates
+triggers and never runs the executor, and `IsExecutorRunning()` is false there, so its `Command*`
 handlers no-op locally and only send to the host.
+
+Trigger scripts, however, **do run on joining clients**. `QueueScriptExecution` both queues the
+script locally *and* broadcasts update `0x67` carrying the filename (§8.11); each client then
+runs `ExecuteCommandFile` on its **own local copy** of that file, synchronously inside
+`ClientReceivePump` rather than via `ScriptQueue`. Only the host uses `ScriptQueue` - on a joiner
+that queue is allocated but never populated, because all seven `QueueScriptExecution` callers are
+host-side. See `threading_model_notes.md` for the caller inventory.
 
 ---
 
@@ -540,7 +705,11 @@ handlers no-op locally and only send to the host.
 | `0x00502c80` | func | `DPlayReceive` (Receive wrapper) |
 | `0x004fdc70` | `StdCall` | `ClientReceivePump` (per frame) |
 | `0x00509050` | thread | `ExecutorThreadProc` (command dispatch @ `0x005092a4`) |
-| `0x004fde70` | `FastCall` | client update dispatch (jmp `0x004fdec4`) |
+| `0x004fde70` | `FastCall<void, u32*>` | `ApplyUpdateMessage` — client update dispatch (jmp `0x004fdec4`) |
+| `0x00512890` | `FastCall<uint>` | `GetPlayerCount` (reads `0x007b9e44`) |
+| `0x005128a0` | `FastCall<uint, uint>` | `GetPlayerIdByIndex` (lazy cache @ `0x007b9e48`) |
+| `0x00505080` | `FastCall<void, char*>` | `QueueScriptExecution` (queues locally **and** broadcasts `0x67`) |
+| `0x007f5f40` | float | `FloatZero` — 0.0f sentinel; zero coords bypass relevance filtering |
 | `0x005028e8` | data | client-switch byte index-map (ids 0..0xcb) |
 | `0x005026b8` | data | client-switch pointer table |
 | `0x007b9e74` | `IDirectPlay4A*` | `MultiplayerActive` |
@@ -556,10 +725,20 @@ Loopback queues, events, and thread details: see `threading_model_notes.md`.
 
 - **High confidence**: COM/session setup, player IDs, SendEx/Receive framing, reliability &
   throttle logic, the message-frame format, the command id set, and the ~100 update ids with a
-  named producer + exact size, plus the field layouts in §8.
+  named producer + exact size, plus the field layouts in §8. The producer/size/reliability columns
+  have been **exhaustively verified** against every `BroadcastToPlayers` call site in the binary
+  (104 functions / 183 references / 163 parsed sites) with zero disagreements — see
+  "How this table was verified" at the end of §7. Every producer function also carries a plate
+  comment in the Ghidra DB listing the update ids it emits.
 - **Lower confidence / not fully decoded**: the semantic detail of update ids listed only in the
   jump table (§7 tail), the exact byte packing beyond the leading fields of the largest messages
   (`0x39` 80 B, `0x5f` 60 B, `0xc8` resync), and the two modem/serial `DPAID_*` GUID *names*
   (the GUID values are exact). The client-apply handlers live in an area Ghidra left as undefined
-  bytes inside `FUN_004fde70`; `disassemble` was applied to the ids inspected here, but a full
+  bytes inside `ApplyUpdateMessage`; `disassemble` was applied to the ids inspected here, but a full
   sweep of every handler was not run.
+- **The §7 tail list is not safe to gloss.** `0x67` sat in it, described as one more small
+  fixed-payload actor update; it is in fact a variable-length message that makes every client
+  execute a local script file (§8.11). Its omission also produced a wrong claim in §9 (that
+  scripts run host-only) which stood until the handler was actually read. Treat the remaining
+  undecoded ids as unknown-shape, not as assumed-small - and decode the handler before asserting
+  anything about what does or does not cross the wire.

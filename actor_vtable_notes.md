@@ -274,6 +274,26 @@ Extends ActorVtbl with 2 entries.
 | 83 | 0x14C | 0x0054eba0 | `getField0x150` | Getter for int field at 0x150 |
 | 84 | 0x150 | 0x0054f460 | `setField0x168` | Stores 12-byte value (int64 + int) at offset 0x168 |
 
+### PickupActorVtbl (344 bytes = 86 slots)
+
+Extends ActorVtbl with 3 entries. Bounded below by `PickupActorVtbl` @ `0x006683dc` and above by
+`TrackObjectActorVtbl` @ `0x00668534`.
+
+| Slot | Offset | Address | Name | Description |
+|------|--------|---------|------|-------------|
+| 83 | 0x14C | 0x00546240 | `SetPickupEnabled` | Stores the byte arg at +0x120; if +0x12c == 0, schedules a respawn deadline into +0x144 as `GetGameTimeSeconds()` + `MPRespawnDelay` scaled by the mode at +0x140 (1 -> x2, 2 -> x1, 3 -> x `FLOAT_006520a0`). Broadcasts update `0x85` (8 B, reliable) |
+| 84 | 0x150 | 0x00546440 | `OnPickedUp` | Item collected by a `MobileActor`. Broadcasts up to 6 updates (`0x75`, `0x8c`, `0x4f` + 3 unresolved) and, when the item has an `associated_script` (+0x134), calls `QueueScriptExecution` on it — one of the seven paths that make every client run a `.gcs` (see `directplay_protocol_notes.md` §8.11) |
+| 85 | 0x154 | 0x00546b20 | `SetField0x138` | Frees the existing `char*` at +0x138 and stores a `strdup` of the argument. **Not** `associated_script`, which is +0x134 — a separate string field, purpose not yet established |
+
+> This vtable was **undefined data** in the Ghidra DB, so none of its slots had cross-references
+> and `OnPickedUp` appeared to have zero callers of any kind — which is exactly why its
+> host-vs-client thread affinity could not be settled statically. It is now defined as
+> `pointer[86]`. Worth checking for the other subclass vtables before concluding "no callers".
+
+**Still undocumented** in this file: the vtable extensions for `CentibodyActor`, `CentipedeActor`,
+`PopupActor`, `TrackObjectActor`, `TumbleweedActor`, `BackgroundCreatureActor`,
+`FlyingBackgroundCreatureActor`, `BlockerActor` and `PresidentActor`.
+
 ### Subclass-Specific Network Messages
 
 | Code | Used In | Description |

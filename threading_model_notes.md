@@ -19,13 +19,14 @@ WinMain PeekMessage loop                   ExecutorThreadProc @ 0x00509050
 - input, window messages                   - WaitForMultipleObjects({kill, pause,
 - rendering (D3D8 BeginScene etc.)           msg-available}, timeout=50ms)
 - per-GameState tick functions             - pops game commands: loopback queue (SP)
-- console UI, ExecuteCommandLine             or IDirectPlay4::Receive (MP)
+- console UI, ExecuteCommandLine              or IDirectPlay4::Receive (MP)
 - pops script queue -> ExecuteCommandFile  - big switch dispatch on message id
-- pops update queue  -> render-state sync  - per-actor updates, EvaluateTriggers
-- sends commands:                          - sends updates:
-    queue 0x007ba32c (SP)                      queue 0x007ba38c (SP)
-    or IDirectPlay4::SendEx (MP client)        or IDirectPlay4::SendEx (MP host)
-                                           - queues trigger scripts -> 0x007ba35c
+  (host only; joiners get scripts          - per-actor updates, EvaluateTriggers
+   via update 0x67 in ClientReceivePump)   - sends updates:
+- pops update queue  -> render-state sync      queue 0x007ba38c (SP)
+- sends commands:                              or IDirectPlay4::SendEx (MP host)
+    queue 0x007ba32c (SP)                  - queues trigger scripts -> 0x007ba35c
+    or IDirectPlay4::SendEx (MP client)      AND broadcasts them as update 0x67
 ```
 
 ## Thread 1: Main thread
@@ -45,6 +46,28 @@ camera/UI updates, `BeginScene` + rendering, `RunQueuedScript` (pop one script f
 from queue `0x007ba35c` and run `ExecuteCommandFile` on it — **trigger scripts execute
 on the main thread, one per frame**), and `ClientReceivePump` (drain the update queue /
 DirectPlay receive — see Message flow below).
+
+Both of those last two can run scripts, and which one does depends on the machine's role.
+`RunQueuedScript` is the **host** path (via `ScriptQueue`, throttled to one per frame).
+`ClientReceivePump` is the **joiner** path: update `0x67` carries a script filename and its
+handler calls `ExecuteCommandFile` inline, unthrottled, bypassing `ScriptQueue` entirely.
+Either way execution lands on the main thread.
+
+The **call order within the tick is fixed and matters**: `RunQueuedScript` @ `0x0046e6d4`
+precedes `ClientReceivePump` @ `0x0046e7ba`. A host therefore runs its one queued script
+*before* applying that frame's updates, whereas a joiner runs scripts *interleaved with*
+them. See `directplay_protocol_notes.md` §8.11 for the full host-vs-joiner scheduling table.
+
+`ClientReceivePump` drains differently depending on session mode, and the familiar
+"≤50 per frame" figure is **multiplayer-only**:
+
+- `ClientDPlay == NULL` (single-player / loopback): `WakeExecutor()`, then pop `UpdateQueue`
+  in a loop **until it is empty** — no cap.
+- `ClientDPlay != NULL` (MP): read the queue depth through vtable `+0xC8`, clamp to `0x32`,
+  then that many `DPlayReceive` calls.
+
+Either way each message is applied by `ApplyUpdateMessage` and then `free`d by the pump — which is
+the concrete demonstration that `MsgQueue_Pop` hands ownership of the payload to its caller.
 
 DllMain of d3d8.dll (and therefore GkPlus init + `main.lua`) also runs on this thread:
 the game loads d3d8.dll from `InitD3DAndSetMode`, called from WinMain.
@@ -143,27 +166,158 @@ and calls `InitClientRouting`; commands go to the host over the network
 with `DPPLAYER_SERVERPLAYER`) and world updates come back through
 `ClientReceivePump`. The host's main thread is itself just another client of its own
 executor, attached to the same session. Consequences: triggers only evaluate on the
-host, trigger/console command scripts only run on the host's main thread, and on a
-joining client `IsExecutorRunning()` is false, so the `Command*` handlers no-op.
+host, and on a joining client `IsExecutorRunning()` is false, so the `Command*`
+handlers no-op.
+
+**Trigger scripts, however, run on every machine — not just the host.**
+`QueueScriptExecution` does *two* things: it pushes the filename onto the local
+`ScriptQueue` **and** it broadcasts update `0x67` ('g') carrying that filename to all
+players. Each client then runs `ExecuteCommandFile` on its **own local copy** of the
+file, from the `case 0x67` arm of the update applier `ApplyUpdateMessage`, guarded by
+`if (!IsExecutorRunning())` so the host does not run it twice. That path is
+synchronous inside `ClientReceivePump` and does **not** use `ScriptQueue`: on a joiner
+the queue exists (it is a static global) and is drained every frame by
+`RunQueuedScript`, but nothing ever pushes to it, because all seven
+`QueueScriptExecution` callers are host-side. See `directplay_protocol_notes.md` §8.11.
+
+So two clients with differing `Scripts\` contents *will* diverge. The `IsExecutorRunning()`
+gate in the `Command*` handlers bounds this, but **only partially — 97 of 249 handlers are
+gated; 152 execute fully on a joining client** (measured transitively, converging at depth 2;
+see `directplay_protocol_notes.md` §8.11 for the breakdown).
+
+The gate tracks *actor/world authority*: `CommandSpawn`, `CommandGive`, `CommandOpenDoor`,
+`CommandTeleport`, `CommandSetActorArmor` and `CommandAddTrigger` are gated, so authoritative
+actor state still arrives only through the host's update stream. But `CommandSet` / `CommandInc`
+(**the token table — the script language's variables**), `CommandCompleteObjective`,
+`CommandDoor` and `CommandExplode` are not, so a divergent client script mutates local tokens
+freely, and `CommandIf` reads tokens, so that client's script control flow diverges as well.
+
+Effects stay client-local: on a joiner `ServerDPlay == NULL`, so an ungated handler calling
+`BroadcastToPlayers` pushes onto the joiner's own loopback `UpdateQueue` and self-applies rather
+than reaching the host.
 
 ### The three loopback queues
 
-All three are instances of the same struct: an embedded RW lock (below) at +0x00, list
-head at +0x20, count +0x24, last-popped buffer +0x28. Push = `MsgQueue_Push` (copies the
-payload with CRT malloc), pop = `MsgQueue_Pop`, flush = `MsgQueue_Flush`; all take the
-embedded lock in exclusive mode. Total queued bytes counter @ 0x007ba328.
+All three are instances of the same 0x30-byte struct. The three globals sit exactly
+0x30 apart (0x007ba32c / 0x007ba35c / 0x007ba38c), which pins the size. Total queued
+bytes counter @ 0x007ba328.
+
+```c
+struct MsgQueue {              // 0x30 — types applied in the Ghidra DB
+    RWLock       lock;         // +0x00  ALWAYS taken exclusively; never shared
+    MsgQueueList list;         // +0x20
+};
+
+struct MsgQueueList {          // 0x10 — same header shape as the menu system's LevelList
+    MsgQueueNode *sentinel;    // +0x00  ->next = front, ->prev = back
+    int           count;       // +0x04
+    void         *last_popped; // +0x08  see ownership note below
+    byte          cache_flag;  // +0x0c  only ever cleared, never set, on these instances
+};
+
+struct MsgQueueNode {          // 0x10 — game pool alloc; freed via vtbl[0](1)
+    void         *vptr;        // +0x00  -> 1-slot vtable @ 0x00669fd4 (scalar deleting dtor)
+    MsgQueueNode *prev;        // +0x04
+    MsgQueueNode *next;        // +0x08
+    void         *payload;     // +0x0c  CRT malloc'd copy of the pushed bytes
+};
+```
+
+Circular doubly-linked with a sentinel; **push at tail, pop at head** (FIFO).
+
+| Op | Address | Notes |
+|----|---------|-------|
+| `MsgQueue_Push` | 0x0056d9a0 | `__thiscall(MsgQueue*, void* payload, uint size)`; copies payload |
+| `MsgQueue_Pop` | 0x0056da40 | returns `void*` payload, or NULL if empty |
+| `MsgQueue_Flush` | 0x0056da80 | frees all payloads + nodes; resets the byte counter |
+| `MsgQueueList_PopFront` | 0x0056dc00 | takes `queue+0x20`, **not** the queue base; does no locking of its own |
+
+Two allocators are in play per entry: the **payload** comes from the CRT `malloc`
+(internally locked), the **node** from the game pool allocator (whose lock is compiled
+out — see below). Only the queue's own RW lock serialises the node traffic.
+
+**Payload ownership: the caller of `MsgQueue_Pop` owns the returned buffer and must
+`free()` it.** `RunQueuedScript` is the model: `ExecuteCommandFile(name); free(name);`.
+Despite the name, `last_popped` is *not* a deferred-free slot on these instances —
+scanning every accessor of all three globals shows nothing ever writes it non-zero, so
+the `free(last_popped)` calls in Push/PopFront/Flush are dead here. It and `cache_flag`
+are generic-container fields this usage never exercises.
+
+`MsgQueueList_PopFront` recovers the just-unlinked node through the *new* front's stale
+`prev` pointer before fixing it up — correct, but fragile to reordering.
 
 | Queue | Direction | Producer | Consumer |
 |-------|-----------|----------|----------|
 | 0x007ba32c | commands: main -> executor | `SendToServer` @ 0x004fdbc0 (or SendEx to server in MP) | thread proc |
-| 0x007ba38c | updates: executor -> main | `BroadcastToPlayers` @ 0x00504bf0 (or SendEx to all players in MP) | `ClientReceivePump` @ 0x004fdc70, called from the in-game tick; applies each via `FUN_004fde70` |
-| 0x007ba35c | trigger script filenames: executor -> main | `QueueScriptExecution` @ 0x00505080 (from `EvaluateTriggers`, `Frag`, `SyncPositionAndBroadcast`, ...) | `RunQueuedScript` @ 0x00505310: one `ExecuteCommandFile` per frame on the main thread |
+| 0x007ba38c | updates: executor -> main | `BroadcastToPlayers` @ 0x00504bf0 (or SendEx to all players in MP) | `ClientReceivePump` @ 0x004fdc70, called from the in-game tick; applies each via `ApplyUpdateMessage` |
+| 0x007ba35c | trigger script filenames: executor -> main | `QueueScriptExecution` @ 0x00505080 (7 callers, all host-side — see below) | `RunQueuedScript` @ 0x00505310: one `ExecuteCommandFile` per frame on the main thread |
 
 `BroadcastToPlayers(msg, size, guaranteed, coords)` in MP: per-player send with position
 relevance filtering (`FUN_00511250`), per-player backlog counters (`0x007b9d84[i]`),
 and probabilistic throttling — when a player's queue is backed up, unreliable messages
 are dropped except a ~1-in-10 random sample (using the per-thread RNG). Reliable
 messages go `DPSEND_GUARANTEED | DPSEND_ASYNC`, unreliable get a 3000ms timeout.
+
+### Who queues scripts (all seven callers of `QueueScriptExecution`)
+
+Every caller is server-side, by one of two mechanisms — an explicit `IsExecutorRunning()`
+guard, or being simulation-authority code that broadcasts. This is why a joining client's
+`ScriptQueue` stays empty even though the queue itself exists there.
+
+> **This is a statement about the queue, not about script execution.** It does *not* mean a
+> joining client never runs scripts. It does: a joiner reads `.gcs` files from its own disk and
+> executes them, just never by way of `ScriptQueue`. The filename arrives as update `0x67` and
+> `ApplyUpdateMessage` calls `SetCurrentDirectoryToGLDir(GL_Scripts)` + `ExecuteCommandFile` on
+> it directly. What is *partially* limited on a joiner is the script's effects, not whether it
+> runs: `IsExecutorRunning()` is consulted **per command, not per script**, and only 97 of the 249
+> `Command*` handlers consult it at all. Authoritative actor mutation is gated; tokens, objectives
+> and various effects are not. See the breakdown above.
+
+| Caller | Address | What it does | Why it is host-side |
+|--------|---------|--------------|---------------------|
+| `EvaluateTriggers` | 0x0050ccc0 | fires trigger scripts | sole caller is `ExecutorThreadProc` — **executor-only, proven** |
+| `MultiplayerRespawnRole` | 0x0050c8b0 | respawns a role for a team, then queues `CTFRespawn.gcs` / `RTPRespawn.gcs` | sole caller is `EvaluateTriggers` (14 sites) — **executor-only by call graph, proven** |
+| `CommandBatchAndBroadcast` | 0x00448400 | console command that runs a script file | body is inside `if (LevelLoadReason != 3) if (IsExecutorRunning())` — **guarded, proven** |
+| `Frag` | 0x0052e220 | kill/score credit | Actor vtable slot; broadcasts — *inferred* |
+| `SyncPositionAndBroadcast` | 0x0053d8d0 | position sync | Actor vtable slot; broadcasts — *inferred* |
+| `OnFlagCaptured` | 0x00533120 | CTF capture; queues `CaptureFlag_team<N>.gcs` | called from `SyncPositionAndBroadcast` @ 0x00533720; broadcasts — *inferred* |
+| `OnPickedUp` | 0x00546440 | item pickup; queues the item's `associated_script` | `PickupActor` vtable slot; broadcasts — *inferred* |
+
+> `MultiplayerRespawnRole` used to be listed here as host-side because of "an explicit
+> `IsExecutorRunning()` guard". That was wrong: the guard covers only the `SpawnRole` call, and
+> `QueueScriptExecution` runs unconditionally below it. The conclusion still holds, and is in fact
+> stronger — its only caller is `EvaluateTriggers`, so it is executor-only by call graph.
+>
+> Note also that `SyncPositionAndBroadcast` names **11 distinct functions**; the one that queues
+> scripts is `0x0053d8d0`, *not* the `0x00533720` that calls `OnFlagCaptured`. Resolve by address.
+
+Caveat on the last four: they are **vtable-dispatched**, so their callers cannot be enumerated
+statically. `OnPickedUp` is `PickupActorVtbl` slot 84 (`0x0066852c`, offset 0x150) — it appeared
+to have zero references of *any* kind only because that vtable was undefined data in Ghidra; it is
+now defined, see `actor_vtable_notes.md`. Their host-side status
+is inferred from the fact that they perform authoritative broadcasts, not proven. `OnPickedUp` in
+particular enqueues with no `IsExecutorRunning()` guard at the call site, so if a client could
+ever reach that virtual method it would enqueue and run its own local file. Resolving this needs
+dynamic tracing.
+
+The three script names these paths can queue are all hardcoded, so the set of files a host can
+make clients execute through *these* producers is fixed and small: `CTFRespawn.gcs`,
+`RTPRespawn.gcs`, `CaptureFlag_team1..5.gcs`. Only `EvaluateTriggers` (from a trigger's
+`script_name` field) and `CommandBatchAndBroadcast` (from console input) can queue an arbitrary
+filename; `OnPickedUp` queues whatever `associated_script` the item carries, which comes from the
+level's `.gls`.
+
+Two allocation bugs turned up while reading these, both harmless in practice but worth knowing:
+`MultiplayerRespawnRole` never frees its 15-byte script-name buffer, and `OnFlagCaptured`
+allocates the default `CaptureFlag_team2.gcs` buffer *before* its switch and orphans it whenever
+a case re-allocates (teams 1/3/4/5), then leaks the survivor too. `QueueScriptExecution` copies
+the string, so nothing dangles — it just leaks.
+
+> **Trap when doing reachability analysis on this binary.** A naive caller-closure walks
+> `StartExecutorThread` -> `ExecutorThreadProc` as though it were a call edge, when it is the
+> `CreateThread` *entry-point* reference. Leave it in and every executor-only function falsely
+> appears reachable from the main-thread tick. Cut that edge and treat `ExecutorThreadProc` as
+> a thread root.
 
 ### Console commands
 
@@ -178,8 +332,18 @@ if (IsExecutorRunning()) {            // executor running (i.e., in a level)?
 }
 ```
 
-Command scripts (.gcf files, trigger scripts) always execute on the main thread —
-either from console input, `LoadLevel`, or the per-frame script-queue pop.
+Command scripts (.gcf files, trigger scripts) always execute on the **main thread** —
+this part holds on every machine. There are four entry points, not three:
+
+1. console input (`ExecuteCommandLine`);
+2. `LoadLevel`;
+3. the per-frame `ScriptQueue` pop (`RunQueuedScript`) — **host only**;
+4. the `case 0x67` arm of the update applier `ApplyUpdateMessage`, reached from
+   `ClientReceivePump` — **joining clients only** (the host is excluded by
+   `if (!IsExecutorRunning())`).
+
+(4) is also main-thread, so "all script execution is main-thread" is still true — but
+"all script execution is host-side" is **not**. See the host/joiner section above.
 
 ## Synchronization primitives
 
@@ -281,7 +445,7 @@ Which thread runs what GkPlus touches:
 | GkPlus code | Thread | Safe w.r.t. main-thread Lua? |
 |-------------|--------|------------------------------|
 | DllMain init, `main.lua` | main (d3d8.dll loaded from WinMain) | yes |
-| `HookedExecuteCommandLine` / `HookedExecuteCommandFile` (Lua trigger callbacks) | main only (console input, LoadLevel, per-frame script-queue pop) | yes |
+| `HookedExecuteCommandLine` / `HookedExecuteCommandFile` (Lua trigger callbacks) | main only (console input, LoadLevel, per-frame script-queue pop, **and update `0x67` via `ClientReceivePump` on MP joiners**) | yes |
 | `HookedSetupConsoleCommands`, `HookedSetupMenus`, `HookedOnMenuItemClicked` | main | yes |
 | ImGui / D3D hooks | main | yes |
 | `HookedDebugPrint` | both (error paths exist on the executor thread) | yes — no Lua use |
@@ -301,9 +465,17 @@ Guidelines:
 - Anything that makes the executor thread call into the Lua VM (like the current
   `HookedRemoveTrigger`) can race with main-thread Lua. Options: defer the unref to
   the main thread (queue it), or take a GkPlus-side mutex around all Lua entry points.
-- `gk.triggers` callbacks are safe *because* the game routes trigger scripts through
-  the script queue to the main thread — do not "optimize" by running them at
-  EvaluateTriggers time.
+- `gk.triggers` callbacks are safe *because* the game never runs trigger scripts on the
+  executor thread — the host routes them through `ScriptQueue` to its main thread, and a
+  joiner runs them from `ClientReceivePump`, also on the main thread. Do not "optimize"
+  by running them at `EvaluateTriggers` time.
+- **In multiplayer a Lua trigger callback fires on every machine, not just the host.**
+  Update `0x67` carries only the script *filename*, so each client re-runs the script —
+  and therefore any GkPlus Lua ref encoded in it — against its own `Scripts\` directory.
+  A callback that mutates Lua-side state will run once per participant, and a client
+  whose script files differ from the host's will take a different path entirely. Anything
+  that must happen exactly once should be gated on `IsExecutorRunning()`, matching what
+  the game's own `Command*` handlers do.
 
 ## Key addresses summary
 
@@ -324,13 +496,17 @@ project database.
 | 0x007b9dec / 0x007b9d60 | IDirectPlay4* | server-side / client-side session |
 | 0x007b9d68 | bool | client routing active |
 | 0x007b9e74 | int | multiplayer session active |
-| 0x007ba32c / 0x007ba35c / 0x007ba38c | queue | commands / scripts / updates |
+| 0x007ba32c / 0x007ba35c / 0x007ba38c | MsgQueue (0x30) | CommandQueue / ScriptQueue / UpdateQueue |
+| 0x007ba328 | int | TotalQueuedBytes |
 | 0x0056d9a0 / 0x0056da40 / 0x0056da80 | ThisCall | MsgQueue_Push / Pop / Flush |
+| 0x0056dc00 | ThisCall<void, MsgQueueList*> | MsgQueueList_PopFront (takes queue+0x20) |
+| 0x0056dba0 | ThisCall | MsgQueueNode_ScalarDeletingDtor (vtable @ 0x00669fd4) |
 | 0x00504bf0 | FastCall | BroadcastToPlayers (server send) |
 | 0x004fdbc0 | FastCall | SendToServer (client send) |
 | 0x004fdc70 | StdCall | ClientReceivePump (per frame) |
-| 0x00505080 | | QueueScriptExecution |
-| 0x00505310 | StdCall<void> | RunQueuedScript (per frame) |
+| 0x004fde70 | | update applier (big id switch; `case 0x67` runs scripts on joiners) |
+| 0x00505080 | FastCall<void, char*> | QueueScriptExecution (queues locally **and** broadcasts 0x67) |
+| 0x00505310 | StdCall<void> | RunQueuedScript (per frame, host only) |
 | 0x00579700 / 0x005797c0 | ThisCall<void, bool> | RWLock Lock / Unlock |
 | 0x007c07a0 / 0x007c07d0 | 0x30-byte struct | executor / main game clock |
 | 0x006a8140 | 2 x 0x7c | per-thread RNG state |

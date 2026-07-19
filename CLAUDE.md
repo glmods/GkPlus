@@ -19,6 +19,9 @@ cmake --build build
 cmake --build build --target copy   # copies d3d8.dll to Gunlok's Steam directory
 ```
 
+`cmake --build build` is incremental and quick. The `static_assert`s in `src/Actors.cpp` are the
+check for any struct-layout or vtable edit — build after touching them rather than eyeballing.
+
 ### Dependencies (vcpkg.json)
 
 | Package | Purpose |
@@ -173,8 +176,8 @@ game stores label pointers with `label_is_static = 1` and never copies or frees 
 - `actor_vtable_notes.md` - Actor class hierarchy, all 83+ vtable slots, subclass sizes, constructor addresses
 - `trigger_system_notes.md` - 22 trigger types, data structures, console command syntax, function addresses
 - `gls_system_notes.md` - GLS/GSH script parser: pipeline, ParsedThingBase layout, per-section field tables (types/ranges/defaults), ToXxx converters, C++ API is `src/GLS.h`
-- `threading_model_notes.md` - Two game threads (main "client" + executor "server"), loopback message queues, pause handshake, per-thread clocks/RNG, which GkPlus hooks run on which thread
-- `directplay_protocol_notes.md` - Multiplayer wire protocol: DirectPlay (`IDirectPlay4A`) COM/session setup, app GUID, SendEx/Receive framing & reliability, and the full command (client->server) and update (server->client) message-id tables with payload layouts and the `0x87` lock-step turn model
+- `threading_model_notes.md` - Two game threads (main "client" + executor "server"), loopback message queues (full `MsgQueue`/`MsgQueueList`/`MsgQueueNode` layouts), pause handshake, per-thread clocks/RNG, which GkPlus hooks run on which thread, and the four script-execution entry points (all main-thread; host uses `ScriptQueue`, MP joiners use update `0x67`)
+- `directplay_protocol_notes.md` - Multiplayer wire protocol: DirectPlay (`IDirectPlay4A`) COM/session setup, app GUID, SendEx/Receive framing & reliability, and the full command (client->server) and update (server->client) message-id tables with payload layouts, the `0x87` lock-step turn model, and update `0x67` (§8.11) which makes every client run a trigger script from its **own** local `Scripts\` copy
 - `menu_system_notes.md` - Both menu systems (front-end `Menus[36]` + in-game `InGameMenus[7]`): `Menu`/`MenuListItem` layouts, the four item constructors and the 4 item types, the full 0-35 menu inventory with titles and populators, the (menu, item) -> action transition map, navigation/rendering/input, key bindings, the localized string table, and the Ghidra DB defects that had to be repaired first
 - `save_system_notes.md` - `.sav`/`.msv` savegame format: full field-by-field stream layout, the header-only "carry to next level" variant, the team carry-over roster, and why the console `SAVE`/`LOAD` commands are the demo system instead
 - `gls.txt` - Game Level Structure file format quick field list (superseded by gls_system_notes.md)
@@ -193,6 +196,38 @@ something, write your understanding back into the database instead of keeping it
 
 Anything reusable (offsets, struct layouts, subsystem behavior) should also land in this file or
 the relevant `*_notes.md`.
+
+### Analysis Traps
+
+- `StartExecutorThread` -> `ExecutorThreadProc` is a `CreateThread` **entry-point reference, not a
+  call edge** — leave it in a caller-closure and every executor-only function falsely appears
+  reachable from the main thread. Cut it; treat thread procs as roots.
+- "No xrefs" often means the *referencing data was never defined* (vtables sitting as raw bytes).
+  Scan for the little-endian pointer before concluding a virtual has no callers.
+- Reachability and gate counts must be **transitive**: `CommandSpawn` looks ungated but delegates
+  to `DoSpawn`, which holds the gate. Converges around depth 2.
+- Read **disassembly** for computed sizes/arguments — the decompiler folds constants differently
+  (`iVar + 0x48` vs the actual `LEA EDX,[EDI + 0x49]`).
+- When extracting call arguments in bulk, take literals from the **same source line** as the
+  buffer variable; pairing P-code operands positionally desyncs in multi-call-site functions.
+- Verify against the Ghidra DB, not the `*_notes.md`. Several long-standing claims in the notes
+  were never measured and turned out wrong.
+
+### Ghidra MCP Mechanics
+
+- `execute_command` runs in a **persistent** Jython context — globals survive between calls, so
+  accumulate into a global and process in batches.
+- 30 s timeout: >~15 decompilations per call times out. Batch with a `DONE` set so a timeout
+  doesn't lose progress.
+- `mem.getBytes()` into a Jython `bytearray` does not marshal back (silently returns zeros) — use
+  `getInt()`/`getByte()` or `jarray`.
+- `createLabel` replaces a dynamic `DAT_` symbol, deleting any `Symbol` handle fetched beforehand
+  (`ConcurrentModificationException`) — re-fetch after.
+- `findDataTypes` may return a pre-existing duplicate from another category; consolidate with
+  `dtm.replaceDataType(old, new, False)` instead of leaving two definitions.
+- For `__thiscall`, the `this` type comes from the function's **parent class namespace**
+  (`setParentNamespace`), not `updateFunction`; a parameter literally named `this` binds to ECX.
+- After renaming in Ghidra, `grep` the `*.md` files for the old `FUN_`/`DAT_` name.
 
 ### Game Binary Layout
 
@@ -455,4 +490,33 @@ KERNEL32/USER32/GDI32/ADVAPI32/OLE32/WINMM (Windows API).
 - Lua refs stored as varint-encoded bytes in script_name fields (high bit set = Lua ref, not filename)
 - Detour hooks follow: resolve original -> attach in constructor -> detach in destructor
 - `static_assert` on struct sizes and offsets to catch layout mismatches
-- `UNKNOWN_METHOD(name)` macro marks vtable slots with known position but unknown signature
+- Game vtables are modelled in `src/Actors.cpp` as **declaration-ordered pure virtuals**: the base
+  `Actor` declares 83 (slot 0 is the destructor), and each subclass appends its own extension slots
+  in vtable order. Adding a virtual there is how you record a new slot — it costs no object size
+  (the vptr already exists), so the `static_assert(sizeof(...))` guards still hold and will catch a
+  mistake. Cross-check slot numbers against `actor_vtable_notes.md`.
+- Fields with a known offset but unknown meaning are named `field0xNN` / `unkN[...]` padding; a
+  getter/setter of unknown purpose is named `GetField0xNN` / `SetField0xNN`
+
+## Git Workflow
+
+**Commit directly to `main` when working in the primary checkout.** This overrides the default
+"if on the default branch, branch first" behavior — do not create a branch and do not ask.
+
+Only work on a separate branch when inside a dedicated git worktree, which will already be on
+its own branch (see the worktree build notes: `VCPKG_ROOT` is unset there, so reuse the main
+build's `vcpkg_installed` with manifest install disabled).
+
+Committing still happens only when explicitly asked.
+
+### Shell quoting for commit messages
+
+The Bash and PowerShell tools need different multi-line quoting, and mixing them up produces a
+partially-executed command rather than a clean error:
+
+- Bash: `git commit -F - <<'MSGEOF' … MSGEOF`
+- PowerShell: `git commit -m @' … '@` with the closing `'@` at column 0
+
+Also: prefix `python3` with `PYTHONIOENCODING=utf-8` when printing non-ASCII on Windows, and use
+forward-slash paths inside Bash heredocs (`'\\'` gets collapsed). `/tmp` does not exist — use the
+scratchpad directory.

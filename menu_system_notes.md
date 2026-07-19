@@ -560,7 +560,7 @@ Each open menu also owns a panel widget in `InGameMenuPanels[7]` @ `0x007ba1dc`.
   in-game menu remains open (see `threading_model_notes.md`).
 - `CloseInGameDialogs` @ `0x0056a230`; exposed to the console as `CommandClearDialogs` @ `0x0044c150`.
 - `OpenInGameMultiplayerFailedMenu` is called from the multiplayer client message dispatch
-  (`FUN_004fde70` @ `0x0050037c`); it refuses to run in SinglePlayer or Cooperative mode.
+  (`ApplyUpdateMessage` @ `0x0050037c`); it refuses to run in SinglePlayer or Cooperative mode.
 - The save/load menus enumerate `*.msv` in Cooperative mode and `*.sav` otherwise, through
   `FUN_004e6840` into `SaveFileList` @ `0x007b6f20` (see `save_system_notes.md`).
 - In-game options renders each value into the label buffers at `0x007ba2c4`..`0x007ba2e4`
