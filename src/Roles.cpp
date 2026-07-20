@@ -31,8 +31,8 @@ struct Character {
   float mine_laying_time;
   bool latch_trigger;
   bool alertable;
-  uint8_t field0x1e;
-  uint8_t field0x1f;
+  uint8_t field0x1e; // padding
+  uint8_t field0x1f; // padding
   int generation_limit;
   float sight_angle;
   float sight_range;
@@ -60,14 +60,14 @@ struct Character {
   bool can_turn;
   bool draw_vision_cone;
   bool draw_hearing_range;
-  uint8_t field0x83;
+  uint8_t field0x83; // padding
   Hierarchy *customisation_hierarchy;
   Hierarchy *shadow_hierarchy;
   int blob_shadow;
   char *description;
-  field field0x94;
-  field field0x98;
-  int field00x9c;
+  field field0x94;  // runtime scratch - not set by ToCharacter
+  field field0x98;  // runtime scratch - not set by ToCharacter
+  int field00x9c;   // runtime scratch - not set by ToCharacter
   int status_window_v;
   int status_window_u;
   float strength;
@@ -90,34 +90,37 @@ struct Light {
   float range;
 };
 
-struct Projectile {
-  bool gravity;
-  uint8_t field0x1;
-  uint8_t field0x2;
-  uint8_t field0x3;
-  float damage;
-  int sound;
-  float max_range;
-  float blast_damage;
-  float blast_range;
-  float blast_range_squared;
-  Light *hit_light;
+struct Projectile { // GLS 'projectile'; see role_subobjects_notes.md
+  bool gravity;         // 0x00 GLS 0x33
+  uint8_t field0x1;     // padding
+  uint8_t field0x2;     // padding
+  uint8_t field0x3;     // padding
+  float damage;         // 0x04 GLS 0x2a (negative heals)
+  int sound;            // 0x08 GLS 0x20
+  float max_range;      // 0x0c GLS 0x2d
+  float blast_damage;   // 0x10 GLS 0x2c
+  float blast_range;    // 0x14 GLS 0x28
+  float blast_range_squared; // 0x18 = blast_range^2 (cached)
+  Light *hit_light;     // 0x1c GLS 0x1f (owned, ToLight)
 };
 
+// See role_subobjects_notes.md. Only ~15 fields come from GLS; the 0x30..0xa8 block is
+// five {vec4 of 1.0f, int count=2} interpolation channels (the first is RGBA colour),
+// default-initialised by ToParticleGenerator. No owned heap pointers.
 struct ParticleGenerator {
-  int type;
-  int field0x4;
-  int field0x8;
-  int life;
-  float rate;
-  Vec3 coords;
+  int type;             // 0x00 GLS 'type' 0x41 (0..12)
+  int kind;             // 0x04 constant 5 (object-kind tag)
+  int field0x8;         // 0x08 copied from parsed+0x1b60
+  int field0xc;         // 0x0c copied from parsed+0x1b64 (not the lifespan; see 0xd0)
+  float rate;           // 0x10 GLS 'rate' 0x43
+  Vec3 coords;          // 0x14 GLS x/y/z 0x44-46
   Vec3 field0x20;
   field field0x2c;
-  float red;
-  float green;
-  float blue;
-  float alpha;
-  int field0x40;
+  float red;            // 0x30 GLS 'red' 0x21  (colour channel base)
+  float green;          // 0x34 GLS 'green' 0x22
+  float blue;           // 0x38 GLS 'blue' 0x23
+  float alpha;          // 0x3c GLS 'alpha' 0x24
+  int field0x40;        // 0x40 channel-0 keyframe count (=2)
   field field0x44;
   float field0x48;
   float field0x4c;
@@ -153,16 +156,50 @@ struct ParticleGenerator {
   void *field0xb8;
   field field0xbc;
   void *field0xc0;
-  float start_scale;
-  float end_scale;
-  float spin;
-  field field0xd0;
+  float start_scale;    // 0xc4 GLS 'start scale' 0x64
+  float end_scale;      // 0xc8 GLS 'end scale' 0x65
+  float spin;           // 0xcc GLS 'spin' 0x66
+  field lifespan_ticks; // 0xd0 GLS 'particle TTL' 0x67 * current clock rate
+};
+
+// Death-behaviour records. Three variants share a dtor-only base vtable; the death/frag
+// handler (Frag @ 0x0052e220) dispatches on `tag` at +0x04. See role_subobjects_notes.md.
+// The tag doubles as the explode/splatter type for the base variant.
+enum class DestructibilityKind : int {
+  Explode = 0,
+  Splatter = 1,
+  FragData = 3,
+  ReplaceDestructibility = 4,
 };
 
 struct Destructibility {
-  void *vtbl;
-  int type;
+  virtual ~Destructibility() = 0;
+  DestructibilityKind tag; // Explode/Splatter for this base variant; else FragData/ReplaceDestructibility
 };
+
+struct FragData { // GLS `frag data`
+  virtual ~FragData() = 0;
+  DestructibilityKind tag; // = FragData
+  Role *role;         // GLS 'role' 0x60 - fragment pieces
+  Role *replace_role; // GLS 'replace role' 0x61 - actor spawned in place at death
+  char *remove;       // GLS 'remove' 0x62 (owned)
+  int scale;          // GLS 'scale' 0x63
+  bool replace;       // GLS 'replace' 0x69
+  bool symmetric;     // GLS 'symmetric' 0x6a
+  uint8_t pad[2];
+  float blast_range;  // GLS 'blast range' 0x28
+  float blast_damage; // GLS 'blast damage' 0x2c
+};
+static_assert(sizeof(FragData) == 0x24);
+
+struct ReplaceDestructibility {
+  virtual ~ReplaceDestructibility() = 0;
+  DestructibilityKind tag; // = ReplaceDestructibility
+  char *name;   // GLS 'name' 0x00 (owned)
+  bool replace; // GLS 'replace' 0x69
+  uint8_t pad[3];
+};
+static_assert(sizeof(ReplaceDestructibility) == 0x10);
 
 struct InventoryInfo {
   Hierarchy *hierarchy;
@@ -185,21 +222,26 @@ struct Role {
   ParticleGenerator *pgen;
   ParticleGenerator *pgen2;
   char *meta_sound;
-  Vec3 field0x2c;
-  Vec3 field0x38;
-  char *hotspot;
-  char *alternate_hotspot;
-  int field0x4c;
-  int field0x50;
+  // Resolved positions of the hotspot / alternate-hotspot nodes within the role's
+  // hierarchy (see HierarchyResolveNamedPointPos @ 0x00594890). Zero for shape/pgen roles.
+  Vec3 hotspot_point;           // 0x2c
+  Vec3 alternate_hotspot_point; // 0x38
+  char *hotspot;                // 0x44 hotspot node name
+  char *alternate_hotspot;      // 0x48 alternate hotspot node name
+  // Counts of present hierarchy nodes in slot ranges 26..30 / 21..25 (ToRole).
+  int num_hier_nodes_26_30;     // 0x4c
+  int num_hier_nodes_21_25;     // 0x50
   int limit;
   Light *light;
   Projectile *projectile;
   Character *character;
   InventoryInfo *inventory_info;
-  VulnList *vulnerabilities;
-  int field0x6c;
-  char *field0x70;
-  char *field0x74;
+  // Vulnerabilities: a 16-byte list header {sentinel, count, cached_array, cache_valid}.
+  // Entries are added outside ToRole (by the vulnerability-processing path).
+  VulnList *vulnerabilities;    // 0x68
+  int num_vulnerabilities;      // 0x6c
+  void *vuln_cached_array;      // 0x70 flattened-array cache, freed+nulled on edit
+  int vuln_cache_valid;         // 0x74
   bool alpha_fogging : 1;
   bool per_vertex_fogging : 1;
   bool no_lighting : 1;
@@ -210,7 +252,7 @@ struct Role {
   bool frag_control : 1;
   bool moves_on_lifts : 1;
   bool status_display : 1;
-  int ai;
+  AIType ai;
   int interface_beam_delay;
   int interface_beam_effect;
   char *interface_beam_script;
@@ -222,10 +264,13 @@ struct Role {
   float recharge_rate;
   float alpha;
   Destructibility *destructibility;
-  void *field0xac;
-  int field0xb0;
-  char *field0xb4;
-  int field0xb8;
+  // Sever points: a 16-byte list header {sentinel, count, cached_array, cache_valid} of
+  // body-part/attachment name strings, split from the "sever point" GLS field on ','.
+  // Uses trigger-style nodes, so RoleDtor cleans it with TriggerList::DeleteTriggers.
+  void *sever_points;              // 0xac list head
+  int num_sever_points;            // 0xb0
+  void *sever_point_cached_array;  // 0xb4 freed+nulled on each insertion
+  int sever_point_cache_valid;     // 0xb8
   int id;
 };
 static_assert(offsetof(Role, hotspot) == 0x44);
@@ -254,7 +299,7 @@ int RoleWrapper::to_string(lua_State *L) const {
 }
 
 int RoleWrapper::get_id() { return role->id; }
-int RoleWrapper::get_type() { return role->ai; }
+int RoleWrapper::get_type() { return static_cast<int>(role->ai); }
 std::string_view RoleWrapper::get_name() {
   if (role->name) {
     return role->name;

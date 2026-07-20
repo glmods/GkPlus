@@ -11,6 +11,7 @@
 #include "Debug.h"
 #include "GUI.h"
 #include "LuaEngine.h"
+#include "Map.h"
 #include "Math.h"
 #include "Memory.h"
 #include "Menu.h"
@@ -78,6 +79,7 @@ struct Modules {
   ActorsModule actors;
   MathModule math;
   RolesModule roles;
+  MapModule map;
   CameraModule camera;
   MiscModule misc;
   DebugModule debug;
@@ -86,7 +88,8 @@ struct Modules {
 
   Modules(lua_State *L)
       : console{L}, menu{L}, gui{L}, tokens{L}, memory{L}, actors{L}, math{L},
-        roles{L}, camera{L}, misc{L}, debug{L}, triggers{L} /*, chunks{L} */ {}
+        roles{L}, map{L}, camera{L}, misc{L}, debug{L},
+        triggers{L} /*, chunks{L} */ {}
 };
 
 extern "C" BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID) {

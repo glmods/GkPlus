@@ -39,6 +39,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ImGuiBindings.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/GUI.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/LuaEngine.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Map.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Math.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Memory.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Menu.cpp"

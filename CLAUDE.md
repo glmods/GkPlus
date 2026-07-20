@@ -21,6 +21,10 @@ cmake --build build --target copy   # copies d3d8.dll to Gunlok's Steam director
 
 `cmake --build build` is incremental and quick. The `static_assert`s in `src/Actors.cpp` are the
 check for any struct-layout or vtable edit — build after touching them rather than eyeballing.
+`-Winvalid-offsetof` warnings on `Actor`/its subclasses and on `Map` are pre-existing and benign
+(they are non-standard-layout due to virtuals); a clean build still links `d3d8.dll`. Every struct
+modelled with pure virtuals produces them — that is the expected cost of the convention below, not
+a signal to switch back to an explicit vtbl field.
 
 ### Dependencies (vcpkg.json)
 
@@ -49,27 +53,10 @@ Overlay configuration in `vcpkg-configuration.json`.
    - Opens Detours transaction, destroys modules (which detach hooks), commits
    - Closes Lua VM
 
-### Module System (src/Module.h)
+### Lua Layer (src/Module.h, src/LuaEngine.h)
 
-All game subsystems use `Module<Derived>` (CRTP). The constructor registers into Lua's
-`package.preload[Derived::module_name]` so Lua code uses `require("gk.xxx")`.
-
-A module that defines `Register(lua_State*)` gets auto-registered. Modules without `Register`
-(like `ChunksModule`) only hook functions without exposing a Lua API.
-
-### Lua Type System (src/LuaEngine.h)
-
-Custom C++20 concepts-based Lua interop:
-
-- **`LuaObject`**: Any type with `metatable_name` and `setup_metatable(L)` static members
-- **`Lua::Create<T>(L, args...)`**: Allocates userdata, sets up metatable with `__gc`, `__tostring`, `__eq`, `__index`/`__newindex` (from `fields`)
-- **Field descriptors** (used in `Fields<...>` type lists):
-  - `Slot<Name, Member>` / `ROSlot` - direct member read/write or read-only
-  - `Getter<Name, Method>` - calls a getter method
-  - `GetterSetter<Name, Get, Set>` - getter + setter methods
-  - `TableGetter<Name, Method>` - getter that returns a Lua table
-  - `Function<Name, Type, Method>` - member function callable from Lua
-  - `StaticSlot` / `StaticGetter` / `StaticFunction` - static/global variants
+The CRTP module base, the concepts-based type interop, the Lua userdata wrappers and the
+per-module API surface are documented in `lua_notes.md`.
 
 ### Function Calling Convention (src/Core.h)
 
@@ -108,31 +95,12 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 | `src/DetourUtils.h` | Member function DetourAttach/DetourDetach wrappers |
 | `src/Varint.h` | Variable-length integer encode/decode (used for Lua refs in trigger scripts) |
 
-### Game Object Wrappers (Lua userdata types)
+### Lua-facing sources
 
-| File | Lua type | Key fields |
-|------|----------|------------|
-| `src/Actors.h/cpp` | `Actor` | id, position, orientation, team_id, role, center, ai_type, vulnerabilities, health |
-| `src/Roles.h/cpp` | `Role` | id, type (ai enum), name, vulnerabilities, spawn() |
-| `src/Vulnerability.h/cpp` | `Vulnerability` | role, vulnerability_role, delay, duration, script, type |
-| `src/Math.h/cpp` | `Vec3`, `Vec4` | x, y, z [, w] (read-only fields) |
-
-### Lua Modules (`require("gk.xxx")`)
-
-| File | Module name | Key API |
-|------|-------------|---------|
-| `src/Console.h/cpp` | `gk.console` | print(), set_text_color(), set_cursor_color(), execute(), register_command(), set_onprint(), set_onsetup() |
-| `src/Menu.h/cpp` | `gk.menu` | See "Menu module API" below |
-| `src/Tokens.h/cpp` | `gk.tokens` | Table-like: tokens.name = value, pairs(tokens), #tokens |
-| `src/Actors.h/cpp` | `gk.actors` | actors[id] returns Actor, pairs(actors) iterates all |
-| `src/Roles.h/cpp` | `gk.roles` | roles[id] or roles["name"], pairs(roles) iterates all |
-| `src/Triggers.h/cpp` | `gk.triggers` | add_time_trigger(delay, callback) |
-| `src/Misc.h/cpp` | `gk.misc` | game_mode, game_state, battle_number, game_difficulty, actor_under_cursor, foobar, parse_gls() |
-| `src/Memory.h/cpp` | `gk.memory` | Direct memory read/write |
-| `src/GUI.h/cpp` | `gk.gui` | ImGui integration |
-| `src/Camera.h/cpp` | `gk.camera` | Camera control |
-| `src/Debug.h/cpp` | `gk.debug` | Debug utilities |
-| `src/AI.h/cpp` | `gk.ai` | AI system access |
+The Lua userdata wrappers (`src/Actors`, `src/Roles`, `src/Map`, `src/Vulnerability`,
+`src/Math`) and the `gk.*` modules (`src/Console`, `src/Menu`, `src/Tokens`, `src/Triggers`,
+`src/Misc`, `src/Memory`, `src/GUI`, `src/Camera`, `src/Debug`, `src/AI`) are tabulated with
+their APIs in `lua_notes.md`.
 
 ### Other
 
@@ -143,42 +111,20 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 | `src/Menus.inc.h` | X-macro listing all 36 Gunlok menus: `GUNLOK_MENU(Name, Id, TitleResourceId, "English title")`. There are no gaps - ids 11 and 14-20 are identified in `menu_system_notes.md` |
 | `imgui-quickjs/` | Static library: QuickJS bindings for ImGui |
 
-### Menu module API (`require("gk.menu")`)
-
-| Member | Purpose |
-|--------|---------|
-| `set_onsetup(cb)` | Runs after `SetupMenus`; `cb` receives `{get=fn}` |
-| `menus` | Indexable by id **or** name (`menus[25]`, `menus.Audio`), `pairs`-iterable, `#menus` |
-| `get(id_or_name)` / `get_ingame(0..6)` | A `Menu` object, or nil |
-| `goto_menu(id_or_name[, remember_parent])` | Calls the game's `GoToMenu` |
-| `chosen_menu()` / `chosen_item()` / `set_chosen_item(n)` | Front-end selection state |
-| `ingame_menu_index()` / `ingame_selected_item()` | In-game (HUD) menu state |
-| `is_ingame_menu_open()` / `close_ingame_menu(kind)` | In-game menu lifecycle |
-| `resource_string(id)` | Resolve a `GL_RESOURCE_ID` through the active language DLL |
-| `ids` / `names` / `titles` | name->id, id->name, id->English title |
-| `item_type` / `pseudo_item` / `visible_rows` | `{plain,value,toggle,choice}`, `{none,back,scroll_up,scroll_down}`, `6` |
-
-`Menu` objects: `id`, `in_game`, `name`, `title`, `title_id`, `parent_id`, `num_items`,
-`num_nodes`, `scroll_offset` (rw), `items`, `item(i)`, `activate([remember])`,
-`add_item(label[, cb])`, `add_value_item(label, value[, cb])`,
-`add_toggle(label, initial[, cb])`, `add_choice(label, {resource_ids}[, initial[, cb]])`.
-
-`MenuItem` objects: `index`, `label`, `type`, `type_name`, `value_text`, `is_current_value`,
-`rect`, `get_value()`, `set_value(v)`.
-
-Strings and bound variables passed from Lua are copied into module-owned storage, because the
-game stores label pointers with `label_is_static = 1` and never copies or frees them.
-
 ## Reverse Engineering Reference
 
 ### Detailed Documentation Files
 
+- `lua_notes.md` - the Lua layer: `Module<Derived>` CRTP registration, the `LuaEngine` concepts/`Fields<>` interop, the userdata wrappers, every `gk.*` module's API, and the `gk.menu` surface
 - `actor_vtable_notes.md` - Actor class hierarchy, all 83+ vtable slots, subclass sizes, constructor addresses
 - `trigger_system_notes.md` - 22 trigger types, data structures, console command syntax, function addresses
 - `gls_system_notes.md` - GLS/GSH script parser: pipeline, ParsedThingBase layout, per-section field tables (types/ranges/defaults), ToXxx converters, C++ API is `src/GLS.h`
+- `level_loading_notes.md` - How a level is built: `BeginLevelSession` -> `LoadLevel` -> `ToMap`, the `.cut`/`.map`/`.opt`/`.loc` sidecar caches, the `LevelMeshHeader` geometry format, the `use <role> in team <n> for "<rif object>"` placed-object binding hash on `ParsedMap+0x1b60`, both spawn factories, and the three seams for replacing the `.gls` path with a native/Lua level builder
+- `role_system_notes.md` - `Role` (0xc0) field-by-field: the entity hash table (0x007b48f0), lifecycle (`CreateRole`/`ToRole`/`RoleDtor`/`DestroyRoles`), the two embedded 16-byte list headers (vulnerabilities @ 0x68, sever points @ 0xac), the `flags` bitfield, `InventoryInfo`, pickup classification via `character->aggression*10`, the `ai` -> Actor-subclass dispatch (`CreateActor`), the spawn path (`SpawnRole`), and three `ToRole` defects
+- `role_subobjects_notes.md` - the four `Role` sub-objects: `Character` (0xb8, with `ToCharacter`'s unit conversions), `Projectile` (0x20), `ParticleGenerator` (0xd4, GLS fields vs runtime animation channels), and the 3-variant `Destructibility` family (base 0x8 / `FragData` 0x24 / `ReplaceDestructibility` 0x10, dispatched on the `+0x04` tag by `Frag` @ 0x0052e220)
 - `threading_model_notes.md` - Two game threads (main "client" + executor "server"), loopback message queues (full `MsgQueue`/`MsgQueueList`/`MsgQueueNode` layouts), pause handshake, per-thread clocks/RNG, which GkPlus hooks run on which thread, and the four script-execution entry points (all main-thread; host uses `ScriptQueue`, MP joiners use update `0x67`)
 - `directplay_protocol_notes.md` - Multiplayer wire protocol: DirectPlay (`IDirectPlay4A`) COM/session setup, app GUID, SendEx/Receive framing & reliability, and the full command (client->server) and update (server->client) message-id tables with payload layouts, the `0x87` lock-step turn model, and update `0x67` (§8.11) which makes every client run a trigger script from its **own** local `Scripts\` copy
-- `menu_system_notes.md` - Both menu systems (front-end `Menus[36]` + in-game `InGameMenus[7]`): `Menu`/`MenuListItem` layouts, the four item constructors and the 4 item types, the full 0-35 menu inventory with titles and populators, the (menu, item) -> action transition map, navigation/rendering/input, key bindings, the localized string table, and the Ghidra DB defects that had to be repaired first
+- `menu_system_notes.md` - Both menu systems (front-end `Menus[36]` + in-game `InGameMenus[7]`): `Menu`/`MenuListItem` layouts, the four item constructors and the 4 item types, the full 0-35 menu inventory with titles and populators, the (menu, item) -> action transition map, navigation/rendering/input, key bindings, and the localized string table
 - `save_system_notes.md` - `.sav`/`.msv` savegame format: full field-by-field stream layout, the header-only "carry to next level" variant, the team carry-over roster, and why the console `SAVE`/`LOAD` commands are the demo system instead
 - `gls.txt` - Game Level Structure file format quick field list (superseded by gls_system_notes.md)
 
@@ -197,6 +143,10 @@ something, write your understanding back into the database instead of keeping it
 Anything reusable (offsets, struct layouts, subsystem behavior) should also land in this file or
 the relevant `*_notes.md`.
 
+Read-only is **not enforced** on delegated work — a nested subagent renamed functions and globals
+this session despite being told not to. If you fan out analysis, treat the constraint as advisory
+and audit the DB afterwards rather than trusting it.
+
 ### Analysis Traps
 
 - `StartExecutorThread` -> `ExecutorThreadProc` is a `CreateThread` **entry-point reference, not a
@@ -210,8 +160,44 @@ the relevant `*_notes.md`.
   (`iVar + 0x48` vs the actual `LEA EDX,[EDI + 0x49]`).
 - When extracting call arguments in bulk, take literals from the **same source line** as the
   buffer variable; pairing P-code operands positionally desyncs in multi-call-site functions.
-- Verify against the Ghidra DB, not the `*_notes.md`. Several long-standing claims in the notes
-  were never measured and turned out wrong.
+- Bulk-recovering broadcast ids: scan each vtable slot body for the last `MOV dword [EBP+x], imm`
+  before a `CALL BroadcastToPlayers` (0x00504bf0). Single-candidate sites are trustworthy — the
+  scan independently reproduced every id already documented — but sites yielding 2+ candidates, or
+  none, are computed (`0x41 + close_range`) and need disassembly.
+- Verify against the Ghidra DB, not the `*_notes.md` — a claim in the notes is only as good as
+  the measurement behind it, and not every one was measured.
+- A **mistyped global pointer** makes the decompiler emit `Global[n].field_0xNN` shorthand whose
+  real offset is `n * sizeof(wrong type) + 0xNN`. Retype the global before reading anything
+  through it, and distrust notes written in `[n].field_` form.
+- When sweeping accesses to a global struct, track the **offset carried in the register**
+  (propagate through `MOV`/`LEA`/`ADD`/`SUB`, kill on other writes and on `CALL` for EAX/ECX/EDX).
+  A plain `[reg+disp]` scan misses every field reached after an `ADD reg,imm` rebase. Sanity-check
+  that all recovered offsets land inside the known struct size.
+- Existing **names in the DB are not evidence either** — several shipped names described
+  something the function does not do. Confirm a name against the body before building on it,
+  and rename when it's wrong.
+- A wrong name does not stay local. `save_system_notes.md` described the savegame `kind` field as
+  "0 = player character" — inferred from a constructor name that does not exist in the binary —
+  which made the format look impossible for any actor larger than 0x178. `kind` is just
+  `IsProjectile()`. When a note calls something contradictory or broken, suspect the label first.
+- A stub that decompiles to `return;` is **not necessarily a no-op**: check for `RET 0xN`. A
+  non-zero operand means the function takes `N` bytes of stack arguments and discards them, which
+  usually makes it a *setter* whose base implementation ignores the value. `Actor` slots 9 and 54
+  were documented as per-tick callbacks for exactly this reason; both are `RET 0x4` and pair with
+  getter slots 8 and 30.
+- The decompiler's `Class::Method` header line does **not** always match
+  `FunctionManager.getParentNamespace()`. Query the namespace; never read ownership off the C output.
+- For a vtable slot, the owning class is the **shallowest** class whose vtable contains that
+  address — not the most-derived one that inherits it. 55 of 249 Actor-family functions were filed
+  under a descendant. Fixing `setParentNamespace` also repairs the `this` parameter type for free.
+- Vtable **slot indices are branch-local**. Two classes deriving from a common base number their own
+  extension slots from the same index, so a "rename slot N everywhere" sweep silently clobbers an
+  unrelated method in a sibling branch (`PickupActor` slot 85 vs `MobileActor` slot 85).
+- The **last** vtable in an adjacent run has no successor to bound it. `PresidentActor`'s
+  (0x00669380) runs to the string pool at 0x00669500 — 96 slots, not the 84 that "ends at the next
+  vtable" implies. Bound the final table with the reference test, never with adjacency.
+- A `ParsedThingBase` subclass may be **larger than 0x1b60**: check the `malloc` size in its
+  `DoParseXxx`. `ParsedMap` is 0x1b78 - the extra 0x18 is the placed-object binding hash.
 
 ### Ghidra MCP Mechanics
 
@@ -225,9 +211,24 @@ the relevant `*_notes.md`.
   (`ConcurrentModificationException`) — re-fetch after.
 - `findDataTypes` may return a pre-existing duplicate from another category; consolidate with
   `dtm.replaceDataType(old, new, False)` instead of leaving two definitions.
+- Editing a struct field: `setFieldName` on an `undefined` component **silently does not persist**,
+  and renaming a component *wider* than the field mislabels its neighbours (`MobileActor+0x187` was
+  a 4-byte `int` spanning 0x188). Use `clearAtOffset` then
+  `replaceAtOffset(off, dt, dt.getLength(), name, comment)`, and re-check `getLength()` afterwards —
+  an unchanged struct size is the guard that the edit landed where you meant.
 - For `__thiscall`, the `this` type comes from the function's **parent class namespace**
   (`setParentNamespace`), not `updateFunction`; a parameter literally named `this` binds to ECX.
+- Ghidra's `__thiscall` puts **only** `this` in ECX, everything else on the stack. A function
+  taking args in ECX *and* EDX is `__fastcall` — model it that way and check
+  `getVariableStorage()` on each param afterwards. `updateFunction("__thiscall", ...)` also
+  auto-inserts its own `this`, shifting your explicit params by one.
 - After renaming in Ghidra, `grep` the `*.md` files for the old `FUN_`/`DAT_` name.
+- A big function's decompilation can exceed the MCP result token cap (it auto-saves to a
+  `tool-results` file needing chunked reads). Instead write it to the scratchpad via Jython
+  (`open(p,'w').write(r.getDecompiledFunction().getC())`) then `Read` it — or hand that file to
+  a subagent to summarize so a 1000+-line function never enters the main context.
+- `getInt()`/`getBytes()` on an uninitialized `.data`/`.bss` global throws `MemoryAccessException`
+  (zero-init globals aren't in the file image) — read meaning from writers/disassembly, not live bytes.
 
 ### Game Binary Layout
 
@@ -286,7 +287,7 @@ the relevant `*_notes.md`.
 | 0x007b7270 | int* | InGameMenuIndex |
 | 0x006a89b4 | int* | InGameMenuSelectedItem |
 | 0x007ba1dc | void*[7] | InGameMenuPanels |
-| 0x007b74dc | LevelList | levelList (0x10-byte list header, not 8) |
+| 0x007b74dc | LevelList | levelList (0x10-byte list header `{sentinel, count, cache, cache_valid}`) |
 | 0x007b74ec | float | MouseYNormalized |
 | 0x007b74d0 | float | MouseXNormalized |
 | 0x007b74f0 | LevelList[8] | KeyBindingCategories |
@@ -320,6 +321,17 @@ the relevant `*_notes.md`.
 | 0x007b9c88 | byte[0x98] | SaveSettingsBlock (size doubles as format version) |
 | 0x007b6e48 | int* | NextInventoryItemId |
 | 0x007b9cf0 | int* | LevelLoadReason (3 = loading a full savegame) |
+
+**Level:** (see `level_loading_notes.md`)
+
+| Offset | Type | Name |
+|--------|------|------|
+| 0x00739090 | Map** | TheMap (0x18c; non-NULL disables ToMap's geometry phase) |
+| 0x00739098 | list | MapAuxObjectList (positional sounds etc.) |
+| 0x007b3ec4 | TeamSlot* | TeamSlots (stride 0xc4; `active` @ 0x69 = slot active) |
+| 0x007b3ec0 | int* | NumTeamSlots |
+| 0x007b6dd0 | char* | ConsoleFileName (level `.gcs`) |
+| 0x007b68e4 | int* | client actor id counter |
 
 ### Key Function Addresses (offsets from base)
 
@@ -404,6 +416,20 @@ the relevant `*_notes.md`.
 |--------|-----------|------|
 | 0x00474540 | FastCall<Parsed*, const char*, int> | ParseGLS |
 
+**Level Loading:** (see `level_loading_notes.md`)
+
+| Offset | Signature | Name |
+|--------|-----------|------|
+| 0x004e2560 | FastCall<int, char> | BeginLevelSession (DL != 0 -> also LoadLevel) |
+| 0x004e0980 | StdCall<void> | LoadLevel |
+| 0x0047f160 | ThisCall (member) | ToMap - builds TheMap and spawns placed objects |
+| 0x0047efa0 | ThisCall (member) | CheckValue_Map - handles `use ... in team ... for ...` |
+| 0x00470f20 | ThisCall<void, Map*, void*, Vec3*, LevelMeshHeader*> | Map_Ctor |
+| 0x005035b0 | FastCall<int, int, Role*, Vec3*, Vec4*> | ServerSpawnActorForTeam |
+| 0x004fce90 | FastCall<void*, int, Role*, Vec3*, Vec4*> | ClientSpawnActorForTeam |
+| 0x005aaac0 | ThisCall<void, List*, void*, const char*> | RifFilterObjectsByName (ECX=out list, EDX=rif) |
+| 0x004ae960 | FastCall<void*, const char*, int> | LoadOrGetRifFile |
+
 **Save System:** (see `save_system_notes.md`)
 
 | Offset | Signature | Name |
@@ -435,13 +461,20 @@ Actor (0x120 bytes, vtbl @ 0x00667e30)
  +- BackgroundCreatureActor (0x120 bytes)
  |   +- FlyingBackgroundCreatureActor (0x120 bytes)
  +- BlockerActor (0x130 bytes)
- +- UnknownActor (0x120 bytes)
+ +- ProjectileActor (0x178 bytes)   <- was `UnknownActor`; see actor_vtable_notes.md
 ```
 
 Key Actor struct offsets (vtable ptr implicit at 0x00): `id` @ 0x0c, `vulnerabilities` @ 0x10,
-`ai_type` @ 0x50, `position` (Vec3) @ 0xa0, `orientation` (Vec4) @ 0xac, `team_id` @ 0xbc, `role` @ 0xc0.
+`ai_type` @ 0x50, `flags` @ 0x7c, `position` (Vec3) @ 0xa0, `orientation` (Vec4) @ 0xac,
+`team_id` @ 0xbc, `role` @ 0xc0, `armor_value` @ 0xf0, `strength` @ 0xf4, `is_dead` @ 0x115.
 
-No RTTI - type checking uses virtual methods (IsCharacter, IsMobile, IsTurret, etc.).
+No RTTI - type checking uses virtual methods (IsCharacter, IsMobile, IsTurret, etc.). Slots 36-50
+are that mechanism and all fifteen are mapped to a concrete class.
+
+Vtable slot counts: Actor 83, MobileActor 95, CharacterActor 100, TurretActor 105,
+PresidentActor 96, PickupActor 86, ProjectileActor 85; the other nine add nothing. **Slot indices are
+only comparable within a branch** - `PickupActor`'s slot 85 and `MobileActor`'s slot 85 are
+unrelated. A slot implementation belongs to the *shallowest* class whose vtable holds it.
 
 ### Trigger Types Enum (TriggerKind)
 
@@ -472,9 +505,33 @@ No RTTI - type checking uses virtual methods (IsCharacter, IsMobile, IsTurret, e
 
 ### Role Structure (0xc0 bytes)
 
-Key fields: `name` @ 0x00, `shape` @ 0x18, `hierarchy` @ 0x1c, `hotspot` @ 0x44,
-`character` @ 0x60, `inventory_info` @ 0x64, `vulnerabilities` @ 0x68,
-`ai` @ 0x7c (determines Actor subclass), `armor` @ 0x94, `shields` @ 0x98, `id` @ 0xbc.
+Full field-by-field breakdown, lifecycle, hash table and spawn dispatch in
+`role_system_notes.md`. Key fields: `name` @ 0x00 (from GLS `identifier` 0x47, **not**
+`name`), `shape` @ 0x18, `hierarchy` @ 0x1c, `hotspot` @ 0x44, `character` @ 0x60,
+`inventory_info` @ 0x64, `vulnerabilities` list @ 0x68 (`{sentinel,count,cache,flag}`),
+`flags` @ 0x78 (10 packed booleans), `ai` @ 0x7c (determines Actor subclass),
+`resistance_factor` @ 0x94, `armor_value` @ 0x98, `shields` @ 0x9c, `sever_points` list
+@ 0xac, `id` @ 0xbc. The C++ mirror is `src/Roles.cpp`.
+
+### Map Structure (0x18c bytes)
+
+Full layout in `level_loading_notes.md`; the C++ mirror is `src/Map.cpp`, modelled as
+`Map : MapBase, RefCountedBase` (see the vtable convention above). Key fields:
+`lock` @ 0x04 (embedded RWLock), `sections`/`num_sections` @ 0x88/0x8c, the second
+base subobject's vptr/`refcount` @ 0xa4/0xa8, `adjacency_built` @ 0xac, `scene_object` @ 0xc8, `bitmap`
+@ 0xcc, `neg_origin` @ 0x11c, `bounds_min`/`bounds_max` @ 0x128/0x134,
+`camera_focus_min`/`max` @ 0x140/0x14c, `.rif` FILETIME @ 0x158, `shadow_object_rif`/
+`_name` @ 0x160/0x164, `default_position` @ 0x168, `sky_object` @ 0x188.
+
+**The origin at 0x11c is stored negated** (`Map_Ctor` XORs each component with
+0x80000000) and `ToMap` *adds* it, so a placed object lands at
+`rif_pos * world_unit_scale - origin`. 0x24..0x88 and 0x8c..0xa4 are still unmapped -
+they are reached only through `__thiscall` methods called directly on `TheMap`.
+
+Roles are the "entity" hash @ 0x007b48f0 (`{num_entities, num_buckets, mask, buckets}`);
+ids come from `next_entity_id` @ 0x007b48d4. `CreateRole` @ 0x004add90 allocates+inserts;
+`ToRole` @ 0x0047cc20 converts a parsed `role`; `CreateActor` @ 0x00510760 dispatches
+`role->ai` to the Actor subclass; `SpawnRole` @ 0x00503710 is `gk.roles` `Role:spawn`.
 
 ### Imports
 
@@ -487,7 +544,6 @@ KERNEL32/USER32/GDI32/ADVAPI32/OLE32/WINMM (Windows API).
 - Game addresses are always offsets added to base address (never hardcoded absolutes)
 - Hash tables (actors, roles) use bucket arrays with linked list chaining
 - Linked lists (triggers, tokens) are doubly-linked with sentinel nodes
-- Lua refs stored as varint-encoded bytes in script_name fields (high bit set = Lua ref, not filename)
 - Detour hooks follow: resolve original -> attach in constructor -> detach in destructor
 - `static_assert` on struct sizes and offsets to catch layout mismatches
 - Game vtables are modelled in `src/Actors.cpp` as **declaration-ordered pure virtuals**: the base
@@ -495,8 +551,30 @@ KERNEL32/USER32/GDI32/ADVAPI32/OLE32/WINMM (Windows API).
   in vtable order. Adding a virtual there is how you record a new slot — it costs no object size
   (the vptr already exists), so the `static_assert(sizeof(...))` guards still hold and will catch a
   mistake. Cross-check slot numbers against `actor_vtable_notes.md`.
+- **A struct with a vtable gets pure virtuals, never an explicit `void *vtbl` member.** Declare the
+  slots as `virtual ... = 0;` in vtable order and let the implicit vptr occupy offset 0x00 — the
+  first *data* member then starts at 0x04 (see `Actor`'s `unk1`, `Map`'s `lock`). An explicit vtbl
+  field would double-count those 4 bytes and, worse, hides the slots. Slots whose purpose is not
+  yet known follow the field convention: `StubN()` (as in `Actor::Stub27`).
+- **A second vptr mid-struct means multiple inheritance — model it with real C++ inheritance**,
+  not a `void *sub_vtbl` field. MSVC lays base subobjects out in declaration order, so the second
+  vptr lands at exactly the right offset once the first base is sized correctly (`Map : MapBase,
+  RefCountedBase` puts `RefCountedBase`'s vptr at 0xa4 because `sizeof(MapBase) == 0xa4`). Add a
+  `static_assert(sizeof(...))` per base plus `offsetof` on a member of each — those are what
+  prove the layout, and they fail loudly if the split is wrong.
+  One deliberate exception: `gls::ParsedThingVtbl` models the vtable as a struct of typed
+  function pointers *on purpose*, because GkPlus calls those slots rather than just describing them.
+- Determining a vtable's **slot count**: MSVC emits every class's vftables adjacently in `.rdata`,
+  so the table ends at the next address that is referenced *at all*. Walk the candidate slots and
+  count references per dword: a real slot has **zero** (nothing points into the middle of a
+  vtable), a boundary has some. `Map`'s secondary vtable at 0x00652828 is 2 slots — 0x0065282c has
+  no refs, 0x00652830 has six from unrelated classes. "Looks like a function pointer" is not a
+  slot test: past a table's end sit the one-slot vtables of the list/node helpers, then floats.
 - Fields with a known offset but unknown meaning are named `field0xNN` / `unkN[...]` padding; a
   getter/setter of unknown purpose is named `GetField0xNN` / `SetField0xNN`
+- Enum-like `int` fields use `enum class Name : int` (near its struct, or a header if shared across
+  files) applied to the field; only encode values you've **verified** (the game's own enum, or a
+  keyword->id function like `GetParticleIDFromName`) — leave `int` rather than guess a mapping.
 
 ## Git Workflow
 

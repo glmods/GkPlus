@@ -30,8 +30,8 @@ The sentinel node points to itself (next=prev=self) when the list is empty.
 ```
 Used as nodes in TriggerList. The field (Ghidra label `actor_name`) stores **actor token
 names** when embedded in TriggerData's target list at 0x44. It is a generic string whose
-semantics depend on context. (Formerly named `Trigger` - renamed to disambiguate from the
-real trigger node below.)
+semantics depend on context. Distinct from the `Trigger` node below, which is the real
+global-list node.
 
 ### Trigger (0x10 = 16 bytes) - Global trigger linked list node
 ```

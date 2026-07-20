@@ -1,4 +1,5 @@
 #include "AI.h"
+#include "Roles.h"
 
 #include <array>
 
@@ -6,7 +7,9 @@ namespace gk {
 
 AIModule::AIModule(lua_State *L) : Module{L} {}
 
-static std::array<const char *, 21> ai_types = {
+// gk.ai.types: index (== AIType) -> lowercase name, and name -> index. Kept in lockstep
+// with enum class AIType (Roles.h) by the static_assert below.
+static std::array<const char *, static_cast<size_t>(AIType::Count)> ai_types = {
     "bot",
     "scavenger",
     "mine",

@@ -617,10 +617,9 @@ Those effects stay client-local: on a joiner `ServerDPlay == NULL`, so an ungate
 calls `BroadcastToPlayers` pushes onto the joiner's *own* loopback `UpdateQueue` and self-applies.
 It never reaches the host.
 
-> Earlier revisions of this file claimed the ungated remainder was "the presentational half
-> (sounds, messages, camera, FMV)". That was never measured and is wrong. Note also that counting
-> only calls made *directly* inside each handler overstates the ungated set at 172 — `CommandSpawn`
-> for instance delegates to `DoSpawn`, which holds the gate.
+> **Count gates transitively.** Counting only calls made *directly* inside each handler
+> overstates the ungated set at 172 — `CommandSpawn` for instance looks ungated but delegates to
+> `DoSpawn`, which holds the gate. The ungated remainder is not simply "the presentational half".
 
 **`0x67` is the only update that can make a client execute a file, and `QueueScriptExecution` is
 the only thing that sends one.** Both halves were established exhaustively rather than by

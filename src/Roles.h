@@ -8,6 +8,34 @@
 namespace gk {
 struct Role;
 
+// The Role's AI class (Role.ai @ 0x7c). Selects the spawned Actor subclass in the game's
+// CreateActor @ 0x00510760. Values verified against the game's AIType enum and the
+// gk.ai `types` table. See role_system_notes.md / role_subobjects_notes.md.
+enum class AIType : int {
+  Bot,
+  Scavenger,
+  Mine,
+  Minebot,
+  Reserved,
+  Blocker,
+  Waiting,
+  Pathfinder,
+  TrackObject,
+  Tumbleweed,
+  Pickup,
+  BackgroundCreature,
+  FlyingBackgroundCreature,
+  Centipede,
+  Centibody,
+  Node,
+  NodeWaiting,
+  Swarm,
+  Popup,
+  President,
+  Turret,
+  Count,
+};
+
 struct RoleWrapper final {
   static constexpr const char *metatable_name = "Role";
   static void setup_metatable(lua_State *L);

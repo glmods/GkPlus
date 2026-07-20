@@ -283,19 +283,16 @@ guard, or being simulation-authority code that broadcasts. This is why a joining
 | `OnFlagCaptured` | 0x00533120 | CTF capture; queues `CaptureFlag_team<N>.gcs` | called from `SyncPositionAndBroadcast` @ 0x00533720; broadcasts — *inferred* |
 | `OnPickedUp` | 0x00546440 | item pickup; queues the item's `associated_script` | `PickupActor` vtable slot; broadcasts — *inferred* |
 
-> `MultiplayerRespawnRole` used to be listed here as host-side because of "an explicit
-> `IsExecutorRunning()` guard". That was wrong: the guard covers only the `SpawnRole` call, and
-> `QueueScriptExecution` runs unconditionally below it. The conclusion still holds, and is in fact
-> stronger — its only caller is `EvaluateTriggers`, so it is executor-only by call graph.
+> **`MultiplayerRespawnRole`'s `IsExecutorRunning()` guard is not what makes it host-side.**
+> The guard covers only the `SpawnRole` call; `QueueScriptExecution` runs unconditionally below
+> it. What proves it executor-only is the call graph — its sole caller is `EvaluateTriggers`.
 >
 > Note also that `SyncPositionAndBroadcast` names **11 distinct functions**; the one that queues
 > scripts is `0x0053d8d0`, *not* the `0x00533720` that calls `OnFlagCaptured`. Resolve by address.
 
 Caveat on the last four: they are **vtable-dispatched**, so their callers cannot be enumerated
-statically. `OnPickedUp` is `PickupActorVtbl` slot 84 (`0x0066852c`, offset 0x150) — it appeared
-to have zero references of *any* kind only because that vtable was undefined data in Ghidra; it is
-now defined, see `actor_vtable_notes.md`. Their host-side status
-is inferred from the fact that they perform authoritative broadcasts, not proven. `OnPickedUp` in
+statically. `OnPickedUp` is `PickupActorVtbl` slot 84 (`0x0066852c`, offset 0x150); see
+`actor_vtable_notes.md`. Their host-side status is inferred from the fact that they perform authoritative broadcasts, not proven. `OnPickedUp` in
 particular enqueues with no `IsExecutorRunning()` guard at the call site, so if a client could
 ever reach that virtual method it would enqueue and run its own local file. Resolving this needs
 dynamic tracing.

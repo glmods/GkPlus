@@ -66,7 +66,6 @@ The filename is assembled into `SaveFileNameBuf` @ `0x007b6ef0`, a **0x29-byte**
 
 > **`SAVE` and `LOAD` in the console are not this system.** `CommandSaveDemo` @ `0x00446b40` and
 > `CommandLoadDemo` @ `0x00446cf0` save and replay *input demos* (alongside `RECORD` / `PLAYBACK`).
-> They were previously named `CommandSave`/`CommandLoad` in the database, which was misleading.
 > Their format is: `u32 len + ScriptFileName`, `u32 len + ConsoleFileName`, `u32 frameCount`,
 > `frameCount * 0x18` bytes of input records, `frameCount * 4` bytes of a parallel table.
 
@@ -159,7 +158,7 @@ u32  num_actors            // the global next-actor-id counter
 u32  serverActorCount
 serverActorCount x {
     u32  size              // actor->vtbl->GetSize()
-    u32  kind              // 0 = player character, 1 = UnknownActor
+    u32  kind              // actor->vtbl->IsProjectile()  (slot 38) as 0/1
     u8[size]  blob         // the raw actor object, memcpy'd
     u32  roleId            // actor->role->id
     u32  actorId           // actor->id
@@ -169,11 +168,42 @@ u32  clientActorCount      // filtered: entries with actor[+0x24] != 0 are skipp
 clientActorCount x { ...same, with the client-side fixup writer... }
 ```
 
-On load, `kind` selects the constructor (`CreatePlayerCharacterCoop` / `UnknownActor::Ctor` on the
-server side, `0x004fce90` / `0x004c47e0` on the client side), the fresh object's `GetSize()` is
-checked against the stored `size` (mismatch aborts the load), the id is forced back to `actorId`,
-and the blob is applied over the object. In Cooperative mode the loader additionally remaps the
-team/player index for the five named player roles (`GUNLOK`, `ELINT`, `HARK`, `FREND`, `MASKELYN`).
+`kind` is **not** an actor-class tag. `SaveGame` computes it at 0x00507e2f as a plain boolean:
+
+```
+MOV EAX,[EAX + 0x98]   ; ActorVtbl slot 38 = IsProjectile
+CALL EAX
+XOR ECX,ECX
+TEST AL,AL
+SETNZ CL               ; kind = IsProjectile() ? 1 : 0
+```
+
+so it distinguishes exactly one thing: *can this actor be rebuilt by the role factory, or not?*
+
+On load the two branches are:
+
+- **`kind == 0`** -> `ServerSpawnActorForTeam(team, role, coords, ori)` @ 0x005035b0, which calls
+  `CreateActor` @ 0x00510760 and dispatches on `role->ai` to construct the **correct subclass**. A
+  saved `TurretActor` comes back as a `TurretActor`, a `CharacterActor` as a `CharacterActor`, and
+  so on. Nothing about this path is player-character-specific.
+- **`kind == 1`** -> `malloc(0x178)` + `ProjectileActor::Ctor` @ 0x00542410 directly. Projectiles
+  need the special case precisely because they are *not* produced by the `role->ai` factory - they
+  are spawned by the weapon tick, the turret firing solution and `SpawnProjectileActor`.
+- any other value aborts the load.
+
+The `GetSize()` check against the stored `size` then validates that the reconstruction picked the
+right class, and the id is forced back to `actorId` before the blob is applied over the object.
+
+In Cooperative mode the team/player index is remapped for the five named player roles (`GUNLOK`,
+`ELINT`, `HARK`, `FREND`, `MASKELYN`) before the spawn - and note `ServerSpawnActorForTeam`
+performs the same five-way remap internally (0x0050360d..0x005036a1), so it happens twice on this
+path.
+
+> An earlier revision of this file described `kind` as "0 = player character, 1 = UnknownActor" and
+> named the kind-0 constructor `CreatePlayerCharacterCoop`. Both were wrong: no such symbol exists
+> in the binary, and reading kind 0 as "player character" made the format look impossible, since a
+> 0x320 `TurretActor` could not have survived a 0x178 reconstruction plus the `GetSize` check. The
+> contradiction was an artifact of the mislabelling, not of the format.
 
 **The record does not end at `actorId`.** Each actor is followed by a variable-length *fixup*
 section written by `WriteActorFixups` @ `0x00531cf0` and consumed by `ReadActorFixups` @

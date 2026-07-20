@@ -392,6 +392,9 @@ correction, centre `(0.25, 0.5)`). Sprites: `SpriteScrollUp` / `SpriteScrollDown
 | Cursor up / down | `MenuSelectPreviousItem` / `MenuSelectNextItem` |
 | Wheel up / down | `MenuScrollUpOrSelectPrevious` / `MenuScrollDownOrSelectNext` |
 
+Mouse position reaches the menu code as two normalized floats, `MouseXNormalized` @ `0x007b74d0`
+and `MouseYNormalized` @ `0x007b74ec`, hit-tested against each item's `rect`.
+
 `MenuSelectPreviousItem` / `MenuSelectNextItem` build a temporary **circular** list of currently
 focusable pseudo-items — `[Up if scrolled] + [visible indices] + [Down if more below] +
 [Back if not Main]` — and step through it with wrap-around.
@@ -430,15 +433,14 @@ PlayUiSound(0x57);
 switch (ChosenMenu)  ->  jump table @0x004ef318 (36 entries)
 ```
 
-**Two decompiler traps, both now annotated in the database:**
+**A decompiler trap:** `LAB_004ef2f1` is `CALL GoToMenu` whose `ECX` (target menu) and `DL`
+(push flag) are set at roughly 30 different `JMP` predecessors. Ghidra renders **every** menu
+transition as a bare no-argument `FUN_004fbfa0()` and loses the destination entirely — read the
+disassembly, not the C output. The table below was recovered that way.
 
-1. `LAB_004ef2f1` is `CALL GoToMenu` whose `ECX` (target menu) and `DL` (push flag) are set at
-   roughly 30 different `JMP` predecessors. Ghidra renders **every** menu transition as a bare
-   no-argument `FUN_004fbfa0()` and loses the destination entirely. The table below was
-   recovered from disassembly.
-2. The jump table at `0x004edda9` (menu 13) originally failed to recover, leaving
-   `0x004eddb0`-`0x004ee3d1` as undefined bytes and emitting `halt_baddata()`. **Repaired**:
-   computed-jump references added at the call site and the table typed at `0x004ef464`.
+The menu-13 jump table is typed at `0x004ef464`, with computed-jump references from the jump
+site at `0x004edda9` to its five targets; that is what makes `0x004eddb0`-`0x004ee3d1`
+disassemble as code.
 
 Back handler specials (`0x004ed00f`): menu 20 restores the video mode; menus 11/12 shut down
 DirectPlay; menu 13 clears `IsMultiplayerHost`; menus 14/16/17 use a **two-stage quit
@@ -624,34 +626,6 @@ from the labels, not proven — `CommandMenu` returns to the front-end (yes) and
 confirmed against `FUN_0056c9e0` @ `0x0056c9e0`, which actually builds the dialog.
 
 `CommandConfirmDialogTest` @ `0x0044c0f0` exercises this path from the console.
-
-## Ghidra database repairs made while writing these notes
-
-Three pre-existing defects made large parts of the menu code decompile into nonsense. All are
-fixed in the database now, but they are recorded here because they will re-bite anyone who
-re-imports the binary:
-
-1. **A spurious `LevelList` struct was applied at `0x007b74ec`**, overlapping two unrelated
-   globals. The real `LevelList` is at `0x007b74dc` and is a 0x10-byte intrusive list header
-   (`{sentinel, count, cache, cacheValid}`), not the 8-byte `{level, levelCount}` it was typed
-   as. The bogus instance swallowed `MouseYNormalized` (`0x007b74ec`) and the first entry of
-   `KeyBindingCategories` (`0x007b74f0`), which made *every* menu decompilation reference
-   `LevelList_007b74ec.level` where it meant the mouse position or a key-binding list.
-   Two separate analysis passes drew opposite, both-partly-wrong conclusions from this; the
-   cross-reference set settles it — `0x007b74f0` is touched only by `RegisterKeyBinding`,
-   `ReadGLKeys`, `WriteGLKeys`, `MenuHandleTextOrKeyBind`, `MenuClearKeyBinding` and
-   `RebuildKeyBindingMenus`, all with `MOV reg, 0x7b74f0` / indexed access, and never by the
-   two mouse-position writers.
-2. **`OnMenuItemClicked`'s jump table at `0x004edda9` was unrecovered** ("Too many branches"),
-   leaving ~1570 bytes of the menu-13 handlers as undefined data and a `halt_baddata()` in the
-   output. Fixed by adding computed-jump references from the jump site to the five targets and
-   typing the table at `0x004ef464`.
-3. **The whole in-game menu dispatcher region `0x00563c70`-`0x00564a90` was undefined bytes.**
-   `InGameMenu__OnItemActivated`'s two-level sparse switch had to be reconstructed from the
-   bytemap and pointer tables by hand, then each jump-table target disassembled explicitly.
-
-The `MenuListItem` struct, the `MenuId` enum (which had `Unk11`, `Unk14`-`Unk20` placeholders),
-and a new `MenuItemType` enum have all been corrected/added.
 
 ## GkPlus API
 

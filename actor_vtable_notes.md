@@ -1,331 +1,454 @@
 # Gunlok Actor VTable - Reverse Engineering Notes
 
-## Class Hierarchy (with sizes and vtable addresses)
+Slot numbers are only meaningful **within a branch of the hierarchy**. `Actor` owns slots 0-82;
+`MobileActor` adds 83-94 and `CharacterActor` 95-99 on top of those, but `PickupActor` and
+`ProjectileActor` add *their own* slots 83-85 / 83-84 that have nothing to do with MobileActor's.
+Never compare a slot index across branches.
+
+## Class Hierarchy (object size / vtable address / vtable slot count)
 
 ```
-Actor (0x120 = 288 bytes) vtbl @ 0x00667e30
- +-- MobileActor (0x230 = 560 bytes) vtbl @ 0x00667f7c
- |    +-- CharacterActor (0x308 = 776 bytes) vtbl @ 0x006680f8
- |    |    +-- CentibodyActor (0x310 = 784 bytes) vtbl @ 0x00668be0
- |    |    |    +-- CentipedeActor (0x310 = 784 bytes) vtbl @ 0x00668d70
- |    |    +-- PopupActor (0x310 = 784 bytes) vtbl @ 0x00668f00
- |    |         +-- TurretActor (0x320 = 800 bytes) vtbl @ 0x00669090
- |    +-- NodeActor (0x278 = 632 bytes) vtbl @ 0x00668a64
- |    +-- PresidentActor (0x240 = 576 bytes) vtbl @ 0x00669380
- +-- PickupActor (0x150 = 336 bytes) vtbl @ 0x006683dc
- +-- TrackObjectActor (0x1b8 = 440 bytes) vtbl @ 0x00668534
- +-- TumbleweedActor (0x120 = 288 bytes) vtbl @ 0x00668680
- +-- BackgroundCreatureActor (0x120 = 288 bytes) vtbl @ 0x006687cc
- |    +-- FlyingBackgroundCreatureActor (0x120 = 288 bytes) vtbl @ 0x00668918
- +-- BlockerActor (0x130 = 304 bytes) vtbl @ 0x00669234
- +-- UnknownActor (0x120 = 288 bytes) vtbl @ 0x00668288
+Actor (0x120) vtbl @ 0x00667e30 [83]
+ +-- MobileActor (0x230) vtbl @ 0x00667f7c [95]
+ |    +-- CharacterActor (0x308) vtbl @ 0x006680f8 [100]
+ |    |    +-- CentibodyActor (0x310) vtbl @ 0x00668be0 [100]
+ |    |    |    +-- CentipedeActor (0x310) vtbl @ 0x00668d70 [100]
+ |    |    +-- PopupActor (0x310) vtbl @ 0x00668f00 [100]
+ |    |         +-- TurretActor (0x320) vtbl @ 0x00669090 [105]
+ |    +-- NodeActor (0x278) vtbl @ 0x00668a64 [95]
+ |    +-- PresidentActor (0x240) vtbl @ 0x00669380 [96]
+ +-- PickupActor (0x150) vtbl @ 0x006683dc [86]
+ +-- TrackObjectActor (0x1b8) vtbl @ 0x00668534 [83]
+ +-- TumbleweedActor (0x120) vtbl @ 0x00668680 [83]
+ +-- BackgroundCreatureActor (0x120) vtbl @ 0x006687cc [83]
+ |    +-- FlyingBackgroundCreatureActor (0x120) vtbl @ 0x00668918 [83]
+ +-- BlockerActor (0x130) vtbl @ 0x00669234 [83]
+ +-- ProjectileActor (0x178) vtbl @ 0x00668288 [85]
 ```
 
-## Constructors
+Every size is confirmed three ways: slot 35 `GetSize` returns it, slot 0's
+`scalar_deleting_destructor` passes it to `Dealloc_`, and the Ghidra struct has that length.
 
-| Class | Constructor | Address |
+> **`ProjectileActor` is 0x178, not 0x120.** Earlier revisions of this file and of `CLAUDE.md` said
+> 0x120, which cannot be right: its own extension slots read `+0x150` and write `+0x168..0x174`.
+>
+> **`PresidentActor`'s vtable is 96 slots, not 84.** It is the last vtable in `.rdata`, so the
+> "ends at the next vtable" shortcut under-counts it; it actually runs to 0x00669500, where the
+> string pool starts. The DB's `PresidentActorVtbl` (len 384) already had this right.
+
+**`ProjectileActor` was called `UnknownActor`** until the evidence below settled what it is. The
+rename has been applied throughout: the class namespace and its 14 member functions, the
+`ProjectileActor` / `ProjectileActorVtbl` types, the vtable label at 0x00668288, the two slot
+funcdefs, and slot 38's `IsProjectile`. Older notes and any external write-ups will still say
+`UnknownActor`.
+
+## Constructors and destructors
+
+Slot 0 is `scalar_deleting_destructor`, a thunk that calls the real destructor body and then
+conditionally `Dealloc_`s. Every destructor body used to be a `FUN_`/mis-demangled symbol; they are
+now named `<Class>::Destructor`.
+
+| Class | Ctor | Dtor body | slot 0 thunk |
+|---|---|---|---|
+| Actor | 0x0052d1f0 | 0x0052d9c0 | 0x0054e2d0 |
+| MobileActor | 0x005324b0 | 0x00532b00 | 0x0054e330 |
+| CharacterActor | 0x0053c700 | 0x0053ca70 | 0x0054e510 |
+| CentibodyActor | 0x00549c40 | 0x00549c80 | 0x0054e390 |
+| CentipedeActor | 0x00549d10 | 0x00549d40 | 0x0054e3c0 |
+| PopupActor | 0x0054a8a0 | 0x0054a8e0 | 0x0054e480 |
+| TurretActor | 0x0054aed0 | 0x0054af20 | 0x0054e5a0 |
+| NodeActor | 0x00549640 | 0x00549870 | 0x0054e420 |
+| PresidentActor | 0x0054d3d0 | 0x0054d450 | 0x0054e4b0 |
+| PickupActor | 0x00545fd0 | 0x005460c0 | 0x0054e450 |
+| TrackObjectActor | 0x00547270 | 0x005473c0 | 0x0054e540 |
+| TumbleweedActor | 0x00549400 | 0x00549500 | 0x0054e570 |
+| BackgroundCreatureActor | 0x00549510 | 0x005495e0 | 0x0054e300 |
+| FlyingBackgroundCreatureActor | 0x00549600 | 0x00549630 | 0x0054e3f0 |
+| BlockerActor | 0x0054c940 | 0x0054c9f0 | 0x0054e360 |
+| ProjectileActor | 0x00542410 | 0x00542670 | 0x0054e4e0 |
+
+`PickupActor::Destructor` was named `Actor::Ctor006683dc` - a *destructor* labelled as a
+constructor. `BlockerActor::Destructor` carried a bogus demangled
+`Concurrency::call<unsigned int, std::function<...>>::~call<...>` symbol. Neither name meant
+anything; both are examples of the "existing names are not evidence" rule.
+
+## Actor Factory / Storage
+
+`CreateActor` @ 0x00510760 dispatches on `role->ai` to the right subclass. Actors live in the hash
+map `actors` @ 0x007ba0d8; `GetActorById` @ 0x0044e0b0; `num_actors` @ 0x007b9ffc.
+
+## Base `Actor` VTable (83 slots)
+
+Five slot names in this table were wrong and have been corrected in the DB. The evidence is
+recorded as a plate comment on each function.
+
+| Old name | New name | Why |
 |---|---|---|
-| Actor | Actor::Ctor | 0x0052d1f0 |
-| MobileActor | MobileActor::Ctor | 0x005324b0 |
-| CharacterActor | CharacterActor::Ctor | 0x0053c700 |
-| PickupActor | PickupActor::Ctor | 0x00545fd0 |
-| TrackObjectActor | TrackObjectActor::Ctor | 0x00547270 |
-| TumbleweedActor | TumbleweedActor::Ctor | 0x00549400 |
-| BackgroundCreatureActor | BackgroundCreatureActorCtor | 0x00549510 |
-| FlyingBackgroundCreatureActor | FlyingBackgroundCreatureActorCtor | 0x00549600 |
-| NodeActor | NodeCtor | 0x00549640 |
-| CentibodyActor | CentibodyActor::Ctor | 0x00549c40 |
-| CentipedeActor | CentipedeCtor | 0x00549d10 |
-| PopupActor | PopupActor::Ctor | 0x0054a8a0 |
-| TurretActor | TurretActor::Ctor | 0x0054aed0 |
-| BlockerActor | BlockerActor::Ctor | 0x0054c940 |
-| PresidentActor | PresidentCtor | 0x0054d3d0 |
-| UnknownActor | UnknownActor::Ctor | 0x00542410 |
+| `IsSpecialType_0` (7) | `IsAttacking` | CharacterActor's override is `MOV AL,[ECX+0x2d4]` = `is_attacking` |
+| `IsSpecialType_1` (8) | `IsMine` | MobileActor's override is `MOV AL,[ECX+0x186]` = `is_mine` |
+| `OnUpdate` (9) | `SetIsMine` | base is `RET 0x4` - it *takes* an argument; MobileActor's stores the byte into `+0x186`. It is the setter paired with slot 8, not a tick callback |
+| `GetSecondaryWeapon` (15) | `GetAttackTarget` | CharacterActor's override returns `+0x2d8` = `attack_target`, not a weapon |
+| `OnPostUpdate` (54) | `SetField0x188` | base is `RET 0x4`; MobileActor's stores the byte into `+0x188`, pairing with slot 30's getter |
+| `GetMovementState` (16) | `GetInventory` | returns MobileActor `+0x194`, which the ctor null-inits, `SetTeamId` `malloc(0x44)`s into, `EquipObject`/`ReceiveObject` read and the destructor frees - a container pointer, not a state enum |
+| `HasInventory` (32) | `HasPendingOrders` | tests MobileActor `+0x1f4`, the **order-queue** count, not inventory |
 
-## Destructor
+### Slots 0-35
 
-- Actor::~Actor (body) @ 0x0052d9c0
-- Slot 0 is the scalar_deleting_destructor wrapper
+| Slot | Addr | Name | Base behaviour |
+|---|---|---|---|
+| 0 | 0x0054e2d0 | `scalar_deleting_destructor` | destroy, optionally free 0x120 |
+| 1 | 0x005301a0 | `OnCreate` | no-op |
+| 2 | 0x0052dbc0 | `SetHealth` | set health, broadcast 0x55 |
+| 3 | 0x0054eab0 | `GetHealth` | out-param from `+0xf8` |
+| 4 | 0x0054ed10 | `GetCenterCoords` | position with Y raised by half height |
+| 5 | 0x0054ec10 | `GetStrengthRatio` | current / max strength |
+| 6 | 0x0054f100 | `IsAlive` | `!is_dead` (`+0x115`) |
+| 7 | 0x0054f130 | `IsAttacking` | false |
+| 8 | 0x0054f170 | `IsMine` | false |
+| 9 | 0x0054e890 | `SetIsMine(bool)` | `RET 4`, discards |
+| 10 | 0x0054ea30 | `GetCharacterData` | `entity->character` |
+| 11 | 0x0054ef80 | `GetWeapon` | NULL |
+| 12 | 0x0054eb30 | `GetField0x118` | `+0x118` |
+| 13 | 0x0054f0c0 | `IsEnabled` | true |
+| 14 | 0x0054f1e0 | `IsMoving` | false |
+| 15 | 0x0054ef30 | `GetAttackTarget` | NULL |
+| 16 | 0x0054eb10 | `GetInventory` | NULL |
+| 17 | 0x0054e650 | `HasCustomisationHierarchy` | false |
+| 18 | 0x0054e8c0 | `GetArmorValue` | `+0xf0` |
+| 19 | 0x0054ebd0 | `GetShieldValue` | global 0.0 |
+| 20 | 0x0054f280 | `ApplyArmorDamage` | no-op |
+| 21 | 0x0054f290 | `ApplyShieldDamage` | no-op |
+| 22 | 0x0054eb60 | `GetAmmoCount` | 100 |
+| 23 | 0x0054ebb0 | `GetField0x304` | 0 |
+| 24 | 0x0054eb70 | `GetAIController` | NULL |
+| 25 | 0x0054ead0 | `GetField0x18c` | 0 - MobileActor's returns a **team-slot index** |
+| 26 | 0x0054f3f0 | `SetField0x18c` | no-op (ignores its arg) |
+| 27 | 0x0054f370 | `Stub27` | no-op, never overridden anywhere |
+| 28 | 0x0054f360 | `SetArmorValue` | `+0xf0` |
+| 29 | 0x0054f440 | `SetShieldValue` | no-op |
+| 30 | 0x0054f510 | `GetField0x188` | false |
+| 31 | 0x0054eaf0 | `GetHotspot` | NULL |
+| 32 | 0x0054f0e0 | `HasPendingOrders` | false |
+| 33 | 0x0054e680 | `SetTeamId` | `this->team_id = arg` |
+| 34 | 0x0054ef10 | `GetInventoryListPtr` | NULL - MobileActor returns `&this[0x19c]` |
+| 35 | 0x0054e930 | `GetSize` | 0x120 |
 
-## Actor Factory
+### Slots 36-50 - type checks (no RTTI in this binary)
 
-`CreateActor_` @ 0x00510760 - dispatches based on `role->ai` enum to construct the right subclass.
+All return false in `Actor`. **All fifteen are now accounted for** - the previous "three unknown
+type-check slots" note was stale.
 
-## Actor Storage
+| Slot | Addr | Name | Overridden by |
+|---|---|---|---|
+| 36 | 0x0054e6c0 | `IsMobile` | MobileActor |
+| 37 | 0x0054e800 | `IsCharacter` | CharacterActor |
+| 38 | 0x0054e7e0 | `IsProjectile` | **ProjectileActor** |
+| 39 | 0x0054e820 | `IsTrackObject` | **TrackObjectActor** |
+| 40 | 0x0054e760 | `IsNode` | NodeActor |
+| 41 | 0x0054e720 | `IsCentipede` | CentipedeActor |
+| 42 | 0x0054e700 | `IsCentibody` | CentibodyActor |
+| 43 | 0x0054e6a0 | `IsBackgroundCreature` | BackgroundCreatureActor |
+| 44 | 0x0054e740 | `IsFlyingBackgroundCreature` | FlyingBackgroundCreatureActor |
+| 45 | 0x0054e780 | `IsPickup` | PickupActor |
+| 46 | 0x0054e840 | `IsTumbleweed` | TumbleweedActor |
+| 47 | 0x0054e7a0 | `IsPopup` | PopupActor |
+| 48 | 0x0054e6e0 | `IsBlocker` | **BlockerActor** |
+| 49 | 0x0054e7c0 | `IsPresident` | PresidentActor |
+| 50 | 0x0054e860 | `IsTurret` | TurretActor |
 
-Actors are stored in a hash map at `actors` @ 0x007ba0d8 (type `Actors`), keyed by actor ID.
-- `GetActorById` @ 0x0044e0b0 - looks up actor by ID via hash bucket.
-- `num_actors` @ 0x007b9ffc - running count incremented in CreateActor.
+Only the class that *introduces* the override appears here; its descendants inherit it. That is why
+`TurretActor` is not listed against 47 even though `IsPopup()` is true for a turret.
 
-## VTable Layout (83 entries)
+### Slots 51-82
 
-### Group 1: Core Lifecycle (Slots 0-9)
+| Slot | Addr | Name | Base behaviour |
+|---|---|---|---|
+| 51 | 0x0052dcc0 | `InitPositionAndTiming` | timing fields + spatial lookup, caches the nav poly into `+0x118` |
+| 52 | 0x0052de60 | `ReleaseAttachment` | ref-counted release of `+0x40` |
+| 53 | 0x0052ded0 | `SetPositionAndOrientation` | coords + quaternion + timing |
+| 54 | 0x0054f4f0 | `SetField0x188(bool)` | `RET 4`, discards |
+| 55 | 0x0054f270 | `OnPrePhysics` | no-op |
+| 56 | 0x0054efa0 | `OnCollisionResponse` | no-op |
+| 57 | 0x0052e0a0 | `Raycast` | ray/shape intersection |
+| 58 | 0x0052df50 | `SweepTest` | swept intersection |
+| 59 | 0x0054f4e0 | `OnDamageReceived` | no-op - see PickupActor, where the slot is really `SetPickupType` |
+| 60 | 0x0054f1a0 | `IsTargetable` | false |
+| 61 | 0x0054f250 | `IsVisible` | `+0x10d` |
+| 62 | 0x0054f200 | `IsInteractable` | false |
+| 63 | 0x0054f150 | `CanBePickedUp` | false |
+| 64 | 0x0052e220 | `Frag` | scoring, splash, debris |
+| 65 | 0x0052f0d0 | `Delete` | sets `is_dead`, cleanup, broadcast 0x49 |
+| 66 | 0x0054e640 | `Associate` | no-op |
+| 67 | 0x0054e880 | `Dissociate` | no-op |
+| 68 | 0x0052f3b0 | `ApplyDamage` | damage/heal, fragging at 0 |
+| 69 | 0x0054f2a0 | `OnHealthChanged` | no-op |
+| 70 | 0x0052f8a0 | `SyncPositionAndBroadcast` | model position + broadcast 0x6f |
+| 71 | 0x005300e0 | `PlayAnimation` | |
+| 72 | 0x00530120 | `BlendAnimation` | |
+| 73 | 0x00530150 | `PlayAnimationEx` | arg 7 is the address of a completion flag |
+| 74 | 0x00530180 | `SetAnimationState` | operates on `anim_object` (`+0xe0`) |
+| 75 | 0x0054f230 | `HasCustomAnimation` | false |
+| 76 | 0x0054f4d0 | `OnAnimationComplete` | no-op |
+| 77 | 0x0054f350 | `OnAnimationEvent` | no-op |
+| 78 | 0x00530270 | `SetTarget` | broadcast 0x56 |
+| 79 | 0x00530390 | `ClearTarget` | broadcast 0x57 |
+| 80 | 0x00530470 | `ChangeOwnerAndTeam` | broadcasts 0x58 + 0x50 |
+| 81 | 0x00530650 | `ReleaseFromOwner` | broadcasts 0x59 + 0x50 |
+| 82 | 0x005308d0 | `ActivateInWorld` | re-register in spatial/team structures, set flag 0x200 |
 
-| Slot | Offset | Base Addr | Suggested Name | Base Behavior |
-|------|--------|-----------|----------------|---------------|
-| 0 | 0x00 | 0x0054e2d0 | `scalar_deleting_destructor` | Destroys actor, optionally frees 0x120 bytes |
-| 1 | 0x04 | 0x005301a0 | `OnCreate` | No-op stub; post-construction callback |
-| 2 | 0x08 | 0x0052dbc0 | `SetHealth` | Sets health float + broadcasts event 0x55 |
-| 3 | 0x0C | 0x0054eab0 | `GetHealth` | Writes health float to out-param |
-| 4 | 0x10 | 0x0054ed10 | `GetCenterCoords` | Returns position with Y offset by half height |
-| 5 | 0x14 | 0x0054ec10 | `GetStrengthRatio` | Returns current_strength / max_strength |
-| 6 | 0x18 | 0x0054f100 | `IsAlive` | Returns true if byte at 0x115 is zero |
-| 7 | 0x1C | 0x0054f130 | `IsSpecialType_0` | Returns false; subclass override |
-| 8 | 0x20 | 0x0054f170 | `IsSpecialType_1` | Returns false; subclass override |
-| 9 | 0x24 | 0x0054e890 | `OnUpdate` | No-op stub; per-tick update callback |
+> Slot 70's name fits the *base* implementation only. In `MobileActor` it is the whole per-tick
+> update (0x236a bytes: mode dispatch, enemy acquisition, movement integration, nav stepping,
+> order dispatch, deployable state machine); in `CharacterActor` it is the attack/weapon tick; in
+> `TurretActor` the firing solution; in `TrackObjectActor` the spline motion; in `ProjectileActor` the
+> projectile dead-reckoning, which broadcasts nothing at all. Read it as **`Update`**, not "sync".
+>
+> Slot 82 has the same problem in reverse: `MobileActor`'s override disposes of the inventory on
+> death and `BlockerActor`'s *un*-blocks nav polygons. Both then chain to the base, which does
+> activate. Treat the name as describing the base only.
 
-### Group 2: Character Data & Combat Stats (Slots 10-23)
+## Override matrix
 
-| Slot | Offset | Base Addr | Suggested Name | Base Behavior |
-|------|--------|-----------|----------------|---------------|
-| 10 | 0x28 | 0x0054ea30 | `GetCharacterData` | Returns entity->character (MobileActor overrides) |
-| 11 | 0x2C | 0x0054ef80 | `GetWeaponData` | Returns 0; CharacterActor returns weapon |
-| 12 | 0x30 | 0x0054eb30 | `GetField0x118` | Returns field at 0x118 |
-| 13 | 0x34 | 0x0054f0c0 | `IsEnabled` | Returns true (1); default active state |
-| 14 | 0x38 | 0x0054f1e0 | `IsMoving` | Returns false; MobileActor checks field 0x184 |
-| 15 | 0x3C | 0x0054ef30 | `GetSecondaryWeaponData` | Returns 0; CharacterActor returns field 0x2d8 |
-| 16 | 0x40 | 0x0054eb10 | `GetMovementState` | Returns 0; MobileActor returns field 0x194 |
-| 17 | 0x44 | 0x0054e650 | `HasCustomisationHierarchy` | Returns false; MobileActor checks character data |
-| 18 | 0x48 | 0x0054e8c0 | `GetArmorValue` | Returns armor_value float (confirmed by console cmd) |
-| 19 | 0x4C | 0x0054ebd0 | `GetShieldValue` | Returns global default 0.0; CharacterActor: field 0x2d0 |
-| 20 | 0x50 | 0x0054f280 | `ApplyArmorDamage` | No-op; CharacterActor iterates armor pieces (type 9) |
-| 21 | 0x54 | 0x0054f290 | `ApplyShieldDamage` | No-op; CharacterActor iterates shield pieces (type 3) |
-| 22 | 0x58 | 0x0054eb60 | `GetAmmoCount` | Returns 100; CharacterActor returns weapon ammo |
-| 23 | 0x5C | 0x0054ebb0 | `GetField0x304` | Returns 0; CharacterActor returns field 0x304 |
+Which slots each subclass replaces, relative to its immediate parent. Slots not listed are
+inherited unchanged. Every leaf overrides slot 0 (`scalar_deleting_destructor`) and slot 35
+(`GetSize`); those are omitted below since they are universal and mechanical.
 
-### Group 3: AI & Movement (Slots 24-30)
+| Class | Parent | Overrides (beyond 0/35) | New slots |
+|---|---|---|---|
+| MobileActor | Actor | 4,5,6,8,9,10,12,14,16,17,24,25,26,30,32,33,34,36,51,52,53,54,56,60,61,62,63,67,68,69,70,82 | 83-94 |
+| CharacterActor | MobileActor | 7,11,15,19,20,21,22,23,29,31,33,37,51,52,65,70,85,86,87,94 | 95-99 |
+| CentibodyActor | CharacterActor | 42,51,70,89 | - |
+| CentipedeActor | CentibodyActor | 41,51,70 | - |
+| PopupActor | CharacterActor | 47,51,70 | - |
+| TurretActor | PopupActor | 50,70,80,81,96,97,98 | 100-104 |
+| NodeActor | MobileActor | 40,51,90 | - |
+| PresidentActor | MobileActor | 33,49,51,70 | 95 |
+| ProjectileActor | Actor | 38,51,52,55,57,58,70,82 | 83-84 |
+| PickupActor | Actor | 13,18,45,51,57,58,59,66,70,75 | 83-85 |
+| TrackObjectActor | Actor | 39,51,52,64,70,76,77 | - |
+| TumbleweedActor | Actor | 46 | - |
+| BackgroundCreatureActor | Actor | 43,82 | - |
+| FlyingBackgroundCreatureActor | BackgroundCreatureActor | 44 | - |
+| BlockerActor | Actor | 48,51,82 | - |
 
-| Slot | Offset | Base Addr | Suggested Name | Base Behavior |
-|------|--------|-----------|----------------|---------------|
-| 24 | 0x60 | 0x0054eb70 | `GetAIController` | Returns 0; MobileActor returns field 0x200 |
-| 25 | 0x64 | 0x0054ead0 | `GetField0x18c` | Returns 0; MobileActor returns field 0x18c |
-| 26 | 0x68 | 0x0054f3f0 | `SetField0x18c` | No-op; MobileActor sets field 0x18c |
-| 27 | 0x6C | 0x0054f370 | `stub_slot27` | No-op; never overridden |
-| 28 | 0x70 | 0x0054f360 | `SetArmorValue` | Sets armor_value float (confirmed by console cmd) |
-| 29 | 0x74 | 0x0054f440 | `SetShieldValue` | No-op; CharacterActor sets field 0x2d0 |
-| 30 | 0x78 | 0x0054f510 | `GetField0x188` | Returns false; MobileActor reads byte at 0x188 |
+Nine of the sixteen classes add **no** slots at all; `TumbleweedActor` and
+`FlyingBackgroundCreatureActor` only override their type check. That is why their vtables are
+typed as plain `ActorVtbl` in the DB.
 
-### Group 4: Inventory & Misc (Slots 31-35)
+## Subclass extension slots
 
-| Slot | Offset | Base Addr | Suggested Name | Base Behavior |
-|------|--------|-----------|----------------|---------------|
-| 31 | 0x7C | 0x0054eaf0 | `GetHotspot` | Returns 0 (null) |
-| 32 | 0x80 | 0x0054f0e0 | `HasInventory` | Returns false; MobileActor checks list size |
-| 33 | 0x84 | 0x0054e680 | `SetTeamId` | Sets this->team_id |
-| 34 | 0x88 | 0x0054ef10 | `GetInventoryListPtr` | Returns 0; MobileActor returns &inventory_list |
-| 35 | 0x8C | 0x0054e930 | `GetStructSize` | Returns 0x120 (each subclass returns its own size) |
+### MobileActor, slots 83-94
 
-### Group 5: Type Checks (Slots 36-50)
+| Slot | Addr | Name | Notes |
+|---|---|---|---|
+| 83 | 0x00536090 | `UpdateMineDetectionAndBounds` | **name is doubtful** - it toggles a bool at `+0x187`, swaps the collision box between a standing and a halved box, and broadcasts `0x4c`/`0x4e` chosen by that bool. Gated on model node 0x13 existing. Reads as a deploy/crouch toggle |
+| 84 | 0x00536830 | `EquipToFirstOpenSlot` | first free `slota`..`sloth` (indices 2-9) from the `+0x19c` list |
+| 85 | 0x0054e5d0 | `QueueOrderKind10` | was `OnPreThink`; appends a tag-10 order record |
+| 86 | 0x0054e5f0 | `QueueOrderPosition` | was `OnPostThink`; appends a tag-1 record with a Vec3 |
+| 87 | 0x0054e5e0 | `QueueOrderTarget` | was `OnPreUpdate`; appends a tag-0 record |
+| 88 | 0x00539450 | `Goto` | move order, gated on `can_turn`, strength and priority |
+| 89 | 0x0053a020 | `Die` | broadcasts 0x3d (destructible) or 0x48 (not), then slots 82 and 64 |
+| 90 | 0x0053a760 | `AddWaypoint` | 0x18-byte record pushed onto the `+0x204` list |
+| 91 | 0x0053b560 | `GetNavigationTarget` | fills a 0x24-byte descriptor |
+| 92 | 0x0054eaa0 | `GetField0x198` | returns `+0x198`, a `Hierarchy*` override |
+| 93 | 0x0053baa0 | `PlayActionAnimation` | gated on a busy flag and a timestamp |
+| 94 | 0x0054e690 | `SetWeapon` | was `OnMobileDamageReceived`; CharacterActor's override frees the old 0x28-byte weapon and allocates a new one (0x21 = none), broadcasting 0x83 |
 
-All return false (0) in Actor base class, overridden to true (1) by the corresponding subclass.
+Slots 85/86/87 all `malloc(0x28)`, fill a tagged record and append it to the list header at
+`+0x1f0`. `MobileActor::FUN_00538830` drains that list and `Dealloc_(node->data, 0x28)`, which is
+what proves the payload size. The queue is serialized by `Read`/`WriteActorFixups`, so pending
+orders survive a save/load. Slot 32 tests its count.
 
-| Slot | Offset | Base Addr | Suggested Name | Overridden By |
-|------|--------|-----------|----------------|---------------|
-| 36 | 0x90 | 0x0054e6c0 | `IsMobile` | MobileActor |
-| 37 | 0x94 | 0x0054e800 | `IsCharacter` | CharacterActor |
-| 38 | 0x98 | 0x0054e7e0 | `IsUnknownType38` | (never overridden in known classes) |
-| 39 | 0x9C | 0x0054e820 | `IsUnknownType39` | (never overridden in known classes) |
-| 40 | 0xA0 | 0x0054e760 | `IsNode` | NodeActor |
-| 41 | 0xA4 | 0x0054e720 | `IsCentipede` | CentipedeActor |
-| 42 | 0xA8 | 0x0054e700 | `IsCentibody` | CentibodyActor (and CentipedeActor) |
-| 43 | 0xAC | 0x0054e6a0 | `IsBackgroundCreature` | BackgroundCreatureActor, FlyingBgCreatureActor |
-| 44 | 0xB0 | 0x0054e740 | `IsFlyingBackgroundCreature` | FlyingBackgroundCreatureActor |
-| 45 | 0xB4 | 0x0054e780 | `IsPickup` | PickupActor |
-| 46 | 0xB8 | 0x0054e840 | `IsTumbleweed` | TumbleweedActor |
-| 47 | 0xBC | 0x0054e7a0 | `IsPopupType` | PopupActor, TurretActor |
-| 48 | 0xC0 | 0x0054e6e0 | `IsUnknownType48` | (never overridden; mislabeled "IsPopup" in Ghidra) |
-| 49 | 0xC4 | 0x0054e7c0 | `IsPresident` | PresidentActor |
-| 50 | 0xC8 | 0x0054e860 | `IsTurret` | TurretActor |
+### CharacterActor, slots 95-99
 
-### Group 6: Position & Physics (Slots 51-58)
+| Slot | Addr | Name | Notes |
+|---|---|---|---|
+| 95 | 0x0054f430 | `SetField0x304` | setter for the cannot-fire gate |
+| 96 | 0x00540c60 | `AttackTarget` | broadcast id is computed: `0x41 + close_range` |
+| 97 | 0x00540a10 | `AttackPosition` | broadcast id is computed: `0x3f + close_range` |
+| 98 | 0x00540f20 | `StopAttacking` | broadcast 0x44 |
+| 99 | 0x00541b90 | `SetAmmoType` | was `ExecuteSpecialAbility`; sets the weapon's ammo type (ECX = `weapon_data`, EDX = ammo id), reselects ammo, broadcasts 0x82 |
 
-| Slot | Offset | Base Addr | Suggested Name | Base Behavior |
-|------|--------|-----------|----------------|---------------|
-| 51 | 0xCC | 0x0052dcc0 | `InitPositionAndTiming` | Sets timing fields + spatial lookup |
-| 52 | 0xD0 | 0x0052de60 | `ReleaseAttachment` | Ref-counted release of field 0x40 |
-| 53 | 0xD4 | 0x0052ded0 | `SetPositionAndOrientation` | Sets coords + quaternion + timing |
-| 54 | 0xD8 | 0x0054f4f0 | `OnPostUpdate` | No-op stub |
-| 55 | 0xDC | 0x0054f270 | `OnPrePhysics` | No-op stub |
-| 56 | 0xE0 | 0x0054efa0 | `OnCollisionResponse` | No-op stub |
-| 57 | 0xE4 | 0x0052e0a0 | `Raycast` | Ray intersection test against shape/model |
-| 58 | 0xE8 | 0x0052df50 | `SweepTest` | Extended ray/sweep test |
+### TurretActor, slots 100-104
 
-### Group 7: Damage & Health (Slots 59, 64, 68-69)
+| Slot | Addr | Name |
+|---|---|---|
+| 100 | 0x0054e8b0 | `SetTurretEnabled` (`+0x310`) |
+| 101 | 0x0054ee40 | `GetTurretAimDirection` (`+0x2bc`) |
+| 102 | 0x0054eb90 | `GetTurretTargetAngles` (`+0x318`/`+0x31c`) |
+| 103 | 0x0054f190 | `IsTurretEnabled` |
+| 104 | 0x0054f410 | `SetTurretTargetAngles` |
 
-| Slot | Offset | Base Addr | Suggested Name | Base Behavior |
-|------|--------|-----------|----------------|---------------|
-| 59 | 0xEC | 0x0054f4e0 | `OnDamageReceived` | No-op stub |
-| 64 | 0x100 | 0x0052e220 | `Frag` | Destruction: scoring, splash damage, debris spawn |
-| 68 | 0x110 | 0x0052f3b0 | `ApplyDamage` | Damage/heal logic, triggers Frag at 0 HP |
-| 69 | 0x114 | 0x0054f2a0 | `OnHealthChanged` | No-op stub |
+Curiously, `TurretActor::SyncPositionAndBroadcast` (the firing solution) touches **none** of
+`+0x310`, `+0x318` or `+0x31c`. The angles it actually integrates are `CharacterActor+0x2f0` and
+`+0x2f4`, which are typed `int` in the DB but used as floats (gun yaw/pitch in 4096-unit brads).
 
-### Group 8: State Queries (Slots 60-63, 75)
+### PresidentActor, slot 95
 
-| Slot | Offset | Base Addr | Suggested Name | Base Behavior |
-|------|--------|-----------|----------------|---------------|
-| 60 | 0xF0 | 0x0054f1a0 | `IsTargetable` | Returns false |
-| 61 | 0xF4 | 0x0054f250 | `IsVisible` | Returns field 0x10d |
-| 62 | 0xF8 | 0x0054f200 | `IsInteractable` | Returns false |
-| 63 | 0xFC | 0x0054f150 | `CanBePickedUp` | Returns false |
-| 75 | 0x12C | 0x0054f230 | `HasCustomAnimation` | Returns false |
+| Slot | Addr | Name |
+|---|---|---|
+| 95 | 0x0054f380 | `SetExitPosition(Vec3)` - writes `+0x230..0x23b`. Was `PresidentMethod` |
 
-### Group 9: Actor Deletion & Association (Slots 65-67)
+### ProjectileActor, slots 83-84
 
-| Slot | Offset | Base Addr | Suggested Name | Base Behavior |
-|------|--------|-----------|----------------|---------------|
-| 65 | 0x104 | 0x0052f0d0 | `DeleteActor` | Full deletion + cleanup + network msg 0x49 |
-| 66 | 0x108 | 0x0054e640 | `Associate` | No-op stub (DummyAssociate) |
-| 67 | 0x10C | 0x0054e880 | `Dissociate` | No-op stub |
+| Slot | Addr | Name |
+|---|---|---|
+| 83 | 0x0054eba0 | `GetProjectileFlags` - returns `+0x150`, used throughout as a **bitfield** (0x10 gore, 0x40 guided, 0x200 dissociate). The field was named `limit`, which is only the GLS keyword it is loaded from (`Role+0x54`), not its meaning |
+| 84 | 0x0054f460 | `SetTargetPosition` - writes a Vec3 by value to `+0x168`, the guidance/arrival target |
 
-### Group 10: Sync & Animation (Slots 70-77)
+### PickupActor, slots 83-85
 
-| Slot | Offset | Base Addr | Suggested Name | Base Behavior |
-|------|--------|-----------|----------------|---------------|
-| 70 | 0x118 | 0x0052f8a0 | `SyncPositionAndBroadcast` | Update model pos + network msg 0x6f |
-| 71 | 0x11C | 0x005300e0 | `PlayAnimation` | Plays animation on 3D model |
-| 72 | 0x120 | 0x00530120 | `BlendAnimation` | Animation blending |
-| 73 | 0x124 | 0x00530150 | `PlayAnimationEx` | Extended animation playback |
-| 74 | 0x128 | 0x00530180 | `SetAnimationState` | Animation state control |
-| 76 | 0x130 | 0x0054f4d0 | `OnAnimationComplete` | No-op stub |
-| 77 | 0x134 | 0x0054f350 | `OnAnimationEvent` | No-op stub |
+| Slot | Addr | Name |
+|---|---|---|
+| 83 | 0x00546240 | `SetPickupEnabled` - stores the byte at `+0x120` and, when `+0x12c == 0`, schedules `+0x144 = GetGameTimeSeconds() + MPRespawnDelay * k` with `k` selected by `+0x140` (1 -> x2, 2 -> x1, 3 -> x0.5). Broadcasts 0x85 |
+| 84 | 0x00546440 | `OnPickedUp` - broadcasts 0x74 (twice), 0x75, 0x8c, 0x4f and, when `associated_script` is set, calls `QueueScriptExecution` (see `directplay_protocol_notes.md` §8.11) |
+| 85 | 0x00546b20 | `SetField0x138` - frees and `strdup`s into `+0x138`. **Not** `associated_script`, which is `+0x134` |
 
-### Group 11: Targeting & Ownership (Slots 78-82)
+`PickupActorVtbl` used to be an untyped `void *[86]`; it is now a proper struct like the others, so
+its slots have real cross-references. An **undefined** vtable gives its slots no xrefs at all, which
+reads as "this virtual has no callers" - check that a vtable is defined before drawing that
+conclusion.
 
-| Slot | Offset | Base Addr | Suggested Name | Base Behavior |
-|------|--------|-----------|----------------|---------------|
-| 78 | 0x138 | 0x00530270 | `SetTarget` | Sets target fields + network msg 0x56 |
-| 79 | 0x13C | 0x00530390 | `ClearTarget` | Clears target + network msg 0x57 |
-| 80 | 0x140 | 0x00530470 | `ChangeOwnerAndTeam` | Reassigns owner/team + network msgs 0x58/0x50 |
-| 81 | 0x144 | 0x00530650 | `ReleaseFromOwner` | Releases from owner + neutralize + msgs 0x59/0x50 |
-| 82 | 0x148 | 0x005308d0 | `ActivateInWorld` | Re-registers in spatial/team structures |
+## Per-class findings
 
-## Network Message Types Used
+### ProjectileActor
 
-| Code | Used In | Description |
-|------|---------|-------------|
-| 0x49 | DeleteActor (slot 65) | Actor deletion |
-| 0x50 | ChangeOwnerAndTeam/ReleaseFromOwner (slots 80-81) | Team change |
-| 0x55 | SetHealth (slot 2) | Health update |
-| 0x56 | SetTarget (slot 78) | Target assignment |
-| 0x57 | ClearTarget (slot 79) | Target cleared |
-| 0x58 | ChangeOwnerAndTeam (slot 80) | Owner change |
-| 0x59 | ReleaseFromOwner (slot 81) | Owner release |
-| 0x6b | Frag (slot 64) | Destruction event |
-| 0x6f | SyncPositionAndBroadcast (slot 70) | Position sync |
-| 0xA6 | ApplyArmorDamage (slot 20) | Armor piece destroyed |
-| 0xA7 | ApplyShieldDamage (slot 21) | Shield partial damage |
-| 0xA8 | ApplyArmorDamage (slot 20) | Armor partial damage |
+Launch origin, velocity and launch time integrated against gravity, with a `Projectile` role
+sub-object supplying damage, splash and radius. Slot 51 stamps the launch time *and* precomputes the
+impact by raycasting every candidate actor; slot 55 (`OnPrePhysics`) is the actual physics step
+(integrate, collide, damage, broadcast, self-delete); slot 70 dead-reckons or steers and does **no**
+networking of its own beyond chaining to `Actor::SyncPositionAndBroadcast`.
 
-## Subclass-Specific VTable Entries
+Guided mode (`flags & 0x40`) blends the velocity direction toward the target over the first 20 ms.
+Slots 57/58 (`Raycast`/`SweepTest`) return 0, opting the projectile out of being hit itself -
+`PickupActor` does the same.
 
-### MobileActorVtbl (380 bytes = 95 slots)
+### TrackObjectActor - spline-driven moving geometry
 
-Extends ActorVtbl with 12 additional entries for movement, navigation, and equipment.
+Slot 76 (`OnAnimationComplete`) is really "install a path": it builds a Catmull-Rom coefficient
+matrix from 4 control points. Slot 77 (`OnAnimationEvent`) starts a leg of motion, gathers riders,
+closes doors and broadcasts `0xad` (forward) / `0xae` (reverse) with a trailing rider-id array. Slot
+70 evaluates the spline and drags riders, track vertices and door sections under the map write lock.
+Slot 64 (`Frag`) releases the riders and reopens the doors.
 
-| Slot | Offset | Address | Name | Description |
-|------|--------|---------|------|-------------|
-| 83 | 0x14C | 0x00536090 | `updateMineDetectionAndBounds` | Checks nearby mines/items, computes bounding box from skeleton/height, sends network msg 0x4C/0x4E |
-| 84 | 0x150 | 0x00536830 | `equipToFirstOpenSlot` | Finds first empty equipment slot (slota-sloth, types 2-9) and equips item |
-| 85 | 0x154 | 0x0054e5d0 | `onPreThink` | No-op stub for subclass override |
-| 86 | 0x158 | 0x0054e5f0 | `onPostThink` | Cleanup stub with vector destructor |
-| 87 | 0x15C | 0x0054e5e0 | `onPreUpdate` | No-op stub for subclass override |
-| 88 | 0x160 | 0x00539450 | `gotoPosition` | Navigate to Vec3f target via pathfinding; checks can_turn/CanBePickedUp/strength |
-| 89 | 0x164 | 0x0053a020 | `die` | Death handler: sends msg 0x48/0x3D, resets is_mine, calls ActivateInWorld/Frag |
-| 90 | 0x168 | 0x0053a760 | `addWaypoint` | Allocates 0x18-byte waypoint, pushes to waypoint queue |
-| 91 | 0x16C | 0x0053b560 | `getNavigationTarget` | Fills output struct with current nav target (actor, coords, pathfinding node) |
-| 92 | 0x170 | 0x0054eaa0 | `getField0x198` | Getter for field_0x198 (state enum / AI mode) |
-| 93 | 0x174 | 0x0053baa0 | `playActionAnimation` | Plays animation with condition checks (flag at 0x190+1, time threshold) |
-| 94 | 0x178 | 0x0054e690 | `onMobileDamageReceived` | No-op stub for subclass damage reaction |
+Its geometry pointer at `+0x130` comes from a list at **`Map+0x24`** - a datapoint inside `Map`'s
+otherwise unmapped 0x24..0x88 region.
 
-### CharacterActorVtbl (400 bytes = 100 slots)
+### BlockerActor - nav-mesh blockage
 
-Extends MobileActorVtbl with 5 entries for combat.
+Slot 51 flood-fills from the floor polygon under the actor to every connected polygon whose centre
+lies inside the blocker's world AABB, sets bit `0x100` ("not walkable") on each, and records them in
+the list header at `+0x120` purely so slot 82 can clear the bit again. The whole body runs under
+`TheMap->lock` taken for write.
 
-| Slot | Offset | Address | Name | Description |
-|------|--------|---------|------|-------------|
-| 95 | 0x17C | 0x0054f430 | `setField0x304` | Setter for field at 0x304 (AI target / character state) |
-| 96 | 0x180 | 0x00540c60 | `attackTarget` | Attack an actor: stores ref-counted target at 0x2D8, sets weapon range, sends msg 0x41/0x42 |
-| 97 | 0x184 | 0x00540a10 | `attackPosition` | Attack world position: stores coords at 0x2DC, sets weapon range, sends msg 0x3F/0x40 |
-| 98 | 0x188 | 0x00540f20 | `stopAttacking` | Stop attack: release target ref, reset anim priorities, sends msg 0x44 |
-| 99 | 0x18C | 0x00541b90 | `executeSpecialAbility` | Execute special ability, sends network msg 0x82 |
+`FUN_0048cf50(Map*, Vec3*)` resolves a point to a nav polygon and reaches into `Map+0x34` (a
+three-level spatial grid), `Map+0x68` (extent) and `Map+0x7c/0x80/0x84` (grid plane coordinates) -
+more of the unmapped `Map` region.
 
-### TurretActorVtbl (420 bytes = 105 slots)
+### CentibodyActor / CentipedeActor - the segmented worm
 
-Extends CharacterActorVtbl with 5 entries for turret aiming.
+`CentipedeActor`'s slot 51 spawns five `centibody` roles, each one segment behind the last, and
+links them through `+0x308` (a refcounted `Actor*`), broadcasting `0x8a` per link. Slot 70 is a
+follow-the-leader chain solver: it frags itself when the chain is empty, releases dead segments, and
+pulls live ones toward their leader. `CentibodyActor`'s own slot 70 is an empty no-op that
+deliberately suppresses the CharacterActor tick.
 
-| Slot | Offset | Address | Name | Description |
-|------|--------|---------|------|-------------|
-| 100 | 0x190 | 0x0054e8b0 | `setTurretEnabled` | Setter for enabled flag at 0x310 |
-| 101 | 0x194 | 0x0054ee40 | `getTurretAimDirection` | Getter for turret aim Vec3f at 0x2BC |
-| 102 | 0x198 | 0x0054eb90 | `getTurretTargetAngles` | Getter for yaw/pitch at 0x318/0x31C (no auto-function in Ghidra) |
-| 103 | 0x19C | 0x0054f190 | `isTurretEnabled` | Getter for enabled flag at 0x310 (no auto-function in Ghidra) |
-| 104 | 0x1A0 | 0x0054f410 | `setTurretTargetAngles` | Setter for yaw/pitch at 0x318/0x31C |
+### PopupActor / TurretActor
 
-### NodeActorVtbl (380 bytes = 95 slots)
+`+0x308` is `deployed` and `+0x309` `transition_in_progress` (the DB had a single `short`).
+`FUN_0054ac90` is `PopupActor::Deploy(bool reverse)`: it plays the popup animation with
+`&this->deployed` as the completion flag, recomputes the collision bounds from model asset 0 or
+0x13, and broadcasts `0x4a + reverse`. Retracted popups scan enemy teams against
+`character->hearing_range_squared` and deploy on the first hit.
 
-Same size as MobileActorVtbl, no extra entries beyond MobileActor's 12.
+`TurretActor::SyncPositionAndBroadcast` calls `Actor::SyncPositionAndBroadcast` **directly**,
+skipping PopupActor, CharacterActor and MobileActor - a deliberate three-level bypass.
 
-### UnknownActorVtbl (340 bytes = 85 slots)
+### PresidentActor - the escort/VIP
 
-Extends ActorVtbl with 2 entries.
+Slot 33 picks a random `exita`..`exitd` aux object out of `MapAuxObjectList` (0x00739098), copies its
+position into `+0x230`, and **unicasts** message `0xc7` (24 bytes, guaranteed) to the owning player
+via `SendToPlayer` @ 0x00504ea0 - the only unicast in the whole Actor hierarchy. Slot 70 broadcasts
+`0x9b` and deletes the actor when it gets within 5 units of the exit, and otherwise defects to
+whichever team has the nearest actor (broadcast `0x50`, rate-limited by `+0x23c`).
 
-| Slot | Offset | Address | Name | Description |
-|------|--------|---------|------|-------------|
-| 83 | 0x14C | 0x0054eba0 | `getField0x150` | Getter for int field at 0x150 |
-| 84 | 0x150 | 0x0054f460 | `setField0x168` | Stores 12-byte value (int64 + int) at offset 0x168 |
+## Network messages
 
-### PickupActorVtbl (344 bytes = 86 slots)
+Recovered by scanning every vtable slot implementation for the immediate stored just before a
+`BroadcastToPlayers` (0x00504bf0) call. Single-candidate sites are reliable - the scan independently
+reproduced every id this file previously documented. Sites where the id is *computed* rather than
+stored as a literal are marked; a few resisted the scan entirely and are listed as "computed".
 
-Extends ActorVtbl with 3 entries. Bounded below by `PickupActorVtbl` @ `0x006683dc` and above by
-`TrackObjectActorVtbl` @ `0x00668534`.
+`BroadcastToPlayers(void *msg, int size, byte guaranteed, Vec3f cullOrigin)`; the first dword of
+every message is the id and the second is almost always `Actor::id`.
 
-| Slot | Offset | Address | Name | Description |
-|------|--------|---------|------|-------------|
-| 83 | 0x14C | 0x00546240 | `SetPickupEnabled` | Stores the byte arg at +0x120; if +0x12c == 0, schedules a respawn deadline into +0x144 as `GetGameTimeSeconds()` + `MPRespawnDelay` scaled by the mode at +0x140 (1 -> x2, 2 -> x1, 3 -> x `FLOAT_006520a0`). Broadcasts update `0x85` (8 B, reliable) |
-| 84 | 0x150 | 0x00546440 | `OnPickedUp` | Item collected by a `MobileActor`. Broadcasts up to 6 updates (`0x75`, `0x8c`, `0x4f` + 3 unresolved) and, when the item has an `associated_script` (+0x134), calls `QueueScriptExecution` on it — one of the seven paths that make every client run a `.gcs` (see `directplay_protocol_notes.md` §8.11) |
-| 85 | 0x154 | 0x00546b20 | `SetField0x138` | Frees the existing `char*` at +0x138 and stores a `strdup` of the argument. **Not** `associated_script`, which is +0x134 — a separate string field, purpose not yet established |
+| Id | Sent by | Meaning |
+|---|---|---|
+| 0x37 / 0x38 | ProjectileActor slot 55, Actor::Frag | projectile damage stat sync (0x38 when `flags & 0x10`) |
+| 0x3b / 0x3d | MobileActor slot 70 | position sync; computed as `(arrived^1)*2 + 0x3b`, so 0x3b stopped / 0x3d moving |
+| 0x3d / 0x48 | MobileActor slot 89 `Die` | death snapshot; 0x3d when the role is destructible, 0x48 when not |
+| 0x3f / 0x40 | CharacterActor slot 97 | attack position; computed `0x3f + close_range` |
+| 0x41 / 0x42 | CharacterActor slot 96 | attack target; computed `0x41 + close_range` |
+| 0x43, 0x45, 0x46, 0x51, 0x62, 0x71 | CharacterActor slot 70 | attack/weapon tick |
+| 0x44 | CharacterActor slot 98 | stop attacking |
+| 0x46 | TurretActor slot 70 | turret fire (64 bytes, unreliable) |
+| 0x47 | ProjectileActor slot 55 | projectile impact |
+| 0x49 | Actor slot 65 | actor deleted |
+| 0x4a / 0x4b | `PopupActor::Deploy` | computed `0x4a + reverse` |
+| 0x4c / 0x4e | MobileActor slot 83 | bounds / detection toggle |
+| 0x4f | MobileActor slot 70, PickupActor slot 84 | replicate animation |
+| 0x50 | Actor slots 80/81, PresidentActor slot 70 | team change |
+| 0x53, 0x54, 0x7e, 0x7f, 0x80, 0x8e | MobileActor slot 70 | mine laying, deployable counts, inventory removal |
+| 0x55 | Actor slot 2 | health update |
+| 0x56 / 0x57 | Actor slots 78/79 | target set / cleared |
+| 0x58 / 0x59 | Actor slots 80/81 | owner change / release |
+| 0x6b, 0xba | Actor slot 64 `Frag` | destruction events (0xba was previously undocumented) |
+| 0x6f | Actor slot 70 | position sync (40 bytes, unreliable) |
+| 0x74, 0x75, 0x8c | PickupActor slot 84 | item collected |
+| 0x82 | CharacterActor slot 99 | ammo type changed |
+| 0x83 | CharacterActor slot 94 | weapon changed |
+| 0x84 | PickupActor slot 66 | script associated |
+| 0x85 | PickupActor slot 83 | pickup enabled / respawn scheduled |
+| 0x8a | CentipedeActor slot 51 | body segment linked |
+| 0x8b | MobileActor slot 68 | gib; payload picks a random sever point |
+| 0x96 | PickupActor slot 70 | pickup expired |
+| 0x97 | MobileActor slot 67 | actor dissociated |
+| 0x9b | MobileActor slot 68, PresidentActor slot 70 | deathmatch frag score / president extracted |
+| 0xa6 | CharacterActor slots 20/21 | armor or shield piece destroyed |
+| 0xa7 / 0xa8 | CharacterActor slots 21/20 | shield / armor partial damage |
+| 0xad / 0xae | TrackObjectActor slot 77 | track leg start; computed `0xad + reverse` |
+| 0xc7 | PresidentActor slot 33 | **unicast**, not broadcast - exit position |
 
-> This vtable was **undefined data** in the Ghidra DB, so none of its slots had cross-references
-> and `OnPickedUp` appeared to have zero callers of any kind — which is exactly why its
-> host-vs-client thread affinity could not be settled statically. It is now defined as
-> `pointer[86]`. Worth checking for the other subclass vtables before concluding "no callers".
-
-**Still undocumented** in this file: the vtable extensions for `CentibodyActor`, `CentipedeActor`,
-`PopupActor`, `TrackObjectActor`, `TumbleweedActor`, `BackgroundCreatureActor`,
-`FlyingBackgroundCreatureActor`, `BlockerActor` and `PresidentActor`.
-
-### Subclass-Specific Network Messages
-
-| Code | Used In | Description |
-|------|---------|-------------|
-| 0x3D | die (slot 89) | Death notification (non-destructible) |
-| 0x3F | attackPosition (slot 97) | Attack position (ranged) |
-| 0x40 | attackPosition (slot 97) | Attack position (melee) |
-| 0x41 | attackTarget (slot 96) | Attack target (ranged) |
-| 0x42 | attackTarget (slot 96) | Attack target (melee) |
-| 0x44 | stopAttacking (slot 98) | Stop attack |
-| 0x48 | die (slot 89) | Death notification (destructible) |
-| 0x4C | updateMineDetectionAndBounds (slot 83) | Bounds update |
-| 0x4E | updateMineDetectionAndBounds (slot 83) | Mine detection update |
-| 0x82 | executeSpecialAbility (slot 99) | Special ability activation |
+`MobileActor::ApplyDamage`'s 0x9b is only sent in Deathmatch, when the killer is on another team,
+and when the victim's role name is one of `hark`, `gunlok`, `maskelyn`, `frend`, `elint`.
 
 ## Key Observations
 
-1. **No RTTI** - The binary has RTTI disabled. Instead, slots 36-50 implement
-   manual type-checking via `IsXxx()` virtual methods (pre-RTTI C++ pattern).
+1. **No RTTI.** Slots 36-50 are the manual type-check mechanism. All fifteen are now mapped to a
+   concrete class.
+2. **Slot 35 `GetSize`** returns each class's `sizeof`, which is how the engine does polymorphic
+   allocation without RTTI - and how the sizes above were confirmed.
+3. **Getter/setter pairs:** armor 18/28, shield 19/29, `+0x18c` 25/26, `is_mine` 8/9, `+0x188`
+   30/54, `+0x304` 23/95. Two of those pairs were only discovered by noticing that the "callback"
+   slots 9 and 54 are `RET 0x4`.
+4. **Damage pipeline:** slot 68 -> slots 20/21 (armor/shield absorption) -> slot 69 -> at zero
+   strength, slot 89 `Die` -> slot 82 -> slot 64 `Frag` -> slot 65 `Delete`.
+5. **Deliberate base-class bypasses.** Several overrides skip intermediate classes and call
+   `Actor::`'s implementation directly - `TurretActor` slot 70 (skips three levels),
+   `CentipedeActor` slot 70 (calls `CharacterActor::`, skipping `CentibodyActor::`), `PopupActor`
+   slot 70 on the retracted path. Do not assume an override chains to its immediate parent.
+6. **Slot names describe the base implementation.** Slots 9, 15, 16, 32, 54, 59, 70, 76, 77 and 82
+   all mean something materially different in at least one subclass. The five worst were renamed;
+   the rest are flagged above.
 
-2. **Slot 35 (`GetStructSize`)** returns the class's sizeof for each subclass.
-   This enables polymorphic allocation/serialization without RTTI.
+## Method-ownership convention
 
-3. **Getter/Setter Pairs**: armor (18/28), shield (19/29), field 0x18c (25/26).
+A slot implementation belongs to the **shallowest** class in the hierarchy whose vtable contains
+that address. Ghidra's symbols originally violated this for 55 of the 249 distinct functions -
+every one of them attributed to a *descendant* that merely inherits the slot (`MobileActor::IsMobile`
+filed under `PresidentActor`, `CharacterActor::GetWeapon` under `TurretActor`, and so on). All 55
+have been reparented, which as a side effect also fixed their `this` parameter type, since Ghidra
+derives that from the parent class namespace.
 
-4. **Damage Pipeline**: ApplyDamage (68) -> ApplyArmorDamage (20) + ApplyShieldDamage (21)
-   -> OnHealthChanged (69) -> if health <= 0: Frag (64) -> DeleteActor (65).
-
-5. **Three unknown type check slots**: 38, 39, and 48 are never overridden in
-   any of the 16 known subclasses. May correspond to cut content or types only
-   present in specific builds.
-
-6. **Ghidra mislabeling**: Slot 47 was labeled "IsPickup" but is actually
-   overridden by PopupActor/TurretActor. The real IsPickup is slot 45.
-   Slot 48 labeled "IsPopup" is never overridden by PopupActor.
+When re-deriving this, note that the decompiler's C output prints a class prefix that does **not**
+always agree with `FunctionManager.getParentNamespace()`. Query the namespace; do not read the
+header line.

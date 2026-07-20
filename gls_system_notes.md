@@ -92,7 +92,7 @@ current frame rate; the ` * 60.0` variant handles minutes).
 | 0x0047bc90 | `CopyFields` (shared vtbl slot 4) | inheritance |
 | 0x0047bd60 | `CheckValue` (shared vtbl slot 5) | field assignment + validation |
 | 0x0047c010 | `InitPlacedActorEntry` | placed-actor list entries (level scripts) |
-| 0x004ae570 | `GetShape(char* name, char* file)` | Loads shape from a .rif |
+| 0x004ae570 | `GetShape(char* file, char* name)` | Loads shape from a .rif. Note the order: ECX = file, EDX = name (`ToShape` passes field 0x01 then field 0x00). Same for `GetHierarchy` @ 0x004ae390. |
 | 0x004add90 | `CreateRole()` | Allocates Role, assigns id, inserts in roles hash |
 | 0x00579000 | `GetResourceString(&LocalizedStrings, id)` | resolves localized text ids |
 
@@ -589,7 +589,7 @@ directory. Loaded at startup from `gldirs.gls` via `LoadGLDirs` @ 0x466b30.
 | `ToCharacter` | 0x47db80 | `Character` (0xb8), heap |
 | `ToProjectile` | 0x47e4e0 | `Projectile` (0x20), heap |
 | `ToLight` | 0x47e220 | `Light` (0x1c), heap |
-| `ToShape` | 0x47c260 | `GetShape(name, file)` - loads from .rif |
+| `ToShape` | 0x47c260 | `GetShape(file, name)` - loads from .rif (ECX = file/field 0x01, EDX = name/field 0x00) |
 | `ToHierarchy` | 0x47c390 | hierarchy object from .rif |
 | `ToParticleGenerator` | 0x47c750 | `ParticleGenerator` (0xd4) |
 | `ToDestructibility` | 0x47e680 | `{vtbl, int type}` (8 bytes) |
@@ -598,7 +598,7 @@ directory. Loaded at startup from `gldirs.gls` via `LoadGLDirs` @ 0x466b30.
 | `ToAmmo` | 0x47d740 | fills `AmmoInfos` ammo slot `[weapon_type*19 + ammo_type]` (table of `Ammo*` at AmmoInfos+0x180) |
 | `ToAmmoInfo` | 0x47d8f0 | fills `AmmoInfos[ammo_type]` (0x14-byte `AmmoInfo` records at +0) |
 | `ToCameraTrack` | 0x47d9f0 | camera track object (0xa0) + pgen/pgen2 |
-| `ToMap` | 0x47f160 | loads the level geometry itself (huge) |
+| `ToMap` | 0x47f160 | loads the level geometry itself (huge) - see `level_loading_notes.md` |
 | `ParseGLDirs` | 0x466c20 | sets game resource directories |
 
 Unit conversions applied during ToCharacter:
@@ -642,11 +642,26 @@ ConvertParsedObjects(list);             // ToXxx per object; loading bar advance
 FreeParsedObjectList(list);
 ```
 
-Placed actors (`rolename at x,y,z` entries produced by grammar rule 99 via
-`InitPlacedActorEntry`), team clauses ("team numbers cannot be negative", "no team
-specified - assuming team 0") and console-variable assignments are part of the same
-grammar and travel through the same list; they are consumed during conversion when
-the map spawns entities.
+Full details in **`level_loading_notes.md`**, including everything `ToMap` does.
+
+Placed actors are **not** `rolename at x,y,z`. The `map` section carries clauses of the
+form
+
+```
+[extreme] use <RoleRef> in team <N> for "RIF OBJECT" [as "TOKEN"] and "RIF OBJECT2" ...
+```
+
+where the quoted names are objects **inside the level `.rif`** - the rif supplies the
+position and orientation, the script only binds a role and team to them. These are
+stored in a 64-bucket hash embedded in `ParsedMap` at `+0x1b60` (so `ParsedMap` is
+`0x1b78` bytes, not `0x1b60`), filled by the ParsedMap `checkValue` override
+`CheckValue_Map` @ 0x0047efa0 under pseudo-field id **9**, and drained by the tail of
+`ToMap`. Team clauses ("team numbers cannot be negative", "no team specified - assuming
+team 0") set the `team` field of each binding, which indexes `TeamSlots` @ 0x007b3ec4.
+
+`InitPlacedActorEntry` @ 0x0047c010 is a *different* thing: a generic tagged list node
+(`{vtbl, 9, ptr, ParsedThingBase* thing, ptr}`) built by the grammar. Its vtable slot 7
+is `ToGameObject_nop`, so `ConvertParsedObjects` skips it.
 
 ## Notes for GkPlus
 

@@ -1,0 +1,213 @@
+# Gunlok Role Sub-Objects - Reverse Engineering Notes
+
+The four heap objects a `Role` points at: **Character** (combat/AI stats), **Projectile**
+(weapon effect), **ParticleGenerator** (emitter) and **Destructibility** (death
+behaviour, a small 3-variant polymorphic family). Each is produced from the parsed GLS
+by a `toGameObject`-style converter and owned by the parent `Role`.
+
+Companion: `role_system_notes.md` (the `Role` itself), `gls_system_notes.md` (the parser
+and per-field GLS rules), `src/Roles.cpp` (the C++ mirrors).
+
+| Sub-object | Role field | Size | Converter | Dtor |
+|------------|-----------|------|-----------|------|
+| Character | 0x60 | 0xb8 | `ToCharacter` @ 0x0047db80 | `CharacterDtor` @ 0x004adce0 |
+| Projectile | 0x5c | 0x20 | `ToProjectile` @ 0x0047e4e0 | `ProjectileDtor` @ 0x004adcc0 |
+| ParticleGenerator | 0x20/0x24 | 0xd4 | `ToParticleGenerator` @ 0x0047c750 | `ParticleGenDtor` @ 0x004af190 |
+| Light | 0x58 | 0x1c | `ToLight` @ 0x0047e220 | (freed inline) |
+| Destructibility | 0xa8 | 0x8 / 0x24 / 0x10 | see §4 | see §4 |
+
+All converters share the pattern: `if (!isValidDeep(parsed)) return NULL;` then `malloc`
++ field copy. **They do not null-check their own result**, and `ToRole` writes through a
+NULL returned by `ToCharacter` - fill every required GLS field (see `role_system_notes.md`
+§8). Values are read from `parsed + 0x238 + id*8` (the 8-byte union).
+
+## 1. Character (0xb8)
+
+The AI/combat stat block. Every field maps 1:1 to a GLS `character` field; the converter
+applies the unit conversions below. The full GLS field table (ids, ranges, defaults) is in
+`gls_system_notes.md`; here is the live layout with the transforms `ToCharacter` applies.
+
+| Off | Field | GLS id | Transform |
+|-----|-------|--------|-----------|
+| 0x00 | walking_speed | 0x0c | `*65536` (16.16); if turning>0 & size>0, re-scaled `(v/size)*65536` |
+| 0x04 | turning_speed | 0x0d | `*4096` (revolutions/sec -> units) |
+| 0x08 | aim | 0x34 | deg -> 4096-step units (`*4096/360`) |
+| 0x0c | angular_scan_rate | 0x10 | `/360*4096` |
+| 0x10 | scan_delay | 0x0e | - |
+| 0x14 | scan_acceptance_angle | 0x0f | `/360*4096` |
+| 0x18 | mine_laying_time | 0x11 | - |
+| 0x1c | latch_trigger | 0x7d | bool |
+| 0x1d | alertable | 0x7c | bool |
+| 0x1e-0x1f | *(padding)* | - | - |
+| 0x20 | generation_limit | 0x7b | - |
+| 0x24 | sight_angle | 0x35 | deg -> units |
+| 0x28 | sight_range | 0x38 | - |
+| 0x2c | sight_range_squared | - | `sight_range^2`, cached |
+| 0x30 | hearing_range | 0x39 | - |
+| 0x34 | hearing_range_squared | - | `hearing_range^2`, cached |
+| 0x38 | alert_radius | 0x3a | - |
+| 0x3c | aggression | 0x3b | - (**overloaded**: `round(aggression*10)` is the pickup type, see `role_system_notes.md` §7) |
+| 0x40 | gun_yaw_angle | 0x36 | deg -> units |
+| 0x44 | elevation_angle | 0x37 | deg -> units |
+| 0x48 | radius_times_size | 0x6b | `radius * size`, pre-multiplied |
+| 0x4c | height_times_size | 0x6c | `height * size`, pre-multiplied |
+| 0x50 | size | 0x6d | - |
+| 0x54 | damage_multiplier | 0x2b | - |
+| 0x58 | shot_speed_multiplier | 0x2e | - |
+| 0x5c | target_cycle_delay | 0x2f | - |
+| 0x60 | alarm_delay | 0x32 | - (read by `Actor::Ctor`) |
+| 0x64 | weapon_cycle_time | 0x30 | - |
+| 0x68 | weapon_cycle_time2 | 0x31 | - |
+| 0x6c | max_weapon | 0x83 | - |
+| 0x70 | max_ammo | 0x84 | - |
+| 0x74 | max_module | 0x85 | - |
+| 0x78 | initial_first_person_range | 0x86 | - |
+| 0x7c | maximum_first_person_range | 0x87 | clamped up to `initial_first_person_range` |
+| 0x80 | can_turn | 0x3c | bool |
+| 0x81 | draw_vision_cone | 0x3d | bool |
+| 0x82 | draw_hearing_range | 0x3e | bool |
+| 0x83 | *(padding)* | - | - |
+| 0x84 | customisation_hierarchy | 0x76 | `ToHierarchy` (**owned**) |
+| 0x88 | shadow_hierarchy | 0x77 | `ToHierarchy` (**owned**) |
+| 0x8c | blob_shadow | 0x5a | - |
+| 0x90 | description | 0x1a | `GetResourceString` |
+| 0x94, 0x98, 0x9c | *(runtime scratch)* | - | **not set by ToCharacter** |
+| 0xa0 | status_window_v | 0x40 | `*(1/1024)` UV |
+| 0xa4 | status_window_u | 0x3f | `*(1/1024)` UV |
+| 0xa8 | strength | 0x29 | - (hit points; read by `Actor::Ctor`) |
+| 0xac | weapon | 0x18 | - (`33` = none; drives the Actor-subclass choice in `CreateActor`) |
+| 0xb0 | secondary_weapon | 0x19 | - |
+| 0xb4 | always_cpu_controlled | 0x74 | bool |
+| 0xb5-0xb7 | *(padding)* | - | - |
+
+Angle unit: the game uses a 4096-step circle (sin/cos tables are 0x1000 entries).
+`CharacterDtor` frees only `customisation_hierarchy` (0x84) and `shadow_hierarchy` (0x88).
+Fields 0x94/0x98/0x9c are left uninitialised by the converter (runtime AI scratch).
+
+## 2. Projectile (0x20)
+
+The per-shot effect. Small and fully mapped.
+
+| Off | Field | GLS id | Notes |
+|-----|-------|--------|-------|
+| 0x00 | gravity | 0x33 | bool |
+| 0x01-0x03 | *(padding)* | - | - |
+| 0x04 | damage | 0x2a | negative heals |
+| 0x08 | sound | 0x20 | default 104 |
+| 0x0c | max_range | 0x2d | default 196.0 |
+| 0x10 | blast_damage | 0x2c | AoE damage |
+| 0x14 | blast_range | 0x28 | AoE radius |
+| 0x18 | blast_range_squared | - | `blast_range^2`, cached |
+| 0x1c | hit_light | 0x1f | `ToLight` (**owned**, 0x1c) |
+
+`ProjectileDtor` frees `hit_light`. `Light` (0x1c) = red/green/blue, specular
+red/green/blue, range (all floats, GLS ids 0x21-0x28) - see `gls_system_notes.md`.
+
+## 3. ParticleGenerator (0xd4)
+
+The emitter template. Only ~15 fields come from GLS; the rest is runtime animation state
+that `ToParticleGenerator` **default-initialises**. No owned heap pointers -
+`ParticleGenDtor` only destructs the three embedded `Vec3` members.
+
+### GLS-derived fields
+
+| Off | Field | GLS id | Notes |
+|-----|-------|--------|-------|
+| 0x00 | type | 0x41 | emitter type 0..12 (shot/fire/smoke/explosion/...) |
+| 0x04 | kind | - | constant 5 (object-kind tag) |
+| 0x08, 0x0c | *(from parsed ext)* | - | copied from parsed+0x1b60/0x1b64 (pgen thing is 0x1b70, not 0x1b60) |
+| 0x10 | rate | 0x43 | emission rate |
+| 0x14 | coords | 0x44/0x45/0x46 | Vec3 emitter offset (x/y/z) |
+| 0x30 | red | 0x21 | base colour (channel 0, see below) |
+| 0x34 | green | 0x22 | |
+| 0x38 | blue | 0x23 | |
+| 0x3c | alpha | 0x24 | |
+| 0xb4 | generate_generators | 0x68 | bool |
+| 0xc4 | start_scale | 0x64 | default 1.0 |
+| 0xc8 | end_scale | 0x65 | default 1.0 |
+| 0xcc | spin | 0x66 | default 0 |
+| 0xd0 | lifespan_ticks | 0x67 | `particle TTL` * current clock rate |
+
+### Runtime animation state (default-initialised)
+
+The block from 0x30 to 0xa8 is **five `{Vec4 (four 1.0f), int count=2}` groups** at
+0x30, 0x48, 0x64, 0x7c, 0x94 - interpolation curves (the first is the RGBA colour whose
+start values come from GLS; the others are scale/other channels), each seeded with two
+keyframes. `Vec3` members at 0x14 (coords), 0x20 and 0xb8 are constructed/destructed by
+the ctor/dtor. The precise runtime meaning of the remaining slots (0x58, 0x60, 0x78,
+0xc0, ...) belongs to the particle-simulation code and is out of scope here; they are
+scratch/interpolation cursors, not GLS data.
+
+## 4. Destructibility - a 3-variant polymorphic family
+
+`Role.destructibility` (0xa8) points at one of three record types. They share a
+**dtor-only base vtable** (`DestructibilityDtor` @ 0x00483950 resets `vtbl`); dispatch is
+**not** virtual - the death/fragment handler `Frag` @ 0x0052e220 switches on the `tag`
+int at **+0x04**.
+
+| tag | Variant | Size | Converter | GLS section |
+|-----|---------|------|-----------|-------------|
+| 0 / 1 | base Destructibility | 0x8 | `ToDestructibility` @ 0x0047e680 | `destructibility { type explode\|splatter }` |
+| 3 | FragData | 0x24 | `ToFragData` @ 0x0047e890 | `frag data { ... }` |
+| 4 | ReplaceDestructibility | 0x10 | `ToReplaceDestructibility` @ 0x0047eaa0 | the name+replace section |
+
+### base Destructibility (0x8)
+
+```
++0x00 vtbl (DestructibilityDtor)
++0x04 tag   // = GLS 'type' 0x41: 0 explode, 1 splatter
+```
+
+### FragData (0x24) - "shatter into pieces"
+
+```
++0x00 vtbl (FragDataDtor)
++0x04 tag = 3
++0x08 Role* role          // GLS 'role' 0x60 - fragment pieces
++0x0c Role* replace_role   // GLS 'replace role' 0x61 - actor left in place at death
++0x10 char* remove         // GLS 'remove' 0x62 (owned)
++0x14 int   scale          // GLS 'scale' 0x63
++0x18 bool  replace        // GLS 'replace' 0x69
++0x19 bool  symmetric      // GLS 'symmetric' 0x6a
++0x1c float blast_range    // GLS 'blast range' 0x28
++0x20 float blast_damage   // GLS 'blast damage' 0x2c
+```
+
+`ToFragData` builds `role`/`replace_role` via `ToRole`. `FragDataDtor` frees `remove`.
+
+### ReplaceDestructibility (0x10) - "swap for another object"
+
+```
++0x00 vtbl (ReplaceDestructibilityDtor)
++0x04 tag = 4
++0x08 char* name     // GLS 'name' 0x00 (owned)
++0x0c bool  replace  // GLS 'replace' 0x69
+```
+
+### Runtime consumption (`Frag` @ 0x0052e220)
+
+When an actor dies with a destructibility, `Frag` reads `destructibility->tag`:
+
+- **default (0/1)** - simple explode/splatter effect.
+- **case 3 (FragData)** - marks the actor (`field_0x7c |= 0x10`); if `blast_damage != 0`
+  and `blast_range > 0`, applies area damage in `blast_range^2`; then `SpawnRole`s
+  `replace_role` at the actor's position/orientation. If the replacement's hierarchy has
+  node slot 3 present, additional attachment logic runs.
+
+(tag `2` is unused by any shipped converter.)
+
+## 5. GkPlus source
+
+`src/Roles.cpp` mirrors all four with `static_assert`s: `Character` (0xb8), `Projectile`
+(0x20), `ParticleGenerator` (0xd4), `Destructibility` (`{vtbl, tag}`), plus `FragData`
+and `ReplaceDestructibility`. The GLS-derived fields are named; runtime particle slots and
+struct padding keep `field0xNN` names.
+
+The destructibility `tag` fields are typed `enum class DestructibilityKind`
+(`Explode=0, Splatter=1, FragData=3, ReplaceDestructibility=4`), mirrored in the Ghidra DB.
+`Role.ai` is `enum class AIType` (Roles.h; §6 of `role_system_notes.md`). Fields whose
+value mapping is not fully recovered (particle `type` 0..12, role `resistance` 0..9) are
+left as `int` rather than encoded as a guessed enum. Note: the console command
+`GetParticleIDFromName` @ 0x0044c340 gives a *partial* particle mapping (smoke=0, steam=1,
+snow=2, fire=3, shot=4, explosion=5, bigexplosion=6, trail=9, rain=11, sparks=12) that may
+differ from the GLS lexer's, so it was not promoted to an enum.
