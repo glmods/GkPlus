@@ -136,6 +136,52 @@ DirectSound via `BinkSetSoundSystem(BinkOpenDirectSound, ...)`).
 - Stop (`StopMusicTrack` @ 0x00587bf0, thunk 0x00587b50): create event into +0x10, wait
   for the thread to signal it, `BinkClose`.
 
+### Music volume, and the startup bug
+
+The track object is 0x20 bytes (the C++ mirror is `MusicTrack` in `src/Music.cpp`);
+`MusicTrack_Ctor` @ 0x00587b10 zeroes it, stores the sound device at +0x14, and sets
+**+0x18 = 0x8000 hardcoded** — the volume, at Bink full scale.
+`MusicTrack_SetVolume` @ 0x00587ca0 writes +0x18 and calls `BinkSetVolume` when a handle is
+open; `PlayMusicTrack` re-applies +0x18 on open, so setting it before playback also works.
+
+Two scales, two globals — both *precomputed*, which is the whole problem:
+
+| Global | Offset | Formula | Range | Consumer |
+|--------|--------|---------|-------|----------|
+| `CDMusicVolumeScaled` | 0x006a79dc | `CDMusicVolume * 0x1c70` | 0..65520 | CD/aux path |
+| `BattleMusicVolumeScaled` | 0x006a7c18 | `BattleMusicVolume * 0xe38` | 0..32760 | Bink track |
+
+Their `.data` initializers are 36400 and 25480 — i.e. baked from the *default* settings
+(`CDMusicVolume` 5, `BattleMusicVolume` 7 @ 0x006abe04/08).
+
+`ApplyMusicVolumeSettings` @ 0x004e7810 is the only function that re-derives both from the
+settings, and it is called **only** from `LoadLevel` and `CommandCDAuto`. `ReadGLKeys` @
+0x004f6f10 (WinMain) loads the settings into the globals but never recomputes the scaled pair
+and never touches `TheMusicTrack` @ 0x007f5bdc. Contrast `SoundEffectsVolume`, which
+`InitSoundEffectsSystem` @ 0x004e7070 reads *lazily* at device init — that one honours the
+config file.
+
+Consequence (a real shipped bug): `EnterMainMenuScreen` @ 0x004e7e50 constructs the track and
+immediately plays `sound\music\track1.bik` on a `TheMusicTrack == NULL` guard, so the front-end
+music runs at the constructor's 0x8000 — above even the slider's own maximum of 32760 —
+regardless of the saved level. Audio menu item 1 (`OnMenuItemClicked`, menu 25) calls
+`MusicTrack_SetVolume(TheMusicTrack, BattleMusicVolume * 0xe38)` on the live track, so the
+slider works immediately and `WriteGLKeys` persists it; it is simply never re-applied on the
+next launch. `LoadLevel` repairs it, so in-game music is correct — the window is startup up to
+the first level load.
+
+The same defect covers three more call sites that also construct-and-play without setting a
+volume: `FUN_0046f020` and `FUN_0046d0f0` (`2a.bik`) and `FUN_004db3c0` (`victory.bik`). The
+three call sites that *do* set their own volume are cinematics (`FUN_004dd4b0`,
+`CinematicsVolume * 0xe38`), the Audio-menu slider, and battle music (`FUN_004e7a40`).
+
+GkPlus fixes all four by detouring `MusicTrack_Ctor` in `MusicModule` (`src/Music.cpp`) and
+seeding `volume` from `BattleMusicVolume` instead of the hardcoded 0x8000; the three
+volume-setting callers overwrite it immediately and are unaffected. Hooking `ReadGLKeys` does
+**not** work — it returns before `WinMain`'s copy-out at 0x0046b667, so the volume globals still
+hold their `.data` defaults, which is the same ordering trap the game itself falls into with
+`ApplyShadowQuality`.
+
 ## Message flow (the core of the model)
 
 Two DirectPlay interface pointers exist because one process can be both client and

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstring>
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 

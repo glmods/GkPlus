@@ -43,6 +43,7 @@ Custom C++20 concepts-based Lua interop:
 | `src/Roles.h/cpp` | `Role` | id, type (ai enum), name, vulnerabilities, spawn() |
 | `src/Map.h/cpp` | `Map`, `TeamSlot` | origin, bounds_min/max, camera_focus_min/max, bitmap, shadow_object_*, num_sections, to_world() |
 | `src/Vulnerability.h/cpp` | `Vulnerability` | role, vulnerability_role, delay, duration, script, type |
+| `src/Music.h/cpp` | `MusicTrack` | volume, looping, playing, play(path[, loop]), stop() |
 | `src/Math.h/cpp` | `Vec3`, `Vec4` | x, y, z [, w] (read-only fields) |
 
 ## Lua Modules (`require("gk.xxx")`)
@@ -57,6 +58,7 @@ Custom C++20 concepts-based Lua interop:
 | `src/Map.h/cpp` | `gk.map` | current(), world_unit_scale(), spawn(role, team, pos, ori), teams[i] / #teams / pairs(teams) |
 | `src/Triggers.h/cpp` | `gk.triggers` | add_time_trigger(delay, callback) |
 | `src/Misc.h/cpp` | `gk.misc` | game_mode, game_state, battle_number, game_difficulty, actor_under_cursor, foobar, parse_gls() |
+| `src/Music.h/cpp` | `gk.music` | current (MusicTrack or nil), battle_volume (0..9 setting). Also owns the `MusicTrack_Ctor` hook that fixes the ignored-volume bug |
 | `src/Memory.h/cpp` | `gk.memory` | Direct memory read/write |
 | `src/GUI.h/cpp` | `gk.gui` | ImGui integration |
 | `src/Camera.h/cpp` | `gk.camera` | Camera control |

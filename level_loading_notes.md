@@ -65,12 +65,64 @@ WinMain
        ...                                                (per-frame, NOT loading)
 
 BeginLevelSession(bool doLoad)            @ 0x004e2560
-  |   from CommandEndBriefing, LoadGame, the menu system, FUN_0046c170/0046f100
+  |   callers: CommandEndBriefing & ShowBriefingOrDebriefScreen (front end, see 2.1),
+  |            LoadGame (savegame restore), FUN_004fb850 (multiplayer briefing),
+  |            FUN_0046c170 (attract-mode demo)
   +- first call only: StartExecutorThread + InitClientRouting (single-player too),
   |  register GAMESPEED/FOG* console commands, load movement_indicator2.rif
   +- GameState = 0x12
   +- if (doLoad) LoadLevel()             @ 0x004e0980
 ```
+
+### 2.1 From the front end: New Game / Choose Level -> briefing -> BeginLevelSession
+
+The menus never call `LoadLevel` directly. Selecting a single-player level only sets
+`ScriptFileName` / `ConsoleFileName`; the actual load is kicked off from the **briefing
+screen**. The non-obvious hop is that difficulty selection goes to `GameState 0x10`
+(briefing), and it is the briefing's `END BRIEFING` command (or a briefing with no scripted
+content) that finally calls `BeginLevelSession`. Verified in `OnMenuItemClicked` @ 0x004ecf10
+(jump table @ 0x004ef318) and the briefing driver:
+
+```
+Main(0) item0 ---------------------------> GoToMenu(7) Single Player
+SinglePlayer(7) item0 "New Game" .........  strdup the CURRENT campaign level's .gls/.gcs
+   |                                         out of LevelList (0x007b74dc): cache node
+   |                                         +0x10 -> ScriptFileName, +0x14 -> ConsoleFileName
+   |                                         -> GoToMenu(9) Difficulty
+SinglePlayer(7) item3 "Choose Level" .....  GoToMenu(5)   (only if FlagChooseLevel 0x006b0173)
+ChooseLevel(5) item n ....................  LevelList__GetTitlePtrAt(0x007b74dc, n) @0x004f7650,
+   |                                         node +0x10/+0x14 -> ScriptFileName/ConsoleFileName;
+   |                                         GameMode(0x007b9e28)==coop -> menu 15, else GoToMenu(9)
+Difficulty(9) item 0/1 (Normal/Hard) .....  GameDifficulty(0x007b9cc4) = item+1;
+   |                                         FUN_004f94c0, FUN_004e8dd0 (menu-screen teardown);
+   |                                         ShowBriefingOrDebriefScreen(isBriefing=1) @0x004b1f60
+   v
+ShowBriefingOrDebriefScreen(1)            @ 0x004b1f60
+  +- GameState = 0x10; global IsBriefing(0x007b68e0) = 1
+  +- display briefing bitmap (GL_MISBRF_FILENAME); load robots.dat
+  +- register briefing console cmds incl. END BRIEFING -> CommandEndBriefing @0x004b33c0
+  +- ExecuteCommandFile("<ScriptFileName, ext -> .brf>")     // the level's briefing script
+  +- if that script queued NO commands (NumCommandsToExecute==0):
+  |       BeginLevelSession(load) inline  @0x004b23c5   -> LoadLevel     [no briefing shown]
+  +- else the briefing screen stays up (GameState 0x10) until the player ends it:
+          END BRIEFING -> CommandEndBriefing -> BeginLevelSession(load) @0x004b33df -> LoadLevel
+```
+
+Notes:
+
+- **`IsBriefing` @ 0x007b68e0** `1` = a
+  pre-level *briefing* is up, `0` = a post-level *debriefing*. `CommandEndBriefing` loads the
+  next level (`BeginLevelSession`, `CL=1`) only when it is non-zero; the `0` path tears the
+  debrief down without loading. `ShowBriefingOrDebriefScreen`'s parameter was likewise
+  mislabelled `IsDebriefing` and is now `isBriefing` (`bool`, in `CL`): `isBriefing=0` shows the
+  debrief screen (`GL_MISDEB_FILENAME`) and chains to the next briefing or `EnterMainMenuScreen`.
+- The screen id is `GetResourceString((isBriefing ^ 1) + GL_MISBRF_FILENAME)`, i.e.
+  `isBriefing=1` -> GL_MISBRF (briefing), `isBriefing=0` -> GL_MISDEB (debrief).
+- Front-end call sites pass the `BeginLevelSession` load flag in **CL** (`MOV CL,1`) — arg 1 of
+  the `__fastcall`, not DL.
+- Training area (menu 21) and campaign-advance (`CommandNextLevel` @0x004f6ba0) reach the same
+  `ShowBriefingOrDebriefScreen`; multiplayer uses FUN_004fb850 / FUN_004ef950 instead, and a
+  savegame load uses `LoadGame` -> `BeginLevelSession` directly (no briefing screen).
 
 ## 3. `LoadLevel` @ 0x004e0980
 

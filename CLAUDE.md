@@ -98,15 +98,16 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 ### Lua-facing sources
 
 The Lua userdata wrappers (`src/Actors`, `src/Roles`, `src/Map`, `src/Vulnerability`,
-`src/Math`) and the `gk.*` modules (`src/Console`, `src/Menu`, `src/Tokens`, `src/Triggers`,
-`src/Misc`, `src/Memory`, `src/GUI`, `src/Camera`, `src/Debug`, `src/AI`) are tabulated with
-their APIs in `lua_notes.md`.
+`src/Music`, `src/Math`) and the `gk.*` modules (`src/Console`, `src/Menu`, `src/Tokens`,
+`src/Triggers`, `src/Misc`, `src/Music`, `src/Memory`, `src/GUI`, `src/Camera`, `src/Debug`,
+`src/AI`) are tabulated with their APIs in `lua_notes.md`.
 
 ### Other
 
 | File | Purpose |
 |------|---------|
 | `src/Chunks.h/cpp` | ChunksModule - hooks chunk registration (debug logging only, no Lua API, currently commented out in entry.cpp) |
+| `src/InputFix.h/cpp` | InputFixModule - hook-only, no Lua API. Detours `AcquireDInputDevice` to suppress the vestigial DirectInput keyboard acquire and its `WH_KEYBOARD_LL` hook (see `input_notes.md`) |
 | `src/ImGuiBindings.h/cpp` | ImGui C++ to Lua/JS bindings via imgui-quickjs |
 | `src/Menus.inc.h` | X-macro listing all 36 Gunlok menus: `GUNLOK_MENU(Name, Id, TitleResourceId, "English title")`. There are no gaps - ids 11 and 14-20 are identified in `menu_system_notes.md` |
 | `imgui-quickjs/` | Static library: QuickJS bindings for ImGui |
@@ -126,7 +127,32 @@ their APIs in `lua_notes.md`.
 - `directplay_protocol_notes.md` - Multiplayer wire protocol: DirectPlay (`IDirectPlay4A`) COM/session setup, app GUID, SendEx/Receive framing & reliability, and the full command (client->server) and update (server->client) message-id tables with payload layouts, the `0x87` lock-step turn model, and update `0x67` (§8.11) which makes every client run a trigger script from its **own** local `Scripts\` copy
 - `menu_system_notes.md` - Both menu systems (front-end `Menus[36]` + in-game `InGameMenus[7]`): `Menu`/`MenuListItem` layouts, the four item constructors and the 4 item types, the full 0-35 menu inventory with titles and populators, the (menu, item) -> action transition map, navigation/rendering/input, key bindings, and the localized string table
 - `save_system_notes.md` - `.sav`/`.msv` savegame format: full field-by-field stream layout, the header-only "carry to next level" variant, the team carry-over roster, and why the console `SAVE`/`LOAD` commands are the demo system instead
+- `input_notes.md` - Input subsystem: keyboard runs on Win32 `WM_KEYDOWN` (`MainWindowWndProc` -> `HandleKeyMessage` -> VK->DIK `VkToScanCodeTable` -> the universal `HandleKeyPress4` sink), mouse on Raw Input, and the DirectInput `SysKeyboard` is a vestigial acquired-but-never-read fossil whose `Acquire()` arms the `WH_KEYBOARD_LL` hook that lags system keyboard input under a debugger; the `gk.inputfix` module (`src/InputFix.cpp`) detours `AcquireDInputDevice` to suppress it
+- `rif_chunk_format.md` - the `.rif` asset format: 12-byte chunk header, `REBCRIF1` Huffman
+  container, all 105 registered chunk types, **and** the AvP upstream mapping (see below)
 - `gls.txt` - Game Level Structure file format quick field list (superseded by gls_system_notes.md)
+
+### Upstream Source: Aliens vs Predator (1999)
+
+Gunlok's asset layer is Rebellion's `3dc` chunk library, and the **published AvP Gold source**
+is available locally at `D:\Documenti\GitHub\aliens-vs-predator\source\AvP_vc\3dc`. This is
+verified, not assumed: AvP's `huffman.cpp` decompresses 563/563 shipped `.rif` files, and 88 of
+Gunlok's 105 registered chunk ids appear in that source. Use it as ground truth for anything
+chunk/RIF-shaped instead of decompiling — `rif_chunk_format.md` has the id -> class/file map.
+
+The split is sharp and worth remembering:
+
+- **Shared** — the chunk/RIF library, `List<T>` (`list_tem.hpp`), `HashTable<T>`
+  (`Hash_tem.hpp`), `Chunk`/`Chunk::Register` (`Chunk.hpp`), and the load-side consumers
+  `avp/win95/Projload.cpp` + `Objsetup.cpp` (AvP's counterpart to `ToMap`).
+- **Not shared** — the entire game layer. Roles, Actors, GLS scripts, triggers, menus and the
+  save format have no AvP counterpart; AvP's `STRATEGYBLOCK`/`MODULE`/behaviour blocks do
+  **not** describe Gunlok structures. Don't map them across.
+
+Two gotchas when searching that tree: most `win95/` files have **uppercase** extensions, so
+`grep --include=*.cpp` silently misses them (use `find -iname`); and AvP's debug `fail()` is
+`#define fail if (0)` under `NDEBUG`, which is why shipped code has no bounds checks
+(e.g. `Menu::GetItemData`).
 
 ### Ghidra Database Hygiene
 
@@ -420,7 +446,7 @@ and audit the DB afterwards rather than trusting it.
 
 | Offset | Signature | Name |
 |--------|-----------|------|
-| 0x004e2560 | FastCall<int, char> | BeginLevelSession (DL != 0 -> also LoadLevel) |
+| 0x004e2560 | FastCall<int, char> | BeginLevelSession (CL != 0 -> also LoadLevel) |
 | 0x004e0980 | StdCall<void> | LoadLevel |
 | 0x0047f160 | ThisCall (member) | ToMap - builds TheMap and spawns placed objects |
 | 0x0047efa0 | ThisCall (member) | CheckValue_Map - handles `use ... in team ... for ...` |
@@ -461,7 +487,7 @@ Actor (0x120 bytes, vtbl @ 0x00667e30)
  +- BackgroundCreatureActor (0x120 bytes)
  |   +- FlyingBackgroundCreatureActor (0x120 bytes)
  +- BlockerActor (0x130 bytes)
- +- ProjectileActor (0x178 bytes)   <- was `UnknownActor`; see actor_vtable_notes.md
+ +- ProjectileActor (0x178 bytes) see actor_vtable_notes.md
 ```
 
 Key Actor struct offsets (vtable ptr implicit at 0x00): `id` @ 0x0c, `vulnerabilities` @ 0x10,

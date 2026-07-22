@@ -1,6 +1,9 @@
 # RIF Chunk Format Reference
 
-Reverse-engineered from the Gunlok (2000) game binary via Ghidra static analysis.
+Reverse-engineered from the Gunlok (2000) game binary via Ghidra static analysis, then
+cross-checked against the **published Aliens vs Predator (1999) source code** — see
+[Upstream](#upstream-the-aliens-vs-predator-1999-3dc-engine) for what that confirms and where
+the ground truth lives.
 
 ## File Structure
 
@@ -463,10 +466,133 @@ Chunk (base, 0x24 bytes)
 
 ## Chunks Not in Binary
 
-The following chunk IDs are referenced in the RIF viewer (`rifviewer/main.js`) as containers but do **not** exist in the Gunlok binary. They may be from the general Rebellion RIF SDK used by other games:
+The following chunk IDs are referenced in the RIF viewer (`rifviewer/main.js`) as containers but do **not** exist in the Gunlok binary. They are from the shared Rebellion `3dc` chunk library — all five are present in the AvP source, so the earlier "general Rebellion RIF SDK used by other games" guess was right:
 
-- `SPRIHEAD` - Sprite header
-- `SPRITEPC` - Sprite PC
-- `SPRITEPS` - Sprite PS
-- `SPRITESA` - Sprite Saturn
-- `FRAGTYPE` - Fragment type
+| Chunk ID   | AvP class                  | AvP source        |
+|------------|----------------------------|-------------------|
+| `SPRIHEAD` | `Sprite_Header_Chunk`      | `Sprchunk.cpp`    |
+| `SPRITEPC` | `PC_Sprite_Chunk`          | `Sprchunk.cpp`    |
+| `SPRITEPS` | `Playstation_Sprite_Chunk` | `Sprchunk.cpp`    |
+| `SPRITESA` | `Saturn_Sprite_Chunk`      | `Sprchunk.cpp`    |
+| `FRAGTYPE` | `Fragment_Type_Chunk`      | `fragchnk.hpp`    |
+
+Gunlok dropped the sprite family (AvP's 2D sprite path) and the `FRAGTYPE` container, keeping
+only `FRAGDATA`/`FRAGLOCN`.
+
+---
+
+## Upstream: the Aliens vs Predator (1999) 3dc engine
+
+Gunlok's asset pipeline is Rebellion's `3dc` chunk library, the same one shipped in the
+**published AvP Gold source release** (`source/AvP_vc/3dc/`). This is not a family resemblance —
+it is the same code, and the AvP source is usable as ground truth for anything in this document.
+
+### Evidence
+
+- **48 of 72** chunk identifiers extracted from `3dc/win95/*.[ch]pp` appear verbatim in `gl.exe`,
+  including the root id `REBINFF2` (AvP's `GodFather_Chunk`).
+- AvP's `HuffmanDecompress()` (`3dc/win95/huffman.cpp`), ported unmodified, decompresses
+  **563 of 563** shipped Gunlok `.rif` files. Every result begins `REBINFF2`, its root
+  `chunk_size` equals the decompressed length exactly, and the chunk tree walks to the end of
+  the buffer with zero slack bytes.
+- `REBCRIF1` is AvP's `COMPRESSED_RIF_IDENTIFIER`, and the 316-byte compressed header
+  documented above is AvP's `HuffmanPackage` struct field-for-field.
+- **88 of the 105** chunk ids Gunlok registers exist in the AvP source (table below).
+- Per-file string overlap is concentrated *entirely* in `3dc/win95/*CHUNK*.cpp`,
+  `chnkload.cpp`, `hierchnk.cpp`, `animobs.cpp` and `avp/win95/{Projload,Objsetup}.cpp`.
+  AvP's game layer (`avp/*.c` — behaviours, weapons, player) shows no meaningful overlap.
+
+**So: the asset/chunk layer is shared; the game layer is not.** Gunlok's Roles, Actors, GLS
+scripts, triggers and menus have no AvP counterpart and must still be read out of the binary.
+Do not expect `STRATEGYBLOCK`, `MODULE` or AvP's behaviour blocks to describe Gunlok structures.
+
+### Structures this confirms
+
+These were already modelled from the binary; AvP names them and explains the layouts:
+
+| GkPlus / notes name                         | AvP original                             | AvP source        |
+|---------------------------------------------|------------------------------------------|-------------------|
+| `LevelList` `{sentinel,count,cache,valid}` (0x10) | `List<T>` `{sentinel,n_entries,entry_pointers,calculated_indices}` | `list_tem.hpp` |
+| `Menu::GetItemData` "cached, NO bounds check" | `List<T>::operator[]` — the bounds `fail()` is `#define fail if (0)` under `NDEBUG` | `list_tem.hpp:402` |
+| roles/actors hash `{n,buckets,mask,table}`  | `_base_HashTable` `{nEntries,tableSize,tableSizeMask,chainPA}` | `Hash_tem.hpp:587` |
+| `RoleList`/`ActorNode` `{data, next}`       | `HashTable<T>::Node` `{TYPE d; Node* nextP;}` (data first, then link) | `Hash_tem.hpp:557` |
+| `Chunk` (0x28) / `Chunk_With_Children` (0x2c) | `class Chunk` / `class Chunk_With_Children` | `Chunk.hpp:203` |
+| `Chunk::Register` @ 0x005d4ae0              | `Chunk::Register(idChunk, idParent, pfnCreate)` | `Chunk.hpp:249` |
+
+Two deliberate divergences found so far:
+
+- `GetRoleById`/`GetActorById` use the raw id (`mask & id`) as the bucket index. AvP's
+  `HashFunction(unsigned)` scrambles (`i ^ i>>4 ^ i>>9 ^ i>>15 ^ i>>22`); Gunlok dropped it,
+  which is fine for its sequential ids.
+- `Chunk::Register` hashes the 8-char id as `(dword0 + dword1)` mixed through
+  `h = (((((h>>7^h)>>6^h)>>5^h)>>4^h)`, not AvP's `sum of toupper(c)`.
+- The roles/actors tables have **no vptr**; `RifRegEntryHashtable` does (AvP's
+  `_base_HashTable` has virtual `NewNode`/`DeleteNode`). Only the chunk registry kept them.
+
+### Chunk registration in the binary
+
+`RegisterAllRifChunkClasses` does not exist — MSVC emits **118 separate 18-byte static-init
+constructors**, one per registration, each `PUSH pfnCreate / MOV EDX,idParent (or XOR EDX,EDX) /
+MOV ECX,idChunk / CALL Chunk::Register / RET`, 0x20-aligned, running 0x0043b3f0..0x0043c511 and
+reached from the CRT init table at `.rdata:0x0064d9d0`. These are AvP's
+`RIF_IMPLEMENT_DYNCREATE` / `..._DECLARE_PARENT` macro expansions (`Chunk.hpp:535`).
+
+In the Ghidra DB they are named `RifRegisterCtor_<ID>[_in_<PARENT>]`, and the 118 loader
+functions they install are `RifLoad_<ID>[_in_<PARENT>]`. Each loader body is the macro verbatim:
+`new XxxChunk(parent, data+12, *(int*)(data+8) - 12)`.
+
+118 registrations cover 105 distinct ids. **15 ids are registered under a required parent**
+(AvP's `_DECLARE_PARENT` form), accounting for 28 of the registrations; the loader differs per
+parent, so these are genuinely distinct functions:
+
+| Chunk      | Registered under            |
+|------------|-----------------------------|
+| `ANIFRADT` | `ANIMFRAM`                  |
+| `ANIMFRAM` | `ANIMSEQU`                  |
+| `ANISEQDT` | `ANIMSEQU`                  |
+| `FRMMORPH` | `SHPMORPH`                  |
+| `SHPHEAD1` | `REBSHAPE`                  |
+| `SHPMORPH` | `REBSHAPE`, `SUBSHAPE`      |
+| `SHPMRGDT` | `REBSHAPE`, `SUBSHAPE`      |
+| `SHPPNORM` | `REBSHAPE`, `SUBSHAPE`, `ANIMFRAM` |
+| `SHPPOLYS` | `REBSHAPE`, `SUBSHAPE`, `CONSHAPE` |
+| `SHPRAWVT` | `REBSHAPE`, `SUBSHAPE`, `ANIMFRAM` |
+| `SHPTEXFN` | `REBSHAPE`, `SUBSHAPE`      |
+| `SHPUVCRD` | `REBSHAPE`, `SUBSHAPE`, `CONSHAPE` |
+| `SHPVFLAG` | `REBSHAPE`, `SUBSHAPE`      |
+| `SHPVNORM` | `REBSHAPE`, `SUBSHAPE`      |
+| `SUBSHPHD` | `SUBSHAPE`                  |
+
+Note `CONSHAPE` is a parent id that is never itself registered.
+
+### Gunlok-only chunks (17)
+
+No AvP source exists for these; they must be read from the binary. Twelve are the cutscene
+system that backs the `.cut` sidecar files (see `level_loading_notes.md`):
+
+`CTUSNDPR` `CTUSRDAT` `CTUSRHIE` `CTUSSPPO` `CUTEVENT` `CUTPOINT` `CUTSCDAT` `CUTSCUSR`
+`CUTSHEAD` `CUTTRACK` `CUTTRFOV` `CUTTRNAM` — plus `MODZONE`, `OBINTDT`, `SHPFLAGS`,
+`SHPVFLAG`, `TRSNDCAT`.
+
+### Chunk ID to AvP class/source map
+
+For the other 88, the AvP class name and file give real field names and types to check the
+layouts in this document against. Highlights (full list reproducible by grepping the AvP tree
+for the quoted id — note the extensions are **uppercase**, so `grep --include=*.cpp` misses most
+of `win95/`):
+
+| Area                   | AvP source file                    | Chunks |
+|------------------------|------------------------------------|--------|
+| Shapes / meshes        | `win95/SHPCHUNK.CPP` / `.HPP`      | `REBSHAPE` `SHPHEAD1` `SHPRAWVT` `SHPVNORM` `SHPPNORM` `SHPPOLYS` `SHPUVCRD` `SHPPCINF` `SHPCENTR` `SHPMRGDT` `SHPMORPH` `FRMMORPH` `SHPFRAGS` `FRAGDATA` `FRAGLOCN` `SUBSHAPE` `SUBSHPHD` `CONSTYPE` `ASALTTEX` `ANSHCEN2` `ANIMSEQU` `ANIMFRAM` `ANIFRADT` `ANISEQDT` |
+| Object hierarchies     | `win95/hierchnk.cpp`, `MISHCHNK.CPP` | `OBJCHIER` `OBJHIERD` `OBHIERNM` `HIERBBOX` `HSETCOLL` `OBHALTSH` `HIDEGDIS` |
+| Object animation       | `win95/animobs.cpp` / `.hpp`       | `OBANSEQS` `OBANSEQC` `OBANALLS` `OBASEQHD` `OBASEQFR` `OBASEQFL` `OBASEQSP` `OBASEQTM` |
+| Modules / objects      | `win95/OBCHUNK.CPP`                | `RBOBJECT` `OBJHEAD1` `MODULEDT` `MODFLAGS` `MODACOUS` `ADJMDLEP` `OBJNOTES` `OBJPRJDT` `OBJTRAK2` `VMDARRAY` `TRAKSOUN` |
+| Environment            | `win95/ENVCHUNK.CPP`               | `REBENVDT` `ENDTHEAD` `ENVACOUS` `ENVSDSCL` `SOUNDDIR` `SPECLOBJ` |
+| Bitmap names           | `win95/BMPNAMES.CPP`               | `BMPNAMES` `BMNAMEXT` `BMNAMVER` `BMPLSTST` `BMPMD5ID` `MATCHIMG` `SHBMPNAM` |
+| Lighting               | `win95/LTCHUNK.CPP`                | `LIGHTSET` `LTSETHDR` `STDLIGHT` `AMBIENCE` `PLOBJLIT` `LITSCALE` `SHPVTINT` |
+| Sound                  | `win95/SNDCHUNK.CPP`               | `SOUNDOB2` `SOUNDEXD` `SOUNDNAM` `INDSOUND` `ALTLOCAT` |
+| Dummy objects          | `win95/DummyObjectChunk.cpp`       | `DUMMYOBJ` `DUMOBJDT` `DUMOBJTX` |
+| Load-side consumers    | `avp/win95/Projload.cpp`, `Objsetup.cpp` | how the chunks are turned into runtime structures |
+
+`Projload.cpp` and `Objsetup.cpp` are the most useful of these: they are AvP's equivalent of
+Gunlok's `ToMap` (0x0047f160) and show what each chunk is *for*, not just its byte layout.
