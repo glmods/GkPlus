@@ -2,11 +2,6 @@
 
 #include "Core.h"
 #include "DetourUtils.h"
-#include "LuaEngine.h"
-
-#include <cassert>
-#include <cstddef>
-#include <cstdint>
 
 namespace gk {
 namespace {
@@ -15,45 +10,11 @@ namespace {
 // full scale while CD audio uses the whole 16-bit range.
 constexpr int BinkVolumePerStep = 0xe38;
 
-MusicTrack **TheMusicTrack;
 int *BattleMusicVolume;
-} // namespace
 
-// The 0x20-byte object built by MusicTrack_Ctor @ 0x00587b10. `device` is the
-// DirectSound device captured at construction; when it is null every operation
-// on the track early-outs, which is how the game copes with a machine that has
-// no sound. `stop_event` doubles as PlayMusicThread's stop flag - StopMusicTrack
-// stores an event HANDLE there and waits on it.
-struct MusicTrack {
-  int field0x00; // PlayMusicTrack sets 1 once BinkOpen succeeds; no reader found
-  void *bink;    // BinkOpen handle; BinkClose zeroes it
-  unsigned thread_id;
-  void *thread;     // null while stopped
-  void *stop_event; // non-null tells the streaming thread to exit
-  void *device;
-  int volume;
-  bool looping;
-  uint8_t pad[3];
-
-  MusicTrack *HookedCtor();
-};
-static_assert(offsetof(MusicTrack, volume) == 0x18);
-static_assert(offsetof(MusicTrack, looping) == 0x1c);
-static_assert(sizeof(MusicTrack) == 0x20);
-
-namespace {
 // MusicTrack_Ctor is __fastcall with only `this` in ECX, so a member function
 // pointer models it exactly and lets the hook assign the field by name.
 MusicTrack *(MusicTrack::*MusicTrackCtor)() = nullptr;
-
-using TSetVolume = ThisCall<char, MusicTrack *, int>;
-TSetVolume SetVolume;
-
-using TPlay = ThisCall<int, MusicTrack *, const char *, bool>;
-TPlay Play;
-
-using TStop = ThisCall<int, MusicTrack *>;
-TStop Stop;
 } // namespace
 
 // The constructor hardcodes `volume` to full scale, and four of its callers -
@@ -69,79 +30,49 @@ MusicTrack *MusicTrack::HookedCtor() {
   return track;
 }
 
-// --- MusicTrackWrapper -------------------------------------------------------
-
-bool MusicTrackWrapper::operator==(const MusicTrackWrapper &) const = default;
-
-MusicTrackWrapper::MusicTrackWrapper(MusicTrack *track) : track(track) {
-  assert(track);
+MusicTrack *GetCurrentMusicTrack() {
+  MusicTrack **the_track;
+  GetObjectAtOffset(the_track, 0x007f5bdc);
+  return *the_track;
 }
 
-void MusicTrackWrapper::setup_metatable(lua_State *L) {}
-
-int MusicTrackWrapper::to_string(lua_State *L) const {
-  lua_pushfstring(L, "<MusicTrack %p>", track);
-  return 1;
+int GetBattleMusicVolume() {
+  int *v;
+  GetObjectAtOffset(v, 0x006abe08);
+  return *v;
 }
 
-int MusicTrackWrapper::get_volume() { return track->volume; }
-
-void MusicTrackWrapper::set_volume(int volume) { SetVolume(track, volume); }
-
-bool MusicTrackWrapper::get_looping() { return track->looping; }
-
-bool MusicTrackWrapper::get_playing() { return track->thread != nullptr; }
-
-int MusicTrackWrapper::play(lua_State *L) {
-  auto path = Lua::check<const char *>(L, 2);
-  bool loop = lua_toboolean(L, 3) != 0;
-
-  lua_pushboolean(L, Play(track, path, loop) != 0);
-  return 1;
+void SetBattleMusicVolume(int volume) {
+  int *v;
+  GetObjectAtOffset(v, 0x006abe08);
+  *v = volume;
 }
 
-int MusicTrackWrapper::stop(lua_State *L) {
-  lua_pushboolean(L, Stop(track) != 0);
-  return 1;
+char SetMusicVolume(MusicTrack *track, int volume) {
+  ThisCall<char, MusicTrack *, int> fn;
+  GetObjectAtOffset(fn, 0x00587ca0);
+  return fn(track, volume);
 }
 
-namespace {
-struct Music {
-  static constexpr const char *metatable_name = "Music";
-  static void setup_metatable(lua_State *L) {}
+int PlayMusic(MusicTrack *track, const char *path, bool loop) {
+  ThisCall<int, MusicTrack *, const char *, bool> fn;
+  GetObjectAtOffset(fn, 0x00587b60);
+  return fn(track, path, loop);
+}
 
-  static std::optional<MusicTrackWrapper> get_current() {
-    if (*TheMusicTrack) {
-      return {*TheMusicTrack};
-    } else {
-      return std::nullopt;
-    }
-  }
+int StopMusic(MusicTrack *track) {
+  ThisCall<int, MusicTrack *> fn;
+  GetObjectAtOffset(fn, 0x00587bf0);
+  return fn(track);
+}
 
-  using fields =
-      Lua::Fields<Lua::StaticGetter<"current", std::optional<MusicTrackWrapper>,
-                                    &get_current>,
-                  Lua::StaticSlot<"battle_volume", int, &BattleMusicVolume>>;
-};
-} // namespace
-
-MusicModule::MusicModule(lua_State *L) : Module{L} {
-  GetObjectAtOffset(TheMusicTrack, 0x007f5bdc);
+MusicSystem::MusicSystem() {
   GetObjectAtOffset(BattleMusicVolume, 0x006abe08);
   GetObjectAtOffset(MusicTrackCtor, 0x00587b10);
-  GetObjectAtOffset(SetVolume, 0x00587ca0);
-  GetObjectAtOffset(Play, 0x00587b60);
-  GetObjectAtOffset(Stop, 0x00587bf0);
-
   DetourAttach(&MusicTrackCtor, &MusicTrack::HookedCtor);
 }
 
-MusicModule::~MusicModule() {
+MusicSystem::~MusicSystem() {
   DetourDetach(&MusicTrackCtor, &MusicTrack::HookedCtor);
-}
-
-int MusicModule::Register(lua_State *L) {
-  Lua::Create<Music>(L);
-  return 1;
 }
 } // namespace gk

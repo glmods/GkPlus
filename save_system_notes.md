@@ -272,7 +272,7 @@ numGlowNodes x str         // model dummy-node names
 u32  numTriggers           // NumTriggers
 numTriggers x {
     u8[0x68]  blob         // raw Trigger record
-    str       script       // ONLY if blob[+0x54] != 0 (the trigger's script/Lua-ref field)
+    str       script       // ONLY if blob[+0x54] != 0 (the trigger's script-name field)
     u32       numNames
     numNames x str         // the trigger's actor-name list (field +0x44)
 }

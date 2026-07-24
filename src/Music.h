@@ -1,56 +1,58 @@
 #pragma once
 
-#include "LuaEngine.h"
-#include "Module.h"
-
-#include <optional>
+#include <cstddef>
+#include <cstdint>
 
 namespace gk {
-struct MusicTrack;
+// The 0x20-byte Bink music-track object stored in TheMusicTrack @ 0x007f5bdc.
+// Only one exists at a time - every call site overwrites the global with a
+// freshly malloc'd 0x20 bytes. `device` is the DirectSound device captured at
+// construction; when it is null every operation on the track early-outs, which
+// is how the game copes with a machine that has no sound. `stop_event` doubles
+// as PlayMusicThread's stop flag. See threading_model_notes.md.
+struct MusicTrack {
+  int field0x00; // PlayMusicTrack sets 1 once BinkOpen succeeds; no reader found
+  void *bink;    // BinkOpen handle; BinkClose zeroes it
+  unsigned thread_id;
+  void *thread;     // null while stopped
+  void *stop_event; // non-null tells the streaming thread to exit
+  void *device;
+  int volume;    // 0x18 Bink scale, 0..0x8000
+  bool looping;  // 0x1c
+  uint8_t pad[3];
 
-// The Bink music-track object stored in TheMusicTrack @ 0x007f5bdc. Only one
-// exists at a time - every call site overwrites the global with a freshly
-// malloc'd 0x20 bytes. The full layout lives in Music.cpp; see
-// threading_model_notes.md for the streaming thread and the volume scales.
-struct MusicTrackWrapper final {
-  static constexpr const char *metatable_name = "MusicTrack";
-  static void setup_metatable(lua_State *L);
-
-  MusicTrack *track;
-
-  MusicTrackWrapper(MusicTrack *track);
-
-  bool operator==(const MusicTrackWrapper &) const;
-
-  int to_string(lua_State *L) const;
-
-  // Bink scale, 0..0x8000. The setter goes through the game's own setter, so a
-  // track that is already streaming picks the change up immediately.
-  int get_volume();
-  void set_volume(int volume);
-  bool get_looping();
-  bool get_playing();
-
-  // play(path[, loop]) - path is relative to the Gunlok directory.
-  int play(lua_State *L);
-  int stop(lua_State *L);
-
-  using type = MusicTrackWrapper;
-  using fields = Lua::Fields<
-      Lua::GetterSetter<"volume", &type::get_volume, &type::set_volume>,
-      Lua::Getter<"looping", &type::get_looping>,
-      Lua::Getter<"playing", &type::get_playing>,
-      Lua::Function<"play", type, &type::play>,
-      Lua::Function<"stop", type, &type::stop>>;
+  // Volume-fix hook entry, installed by MusicSystem (see Music.cpp).
+  // MusicTrack_Ctor is __fastcall with only `this` in ECX, so a member function
+  // pointer models it exactly and lets the hook assign the field by name.
+  MusicTrack *HookedCtor();
 };
+static_assert(offsetof(MusicTrack, volume) == 0x18);
+static_assert(offsetof(MusicTrack, looping) == 0x1c);
+static_assert(sizeof(MusicTrack) == 0x20);
 
-class MusicModule final : public Module<MusicModule> {
+// --- Native API --------------------------------------------------------------
+
+// TheMusicTrack @ 0x007f5bdc; null when no track exists.
+MusicTrack *GetCurrentMusicTrack();
+
+// Battle Music Volume setting (0..9) @ 0x006abe08.
+int GetBattleMusicVolume();
+void SetBattleMusicVolume(int volume);
+
+// SetVolume @ 0x00587ca0 (Bink scale 0..0x8000); a streaming track picks the
+// change up immediately.
+char SetMusicVolume(MusicTrack *track, int volume);
+// Play @ 0x00587b60; path is relative to the Gunlok directory.
+int PlayMusic(MusicTrack *track, const char *path, bool loop);
+// Stop @ 0x00587bf0.
+int StopMusic(MusicTrack *track);
+
+// Installs the MusicTrack-constructor volume fix (see Music.cpp). RAII: attaches
+// in the ctor, detaches in the dtor - construct/destroy inside a Detours
+// transaction.
+class MusicSystem {
 public:
-  static constexpr const char *module_name = "gk.music";
-
-  MusicModule(lua_State *L);
-  ~MusicModule();
-
-  int Register(lua_State *L);
+  MusicSystem();
+  ~MusicSystem();
 };
 } // namespace gk

@@ -12,8 +12,6 @@
 
 #include "Core.h"
 #include "GUI.h"
-#include "ImGuiBindings.h"
-#include "LuaEngine.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd,
                                                              UINT msg,
@@ -36,7 +34,8 @@ StdCall<int> DoEvents;
 
 bool ShowGUI = false;
 
-lua_Integer OnDrawGui = LUA_NOREF;
+// The native draw seam (see GUI.h). Null until something installs a callback.
+OverlayDrawCallback OverlayDraw = nullptr;
 
 IDirect3DDevice9 *GetDX9Device() {
   return (*DirectXDevice)->GetProxyInterface();
@@ -70,13 +69,8 @@ void __stdcall HookedPresentScene() {
   ImGui_ImplWin32_NewFrame();
   ImGui::NewFrame();
 
-  auto L = Lua::GetEngine();
-  lua_rawgeti(L, LUA_REGISTRYINDEX, OnDrawGui);
-  if (!lua_isnil(L, -1)) {
-    PushImgui(L);
-    lua_call(L, 1, 0);
-  } else {
-    lua_pop(L, 1);
+  if (OverlayDraw) {
+    OverlayDraw();
   }
 
   if (GetDX9Device()->BeginScene() >= 0) {
@@ -120,16 +114,13 @@ LRESULT WINAPI HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam,
   }
   return WndProc(hWnd, msg, wParam, lParam);
 }
-
-int LuaOnDrawGui(lua_State *L) {
-  luaL_unref(L, LUA_REGISTRYINDEX, OnDrawGui);
-  lua_pushvalue(L, 1);
-  OnDrawGui = luaL_ref(L, LUA_REGISTRYINDEX);
-  return 0;
-}
 } // namespace
 
-GUIModule::GUIModule(lua_State *L) : Module{L} {
+void SetOverlayDrawCallback(OverlayDrawCallback callback) {
+  OverlayDraw = callback;
+}
+
+GUISystem::GUISystem() {
   GetObjectAtOffset(WndProc, 0x0046aad0);
   GetObjectAtOffset(GameWindow, 0x006b02b8);
   GetObjectAtOffset(DirectXDevice, 0x007c121c);
@@ -159,7 +150,7 @@ GUIModule::GUIModule(lua_State *L) : Module{L} {
   DetourAttach(&DoEvents, HookedDoEvents);
 }
 
-GUIModule::~GUIModule() {
+GUISystem::~GUISystem() {
   DetourDetach(&WndProc, HookedWndProc);
   DetourDetach(&InitDirectSound, HookedInitDirectSound);
   DetourDetach(&CreateDirect3D, HookedCreateDirect3D);
@@ -168,22 +159,5 @@ GUIModule::~GUIModule() {
   DetourDetach(&ResetD3D1, HookedResetD3D1);
   DetourDetach(&ResetD3D2, HookedResetD3D2);
   DetourDetach(&DoEvents, HookedDoEvents);
-}
-
-int GUIModule::Register(lua_State *L) {
-  lua_newtable(L);
-  lua_pushcfunction(L, LuaOnDrawGui);
-  lua_setfield(L, -2, "set_ondraw");
-
-  lua_pushcfunction(L, ([](lua_State *L) {
-                      auto file = Lua::to<std::string_view>(L, 1);
-                      auto sz = Lua::check<float>(L, 2);
-                      auto font = ImGui::GetIO().Fonts->AddFontFromFileTTF(
-                          file.data(), sz);
-                      Lua::Create<GuiFont>(L, font);
-                      return 1;
-                    }));
-  lua_setfield(L, -2, "load_font");
-  return 1;
 }
 } // namespace gk

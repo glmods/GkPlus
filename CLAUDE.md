@@ -1,8 +1,16 @@
 # GkPlus - Gunlok Modding Framework
 
 A 32-bit Windows DLL mod for the game **Gunlok** (2000). Built as a `d3d8.dll` proxy that hooks
-into the game via Microsoft Detours, exposing game systems to Lua 5.4 scripting. The game binary
-is actively being reverse engineered in Ghidra, accessible via MCP.
+into the game via Microsoft Detours. It is a **native C++ reverse-engineering library**: the
+decompiled game structs live in headers, a typed native API wraps the game's own functions and
+globals, and a handful of behavioral hooks (music volume fix, input fix, debug redirect, ImGui/D3D
+overlay) run at load. The game binary is actively being reverse engineered in Ghidra, accessible
+via MCP.
+
+There is no embedded scripting layer. The QuickJS + ImGui overlay pieces (`quickjs-ng`,
+`dear-bindings`, the `imgui-quickjs/` subproject) remain staged in the build; the overlay's
+per-frame draw is a native seam (`gk::SetOverlayDrawCallback`) that a future QuickJS module can
+plug into.
 
 ## Build
 
@@ -19,8 +27,9 @@ cmake --build build
 cmake --build build --target copy   # copies d3d8.dll to Gunlok's Steam directory
 ```
 
-`cmake --build build` is incremental and quick. The `static_assert`s in `src/Actors.cpp` are the
-check for any struct-layout or vtable edit — build after touching them rather than eyeballing.
+`cmake --build build` is incremental and quick. The `static_assert`s in `src/Actors.h` (and the
+other struct headers) are the check for any struct-layout or vtable edit — build after touching them
+rather than eyeballing.
 `-Winvalid-offsetof` warnings on `Actor`/its subclasses and on `Map` are pre-existing and benign
 (they are non-standard-layout due to virtuals); a clean build still links `d3d8.dll`. Every struct
 modelled with pure virtuals produces them — that is the expected cost of the convention below, not
@@ -30,7 +39,6 @@ a signal to switch back to an explicit vtbl field.
 
 | Package | Purpose |
 |---------|---------|
-| lua | Lua 5.4 scripting engine |
 | imgui (dx9-binding, win32-binding) | In-game GUI overlay |
 | d3d8to9 | Direct3D 8 to 9 translation layer |
 | detours | Microsoft Detours - function hooking |
@@ -44,19 +52,30 @@ Overlay configuration in `vcpkg-configuration.json`.
 
 ### DLL Lifecycle (src/entry.cpp)
 
-1. `DllMain(DLL_PROCESS_ATTACH)`:
-   - Resolves global pointers (triggers, doors) via `GetObjectAtOffset`
-   - Initializes Lua VM (`Lua::Init()`, `luaL_openlibs`)
-   - Opens a Detours transaction, constructs all modules (which attach hooks), commits
-   - Loads and executes `main.lua`
-2. `DllMain(DLL_PROCESS_DETACH)`:
-   - Opens Detours transaction, destroys modules (which detach hooks), commits
-   - Closes Lua VM
+1. `DllMain(DLL_PROCESS_ATTACH)`: opens a Detours transaction, constructs the `Subsystems`
+   aggregate (each member attaches its detours in its ctor), commits.
+2. `DllMain(DLL_PROCESS_DETACH)`: opens a Detours transaction, destroys the `Subsystems` aggregate
+   (each member detaches its detours in its dtor), commits.
 
-### Lua Layer (src/Module.h, src/LuaEngine.h)
+`Subsystems` holds only the **hook-installing** subsystems — `MusicSystem`, `DebugSystem`,
+`GUISystem`, `InputFixSystem`. Everything else is struct-only or a native-API wrapper that resolves
+its offsets lazily per call (`GetObjectAtOffset` is cheap because `GetBaseAddress()` caches), so
+those subsystems need no lifecycle object.
 
-The CRTP module base, the concepts-based type interop, the Lua userdata wrappers and the
-per-module API surface are documented in `lua_notes.md`.
+### Native API and struct headers
+
+Each subsystem is a header of decompiled structs/enums plus free-function declarations over the
+game's own functions and globals, implemented in the matching `.cpp` (the same split `src/GLS.h` /
+`src/GLS.cpp` has always had). Examples: `gk::GetActorById` / `gk::GetActorsTable` (Actors.h),
+`gk::GetRoleByName` / `gk::SpawnRole` / `gk::AITypeName` (Roles.h), `gk::GetCurrentMap` /
+`gk::MapSpawn` / `gk::MapToWorld` (Map.h), `gk::GoToMenu` / `gk::ResourceString` (Menu.h),
+`gk::Print` / `gk::RegisterConsoleCommand` (Console.h), `gk::GetGameMode` / `gk::GetSettings`
+(Misc.h). A native-API function resolves its offset per call — there are no cached module-owned
+pointers to keep alive.
+
+Adding a subsystem: write the `.h` (structs + `static_assert`s + API decls) and `.cpp` (bodies),
+and add the `.cpp` to `CMakeLists.txt`. Only add a member to `Subsystems` in `entry.cpp` if the
+subsystem installs a detour that must live for the process lifetime.
 
 ### Function Calling Convention (src/Core.h)
 
@@ -88,48 +107,48 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 
 | File | Purpose |
 |------|---------|
-| `src/entry.cpp` | DllMain, module instantiation order, global pointer setup |
-| `src/Core.h/cpp` | `GetBaseAddress()`, `GetObjectAtOffset()`, `DebugWrite()` |
-| `src/Module.h` | CRTP module base - auto-registers in Lua `package.preload` |
-| `src/LuaEngine.h/cpp` | Lua VM init/close, type interop (concepts, Fields, Create) |
+| `src/entry.cpp` | DllMain; constructs the `Subsystems` hook aggregate inside a Detours transaction |
+| `src/Core.h/cpp` | `GetBaseAddress()`, `GetObjectAtOffset()`, `DebugWrite()`, the calling-convention aliases |
+| `src/Field.h` | `union field` — a shared 4-byte value slot used by several struct mirrors |
 | `src/DetourUtils.h` | Member function DetourAttach/DetourDetach wrappers |
 | `src/List.h` | `List<T>` / `List_Member<T>` / `List_Member_Base<T>` — layout mirror of AvP's `list_tem.hpp`, with sentinel-safe `begin()`/`end()` |
 | `src/HashTable.h` | `HashTableBase<T>` / `HashTable<T>` — layout mirror of AvP's `Hash_tem.hpp`, with bucket-walking `begin()`/`end()` |
-| `src/Varint.h` | Variable-length integer encode/decode (used for Lua refs in trigger scripts) |
+| `src/Memory.h/cpp` | `pool_alloc`/`pool_free` and the `pool_unique_ptr`/`pool_string` ownership markers |
+| `src/Varint.h` | Variable-length integer encode/decode utility (currently no callers) |
 
-### Lua-facing sources
+### Subsystem sources (struct headers + native API)
 
-The Lua userdata wrappers (`src/Actors`, `src/Roles`, `src/Map`, `src/Vulnerability`,
-`src/Music`, `src/Math`) and the `gk.*` modules (`src/Console`, `src/Menu`, `src/Tokens`,
-`src/Triggers`, `src/Misc`, `src/Music`, `src/Memory`, `src/GUI`, `src/Camera`, `src/Debug`,
-`src/AI`) are tabulated with their APIs in `lua_notes.md`.
+Each pair is a header of decompiled structs/enums plus native free-function declarations, and a
+`.cpp` implementing them (offset resolution + any behavioral hooks): `src/Actors`, `src/Roles`,
+`src/Map`, `src/Vulnerability` (header-only), `src/Music`, `src/Math`, `src/Menu`, `src/Tokens`,
+`src/Triggers`, `src/Console`, `src/Misc`, `src/Camera`, `src/Debug`, `src/GUI`, `src/InputFix`.
+`src/GLS.h/cpp` is the model the rest now follow. The behavioral-hook subsystems (`Music`, `Debug`,
+`GUI`, `InputFix`) expose a `*System` RAII class constructed by `entry.cpp`; the others are pure
+struct + native-API.
 
 ### Other
 
 | File | Purpose |
 |------|---------|
-| `src/Chunks.h/cpp` | ChunksModule - hooks chunk registration (debug logging only, no Lua API, currently commented out in entry.cpp) |
-| `src/InputFix.h/cpp` | InputFixModule - hook-only, no Lua API. Detours `AcquireDInputDevice` to suppress the vestigial DirectInput keyboard acquire and its `WH_KEYBOARD_LL` hook (see `input_notes.md`) |
-| `src/ImGuiBindings.h/cpp` | ImGui C++ to Lua/JS bindings via imgui-quickjs |
+| `src/InputFix.h/cpp` | `InputFixSystem` - hook-only. Detours `AcquireDInputDevice` to suppress the vestigial DirectInput keyboard acquire and its `WH_KEYBOARD_LL` hook (see `input_notes.md`) |
 | `src/Menus.inc.h` | X-macro listing all 36 Gunlok menus: `GUNLOK_MENU(Name, Id, TitleResourceId, "English title")`. There are no gaps - ids 11 and 14-20 are identified in `menu_system_notes.md` |
-| `imgui-quickjs/` | Static library: QuickJS bindings for ImGui |
+| `imgui-quickjs/` | Static library: QuickJS bindings for ImGui. Staged in the build but not yet wired into the overlay (`GUI.cpp`'s draw seam is `SetOverlayDrawCallback`) |
 
 ## Reverse Engineering Reference
 
 ### Detailed Documentation Files
 
-- `lua_notes.md` - the Lua layer: `Module<Derived>` CRTP registration, the `LuaEngine` concepts/`Fields<>` interop, the userdata wrappers, every `gk.*` module's API, and the `gk.menu` surface
 - `actor_vtable_notes.md` - Actor class hierarchy, all 83+ vtable slots, subclass sizes, constructor addresses
 - `trigger_system_notes.md` - 22 trigger types, data structures, console command syntax, function addresses
 - `gls_system_notes.md` - GLS/GSH script parser: pipeline, ParsedThingBase layout, per-section field tables (types/ranges/defaults), ToXxx converters, C++ API is `src/GLS.h`
-- `level_loading_notes.md` - How a level is built: `BeginLevelSession` -> `LoadLevel` -> `ToMap`, the `.cut`/`.map`/`.opt`/`.loc` sidecar caches, the `LevelMeshHeader` geometry format, the `use <role> in team <n> for "<rif object>"` placed-object binding hash on `ParsedMap+0x1b60`, both spawn factories, and the three seams for replacing the `.gls` path with a native/Lua level builder
+- `level_loading_notes.md` - How a level is built: `BeginLevelSession` -> `LoadLevel` -> `ToMap`, the `.cut`/`.map`/`.opt`/`.loc` sidecar caches, the `LevelMeshHeader` geometry format, the `use <role> in team <n> for "<rif object>"` placed-object binding hash on `ParsedMap+0x1b60`, both spawn factories, and the three seams for replacing the `.gls` path with a native level builder
 - `role_system_notes.md` - `Role` (0xc0) field-by-field: the entity hash table (0x007b48f0), lifecycle (`CreateRole`/`ToRole`/`RoleDtor`/`DestroyRoles`), the two embedded 16-byte list headers (vulnerabilities @ 0x68, sever points @ 0xac), the `flags` bitfield, `InventoryInfo`, pickup classification via `character->aggression*10`, the `ai` -> Actor-subclass dispatch (`CreateActor`), the spawn path (`SpawnRole`), three `ToRole` defects, and (§10) the whole vulnerability subsystem - `Vulnerability` (0x1c), `VulnerabilityType`, the 0xc-byte list sentinel, and the four population paths
 - `role_subobjects_notes.md` - the four `Role` sub-objects: `Character` (0xb8, with `ToCharacter`'s unit conversions), `Projectile` (0x20), `ParticleGenerator` (0xd4: GLS fields, the five 0x18-byte `PGenChannel` records, the `ParticleType` enum, and the template -> emitter map from `ParticleEmitter_Ctor`), and the 3-variant `Destructibility` family (base 0x8 / `FragData` 0x24 / `ReplaceDestructibility` 0x10, dispatched on the `+0x04` tag by `Frag` @ 0x0052e220)
 - `threading_model_notes.md` - Two game threads (main "client" + executor "server"), loopback message queues (full `MsgQueue`/`MsgQueueList`/`MsgQueueNode` layouts), pause handshake, per-thread clocks/RNG, which GkPlus hooks run on which thread, and the four script-execution entry points (all main-thread; host uses `ScriptQueue`, MP joiners use update `0x67`)
 - `directplay_protocol_notes.md` - Multiplayer wire protocol: DirectPlay (`IDirectPlay4A`) COM/session setup, app GUID, SendEx/Receive framing & reliability, and the full command (client->server) and update (server->client) message-id tables with payload layouts, the `0x87` lock-step turn model, and update `0x67` (§8.11) which makes every client run a trigger script from its **own** local `Scripts\` copy
 - `menu_system_notes.md` - Both menu systems (front-end `Menus[36]` + in-game `InGameMenus[7]`): `Menu`/`MenuListItem` layouts, the four item constructors and the 4 item types, the full 0-35 menu inventory with titles and populators, the (menu, item) -> action transition map, navigation/rendering/input, key bindings, and the localized string table
 - `save_system_notes.md` - `.sav`/`.msv` savegame format: full field-by-field stream layout, the header-only "carry to next level" variant, the team carry-over roster, and why the console `SAVE`/`LOAD` commands are the demo system instead
-- `input_notes.md` - Input subsystem: keyboard runs on Win32 `WM_KEYDOWN` (`MainWindowWndProc` -> `HandleKeyMessage` -> VK->DIK `VkToScanCodeTable` -> the universal `HandleKeyPress4` sink), mouse on Raw Input, and the DirectInput `SysKeyboard` is a vestigial acquired-but-never-read fossil whose `Acquire()` arms the `WH_KEYBOARD_LL` hook that lags system keyboard input under a debugger; the `gk.inputfix` module (`src/InputFix.cpp`) detours `AcquireDInputDevice` to suppress it
+- `input_notes.md` - Input subsystem: keyboard runs on Win32 `WM_KEYDOWN` (`MainWindowWndProc` -> `HandleKeyMessage` -> VK->DIK `VkToScanCodeTable` -> the universal `HandleKeyPress4` sink), mouse on Raw Input, and the DirectInput `SysKeyboard` is a vestigial acquired-but-never-read fossil whose `Acquire()` arms the `WH_KEYBOARD_LL` hook that lags system keyboard input under a debugger; the `InputFixSystem` (`src/InputFix.cpp`) detours `AcquireDInputDevice` to suppress it
 - `rif_chunk_format.md` - the `.rif` asset format: 12-byte chunk header, `REBCRIF1` Huffman
   container, all 105 registered chunk types, **and** the AvP upstream mapping (see below)
 - `gls.txt` - Game Level Structure file format quick field list (superseded by gls_system_notes.md)
@@ -694,7 +713,7 @@ they are reached only through `__thiscall` methods called directly on `TheMap`.
 Roles are the "entity" hash @ 0x007b48f0 (`{num_entities, num_buckets, mask, buckets}`);
 ids come from `next_entity_id` @ 0x007b48d4. `CreateRole` @ 0x004add90 allocates+inserts;
 `ToRole` @ 0x0047cc20 converts a parsed `role`; `CreateActor` @ 0x00510760 dispatches
-`role->ai` to the Actor subclass; `SpawnRole` @ 0x00503710 is `gk.roles` `Role:spawn`.
+`role->ai` to the Actor subclass; `SpawnRole` @ 0x00503710 is the native `gk::SpawnRole`.
 
 ### Imports
 

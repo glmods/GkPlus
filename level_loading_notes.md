@@ -1,7 +1,7 @@
 # Gunlok Level Loading - Reverse Engineering Notes
 
 How a level goes from `.gls` + `.rif` to a running world, and where the seams are for
-replacing the `.gls` half with a native/Lua level builder.
+replacing the `.gls` half with a native level builder.
 
 Companion documents: `gls_system_notes.md` (the script parser), `rif_chunk_format.md`
 (the geometry container), `trigger_system_notes.md` (the `.gcs` half),
@@ -311,8 +311,8 @@ field to scaled rif locator coordinates. The net effect on a placed object is
 pos = rif_locator_pos * GetWorldUnitScale() - origin
 ```
 
-`gk::MapWrapper::get_origin` flips the sign back, so the Lua `map.origin` is the
-origin the map was actually built with.
+`gk::MapOrigin` flips the sign back, returning the origin the map was actually
+built with.
 
 **`max camera distance` (0x51) is parsed, range-checked and then never read.**
 `MaxCameraDist1 = MaxCameraDist2` comes from globals only.
@@ -331,7 +331,7 @@ Then the placed objects - see the next section.
 
 ## 5. Placed objects: the `use ... for ...` binding table
 
-This is the part a Lua level builder most wants to replace, and it is cleanly isolated.
+This is the part a native level builder most wants to replace, and it is cleanly isolated.
 
 ### Syntax
 
@@ -500,9 +500,9 @@ geometry work. `gk::gls` already knows how to build `ParsedRole`s programmatical
 
 **(b) Keep the `.rif`, drop the `map` section.** Reimplement the consumption loop in the
 mod: `LoadOrGetRifFile` -> `RifFilterObjectsByName` -> read `O[0x44..0x5c]` ->
-`ServerSpawnActorForTeam` / `ClientSpawnActorForTeam` -> `CreateToken`. This is a direct
-Lua binding: `level.place("GRUNT LEGS A", role, team, "token")`. Everything needed is a
-named export already.
+`ServerSpawnActorForTeam` / `ClientSpawnActorForTeam` -> `CreateToken`. This maps directly
+onto the native API (`gk::MapSpawn` + `gk::CreateToken`); everything needed is a named
+export already.
 
 **(c) Supply geometry natively.** `TheMap != NULL` at the top of `ToMap` is the single
 gate on the entire geometry phase - if something else has populated that global, `ToMap`

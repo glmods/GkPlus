@@ -1,13 +1,16 @@
 #pragma once
 
-#include "Module.h"
+#include "Math.h"
 
 namespace gk {
-class CameraModule final : public Module<CameraModule> {
-public:
-  static constexpr const char *module_name = "gk.camera";
+// Camera globals: CameraPosition @ 0x007b4e0c, CameraDistance @ 0x007b3e78,
+// MaxCameraDistance @ 0x006a5748.
+Vec3 GetCameraPosition();
+void SetCameraPosition(Vec3 pos);
 
-  CameraModule(lua_State *L);
-  int Register(lua_State *L);
-};
+float GetCameraDistance();
+void SetCameraDistance(float dist);
+
+float GetMaxCameraDistance();
+void SetMaxCameraDistance(float dist);
 } // namespace gk

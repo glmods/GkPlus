@@ -18,8 +18,6 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 find_package(imgui CONFIG REQUIRED)
 
-find_package(Lua 5.4 REQUIRED)
-
 find_package(detours MODULE REQUIRED)
 
 find_package(d3d8to9 MODULE REQUIRED)
@@ -36,10 +34,8 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Debug.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/entry.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/GLS.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/ImGuiBindings.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/GUI.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/InputFix.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/LuaEngine.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Map.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Math.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Memory.cpp"
@@ -49,10 +45,8 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Roles.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Tokens.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Triggers.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Vulnerability.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/exports.def")
-target_link_libraries(GkPlus PRIVATE detours imgui::imgui d3d8to9 d3d9 ${LUA_LIBRARIES} qjs)
-target_include_directories(GkPlus PRIVATE ${LUA_INCLUDE_DIR})
+target_link_libraries(GkPlus PRIVATE detours imgui::imgui d3d8to9 d3d9 qjs)
 set_target_properties(GkPlus
     PROPERTIES
     OUTPUT_NAME "d3d8"

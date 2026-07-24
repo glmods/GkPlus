@@ -41,12 +41,12 @@ int (DInputDevice::*AcquireDInputDevice)() = nullptr;
 // satisfies both callers while the device is left unacquired (and thus hookless).
 int DInputDevice::HookedAcquire() { return 1; }
 
-InputFixModule::InputFixModule(lua_State *L) : Module{L} {
+InputFixSystem::InputFixSystem() {
   GetObjectAtOffset(AcquireDInputDevice, 0x004e3cb0);
   DetourAttach(&AcquireDInputDevice, &DInputDevice::HookedAcquire);
 }
 
-InputFixModule::~InputFixModule() {
+InputFixSystem::~InputFixSystem() {
   DetourDetach(&AcquireDInputDevice, &DInputDevice::HookedAcquire);
 }
 } // namespace gk

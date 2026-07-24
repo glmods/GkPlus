@@ -69,7 +69,7 @@ them. See `directplay_protocol_notes.md` §8.11 for the full host-vs-joiner sche
 Either way each message is applied by `ApplyUpdateMessage` and then `free`d by the pump — which is
 the concrete demonstration that `MsgQueue_Pop` hands ownership of the payload to its caller.
 
-DllMain of d3d8.dll (and therefore GkPlus init + `main.lua`) also runs on this thread:
+DllMain of d3d8.dll (and therefore GkPlus init) also runs on this thread:
 the game loads d3d8.dll from `InitD3DAndSetMode`, called from WinMain.
 
 ## Thread 2: Executor thread ("server")
@@ -483,42 +483,31 @@ randomness (executor) independent from client-side randomness (main).
 
 ## Implications for GkPlus
 
-Which thread runs what GkPlus touches:
+Which thread runs the GkPlus hooks:
 
-| GkPlus code | Thread | Safe w.r.t. main-thread Lua? |
-|-------------|--------|------------------------------|
-| DllMain init, `main.lua` | main (d3d8.dll loaded from WinMain) | yes |
-| `HookedExecuteCommandLine` / `HookedExecuteCommandFile` (Lua trigger callbacks) | main only (console input, LoadLevel, per-frame script-queue pop, **and update `0x67` via `ClientReceivePump` on MP joiners**) | yes |
-| `HookedSetupConsoleCommands`, `HookedSetupMenus`, `HookedOnMenuItemClicked` | main | yes |
-| ImGui / D3D hooks | main | yes |
-| `HookedDebugPrint` | both (error paths exist on the executor thread) | yes — no Lua use |
-| `HookedPrint` (`gk.console.set_onprint` -> `lua_call`) | mostly main; executor-side prints via gameplay code are possible | **risk** |
-| `TriggerData::HookedRemoveTrigger` (`luaL_unref`) | **executor only** — `RemoveTrigger`'s sole caller is `EvaluateTriggers` | **no — cross-thread Lua call** |
+| GkPlus hook | Thread | Notes |
+|-------------|--------|-------|
+| DllMain init (`Subsystems` ctor) | main (d3d8.dll loaded from WinMain) | installs all detours |
+| ImGui / D3D overlay (`GUISystem`) | main | — |
+| `MusicSystem` volume-fix ctor hook | main (MusicTrack construction sites) | — |
+| `HookedDebugPrint` (`DebugSystem`) | both (error paths exist on the executor thread) | safe — only `OutputDebugString` |
 
-Guidelines:
+Native code reaching into game state has to respect the two-thread split:
 
-- A Lua callback that must touch world state from the main thread while the executor
-  is live should be bracketed with the pause handshake: call `SuspendExecutor`
-  (0x00505290) before and `ResumeExecutor` (0x005052d0) after (cheap, recursion-safe,
-  no-op if called on the executor thread).
-- `gk.misc.foobar` (0x007b9df0) is actually the executor-thread-running flag —
-  consider renaming it (e.g. `simulation_running`).
-- Reading actors/roles/tokens from Lua (main thread) races with the executor mutating
-  them; for consistent multi-field reads, use the pause handshake.
-- Anything that makes the executor thread call into the Lua VM (like the current
-  `HookedRemoveTrigger`) can race with main-thread Lua. Options: defer the unref to
-  the main thread (queue it), or take a GkPlus-side mutex around all Lua entry points.
-- `gk.triggers` callbacks are safe *because* the game never runs trigger scripts on the
-  executor thread — the host routes them through `ScriptQueue` to its main thread, and a
-  joiner runs them from `ClientReceivePump`, also on the main thread. Do not "optimize"
-  by running them at `EvaluateTriggers` time.
-- **In multiplayer a Lua trigger callback fires on every machine, not just the host.**
-  Update `0x67` carries only the script *filename*, so each client re-runs the script —
-  and therefore any GkPlus Lua ref encoded in it — against its own `Scripts\` directory.
-  A callback that mutates Lua-side state will run once per participant, and a client
-  whose script files differ from the host's will take a different path entirely. Anything
-  that must happen exactly once should be gated on `IsExecutorRunning()`, matching what
-  the game's own `Command*` handlers do.
+- Reading actors/roles/tokens/the map from the main thread races with the executor
+  mutating them. For a consistent multi-field read, or for a mutation while the executor
+  is live, bracket it with the pause handshake: `SuspendExecutor` (0x00505290) before and
+  `ResumeExecutor` (0x005052d0) after (cheap, recursion-safe, no-op on the executor thread).
+- `IsExecutorRunning()` (0x00502da0; the `Foobar`/executor-running flag @ 0x007b9df0 —
+  consider renaming it `simulation_running`) is the gate for once-only actions: on a listen
+  host the executor and the client both run, so anything that must happen exactly once should
+  be gated on it, matching what the game's own `Command*` handlers do.
+- The game never runs trigger scripts on the executor thread — the host routes them through
+  `ScriptQueue` to its main thread, and a joiner runs them from `ClientReceivePump`, also on
+  the main thread. In multiplayer the script runs on *every* machine, not just the host:
+  update `0x67` carries only the script *filename*, so each client re-runs it against its own
+  `Scripts\` directory. A native action driven off a trigger therefore runs once per
+  participant, and a client whose script files differ from the host's takes a different path.
 
 ## Key addresses summary
 

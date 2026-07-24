@@ -1,7 +1,5 @@
 #pragma once
 
-#include "Module.h"
-
 #include <memory>
 
 namespace gk {
@@ -74,12 +72,4 @@ template <typename T, typename... Args> auto make_pool_unique(Args &&...args) {
     throw;
   }
 }
-
-class MemoryModule final : public Module<MemoryModule> {
-public:
-  static constexpr const char *module_name = "gk.memory";
-
-  MemoryModule(lua_State *L);
-  int Register(lua_State *L);
-};
 } // namespace gk

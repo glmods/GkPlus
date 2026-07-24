@@ -1,11 +1,8 @@
 #pragma once
 #include "List.h"
-#include "LuaEngine.h"
 #include "Memory.h"
-#include "Module.h"
 
 #include <cstddef>
-#include <string_view>
 
 namespace gk {
 
@@ -113,106 +110,46 @@ static_assert(offsetof(Menu, title_resource_id) == 0x20);
 static_assert(offsetof(Menu, num_items) == 0x24);
 static_assert(offsetof(Menu, first_item_resource_id) == 0x28);
 
+// --- Native API over the menu system ----------------------------------------
+
+// English identifier for a front-end menu id (e.g. MenuIndex::Audio -> "Audio").
 const char *GetMenuName(MenuIndex idx);
-// Resolves a GL_RESOURCE_ID through the localized string table. Returns "" for
-// ids with no string in the active glres*.dll.
+// The renderer's name for an item type ("plain"/"value"/"toggle"/"choice").
+const char *MenuItemTypeName(MenuItemType t);
+// Resolves a GL_RESOURCE_ID through the localized string table (LocalizedStrings
+// @ 0x00725664 via GetResourceString @ 0x00579000). Returns "" for ids with no
+// string in the active glres*.dll.
 const char *ResourceString(unsigned id);
 
-struct MenuItemWrapper final {
-  static constexpr const char *metatable_name = "MenuItem";
-  static void setup_metatable(lua_State *L);
+// Menus[36] @ 0x007b76d0 and InGameMenus[7] @ 0x007b7578.
+Menu *GetMenus();
+Menu *GetInGameMenus();
 
-  MenuListItem *item;
-  explicit MenuItemWrapper(MenuListItem *item);
+// ChosenMenu @ 0x007b732c / ChosenMenuItem @ 0x006a7d6c (see the MenuItem* pseudo-
+// values). InGameMenuIndex @ 0x007b7270 / InGameMenuSelectedItem @ 0x006a89b4.
+MenuIndex GetChosenMenu();
+int GetChosenMenuItem();
+void SetChosenMenuItem(int item);
+int GetInGameMenuIndex();
+int GetInGameMenuSelectedItem();
 
-  bool operator==(const MenuItemWrapper &) const;
-  int to_string(lua_State *L) const;
+// GoToMenu @ 0x004fbfa0 (remember = push the current menu as parent).
+void GoToMenu(MenuIndex target, bool remember);
+// IsAnyInGameMenuOpen @ 0x00569550.
+bool IsAnyInGameMenuOpen();
+// CloseInGameMenu @ 0x005691f0 (kind 0/1/2/3/0x41/0x42/0x43).
+void CloseInGameMenu(int kind);
 
-  int get_index();
-  std::string_view get_label();
-  int get_type();
-  std::string_view get_type_name();
-  std::string_view get_value_text();
-  bool get_is_current_value();
-  void get_rect(lua_State *L);
-
-  // Reads/writes the bound variable for Toggle (bool) and MultiValue (int)
-  // items. Errors for the other two types, which have no binding.
-  int get_value(lua_State *L);
-  int set_value(lua_State *L);
-
-  using type = MenuItemWrapper;
-  using fields = Lua::Fields<
-      Lua::Getter<"index", &type::get_index>,
-      Lua::Getter<"label", &type::get_label>,
-      Lua::Getter<"type", &type::get_type>,
-      Lua::Getter<"type_name", &type::get_type_name>,
-      Lua::Getter<"value_text", &type::get_value_text>,
-      Lua::Getter<"is_current_value", &type::get_is_current_value>,
-      Lua::TableGetter<"rect", &type::get_rect>,
-      Lua::Function<"get_value", type, &type::get_value>,
-      Lua::Function<"set_value", type, &type::set_value>>;
-};
-
-struct MenuWrapper final {
-  static constexpr const char *metatable_name = "Menu";
-  static void setup_metatable(lua_State *L);
-
-  Menu *menu;
-  int id;        // index within its array
-  bool in_game;  // false = Menus[36], true = InGameMenus[7]
-
-  MenuWrapper(Menu *menu, int id, bool in_game);
-
-  bool operator==(const MenuWrapper &) const;
-  int to_string(lua_State *L) const;
-
-  int get_id();
-  bool get_in_game();
-  std::string_view get_name();
-  std::string_view get_title();
-  int get_title_id();
-  int get_parent_id();
-  int get_num_items();
-  int get_num_nodes();
-  int get_scroll_offset();
-  void set_scroll_offset(int value);
-  void get_items(lua_State *L);
-
-  int item(lua_State *L);
-  int add_item(lua_State *L);
-  int add_value_item(lua_State *L);
-  int add_toggle(lua_State *L);
-  int add_choice(lua_State *L);
-  int activate(lua_State *L);
-
-  using type = MenuWrapper;
-  using fields = Lua::Fields<
-      Lua::Getter<"id", &type::get_id>,
-      Lua::Getter<"in_game", &type::get_in_game>,
-      Lua::Getter<"name", &type::get_name>,
-      Lua::Getter<"title", &type::get_title>,
-      Lua::Getter<"title_id", &type::get_title_id>,
-      Lua::Getter<"parent_id", &type::get_parent_id>,
-      Lua::Getter<"num_items", &type::get_num_items>,
-      Lua::Getter<"num_nodes", &type::get_num_nodes>,
-      Lua::GetterSetter<"scroll_offset", &type::get_scroll_offset,
-                        &type::set_scroll_offset>,
-      Lua::TableGetter<"items", &type::get_items>,
-      Lua::Function<"item", type, &type::item>,
-      Lua::Function<"add_item", type, &type::add_item>,
-      Lua::Function<"add_value_item", type, &type::add_value_item>,
-      Lua::Function<"add_toggle", type, &type::add_toggle>,
-      Lua::Function<"add_choice", type, &type::add_choice>,
-      Lua::Function<"activate", type, &type::activate>>;
-};
-
-class MenuModule final : public Module<MenuModule> {
-public:
-  static constexpr const char *module_name = "gk.menu";
-
-  MenuModule(lua_State *L);
-  ~MenuModule();
-  int Register(lua_State *L);
-};
+// Menu item builders. The game stores label/value pointers without copying and
+// binds the toggle/choice variables by pointer, so everything passed here must
+// outlive the menu. AddItem @ 0x004f7a60, AddValueItem @ 0x004f7ae0,
+// AddToggleItem @ 0x004f7950, AddMultiValueItem @ 0x004f79d0.
+void MenuAddItem(Menu *menu, const char *label);
+void MenuAddValueItem(Menu *menu, const char *label, const char *value,
+                      bool label_is_static, bool value_text_owned);
+void MenuAddToggleItem(Menu *menu, const char *label, int *value);
+void MenuAddMultiValueItem(Menu *menu, const char *label, int *index,
+                           unsigned **labels);
+// GetItemData @ 0x004f7750 - cached, NO bounds check.
+void *GetMenuItemData(Menu *menu, int index);
 } // namespace gk
