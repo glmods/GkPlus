@@ -56,7 +56,7 @@ target_include_directories(GkPlus PRIVATE ${LUA_INCLUDE_DIR})
 set_target_properties(GkPlus
     PROPERTIES
     OUTPUT_NAME "d3d8"
-    CXX_STANDARD 20)
+    CXX_STANDARD 23)
 
 add_library(huffman
     "${CMAKE_CURRENT_SOURCE_DIR}/huffman/huffman_compress.cpp"

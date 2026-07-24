@@ -110,17 +110,15 @@ const char *MenuItemTypeName(MenuItemType t) {
   }
 }
 
-// Walks a menu's circular item list. The game terminates on
-// items_owner->sentinel rather than menu->sentinel, because items_owner lets one
-// menu render another menu's list.
+// Walks a menu's item list. The game iterates items_owner's list rather than the
+// menu's own, because items_owner lets one menu render another menu's list.
 template <typename F> void ForEachItem(Menu *menu, F &&fn) {
   Menu *owner = menu->items_owner ? menu->items_owner : menu;
-  MenuListItem *end = owner->sentinel;
-  if (!end) {
+  if (!owner->items.sentinel) {
     return;
   }
-  for (MenuListItem *p = end->next; p && p != end; p = p->next) {
-    fn(p);
+  for (auto it = owner->items.begin(); it != owner->items.end(); ++it) {
+    fn(static_cast<MenuListItem *>(it.node));
   }
 }
 
@@ -135,92 +133,92 @@ bool MenuItemWrapper::operator==(const MenuItemWrapper &other) const {
 }
 
 int MenuItemWrapper::to_string(lua_State *L) const {
-  lua_pushfstring(L, "MenuItem(%d, %s, \"%s\")", item->index,
-                  MenuItemTypeName(item->type),
-                  item->label ? item->label : "");
+  lua_pushfstring(L, "MenuItem(%d, %s, \"%s\")", item->data.index,
+                  MenuItemTypeName(item->data.type),
+                  item->data.label ? item->data.label : "");
   return 1;
 }
 
-int MenuItemWrapper::get_index() { return item->index; }
+int MenuItemWrapper::get_index() { return item->data.index; }
 
 std::string_view MenuItemWrapper::get_label() {
-  return item->label ? item->label : "";
+  return item->data.label ? item->data.label : "";
 }
 
-int MenuItemWrapper::get_type() { return static_cast<int>(item->type); }
+int MenuItemWrapper::get_type() { return static_cast<int>(item->data.type); }
 
 std::string_view MenuItemWrapper::get_type_name() {
-  return MenuItemTypeName(item->type);
+  return MenuItemTypeName(item->data.type);
 }
 
 bool MenuItemWrapper::get_is_current_value() {
-  return item->is_current_value != 0;
+  return item->data.is_current_value != 0;
 }
 
 // The string the game draws on the right-hand side, reproducing the renderer's
 // own switch on itemType.
 std::string_view MenuItemWrapper::get_value_text() {
-  switch (item->type) {
+  switch (item->data.type) {
   case MenuItemType::LabelWithValue:
-    return item->value_text ? item->value_text : "";
+    return item->data.value_text ? item->data.value_text : "";
   case MenuItemType::Toggle:
-    if (!item->toggle_value) {
+    if (!item->data.toggle_value) {
       return "";
     }
     // GL_TEXT_ON = 0x2ee0, GL_TEXT_OFF = 0x2ee1
-    return ResourceString(*item->toggle_value != 0 ? 0x2ee0 : 0x2ee1);
+    return ResourceString(*item->data.toggle_value != 0 ? 0x2ee0 : 0x2ee1);
   case MenuItemType::MultiValue:
-    if (!item->multi_value_index || !item->multi_value_labels ||
-        !*item->multi_value_labels) {
+    if (!item->data.multi_value_index || !item->data.multi_value_labels ||
+        !*item->data.multi_value_labels) {
       return "";
     }
-    return ResourceString((*item->multi_value_labels)[*item->multi_value_index]);
+    return ResourceString((*item->data.multi_value_labels)[*item->data.multi_value_index]);
   default:
     return "";
   }
 }
 
 void MenuItemWrapper::get_rect(lua_State *L) {
-  lua_pushnumber(L, item->rect_left);
+  lua_pushnumber(L, item->data.rect_left);
   lua_setfield(L, -2, "left");
-  lua_pushnumber(L, item->rect_top);
+  lua_pushnumber(L, item->data.rect_top);
   lua_setfield(L, -2, "top");
-  lua_pushnumber(L, item->rect_right);
+  lua_pushnumber(L, item->data.rect_right);
   lua_setfield(L, -2, "right");
-  lua_pushnumber(L, item->rect_bottom);
+  lua_pushnumber(L, item->data.rect_bottom);
   lua_setfield(L, -2, "bottom");
 }
 
 int MenuItemWrapper::get_value(lua_State *L) {
-  switch (item->type) {
+  switch (item->data.type) {
   case MenuItemType::Toggle:
-    if (!item->toggle_value) {
+    if (!item->data.toggle_value) {
       return luaL_error(L, "toggle item has no bound variable");
     }
-    lua_pushboolean(L, *item->toggle_value != 0);
+    lua_pushboolean(L, *item->data.toggle_value != 0);
     return 1;
   case MenuItemType::MultiValue:
-    if (!item->multi_value_index) {
+    if (!item->data.multi_value_index) {
       return luaL_error(L, "choice item has no bound variable");
     }
-    lua_pushinteger(L, *item->multi_value_index);
+    lua_pushinteger(L, *item->data.multi_value_index);
     return 1;
   default:
     return luaL_error(L, "item type '%s' has no bound value",
-                      MenuItemTypeName(item->type));
+                      MenuItemTypeName(item->data.type));
   }
 }
 
 int MenuItemWrapper::set_value(lua_State *L) {
-  switch (item->type) {
+  switch (item->data.type) {
   case MenuItemType::Toggle:
-    if (!item->toggle_value) {
+    if (!item->data.toggle_value) {
       return luaL_error(L, "toggle item has no bound variable");
     }
-    *item->toggle_value = lua_toboolean(L, 2) ? 1 : 0;
+    *item->data.toggle_value = lua_toboolean(L, 2) ? 1 : 0;
     return 0;
   case MenuItemType::MultiValue: {
-    if (!item->multi_value_index) {
+    if (!item->data.multi_value_index) {
       return luaL_error(L, "choice item has no bound variable");
     }
     // The label array carries no length, so an out-of-range index would make the
@@ -230,12 +228,12 @@ int MenuItemWrapper::set_value(lua_State *L) {
     if (v < 0) {
       return luaL_error(L, "choice index must be >= 0");
     }
-    *item->multi_value_index = static_cast<int>(v);
+    *item->data.multi_value_index = static_cast<int>(v);
     return 0;
   }
   default:
     return luaL_error(L, "item type '%s' has no bound value",
-                      MenuItemTypeName(item->type));
+                      MenuItemTypeName(item->data.type));
   }
 }
 
@@ -276,7 +274,7 @@ int MenuWrapper::get_title_id() {
 }
 int MenuWrapper::get_parent_id() { return menu->parent_menu_id; }
 int MenuWrapper::get_num_items() { return menu->num_items; }
-int MenuWrapper::get_num_nodes() { return menu->num_nodes; }
+int MenuWrapper::get_num_nodes() { return menu->items.size(); }
 int MenuWrapper::get_scroll_offset() { return menu->scroll_offset; }
 void MenuWrapper::set_scroll_offset(int value) { menu->scroll_offset = value; }
 
@@ -291,7 +289,7 @@ void MenuWrapper::get_items(lua_State *L) {
 int MenuWrapper::item(lua_State *L) {
   lua_Integer index = luaL_checkinteger(L, 2);
   // Menu__GetItemData has no bounds check, so do it here.
-  if (index < 0 || index >= menu->num_nodes) {
+  if (index < 0 || index >= menu->items.size()) {
     lua_pushnil(L);
     return 1;
   }

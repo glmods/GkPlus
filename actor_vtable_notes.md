@@ -120,7 +120,7 @@ recorded as a plate comment on each function.
 | 21 | 0x0054f290 | `ApplyShieldDamage` | no-op |
 | 22 | 0x0054eb60 | `GetAmmoCount` | 100 |
 | 23 | 0x0054ebb0 | `GetField0x304` | 0 |
-| 24 | 0x0054eb70 | `GetAIController` | NULL |
+| 24 | 0x0054eb70 | `GetNavAgent` | NULL - MobileActor returns the actor's `NavAgent` (nav-mesh movement/collision agent, `+0x200`; see `src/Actors.cpp`) |
 | 25 | 0x0054ead0 | `GetField0x18c` | 0 - MobileActor's returns a **team-slot index** |
 | 26 | 0x0054f3f0 | `SetField0x18c` | no-op (ignores its arg) |
 | 27 | 0x0054f370 | `Stub27` | no-op, never overridden anywhere |
@@ -278,6 +278,12 @@ orders survive a save/load. Slot 32 tests its count.
 | 103 | 0x0054f190 | `IsTurretEnabled` |
 | 104 | 0x0054f410 | `SetTurretTargetAngles` |
 
+The three `TurretActor`-only fields are `turret_enabled` (byte `+0x310`), `target_angle_yaw`
+(`+0x318`) and `target_angle_pitch` (`+0x31c`); slot 102 reads the yaw/pitch pair as a single
+int64. The dword at `+0x314` is alignment padding to 8-align that pair — the constructor
+(0x0054aed0) initialises `+0x310`/`+0x318`/`+0x31c` but skips it, and no Actor-family function
+reads or writes it.
+
 Curiously, `TurretActor::SyncPositionAndBroadcast` (the firing solution) touches **none** of
 `+0x310`, `+0x318` or `+0x31c`. The angles it actually integrates are `CharacterActor+0x2f0` and
 `+0x2f4`, which are typed `int` in the DB but used as floats (gun yaw/pitch in 4096-unit brads).
@@ -300,8 +306,8 @@ Curiously, `TurretActor::SyncPositionAndBroadcast` (the firing solution) touches
 | Slot | Addr | Name |
 |---|---|---|
 | 83 | 0x00546240 | `SetPickupEnabled` - stores the byte at `+0x120` and, when `+0x12c == 0`, schedules `+0x144 = GetGameTimeSeconds() + MPRespawnDelay * k` with `k` selected by `+0x140` (1 -> x2, 2 -> x1, 3 -> x0.5). Broadcasts 0x85 |
-| 84 | 0x00546440 | `OnPickedUp` - broadcasts 0x74 (twice), 0x75, 0x8c, 0x4f and, when `associated_script` is set, calls `QueueScriptExecution` (see `directplay_protocol_notes.md` §8.11) |
-| 85 | 0x00546b20 | `SetField0x138` - frees and `strdup`s into `+0x138`. **Not** `associated_script`, which is `+0x134` |
+| 84 | 0x00546440 | `OnPickedUp` - first enforces the REQUIRES gate: if `required_item_name` (`+0x138`) is set, the pickup is denied unless the collector's inventory already holds a role of that name (`CountInventoryItemsWithRoleName` @ 0x004e5240 != 0), broadcasting 0x74 and, for a `"key"`-named requirement, the `GL_INMISSION_2` message (0xb3). Once past the gate: broadcasts 0x74, 0x75, 0x8c, 0x4f and, when `associated_script` is set, calls `QueueScriptExecution` (see `directplay_protocol_notes.md` §8.11) |
+| 85 | 0x00546b20 | `SetRequiredItem` (was `SetField0x138`) - the `REQUIRES [name] [reqd name]` console command sink: frees and `strdup`s the required-item role name into `required_item_name` (`+0x138`). **Not** `associated_script`, which is `+0x134` (the `ASSOCIATE` script) |
 
 `PickupActorVtbl` used to be an untyped `void *[86]`; it is now a proper struct like the others, so
 its slots have real cross-references. An **undefined** vtable gives its slots no xrefs at all, which

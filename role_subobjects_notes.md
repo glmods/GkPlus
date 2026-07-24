@@ -128,15 +128,140 @@ that `ToParticleGenerator` **default-initialises**. No owned heap pointers -
 | 0xcc | spin | 0x66 | default 0 |
 | 0xd0 | lifespan_ticks | 0x67 | `particle TTL` * current clock rate |
 
-### Runtime animation state (default-initialised)
+`type` is a `ParticleType` (0..12). The console keyword table in `GetParticleIDFromName`
+@ 0x0044c340 names 10 of them: smoke 0, steam 1, snow 2, fire 3, shot 4, explosion 5,
+bigexplosion 6, trail 9, rain 11, sparks 12. Ids 7, 8 and 10 exist but have no keyword.
+Explosion doubles as the parser's fallback for an unrecognised name.
 
-The block from 0x30 to 0xa8 is **five `{Vec4 (four 1.0f), int count=2}` groups** at
-0x30, 0x48, 0x64, 0x7c, 0x94 - interpolation curves (the first is the RGBA colour whose
-start values come from GLS; the others are scale/other channels), each seeded with two
-keyframes. `Vec3` members at 0x14 (coords), 0x20 and 0xb8 are constructed/destructed by
-the ctor/dtor. The precise runtime meaning of the remaining slots (0x58, 0x60, 0x78,
-0xc0, ...) belongs to the particle-simulation code and is out of scope here; they are
-scratch/interpolation cursors, not GLS data.
+`kind` is **not** an inert "object-kind tag". `ToParticleGenerator` seeds it to 5, and
+`ParticleEmitter_Ctor` reads 5 as *"take the blend/render mode from
+`ParticleTypeInfos[type]+0x20`"*; any other value is used directly.
+
+### Why the rest of the struct was unmapped
+
+`ToParticleGenerator` writes constants (`1.0f`, `2`, `0`) into everything outside the GLS
+table above, so **reading the converter can never reveal what those fields mean** - and
+until now it was the only function in the Ghidra DB with the `ParticleGenerator` type
+applied. The struct also carried no `static_assert` on the GkPlus side, so nothing was
+pinning the layout either. The meaning lives entirely in two places downstream:
+
+1. **`ParticleEmitter_Ctor` @ 0x00580510** - builds the live 0x104-byte emitter from the
+   template. 15 call sites; the `ParticleTester` object (0x190) embeds a whole
+   `ParticleGenerator` at +0xb8 and hands it straight to this function, which is the
+   easiest way to see the template consumed end to end.
+2. **`ParticleTypeInfos` @ 0x007c1964** - `InitParticleSystem` @ 0x005828f0 allocates
+   `malloc(0xac8)` = array cookie + **13 x 0xd4** elements and fills each with
+   `InitParticleTypeInfo` @ 0x0057d220 (a 13-case switch, ~12.8 KB of code). Every default
+   the emitter falls back to - colour ramp, blend mode, min/max TTL, gravity, bounding
+   extent - is in there. **Trap: 0xd4 is also `sizeof(ParticleGenerator)`, but this is a
+   different type.** Its element ctor builds `Vec3`s at 0x2c/0x38/0x44/0x50/0x5c/0x80/
+   0x8c/0xa4/0xb8/0xc4, which `ParticleGenerator` does not have. Size coincidence only.
+
+### Runtime state: five 0x18-byte animation channels
+
+The old reading of this block - "five `{Vec4 of 1.0f, int count=2}` groups at 0x30, 0x48,
+0x64, 0x7c, 0x94" - was **wrong about where the records start**, which is why the leading
+dwords looked like padding. `ParticleEmitter_Ctor` ingests channel A with a single
+`MOVUPS xmm0,[tmpl+0x2c]` + `MOVQ [tmpl+0x3c]`, and channel B from `+0x44`/`+0x54`;
+`ToParticleGenerator` likewise stores `xmmword ptr [ESI+0x2c]` and `[ESI+0x44]`. So the
+record is 0x18 bytes and **starts at the lead dword**:
+
+```
+struct PGenChannel { int lead; float v[4]; unsigned trail; };   // 0x18
+```
+
+| Off | Channel | Notes |
+|-----|---------|-------|
+| 0x2c | A - colour | `v` = GLS red/green/blue/alpha 0x21-0x24; -> emitter+0xa0 |
+| 0x44 | B | -> emitter+0xb8 |
+| 0x60 | C | lead never written by `ToParticleGenerator` |
+| 0x78 | D | ditto |
+| 0x90 | E | ditto |
+
+with a 4-byte gap at 0x5c..0x5f between B and C holding two bools. `trail` is 2 from both
+constructors, but `ParticleEmitter_Ctor` tests **bit 1** (zero `v[3]`, i.e. alpha) and
+**bit 0** (zero byte 3 of `lead`) of channel A's copy when the blend mode is 1 - so it
+reads as a flags word, not the keyframe count previously assumed. Only one consumer has
+been checked, so treat that as measured-but-not-exhaustive.
+
+Channels C and D are gated: `use_channel_cd` (0x5c) enables
+`FUN_0057a040(&chanC, &chanD, &field0xb8, 5.5f, field0xa8, field0xac, field0xb0)`.
+`ToParticleGenerator` zeroes that gate, which is why it can leave C/D/E's leads
+uninitialised without it mattering - a latent hazard for any code that builds a generator
+by hand, not a live bug.
+
+### Template -> emitter field map (from `ParticleEmitter_Ctor`)
+
+| Template | Emitter | Meaning |
+|----------|---------|---------|
+| 0x00 `type` | +0x00 | also indexes `ParticleTypeInfos` for every default |
+| 0x04 `kind` | +0x04 | blend mode; 5 = take `ParticleTypeInfos[type]+0x20` |
+| 0x08, 0x0c | +0x28, +0x2c | 0x0c also drives +0xd4 |
+| 0x10 `rate` | +0xd8 | and +0x30 = tickrate / rate = **emission interval in ticks** |
+| 0x14 Vec3 | +0x7c..+0x84 | then divided by the tick rate, so it is a **per-second rate**, not a static offset |
+| 0x20 Vec3 | +0xdc..+0xe4 | |
+| 0x5d, 0xb4, 0xb5 | +0xd1, +0xd2, +0xd0 | byte flags (0xb4 = `generate_generators`) |
+| 0xc4/0xc8 | +0x3c/+0x40 | start/end scale |
+| 0xcc `spin` | +0x9c | scaled by the tick rate |
+| 0xd0 `lifespan_ticks` | +0x94/+0x98 | **0 = use `ParticleTypeInfos[type]`+0xb0/+0xb4 min/max TTL** |
+
+The emitter also threads itself onto a per-type live-emitter list at
+`ParticleTypeInfos[type]+0x28`, with the next pointer at emitter+0xfc.
+
+### `ParticleTypeInfo` (0xd4) - the per-type default table
+
+`ParticleTypeInfos` @ 0x007c1964 is `ParticleTypeInfo[13]`, indexed by `ParticleType`.
+Reading the 13 filled instances side by side is what named it: a field holding 9.81 is
+gravity, one holding 30 for rain and 9 for snow is fall speed, and so on.
+
+| Off | Field | Notes |
+|-----|-------|-------|
+| 0x08 | `uv_u0` `uv_u1` `uv_v0` `uv_v1` | sprite rect in the `particles.rim` atlas, stored as `(pixel + 0.5) / 512`. The renderer (0x00582d10) takes `u1-u0` / `v1-v0` as the quad size. Smoke is a 58x54 sprite, snow 10x9, rain 8x14, trail a 23x211 strip. |
+| 0x18 | `render_state` | `malloc(0x1bc)`. Its ctor/finalise (0x00469860 / 0x005a2460) are **generic** engine helpers shared with the shadow renderer - not particle-specific. |
+| 0x20 | `blend_mode` | 0/1/2; what `ParticleEmitter_Ctor` uses when the template's `kind` is 5 |
+| 0x24 | `type` | own index |
+| 0x28 | `live_emitters` | head of the live-emitter list; next pointer at emitter+0xfc |
+| 0x2c/0x44/0x50/0x5c | per-tick precompute | derived in the epilogue, see below |
+| 0x68 | `alpha` | 128 smoke/steam/snow, 255 most, 0 rain/sparks; the update divides it by a step count to get a fade rate |
+| 0x74/0x78 | `min_size` `max_size` | 0.35 smoke, 2.0 bigexplosion, 0.15 shot |
+| 0x7c | `needs_state_change` | draw-batching hint, see below |
+| 0x80 | `turbulence` | small per-axis drift (**inferred**); `ParticleEmitter_Ctor` ABSs it into the emitter's bounds |
+| 0x8c | `velocity` | units/s. rain (0,30,0), snow (0,9,0), steam (0,-1,0), fire (0,-0.7,0) - **+y is down** |
+| 0xa0 | `field0xa0` | bool gate tested by the update |
+| 0xa4 | `field0xa4` | per-second Vec3, non-zero only for bigexplosion (2.5,-2.5,2.5) and sparks (3,-3,3); purpose unconfirmed |
+| 0xb0/0xb4 | `min_ttl_16_16` `max_ttl_16_16` | lifetime in 16.16 fixed-point seconds; what a template with `lifespan_ticks == 0` falls back to |
+| 0xb8 | `spawn_velocity_range` | per-axis initial velocity randomisation, u/s. The update multiplies a random vector by it and forces y to `-ABS`, so the stored sign is irrelevant. shot (5,5,5), explosion (4,-4,4), trail (6,-8,6). |
+| 0xc4 | `gravity` | u/s^2: 9.81 for snow/explosion/rain/sparks, 6 for trail, 0 for smoke/steam/fire |
+| 0xd0 | `ttl_seconds` | the update rounds `ttl_seconds * tickrate` into ticks |
+
+0x00, 0x04, 0x6c, 0x70 and the `Vec3` at 0x38 are never written by `InitParticleTypeInfo`;
+0x98/0x9c are written from per-case locals that have not been traced.
+
+**The shared epilogue is all derived state** - do not read 0x2c/0x44/0x50/0x5c as
+independent data:
+
+```
+turbulence_per_tick = turbulence / sqrt(tickrate)     // random-walk scaling
+velocity_per_tick2  = velocity / tickrate^2
+velocity_half_t2    = velocity_per_tick2 / 2          // the 1/2 a t^2 position term
+gravity_per_tick2   = gravity  / tickrate^2
+live_emitters       = NULL
+```
+
+It then sets `needs_state_change` unless this type's `render_state` is field-for-field
+equal to **`ParticleTypeInfos[type - 1]`**'s (including the 0x30-byte per-stage array) -
+a batching hint so adjacent types that share a material don't re-issue state. The compare
+is guarded by `type != SMOKE`, so the `-1` index is never taken.
+
+**Caveat on the `ParticleType` ids:** the table is 13 entries and the switch has 13 cases,
+but ids 7, 8 and 10 have no console keyword. 7 and 8 share an identical sprite rect, and 9
+(`trail`) and 10 have identical physics - so the unnamed ids are variants of their
+neighbours, not unused slots.
+
+**Next levers:** the per-tick update `FUN_00581180` (single caller `FUN_00580460`) and the
+renderer `FUN_00582d10` (single caller `FUN_00574c50`) are the only remaining consumers;
+between them they should settle `turbulence`, `field0xa4`, `field0xa0` and the emitter's
+own 0x104-byte layout. Both now decompile against named `ParticleTypeInfo` fields.
 
 ## 4. Destructibility - a 3-variant polymorphic family
 
@@ -198,10 +323,13 @@ When an actor dies with a destructibility, `Frag` reads `destructibility->tag`:
 
 ## 5. GkPlus source
 
-`src/Roles.cpp` mirrors all four with `static_assert`s: `Character` (0xb8), `Projectile`
-(0x20), `ParticleGenerator` (0xd4), `Destructibility` (`{vtbl, tag}`), plus `FragData`
-and `ReplaceDestructibility`. The GLS-derived fields are named; runtime particle slots and
-struct padding keep `field0xNN` names.
+`src/Roles.cpp` mirrors all four: `Character` (0xb8), `Projectile` (0x20),
+`ParticleGenerator` (0xd4, plus `PGenChannel` and the `ParticleType` enum),
+`Destructibility` (`{vtbl, tag}`), `FragData` and `ReplaceDestructibility`. The
+GLS-derived fields are named; runtime particle slots and struct padding keep `field0xNN`
+names. `Character`, `PGenChannel`, `ParticleGenerator` (size + five channel offsets),
+`FragData` and `ReplaceDestructibility` carry `static_assert`s; **`Projectile` still has
+none**.
 
 The destructibility `tag` fields are typed `enum class DestructibilityKind`
 (`Explode=0, Splatter=1, FragData=3, ReplaceDestructibility=4`), mirrored in the Ghidra DB.

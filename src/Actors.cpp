@@ -1,12 +1,14 @@
 #include "Actors.h"
 
 #include "Core.h"
+#include "HashTable.h"
+#include "List.h"
 #include "LuaEngine.h"
 #include "Math.h"
+#include "Memory.h"
 #include "Vulnerability.h"
 
 #include <cassert>
-#include <span>
 
 namespace gk {
 union field {
@@ -15,6 +17,12 @@ union field {
   char *str;
   Role *role;
 };
+
+// The 0x44-byte inventory container hanging off MobileActor::inventory. Only its
+// size is known (from the pool free in MobileActor::Destructor @ 0x00532b00), so
+// it stays opaque - the forward declaration exists to give the owning pointer a
+// name to point at.
+struct Inventory;
 
 // 0x28-byte weapon instance hanging off CharacterActor::weapon_data.
 struct Weapon {
@@ -36,10 +44,13 @@ struct Actor {
   bool field0x8;
   char pad0x9[3];
   int id;                     // 0x0c
-  VulnList *vulnerabilities;  // 0x10
-  int num_vulnerabilities;    // 0x14
-  void *field0x18;
-  char pad0x1c[0x14];
+  // Actor::Ctor allocates the sentinel and copies the role's entries into it -
+  // the `Vulnerability` objects are shared, not cloned. Nothing here is a
+  // pool_unique_ptr: the sentinel is pool_alloc'd and then never freed, and the
+  // entries are only pool-freed by ~Actor when `actor_scoped` is set (the
+  // role-supplied ones stay owned by the Role).
+  VulnerabilityList vulnerabilities; // 0x10
+  char pad0x20[0x10];
   float alarm_delay;          // 0x30
   char pad0x34[0xc];
   void *attachment;           // 0x40 ref-counted; released by slot 52
@@ -71,7 +82,10 @@ struct Actor {
   int field0xd4;
   float field0xd8;            // 0xd8 latched into 0xdc on death
   int field0xdc;
-  void *anim_object;          // 0xe0 3D model, driven by slots 71-74
+  // 0xe0 3D model, driven by slots 71-74. pool_alloc'd (0x1f0) by Actor::Ctor but
+  // refcounted from then on - the dtor decrements and calls slot 0, so the free
+  // is the model's business, not the Actor's.
+  void *anim_object;
   Vec3 top_coords;            // 0xe4
   float armor_value;          // 0xf0
   float strength;             // 0xf4 current health pool
@@ -88,42 +102,87 @@ struct Actor {
   int field0x118;             // 0x118 slot 12
   char pad0x11c[4];
 
+  // vtable, slots 0-82. Each comment is `slot#  what the *base* body does`; where
+  // a subclass gives the slot a materially different meaning that is called out
+  // inline. Slot indices are branch-local (see actor_vtable_notes.md for the
+  // per-slot addresses and the network-message ids).
+
+  // 0  scalar deleting dtor: run ~Actor's body, then optionally pool-free 0x120.
   virtual ~Actor() = 0;
+  // 1  post-construction hook; base is a no-op.
   virtual void OnCreate() = 0;
+  // 2  write health (+0xf8), broadcast 0x55.
   virtual void SetHealth(float) = 0;
+  // 3  out-param health from +0xf8.
   virtual void GetHealth(float *) = 0;
+  // 4  position with Y raised by half the actor height.
   virtual Vec3 *GetCenterCoords(Vec3 *) = 0;
+  // 5  out-param current/max strength.
   virtual void GetStrengthRatio(float *) = 0;
+  // 6  !is_dead (+0x115).
   virtual bool IsAlive() = 0;
+  // 7  base false; CharacterActor returns is_attacking (+0x2d4).
   virtual bool IsAttacking() = 0;
+  // 8  base false; MobileActor returns is_mine (+0x186). Getter paired with slot 9.
   virtual bool IsMine() = 0;
+  // 9  base RET 4 (discards arg); MobileActor stores it to is_mine. Setter for slot 8.
   virtual void SetIsMine(bool) = 0;
+  // 10  role->character.
   virtual Character *GetCharacter() = 0;
+  // 11  base NULL; CharacterActor returns its 0x28-byte weapon (+0x2b8).
   virtual Weapon *GetWeapon() = 0;
+  // 12  +0x118 (the nav poly cached by slot 51).
   virtual int GetField0x118() = 0;
+  // 13  base true; PickupActor returns its enabled flag (+0x120).
   virtual bool IsEnabled() = 0;
+  // 14  base false; MobileActor returns is_moving (+0x184).
   virtual bool IsMoving() = 0;
+  // 15  base NULL; CharacterActor returns attack_target (+0x2d8).
   virtual Actor *GetAttackTarget() = 0;
+  // 16  base NULL; MobileActor returns the 0x44-byte inventory container (+0x194).
   virtual void *GetInventory() = 0;
+  // 17  base false; MobileActor: character->customisation_hierarchy != NULL.
   virtual bool HasCustomisationHierarchy() = 0;
+  // 18  out-param armor_value (+0xf0).
   virtual void GetArmorValue(float *) = 0;
+  // 19  base out-params 0.0; CharacterActor returns shield_value (+0x2d0).
   virtual void GetShieldValue(float *) = 0;
+  // 20  base no-op; CharacterActor destroys an armor piece, broadcast 0xa6/0xa8.
   virtual void ApplyArmorDamage() = 0;
+  // 21  base no-op; CharacterActor destroys a shield piece, broadcast 0xa6/0xa7.
   virtual void ApplyShieldDamage() = 0;
+  // 22  base returns 100; CharacterActor returns the real ammo count.
   virtual int GetAmmoCount() = 0;
+  // 23  base 0; CharacterActor returns the cannot-fire gate (+0x304). Paired w/ slot 95.
   virtual int GetField0x304() = 0;
-  virtual void *GetAIController() = 0;
+  // 24  base NULL; MobileActor returns its nav agent (+0x200).
+  virtual void *GetNavAgent() = 0;
+  // 25  base 0; MobileActor returns a team-slot index (+0x18c). Paired with slot 26.
   virtual int GetField0x18c() = 0;
+  // 26  base no-op (ignores arg); MobileActor stores the team-slot index. Setter for 25.
   virtual void SetField0x18c(int) = 0;
+  // 27  no-op, never overridden anywhere.
   virtual void Stub27() = 0;
+  // 28  write armor_value (+0xf0). Setter for slot 18.
   virtual void SetArmorValue(float) = 0;
+  // 29  base no-op; CharacterActor writes shield_value (+0x2d0). Setter for slot 19.
   virtual void SetShieldValue(float) = 0;
+  // 30  base false; MobileActor returns +0x188. Getter paired with slot 54.
   virtual bool GetField0x188() = 0;
+  // 31  base NULL; CharacterActor returns its hotspot node (+0x2c8).
   virtual char *GetHotspot() = 0;
+  // 32  base false; MobileActor tests the order-queue count (+0x1f4).
   virtual bool HasPendingOrders() = 0;
+  // 33  team_id = arg; MobileActor/CharacterActor/PresidentActor extend it.
   virtual void SetTeamID(int) = 0;
+  // 34  base NULL; MobileActor returns &inventory_list (+0x19c).
   virtual void *GetInventoryListPtr() = 0;
+  // 35  sizeof(this): 0x120 in base. Drives polymorphic (de)allocation without RTTI.
   virtual int GetSize() = 0;
+
+  // 36-50  manual RTTI: each returns false in Actor and true only in the named
+  // class (and its descendants, which inherit the override) - the binary has no
+  // C++ RTTI, so these slots are the whole type-check mechanism.
   virtual bool IsMobile() = 0;
   virtual bool IsCharacter() = 0;
   virtual bool IsProjectile() = 0;
@@ -139,43 +198,117 @@ struct Actor {
   virtual bool IsBlocker() = 0;
   virtual bool IsPresident() = 0;
   virtual bool IsTurret() = 0;
+
+  // 51  stamp the create/update timestamps, resolve the nav poly under the actor
+  //     into +0x118, and fire the +0x38 callback if one is installed.
   virtual void InitPositionAndTiming(int, int, float) = 0;
+  // 52  refcounted release of the attachment at +0x40.
   virtual void ReleaseAttachment() = 0;
+  // 53  set coords + orientation quaternion + timing.
   virtual void SetPositionAndOrientation(Vec3 *, Vec4 *, int) = 0;
+  // 54  base RET 4 (discards); MobileActor stores it to +0x188. Setter for slot 30.
   virtual void SetField0x188(bool) = 0;
+  // 55  base no-op; ProjectileActor's is the physics step (integrate/collide/damage).
   virtual void OnPrePhysics() = 0;
+  // 56  base no-op.
   virtual void OnCollisionResponse() = 0;
+  // 57  ray/shape intersection; Pickup/Projectile return 0 to opt out of being hit.
   virtual void Raycast(int *, int, int, int *) = 0;
+  // 58  swept intersection; same opt-out as slot 57.
   virtual void SweepTest(int *, int, int, int, int *) = 0;
+  // 59  base no-op; in PickupActor this slot is really SetPickupType.
   virtual void OnDamageReceived() = 0;
+  // 60  base false; MobileActor: alive && +0x17c != a global sentinel.
   virtual bool IsTargetable() = 0;
+  // 61  visible flag (+0x10d).
   virtual bool IsVisible() = 0;
+  // 62  base false; MobileActor: move_state (+0x1bc) is neither 0 nor 1.
   virtual bool IsInteractable() = 0;
+  // 63  base false; MobileActor returns can_be_picked_up (+0x187).
   virtual bool CanBePickedUp() = 0;
+  // 64  Frag: scoring, splash, debris; broadcast 0x6b/0xba (0x37/0x38 for projectiles).
   virtual void Frag() = 0;
+  // 65  set is_dead, run cleanup, broadcast 0x49.
   virtual void Delete() = 0;
+  // 66  base no-op; PickupActor stores the script name and broadcasts 0x84.
   virtual void Associate(char *script, char one_shot) = 0;
+  // 67  base no-op; MobileActor broadcasts 0x97.
   virtual void Dissociate() = 0;
+  // 68  damage/heal pipeline: absorb via armor/shield, frag at 0 strength.
   virtual bool ApplyDamage(float, bool) = 0;
+  // 69  base no-op; health-changed hook.
   virtual void OnHealthChanged() = 0;
+  // 70  really "Update": base syncs model position + broadcast 0x6f, but every
+  //     mobile subclass replaces this with its whole per-tick logic (AI/movement,
+  //     weapon fire, spline motion, projectile dead-reckoning).
   virtual void SyncPositionAndBroadcast(int, int, float) = 0;
+  // 71  play an animation on anim_object (+0xe0).
   virtual void PlayAnimation(int, int, int, int, int, int) = 0;
+  // 72  cross-fade blend into an animation.
   virtual void BlendAnimation(int, int, int, int, int, int, int) = 0;
+  // 73  play an animation; arg 7 is the address of a completion flag to set.
   virtual void PlayAnimationEx(int, int, int, int, int, int, int, int) = 0;
+  // 74  set the animation state machine on anim_object.
   virtual void SetAnimationState(unsigned int, int) = 0;
+  // 75  base false; PickupActor returns has_associated_script (+0x148).
   virtual bool HasCustomAnimation() = 0;
+  // 76  base no-op; TrackObjectActor installs a Catmull-Rom spline path.
   virtual void OnAnimationComplete() = 0;
+  // 77  base no-op; TrackObjectActor starts a leg of motion, broadcast 0xad/0xae.
   virtual void OnAnimationEvent() = 0;
+  // 78  set target, broadcast 0x56.
   virtual void SetTarget(int, int) = 0;
+  // 79  clear target, broadcast 0x57.
   virtual void ClearTarget() = 0;
+  // 80  reassign owner+team, broadcast 0x58 then 0x50.
   virtual void ChangeOwnerAndTeam(int, int, int) = 0;
+  // 81  release from owner, broadcast 0x59 then 0x50.
   virtual void ReleaseFromOwner() = 0;
+  // 82  (re)register in the spatial/team structures, set flag 0x200; MobileActor
+  //     also disposes the inventory on death, BlockerActor un-blocks its nav polys.
   virtual void ActivateInWorld() = 0;
 };
 static_assert(sizeof(Actor) == 0x120);
+static_assert(offsetof(Actor, vulnerabilities) == 0x10);
+static_assert(offsetof(Actor, alarm_delay) == 0x30);
 static_assert(offsetof(Actor, ai_type) == 0x50);
 static_assert(offsetof(Actor, position) == 0xa0);
 static_assert(offsetof(Actor, orientation) == 0xac);
+
+// The actor's registration in the nav-mesh/pathfinding world, hanging off
+// MobileActor::nav_agent - a nav-snapped position, a collision shape, the polygon
+// it currently occupies, a velocity, and the traversal-capability flags the
+// pathfinder tests against poly walkability. Exposed by slot 24 GetNavAgent
+// (historically mis-named GetAIController: this is not an "AI brain").
+//
+// Built by CreateNavAgent (0x00472b80) from MobileActor::InitPositionAndTiming
+// (slot 51) under TheMap->lock, which also allocates a 0x10-byte doubly-linked
+// registration node (vtable @ 0x00652870, back-pointer at node+0xc) and threads it
+// into the spatial-grid list. Torn down by DestroyNavAgent (0x00473e80): it unlinks
+// that node, releases the shape via its vtable, and pool-frees these 0x34 bytes.
+struct NavAgent {
+  unsigned update_time;   // 0x00 game-clock stamp; min-tracked each tick by the Update
+  Vec3 position;          // 0x04 world position, snapped onto the nav mesh
+  // 0x10 collision-shape descriptor (pool_alloc 0x18, polymorphic; vtable
+  // @ 0x006647a8). Released through its own vtable slot 0 by DestroyNavAgent.
+  void *shape;
+  // 0x14 the nav polygon the agent occupies (from FUN_0048d380). Its +0x14 is a
+  // walkability bitfield: register sets 0x100040, unregister clears it.
+  void *nav_poly;
+  float radius;           // 0x18 collision radius = shape size field * DAT_00652874
+  // 0x1c movement vector; the tick uses its squared length as the speed check.
+  Vec3 velocity;
+  float gravity;          // 0x28 per-agent gravity, default 9.81 (DAT_006a3a60)
+  // 0x2c traversal-capability mask derived from the collision size (0x40100 base;
+  // +0x400 tall, +0x80, +0x200 wide), then & 0xfffff97f. Read by MobileActor::SetTeamId.
+  unsigned traversal_flags;
+  unsigned traversal_flags_full; // 0x30 the same bits with 0x100000 forced on
+};
+static_assert(sizeof(NavAgent) == 0x34);
+static_assert(offsetof(NavAgent, shape) == 0x10);
+static_assert(offsetof(NavAgent, nav_poly) == 0x14);
+static_assert(offsetof(NavAgent, velocity) == 0x1c);
+static_assert(offsetof(NavAgent, traversal_flags) == 0x2c);
 
 struct MobileActor : Actor {
   char pad0x120[0x40];
@@ -197,10 +330,12 @@ struct MobileActor : Actor {
   int field0x18c;              // 0x18c slots 25/26; used as a team-slot index
   short field0x190;            // 0x190 anim channel (lo) + busy flag (hi)
   char pad0x192[2];
-  void *inventory;             // 0x194 slot 16; 0x44-byte container
+  pool_unique_ptr<Inventory> inventory; // 0x194 slot 16; 0x44-byte container
   void *field0x198;            // 0x198 slot 92; Hierarchy* override
-  void *inventory_list;        // 0x19c slot 34 returns &inventory_list
-  char pad0x1a0[0x14];
+  // 0x19c slot 34 returns &inventory_list. Entries are 0x18 bytes and pool-owned:
+  // ~MobileActor pool-frees each one as it drains the list.
+  List<void *> inventory_list;
+  char pad0x1ac[8];            // 0x1ac
   float aim;                   // 0x1b4
   char pad0x1b8[4];
   int move_state;              // 0x1bc slot 62; MobileActor::SetMoveState
@@ -212,50 +347,53 @@ struct MobileActor : Actor {
   Vec3 goto_target;            // 0x1dc
   float goto_priority;         // 0x1e8
   float goto_priority_current; // 0x1ec
-  void *order_queue;           // 0x1f0 list header {sentinel,count,cache,valid}
-  int order_queue_count;       // 0x1f4 slot 32
-  void *field0x1f8;
-  char pad0x1fc[4];
-  void *ai_controller;         // 0x200 slot 24
-  void *waypoints_sentinel;    // 0x204 embedded waypoint list header
-  int waypoints_count;         // 0x208
-  void *waypoints_cache;       // 0x20c
-  bool waypoints_cache_valid;  // 0x210
-  char pad0x211[3];
+  List<void *> order_queue;    // 0x1f0 (size() @ 0x1f4 is slot 32)
+  NavAgent *nav_agent;         // 0x200 slot 24 (see NavAgent above)
+  List<void *> waypoints;      // 0x204 embedded waypoint list
   void *field0x214;
   char pad0x218[0xc];
   void *waypoint_ptr;          // 0x224 cursor into the waypoint list
-  void *waypoint_list;         // 0x228 -> &waypoints_sentinel
+  List<void *> *waypoint_list; // 0x228 -> &waypoints
   char pad0x22c[4];
 
+  // MobileActor extension slots 83-94.
+  // 83  deploy/crouch toggle (name doubtful): flips +0x187, swaps the collision box
+  //     between standing and halved, broadcast 0x4c/0x4e; gated on model node 0x13.
   virtual void UpdateMineDetectionAndBounds() = 0;
+  // 84  equip into the first free slota..sloth (inventory-list indices 2-9).
   virtual void EquipToFirstOpenSlot(int, int) = 0;
+  // 85  append a tag-10 order record (0x28 bytes) to the order queue (+0x1f0).
   virtual void QueueOrderKind10(int) = 0;
+  // 86  append a tag-1 order record carrying a Vec3.
   virtual void QueueOrderPosition(Vec3 *, int, char) = 0;
+  // 87  append a tag-0 order record.
   virtual void QueueOrderTarget(int, char) = 0;
+  // 88  issue a move order, gated on can_turn, strength and priority.
   virtual int Goto(Vec3 *, float) = 0;
+  // 89  death: broadcast 0x3d (destructible) or 0x48, then slots 82 and 64.
   virtual void Die() = 0;
+  // 90  push a 0x18-byte waypoint record onto the waypoint list (+0x204).
   virtual void AddWaypoint(Vec3 *, int, char, int) = 0;
+  // 91  fill a 0x24-byte navigation-target descriptor.
   virtual void GetNavigationTarget(int *) = 0;
+  // 92  return the Hierarchy* override at +0x198.
   virtual void *GetField0x198() = 0;
+  // 93  play an action animation, gated on the busy flag and a timestamp (+0x88).
   virtual void PlayActionAnimation(int, float) = 0;
+  // 94  base setter; CharacterActor frees the old 0x28 weapon and builds a new one
+  //     (0x21 = none), broadcast 0x83.
   virtual void SetWeapon(int) = 0;
 };
 static_assert(sizeof(MobileActor) == 0x230);
 static_assert(offsetof(MobileActor, character) == 0x160);
 static_assert(offsetof(MobileActor, is_mine) == 0x186);
 static_assert(offsetof(MobileActor, inventory) == 0x194);
-static_assert(offsetof(MobileActor, ai_controller) == 0x200);
+static_assert(offsetof(MobileActor, nav_agent) == 0x200);
 
-// 0x120..0x12f is the standard {sentinel, count, cache, cache_valid} list header.
-// It records every nav-mesh polygon whose "blocked" bit (0x100) this actor set, so
+// Records every nav-mesh polygon whose "blocked" bit (0x100) this actor set, so
 // slot 82 can undo them.
 struct BlockerActor : Actor {
-  void *blocked_polys;       // 0x120
-  int num_blocked_polys;     // 0x124
-  void *blocked_polys_cache; // 0x128
-  char blocked_polys_cache_valid; // 0x12c
-  char pad0x12d[3];
+  List<void *> blocked_polys; // 0x120
 };
 static_assert(sizeof(BlockerActor) == 0x130);
 static_assert(offsetof(BlockerActor, blocked_polys) == 0x120);
@@ -267,8 +405,13 @@ struct PickupActor : Actor {
   char is_destructible;     // 0x12c gates GetArmorValue and SetPickupEnabled
   char pad0x12d[3];
   char pad0x130[4];
-  char *associated_script;  // 0x134 set by slot 66 Associate
-  char *unk_string0x138;    // 0x138 set by slot 85; NOT associated_script
+  pool_string associated_script; // 0x134 set by slot 66 Associate
+  // 0x138 the REQUIRES console command's item: the name of a Role the collector
+  // must already hold in inventory before this actor can be picked up/activated
+  // (`REQUIRES DOOR_A KEY_1`). Set by slot 85 SetRequiredItem; read by slot 84
+  // OnPickedUp, which denies the pickup unless the inventory contains a matching
+  // role. NOT associated_script (+0x134), which is the ASSOCIATE script path.
+  pool_string required_item_name; // 0x138
   bool is_script_oneshot;   // 0x13c
   char pad0x13d[3];
   int respawn_delay_mode;   // 0x140 1 -> x2, 2 -> x1, 3 -> x0.5
@@ -276,13 +419,19 @@ struct PickupActor : Actor {
   int has_associated_script; // 0x148 slot 75; set by slot 66 Associate
   float pickup_radius;      // 0x14c
 
+  // PickupActor extension slots 83-85.
+  // 83  store enabled (+0x120); when pickup_type == 0, schedule respawn_at_time
+  //     (MPRespawnDelay scaled by respawn_delay_mode). Broadcast 0x85.
   virtual void SetPickupEnabled(bool) = 0;
+  // 84  collected: broadcast 0x74/0x75/0x8c/0x4f, and run associated_script if set.
   virtual void OnPickedUp(MobileActor *) = 0;
-  virtual void SetField0x138(const char *) = 0;
+  // 85  free and strdup the REQUIRES item name into required_item_name (+0x138);
+  //     NOT associated_script (+0x134).
+  virtual void SetRequiredItem(const char *) = 0;
 };
 static_assert(sizeof(PickupActor) == 0x150);
 static_assert(offsetof(PickupActor, associated_script) == 0x134);
-static_assert(offsetof(PickupActor, unk_string0x138) == 0x138);
+static_assert(offsetof(PickupActor, required_item_name) == 0x138);
 static_assert(offsetof(PickupActor, respawn_at_time) == 0x144);
 
 // Launch origin + velocity + launch time integrated against gravity, with the role's
@@ -307,7 +456,10 @@ struct ProjectileActor : Actor {
   Vec3 target_position;   // 0x168 written by slot 84
   int field0x174;
 
+  // ProjectileActor extension slots 83-84.
+  // 83  return the +0x150 bitfield (0x10 gore, 0x40 guided, 0x200 dissociate).
   virtual unsigned GetProjectileFlags() = 0;
+  // 84  write a Vec3 by value into +0x168, the guidance/arrival target.
   virtual void SetTargetPosition(Vec3) = 0;
 };
 static_assert(sizeof(ProjectileActor) == 0x178);
@@ -330,10 +482,7 @@ struct TrackObjectActor : Actor {
   Vec4 target_ori;        // 0x188
   char pad0x198[8];       // 0x198 int64 start time
   char pad0x1a0[8];
-  void *riders;           // 0x1a8 list of refcounted Actor* being carried
-  int num_riders;         // 0x1ac
-  void *riders_cache;     // 0x1b0
-  int riders_cache_valid; // 0x1b4
+  List<Actor *> riders;   // 0x1a8 refcounted Actors being carried
 };
 static_assert(sizeof(TrackObjectActor) == 0x1b8);
 static_assert(offsetof(TrackObjectActor, geometry) == 0x130);
@@ -359,7 +508,7 @@ struct CharacterActor : MobileActor {
   char pad0x294[0x10];
   int weapon_type;            // 0x2a4
   char pad0x2a8[0x10];
-  Weapon *weapon;             // 0x2b8 slot 11
+  pool_unique_ptr<Weapon> weapon; // 0x2b8 slot 11; pool-freed by ~CharacterActor
   Vec3 aim_direction;         // 0x2bc (TurretActor uses it as muzzle position)
   void *hotspot;              // 0x2c8 slot 31
   void *alternate_hotspot;    // 0x2cc
@@ -376,10 +525,16 @@ struct CharacterActor : MobileActor {
   void *selected_ammo;        // 0x300
   int field0x304;             // 0x304 slots 23/95; cannot-fire gate
 
+  // CharacterActor extension slots 95-99.
+  // 95  write the cannot-fire gate (+0x304). Setter for slot 23.
   virtual void SetField0x304(int) = 0;
+  // 96  attack an actor; broadcast id is computed 0x41 + close_range.
   virtual void AttackTarget(Actor *, int, char, char) = 0;
+  // 97  attack a position; broadcast id is computed 0x3f + close_range.
   virtual void AttackPosition(Vec3 *, int, char, char) = 0;
+  // 98  stop attacking, broadcast 0x44.
   virtual void StopAttacking(int) = 0;
+  // 99  set the weapon's ammo type, reselect ammo, broadcast 0x82.
   virtual void SetAmmoType(int) = 0;
 };
 static_assert(sizeof(CharacterActor) == 0x308);
@@ -391,10 +546,9 @@ static_assert(offsetof(CharacterActor, field0x304) == 0x304);
 struct NodeActor : MobileActor {
   char pad0x230[8];    // 0x230/0x234 int64 spawn timestamp
   char pad0x238[0x20];
-  void *paths;         // 0x258 list of paths; each payload is itself a list of
-  int num_paths;       // 0x25c 0x18-byte waypoint records
-  void *paths_cache;   // 0x260
-  int paths_cache_valid; // 0x264
+  // 0x258 each payload is itself a list of 0x18-byte waypoint records, which
+  // ~NodeActor pool-frees.
+  List<void *> paths;
   void *current_path;  // 0x268 slot 90 appends to *(current_path + 0xc)
   char pad0x26c[0xc];
 };
@@ -408,6 +562,8 @@ static_assert(offsetof(NodeActor, current_path) == 0x268);
 struct PresidentActor : MobileActor {
   Vec3 exit_position;          // 0x230 slot 95
   float last_team_switch_time; // 0x23c
+  // PresidentActor extension slot 95.
+  // 95  write the exit position by value into +0x230..0x23b.
   virtual void SetExitPosition(Vec3) = 0;
 };
 static_assert(sizeof(PresidentActor) == 0x240);
@@ -435,27 +591,43 @@ struct CentipedeActor : CentibodyActor {};
 static_assert(sizeof(CentipedeActor) == 0x310);
 
 struct TurretActor : PopupActor {
-  char unk8[16];
+  bool turret_enabled;      // 0x310 slots 100/103
+  char pad0x311[7];         // 0x311 alignment; never read/written (ctor skips it)
+  // 0x318/0x31c target yaw/pitch: written separately by slot 104, read together as
+  // an int64 pair by slot 102. Despite the int typing they hold packed angles.
+  int target_angle_yaw;     // 0x318 slots 102/104
+  int target_angle_pitch;   // 0x31c
+  // TurretActor extension slots 100-104. Note the firing solution (slot 70)
+  // integrates CharacterActor+0x2f0/+0x2f4 (gun yaw/pitch), not these fields.
+  // 100  store turret_enabled (+0x310).
   virtual void SetTurretEnabled(bool) = 0;
+  // 101  out-param the aim direction (+0x2bc).
   virtual void GetTurretAimDirection(long long *) = 0;
+  // 102  return the packed target_angle_yaw/pitch pair (+0x318/+0x31c).
   virtual long long GetTurretTargetAngles() = 0;
+  // 103  read turret_enabled.
   virtual bool IsTurretEnabled() = 0;
+  // 104  set target_angle_yaw/pitch.
   virtual void SetTurretTargetAngles(int, int) = 0;
 };
 static_assert(sizeof(TurretActor) == 0x320);
+static_assert(offsetof(TurretActor, turret_enabled) == 0x310);
+static_assert(offsetof(TurretActor, target_angle_yaw) == 0x318);
 
-struct ActorNode {
-  Actor *actor;
-  ActorNode *next;
-};
-
-struct Actors {
-  int unk1;
-  int num_actors;
-  int num_buckets;
-  int bucket_mask;
-  ActorNode **buckets;
-};
+// The actor hash @ 0x007ba0d8. Unlike the roles table this one is a real object:
+// its address is passed as `this` to the template's own methods, and 0x0054f2b0 is
+// a byte-for-byte match for AvP's `_base_HashTable::Remove` (chains @ this+0x10,
+// mask @ this+0x0c, n_entries @ this+0x04, `Dealloc?(node, 8)` for the node), so
+// the field at +0x00 that older notes called `unk1` is the vptr.
+using Actors = HashTable<Actor *>;
+using ActorNode = Actors::Node;
+static_assert(sizeof(Actors) == 0x14);
+static_assert(sizeof(ActorNode) == 0x8);
+// These are the layout proof: they fail if the vptr does not land first, pushing
+// the inherited fields to the offsets GetActorById reads.
+static_assert(offsetof(Actors, n_entries) == 0x04);
+static_assert(offsetof(Actors, table_size_mask) == 0x0c);
+static_assert(offsetof(Actors, chains) == 0x10);
 
 static Actors *actors;
 static FastCall<Actor *, int> GetActorById;
@@ -515,23 +687,19 @@ struct ActorIterator {
   static constexpr const char *metatable_name = "ActorIterator";
   static void setup_metatable(lua_State *L) {}
 
-  std::span<ActorNode *> remaining_buckets;
-  ActorNode *node{};
+  Actors::iterator cur{};
+  Actors::iterator last{};
 
   int next(lua_State *L) {
-    while (!node) {
-      if (remaining_buckets.empty()) {
-        return 0;
-      }
-
-      node = remaining_buckets.front();
-      remaining_buckets = remaining_buckets.subspan(1);
+    if (cur == last) {
+      return 0;
     }
 
-    lua_pushinteger(L, node->actor->id);
-    Lua::Create<ActorWrapper>(L, node->actor);
-    node = node->next;
+    Actor *actor = *cur;
+    ++cur;
 
+    lua_pushinteger(L, actor->id);
+    Lua::Create<ActorWrapper>(L, actor);
     return 2;
   }
 };
@@ -556,8 +724,7 @@ int ActorsModule::Register(lua_State *L) {
   lua_pushcfunction(
       L, ([](lua_State *L) {
         Lua::PushMemberFunction<ActorIterator, &ActorIterator::next>(L);
-        Lua::Create<ActorIterator>(
-            L, std::span(actors->buckets, actors->num_buckets));
+        Lua::Create<ActorIterator>(L, actors->begin(), actors->end());
         return 2;
       }));
   lua_setfield(L, -2, "__pairs");

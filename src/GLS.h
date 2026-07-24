@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Core.h"
+#include "List.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -202,13 +203,8 @@ union ParsedValue {
 };
 static_assert(sizeof(ParsedValue) == 8);
 
-// List head for the allowed sub-object constructors of a Custom field.
-struct ComplexParsedValue {
-  void *sentinel;
-  int32_t count;
-  void *cached_array;
-  bool cache_flag;
-};
+// List of the allowed sub-object constructors of a Custom field.
+using ComplexParsedValue = List<void *>;
 static_assert(sizeof(ComplexParsedValue) == 0x10);
 
 // Argument to the checkValue vtable slot: a single field assignment.
@@ -234,6 +230,11 @@ static_assert(sizeof(ParsedThingVtbl) == 0x20);
 
 // One parsed script object (any section type). Allocated by the game;
 // 0x1b60 bytes (roles: 0x1b68, the extra dword caches the converted Role*).
+//
+// ParsedThingBase_Dtor @ 0x0047bae0 walks field_types and pool-frees the String
+// slots while refcount-releasing the Custom ones. Neither can be a
+// pool_unique_ptr: they share a `ParsedValue` union slot, which a move-only
+// member would make non-trivial, and the discriminator is a parallel array.
 struct ParsedThing {
   ParsedThingVtbl *vtbl;
   void *symbol_link;
@@ -319,35 +320,11 @@ static_assert(sizeof(ParsedThing) == 0x1b60);
 // Node of the parsed-object list. Placed-actor entries (from level scripts)
 // use the same node layout but their payload is not a ParsedThing; check
 // thing->type() != SectionType::Unknown before using field accessors.
-struct ParsedObjectNode {
-  void *vtbl;
-  ParsedObjectNode *prev;
-  ParsedObjectNode *next;
-  ParsedThing *thing;
-};
+using ParsedObjectNode = List_Member<ParsedThing *>;
 
-// Result of LoadGLS: sentinel-based doubly-linked list.
-struct ParsedObjectList {
-  ParsedObjectNode *sentinel;
-  int32_t count;
-  void *cached_array;
-  char cache_flag;
-
-  struct iterator {
-    ParsedObjectNode *node;
-    ParsedObjectNode *sentinel;
-
-    ParsedThing *operator*() const { return node->thing; }
-    iterator &operator++() {
-      node = node->next;
-      return *this;
-    }
-    bool operator==(const iterator &other) const = default;
-  };
-
-  iterator begin() { return {sentinel->next, sentinel}; }
-  iterator end() { return {sentinel, sentinel}; }
-};
+// Result of LoadGLS.
+using ParsedObjectList = List<ParsedThing *>;
+static_assert(sizeof(ParsedObjectNode) == 0x10);
 static_assert(sizeof(ParsedObjectList) == 0x10);
 
 // Parses a .gls/.gsh file (two passes, follows #include). Returns the global

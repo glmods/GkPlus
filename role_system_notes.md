@@ -96,8 +96,8 @@ Verified against `ToRole` (the only field-setter from script), `CreateRole` (def
 | 0x74 | `vuln_cache_valid` | int | - | cache flag |
 | 0x78 | `flags` | u16 | many | 10 bit-packed booleans, see §5 |
 | 0x7c | `ai` | AIType(int) | 0x49 | selects the Actor subclass, see §6 |
-| 0x80 | `interface_beam_delay` | int | 0x4a | default -1 |
-| 0x84 | `interface_beam_effect` | int | 0x4b | default 1; `4` = script (needs 0x4c) |
+| 0x80 | `interface_beam_delay` | int | 0x4a | default -1; `< 0` disables the vuln |
+| 0x84 | `interface_beam_effect` | VulnerabilityType | 0x4b | default 1 (`Confusion`); `4` = `Script` (needs 0x4c) |
 | 0x88 | `interface_beam_script` | char* | 0x4c | only if effect == 4 |
 | 0x8c | `interface_beam_duration` | int | 0x4d | default -1 |
 | 0x90 | `resistance` | int | 0x4e | |
@@ -118,7 +118,7 @@ Verified against `ToRole` (the only field-setter from script), `CreateRole` (def
 
 - `0x68..0x74` - **vulnerabilities**. Nodes are `VulnList` (0x10) holding
   `Vulnerability*` (0x1c); each vuln owns a `script` string. Populated by the
-  vulnerability-processing path, not `ToRole`.
+  vulnerability-processing path, not `ToRole`. See §10.
 - `0xac..0xb8` - **sever points**. `ToRole` splits the `sever point` GLS string on
   `,`; each token becomes a node (`{vtbl=TriggerBase, char* name}`). Despite reusing the
   trigger node type (so `RoleDtor` cleans it with `TriggerList::DeleteTriggers`), this is
@@ -248,3 +248,49 @@ pickup roles. Observed:
 - The C++ `Role`/`Character`/`Projectile`/`Light`/`ParticleGenerator`/`InventoryInfo`
   struct mirrors live in `src/Roles.cpp` with `static_assert`s on the key offsets and
   total size (0xc0).
+
+## 10. Vulnerabilities
+
+A `Vulnerability` (0x1c) says "when a **`role`** hits me with a **`vuln_role`**, apply
+**`type`** after **`delay`**". The C++ mirror is `src/Vulnerability.cpp`.
+
+| Off | Field | Type | Notes |
+|-----|-------|------|-------|
+| 0x00 | `entity` | Role* | the role that must deliver the hit (stock: `elint`) |
+| 0x04 | `vuln_entity` | Role* | the role it must be delivered with (stock: `interface_beam`) |
+| 0x08 | `delay` | int | ticks before it fires |
+| 0x0c | `duration` | int | only read for `Confusion`/`Charm`, else -1 |
+| 0x10 | `script` | char* | owned; NULL unless `type == Script` |
+| 0x14 | `type` | VulnerabilityType | |
+| 0x18 | `actor_scoped` | bool | byte-wide; 1 = attached to one Actor, 0 = inherited from a Role |
+
+`VulnerabilityType`: `Shutdown` 0, `Confusion` 1, `Destroy` 2, `Charm` 3, `Script` 4 -
+the keywords `SHUTDOWN` / `CONFUSE` / `DESTROY` / `CHARM` / *(script name)* that
+`CommandVulnerability` (0x0044a600, console `VULNERABILITY`) parses. `Role::interface_beam_effect`
+(0x84) holds the same enum.
+
+Both `Role` (0x68) and `Actor` (0x10) carry a `List<Vulnerability*>` in the standard
+16-byte `{sentinel, count, cached_array, cache_valid}` header; nodes are `VulnList`
+(0x10 = `{vtbl, prev, next, vuln}`, vtbl `PTR_FUN_00652070`). **The sentinel is only 0xc
+bytes** - `Actor::Ctor` mallocs 0xc for it - so it has no `vuln` field and must never be
+dereferenced as a full node. Walk it the way the engine does, `for (cur = sentinel->next;
+cur != sentinel; cur = cur->next)`.
+
+Population paths:
+
+- `Actor::Ctor` (0x0052d1f0) copies every node of `role->vulnerabilities` into the new
+  actor's list. It copies the **pointer**, so a role's `Vulnerability` is shared by every
+  actor spawned from it - editing one edits all of them.
+- `AddInterfaceBeamVulnerability` (0x00510fe0, from `SpawnRole` /
+  `ServerSpawnActorForTeam`) synthesises the stock elint-hack vuln from the role's four
+  `interface beam` fields (delay<-0x80, duration<-0x8c, script<-0x88, type<-0x84), unless
+  `interface_beam_delay < 0` or an elint/interface_beam vuln is already present.
+- `CommandVulnerability` adds one by hand; given a role name it also fans the same
+  `Vulnerability*` out to every live actor of that role.
+- `ReadActorFixups` restores them on savegame load via `VulnList_AddEntryEnd` (0x0054f610).
+  The insert helpers are `VulnList_AddEntryStart` (0x0044ea80) and that one; both take the
+  list *header* in ECX and invalidate `cached_array`.
+
+GkPlus exposes each entry as a `Vulnerability` userdata (`src/Vulnerability.h`) with
+`role`, `vulnerability_role`, `delay`, `duration`, `script` (nil when absent), `type` and
+`actor_scoped`, reachable as `Role.vulnerabilities` / `Actor.vulnerabilities`.

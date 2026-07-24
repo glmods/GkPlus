@@ -42,7 +42,7 @@ Custom C++20 concepts-based Lua interop:
 | `src/Actors.h/cpp` | `Actor` | id, position, orientation, team_id, role, center, ai_type, vulnerabilities, health |
 | `src/Roles.h/cpp` | `Role` | id, type (ai enum), name, vulnerabilities, spawn() |
 | `src/Map.h/cpp` | `Map`, `TeamSlot` | origin, bounds_min/max, camera_focus_min/max, bitmap, shadow_object_*, num_sections, to_world() |
-| `src/Vulnerability.h/cpp` | `Vulnerability` | role, vulnerability_role, delay, duration, script, type |
+| `src/Vulnerability.h/cpp` | `Vulnerability` | role (attacker), vulnerability_role (weapon), delay, duration, script, type, actor_scoped |
 | `src/Music.h/cpp` | `MusicTrack` | volume, looping, playing, play(path[, loop]), stop() |
 | `src/Math.h/cpp` | `Vec3`, `Vec4` | x, y, z [, w] (read-only fields) |
 

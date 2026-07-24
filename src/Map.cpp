@@ -1,8 +1,11 @@
 #include "Map.h"
 
 #include "Core.h"
+#include "HashTable.h"
+#include "List.h"
 #include "LuaEngine.h"
 #include "Math.h"
+#include "Memory.h"
 #include "Roles.h"
 
 #include <cassert>
@@ -45,44 +48,32 @@ static_assert(sizeof(LevelMeshHeader) == 0x18);
 // map section. Stored in a PlacedObjectBindingMap embedded at ParsedMap+0x1b60
 // (which is why ParsedMap is 0x1b78 and every other section type is 0x1b60),
 // and consumed - one shot, each entry removed as it is spawned - by ToMap.
+// The payload of a binding entry. PlacedObjectBinding_Dtor @ 0x0047ec00 frees the
+// two strings and drops a reference on the parsed role.
 struct PlacedObjectBinding {
-  char *object_name; // RIF object name (owned copy)
-  char *token_name;  // the `as "..."` clause, null if absent
+  pool_string object_name; // RIF object name (owned copy)
+  pool_string token_name;  // the `as "..."` clause, null if absent
   void *role;        // the parsed `role` section (ParsedThing*), ref_count++
   int team;          // index into TeamSlots[]
   bool overridable;  // 0 => a duplicate object name is an error
   uint8_t pad[3];
-  PlacedObjectBinding *next; // bucket chain
 };
 static_assert(offsetof(PlacedObjectBinding, team) == 0x0c);
-static_assert(sizeof(PlacedObjectBinding) == 0x18);
+static_assert(sizeof(PlacedObjectBinding) == 0x14);
 
 // Hash = sum of toupper(c) over object_name; lookup compares with __stricmp.
-// Embedded at ParsedMap+0x1b60; vtbl 0x0066328c is exactly three slots (the node
-// allocation policy) - ParsedMap's own ParsedThingVtbl starts right after, at
-// 0x00663298. Nodes are 0x18 bytes with `next` at +0x14.
-struct PlacedObjectBindingMap {
-  virtual void *CreateNode(PlacedObjectBinding *binding, void *next) = 0;
-  virtual void *CreateEmptyNode() = 0;
-  virtual void DestroyNode(void *node) = 0;
-
-  int count;    // 0x04
-  int capacity; // 0x08 (64)
-  unsigned mask;                 // 0x0c (63)
-  PlacedObjectBinding **buckets; // 0x10
-};
+// Embedded at ParsedMap+0x1b60. This is the polymorphic form of the template, and
+// the vtable confirms it: 0x0066328c is exactly three slots - the v1.1 node
+// allocation policy - with ParsedMap's own ParsedThingVtbl starting right after at
+// 0x00663298. The payload is held by value, so a node is 0x14 + the link = 0x18
+// with `next` at +0x14, which is what the old flat struct was describing.
+using PlacedObjectBindingMap = HashTable<PlacedObjectBinding>;
+using PlacedObjectBindingNode = PlacedObjectBindingMap::Node;
 static_assert(sizeof(PlacedObjectBindingMap) == 0x14);
-
-// The standard {sentinel, count, cached_array, cache_valid} list header used
-// throughout the engine (cf. Role::vulnerabilities, ParsedObjectList).
-struct ListHeader {
-  void *sentinel;
-  int count;
-  void *cached_array;
-  bool cache_valid;
-  uint8_t pad[3];
-};
-static_assert(sizeof(ListHeader) == 0x10);
+static_assert(sizeof(PlacedObjectBindingNode) == 0x18);
+static_assert(offsetof(PlacedObjectBindingMap, n_entries) == 0x04);
+static_assert(offsetof(PlacedObjectBindingMap, chains) == 0x10);
+static_assert(offsetof(PlacedObjectBindingNode, next) == 0x14);
 
 // Embedded reader/writer lock at Map+0x04. RWLock_Lock @ 0x00579700 and
 // RWLock_Unlock @ 0x005797c0 touch only +0x00 and +0x1c; the interior is opaque.
@@ -95,6 +86,9 @@ static_assert(sizeof(RWLock) == 0x20);
 // @ 0x00470f20 and decorated by ToMap @ 0x0047f160. A non-null TheMap makes
 // ToMap skip its entire geometry phase, which is the seam a native level
 // builder hooks. See level_loading_notes.md.
+//
+// The Map dtor @ 0x00471e60 owns only the three strings below; scene_object and
+// sky_object are refcounted, and the Map itself is pool-freed as 0x18c.
 //
 // Offsets 0x24..0x88 and 0x8c..0xa4 are still largely unmapped: they are only
 // reached through __thiscall methods invoked directly on TheMap (FUN_0048cf50
@@ -110,12 +104,12 @@ struct MapBase {
   virtual void ClearReferencesTo(void *removed_ranges) = 0;
 
   RWLock lock;            // 0x04 held while the section adjacency is rebuilt
-  ListHeader field0x24;   // 0x24
+  List<void *> field0x24;   // 0x24
   uint8_t unk0x34[0x54];  // 0x34
   void **sections;        // 0x88 section table
   int num_sections;       // 0x8c
   uint8_t unk0x90[0x4];   // 0x90
-  ListHeader field0x94;   // 0x94
+  List<void *> field0x94;   // 0x94
 };
 static_assert(offsetof(MapBase, sections) == 0x88);
 static_assert(sizeof(MapBase) == 0xa4);
@@ -144,7 +138,7 @@ struct Map : MapBase, RefCountedBase {
   Vec4 field0xb4;         // 0x0b4 {1,1,1,1} in Map_Ctor
   int field0xc4;          // 0x0c4 = 2 in Map_Ctor
   void *scene_object;     // 0x0c8 0x1f0 bytes, FUN_0059c3a0(sceneObject, 1)
-  char *bitmap;           // 0x0cc owned; map section field 0x02
+  pool_string bitmap;     // 0x0cc map section field 0x02
   bool field0xd0;         // 0x0d0
   bool field0xd1;         // 0x0d1 set to 1 at the end of Map_Ctor
   bool field0xd2;         // 0x0d2
@@ -156,8 +150,8 @@ struct Map : MapBase, RefCountedBase {
   float field0xf0;        // 0x0f0 = 0.5
   float field0xf4;        // 0x0f4 = 0.5
   int field0xf8;          // 0x0f8
-  ListHeader field0xfc;   // 0x0fc
-  ListHeader field0x10c;  // 0x10c
+  List<void *> field0xfc;   // 0x0fc
+  List<void *> field0x10c;  // 0x10c
   // NEGATED map origin - Map_Ctor XORs each component of its `origin` argument
   // with 0x80000000 before storing it, and ToMap ADDs this to scaled rif
   // locator coordinates. Net effect: pos = rif_pos * world_unit_scale - origin.
@@ -172,8 +166,8 @@ struct Map : MapBase, RefCountedBase {
   Vec3 camera_focus_max;  // 0x14c
   unsigned rif_time_low;  // 0x158 FILETIME of the level .rif; the .cut/.map
   unsigned rif_time_high; // 0x15c cache stamp is compared against this pair
-  char *shadow_object_rif;  // 0x160 owned; map section field 0x54
-  char *shadow_object_name; // 0x164 owned; map section field 0x55
+  pool_string shadow_object_rif;  // 0x160 map section field 0x54
+  pool_string shadow_object_name; // 0x164 map section field 0x55
   Vec3 default_position;    // 0x168 valid only if has_default_position
   bool has_default_position; // 0x174 gates ConsoleParsePosition's use of it
   uint8_t pad0x175[3];      // 0x175
@@ -257,12 +251,12 @@ int MapWrapper::to_string(lua_State *L) const {
   return 1;
 }
 
-std::string_view MapWrapper::get_bitmap() { return str(map->bitmap); }
+std::string_view MapWrapper::get_bitmap() { return str(map->bitmap.get()); }
 std::string_view MapWrapper::get_shadow_object_rif() {
-  return str(map->shadow_object_rif);
+  return str(map->shadow_object_rif.get());
 }
 std::string_view MapWrapper::get_shadow_object_name() {
-  return str(map->shadow_object_name);
+  return str(map->shadow_object_name.get());
 }
 int MapWrapper::get_num_sections() { return map->num_sections; }
 bool MapWrapper::get_adjacency_built() { return map->adjacency_built; }

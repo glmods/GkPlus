@@ -5,6 +5,7 @@
 #include "LuaEngine.h"
 
 #include <array>
+#include <cstddef>
 #include <string_view>
 
 namespace gk {
@@ -19,16 +20,46 @@ static int *GameState;
 
 static Actor **ActorUnderCursor;
 
-static struct {
-  int CDMusicVolume;
-  int BattleMusicVolume;
-  int CinematicsVolume;
-  int SoundEffectsVolume;
-  int AreHintsOn;
-  int IsFriendlyFireOn;
-  int AreFriendlyMinesOn;
-  int IsAutoCrouchOn;
-} *Settings;
+// The GLKeys "data" block: the 0x50-byte settings struct ReadGLKeys parses from
+// Scripts\GLkeys.cfg and WinMain blits (five MOVUPS) onto the global block at
+// 0x006abdd0. The on-disk order is scrambled and interleaves seven unrelated
+// 0x007b9cxx globals; this is the in-memory layout. Full field-by-field notes,
+// the on-disk order, and the persistence quirks are in menu_system_notes.md.
+//
+// The persisted block is exactly +0x00..+0x4f. IsAutoCrouchOn and BandwidthUse
+// are contiguous in .data right after it but live *outside* the block, so they
+// are saved nowhere and reset to their .data defaults every launch.
+struct GLKeysSettings {
+  int UnusedPrefToggle;       // 0x00  dead: menu 26 case 6 is unreachable
+  int LinearMipmapOn;         // 0x04  video toggle
+  int AnisotropicFilteringOn; // 0x08  video toggle (auto-cleared if ValidateDevice fails)
+  int TripleBufferingOn;      // 0x0c  video toggle
+  int Use32BitTextures;       // 0x10  video toggle
+  int EnableRenderFlag0x400;  // 0x14  not persisted; WinMain hardcodes to 1
+  int DepthStencilBits;       // 0x18  discarded on load (renegotiated per device)
+  int VramTextureReduction;   // 0x1c  auto-computed from VRAM, not a user setting
+  int TextureDetail;          // 0x20  video multi-value
+  int ShadowQuality;          // 0x24  video multi-value (menu binds PendingShadowQuality)
+  int ColourDepthIndex;       // 0x28  discarded on load (silently resets to 32-bit)
+  int DynamicLightsOn;        // 0x2c  video toggle
+  int ParticleFx;             // 0x30  video multi-value
+  int CDMusicVolume;          // 0x34  menu 25 Audio, 0..9
+  int BattleMusicVolume;      // 0x38  menu 25 Audio, 0..9
+  int CinematicsVolume;       // 0x3c  menu 25 Audio, 0..9
+  int SoundEffectsVolume;     // 0x40  menu 25 Audio, 0..9
+  int AreHintsOn;             // 0x44  menu 26 Prefs, 0/1
+  int IsFriendlyFireOn;       // 0x48  menu 26 Prefs, 0/1
+  int AreFriendlyMinesOn;     // 0x4c  menu 26 Prefs, 0/1  <-- end of persisted 0x50 block
+  int IsAutoCrouchOn;         // 0x50  menu 26 Prefs, 0/1; not persisted (past the block)
+  int BandwidthUse;           // 0x54  menu 26 Prefs; MP net throttle 0..9, menu shows
+                              //       9 - value; gates optional net updates and caps the
+                              //       send backlog at 0x14 - value; not persisted
+};
+static_assert(sizeof(GLKeysSettings) == 0x58);
+static_assert(offsetof(GLKeysSettings, CDMusicVolume) == 0x34);
+static_assert(offsetof(GLKeysSettings, AreFriendlyMinesOn) == 0x4c);
+static_assert(offsetof(GLKeysSettings, IsAutoCrouchOn) == 0x50);
+static GLKeysSettings *Settings;
 
 static int *BattleNumber;
 
@@ -56,7 +87,7 @@ MiscModule::MiscModule(lua_State *L) : Module{L} {
   GetObjectAtOffset(GameMode, 0x007b9e28);
   GetObjectAtOffset(GameState, 0x006b02b4);
   GetObjectAtOffset(ActorUnderCursor, 0x007b68e8);
-  GetObjectAtOffset(Settings, 0x006abe04);
+  GetObjectAtOffset(Settings, 0x006abdd0);
   GetObjectAtOffset(BattleNumber, 0x006a79b4);
   GetObjectAtOffset(EPWEnabled, 0x006a3001);
   GetObjectAtOffset(GameDifficulty, 0x007b9cc4);
@@ -92,7 +123,7 @@ struct State {
           lua_pushnil(L);
           return 1;
         }
-        lua_createtable(L, list->count, 0);
+        lua_createtable(L, list->size(), 0);
         int index = 1;
         for (auto *thing : *list) {
           lua_createtable(L, 0, 3);

@@ -60,6 +60,11 @@ Really `ListNode` (0x10: vtable/prev/next/pad) + **`MenuItemData` (0x68) at +0x1
 `MenuListItemVtable` has **exactly one slot** (the scalar deleting destructor) — there is no
 virtual draw or update; all polymorphism is the `itemType` int.
 
+That `ListNode` is just `List_Member_Base` from AvP's `list_tem.hpp`, so the node is exactly
+`List_Member<MenuItemData>` — which is how `src/Menu.h` now models it, with `Menu`'s first four
+fields as an embedded `List<MenuItemData>`. The 0x0c padding below is not a field at all: it is
+the gap the template leaves between its 0xc-byte base and an 8-aligned payload.
+
 | Node off | Data off | Type | Name | Meaning |
 |---|---|---|---|---|
 | 0x00 | — | `void**` | `vtable` | `&MenuListItemVtable`, 1 slot |

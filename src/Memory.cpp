@@ -7,6 +7,10 @@
 
 namespace gk {
 namespace {
+
+CDecl<void *, size_t> pool_alloc_ptr;
+StdCall<void, void *> pool_free_ptr;
+
 template <typename T> int LuaReadInt(lua_State *L) {
   auto addr = Lua::check<int>(L, 1);
   T *obj;
@@ -50,7 +54,13 @@ int LuaWriteFloat(lua_State *L) {
 }
 } // namespace
 
-MemoryModule::MemoryModule(lua_State *L) : Module{L} {}
+void *pool_alloc(size_t sz) { return pool_alloc_ptr(sz); }
+void pool_free(void *ptr) { pool_free_ptr(ptr); }
+
+MemoryModule::MemoryModule(lua_State *L) : Module{L} {
+  GetObjectAtOffset(pool_alloc_ptr, 0x00571470);
+  GetObjectAtOffset(pool_free_ptr, 0x005715b0);
+}
 
 int MemoryModule::Register(lua_State *L) {
   lua_newtable(L);

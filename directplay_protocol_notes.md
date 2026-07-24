@@ -516,7 +516,7 @@ Command handler (executor cases `0x3b`/`0x3d`) reads:
 +0x08 u32     flag                 (0x3b: clears +0xE0 flag & does door proximity; 0x3d: sets it)
 +0x0c f32[3]  target position       -> SetPositionAndOrientation
 +0x18 f32[4]  target orientation quat
-+0x28 f32[3]  waypoint              -> AI controller +0x1c/+0x20/+0x24
++0x28 f32[3]  waypoint              -> NavAgent velocity (+0x1c/+0x20/+0x24)
 +0x34 f32     delay / alarm
 ```
 

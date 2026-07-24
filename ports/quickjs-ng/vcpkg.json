@@ -1,7 +1,7 @@
 {
     "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
     "name": "quickjs-ng",
-    "version": "0.12.1",
+    "version": "0.15.1",
     "description": "QuickJS, the Next Generation: a mighty JavaScript engine",
     "homepage": "https://github.com/quickjs-ng/quickjs",
     "license": "MIT",

@@ -1,5 +1,7 @@
 #pragma once
+#include "List.h"
 #include "LuaEngine.h"
+#include "Memory.h"
 #include "Module.h"
 
 #include <cstddef>
@@ -32,66 +34,69 @@ inline constexpr int MenuItemScrollDown = 0x103;
 // Only six rows are ever visible; Menu::scroll_offset picks the first.
 inline constexpr int MenuVisibleRows = 6;
 
-// The game's menu entry: ListNode (0x10) + MenuItemData (0x68) at +0x10.
-// MenuListItemVtable has exactly one slot (scalar deleting dtor) -- there is no
-// virtual draw, all polymorphism is the `type` int.
-struct MenuListItem {
-  void *vtable;                  // 0x00
-  MenuListItem *prev;            // 0x04
-  MenuListItem *next;            // 0x08
-  int pad_0c;                    // 0x0c
-  int *toggle_value;             // 0x10 Toggle only; dereferenced as int*, not bool*
-  char *value_text;              // 0x14 LabelWithValue only
-  unsigned char value_text_owned;// 0x18 1 = heap, free it
-  unsigned char pad_19[3];
-  int *multi_value_index;        // 0x1c MultiValue only
-  unsigned **multi_value_labels; // 0x20 MultiValue only; DOUBLE indirect
-  unsigned char is_current_value;// 0x24 draw this row red instead of green
-  unsigned char pad_25[3];
-  char *label;                   // 0x28
-  float rect_left;               // 0x2c normalized screen coords
-  float rect_top;                // 0x30
-  float rect_right;              // 0x34
-  float rect_bottom;             // 0x38
-  MenuItemType type;             // 0x3c
-  unsigned char label_is_static; // 0x40 0 = heap, free it (opposite of value_text_owned)
-  unsigned char pad_41[3];
-  int index;                     // 0x44
-  float glow_level;              // 0x48 ramps 0..0.5 while selected
-  float reveal_rate;             // 0x4c chars per ms for the typewriter effect
-  float unused_random;           // 0x50 written by InitAnimation, never read
-  int label_chars_revealed;      // 0x54
-  int value_chars_revealed;      // 0x58
-  int pad_5c;                    // 0x5c
-  long long label_reveal_start;  // 0x60
-  long long value_reveal_start;  // 0x68
-  void *extra_owned_buffer;      // 0x70
-  int pad_74;                    // 0x74
+// The payload half of a menu entry -- the "MenuItemData (0x68)" that sits at
+// +0x10 of the 0x78-byte node. MenuListItemVtable has exactly one slot (scalar
+// deleting dtor) -- there is no virtual draw, all polymorphism is the `type` int.
+//
+// Of the three buffers Menu::ClearItems @ 0x004f7cd0 reclaims, only
+// extra_owned_buffer is owned unconditionally; label and value_text are each
+// gated on a sibling flag, so neither can be a pool_unique_ptr. The bound value
+// pointers point at globals and are never freed.
+struct MenuItemData {
+  int *toggle_value;             // 0x00 Toggle only; dereferenced as int*, not bool*
+  char *value_text;              // 0x04 LabelWithValue only; owned iff value_text_owned
+  unsigned char value_text_owned;// 0x08 1 = heap, free it
+  unsigned char pad_09[3];
+  int *multi_value_index;        // 0x0c MultiValue only
+  unsigned **multi_value_labels; // 0x10 MultiValue only; DOUBLE indirect
+  unsigned char is_current_value;// 0x14 draw this row red instead of green
+  unsigned char pad_15[3];
+  char *label;                   // 0x18 owned iff label_is_static == 0
+  float rect_left;               // 0x1c normalized screen coords
+  float rect_top;                // 0x20
+  float rect_right;              // 0x24
+  float rect_bottom;             // 0x28
+  MenuItemType type;             // 0x2c
+  unsigned char label_is_static; // 0x30 0 = heap, free it (opposite of value_text_owned)
+  unsigned char pad_31[3];
+  int index;                     // 0x34
+  float glow_level;              // 0x38 ramps 0..0.5 while selected
+  float reveal_rate;             // 0x3c chars per ms for the typewriter effect
+  float unused_random;           // 0x40 written by InitAnimation, never read
+  int label_chars_revealed;      // 0x44
+  int value_chars_revealed;      // 0x48
+  int pad_4c;                    // 0x4c alignment gap before the two timestamps
+  long long label_reveal_start;  // 0x50
+  long long value_reveal_start;  // 0x58
+  pool_unique_ptr<void> extra_owned_buffer; // 0x60
+  int pad_64;                    // 0x64
 };
-static_assert(sizeof(MenuListItem) == 0x78);
-static_assert(offsetof(MenuListItem, toggle_value) == 0x10);
-static_assert(offsetof(MenuListItem, value_text) == 0x14);
-static_assert(offsetof(MenuListItem, multi_value_index) == 0x1c);
-static_assert(offsetof(MenuListItem, multi_value_labels) == 0x20);
-static_assert(offsetof(MenuListItem, is_current_value) == 0x24);
-static_assert(offsetof(MenuListItem, label) == 0x28);
-static_assert(offsetof(MenuListItem, rect_left) == 0x2c);
-static_assert(offsetof(MenuListItem, type) == 0x3c);
-static_assert(offsetof(MenuListItem, label_is_static) == 0x40);
-static_assert(offsetof(MenuListItem, index) == 0x44);
-static_assert(offsetof(MenuListItem, glow_level) == 0x48);
-static_assert(offsetof(MenuListItem, label_reveal_start) == 0x60);
-static_assert(offsetof(MenuListItem, extra_owned_buffer) == 0x70);
+static_assert(sizeof(MenuItemData) == 0x68);
+static_assert(offsetof(MenuItemData, multi_value_index) == 0x0c);
+static_assert(offsetof(MenuItemData, multi_value_labels) == 0x10);
+static_assert(offsetof(MenuItemData, is_current_value) == 0x14);
+static_assert(offsetof(MenuItemData, label) == 0x18);
+static_assert(offsetof(MenuItemData, rect_left) == 0x1c);
+static_assert(offsetof(MenuItemData, type) == 0x2c);
+static_assert(offsetof(MenuItemData, label_is_static) == 0x30);
+static_assert(offsetof(MenuItemData, index) == 0x34);
+static_assert(offsetof(MenuItemData, glow_level) == 0x38);
+static_assert(offsetof(MenuItemData, label_reveal_start) == 0x50);
+static_assert(offsetof(MenuItemData, extra_owned_buffer) == 0x60);
 
-// The game's menu container. Used for both Menus[36] and InGameMenus[7].
-// The first four fields are an intrusive list header, the same template that
-// backs LevelList and MultiplayerLevelList.
+// The entry is a plain List_Member. This is what the previously unexplained
+// `pad_0c` was: the gap List_Member<T> leaves between the 0xc-byte base and an
+// 8-aligned payload. 0xc rounded up to 0x10, plus 0x68, is exactly the 0x78 the
+// item's destructor pool-frees.
+using MenuListItem = List_Member<MenuItemData>;
+static_assert(alignof(MenuItemData) == 8);
+static_assert(sizeof(MenuListItem) == 0x78);
+
+// The game's menu container. Used for both Menus[36] and InGameMenus[7]. It opens
+// with an embedded List<MenuItemData> -- the same template that backs LevelList
+// and MultiplayerLevelList.
 struct Menu {
-  MenuListItem *sentinel;          // 0x00 circular list sentinel
-  int num_nodes;                   // 0x04
-  int *cached_items;               // 0x08 flat index -> MenuItemData* array
-  bool cache_valid;                // 0x0c
-  unsigned char pad_0d[3];
+  List<MenuItemData> items;        // 0x00
   MenuListItem *current_item;      // 0x10 mutable iteration cursor
   Menu *items_owner;               // 0x14 self-pointer; lets one menu render another's items
   int scroll_offset;               // 0x18 index of the first visible item

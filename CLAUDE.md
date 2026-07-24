@@ -93,6 +93,8 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 | `src/Module.h` | CRTP module base - auto-registers in Lua `package.preload` |
 | `src/LuaEngine.h/cpp` | Lua VM init/close, type interop (concepts, Fields, Create) |
 | `src/DetourUtils.h` | Member function DetourAttach/DetourDetach wrappers |
+| `src/List.h` | `List<T>` / `List_Member<T>` / `List_Member_Base<T>` — layout mirror of AvP's `list_tem.hpp`, with sentinel-safe `begin()`/`end()` |
+| `src/HashTable.h` | `HashTableBase<T>` / `HashTable<T>` — layout mirror of AvP's `Hash_tem.hpp`, with bucket-walking `begin()`/`end()` |
 | `src/Varint.h` | Variable-length integer encode/decode (used for Lua refs in trigger scripts) |
 
 ### Lua-facing sources
@@ -121,8 +123,8 @@ The Lua userdata wrappers (`src/Actors`, `src/Roles`, `src/Map`, `src/Vulnerabil
 - `trigger_system_notes.md` - 22 trigger types, data structures, console command syntax, function addresses
 - `gls_system_notes.md` - GLS/GSH script parser: pipeline, ParsedThingBase layout, per-section field tables (types/ranges/defaults), ToXxx converters, C++ API is `src/GLS.h`
 - `level_loading_notes.md` - How a level is built: `BeginLevelSession` -> `LoadLevel` -> `ToMap`, the `.cut`/`.map`/`.opt`/`.loc` sidecar caches, the `LevelMeshHeader` geometry format, the `use <role> in team <n> for "<rif object>"` placed-object binding hash on `ParsedMap+0x1b60`, both spawn factories, and the three seams for replacing the `.gls` path with a native/Lua level builder
-- `role_system_notes.md` - `Role` (0xc0) field-by-field: the entity hash table (0x007b48f0), lifecycle (`CreateRole`/`ToRole`/`RoleDtor`/`DestroyRoles`), the two embedded 16-byte list headers (vulnerabilities @ 0x68, sever points @ 0xac), the `flags` bitfield, `InventoryInfo`, pickup classification via `character->aggression*10`, the `ai` -> Actor-subclass dispatch (`CreateActor`), the spawn path (`SpawnRole`), and three `ToRole` defects
-- `role_subobjects_notes.md` - the four `Role` sub-objects: `Character` (0xb8, with `ToCharacter`'s unit conversions), `Projectile` (0x20), `ParticleGenerator` (0xd4, GLS fields vs runtime animation channels), and the 3-variant `Destructibility` family (base 0x8 / `FragData` 0x24 / `ReplaceDestructibility` 0x10, dispatched on the `+0x04` tag by `Frag` @ 0x0052e220)
+- `role_system_notes.md` - `Role` (0xc0) field-by-field: the entity hash table (0x007b48f0), lifecycle (`CreateRole`/`ToRole`/`RoleDtor`/`DestroyRoles`), the two embedded 16-byte list headers (vulnerabilities @ 0x68, sever points @ 0xac), the `flags` bitfield, `InventoryInfo`, pickup classification via `character->aggression*10`, the `ai` -> Actor-subclass dispatch (`CreateActor`), the spawn path (`SpawnRole`), three `ToRole` defects, and (§10) the whole vulnerability subsystem - `Vulnerability` (0x1c), `VulnerabilityType`, the 0xc-byte list sentinel, and the four population paths
+- `role_subobjects_notes.md` - the four `Role` sub-objects: `Character` (0xb8, with `ToCharacter`'s unit conversions), `Projectile` (0x20), `ParticleGenerator` (0xd4: GLS fields, the five 0x18-byte `PGenChannel` records, the `ParticleType` enum, and the template -> emitter map from `ParticleEmitter_Ctor`), and the 3-variant `Destructibility` family (base 0x8 / `FragData` 0x24 / `ReplaceDestructibility` 0x10, dispatched on the `+0x04` tag by `Frag` @ 0x0052e220)
 - `threading_model_notes.md` - Two game threads (main "client" + executor "server"), loopback message queues (full `MsgQueue`/`MsgQueueList`/`MsgQueueNode` layouts), pause handshake, per-thread clocks/RNG, which GkPlus hooks run on which thread, and the four script-execution entry points (all main-thread; host uses `ScriptQueue`, MP joiners use update `0x67`)
 - `directplay_protocol_notes.md` - Multiplayer wire protocol: DirectPlay (`IDirectPlay4A`) COM/session setup, app GUID, SendEx/Receive framing & reliability, and the full command (client->server) and update (server->client) message-id tables with payload layouts, the `0x87` lock-step turn model, and update `0x67` (§8.11) which makes every client run a trigger script from its **own** local `Scripts\` copy
 - `menu_system_notes.md` - Both menu systems (front-end `Menus[36]` + in-game `InGameMenus[7]`): `Menu`/`MenuListItem` layouts, the four item constructors and the 4 item types, the full 0-35 menu inventory with titles and populators, the (menu, item) -> action transition map, navigation/rendering/input, key bindings, and the localized string table
@@ -142,9 +144,19 @@ chunk/RIF-shaped instead of decompiling — `rif_chunk_format.md` has the id -> 
 
 The split is sharp and worth remembering:
 
-- **Shared** — the chunk/RIF library, `List<T>` (`list_tem.hpp`), `HashTable<T>`
-  (`Hash_tem.hpp`), `Chunk`/`Chunk::Register` (`Chunk.hpp`), and the load-side consumers
+- **Shared** — the chunk/RIF library, `List<T>` (`list_tem.hpp`, mirrored in `src/List.h`),
+  `HashTable<T>` (`Hash_tem.hpp`, mirrored in `src/HashTable.h` — and it reaches further into
+  the game layer than the "not shared" rule below suggests: the actors and roles tables are
+  both this template),
+  `Chunk`/`Chunk::Register` (`Chunk.hpp`), and the load-side consumers
   `avp/win95/Projload.cpp` + `Objsetup.cpp` (AvP's counterpart to `ToMap`).
+  `list_tem.hpp` is the ground truth for every `{sentinel, count, cached_array,
+  cache_valid}` header in Gunlok: the header is `List<T>`, nodes are
+  `List_Member<T>` (`{vptr, prev, next, data}`, 0x10 for a pointer payload), and the
+  **sentinel is a bare `List_Member_Base` of only 0xc bytes** — it has no `data`, so
+  reading a node field off it is a heap over-read. Terminate on `cur != sentinel`, never
+  on `cur->next != sentinel`. All three are mirrored in `src/List.h`; use them rather
+  than open-coding the header again (see the convention below).
 - **Not shared** — the entire game layer. Roles, Actors, GLS scripts, triggers, menus and the
   save format have no AvP counterpart; AvP's `STRATEGYBLOCK`/`MODULE`/behaviour blocks do
   **not** describe Gunlok structures. Don't map them across.
@@ -224,6 +236,29 @@ and audit the DB afterwards rather than trusting it.
   vtable" implies. Bound the final table with the reference test, never with adjacency.
 - A `ParsedThingBase` subclass may be **larger than 0x1b60**: check the `malloc` size in its
   `DoParseXxx`. `ParsedMap` is 0x1b78 - the extra 0x18 is the placed-object binding hash.
+- A **`ToXxx` converter that only default-initialises a field can never tell you what it
+  means** - constants are not evidence. When a struct is mostly `field0xNN`, check whether the
+  only function with the type applied is the converter; if so the analysis simply never reached
+  a consumer. `ParticleGenerator` sat that way until `ParticleEmitter_Ctor` was found.
+- **Same size is not the same type.** `ParticleTypeInfos`' elements are 0xd4 bytes, exactly
+  `sizeof(ParticleGenerator)`, and are reached through the same code - but their element ctor
+  builds `Vec3`s at completely different offsets. Confirm with the ctor/dtor pair, not the size.
+- A struct copied with **`MOVUPS`/`MOVQ` shows you its real record boundaries**. Five
+  `ParticleGenerator` sub-records looked like `{vec4, int}` preceded by padding until the
+  16-byte load from `+0x2c` (not `+0x30`) proved each record starts one dword earlier.
+- A **table of N filled instances beats any single decompilation**. Diffing the 13 cases of
+  `InitParticleTypeInfo` down a column named most of `ParticleTypeInfo` in one pass: the field
+  that is 9.81 for snow/rain/sparks is gravity, the one that is 30 for rain and 9 for snow is
+  fall speed. When a struct resists, look for the initialiser that fills every variant.
+- **A shared epilogue after a switch is usually derived state.** Four of `ParticleTypeInfo`'s
+  `Vec3`s are just the others divided by the tick rate; naming them as independent fields would
+  have invented four physics parameters that do not exist.
+- A helper reached only through subsystem X is **not necessarily X's**. `ParticleTypeInfo`'s
+  `render_state` ctor/finalise looked particle-specific until a caller check showed the shadow
+  renderer and five other subsystems using them. Check callers before baking a prefix into a name.
+- **No `static_assert` means nothing is pinning the layout.** Before trusting a GkPlus struct
+  mirror, check it actually has one - `ParticleGenerator` and `Projectile` had none despite
+  this file claiming otherwise.
 
 ### Ghidra MCP Mechanics
 
@@ -279,13 +314,15 @@ and audit the DB afterwards rather than trusting it.
 
 | Offset | Type | Name |
 |--------|------|------|
-| 0x007ba0d8 | Actors* | actors (hash table) |
+| 0x007ba0d8 | Actors* | actors — `HashTable<Actor*>`, so +0x00 is the vptr and `n_entries` is at +0x04 |
+| 0x0054f2b0 | ThisCall (member) | HashTable_Remove (the template's `Remove`) |
+| 0x0054db10 | FastCall<unsigned, Actor*> | HashFunction_Actor (returns `actor->id`) |
 
 **Role System:**
 
 | Offset | Type | Name |
 |--------|------|------|
-| 0x007b48f0 | Roles* | roles (hash table) |
+| 0x007b48f0 | Roles* | roles — `HashTableBase<Role*>`, the **vptr-less** shape, so `n_entries` is at +0x00 |
 
 **Token System:**
 
@@ -293,14 +330,49 @@ and audit the DB afterwards rather than trusting it.
 |--------|------|------|
 | 0x007b6af8 | Tokens* | tokens |
 
-**Console System:**
+**Console System:** (the whole block 0x007b6950-0x007b6b41 is mapped in the Ghidra DB)
 
 | Offset | Type | Name |
 |--------|------|------|
-| 0x007b6958 | char* | CommandLine |
-| 0x007b6950 | unsigned* | TextColor |
+| 0x007b6958 | char[252] | CommandLine (`ConsoleCommandLine`) |
+| 0x007b6b40 | char[0xfc] | SavedConsoleCommandLine (ESC-stash of the line) |
+| 0x007b6950 | unsigned | TextColor (`ConsoleTextColor`, "TEXT COLOR" cmd) |
+| 0x007b6954 | unsigned | UITextColorLight 0xffccccd6 (scrolling msgs, briefing) |
+| 0x007b6a64 / 0x007b6a68 | unsigned | UIColorDim 0xff595966 / UIColorYellow 0xffffef47 |
 | 0x007c149c | unsigned* | CursorColor |
-| 0x007b6aa8 | CommandList* | List (command list) |
+| 0x007b6a54/58/5c/60 | Font* | ConsoleSmallFont / ConsoleLargeFont / HudSmallFont / ConsoleLargeFont2 (all built in FUN_004d5380) |
+| 0x007b6a70..0x007b6a7c | — | command **hash table**: NumRegisteredCommands, CommandTableNumBuckets, CommandTableMask, CommandTableBuckets (`CommandListElem**`) |
+| 0x007b6aa8..0x007b6ab4 | List | command exec queue: CommandsToExecute (anchor), NumCommandsToExecute, cache, cacheValid — one popped per frame by `PumpQueuedConsoleCommand` |
+| 0x007b6a80 / 0x007b6b38 | float | ConsoleTextScrollTarget / ConsoleSlidePos (open/close anim; -1=closed) |
+| 0x007b6b3c | Sprite* | ConsoleBackdropSprite (FUN_004d7b20) |
+| 0x007b6ac8/cc/d0/d4 | — | DrawText scratch arg block (X/Ctx/Scale/4) |
+
+The console keeps text as parallel `List<T>` headers (0x10 bytes each: `{anchor_ptr, count,
+cached_array, cache_valid}` — the anchor is a **pointer** to a heap sentinel, unlike the embedded
+`List<T>` in `src/List.h`). Overlay (transient, console-closed, cap `DAT_006a66ac`): `ConsoleOverlayText`
+@0x6a84 + `ConsoleOverlayColor` @0x6a98. Scrollback/history (cap `DAT_006a66b0`): `ConsoleHistoryText`
+@0x6ab8 + `ConsoleHistoryColor` @0x6ad8 + `ConsoleHistoryTime` @0x6ae8. On-screen text-line layout
+(anti-overlap, category @+0x30): `ScreenTextLineList` @0x6b28.
+
+**Briefing / Debrief / Stats screen:** (globals 0x007b6890-0x007b68e1; driver `ShowBriefingOrDebriefScreen` @0x004b1f60)
+
+| Offset | Type | Name |
+|--------|------|------|
+| 0x007b68e0 / 0x007b68e1 | bool | IsBriefing (1=brief,0=debrief) / IsTrainingDebrief |
+| 0x007b6890 | byte | StatsScreenClientsReady (MP debrief handshake) |
+| 0x007b6894 | int | CurrentBriefingTextIndex (GL_BRIEFING_0+n; -1=none) |
+| 0x007b689c / 0x007b68ac / 0x007b68bc | List | BriefingBitmapList / BriefingSceneObjList / BriefingTextList (each 0x10-byte pointer-anchored list) |
+| 0x007b68cc | int | BriefingFadeMode (0 none / 1 in / 2 out) |
+| 0x007b68d0 / 0x007b68d8 | int64 | BriefingFadeStartTime / BriefingFadeEndTime |
+
+**Client entity globals** (near the units block): `ObjectList` @0x007b6928 is the iterable
+`List<Object*>` of every client game object (IsXxx @vtbl+0x18, name-ptr @+0xb8, teamslot @+0xb4 —
+the named chars Gunlok/Elint/Hark/Frend/Maskelyn live here); `ProximityObjectList` @0x007b6938 is the
+proximity-activated subset. `UnitsTable` @0x007b68f0 is a `HashTable<Unit*>` (vptr variant like
+`actors`): n_entries=`NumUnits`@0x6f4, buckets=`UnitsTable_buckets`@0x6900. `CombatMusicKillCounter`
+@0x007b68ec counts kind-2 entity deaths to escalate battle music (FUN_004e7230). The six scattered
+`VestigialFloat_*` (0x6898/6904/6914/6924/6948/6a94 = 1024/1024/60/120/1024/1024) are CRT-constructed
+floats with **no readers**.
 
 **Menu System:** (see `menu_system_notes.md`)
 
@@ -334,6 +406,46 @@ and audit the DB afterwards rather than trusting it.
 | 0x007b9cc4 | int* | GameDifficulty |
 | 0x007b9c70 | Cheats* | Cheats |
 | 0x007b9df0 | int* | Foobar |
+
+**PRNG** (BSD `random()`, additive LFG DEG_3=31 / SEP_3=3; the generator is inlined at call
+sites as `(*fptr += *rptr) >> 1`): there are **two** state tables selected per-call by
+`GetCurrentThreadId() == ExecutingThread` — the client and executor threads each have an
+independent RNG so server-side simulation stays deterministic (see `threading_model_notes.md`).
+
+| Offset | Type | Name |
+|--------|------|------|
+| 0x006a3008 | int[31] | RandomState (main/client thread state table, 0x7c bytes) |
+| 0x006a3084 | int[31] | RandomStateExecutor (executor/server thread copy, at +0x7c) |
+| 0x006a3100 / 0x006a3104 | int* | RandomEndPtr / …Executor (= &state[31]) |
+| 0x006a3108 / 0x006a310c | int* | RandomFrontPtr / …Executor (fptr, init &state[3]) |
+| 0x006a3110 / 0x006a3114 | int* | RandomRearPtr / …Executor (rptr, init &state[0]) |
+
+**Saved mission-state block** (0x007b9c88..0x007b9d20, the 0x98 bytes `SaveGame` snapshots — this
+is the "SaveSettingsBlock", but its fields are ordinary live game state, not a settings struct):
+the WAIT-command deadline (`0x9c88`/`0x9c8c` game-clock 64-bit; real-time twin at `0x9c90`/`0x9c94`,
+click-cancel flags `0x9c98`/`0x9c99`), `GameDifficulty`, the sun color/direction
+(`SunLightColor` 0x9cc8 / `SunDirection` 0x9ce0, set by SetSunBrightness/SetSunAngle), the
+`TrainingAreaIndex` (0x9d14), and the **mission-stats** counters (reset by FUN_004fcc30, broadcast
+to clients at debrief via message id `0xa2` in FUN_005029d0, read by CommandStatsScreen):
+`MissionShotsFired` 0x9cf8 / `MissionShotsHit` 0x9cfc (accuracy = hit/fired, both count non-team-2
+shooters) with team-2 copies `…Team2` at 0x9d00/0x9d04, `MissionTimeSeconds` 0x9d08, the resurrection
+penalty 0x9d0c/0x9d10, and `DifficultyHealthToggle` 0x9cf4 (difficulty menu item 2).
+
+**Networking / effect lists** (all `{anchor,count,cache,valid}` 0x10-byte headers with a
+pointer-anchored heap sentinel, like the console lists): client `ClientOutgoingMsgList` @0x9d50 and
+server `ServerOutgoingMsgList` @0x9ddc; the four DirectPlay enumeration snapshots
+`DPlayGroupList`/`DPlayPlayerList`/`DPlayGroupDataList`/`DPlaySessionList` @0x9e30/0x9e40/0x9e54/0x9e64
+(rebuilt from the `MultiplayerActive` COM object); `RespawnRoleList` @0x9d98; and the effect lists
+`WallEffectList`/`WorldEffectList`/`LightEffectList` @0x9e88/0x9ebc/0x9ecc (light-cylinder & lightning
+nodes are 0x80 bytes). `ScannerEffectSprite` @0x9f80 (bitmaps\scanner.rim) is the scanline
+post-process; the other per-command effect sprites are `RayEffectSprite`/`LightCylinderSprite`/
+`LaserFenceSprite`/`RingShockwaveSprite` (0x9f70/0x9f74/0x9f6c/0x9f60), and `EffectEmitterList` @0x9e98
+(+ its geometry twin @0x9ea8) holds the steam/trail/explosion/sparks particle emitters. Executor thread
+flags: `ExecutorThreadStarted`/`ExecutorKillFlag`/`ExecutorPauseAckFlag` @0x9df1-0x9df3.
+
+A recurring **`VestigialFloat_*`** pattern shows up across `.data`: single `float` globals
+CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84/0x9d94/0x9e50/0x9eb8/
+0x9f9c here; 0x6898/0x6904/0x6948/0x6a94 etc. in the console block). Treat them as dead/vestigial.
 
 **Save System:** (see `save_system_notes.md`)
 
@@ -435,6 +547,31 @@ and audit the DB afterwards rather than trusting it.
 | 0x0056a120 | FastCall<void, const char*, void*, void*> | OpenInGameConfirmDialog |
 | 0x005691f0 | FastCall<void, int> | CloseInGameMenu (kind 0/1/2/3/0x41/0x42/0x43) |
 | 0x00569550 | FastCall<char> | IsAnyInGameMenuOpen |
+
+**Particles:** (see `role_subobjects_notes.md` §3)
+
+| Offset | Signature | Name |
+|--------|-----------|------|
+| 0x00580510 | ThisCall<void, void*, ParticleGenerator*, Vec3*, void*, char> | ParticleEmitter_Ctor (the template consumer) |
+| 0x005828f0 | StdCall<void> | InitParticleSystem (allocates ParticleTypeInfos[13]) |
+| 0x0057d220 | ThisCall<void, ParticleTypeInfo*, ParticleType> | InitParticleTypeInfo (13-case per-type defaults + per-tick precompute) |
+| 0x00581180 | - | particle per-tick update (unnamed; reads gravity_per_tick2/ttl_seconds/spawn_velocity_range) |
+| 0x00582d10 | - | particle renderer (unnamed; reads the uv rect, render_state, live_emitters) |
+| 0x0044c340 | StdCall<int> | GetParticleIDFromName (console keyword -> ParticleType) |
+| 0x007c1964 | ParticleTypeInfo* | ParticleTypeInfos (13 x 0xd4; **not** ParticleGenerator) |
+| 0x007c1968 | void* | ParticlesRimTextures (`bitmaps\particles.rim`) |
+
+**Memory:** (wrapped as `gk::pool_alloc` / `gk::pool_free` in `src/Memory.cpp`)
+
+| Offset | Signature | Name |
+|--------|-----------|------|
+| 0x00571470 | CDecl<void*, size_t> | pool_alloc — page sub-allocator; falls back to real CRT malloc for big blocks |
+| 0x005715b0 | StdCall<void, void*> | pool_free — returns an emptied page to the real CRT free |
+| 0x005e3f64 | StdCall<void, void*, int> | `Dealloc?` (sized wrapper; discards the size, calls pool_free) |
+| 0x005e3f72 | — | `malloc` — bare `JMP pool_alloc` |
+| 0x005e3f7b | — | `free` — bare `JMP pool_free`; **every** `free` in game code goes here |
+| 0x0044e1a0 | FastCall<char*, char*> | `strdup` — game-written, allocates via the malloc thunk |
+| 0x00601f4a / 0x00601f2d | — | the *real* CRT malloc/free. Only pool_alloc/pool_free and a few file/rif paths (`ToMap`, `LoadOrGetRifFile`) call them — no field in any mirrored struct holds this memory |
 
 **Misc:**
 
@@ -568,8 +705,31 @@ KERNEL32/USER32/GDI32/ADVAPI32/OLE32/WINMM (Windows API).
 
 - Everything lives in the `gk` namespace
 - Game addresses are always offsets added to base address (never hardcoded absolutes)
-- Hash tables (actors, roles) use bucket arrays with linked list chaining
-- Linked lists (triggers, tokens) are doubly-linked with sentinel nodes
+- **Hash tables are `HashTable<T>` / `HashTableBase<T>` from `src/HashTable.h`** — AvP's
+  `Hash_tem.hpp` (`_base_HashTable`), separate chaining, power-of-two table, no rehashing.
+  Gunlok uses **both** shapes and the difference is 4 bytes of offset on every field, so check
+  which one you have: `HashTable<T>` carries the v1.1 three-slot node-allocation vtable
+  (`NewNode`, `DeleteNode`, `NewNode(T, Node*)` — that declaration order is the slot order) and
+  puts `n_entries` at 0x04; `HashTableBase<T>` has no vptr and starts at 0x00. `actors`
+  @ 0x007ba0d8 is the former (its address is passed as `this`, and `HashTable_Remove`
+  @ 0x0054f2b0 is the template's own `Remove`); `roles` @ 0x007b48f0 is the latter (nothing in
+  `.text` even mentions 0x007b48ec, and every operation is inlined into `CreateRole` /
+  `GetRoleByName` / `GetRoleById` / `DestroyRoles`). Note the node is `{d, next}` — payload
+  **first**, the opposite of `List_Member<T>` — so a node holding a by-value payload is
+  `sizeof(T) + 4`, which is what makes a `PlacedObjectBinding` node 0x18 for a 0x14 payload.
+  The table's `T` needs a `HashFunction(T)` overload; Gunlok's for `Actor*`
+  (`HashFunction_Actor` @ 0x0054db10) just returns `actor->id`
+- **A `{sentinel, count, cached_array, cache_valid}` group is `List<T>` from `src/List.h`** —
+  embed it as one member instead of spelling out four fields, and model the node type as
+  `List_Member<T>` rather than `{void *vtbl; N *prev, *next; T data;}`. Range-for over a
+  `List<T>` terminates on the sentinel correctly by construction, which is the whole point;
+  `entry_of()` is the escape hatch when you need the node itself, and it is only valid on a
+  node you have already proved is not the head. `List<T>` is deliberately a trivially-copyable
+  aggregate with no constructors — `RegisterTriggers` takes one **by value** — and it is
+  standard-layout, so embedding it does not cost `-Winvalid-offsetof` warnings on the
+  containing struct. Picking the right `T` is a real claim about the payload: `List_Member<T>`
+  puts `data` at 0x0c for a pointer but at 0x10 for an 8-aligned value type, which is exactly
+  what makes `MenuListItem` 0x78 rather than 0x10
 - Detour hooks follow: resolve original -> attach in constructor -> detach in destructor
 - `static_assert` on struct sizes and offsets to catch layout mismatches
 - Game vtables are modelled in `src/Actors.cpp` as **declaration-ordered pure virtuals**: the base
@@ -598,9 +758,34 @@ KERNEL32/USER32/GDI32/ADVAPI32/OLE32/WINMM (Windows API).
   slot test: past a table's end sit the one-slot vtables of the list/node helpers, then floats.
 - Fields with a known offset but unknown meaning are named `field0xNN` / `unkN[...]` padding; a
   getter/setter of unknown purpose is named `GetField0xNN` / `SetField0xNN`
+- **Owning pointers in a struct mirror are `pool_unique_ptr<T>` (`src/Memory.h`); owned strings
+  are the `pool_string` alias.** There is only **one heap** on the game side — `pool_alloc` is a
+  page sub-allocator over the CRT, and the game's `malloc`/`free`/`strdup` are JMP thunks into
+  it — so a decompiled `free(x)` and a decompiled `Dealloc?(x, n)` are the same call and strings
+  are pool memory like everything else. Do **not** add a CRT-flavoured deleter: this DLL's `/MD`
+  UCRT heap is neither the pool nor the game's CRT heap, so calling our `::free` on any of these
+  pointers would corrupt it. The deleter is empty, so the member stays pointer-sized and the
+  existing `static_assert`s remain the proof; MSVC's `unique_ptr` is standard-layout, so this
+  adds no `-Winvalid-offsetof` warnings either. Read the containing object's destructor before
+  annotating, and keep the reason a sibling stayed raw in a comment — **refcounted** (per-type
+  Release, or "decrement then slot 0"), **borrowed** (`GetResourceString` results and the roles
+  hash are the two big sources), **conditional** (ownership gated on a sibling flag, as with
+  `MenuItemData::label`), or **leaked** (allocated per-object, never released).
 - Enum-like `int` fields use `enum class Name : int` (near its struct, or a header if shared across
   files) applied to the field; only encode values you've **verified** (the game's own enum, or a
   keyword->id function like `GetParticleIDFromName`) — leave `int` rather than guess a mapping.
+- **A misleading name is renamed, not annotated around.** When a type, field, function, or global
+  turns out to mean something other than its current name (yours or a shipped one), rename it to
+  what it *is* — do not keep a wrong name behind a "the name is doubtful" comment. Renaming is free
+  and expected; the whole point of the DB/mirror is that names carry the analysis. Do it in one
+  pass across **all three surfaces** — the `src/*.cpp` mirror, every `*_notes.md`, and the Ghidra DB
+  (type + field + the getter/setter/ctor/dtor that reach it) — then `grep` the old name to confirm
+  nothing dangles. Leave a one-line breadcrumb of the prior name where external write-ups will still
+  use it (a struct doc comment, or the notes' slot row). Example: the MobileActor `+0x200` object
+  was modelled as `AIController` / `GetAIController`, but it is the actor's nav-mesh
+  movement/collision agent, so it is now `NavAgent` / `nav_agent` / `GetNavAgent` with
+  `CreateNavAgent`/`DestroyNavAgent`, and the getter's old name is noted in the `NavAgent` comment
+  and the slot-24 row of `actor_vtable_notes.md`.
 
 ## Git Workflow
 

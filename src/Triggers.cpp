@@ -3,9 +3,13 @@
 
 #include "Core.h"
 #include "DetourUtils.h"
+#include "List.h"
 #include "LuaEngine.h"
 #include "Math.h"
+#include "Memory.h"
 #include "Varint.h"
+
+#include <type_traits>
 
 #include "Triggers.h"
 
@@ -36,18 +40,25 @@ enum class TriggerKind {
   BeenAlerted,
 };
 
+// Payload of a trigger's target list: an actor-name entry created by CreateTrigger.
 struct ITrigger {};
 
+// The engine's `List<ITrigger *>`. Passed BY VALUE to RegisterTriggers, which is
+// why List<T> must stay a trivially-copyable aggregate.
+using TriggerList = List<ITrigger *>;
+static_assert(sizeof(TriggerList) == 0x10);
+static_assert(std::is_trivially_copyable_v<TriggerList>);
+
+// pool_alloc'd (0x68) by RegisterTriggers and pool-freed by RemoveTrigger, which
+// also frees the script name. The target-list sentinel is pool_alloc'd and then
+// leaked, so it stays a raw pointer inside TriggerList.
 struct TriggerData {
   TriggerKind kind;
   Vec3 coords[4];
   long long time_or_radius;
   float radius_squared;
-  ITrigger *target_list_sentinel;
-  int target_list_count;
-  void *target_list_cache;
-  unsigned target_list_cache_flags;
-  unsigned char *script_name;
+  TriggerList targets;
+  pool_unique_ptr<unsigned char> script_name;
   int team_or_warning;
   unsigned armed;
   int last_trigger_actor;
@@ -65,20 +76,12 @@ TriggerData *TriggerData::HookedRemoveTrigger(char c) {
   // executor thread (see threading_model_notes.md) — luaL_unref here races with
   // main-thread Lua. Defer the unref to the main thread instead.
   if (script_name && (*script_name & 0x80)) {
-    lua_Integer ref = DecodeVarint(script_name);
+    lua_Integer ref = DecodeVarint(script_name.get());
     auto L = Lua::GetEngine();
     luaL_unref(L, LUA_REGISTRYINDEX, ref);
   }
   return (this->*RemoveTrigger)(c);
 }
-
-struct TriggerList {
-  ITrigger *sentinel;
-  int count;
-  void *cached_array;
-  bool cache_flag;
-};
-static_assert(sizeof(TriggerList) == 0x10);
 
 using TCopyList = ThisCall<TriggerList *, TriggerList *, TriggerList *>;
 TCopyList CopyList;
