@@ -94,6 +94,12 @@ void GoToMenu(MenuIndex target, bool remember) {
   fn(target, remember);
 }
 
+void PlayUiSound(int sound_id) {
+  FastCall<void, int> fn;
+  GetObjectAtOffset(fn, 0x0058cdd0);
+  fn(sound_id);
+}
+
 bool IsAnyInGameMenuOpen() {
   FastCall<char> fn;
   GetObjectAtOffset(fn, 0x00569550);

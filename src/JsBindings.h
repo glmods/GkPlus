@@ -134,7 +134,7 @@ bool EnsureClass(JSContext *ctx, JSClassID *class_id, const JSClassDef *def,
 JSValue NewActorWrapper(JSContext *ctx, Actor *actor);
 JSValue NewRoleWrapper(JSContext *ctx, Role *role);
 
-// --- the six namespace builders ----------------------------------------------
+// --- the seven namespace builders --------------------------------------------
 
 JSValue NewCameraNamespace(JSContext *ctx);
 JSValue NewConsoleNamespace(JSContext *ctx);
@@ -142,5 +142,6 @@ JSValue NewActorsNamespace(JSContext *ctx);
 JSValue NewRolesNamespace(JSContext *ctx);
 JSValue NewTokensNamespace(JSContext *ctx);
 JSValue NewTriggersNamespace(JSContext *ctx);
+JSValue NewMenusNamespace(JSContext *ctx);
 
 } // namespace gk::js

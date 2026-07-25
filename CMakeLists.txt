@@ -31,6 +31,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Camera.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Console.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Core.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/CustomMenu.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Debug.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/entry.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/GLS.cpp"
@@ -41,6 +42,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsCommon.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsConsole.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsGk.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/JsMenus.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsRoles.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsTokens.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsTriggers.cpp"
@@ -51,10 +53,11 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Misc.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Music.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Roles.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Script.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Tokens.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Triggers.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/exports.def")
-target_link_libraries(GkPlus PRIVATE detours imgui::imgui d3d8to9 d3d9 qjs)
+target_link_libraries(GkPlus PRIVATE detours imgui::imgui d3d8to9 d3d9 qjs imgui-quickjs)
 set_target_properties(GkPlus
     PROPERTIES
     OUTPUT_NAME "d3d8"

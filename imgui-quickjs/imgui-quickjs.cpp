@@ -6162,7 +6162,6 @@ const JSCFunctionListEntry js_imgui_funcs[] = {
     JS_ENUM_DEF(TableColumnFlags),
     JS_ENUM_DEF(TableRowFlags),
     JS_ENUM_DEF(TableBgTarget),
-    JS_ENUM_DEF(SortDirection),
 
     // Text Widgets
     JS_CFUNC_DEF("Text", 1, js_ImGui_Text),

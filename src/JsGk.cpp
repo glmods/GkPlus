@@ -20,9 +20,10 @@ struct NamespaceEntry {
 // no console object - that lives in quickjs-libc, which this port does not
 // install), but a host that adds one would.
 const NamespaceEntry Namespaces[] = {
-    {"camera", NewCameraNamespace},   {"console", NewConsoleNamespace},
-    {"actors", NewActorsNamespace},   {"roles", NewRolesNamespace},
-    {"tokens", NewTokensNamespace},   {"triggers", NewTriggersNamespace},
+    {"camera", NewCameraNamespace},     {"console", NewConsoleNamespace},
+    {"actors", NewActorsNamespace},     {"roles", NewRolesNamespace},
+    {"tokens", NewTokensNamespace},     {"triggers", NewTriggersNamespace},
+    {"menus", NewMenusNamespace},
 };
 
 int InitModule(JSContext *ctx, JSModuleDef *m) {

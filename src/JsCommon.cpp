@@ -1,9 +1,14 @@
 #include "JsBindings.h"
 
+#include "Console.h"
+#include "Core.h"
+#include "Js.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <string>
 
 namespace gk::js {
 namespace {
@@ -343,6 +348,67 @@ const JSClassExoticMethods CollectionExotic = {
 };
 
 } // namespace
+
+void Log(const char *text) {
+  if (!text) {
+    return;
+  }
+  DebugWrite(std::string("[gkplus] ") + text);
+  // The console keeps one list entry per line and does not wrap on '\n', so a
+  // multi-line stack trace has to be fed to it a line at a time. A trailing
+  // newline - which every stack trace has - must not become a blank entry.
+  std::string line;
+  bool wrote = false;
+  for (const char *p = text;; ++p) {
+    if (*p == '\n' || *p == '\0') {
+      if (*p == '\0' && line.empty() && wrote) {
+        break;
+      }
+      Print(line.c_str());
+      wrote = true;
+      line.clear();
+      if (*p == '\0') {
+        break;
+      }
+      continue;
+    }
+    if (*p != '\r') {
+      line += *p;
+    }
+  }
+}
+
+void ReportException(JSContext *ctx, const char *where) {
+  JSValue exc = JS_GetException(ctx);
+  std::string message = where ? where : "script";
+  message += ": ";
+
+  const char *text = JS_ToCString(ctx, exc);
+  message += text ? text : "(exception could not be converted to a string)";
+  if (text) {
+    JS_FreeCString(ctx, text);
+  }
+
+  // Errors carry a stack; anything else thrown does not, and asking for the
+  // property would be a spurious lookup on a primitive.
+  if (JS_IsError(exc)) {
+    JSValue stack = JS_GetPropertyStr(ctx, exc, "stack");
+    if (!JS_IsException(stack) && !JS_IsUndefined(stack)) {
+      const char *trace = JS_ToCString(ctx, stack);
+      if (trace && *trace) {
+        message += '\n';
+        message += trace;
+      }
+      if (trace) {
+        JS_FreeCString(ctx, trace);
+      }
+    }
+    JS_FreeValue(ctx, stack);
+  }
+  JS_FreeValue(ctx, exc);
+
+  Log(message.c_str());
+}
 
 JSValue NewVec3(JSContext *ctx, const Vec3 &v) {
   JSValue obj = JS_NewObject(ctx);

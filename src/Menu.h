@@ -12,6 +12,12 @@ enum class MenuIndex {
 #include "Menus.inc.h"
 };
 
+// Menus[36]. Counted off the X-macro so it cannot drift from the enum.
+inline constexpr int MenuCount = 0
+#define GUNLOK_MENU(...) +1
+#include "Menus.inc.h"
+    ;
+
 // MenuListItem::itemType. Only 0..3 exist -- verified by scanning every immediate
 // stored to the itemType slot in the menu region. There is no slider, no dedicated
 // text-entry type and no greyed-out state.
@@ -135,6 +141,14 @@ int GetInGameMenuSelectedItem();
 
 // GoToMenu @ 0x004fbfa0 (remember = push the current menu as parent).
 void GoToMenu(MenuIndex target, bool remember);
+
+// PlayUiSound @ 0x0058cdd0 - __fastcall with the sound id in ECX and nothing in
+// EDX (the body pushes ECX, a 0 and the sound-engine global, and tail-calls
+// 0x0058a660). OnMenuItemClicked opens with UiSoundMenuSelect for *every*
+// activation, so anything that handles a click instead of the game has to play
+// it too or the item feels dead.
+inline constexpr int UiSoundMenuSelect = 0x57;
+void PlayUiSound(int sound_id);
 // IsAnyInGameMenuOpen @ 0x00569550.
 bool IsAnyInGameMenuOpen();
 // CloseInGameMenu @ 0x005691f0 (kind 0/1/2/3/0x41/0x42/0x43).

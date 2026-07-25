@@ -7,10 +7,10 @@ globals, and a handful of behavioral hooks (music volume fix, input fix, debug r
 overlay) run at load. The game binary is actively being reverse engineered in Ghidra, accessible
 via MCP.
 
-There is no embedded scripting layer. The QuickJS + ImGui overlay pieces (`quickjs-ng`,
-`dear-bindings`, the `imgui-quickjs/` subproject) remain staged in the build; the overlay's
-per-frame draw is a native seam (`gk::SetOverlayDrawCallback`) that a future QuickJS module can
-plug into.
+On top of that sits a **QuickJS scripting layer**: `src/Script.cpp` boots a runtime during the
+game's `SetupMenus` and runs `<game dir>\gkplus\main.mjs`, which can import the `"gk"` and
+`"ImGui"` C modules, add items to the game's front-end menus and draw an ImGui overlay. See
+"Script host" below.
 
 ## Build
 
@@ -44,21 +44,39 @@ cmake --build build 2>&1 | Select-String ': (warning|error):' | Select-String -N
 
 Nothing in `src/` can be exercised outside Gunlok: `GetBaseAddress()` derives from the host exe's
 entry point, so every native-API call faults in a standalone process. To runtime-test a layer that
-does not itself touch game memory (the `src/Js*` bindings are the case in point), compile it into a
-throwaway 32-bit exe alongside a stub TU that replaces the `gk::` natives with fakes:
+does not itself touch game memory (the `src/Js*` bindings and the script host are the cases in
+point), compile it into a throwaway 32-bit exe alongside a stub TU that replaces the `gk::` natives
+with fakes:
 
 ```
-clang-cl -m32 /EHsc /MD -clang:-std=c++23 -Wno-invalid-offsetof \
-  "/Ibuild/vcpkg_installed/x86-windows-static-md/include" main.cpp stubs.cpp src/JsCommon.cpp … \
-  /Feharness.exe /link build/vcpkg_installed/x86-windows-static-md/lib/qjs.lib
+clang-cl -m32 /EHsc /MD -clang:-std=c++23 -Wno-invalid-offsetof -Wno-deprecated-declarations \
+  "/Ibuild/vcpkg_installed/x86-windows-static-md/include" "/I." "/Iimgui-quickjs" \
+  main.cpp stubs.cpp src/JsCommon.cpp src/JsMenus.cpp src/CustomMenu.cpp src/Script.cpp \
+  imgui-quickjs/imgui-quickjs.cpp /Feharness.exe /link \
+  build/vcpkg_installed/x86-windows-static-md/lib/{qjs,imgui,detours}.lib
 ```
 
-Do **not** put `src/` on the include path (see the include collision under Conventions). The real
-project flags live in `build/CMakeFiles/impl-Debug.ninja` (`FLAGS =`) if they drift. Always add a
+Do **not** put `src/` on the include path (see the include collision under Conventions) — put the
+**repo root** there instead and include as `"src/Menu.h"`, which is what `-I .` above is for; the
+`src/*.cpp` files still resolve their own siblings through quoted includes. The real project flags
+live in `build/CMakeFiles/impl-Debug.ninja` (`FLAGS =`) if they drift. Always add a
 deliberately-failing assertion once and confirm the harness reports it — a harness that cannot fail
 proves nothing.
 
-Four things that cost time the first time round:
+Two things make the script host reachable at all:
+
+- The harness must **not construct the `*System` objects** — their ctors resolve offsets off a fake
+  base and hand them to Detours. Both subsystems therefore expose their hook bodies as ordinary
+  functions (`BootScriptHost`, `ReconcileCustomMenu`, `DispatchCustomMenuClick`) and the `*System`
+  ctor is only the detour. Drive those directly.
+- Supply the harness's own `gk::js::RegisterGkModule` and simply do not compile `JsGk.cpp`. The
+  trimmed module registers just the namespace under test, which is what keeps the actor/role/token
+  stubs (and the whole pure-virtual scrape below) out of a menus-and-host harness. Building nodes
+  for a `List<T>` also needs `template <typename T> List_Member_Base<T>::~List_Member_Base() {}` —
+  the pure virtual dtor is declared but never defined in the DLL, because nothing there ever
+  constructs a node.
+
+Four more things that cost time the first time round:
 
 - **Run the compile from the PowerShell tool, not Bash.** MSYS rewrites every `/`-prefixed flag into
   a path (`/EHsc` becomes `C:/Program Files/Git/EHsc`), and clang-cl silently forwards the wreckage
@@ -101,9 +119,9 @@ Overlay configuration in `vcpkg-configuration.json`.
    (each member detaches its detours in its dtor), commits.
 
 `Subsystems` holds only the **hook-installing** subsystems — `MusicSystem`, `DebugSystem`,
-`GUISystem`, `InputFixSystem`. Everything else is struct-only or a native-API wrapper that resolves
-its offsets lazily per call (`GetObjectAtOffset` is cheap because `GetBaseAddress()` caches), so
-those subsystems need no lifecycle object.
+`GUISystem`, `InputFixSystem`, `CustomMenuSystem`, `ScriptSystem`. Everything else is struct-only
+or a native-API wrapper that resolves its offsets lazily per call (`GetObjectAtOffset` is cheap
+because `GetBaseAddress()` caches), so those subsystems need no lifecycle object.
 
 ### Native API and struct headers
 
@@ -164,24 +182,90 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 Each pair is a header of decompiled structs/enums plus native free-function declarations, and a
 `.cpp` implementing them (offset resolution + any behavioral hooks): `src/Actors`, `src/Roles`,
 `src/Map`, `src/Vulnerability` (header-only), `src/Music`, `src/Math`, `src/Menu`, `src/Tokens`,
-`src/Triggers`, `src/Console`, `src/Misc`, `src/Camera`, `src/Debug`, `src/GUI`, `src/InputFix`.
+`src/Triggers`, `src/Console`, `src/Misc`, `src/Camera`, `src/Debug`, `src/GUI`, `src/InputFix`,
+`src/CustomMenu`, `src/Script`.
 `src/GLS.h/cpp` is the model the rest now follow. The behavioral-hook subsystems (`Music`, `Debug`,
-`GUI`, `InputFix`) expose a `*System` RAII class constructed by `entry.cpp`; the others are pure
-struct + native-API.
+`GUI`, `InputFix`, `CustomMenu`, `Script`) expose a `*System` RAII class constructed by
+`entry.cpp`; the others are pure struct + native-API.
+
+### Script host (`src/Script.h/cpp`)
+
+One `JSRuntime`, one `JSContext`, one entry module. The entry module is `GKPLUS_SCRIPT` if that
+environment variable is set, otherwise **`gkplus\main.mjs` next to `d3d8.dll`** (i.e. in Gunlok's
+directory). A missing file logs the path it looked for and leaves the game unmodified.
+`examples/main.mjs` is a working starting point.
+
+```js
+export function setup_menus(menus) { menus.Main.add_item("Hi", (item) => {}); }
+export function draw_gui(ImGui)    { if (ImGui.Begin("x")) { … } ImGui.End(); }
+```
+
+Four facts pin the design, in decreasing order of how expensive they were to find:
+
+- **The boot point is a detour on `SetupMenus` @ 0x004e95e0**, not `DllMain` and not the first
+  frame. `WinMain` calls it exactly once, after `LoadResourceStringTable` (0x0046b355) and
+  `InitConsole` (0x0046bb81) and before the frame loop (0x0046be47) — so at boot the localized
+  strings and `gk::Print` both work, and the game's own menus are already populated. That last
+  part is load-bearing: `OnMenuItemClicked` switches on the item *index*, so a script item added
+  before the game's would shift every index in the dispatch table.
+- **`ImGui` and `gk` are handed to the script as arguments** as well as being importable. Getting
+  a usable namespace object for a C module requires the module to have been *linked*, which only
+  happens when something imports it, so `BootScriptHost` evaluates a three-line internal module
+  (`import * as ImGui from "ImGui"; import * as gk from "gk"; export {ImGui, gk};`) and reads its
+  namespace. Same object identity as the script's own `import * as`, and it fails loudly at boot
+  rather than inside the user's first import.
+- **Module evaluation returns a promise even without top-level await**, so `Await()` pumps
+  `JS_ExecutePendingJob` until it settles, and reports a stuck pending promise instead of spinning.
+- **The entry module's name uses forward slashes.** QuickJS's default normalizer resolves a
+  relative specifier by scanning the *importing module's name* for `/`; with `C:\…\main.mjs` it
+  finds none and `import "./x.mjs"` silently resolves to `x.mjs` in the process's cwd.
+
+Two seams in `src/GUI.h` carry it: `SetOverlayDrawCallback` (inside the ImGui frame, F11 only)
+runs `draw_gui`, and `SetFrameCallback` (once per `PresentScene`, overlay or not) drains the job
+queue. Both are installed by `BootScriptHost`, not by the `ScriptSystem` ctor, so they can never
+call into a context that does not exist yet. Everything runs on the main thread.
+
+Nothing a script throws reaches game code: every seam ends at `gk::js::ReportException`, which
+prints the message and stack to the console and the debugger. A `draw_gui` that throws is
+**disabled for the session** — once per frame forever is a flood, not a diagnostic, and a script
+that threw mid-frame has usually left ImGui's stack unbalanced. There is also a global `console`
+(`log`/`info`/`warn`/`error`/`debug`), which QuickJS core does not provide.
+
+### Custom menu items (`src/CustomMenu.h/cpp`)
+
+Front-end menu items owned by GkPlus. `CustomMenuSystem` hooks `UpdateAndDrawMenuScreen` and
+`OnMenuItemClicked`; the bodies are `ReconcileCustomMenu` and `DispatchCustomMenuClick`.
+
+- **Registrations are never freed and never move** (`vector<unique_ptr<CustomMenuItem>>`).
+  `Menu::AddItem` and `Menu::AddToggleItem` both store the label pointer with `label_is_static = 1`
+  and bind a toggle's `int *` by address, and `ClearItems` frees neither — so the game reads our
+  `std::string`'s characters and our `int` for as long as the item is on screen.
+- **Items are applied lazily, at draw time, for the chosen menu only** — never at registration.
+  That is what keeps them *after* the game's own items on the dynamically populated menus, whose
+  populators run on transition. It also makes them survive a rebuild for free: reconcile matches by
+  label *pointer* (exact, even for two items with the same text) and re-appends whatever is
+  missing. The one menu out of reach is **11 (JoinGame)**, which re-enumerates its sessions from
+  inside `UpdateAndDrawMenuScreen` every frame, after we have reconciled it.
+- A custom toggle **flips its own `int`** in the dispatch, because the game has no generic toggle
+  handler — `OnMenuItemClicked` mutates every bound variable explicitly.
+- Dispatch plays `PlayUiSound(UiSoundMenuSelect)` itself, since it never reaches the game's
+  handler, which opens with exactly that.
+
+There is no removal: `Menu::ClearItems` is all-or-nothing and each item caches its own index, so
+`ClearCustomMenuActions()` (used at host teardown) makes items inert rather than deleting them.
+Only the **front-end** `Menus[36]` is covered; `InGameMenus[7]` has a separate dispatch
+(`InGameMenu::OnItemActivated`) and is not wired up.
 
 ### JavaScript bindings (`src/Js*`)
 
-The `"gk"` QuickJS C module, exposing six subsystems to scripts. `src/Js.h` is the whole public
-surface — `gk::js::RegisterGkModule(JSContext *)` — and `src/JsGk.cpp` builds the module from six
-namespace objects, one per translation unit: `JsCamera`, `JsConsole`, `JsActors`, `JsRoles`,
-`JsTokens`, `JsTriggers`, over shared helpers in `src/JsBindings.h` / `src/JsCommon.cpp`.
-
-**It registers bindings and nothing else.** There is still no host — nothing creates a runtime,
-loads a script or pumps the job queue — so until one lands, `RegisterGkModule` has no callers and
-no script ever imports `"gk"`. `src/GUI.h`'s `SetOverlayDrawCallback` remains the intended seam.
+The `"gk"` QuickJS C module, exposing seven subsystems to scripts. `src/Js.h` is the public surface
+— `RegisterGkModule`, plus `Log` / `ReportException` / `ReleaseCallbacks` for the host — and
+`src/JsGk.cpp` builds the module from seven namespace objects, one per translation unit:
+`JsCamera`, `JsConsole`, `JsActors`, `JsRoles`, `JsTokens`, `JsTriggers`, `JsMenus`, over shared
+helpers in `src/JsBindings.h` / `src/JsCommon.cpp`.
 
 ```js
-import gk, { camera, console, actors, roles, tokens, triggers } from "gk";
+import gk, { camera, console, actors, roles, tokens, triggers, menus } from "gk";
 camera.distance = 900;                              // live accessors
 for (const a of actors) if (a.alive) a.health = 50; // iterable
 actors[12].frag();                                  // by id
@@ -189,15 +273,28 @@ actors["tbaa"].set_target(actors["hark"].id, 0);    // by token name
 roles["gunlok"].spawn(0, {x: 0, y: 0, z: 0});
 for (const [name, value] of Object.entries(tokens)) console.print(`${name}=${value}`);
 tokens["score"] = 0;                                // upsert; actors/roles throw
+menus.Main.add_item("Open console", (item) => {});  // menus[0], menus["main"] too
+menus[1].add_toggle("Cheats", false, (item) => log(item.value));
 ```
 
-`actors`, `roles` and `tokens` are all **exotic-property collections** built by the same
+`actors`, `roles`, `tokens` and `menus` are all **exotic-property collections** built by the same
 scaffolding in `JsCommon.cpp`: indexable, `in`-testable, `Object.keys`/`values`/`entries`-able, and
 iterable over a snapshot. `NewCollection` gives every one of them a non-enumerable `count` and
-`Symbol.iterator`; a namespace only supplies per-collection extras (`roles.ai_types`). Actors and
-roles are keyed by **id** (names are a lookup convenience and are not enumerated); tokens are keyed
-by **name** and resolve to the bare value, with `lookup_id` left null so a token called `"5"` still
-works.
+`Symbol.iterator`; a namespace only supplies per-collection extras (`roles.ai_types`,
+`menus.current`). Actors, roles and menus are keyed by **id** (names are a lookup convenience and
+are not enumerated); tokens are keyed by **name** and resolve to the bare value, with `lookup_id`
+left null so a token called `"5"` still works.
+
+Every lookup mints a **fresh wrapper**, so `menus[0] !== menus[0]` and likewise for actors and
+roles. Compare `.id`, not object identity. The one exception is a `MenuItem`: `add_item` returns
+the same object the callback receives, because the binding holds it for the item's lifetime.
+
+`menus` covers the front end only (`Menus[36]`, keyed 0-35 and by the `Menus.inc.h` name, matched
+case-insensitively). A `Menu` wrapper has `id`, `name`, `title` (localized), `count`, `items` (a
+snapshot of the game's own entries as `{index, label, type}`), `add_item`, `add_toggle` and
+`open(remember)`. Unlike the Actor and Role wrappers, `Menu` and `MenuItem` hold pointers that
+outlive every context — into the `.data` array and into a never-freed registration — so neither
+needs a finalizer and neither can dangle.
 
 Writes go through `CollectionOps::assign`, which only `tokens` supplies — `tokens["score"] = 0` is
 an upsert. The handler **throws** rather than returning false: quickjs hands an exotic
@@ -249,14 +346,55 @@ through `actors[…]`.
 creates a prototype (a class adding no members still needs one in the chain) and chains it to the
 parent's, re-read per context because `JS_SetClassProto` is per-context.
 
+### Type definitions (`types/`)
+
+Ambient `.d.ts` declarations for everything a script can reach, so an editor type-checks a plain
+`.mjs` with no build step. `types/README.md` is the user-facing half; what matters here is who
+maintains what.
+
+- **`types/gk.d.ts` is hand-written and must be updated alongside `src/Js*.cpp`.** The bindings are
+  the truth; nothing enforces the correspondence but `types/typecheck.ts`.
+- **`types/imgui.d.ts` is generated** — re-run `python3 types/gen-imgui-dts.py` after touching
+  `imgui-quickjs.cpp`. The generator reads the export list for names, each wrapper *body* for types
+  (which `JS_To*` a parameter goes through, which `JS_New*` the result comes from, and the
+  `JS_GetPropertyStr` keys of an options object), and the doc comment for parameter *names* only.
+  It currently types all 197 functions and 28 enums with **zero `any`**, and prints the count of
+  anything it could not infer — if that number stops being 0, the C++ grew a shape the generator
+  does not know.
+- **`npx tsc -p types/tsconfig.json` is the check**, and `types/typecheck.ts` asserts in both
+  directions: ordinary lines must compile, and every `@ts-expect-error` line must not. A vacuous
+  declaration file (everything `any`) fails it, because all thirteen expect-error directives would
+  go unused.
+
+Three modelling decisions that took a round-trip through `tsc` to settle:
+
+- **`Actor` is a discriminated union on `kind`, not an inheritance chain.** Interfaces cannot
+  narrow an inherited property to a different literal, so `interface CharacterActor extends
+  MobileActor` and `kind: "character"` are mutually exclusive. The members are therefore composed
+  from mixin interfaces (`ActorBase`, `MobileMembers`, `CharacterMembers`…), each class gets its
+  own literal `kind`, and `Actor` is the union of all sixteen — which is what makes
+  `if (a.kind === "turret") a.turret_enabled` work. Users write `Actor`, never `ActorBase`.
+- **`instanceof` narrows through a widened `prototype`.** `actors.classes.MobileActor` is typed
+  `ActorClass<AnyMobileActor>`, not `ActorClass<MobileActor>`, because at runtime the test is true
+  for every descendant; narrowing to the exact class would be *wrong*. `ActorClass<T>` extends
+  `Function` and deliberately has **no construct signature**, so `new actors.classes.PickupActor()`
+  is a type error — matching the runtime, which throws.
+- **A collection is an intersection**, `Members & { readonly [key: string]: T | undefined }`.
+  Declaring `count` beside a string index signature is illegal in a single interface (the property
+  must conform to the index type); in an intersection the declared property still wins on lookup,
+  so `actors.count` is `number` while `actors["hark"]` is `Actor | undefined`. `tokens` is the one
+  whose index signature is not `readonly`.
+
 ### Other
 
 | File | Purpose |
 |------|---------|
 | `src/InputFix.h/cpp` | `InputFixSystem` - hook-only. Detours `AcquireDInputDevice` to suppress the vestigial DirectInput keyboard acquire and its `WH_KEYBOARD_LL` hook (see `input_notes.md`) |
 | `src/ActorClasses.inc.h` | X-macro listing the 15 Actor subclasses: `GK_ACTOR_CLASS(Name, Parent, Predicate, Kind)`. Drives the JS class table, `kind`, the RTTI ladder and the prototype chain. **Must list every class before its own base** |
-| `src/Menus.inc.h` | X-macro listing all 36 Gunlok menus: `GUNLOK_MENU(Name, Id, TitleResourceId, "English title")`. There are no gaps - ids 11 and 14-20 are identified in `menu_system_notes.md` |
-| `imgui-quickjs/` | Static library: QuickJS bindings for ImGui. Staged in the build but not yet wired into the overlay (`GUI.cpp`'s draw seam is `SetOverlayDrawCallback`) |
+| `src/Menus.inc.h` | X-macro listing all 36 Gunlok menus: `GUNLOK_MENU(Name, Id, TitleResourceId, "English title")`. There are no gaps - ids 11 and 14-20 are identified in `menu_system_notes.md`. Also counted into `gk::MenuCount` |
+| `imgui-quickjs/` | Static library: the `"ImGui"` QuickJS C module, linked into `d3d8.dll` and registered by the script host. Its export list is `JS_CFUNC_DEF` + `JS_OBJECT_DEF` only, which is what makes `JS_SetModuleExportList` legal for it (see the QuickJS conventions) |
+| `examples/main.mjs` | A working entry module, JSDoc-annotated against `types/`. Install it as `<Gunlok>\gkplus\main.mjs`; `examples/jsconfig.json` is what type-checks it |
+| `types/` | `.d.ts` for the `"gk"` and `"ImGui"` modules, the generator for the latter, and `typecheck.ts`. See "Type definitions" above |
 
 ## Reverse Engineering Reference
 
@@ -508,8 +646,8 @@ skips the list entirely, drawing from the calling thread's PRNG for a uniform in
 | 0x007b6950 | unsigned | TextColor (`ConsoleTextColor`, "TEXT COLOR" cmd) |
 | 0x007b6954 | unsigned | UITextColorLight 0xffccccd6 (scrolling msgs, briefing) |
 | 0x007b6a64 / 0x007b6a68 | unsigned | UIColorDim 0xff595966 / UIColorYellow 0xffffef47 |
-| 0x007c149c | unsigned | CursorColor (ARGB, init 0xffe5e5e5 in FUN_004d5380) |
-| 0x007b6a54/58/5c/60 | Font* | ConsoleSmallFont / ConsoleLargeFont / HudSmallFont / ConsoleLargeFont2 (all built in FUN_004d5380) |
+| 0x007c149c | unsigned | CursorColor (ARGB, init 0xffe5e5e5 in `InitConsole` @ 0x004d5380) |
+| 0x007b6a54/58/5c/60 | Font* | ConsoleSmallFont / ConsoleLargeFont / HudSmallFont / ConsoleLargeFont2 (all built in `InitConsole`) |
 | 0x007b6a70..0x007b6a7c | — | command **hash table**: NumRegisteredCommands, CommandTableNumBuckets, CommandTableMask, CommandTableBuckets (`CommandListElem**`) |
 | 0x007b6aa8..0x007b6ab4 | List | command exec queue: CommandsToExecute (anchor), NumCommandsToExecute, cache, cacheValid — one popped per frame by `PumpQueuedConsoleCommand` |
 | 0x007b6a80 / 0x007b6b38 | float | ConsoleTextScrollTarget / ConsoleSlidePos (open/close anim; -1=closed) |
@@ -703,6 +841,8 @@ CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84
 | 0x004f7cd0 | FastCall<void, Menu*> | Menu::ClearItems |
 | 0x004fbf10 | ThisCall<void, Menu*, void*> | Menu::AppendItemNode |
 | 0x004ea8e0 | StdCall<void> | UpdateAndDrawMenuScreen |
+| 0x0058cdd0 | FastCall<void, int> | PlayUiSound (id in ECX; 0x57 = menu activation) |
+| 0x004d5380 | StdCall<void> | InitConsole (WinMain @ 0x0046bb81, right before SetupMenus) |
 | 0x004e7e50 | StdCall<void> | EnterMainMenuScreen |
 | 0x00470c70 | FastCall<void, void*> | MenuScreenInputHandler |
 | 0x00579000 | FastCall<const char*, void*, unsigned> | GetResourceString (ECX=&LocalizedStrings) |
@@ -993,6 +1133,14 @@ the one that bites hardest, because its failure mode is silent.
 - **A bare specifier needs no module loader and no normalizer.**
   `js_default_module_normalize_name` passes through anything not starting with `.`, and resolution
   checks the already-loaded modules — where `JS_NewCModule` registers — before consulting a loader.
+  A loader is only needed for the *script's* own files, and `src/Script.cpp` has the minimal one.
+- **A duplicated name in an export list is a latent `SyntaxError`.** `imgui-quickjs` listed
+  `JS_ENUM_DEF(SortDirection)` twice, which cost nothing until something did
+  `import * as ImGui from "ImGui"` — building a namespace object rejects duplicate exports, so the
+  whole module failed to link and the host reported "duplicate exported name 'SortDirection'". A
+  long hand-maintained `JSCFunctionListEntry` array needs a duplicate check, not review:
+  `awk` the array out of the file, `grep -oE 'JS_(CFUNC_DEF\("[A-Za-z0-9_]+"|ENUM_DEF\([A-Za-z0-9_]+)'`,
+  `sort | uniq -d`.
 
 JavaScript naming, which is not the C++ naming: `snake_case` for methods and functions
 (`set_target`, `attack_position`), `PascalCase` for classes and types (the `JSClassDef::class_name`

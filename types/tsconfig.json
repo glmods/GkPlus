@@ -1,0 +1,20 @@
+{
+  "//": [
+    "Checks gk.d.ts and imgui.d.ts against typecheck.ts, which asserts in both",
+    "directions: ordinary lines must compile, and every @ts-expect-error line",
+    "must NOT - an unused directive is itself an error. Run it after touching",
+    "either the declarations or the bindings they describe:",
+    "",
+    "    npx tsc -p types/tsconfig.json"
+  ],
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "types": []
+  },
+  "files": ["gk.d.ts", "imgui.d.ts", "typecheck.ts"]
+}

@@ -34,8 +34,9 @@ StdCall<int> DoEvents;
 
 bool ShowGUI = false;
 
-// The native draw seam (see GUI.h). Null until something installs a callback.
+// The native seams (see GUI.h). Null until something installs a callback.
 OverlayDrawCallback OverlayDraw = nullptr;
+FrameCallback Frame = nullptr;
 
 IDirect3DDevice9 *GetDX9Device() {
   return (*DirectXDevice)->GetProxyInterface();
@@ -62,6 +63,12 @@ void __stdcall HookedReleaseDirect3DDevice() {
 }
 
 void __stdcall HookedPresentScene() {
+  // Before the overlay check on purpose: this is the once-per-frame heartbeat,
+  // and it has to keep ticking while the overlay is hidden.
+  if (Frame) {
+    Frame();
+  }
+
   if (!*DirectXDevice || !ShowGUI) {
     return PresentScene();
   }
@@ -119,6 +126,8 @@ LRESULT WINAPI HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam,
 void SetOverlayDrawCallback(OverlayDrawCallback callback) {
   OverlayDraw = callback;
 }
+
+void SetFrameCallback(FrameCallback callback) { Frame = callback; }
 
 GUISystem::GUISystem() {
   GetObjectAtOffset(WndProc, 0x0046aad0);
