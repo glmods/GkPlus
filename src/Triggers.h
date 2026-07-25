@@ -67,7 +67,15 @@ TriggerList *InitListWithActorName(TriggerList *list,
 ITrigger *CreateTrigger(TriggerList *list,
                         const char **actor_name);            // 0x0044e8c0
 void DeleteList(TriggerList *list);                          // 0x0044ce40
-// RegisterTriggers @ 0x0043e240 - `targets` is passed BY VALUE.
+// RegisterTriggers @ 0x0043e240 - `targets` is passed BY VALUE, and CONSUMED:
+// the last thing it does on every path, including the early-out when the
+// executor is not running, is DeleteTriggers on its copy, which frees the
+// sentinel InitList allocated. Calling DeleteList afterwards double-frees it -
+// do not read the InitList/DeleteList pair above as bracketing this call.
+//
+// It copies every string it is given (strdup for `script`, malloc+strcpy per
+// actor name), so caller-owned buffers only need to outlive the call. It also
+// reads coords[0..3] unconditionally, with no null and no length check.
 void RegisterTriggers(TriggerKind kind, Vec3 *coords, long long time_or_radius,
                       TriggerList targets, const unsigned char *script, int team);
 // RemoveTrigger @ 0x0050c400.

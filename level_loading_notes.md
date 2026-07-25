@@ -427,7 +427,7 @@ for (binding in map->bindings) {
             int id = -1;
             if (IsExecutorRunning())     id = ServerSpawnActorForTeam(team, role, &pos, &quat);
             if (IsClientRoutingActive()) id = ClientSpawnActorForTeam(team, role, &pos, &quat);
-            if (binding->token_name)     CreateToken(&Tokens, binding->token_name, (float)id);
+            if (binding->token_name)     SetOrCreateToken(&Tokens, binding->token_name, (float)id);
         }
     }
     PlacedObjectBindingMap_Remove(binding);   // consumed, one shot
@@ -500,8 +500,9 @@ geometry work. `gk::gls` already knows how to build `ParsedRole`s programmatical
 
 **(b) Keep the `.rif`, drop the `map` section.** Reimplement the consumption loop in the
 mod: `LoadOrGetRifFile` -> `RifFilterObjectsByName` -> read `O[0x44..0x5c]` ->
-`ServerSpawnActorForTeam` / `ClientSpawnActorForTeam` -> `CreateToken`. This maps directly
-onto the native API (`gk::MapSpawn` + `gk::CreateToken`); everything needed is a named
+`ServerSpawnActorForTeam` / `ClientSpawnActorForTeam` -> `SetOrCreateToken` (formerly
+`CreateToken`). This maps directly
+onto the native API (`gk::MapSpawn` + `gk::SetOrCreateToken`); everything needed is a named
 export already.
 
 **(c) Supply geometry natively.** `TheMap != NULL` at the top of `ToMap` is the single

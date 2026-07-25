@@ -409,7 +409,7 @@ exclusive flag (byte), +0x04 CRITICAL_SECTION, +0x1C reader count. Writers spin 
 `Sleep(5)` until readers drain; readers bump the count. Instances:
 
 - embedded in the three loopback queues (all three take it exclusively);
-- the token system (`Tokens` @ 0x007b6af8) — `CreateToken`, `Get/SetTokenValue`,
+- the token system (`Tokens` @ 0x007b6af8) — `SetOrCreateToken`, `Get/SetTokenValue`,
   `FindTokenWithValue`, `ListTokens`, `FreeTokens` all lock it (tokens are read and
   written from both threads);
 - door open/close (`OpenDoor`/`CloseDoor` @ 0x0043fbd0/0x0043fc50);

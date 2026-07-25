@@ -278,7 +278,7 @@ numTriggers x {
 }
 ```
 
-Tokens and pending commands are rebuilt through the normal `CreateToken` / `TriggerList::CreateTrigger`
+Tokens and pending commands are rebuilt through the normal `SetOrCreateToken` / `TriggerList::CreateTrigger`
 APIs, so the linked lists are reconstructed rather than restored byte-for-byte.
 
 #### Doors

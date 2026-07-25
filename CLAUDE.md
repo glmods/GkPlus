@@ -33,7 +33,50 @@ rather than eyeballing.
 `-Winvalid-offsetof` warnings on `Actor`/its subclasses and on `Map` are pre-existing and benign
 (they are non-standard-layout due to virtuals); a clean build still links `d3d8.dll`. Every struct
 modelled with pure virtuals produces them — that is the expected cost of the convention below, not
-a signal to switch back to an explicit vtbl field.
+a signal to switch back to an explicit vtbl field. A TU including `src/Actors.h` emits ~30 of them,
+which bury your own diagnostics; filter with
+
+```
+cmake --build build 2>&1 | Select-String ': (warning|error):' | Select-String -NotMatch 'invalid-offsetof'
+```
+
+### Runtime-testing outside the game
+
+Nothing in `src/` can be exercised outside Gunlok: `GetBaseAddress()` derives from the host exe's
+entry point, so every native-API call faults in a standalone process. To runtime-test a layer that
+does not itself touch game memory (the `src/Js*` bindings are the case in point), compile it into a
+throwaway 32-bit exe alongside a stub TU that replaces the `gk::` natives with fakes:
+
+```
+clang-cl -m32 /EHsc /MD -clang:-std=c++23 -Wno-invalid-offsetof \
+  "/Ibuild/vcpkg_installed/x86-windows-static-md/include" main.cpp stubs.cpp src/JsCommon.cpp … \
+  /Feharness.exe /link build/vcpkg_installed/x86-windows-static-md/lib/qjs.lib
+```
+
+Do **not** put `src/` on the include path (see the include collision under Conventions). The real
+project flags live in `build/CMakeFiles/impl-Debug.ninja` (`FLAGS =`) if they drift. Always add a
+deliberately-failing assertion once and confirm the harness reports it — a harness that cannot fail
+proves nothing.
+
+Four things that cost time the first time round:
+
+- **Run the compile from the PowerShell tool, not Bash.** MSYS rewrites every `/`-prefixed flag into
+  a path (`/EHsc` becomes `C:/Program Files/Git/EHsc`), and clang-cl silently forwards the wreckage
+  to the linker as input files — so the build *appears* to work until it links, and `/EHsc` `/MD`
+  were never applied. Include the src files by **absolute** path from the harness directory; quoted
+  includes still resolve each header's own siblings.
+- **Stub actors need every pure virtual.** Generate them: scrape `virtual … = 0;` out of
+  `src/Actors.h` into per-class `#define`s of `override` bodies, paste those into each stub class.
+  Emit the parameter list verbatim — both `char *script` and a bare `float *` are legal in a
+  definition, so there is nothing to rename. The generated slot counts are a free cross-check
+  against `actor_vtable_notes.md` (82 + dtor / 12 / 5 / 5 / 3).
+- **`Actor::~Actor()` is pure and undefined**, and `Inventory` is only ever forward-declared. Both
+  are fine in the DLL because nothing there instantiates or destroys an actor; a harness that does
+  must supply `gk::Actor::~Actor() {}` and a harness-local `struct Inventory {}` (otherwise
+  `pool_unique_ptr<Inventory>`'s deleter fails to instantiate on an incomplete type).
+- Have the stub hierarchy **restate the class tree independently** of `src/ActorClasses.inc.h`
+  rather than including it. If the two disagree the kind/`instanceof` tests fail, which is the
+  point of testing the ladder at all.
 
 ### Dependencies (vcpkg.json)
 
@@ -126,11 +169,92 @@ Each pair is a header of decompiled structs/enums plus native free-function decl
 `GUI`, `InputFix`) expose a `*System` RAII class constructed by `entry.cpp`; the others are pure
 struct + native-API.
 
+### JavaScript bindings (`src/Js*`)
+
+The `"gk"` QuickJS C module, exposing six subsystems to scripts. `src/Js.h` is the whole public
+surface — `gk::js::RegisterGkModule(JSContext *)` — and `src/JsGk.cpp` builds the module from six
+namespace objects, one per translation unit: `JsCamera`, `JsConsole`, `JsActors`, `JsRoles`,
+`JsTokens`, `JsTriggers`, over shared helpers in `src/JsBindings.h` / `src/JsCommon.cpp`.
+
+**It registers bindings and nothing else.** There is still no host — nothing creates a runtime,
+loads a script or pumps the job queue — so until one lands, `RegisterGkModule` has no callers and
+no script ever imports `"gk"`. `src/GUI.h`'s `SetOverlayDrawCallback` remains the intended seam.
+
+```js
+import gk, { camera, console, actors, roles, tokens, triggers } from "gk";
+camera.distance = 900;                              // live accessors
+for (const a of actors) if (a.alive) a.health = 50; // iterable
+actors[12].frag();                                  // by id
+actors["tbaa"].set_target(actors["hark"].id, 0);    // by token name
+roles["gunlok"].spawn(0, {x: 0, y: 0, z: 0});
+for (const [name, value] of Object.entries(tokens)) console.print(`${name}=${value}`);
+tokens["score"] = 0;                                // upsert; actors/roles throw
+```
+
+`actors`, `roles` and `tokens` are all **exotic-property collections** built by the same
+scaffolding in `JsCommon.cpp`: indexable, `in`-testable, `Object.keys`/`values`/`entries`-able, and
+iterable over a snapshot. `NewCollection` gives every one of them a non-enumerable `count` and
+`Symbol.iterator`; a namespace only supplies per-collection extras (`roles.ai_types`). Actors and
+roles are keyed by **id** (names are a lookup convenience and are not enumerated); tokens are keyed
+by **name** and resolve to the bare value, with `lookup_id` left null so a token called `"5"` still
+works.
+
+Writes go through `CollectionOps::assign`, which only `tokens` supplies — `tokens["score"] = 0` is
+an upsert. The handler **throws** rather than returning false: quickjs hands an exotic
+`set_property` result straight back to the caller (quickjs.c:10209-10213) instead of converting
+false into the strict-mode TypeError the ordinary read-only path raises, so returning false would
+make `actors[1] = x` a silent no-op. Own properties resolve first (quickjs.c:10137 vs :10203), so
+`tokens.count = 5` hits the read-only accessor and cannot reach the table.
+
+`Actor`/`Role` wrappers hold the **raw game pointer**, so a wrapper kept past its object's
+destruction reads recycled pool memory — `.valid` is the escape hatch, and `frag()`, `remove()` and
+`die()` null the pointer because those are the destructions the binding can see. `Actor`'s surface
+is the vtable, not its fields; `id` (our own snapshot) and `name` (a token lookup) are the two
+documented exceptions. Tokens are not wrapped at all: an 8-byte `{name, value}` pair has no
+identity to re-resolve against, so the collection yields plain values.
+
+**The Actor hierarchy is a real JS prototype chain.** `src/ActorClasses.inc.h` is an X-macro of
+`(Name, Parent, Predicate, Kind)` over all fifteen subclasses, and `JsActors.cpp` generates the
+per-class `JSClassID`s, the `JSClassDef`s, the `kind` strings, the RTTI dispatch ladder and the
+chained prototypes from it. `NewActorWrapper` runs the ladder once and picks the class, so
+`JS_NewObjectClass` installs the right prototype:
+
+```js
+actors[4] instanceof actors.classes.MobileActor;   // true for a turret
+typeof actors[5].goto;                             // "undefined" - a pickup cannot move
+```
+
+Three consequences worth knowing:
+
+- **A subclass member is absent, not throwing.** `if (a.goto)` is a valid feature test, and walking
+  a whole prototype chain reading every property is safe. Under the previous flat prototype
+  `turret_enabled` sat on the *base*, so merely reading it on a character raised.
+- **The chain does not replace the checked downcasts.** The prototype is chosen once, at wrap time,
+  but the wrapper holds a raw pointer the game can free and recycle onto a different subclass, so
+  `ResolveMobile`/`ResolveCharacter`/`ResolvePickup`/`ResolveTurret` still re-run the predicate on
+  every call. A borrowed method (`MobileActor.prototype.goto.call(pickup, …)`) still throws.
+- **One ordering rule drives everything**, and `JsActors.cpp` `static_assert`s it: every class is
+  listed **before its own base**. The predicates are inherited (`IsMobile()` is true for a turret),
+  so the ladder must test most-derived first; the chain is built by walking the list backwards,
+  which needs each base's prototype to exist already.
+
+Classes that add no JS surface (`PopupActor`, `CentibodyActor`, the background creatures…) still get
+a prototype and a class id, so `instanceof` does not lie about a class an actor genuinely is.
+`actors.classes` holds one non-enumerable handle per class purely for the brand check and for
+`constructor.name`; calling one throws, since scripts cannot create actors. Like `count`, being an
+own property means it shadows the indexer, so a token literally named `"classes"` is unreachable
+through `actors[…]`.
+
+`EnsureClass` has a six-argument overload for this: unlike the five-argument one, it *always*
+creates a prototype (a class adding no members still needs one in the chain) and chains it to the
+parent's, re-read per context because `JS_SetClassProto` is per-context.
+
 ### Other
 
 | File | Purpose |
 |------|---------|
 | `src/InputFix.h/cpp` | `InputFixSystem` - hook-only. Detours `AcquireDInputDevice` to suppress the vestigial DirectInput keyboard acquire and its `WH_KEYBOARD_LL` hook (see `input_notes.md`) |
+| `src/ActorClasses.inc.h` | X-macro listing the 15 Actor subclasses: `GK_ACTOR_CLASS(Name, Parent, Predicate, Kind)`. Drives the JS class table, `kind`, the RTTI ladder and the prototype chain. **Must list every class before its own base** |
 | `src/Menus.inc.h` | X-macro listing all 36 Gunlok menus: `GUNLOK_MENU(Name, Id, TitleResourceId, "English title")`. There are no gaps - ids 11 and 14-20 are identified in `menu_system_notes.md` |
 | `imgui-quickjs/` | Static library: QuickJS bindings for ImGui. Staged in the build but not yet wired into the overlay (`GUI.cpp`'s draw seam is `SetOverlayDrawCallback`) |
 
@@ -184,6 +308,14 @@ Two gotchas when searching that tree: most `win95/` files have **uppercase** ext
 `grep --include=*.cpp` silently misses them (use `find -iname`); and AvP's debug `fail()` is
 `#define fail if (0)` under `NDEBUG`, which is why shipped code has no bounds checks
 (e.g. `Menu::GetItemData`).
+
+### Upstream Source: quickjs-ng
+
+The exact `quickjs.c` for the pinned 0.15.1 is unpacked at
+`vcpkg/buildtrees/quickjs-ng/src/v0.15.1-*/quickjs.c`. Read it rather than reasoning about QuickJS
+semantics — it is what settled every rule in the QuickJS conventions below: the export-list
+`abort()`, own-property-before-exotic lookup order, `find_atom`'s `[Symbol.iterator]` scan, and who
+frees `val` in an exotic setter. The public header alone does not answer any of those.
 
 ### Ghidra Database Hygiene
 
@@ -309,6 +441,10 @@ and audit the DB afterwards rather than trusting it.
   a subagent to summarize so a 1000+-line function never enters the main context.
 - `getInt()`/`getBytes()` on an uninitialized `.data`/`.bss` global throws `MemoryAccessException`
   (zero-init globals aren't in the file image) — read meaning from writers/disassembly, not live bytes.
+- `getInstructionAt` returns None for an address inside an instruction — use
+  `getInstructionContaining` and walk `getPrevious()` to dump a window around a data reference.
+- Walk to a vtable slot's body with `mem.getInt(vtbl + slot*4)`, masking `& 0xffffffff` (Jython ints
+  are signed, so a high address comes back negative and `getAddress` rejects it).
 
 ### Game Binary Layout
 
@@ -349,6 +485,20 @@ and audit the DB afterwards rather than trusting it.
 |--------|------|------|
 | 0x007b6af8 | Tokens* | tokens |
 
+**Tokens are also how the engine names actors.** A token is a `{name, float}` pair, and for an
+actor name the float *is* the actor id: `ConsoleParseActorName` @ 0x004d6d90 does
+`GetTokenValue -> ROUND -> GetActorById`, and `CommandGetActorName` @ 0x00446d30 inverts it with
+`FindTokenWithValue((float)actor->id)`. `Actor` has no name field of its own. The three lookups are
+`GetTokenValue` @ 0x004d3910, `SetTokenValue` @ 0x004d38a0 and `FindTokenWithValue` @ 0x004d3a60,
+all `__thiscall` on the table; they are wrapped in `src/Tokens.h`. The class namespace was
+`struct_unk1` in the DB and is now `Tokens`.
+
+Two things the mirror cannot express. The global is a **`{List, RWLock}` pair** — every token
+function locks an `RWLock` at `this + 0x10` (0x007b6b08) for the whole call, so they may only be
+called with the real global, never a locally-built `Tokens`. And `GetTokenValue` compares names
+with `_mbsicmp` (**case-insensitive**) and special-cases a `rand(N)` name as a pseudo-token that
+skips the list entirely, drawing from the calling thread's PRNG for a uniform integer in `[0, N)`.
+
 **Console System:** (the whole block 0x007b6950-0x007b6b41 is mapped in the Ghidra DB)
 
 | Offset | Type | Name |
@@ -358,7 +508,7 @@ and audit the DB afterwards rather than trusting it.
 | 0x007b6950 | unsigned | TextColor (`ConsoleTextColor`, "TEXT COLOR" cmd) |
 | 0x007b6954 | unsigned | UITextColorLight 0xffccccd6 (scrolling msgs, briefing) |
 | 0x007b6a64 / 0x007b6a68 | unsigned | UIColorDim 0xff595966 / UIColorYellow 0xffffef47 |
-| 0x007c149c | unsigned* | CursorColor |
+| 0x007c149c | unsigned | CursorColor (ARGB, init 0xffe5e5e5 in FUN_004d5380) |
 | 0x007b6a54/58/5c/60 | Font* | ConsoleSmallFont / ConsoleLargeFont / HudSmallFont / ConsoleLargeFont2 (all built in FUN_004d5380) |
 | 0x007b6a70..0x007b6a7c | — | command **hash table**: NumRegisteredCommands, CommandTableNumBuckets, CommandTableMask, CommandTableBuckets (`CommandListElem**`) |
 | 0x007b6aa8..0x007b6ab4 | List | command exec queue: CommandsToExecute (anchor), NumCommandsToExecute, cache, cacheValid — one popped per frame by `PumpQueuedConsoleCommand` |
@@ -521,7 +671,10 @@ CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84
 
 | Offset | Signature | Name |
 |--------|-----------|------|
-| 0x004d35f0 | ThisCall<void, Tokens*, const char*, float> | CreateToken |
+| 0x004d35f0 | ThisCall<void, Tokens*, const char*, float> | SetOrCreateToken — an **upsert**, not a create; it overwrites in place when the name already exists (case-insensitively) and allocates only when it does not. Named `CreateToken` until the body was read |
+| 0x004d3910 | ThisCall<bool, Tokens*, float*, const char*> | GetTokenValue — case-insensitive; a `rand(N)` name is a pseudo-token that skips the list |
+| 0x004d38a0 | ThisCall<void, Tokens*, const char*, float> | SetTokenValue — update-only, **silent** for a token that does not exist |
+| 0x004d3a60 | ThisCall<bool, Tokens*, float, char**> | FindTokenWithValue — reverse lookup; how an actor id becomes a name |
 
 **Triggers:**
 
@@ -634,8 +787,8 @@ Actor (0x120 bytes, vtbl @ 0x00667e30)
  |   |   +- CentibodyActor (0x310 bytes)
  |   |   |   +- CentipedeActor (0x310 bytes)
  |   |   +- PopupActor (0x310 bytes)
- |   |   |   +- TurretActor (0x320 bytes)
- |   |   +- NodeActor (0x278 bytes)
+ |   |       +- TurretActor (0x320 bytes)
+ |   +- NodeActor (0x278 bytes)
  |   +- PresidentActor (0x240 bytes)
  +- PickupActor (0x150 bytes)
  +- TrackObjectActor (0x1b8 bytes)
@@ -649,6 +802,13 @@ Actor (0x120 bytes, vtbl @ 0x00667e30)
 Key Actor struct offsets (vtable ptr implicit at 0x00): `id` @ 0x0c, `vulnerabilities` @ 0x10,
 `ai_type` @ 0x50, `flags` @ 0x7c, `position` (Vec3) @ 0xa0, `orientation` (Vec4) @ 0xac,
 `team_id` @ 0xbc, `role` @ 0xc0, `armor_value` @ 0xf0, `strength` @ 0xf4, `is_dead` @ 0x115.
+
+`NodeActor` derives from **`MobileActor`**, not `CharacterActor` - earlier revisions of this tree
+indented it one level too deep, which cannot be right (0x278 is smaller than `CharacterActor`'s
+0x308). `src/Actors.h` and `actor_vtable_notes.md` always had it correct.
+
+The whole tree is also an X-macro, `src/ActorClasses.inc.h`, which is what the JS binding layer
+generates its class table from; keep the two in step.
 
 No RTTI - type checking uses virtual methods (IsCharacter, IsMobile, IsTurret, etc.). Slots 36-50
 are that mechanism and all fifteen are mapped to a concrete class.
@@ -806,6 +966,46 @@ KERNEL32/USER32/GDI32/ADVAPI32/OLE32/WINMM (Windows API).
   `CreateNavAgent`/`DestroyNavAgent`, and the getter's old name is noted in the `NavAgent` comment
   and the slot-24 row of `actor_vtable_notes.md`.
 
+### QuickJS binding conventions (`src/Js*`)
+
+Four rules, all verified against quickjs-ng 0.15.1's own source rather than assumed. The first is
+the one that bites hardest, because its failure mode is silent.
+
+- **Never let a `JS_CGETSET_DEF` reach `JS_SetModuleExportList`.** That switch ends in
+  `default: abort()` (quickjs.c:40006) — the process dies with no diagnostic, no exception, no log.
+  `JS_SetPropertyFunctionList` is the one instantiation path that honours `JS_DEF_CGETSET`. The
+  binding layer sidesteps this structurally: it never calls `JS_SetModuleExportList` at all, every
+  namespace is built object-first and handed to `JS_SetModuleExport` as a finished value, and every
+  `JSCFunctionListEntry` array stays file-local to the TU that installs it.
+- **A C module's named exports are values set once at instantiation, not live bindings.**
+  `import { position } from "gk"` could only ever be a snapshot. Exporting *objects* and putting the
+  accessors on them is what makes state live — which is why there is one `"gk"` module with six
+  namespace objects rather than six `gk:*` modules of loose exports. `JS_DEF_OBJECT` nests safely
+  (it routes through `JS_NewObjectProtoList` -> `JS_SetPropertyFunctionList`, quickjs.c:40081), so
+  accessors are legal one level below an export and nowhere above it.
+- **Own properties beat exotic handlers.** `JS_GetPropertyInternal` calls `find_own_property` before
+  consulting `exotic->get_own_property` at each step of the prototype chain (quickjs.c:8734). That
+  is what lets `actors.count` and `actors[Symbol.iterator]` coexist with `actors[12]`. Keep those
+  own properties **non-enumerable**, or they show up in `Object.keys(actors)` beside the ids — the
+  same reason `Array`'s `length` is hidden. Conversely `JSPropertyEnum::is_enumerable` is *ignored*
+  for exotic objects (quickjs re-queries `get_own_property`), so that callback must return
+  `JS_PROP_ENUMERABLE` or `Object.keys` comes back empty.
+- **A bare specifier needs no module loader and no normalizer.**
+  `js_default_module_normalize_name` passes through anything not starting with `.`, and resolution
+  checks the already-loaded modules — where `JS_NewCModule` registers — before consulting a loader.
+
+JavaScript naming, which is not the C++ naming: `snake_case` for methods and functions
+(`set_target`, `attack_position`), `PascalCase` for classes and types (the `JSClassDef::class_name`
+strings — `Actor`, `Role`, `Actors`, `Roles`), `camelCase` for local variables in JS, and
+`snake_case` for data properties and accessors (`max_distance`, `text_color`, `strength_ratio`).
+`goto` keeps the engine's name for `MobileActor` slot 88; reserved words are barred as identifiers,
+not as member names, so `actor.goto(dst, 1.0)` parses.
+
+Do not put `src/` on an include path. `quickjs.h` does `#include <math.h>`, which resolves to
+`src/Math.h` on a case-insensitive filesystem and produces a wall of errors from `<cstdlib>`. The
+build never does this (sources are compiled by full path and include each other relatively); a
+throwaway harness that adds `-I src` will.
+
 ## Git Workflow
 
 **Commit directly to `main` when working in the primary checkout.** This overrides the default
@@ -828,3 +1028,10 @@ partially-executed command rather than a clean error:
 Also: prefix `python3` with `PYTHONIOENCODING=utf-8` when printing non-ASCII on Windows, and use
 forward-slash paths inside Bash heredocs (`'\\'` gets collapsed). `/tmp` does not exist — use the
 scratchpad directory.
+
+Use the `Edit` tool for text substitution in files, never a PowerShell read-replace-write:
+`Set-Content -NoNewline` rejected its own parameter in this shell, and the round-trip rewrites line
+endings across the whole file.
+
+Stage with a path glob (`git add src/Js*`), not a hand-typed file list — a 17-file list silently
+dropped `src/JsGk.cpp` and would have committed a JS binding layer with no module registration.
