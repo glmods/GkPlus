@@ -11,18 +11,41 @@ import gk, {
   actors,
   camera,
   console as gameConsole,
-  menus,
+  gls,
+  levels,
+  make,
   roles,
   tokens,
   triggers,
 } from "gk";
-import type { Actor, Menus, MenuItem, Role, TurretActor, Vec3 } from "gk";
-import * as ImGui from "ImGui";
+// @ts-expect-error - `menus` is not an export: it is only setup_menus'
+// argument, because the game's own items must be in place before a script adds
+// one.
+import { menus as notAnExport } from "gk";
+import type {
+  Actor,
+  GameAsset,
+  GlsField,
+  GlsSection,
+  Level,
+  LevelLocator,
+  LevelModule,
+  Menus,
+  MenuItem,
+  Role,
+  SetupMenus,
+  TurretActor,
+  Vec3,
+} from "gk";
+// @ts-expect-error - ImGui is deliberately not a module: it is only reachable
+// as draw_gui's argument, because that is the only place its calls are valid.
+import * as NotAModule from "ImGui";
 
 // --- the module ---------------------------------------------------------------
 
 const sameObject: boolean = gk.actors === actors;
-const namespaces: Menus = gk.menus;
+// @ts-expect-error - and it is not on the default export either
+const notThereEither: Menus = gk.menus;
 
 // --- camera -------------------------------------------------------------------
 
@@ -39,8 +62,14 @@ const bad: number = camera.position.q;
 
 gameConsole.print("hello");
 gameConsole.text_color = 0xff00ff00;
-console.log("host console", 1, true);
-console.warn("also here");
+gameConsole.log("host logging", 1, true);
+gameConsole.warn("also here");
+gameConsole.execute("SPAWN gunlok");
+const queuedFile: boolean = gameConsole.execute_file("level01.gcs");
+
+// @ts-expect-error - there is no global console: the host installs none, and
+// log/info/warn/error/debug live on the one exported by "gk".
+console.log("nowhere to go");
 
 // --- actors: collection -------------------------------------------------------
 
@@ -141,35 +170,147 @@ const noSuchKind = triggers.kind.explode;
 
 // --- menus --------------------------------------------------------------------
 
-const main = menus.Main;
-const byIndex: Menus[number] = menus[0];
-const byLowercase = menus["main"];
-const total: number = menus.count;
-const title: string = main.title;
-const items: string[] = main.items.map((i) => i.label ?? "");
-for (const m of menus) {
-  const label: string = `${m.id} ${m.name}`;
+// The whole surface is reachable only through the argument.
+export const setup_menus: SetupMenus = (menus) => {
+  const main = menus.Main;
+  const byIndex: Menus[number] = menus[0];
+  const byLowercase = menus["main"];
+  const total: number = menus.count;
+  const title: string = main.title;
+  const items: string[] = main.items.map((i) => i.label ?? "");
+  for (const m of menus) {
+    const label: string = `${m.id} ${m.name}`;
+  }
+
+  const added: MenuItem = main.add_item("Open console", (item) => {
+    const where: number = item.index;
+    const owner = item.menu;
+    gameConsole.log(`clicked ${item.label} on ${owner.name}`);
+  });
+  const toggle = menus.Options.add_toggle("Cheats", false, (item) => {
+    const on: boolean | undefined = item.value;
+  });
+  toggle.value = true;
+  menus.Options.open(true);
+
+  // @ts-expect-error - the menu list is fixed
+  menus[0] = main;
+  // @ts-expect-error - the callback takes the item, not a string
+  main.add_item("x", (item: string) => {});
+};
+
+// --- make ---------------------------------------------------------------------
+
+const hcy: GameAsset = make.hierarchy("units\\bug.rif", "bug");
+// Every owned sub-object is described inline and built inside make.role, so a
+// script can never hand the same Character to two roles.
+const Rol_Bug: Role = make.role({
+  identifier: "bug",
+  hierarchy: { rif: "units\\bug.rif", object: "bug", hotspot: "head" },
+  character: {
+    walking_speed: 1.5,
+    turning_speed: 0.4,
+    strength: 1,
+    aim: 20,
+    sight_angle: 70,
+    aggression: 0.1,
+    weapon: "enemy laser weak", // a keyword, resolved through the probed table
+  },
+  ai: "background creature",
+  action_on_death: "must not drop",
+  resistance: "resists laser",
+  destructibility: { kind: "explode" },
+  reflective: false,
+});
+const bugId: number = Rol_Bug.id;
+// A reusable handle is fine too - the rif cache owns it.
+make.role({ identifier: "bug2", hierarchy: hcy, ai: "bot" });
+const ammoOk: boolean = make.ammo({
+  ammo_type: "plasma bolts",
+  weapon_type: "plasma pistol",
+  role: Rol_Bug,
+});
+const infoOk: boolean = make.ammo_info({ ammo_type: "flares", shape: hcy, max_per_slot: 50 });
+make.camera_track({ name: "camtrack1" });
+
+// @ts-expect-error - the destructibility variants are discriminated on `kind`
+make.role({ identifier: "x", destructibility: { kind: "shatter" } });
+// @ts-expect-error - a Role comes back, not a builder to configure further
+make.role({ identifier: "x" }).set("ai", "bot");
+
+// --- gls: what only the parser can answer ---------------------------------------
+
+const sections: GlsSection[] = gls.sections;
+const schema: GlsField[] = gls.schema("character");
+const required: string[] = schema.filter((f) => f.required).map((f) => f.name);
+const aiValues: Record<string, number | null> = gls.probe("role", "ai", ["bot", "turret"]);
+const parsed: number = gls.try_parse("destructibility D_X\n{\n\ttype explode\n}\n");
+
+// @ts-expect-error - "creature" is not one of the fifteen section keywords
+gls.schema("creature");
+// @ts-expect-error - building objects moved to `make`
+gls.role({ identifier: "bug" });
+
+// --- levels -------------------------------------------------------------------
+
+const arena: Level = levels.add("Test Arena", {
+  rif: "levels\\level01.rif",
+  object: "Land",
+  bitmap: "bitmaps\\LEVEL01.rim",
+  camera_plane: "camhund",
+  max_camera_distance: 60,
+  includes: ["gunlok.gsh", "archore.gsh"],
+  populate(level) {
+    const spots: LevelLocator[] = level.locators("Goodie A");
+    for (const spot of spots) {
+      const id: number = level.spawn("Rol_GunLok", 1, spot, { as: "gunlok" });
+    }
+    // A bare position works too - a locator is just {position, orientation}.
+    level.spawn("Rol_Archore", 2, { x: 10, y: 0, z: 10 });
+  },
+  setup(level) {
+    // The .gcs slot: runs last, with the world already built.
+    gameConsole.execute("sunangle 140");
+  },
+});
+const arenaTitle: string = arena.title;
+const arenaRif: string = arena.map.rif;
+const levelCount: number = levels.count;
+const loadingNow: Level | null = levels.current;
+const byTitle = levels["Test Arena"];
+for (const level of levels) {
+  const busy: boolean = level.loading;
 }
+// A single include needs no brackets.
+levels.add("Minimal", { rif: "levels\\level02.rif", object: "Land", includes: "defaults.gsh" });
+// The module form: `import * as m from "./levels/arena.mjs"` produces exactly
+// this shape - the map nested under `map`, the hooks beside it - so a namespace
+// is passed straight in.
+const asModule: LevelModule = {
+  map: { rif: "levels\\level01.rif", object: "Land" },
+  includes: ["gunlok.gsh"],
+  define(level) {},
+  populate(level) {},
+  setup(level) {},
+};
+const fromModule: Level = levels.add("From A Module", asModule);
 
-const added: MenuItem = main.add_item("Open console", (item) => {
-  const where: number = item.index;
-  const owner = item.menu;
-  console.log(`clicked ${item.label} on ${owner.name}`);
-});
-const toggle = menus.Options.add_toggle("Cheats", false, (item) => {
-  const on: boolean | undefined = item.value;
-});
-toggle.value = true;
-menus.Options.open(true);
-
-// @ts-expect-error - the menu list is fixed
-menus[0] = main;
-// @ts-expect-error - the callback takes the item, not a string
-main.add_item("x", (item: string) => {});
+// @ts-expect-error - `object` is required; a rif alone does not name a map
+levels.add("Broken", { rif: "levels\\level01.rif" });
+// @ts-expect-error - a module *path* is no longer accepted; import it yourself
+levels.add("By Path", "./levels/arena.mjs");
+// @ts-expect-error - the registered levels are read-only
+levels[0] = arena;
+// @ts-expect-error - locators() gives whole locators, not bare positions
+const notAVec: number = arena.locators("x")[0].y;
 
 // --- ImGui --------------------------------------------------------------------
 
-export function draw_gui(imgui: typeof ImGui): void {
+// @ts-expect-error - and it is a type, not a global value, so there is nothing
+// to call from outside the callback either.
+ImGui.Text("outside a frame");
+
+export function draw_gui(imgui: ImGui): void {
   if (imgui.Begin("GkPlus")) {
     imgui.Text(`${actors.count} actors`);
 

@@ -179,6 +179,213 @@ set to `true` whenever the field is assigned:
   is only usable as an `abstract` parent, `LoadGLS` warns "incomplete object
   definition found" and `ToXxx` converters return NULL.
 
+### Enum keyword fields: vocabulary known, values not
+
+Several Integer fields take a keyword rather than a number (`ai bot`, `type explode`,
+`action on death must drop`). The keywords are compiled into the **flex DFA** as state
+transitions, so they are *not* strings in `gl.exe` — searching the binary for `must drop`,
+`resists laser`, `corona` or `plasma pistol` finds nothing. Nor are they in any shipped
+file: `Scripts\glresrc.h` / `glresrc_enum.h` only carry `GL_*` resource ids (whose
+numbering is unrelated — `GL_AMMO_*` runs 7600..7626, 27 entries, against an `ammo type`
+space of 0..19), and `Sounds.h` is sound ids.
+
+What the shipped scripts *do* pin is the complete vocabulary. Harvested from every
+`Scripts\*.gsh` and `*.gls`:
+
+| Field | Id | Status |
+|-------|----|--------|
+| `ai` | 0x49 | **recovered**, and matches `enum class AIType` exactly — the control |
+| `type` (destructibility) | 0x41 | **recovered** — `explode` 0, `splatter` 1, matching `DestructibilityKind` |
+| `type` (pgenerator) | 0x41 | **recovered** — confirms 7 console-table ids and adds `corona` 7, `laser trail` 10 |
+| `action on death` | 0x5d | **recovered** — `must drop` 1, `must not drop` 2 |
+| `resistance` | 0x4e | **recovered** — 2/4/6/8, and *not* a bitmask |
+| `ammo type` | 0x17 | **recovered**, complete 0..18 |
+| `weapon type` | 0x18 (ammo) | **recovered**, 31 of 34 |
+| `weapon` / `secondary weapon` | 0x18/0x19 (character) | **partly** — 0..14 confirmed identical to `weapon type`; see below |
+
+### `weapon` and `weapon type` are one enum with two bounds
+
+They share field id 0x18, and probing a `character` returned exactly the values probing an
+`ammo` did for the same keywords (0..14). What differs is the declared range:
+
+| Section | Field | max_values[0x18] |
+|---------|-------|------------------|
+| `ammo` | `weapon type` | **33** |
+| `character` | `weapon` / `secondary weapon` (0x19) | **INT_MAX** |
+
+So `weapon type` is the first 34 entries - the things that are weapons with ammo, which is
+all the `Ammo` table can index at `ammo_type + weapon_type * 19` - and `character.weapon`
+is a wider **inventory item** space. The shipped pickups confirm it: `body_slot_upgrades.gsh`
+has real `character` sections with `weapon audio cloak`, `weapon lock decoder`,
+`weapon terrain scanner`, and `ammo_pickups.gsh` has `weapon autolock bolts`. None of those
+can fit under 34, so they occupy ids above 33 - not yet recovered, because probing stopped
+before reaching them.
+
+**`weapon enemy laser` looks like a shipped bug.** The probe refuses it, and the only use is
+`guardian_turret.gsh`, reached from the multiplayer level `mplay_tf_oilrig01.gls`. That
+same character also sets `sight angle 90`, which is outside the field's declared 0..89 - so
+the section almost certainly logs errors at load and nobody noticed.
+
+### Declared bounds, for the enum fields
+
+Straight off the section constructors, and useful for knowing when a recovered table is
+complete:
+
+| Section | Field | Range | Recovered |
+|---------|-------|-------|-----------|
+| `destructibility` | `type` 0x41 | 0..1 | **complete** |
+| `pgenerator` | `type` 0x41 | 0..12 | 12 of 13 - only id **8** unnamed |
+| `ammo` | `ammo type` 0x17 | 0..19 | 0..18, so 19 is unused |
+| `ammo` | `weapon type` 0x18 | 0..33 | 31; 10, 15 unnamed and 33 = the keyword-less default |
+| `role` | `resistance` 0x4e | 0..9 | 4 of them, at 2/4/6/8 |
+| `role` | `action on death` 0x5d | 0..INT_MAX | 2, plus 0 = unspecified |
+| `character` | `weapon` 0x18 | 0..INT_MAX | 0..14 so far |
+
+### Recovered by probing (`gls.probe`)
+
+`ammo type` (0x17), complete and a clean bijection onto 0..18 — no gaps or duplicates,
+which is the check that it is right:
+
+| | | | | |
+|---|---|---|---|---|
+| 0 needles | 1 flares | 2 plasma bolts | 3 plasmaxi bolts | 4 plasma shells |
+| 5 autolock bolts | 6 battery basic | 7 battery plus | 8 energy cells | 9 grenade basic |
+| 10 grenade plus | 11 grenade EMP | 12 missile EMP | 13 missile basic | 14 missile plus |
+| 15 flames | 16 napalm | 17 nanotech dismantler | 18 none needed | |
+
+`weapon type` (0x18), 31 of the 34-value space — every keyword any shipped script uses.
+Player weapons occupy the low ids, enemy weapons the high ones:
+
+| | | | |
+|---|---|---|---|
+| 0 plasma pistol | 1 plasma pistol training | 2 plasmagnum | 3 plasmatrix |
+| 4 laser | 5 binary laser | 6 maxim laser | 7 grenade launcher |
+| 8 missile launcher | 9 flamethrower | 11 nanofrag | 12 epulsar |
+| 13 repair arm | 14 interface arm | 16 enemy plasma weak | 17 enemy plasma medium |
+| 18 enemy plasma strong | 19 enemy laser weak | 20 enemy laser medium | 21 enemy laser strong |
+| 22 enemy grenade launcher basic | 23 enemy grenade launcher plus | 24 enemy missile launcher basic | 25 enemy missile launcher plus |
+| 26 enemy missile launcher basic slow reload | 27 enemy laser adversor | 28 enemy plasma pulsax | 29 enemy plasma pulsox |
+| 30 enemy plasma mini pulsox | 31 enemy epulsar obliteron | 32 enemy epulsar obliteron deadly | |
+
+Missing: **10** and **15**, which no shipped script names, and **33**, the ctor default
+that means "none" (see below - it has no spelling).
+
+The four small ones, all confirmed against existing enums where one existed:
+
+| Field | Values |
+|-------|--------|
+| `type` (destructibility) | 0 `explode`, 1 `splatter` — matches `DestructibilityKind` |
+| `action on death` | 1 `must drop`, 2 `must not drop`; 0 is the default and has no keyword |
+| `resistance` | 2 `resists laser`, 4 `resists explosives`, 6 `resists epulsar`, 8 `resists small arms` |
+| `type` (pgenerator) | 0 `smoke`, 1 `steam`, 3 `fire`, 4 `shot`, 5 `explosion`, 6 `big explosion`, **7 `corona`**, **10 `laser trail`**, 12 `sparks` |
+
+Two of those deserve a note:
+
+- **`resistance` is not a bitmask.** The values step by 2 (2/4/6/8), not by powers of two,
+  so 1/3/5/7 are unaccounted for and the four keywords cannot be combined. An earlier guess
+  in this file that "four values reads like a bitmask" was wrong.
+- **`corona` = 7 and `laser trail` = 10** fill two of the three ids
+  `GetParticleIDFromName` leaves unnamed; **8 is still unknown**. The probe also
+  independently reproduced smoke/steam/fire/shot/explosion/big explosion/sparks at the ids
+  the console table gives, which is a second check on `ParticleType` in `src/Roles.h`.
+
+**The `ai` row is the control and it passed**: all 21 keywords came back at exactly the
+values `enum class AIType` declares, in order, including the non-obvious middle
+(`reserved` 4, `waiting` 6, `pathfinder` 7, `swarm` 17). Together with `destructibility`
+matching `DestructibilityKind`, that is two independent confirmations that the method
+reports what the game actually stores.
+
+### Five traps the probing exposed
+
+The first is the one that matters to anything calling `LoadGLS`, not just to probing.
+
+- **A syntax error poisons the parser for the rest of the process.** `LoadGLS` resets its
+  error counter, `ParsedObjList` and the symbol tables on entry, but evidently not the file
+  stack, and *nothing recovers* - after one bad parse, a verbatim copy of a shipped section
+  fails identically. This was established by bisection: six `destructibility` variants all
+  parsed when run first, and the same text returned -1 once a syntax error had happened
+  earlier in the run. Any tool making repeated `LoadGLS` calls has to treat the first
+  failure as terminal.
+- **An unrecognised keyword is a `syntax error`, not a per-value rejection**, so it takes
+  the rest of the file with it *and* poisons everything after. `gls::ProbeKeywords` parses
+  one keyword per call and stops at the first refusal for both reasons.
+- **`none` is not spellable on an integer enum field.** It is a value form for String and
+  Custom fields only; `weapon type none` is a syntax error even though 33 (= none) is that
+  field's own default. The ctor default is reachable only by omitting the field.
+- **An object missing a required field is silently demoted to abstract and left OUT of
+  `ParsedObjList`.** The warning is "abstract definition not declared with 'abstract'",
+  and `LoadGLS` then reports "empty script found" for a file where every section did in
+  fact parse. Anything reading the returned list has to make its objects complete first.
+  The trap inside the trap: **`pgenerator`'s required `life` is invisible to reflection**,
+  because field id 0x42 is intercepted by that section's `CheckValue` override and stored
+  in the 0x1b70 object's extension, so `field_types[0x42]` is never set. A pgenerator
+  built from `SectionFields` alone is always incomplete.
+- **`field_names[]` *is* the lexer spelling** - a hypothesis to the contrary was tested and
+  refuted: `nolighting` parses and `no lighting` is a syntax error, likewise
+  `generategenerators`. The array is safe to generate script text from.
+
+Two things worth knowing before trusting that table further:
+
+- **`corona` and `laser trail` are particle types the console keyword table does not
+  know.** `GetParticleIDFromName` @ 0x0044c340 is where `ParticleType` (`src/Roles.h`)
+  came from, and it leaves 7, 8 and 10 unnamed. The GLS lexer accepts these two, so they
+  are two of those three ids — which one is which has not been established.
+- **The `weapon` keyword harvest is not clean.** 64 distinct values turn up under `weapon
+  <x>`, well past the 34-value space the constructor allows, and they include ammo names,
+  gadgets (`audio cloak`, `lock decoder`, `terrain scanner`) and two object references
+  (`Wpn_BlueLaser`). So `weapon` is being used for more than one field, or for an
+  inventory-item space wider than `character`'s. Do not treat that list as the character
+  `weapon` enum without separating the sections first.
+
+Recovering the actual numbers needs either the flex DFA simulated out of `GSHTokenize`
+@ 0x00474920 (feed each keyword through the transition tables for its rule number, then
+read the `yylval` constant that rule's action loads) or a running game to observe the
+converted values. Neither has been done.
+
+### The schema is in the object: reflection
+
+Everything the tables further down this file record by hand is also **present at runtime**,
+written into each instance by its own section constructor. For any parsed object:
+
+| Array | What it tells you |
+|-------|-------------------|
+| `field_types[id]` | `None` means this section does not accept the id at all |
+| `field_names[id]` | the GLS keyword, e.g. `"walking speed"` |
+| `field_satisfied[id]` | as *initialized*: `true` = has a default, `false` = required |
+| `min_values[id]` / `max_values[id]` | the bounds `CheckValue` enforces |
+| `min_values[id].boolean` | String and Custom only: "`none` is allowed" |
+
+So constructing one throwaway instance per section type recovers the whole schema, and no
+hand-written table can drift from the binary. `gk::gls::SectionFields` (`src/GLS.cpp`) does
+exactly that and is what the `gls` JS bindings build their field names from. The per-section
+tables below stay useful as a reference, but the object is the authority.
+
+### Two hazards when reusing parsed objects
+
+Both matter as soon as parsed objects are built programmatically and kept, which is what
+`src/JsGls.cpp` does.
+
+- **`ToRole` caches its result at `parsed+0x1b60`** (the extra dword a role's 0x1b68
+  allocation carries) and is gated on that being null. `DestroyRoles` frees every `Role`
+  between levels, so converting the same parsed role on a second level load hands back a
+  pointer into a freed pool page. `gk::gls::ResetConversionCache` clears the dword; the
+  other section types have no cache and are unaffected.
+- **`CheckValue` applies no unit conversion** - it range-checks and stores (0x0047bd60 is a
+  duplicate check, a type switch, a bounds compare and a store, nothing else). The stored
+  value is in `.gls` units, which the declared defaults confirm: `scan delay` defaults to
+  0.5 s and `sight angle` is bounded 0..89 degrees. Seconds become ticks and degrees become
+  radians inside `ToCharacter`, i.e. *after* the parsed object. A value set programmatically
+  therefore means exactly what the same literal means in a `.gsh`.
+
+### Recovering a parsed object's symbol name
+
+`ParsedThingBase.link` @ +0x04 is the symbol-table backlink, and the entry it points at is the
+8-byte `{ParsedThingBase *thing, char *name}` that `SymbolEntry_Ctor` builds (see
+`RegisterInSymbolTable` @ 0x0047b670, which hashes `entry[1]` as the string). So the `Rol_Bug`
+in `role Rol_Bug { ... }` is reachable from the parsed object itself - which is what a
+`.gsh` -> `.mjs` transpiler would need, since `ClearParseSymbolTables` @ 0x0047aa70 wipes the
+table before `LoadGLS` returns. Not yet used by anything.
+
 ### ParsedThingVtbl (8-9 slots)
 
 | # | Name | Shared impl | Purpose |
@@ -668,7 +875,11 @@ is `ToGameObject_nop`, so `ConvertParsedObjects` skips it.
 - The full C++ API for this system lives in `src/GLS.h` / `src/GLS.cpp`
   (`gk::gls`): faithful `ParsedThing` layout, field-id enum, typed accessors,
   section-type discrimination via `parser_func`, plus wrappers for `LoadGLS`,
-  `ConvertParsedObjects` and `FreeParsedObjectList`.
+  `ConvertParsedObjects` and `FreeParsedObjectList`, the programmatic construction
+  API (`Create` / `Set` / `InheritFrom` / `RegisterGameObject` / `ToRole`) and the
+  runtime reflection above (`SectionFields` / `FindField` / `ResetConversionCache`).
+  `src/JsGls.cpp` exposes all of it to scripts as the `gls` namespace, which is how
+  a `.gsh` header gets re-implemented as an `.mjs` module.
 - Because `ParsedRole` caches the converted `Role*` at +0x1b60, converting a role
   twice returns the same `Role`.
 - LoadGLS is destructive global state (`ParsedObjList`, symbol tables): do not call

@@ -52,9 +52,33 @@ declare module "gk" {
   // --- console ---------------------------------------------------------------
 
   /** The *game's* console (` to open), not the host's global `console`. */
+  /** The game's console and the host's logging, in one object. There is no
+   *  global `console`: import this one. */
   export interface Console {
-    /** Writes one line to the console. */
+    /** Writes one line to the game console. */
     print(text: string): void;
+
+    /** Joins its arguments with spaces and writes them to the game console and
+     *  to the debugger, a line at a time. All five are the same function - the
+     *  host has no severity levels. */
+    log(...args: unknown[]): void;
+    info(...args: unknown[]): void;
+    warn(...args: unknown[]): void;
+    error(...args: unknown[]): void;
+    debug(...args: unknown[]): void;
+
+    /** Runs one console command, exactly as typing it would. */
+    execute(command: string): void;
+    /** *Queues* a file of console commands - what a level's `.gcs` is. The
+     *  lines are appended to the console's command queue, which runs one per
+     *  frame, so nothing has happened yet when this returns. The path is
+     *  resolved against the game's current directory, which moves during a
+     *  level load. `//` starts a comment and a leading `#` is a directive
+     *  (`ONLY IF SAFE`, `ONLY IF HINTS ON`, `CLEAR BATCH`,
+     *  `EXECUTE IMMEDIATELY`, `NORMAL EXECUTION`); lines are capped at 249
+     *  characters. Returns whether the file opened. */
+    execute_file(path: string): boolean;
+
     /** ARGB, as 0xAARRGGBB. */
     text_color: number;
     /** ARGB, as 0xAARRGGBB. */
@@ -690,6 +714,468 @@ declare module "gk" {
     readonly [name: string]: Menu | undefined;
   };
 
+  // --- gls: definitions without the parser -------------------------------------
+
+  /** The fifteen GLS section keywords, spelled as `gls` factory names. */
+  export type GlsSection =
+    | "shape"
+    | "hierarchy"
+    | "pgenerator"
+    | "light"
+    | "projectile"
+    | "destructibility"
+    | "frag_data"
+    | "replace_destructibility"
+    | "role"
+    | "character"
+    | "ammo"
+    | "ammo_info"
+    | "camera_track"
+    | "map"
+    | "directory";
+
+  /** How a field's value is typed, as its section's constructor declared it. */
+  export type GlsFieldType =
+    | "boolean"
+    | "integer"
+    | "float"
+    | "string"
+    | "object"
+    | "none";
+
+  /** One field of a section, read off the game rather than from a table here. */
+  export interface GlsField {
+    /** The JS spelling - the GLS keyword with spaces as underscores. */
+    name: string;
+    /** The GLS keyword itself, e.g. "walking speed". */
+    keyword: string;
+    type: GlsFieldType;
+    /** True when the object will not convert until this field is assigned. */
+    required: boolean;
+    /** String and object fields only: whether `null` (GLS `none`) is accepted. */
+    none_ok: boolean;
+    min?: number;
+    max?: number;
+  }
+
+  // --- make: building game objects natively ------------------------------------
+
+  /** A Shape or Hierarchy out of the .rif cache. Borrowed - the cache owns it, so
+   *  the same handle can be given to any number of roles. */
+  export interface GameAsset {
+    readonly __asset: unique symbol;
+  }
+
+  /** Either an existing handle, or `{rif, object}` to look one up inline. A
+   *  hierarchy may also carry the hotspot names, which is where GLS puts them. */
+  export type AssetRef =
+    | GameAsset
+    | { rif: string; object: string; hotspot?: string; alternate_hotspot?: string };
+
+  /** A `character` block. Values are in .gls units - degrees, seconds, metres,
+   *  animation cycles per second - and every default is the game's own. */
+  export interface CharacterDesc {
+    walking_speed?: number;
+    turning_speed?: number;
+    strength?: number;
+    aim?: number;
+    sight_angle?: number;
+    sight_range?: number;
+    hearing_range?: number;
+    aggression?: number;
+    scan_delay?: number;
+    scan_acceptance_angle?: number;
+    angular_scan_rate?: number;
+    mine_laying_time?: number;
+    damage_multiplier?: number;
+    shot_speed_multiplier?: number;
+    target_cycle_time?: number;
+    weapon_cycle_time?: number;
+    weapon_cycle_time2?: number;
+    alarm_delay?: number;
+    gun_yaw_angle?: number;
+    elevation_angle?: number;
+    alert_radius?: number;
+    /** 0 means "use the model's bounding box" - the default, and what almost
+     *  every shipped character relies on. */
+    radius?: number;
+    height?: number;
+    size?: number;
+    initial_first_person_range?: number;
+    maximum_first_person_range?: number;
+    /** A weapon keyword, or the raw id. 33 = none, which has no keyword. */
+    weapon?: string | number;
+    secondary_weapon?: string | number;
+    description?: number;
+    status_window_u?: number;
+    status_window_v?: number;
+    blob_shadow?: number;
+    generation_limit?: number;
+    max_weapon?: number;
+    max_ammo?: number;
+    max_module?: number;
+    can_turn?: boolean;
+    draw_vision_cone?: boolean;
+    draw_hearing_range?: boolean;
+    always_cpu_controlled?: boolean;
+    alertable?: boolean;
+    latch_trigger?: boolean;
+    customisation_hierarchy?: AssetRef;
+    shadow_hierarchy?: AssetRef;
+  }
+
+  export interface LightDesc {
+    red?: number;
+    green?: number;
+    blue?: number;
+    specular_red?: number;
+    specular_green?: number;
+    specular_blue?: number;
+    range?: number;
+  }
+
+  export interface ProjectileDesc {
+    gravity?: boolean;
+    damage?: number;
+    sound?: number;
+    max_range?: number;
+    blast_damage?: number;
+    blast_range?: number;
+    hit_light?: LightDesc;
+  }
+
+  export interface ParticleGeneratorDesc {
+    /** A particle keyword (`smoke`, `corona`, `laser trail`, ...) or its id. */
+    type?: string | number;
+    rate?: number;
+    coords?: Vec3;
+    red?: number;
+    green?: number;
+    blue?: number;
+    alpha?: number;
+    start_scale?: number;
+    end_scale?: number;
+    spin?: number;
+    /** Converted to ticks at the calling thread's clock rate. */
+    particle_ttl_seconds?: number;
+    generate_generators?: boolean;
+    /** GLS `life`, as its raw dword pair - the encoding of `infinite` is not
+     *  recovered, so copy it off a parsed generator if you need to match one. */
+    life_low?: number;
+    life_high?: number;
+  }
+
+  /** A role's death behaviour. The three variants of the destructibility family,
+   *  discriminated by `kind`. */
+  export type DestructibilityDesc =
+    | { kind: "explode" | "splatter" }
+    | { kind: "replace"; name: string; replace?: boolean }
+    | {
+        kind: "frag";
+        role?: Role;
+        replace_role?: Role;
+        remove?: string;
+        scale?: number;
+        replace?: boolean;
+        symmetric?: boolean;
+        blast_range?: number;
+        blast_damage?: number;
+      };
+
+  /** A `role` block. Sub-objects are described inline and built inside
+   *  `make.role`, because the Role takes ownership of every one of them. */
+  export interface RoleDesc {
+    /** GLS `identifier` - this, not `name`, is what `roles["..."]` finds. */
+    identifier?: string;
+    /** Set at most one. A hierarchy is what enables hotspot resolution. */
+    shape?: AssetRef;
+    hierarchy?: AssetRef;
+    hotspot?: string;
+    alternate_hotspot?: string;
+    character?: CharacterDesc;
+    light?: LightDesc;
+    projectile?: ProjectileDesc;
+    pgen?: ParticleGeneratorDesc;
+    pgen2?: ParticleGeneratorDesc;
+    destructibility?: DestructibilityDesc;
+    inventory_shape?: AssetRef;
+    inventory_hierarchy?: AssetRef;
+    /** An AI keyword (`bot`, `turret`, `background creature`, ...) or its id. */
+    ai?: string | number;
+    /** `must drop` / `must not drop`, or the id. */
+    action_on_death?: string | number;
+    /** `resists laser` / `resists small arms` / `resists explosives` /
+     *  `resists epulsar`, or the id. Not a bitmask - these do not combine. */
+    resistance?: string | number;
+    resistance_factor?: number;
+    /** Comma-separated node names, exactly as the GLS field takes them. */
+    sever_points?: string;
+    meta_sound?: string;
+    description?: number;
+    pickup_name?: number;
+    pickup_radius?: number;
+    recon_name?: number;
+    recon_ai_short?: number;
+    recon_ai_number?: number;
+    recon_ai_long?: number;
+    recon_ai_long2?: number;
+    interface_beam_delay?: number;
+    /** A VulnerabilityType id; no keyword table has been recovered for it. */
+    interface_beam_effect?: number;
+    interface_beam_script?: string;
+    interface_beam_duration?: number;
+    limit?: number;
+    alpha?: number;
+    armor?: number;
+    shields?: number;
+    recharge_rate?: number;
+    /** Wins over per_vertex_fogging, which is forced off when this is set. */
+    alpha_fogging?: boolean;
+    per_vertex_fogging?: boolean;
+    no_lighting?: boolean;
+    reflective?: boolean;
+    destination_selectable?: boolean;
+    destroy_after_collection?: boolean;
+    hit_test_ignore?: boolean;
+    frag_control?: boolean;
+    moves_on_lifts?: boolean;
+    status_display?: boolean;
+  }
+
+  export interface AmmoDesc {
+    ammo_type?: string | number;
+    weapon_type?: string | number;
+    name?: string;
+    file?: string;
+    round_time?: number;
+    reload_time?: number;
+    life_timer?: number;
+    magazine_size?: number;
+    salvo_size?: number;
+    sound?: number;
+    firing_speed?: number;
+    role?: Role;
+  }
+
+  export interface AmmoInfoDesc {
+    ammo_type?: string | number;
+    shape?: AssetRef;
+    hierarchy?: AssetRef;
+    ammo_name?: number;
+    description?: number;
+    max_per_slot?: number;
+  }
+
+  /** Builds live game objects through the game's own conversion logic,
+   *  reimplemented natively - no parser, and a definition costs a few dozen bytes
+   *  rather than the 0x1b60 a parsed object does.
+   *
+   *      const role = make.role({
+   *        identifier: "bug",
+   *        hierarchy: { rif: "units\\bug.rif", object: "bug", hotspot: "head" },
+   *        character: { walking_speed: 1.5, strength: 1, aggression: 0.1 },
+   *        ai: "background creature",
+   *      });
+   *
+   *  `make.role` registers the Role in the roles hash, so call it once per level
+   *  load - the hash is cleared between levels - not once at startup. */
+  export interface Make {
+    /** A .rif lookup. The cache owns the result, so the handle is reusable. */
+    shape(rif: string, object: string): GameAsset;
+    hierarchy(rif: string, object: string): GameAsset;
+    /** Builds and registers a Role, with every sub-object built inline. */
+    role(desc: RoleDesc): Role;
+    /** Fills the Ammo slot at [ammo_type + weapon_type * 19]. False when that
+     *  slot is already taken - the first definition of a pair wins. */
+    ammo(desc: AmmoDesc): boolean;
+    /** Fills AmmoInfos[ammo_type]. */
+    ammo_info(desc: AmmoInfoDesc): boolean;
+    /** Needs a loaded level: it binds against the level .rif by name. */
+    camera_track(desc: {
+      name: string;
+      pgen?: ParticleGeneratorDesc;
+      pgen2?: ParticleGeneratorDesc;
+    }): boolean;
+  }
+
+  /** What only the GLS *parser* can answer. Building objects is `make`. */
+  export interface Gls {
+    /** The fifteen section keywords, as `schema` takes them. */
+    readonly sections: GlsSection[];
+    /** The field table a section constructor declares about itself - types,
+     *  keywords, which are required, and the bounds CheckValue enforces. Read
+     *  off the game, so it cannot drift from it. */
+    schema(section: GlsSection): GlsField[];
+    /** Recovers the integer behind a GLS enum keyword (`ai bot`, `type explode`)
+     *  by handing the parser a one-field section per name and reading the stored
+     *  value back. `null` means the parser rejected that keyword, which doubles
+     *  as a validity check.
+     *
+     *  These keywords are compiled into the lexer's DFA rather than stored as
+     *  strings, so this is the only way to learn their values short of a
+     *  debugger. It parses a throwaway script, so do NOT call it while a level is
+     *  loading - the GLS parser uses destructive global state. */
+    probe(
+      section: GlsSection,
+      field: string,
+      names: string[]
+    ): Record<string, number | null>;
+    /** Parses arbitrary .gls text and returns how many objects reached the
+     *  parsed-object list, or -1 if none did. The bisection tool for working out
+     *  why a generated section will not parse - note that -1 covers both "syntax
+     *  error" and "every section was demoted to abstract", which the parser does
+     *  not distinguish to callers.
+     *
+     *  Nothing is converted, so it is safe to call repeatedly - but it is the
+     *  same destructive global parser state, so not during a level load. */
+    try_parse(source: string): number;
+  }
+
+  // --- levels ------------------------------------------------------------------
+
+  /** The `map { ... }` block a custom level replaces its .gls with, field for
+   *  field. Only `rif` and `object` are required; leaving an optional string out
+   *  is the same as omitting the line from a .gls. */
+  export interface LevelMap {
+    /** The level geometry .rif, relative to the RIFs directory - GLS `file`. */
+    rif: string;
+    /** The object *inside* that .rif to build the map from - GLS `name`. */
+    object: string;
+    /** Loading/HUD bitmap; omitted means `none`. */
+    bitmap?: string;
+    /** Name of a .loc locator; omitted means `none`. */
+    camera_plane?: string;
+    /** 10..500. Defaults to 60. */
+    max_camera_distance?: number;
+    max_camera_focus_height?: string;
+    min_camera_focus_height?: string;
+    shadow_object_rif?: string;
+    shadow_object_name?: string;
+    /** 10..10000. Defaults to 200. */
+    max_vertices_per_section?: number;
+  }
+
+  /** One object of a given name in the level .rif, already in world space - the
+   *  `for "<rif object>"` half of a .gls `use` clause. */
+  export interface LevelLocator {
+    position: Vec3;
+    orientation: Vec4;
+  }
+
+  /** Extra arguments to `level.spawn`. */
+  export interface SpawnOptions {
+    /** Creates a token holding the new actor's id, which is how the engine names
+     *  actors - the `as "<token>"` clause of a .gls `use`. */
+    as?: string;
+  }
+
+  /** A level registered by this script. The same object comes back from
+   *  `levels.add` and arrives at every load callback. */
+  export interface Level {
+    readonly title: string;
+    /** The generated prelude script, which is this level's ScriptFileName. */
+    readonly script_file: string;
+    /** A snapshot of the map description, rebuilt on every read. */
+    readonly map: Required<LevelMap>;
+    /** True while any of this level's load callbacks is running: `define`,
+     *  `populate` or `setup`. */
+    readonly loading: boolean;
+
+    /** Every object of that name in the level .rif, in the coordinates the game
+     *  would have spawned a placed object at. Throws outside a load callback,
+     *  and is empty before the geometry exists. */
+    locators(name: string): LevelLocator[];
+    /** Spawns `role` for `team` at `where` - a locator, or any `{x, y, z}`.
+     *  Returns the new actor id, or -1 if nothing spawned. Throws outside a
+     *  load callback, before the geometry exists (so not from `define`), or if
+     *  no role of that name is registered. */
+    spawn(
+      role: string,
+      team: number,
+      where: LevelLocator | Vec3,
+      options?: SpawnOptions
+    ): number;
+    toString(): string;
+  }
+
+  /** The parts of a level that are not the map itself. A level module supplies
+   *  them as named exports; an inline description as properties. */
+  export interface LevelBody {
+    /** .gls/.gsh files defining the roles, characters and ammo the level's
+     *  actors need, relative to the game's Scripts directory. They are parsed in
+     *  one pass, so their `#include` guards work exactly as in a hand-written
+     *  level.
+     *
+     *  Leave this out entirely if the level builds its definitions with `gls`
+     *  instead - that is the no-GLS-parsing path. */
+    includes?: string | string[];
+    /** Registers this level's roles, characters and ammo. Runs once per load,
+     *  before the map is even converted - where a .gls's `#include` block sits.
+     *
+     *  It has to be per load rather than once at startup, because the roles hash
+     *  is cleared between levels; the `GlsObject`s themselves are reusable, so
+     *  keep them at module scope and call `register()` from here. */
+    define?: (level: Level) => void;
+    /** Runs once per load of this level, after the geometry exists and before
+     *  the camera settles - the window a .gls's placed objects spawn in. */
+    populate?: (level: Level) => void;
+    /** Stands in for the level's .gcs, and runs exactly where the game would
+     *  have run one: last, with the world already built and the camera settled.
+     *  This is where triggers get armed, fog and camera bounds get set, and
+     *  console commands get issued.
+     *
+     *  Skipped when a savegame is restored, for the same reason the .gcs is -
+     *  the save already holds whatever it set up. */
+    setup?: (level: Level) => void;
+  }
+
+  /** What `levels.add` takes when the level is described inline: the map fields
+   *  flat on the object, beside the hooks. */
+  export interface LevelDescription extends LevelMap, LevelBody {}
+
+  /** The shape of a level module - and, because a module namespace *is* an
+   *  object with the map nested under `map`, a description `levels.add` accepts
+   *  as-is:
+   *
+   *      // arena.mjs
+   *      export const map = { rif: "...", object: "Land" };
+   *      export const includes = ["gunlok.gsh"];
+   *      export function populate(level) { ... }
+   *      export function setup(level) { ... }
+   *
+   *      // main.mjs
+   *      import * as arena from "./levels/arena.mjs";
+   *      levels.add("Test Arena", arena);
+   */
+  export interface LevelModule extends LevelBody {
+    map: LevelMap;
+  }
+
+  export interface LevelsMembers {
+    readonly count: number;
+    /** The level being loaded right now, or null outside a load callback. */
+    readonly current: Level | null;
+    /** Registers a level built from a script instead of a .gls + .gcs pair, and
+     *  appends it to Choose Level - along with a "Choose Level" item on Single
+     *  Player, since the game's own one needs `-chooselevel`.
+     *
+     *  `source` is the description object: either flat (`LevelDescription`) or
+     *  with the map nested under `map`, which is what a level module's namespace
+     *  gives you - `import * as arena` and pass it straight in.
+     *
+     *  Either way the map is validated here, through the game's own field
+     *  checks, so a bad value throws now rather than halfway through a load. */
+    add(title: string, source: LevelDescription | LevelModule): Level;
+    [Symbol.iterator](): IterableIterator<Level>;
+  }
+
+  /** The levels this script registered, keyed by registration order and by
+   *  title. The game's own campaign levels are not in here. */
+  export type Levels = LevelsMembers & {
+    readonly [index: number]: Level | undefined;
+    readonly [title: string]: Level | undefined;
+  };
+
   // --- the module ------------------------------------------------------------
 
   export const camera: Camera;
@@ -698,9 +1184,15 @@ declare module "gk" {
   export const roles: Roles;
   export const tokens: Tokens;
   export const triggers: Triggers;
-  export const menus: Menus;
+  export const levels: Levels;
+  export const make: Make;
+  export const gls: Gls;
 
-  /** The default export carries the same seven objects: `gk.actors === actors`. */
+  // `menus` is not exported: it is only ever setup_menus' argument, because
+  // adding a front-end item is a boot-time act. Keep the argument if you need
+  // it later.
+
+  /** The default export carries the same nine objects: `gk.actors === actors`. */
   const gk: {
     camera: Camera;
     console: Console;
@@ -708,29 +1200,31 @@ declare module "gk" {
     roles: Roles;
     tokens: Tokens;
     triggers: Triggers;
-    menus: Menus;
+    levels: Levels;
+    make: Make;
+    gls: Gls;
   };
   export default gk;
 
   // --- the entry module's contract -------------------------------------------
 
   /** The shape of `export function setup_menus`. Called once at startup, after
-   *  the game has filled its own menus. */
+   *  the game has filled its own menus.
+   *
+   *  The argument is the only way to reach `menus`: there is no export for it,
+   *  because the game's own items must be in place before a script adds one. */
   export type SetupMenus = (menus: Menus) => void;
 
   /** The shape of `export function draw_gui`. Called every frame the F11
    *  overlay is open, inside an active ImGui frame. Throwing disables it for
-   *  the rest of the session. */
-  export type DrawGui = (imgui: typeof import("ImGui")) => void;
+   *  the rest of the session.
+   *
+   *  The argument is the only way to reach ImGui: there is no module to import
+   *  it from, because nothing it offers works outside this callback. */
+  export type DrawGui = (imgui: ImGui) => void;
 }
 
-/** The host installs its own console - QuickJS core has none. It writes to the
- *  game console and to the debugger. Not the same object as the `console`
- *  exported by "gk", which is the game's console. */
-declare const console: {
-  log(...args: unknown[]): void;
-  info(...args: unknown[]): void;
-  warn(...args: unknown[]): void;
-  error(...args: unknown[]): void;
-  debug(...args: unknown[]): void;
-};
+// There is deliberately no global `console` declared here, because the host
+// installs none: QuickJS core has no console object, and GkPlus puts log/info/
+// warn/error/debug on the `console` exported by "gk" instead of adding a second
+// one. `import { console } from "gk"` is how a script gets it.

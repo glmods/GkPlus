@@ -1,5 +1,14 @@
 #include "GLS.h"
 
+#include "Console.h"
+#include "Core.h"
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h> // GetTempPath / CreateDirectory / DeleteFile for the probe
+
+#include <cstdio>
+#include <iterator>
+
 namespace gk::gls {
 namespace {
 // Section entry functions; ParsedThing::parser_func holds one of these.
@@ -244,6 +253,366 @@ bool IsValid(const ParsedThing &thing) {
 bool IsValidDeep(const ParsedThing &thing) {
   auto &mut = const_cast<ParsedThing &>(thing);
   return mut.vtbl->is_valid_deep(&mut);
+}
+
+// --- Reflection ---------------------------------------------------------------
+
+namespace {
+struct SectionName {
+  SectionType type;
+  const char *name;
+};
+
+// The grammar's section keywords. `ReplaceDestructibility` is the one without a
+// keyword of its own - it is the `name` + `replace` form of a destructibility
+// block (ParseUnk2 @ 0x0047e9e0) - so it gets a descriptive name instead.
+const SectionName SectionNames[] = {
+    {SectionType::Shape, "shape"},
+    {SectionType::Hierarchy, "hierarchy"},
+    {SectionType::ParticleGenerator, "pgenerator"},
+    {SectionType::Light, "light"},
+    {SectionType::Projectile, "projectile"},
+    {SectionType::Destructibility, "destructibility"},
+    {SectionType::FragData, "frag data"},
+    {SectionType::ReplaceDestructibility, "replace destructibility"},
+    {SectionType::Role, "role"},
+    {SectionType::Character, "character"},
+    {SectionType::Ammo, "ammo"},
+    {SectionType::AmmoInfo, "ammo info"},
+    {SectionType::CameraTrack, "camera track"},
+    {SectionType::Map, "map"},
+    {SectionType::Directory, "directory"},
+};
+
+char FoldChar(char c) {
+  if (c == '_')
+    return ' '; // "walking_speed" and "walking speed" are the same key
+  return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
+}
+
+bool NameMatches(const char *a, const char *b) {
+  if (!a || !b)
+    return false;
+  for (; *a && *b; ++a, ++b) {
+    if (FoldChar(*a) != FoldChar(*b))
+      return false;
+  }
+  return *a == *b;
+}
+
+// Reads the schema straight off a throwaway instance. Built on first use and
+// kept for the process: a section constructor is cheap but not free, and the
+// answer never changes.
+std::vector<FieldInfo> BuildFields(SectionType type) {
+  std::vector<FieldInfo> fields;
+  ParsedThing *probe = Create(type);
+  if (!probe)
+    return fields;
+  for (size_t i = 0; i < NumFields; ++i) {
+    FieldType ft = probe->field_types[i];
+    if (ft == FieldType::None)
+      continue; // this section does not accept the id at all
+    FieldInfo info{};
+    info.id = static_cast<FieldId>(i);
+    info.name = probe->field_names[i];
+    info.type = ft;
+    // field_satisfied starts true exactly for the fields that have a default;
+    // a required field starts false and only IsValid ever complains about it.
+    info.optional = probe->field_satisfied[i];
+    // For String and Custom the min slot is not a bound at all - the ctor puts
+    // "none is allowed" there, which is what CheckValue tests before storing null.
+    info.none_ok = (ft == FieldType::String || ft == FieldType::Custom) &&
+                   probe->min_values[i].boolean;
+    info.min_integer = probe->min_values[i].integer;
+    info.max_integer = probe->max_values[i].integer;
+    info.min_float = probe->min_values[i].flt;
+    info.max_float = probe->max_values[i].flt;
+    fields.push_back(info);
+  }
+  Release(probe);
+  return fields;
+}
+} // namespace
+
+const char *SectionTypeName(SectionType type) {
+  for (const SectionName &entry : SectionNames) {
+    if (entry.type == type)
+      return entry.name;
+  }
+  return "unknown";
+}
+
+SectionType SectionTypeFromName(const char *name) {
+  for (const SectionName &entry : SectionNames) {
+    if (NameMatches(entry.name, name))
+      return entry.type;
+  }
+  return SectionType::Unknown;
+}
+
+const SectionType *AllSectionTypes() {
+  static SectionType types[std::size(SectionNames) + 1] = {};
+  static bool filled = [] {
+    size_t i = 0;
+    for (const SectionName &entry : SectionNames)
+      types[i++] = entry.type;
+    types[i] = SectionType::Unknown;
+    return true;
+  }();
+  (void)filled;
+  return types;
+}
+
+const std::vector<FieldInfo> &SectionFields(SectionType type) {
+  static std::vector<FieldInfo> cache[static_cast<size_t>(SectionType::Directory) + 1];
+  static bool built[static_cast<size_t>(SectionType::Directory) + 1] = {};
+  auto index = static_cast<size_t>(type);
+  if (index >= std::size(cache)) {
+    static const std::vector<FieldInfo> empty;
+    return empty;
+  }
+  if (!built[index]) {
+    built[index] = true;
+    cache[index] = BuildFields(type);
+  }
+  return cache[index];
+}
+
+const FieldInfo *FindField(SectionType type, const char *name) {
+  for (const FieldInfo &field : SectionFields(type)) {
+    if (NameMatches(field.name, name))
+      return &field;
+  }
+  return nullptr;
+}
+
+namespace {
+// Where the probe script goes. Not the game's Scripts directory - nothing here
+// should leave anything behind in the user's install - and an absolute path works
+// because LoadGLS fopen's its top-level file directly.
+std::string ProbeScriptPath() {
+  char temp[MAX_PATH]{};
+  DWORD len = GetTempPathA(sizeof(temp), temp);
+  if (len == 0 || len >= sizeof(temp)) {
+    return {};
+  }
+  std::string dir = std::string{temp} + "gkplus";
+  CreateDirectoryA(dir.c_str(), nullptr);
+  return dir + "\\gls_probe.gls";
+}
+
+// A value that satisfies `field` without tripping its bounds. Only needed to make
+// the section *complete*: an object missing any required field is quietly demoted
+// to abstract ("abstract definition not declared with 'abstract'") and then left
+// OUT of ParsedObjList, so the probe would have nothing to read - which is exactly
+// what the first version of this hit, with LoadGLS reporting "empty script found".
+std::string FillerFor(const FieldInfo &field) {
+  auto clamp_int = [&](int32_t v) {
+    return v < field.min_integer ? field.min_integer
+                                 : (v > field.max_integer ? field.max_integer : v);
+  };
+  switch (field.type) {
+  case FieldType::Boolean:
+    return "no";
+  case FieldType::Integer: {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%d", clamp_int(0));
+    return buf;
+  }
+  case FieldType::Float: {
+    double v = 0.0;
+    if (v < field.min_float) {
+      v = field.min_float;
+    }
+    if (v > field.max_float) {
+      v = field.max_float;
+    }
+    char buf[64];
+    // %.6f, not %g: the lexer has no exponent form, so 1e-05 is a syntax error.
+    std::snprintf(buf, sizeof(buf), "%.6f", v);
+    return buf;
+  }
+  case FieldType::String:
+    return field.none_ok ? "none" : "\"gkplus\"";
+  case FieldType::Custom:
+    // No section has a required Custom field, so this only ever runs for one that
+    // accepts `none`; if that changes it will show up as a failed probe rather
+    // than a wrong answer.
+    return "none";
+  default:
+    return {};
+  }
+}
+} // namespace
+
+int TryParse(const char *source) {
+  if (!source) {
+    return -1;
+  }
+  std::string path = ProbeScriptPath();
+  if (path.empty()) {
+    return -1;
+  }
+  std::FILE *file = std::fopen(path.c_str(), "w");
+  if (!file) {
+    return -1;
+  }
+  std::fputs(source, file);
+  if (std::fclose(file) != 0) {
+    return -1;
+  }
+  ParsedObjectList *list = LoadGLS(path.c_str(), 1);
+  DeleteFileA(path.c_str());
+  if (!list) {
+    return -1;
+  }
+  int count = list->n_entries;
+  FreeParsedObjectList(list);
+  return count;
+}
+
+bool ProbeKeywords(SectionType section, FieldId field,
+                   const std::vector<std::string> &keywords,
+                   std::vector<std::optional<int32_t>> *out) {
+  if (!out) {
+    return false;
+  }
+  out->assign(keywords.size(), std::nullopt);
+  const char *section_name = SectionTypeName(section);
+  const FieldInfo *info = nullptr;
+  for (const FieldInfo &f : SectionFields(section)) {
+    if (f.id == field) {
+      info = &f;
+      break;
+    }
+  }
+  // Reflection first: asking for a field the section does not accept would
+  // produce a script the parser rejects wholesale, and a confusing empty result.
+  if (!info || !info->name) {
+    return false;
+  }
+
+  std::string path = ProbeScriptPath();
+  if (path.empty()) {
+    return false;
+  }
+
+  // Precomputed once: every required field except the one under test, plus every
+  // optional *numeric* one.
+  //
+  // The required ones are what makes the section complete. The optional numeric
+  // ones are only there to silence "default value assumed for '%s'", which
+  // otherwise prints once per unset field per section - tens of thousands of
+  // console lines across a full run. They are safe to fill because the value is
+  // clamped into the field's own declared range; optional String and Custom
+  // fields are left alone, since a filler there could be rejected outright and
+  // cost the whole parse.
+  std::string filler;
+  // `life` is required by a pgenerator but invisible to reflection: it is field
+  // id 0x42, and the section's CheckValue override intercepts it before the
+  // normal machinery, storing it in the 0x1b70 object's extension instead of
+  // parsed_values - so field_types[0x42] is never set and SectionFields cannot
+  // see it. Without it every probe object is silently demoted to abstract.
+  if (section == SectionType::ParticleGenerator && field != FieldId::Count) {
+    filler += "\tlife infinite\n";
+  }
+  for (const FieldInfo &f : SectionFields(section)) {
+    if (f.id == field || !f.name) {
+      continue;
+    }
+    // ONLY required fields. Optional ones exist to be omitted - the sole cost is
+    // a "default value assumed" warning - and every one emitted is another chance
+    // to hit a syntax error that poisons the whole run.
+    //
+    // Filling them was originally a noise-reduction measure and it cost two runs:
+    // first via optional *Integer* enums, where no shipped script ever writes a
+    // bare number and the grammar wants a keyword (`secondary weapon 0`), and
+    // then again via some optional Float or Boolean in the character section. The
+    // noise is cosmetic; the correctness is not.
+    if (f.optional) {
+      continue;
+    }
+    std::string value = FillerFor(f);
+    if (!value.empty()) {
+      filler += "\t";
+      filler += f.name;
+      filler += " ";
+      filler += value;
+      filler += "\n";
+    }
+  }
+
+  // ONE keyword per parse, not one file for all of them. An unrecognised keyword
+  // is a *syntax error*, not a per-value rejection, and the yacc parser abandons
+  // the rest of the file - so a single bad name in a batch loses every keyword
+  // after it. Parsing each separately costs a few dozen tiny parses and makes a
+  // rejection mean exactly "this keyword is not valid for this field".
+  //
+  // The label carries no digits on purpose: `GkPlusProbe0` was itself a syntax
+  // error for some sections, so the identifier rule appears not to accept them.
+  auto slot = static_cast<size_t>(field);
+  bool any = false;
+  bool reported = false;
+  for (size_t i = 0; i < keywords.size(); ++i) {
+    std::FILE *file = std::fopen(path.c_str(), "w");
+    if (!file) {
+      return false;
+    }
+    std::fprintf(file, "%s GkPlusProbe\n{\n\t%s %s\n%s}\n", section_name,
+                 info->name, keywords[i].c_str(), filler.c_str());
+    bool written = std::fclose(file) == 0;
+    if (!written) {
+      return false;
+    }
+
+    ParsedObjectList *list = LoadGLS(path.c_str(), 1);
+    bool got = false;
+    if (list) {
+      for (ParsedThing *thing : *list) {
+        // `is_defined` separates "the parser accepted this keyword" from "the
+        // section kept the field's default".
+        if (thing && thing->is_defined[slot]) {
+          (*out)[i] = thing->values[slot].integer;
+          any = true;
+          got = true;
+          break;
+        }
+      }
+      FreeParsedObjectList(list);
+    }
+    // STOP at the first failure. A syntax error does not just lose that keyword:
+    // it poisons the parser for every subsequent LoadGLS call in the process.
+    // LoadGLS resets its error counter, ParsedObjList and the symbol tables, but
+    // evidently not the file stack, and nothing recovers - a verbatim copy of a
+    // shipped section fails just the same afterwards. Carrying on would report
+    // every later keyword as "rejected" when the truth is "never tested", which
+    // is worse than stopping.
+    if (!got) {
+      reported = true;
+      std::string script = std::string{section_name} + " GkPlusProbe\n{\n\t" +
+                           info->name + " " + keywords[i] + "\n" + filler + "}\n";
+      std::string why = "gls probe: stopped at '" + keywords[i] +
+                        "' - a failed parse poisons every later one, so the "
+                        "remaining keywords are untested, not rejected. Script:";
+      Print(why.c_str());
+      DebugWrite(why);
+      Print(script.c_str());
+      DebugWrite(script);
+      break;
+    }
+  }
+  DeleteFileA(path.c_str());
+  (void)reported;
+  return any;
+}
+
+void ResetConversionCache(ParsedThing *thing) {
+  if (!thing || thing->type() != SectionType::Role)
+    return;
+  // The dword immediately past the 0x1b60 base - a role allocates 0x1b68 for it.
+  auto *cache = reinterpret_cast<void **>(reinterpret_cast<char *>(thing) +
+                                          sizeof(ParsedThing));
+  *cache = nullptr;
 }
 
 void *RegisterGameObject(ParsedThing &thing) {

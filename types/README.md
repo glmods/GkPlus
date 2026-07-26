@@ -1,14 +1,14 @@
 # TypeScript definitions for the GkPlus scripting API
 
-Ambient declarations for everything a `main.mjs` can reach: the `"gk"` module,
-the `"ImGui"` module, and the host's global `console`. They give an editor
+Ambient declarations for everything a `main.mjs` can reach: the `"gk"` module and
+the objects the host hands to `setup_menus` and `draw_gui`. They give an editor
 autocomplete and type checking over plain `.mjs` files - there is no build step
 and no TypeScript at runtime, since the game loads the `.mjs` as-is.
 
 | File | What it covers | Maintained |
 |------|----------------|------------|
-| `gk.d.ts` | the `"gk"` module: `camera`, `console`, `actors`, `roles`, `tokens`, `triggers`, `menus`, plus the `setup_menus` / `draw_gui` contract and the global `console` | by hand, from `src/Js*.cpp` |
-| `imgui.d.ts` | the `"ImGui"` module: 197 functions and 28 enums | **generated** - run `python3 types/gen-imgui-dts.py` |
+| `gk.d.ts` | the `"gk"` module: `camera`, `console`, `actors`, `roles`, `tokens`, `triggers`, `levels`, `make`, `gls`, plus the `setup_menus` / `draw_gui` / level-module contracts. `menus` is *not* an export - it is `setup_menus`' argument - and there is no global `console`: `log`/`info`/`warn`/`error`/`debug` are on the `console` this module exports | by hand, from `src/Js*.cpp` |
+| `imgui.d.ts` | the `ImGui` interface: 197 functions and 28 enums. A type only - there is no `"ImGui"` module and no global to call, because the calls are only valid inside `draw_gui` | **generated** - run `python3 types/gen-imgui-dts.py` |
 
 ## Using them
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <quickjs.h>
+
 namespace gk {
 // The QuickJS host: one runtime, one context, one entry module.
 //
@@ -20,10 +22,13 @@ namespace gk {
 //   export function setup_menus(menus)  // once, at boot
 //   export function draw_gui(ImGui)     // every frame the F11 overlay is open
 //
-// and the same objects are importable directly:
+// The game bindings are also importable directly:
 //
 //   import { menus } from "gk";
-//   import * as ImGui from "ImGui";
+//
+// ImGui is not. Its calls are only valid between NewFrame and Render, so the
+// object exists solely as draw_gui's argument - there is no "ImGui" module to
+// import it from somewhere it would not work.
 //
 // Everything runs on the main thread: boot inside SetupMenus, draw_gui inside
 // the overlay's ImGui frame, menu callbacks from the front-end input handler,

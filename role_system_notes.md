@@ -239,6 +239,38 @@ pickup roles. Observed:
    call rebuilds.
 3. **Uninitialised `pickup_radius`** in the inline InventoryInfo path (§4).
 
+## 8.5 Building a `Role` without a `ParsedThing` (`src/MakeRole.cpp`)
+
+`gk::MakeRole(const RoleDesc &)` is `ToRole` re-expressed over already-built sub-objects,
+so a definition costs a few dozen bytes instead of a 0x1b60-byte parsed object. It calls
+the game's own `CreateRole`, so the Role still lands in the entity hash with a fresh id.
+Five things about `ToRole` that the rewrite had to reproduce and that are easy to miss:
+
+- **GLS `shape` (0x05) is one field with three meanings**, dispatched on the *section type*
+  of what it referenced: a `shape` fills `Role::shape`, a `pgenerator` fills `Role::pgen`
+  (overwriting whatever field 0x07 put there), and anything else is treated as a hierarchy.
+  Only the hierarchy branch resolves hotspots and counts nodes.
+- **The hotspot names come from the hierarchy section, not the role.** `ToRole` reaches
+  into `parsed[0x05]->parsed_values[0x03]` and `[0x04]`, strdups them, and resolves each to
+  a point with `HierarchyResolveNamedPointPos` @ 0x00594890. `alternate_hotspot_point`
+  starts as a *copy* of `hotspot_point`, so a hierarchy with only a `hotspot` gives both
+  points the same value rather than leaving the second at the origin.
+- **`InventoryInfo` is allocated lazily by six different fields** (0x06, 0x1a, 0x1b, 0x5d,
+  0x5e and the shape branch), each re-checking whether one exists. Because `pickup radius`
+  (0x5e) defaults to **6.0, not 0**, and the allocation is gated on `!= 0.0`, every role
+  converted from GLS ends up with an `InventoryInfo` whether it is a pickup or not.
+- **The character's collision extents are derived here, not in `ToCharacter`** - see
+  `role_subobjects_notes.md` §1. A GLS `radius`/`height` of 0 means "use the model's
+  bounding box".
+- **A non-`TrackObject` role drops a chunk hanging off its shape at +0x8c** (release
+  @ 0x00595c60, then a 0x18 pool free). Shared geometry only `TrackObject` keeps a private
+  copy of.
+
+`ParseRole`'s own defaults, recovered from its `.rdata` constants: `alpha` 1.0,
+`ai` 4, `interface beam delay`/`duration` -1, `interface beam effect` 1 (`Confusion`),
+`pickup radius` 6.0, `destroy after collection` and `status display` **true**, `recon ai
+number` -1, `switch size` 100, everything else 0/false.
+
 ## 9. GkPlus surface (`src/Roles.cpp`, `require("gk.roles")`)
 
 - `roles[id]` / `roles["name"]` -> `GetRoleById` / `GetRoleByName`, wrapped as a `Role`

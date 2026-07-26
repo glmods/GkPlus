@@ -71,8 +71,33 @@ BeginLevelSession(bool doLoad)            @ 0x004e2560
   +- first call only: StartExecutorThread + InitClientRouting (single-player too),
   |  register GAMESPEED/FOG* console commands, load movement_indicator2.rif
   +- GameState = 0x12
-  +- if (doLoad) LoadLevel()             @ 0x004e0980
+  +- if (doLoad) LoadLevel(freshStart = 1)   @ 0x004e0980   (MOV CL,1 @ 0x004e26d9)
 ```
+
+### 2.2 `LoadLevel` takes an argument
+
+`LoadLevel` is **`__fastcall(bool freshStart)`**, not `StdCall<void>` - the flag arrives
+in CL and is stashed at `[EBP-0x175]` in the prologue (0x004e09ad), before anything
+else touches ECX. It gates five things: the sun colour/direction, the
+`ExecuteCommandFile(ConsoleFileName)` that queues the level `.gcs`, the
+`ExecuteAllCommands()` that runs it, `FUN_00504500`, and the mission-stats reset in
+SP/coop.
+
+Only two call sites, and they disagree:
+
+| Caller | CL | Meaning |
+|--------|----|---------|
+| `BeginLevelSession` @ 0x004e26d9 | `MOV CL,1` | a new level start |
+| `LoadGame` @ 0x00505c86 | `XOR CL,CL` | restoring a savegame (right after `LevelLoadReason = 3`) |
+
+So it is the savegame counterpart of `LevelLoadReason == 3`, carried separately: a
+restore must not re-run the `.gcs`, because the save already holds everything that
+script set up.
+
+**The `.gcs` therefore runs in single player.** Earlier revisions of this file
+annotated the `ExecuteCommandFile(ConsoleFileName)` in step 7 as multiplayer-only,
+having mistaken this flag for the multiplayer one. `level01.gcs` is 22 KB of camera
+bounds, fog, sun and trigger setup that single-player level 1 plainly needs.
 
 ### 2.1 From the front end: New Game / Choose Level -> briefing -> BeginLevelSession
 
@@ -139,14 +164,14 @@ then `ShowLoadingMessage` @ 0x004e2910; `FUN_004e2c20(pct)` advances the bar.
  7. GL_LOADING_LEVEL_DATA   :
         SetCurrentDirectoryToGLDir(GL_Scripts)
         list = LoadGLS(ScriptFileName, 1)     // parse .gls + every #include
-        if (multiplayer) { BattleNumber = 3; ExecuteCommandFile(ConsoleFileName) }
-        SetCurrentDirectory()
+        if (freshStart) { BattleNumber = 3; ExecuteCommandFile(ConsoleFileName) }
+        SetCurrentDirectory()                 // cwd is back to normal from here on
         ConvertParsedObjects(list)            // <<< ToMap runs here, see section 4
-        FreeParsedObjectList(list)
+        FreeParsedObjectList(list)            // pool-frees the header too
  8. world bounds -> 0x007f598c.. ; ShadowQuality==3 && LevelLoadReason!=3 -> shadow bake
  9. GL_LOADING_TEXTURES     : texture upload; free BriefingRIM
 10. camera defaults (dist 20, roll 341 deg), then snap to the first team-1 actor
-11. clocks resynced to the executor; music stopped; ExecuteAllCommands() (the .gcs)
+11. clocks resynced to the executor; music stopped; if (freshStart) ExecuteAllCommands() (the .gcs)
 12. if (LevelLoadReason != 3) ApplyTeamCarryOverState()   // inventory carried between levels
 13. LevelLoadReason = 0
 14. multiplayer frag/time-limit trigger registered
@@ -489,6 +514,35 @@ Loaded by `FUN_005b03b0` from the RIFs directory during the cold path only. `.lo
 holds the named locators used for the camera plane and the focus-height fields;
 entries named `"sky"` are filtered out of the geometry list.
 
+## 6.5 Registering a level: `AddLevel` and `LevelList`
+
+`AddLevel` @ 0x004efcc0 - `__fastcall(char *title, char *scriptFile, char *consoleFile)` -
+is the game's own level registration, and the only way anything gets into Choose Level.
+It strdups all three strings into a 0x18-byte node appended to `LevelList` @ 0x007b74dc,
+**and appends a plain item to `Menus[5]` (ChooseSinglePlayerLevel) in the same call** - so
+menu 5 is populated incrementally as levels register, and menu 5's dispatch mapping item
+*n* onto list entry *n* holds by construction.
+
+`LevelList` is `List<LevelInfo>` (the same template as `Menu::items`), so a node is the
+0xc-byte `List_Member` base plus:
+
+| Off (node) | Field |
+|------------|-------|
+| +0x0c | `char *title` - also the menu item's label, stored by pointer |
+| +0x10 | `char *script` -> `ScriptFileName`, the level `.gls` |
+| +0x14 | `char *console` -> `ConsoleFileName`, the level `.gcs` |
+
+Nothing frees them; there is no `RemoveLevel`. Callers: `EnterMainMenuScreen` (the
+15-mission campaign, 15 calls) and `CommandAddMission` (`ADD MISSION <gls> <gcs>`).
+Mirrored as `gk::LevelInfo` / `gk::LevelList` / `gk::AddLevel` in `src/Menu.h`.
+
+**Getting to menu 5 is the catch.** Its only in-game entry point is item 3 of the
+SinglePlayer menu, which `SetupMenus` adds **only if `FlagChooseLevel` @ 0x006b0173** is
+set - and `WinMain` sets that from the `-chooselevel` command line switch
+(`FlagChooseLevel |= strstr(cmdLine, "-chooselevel") != NULL`, 0x0046afe2). Since
+`SetupMenus` reads it once, setting the flag later cannot conjure the item; anything
+registering levels after boot has to supply its own way in.
+
 ## 7. Replacing the `.gls` path
 
 The design already has the seams. In order of increasing ambition:
@@ -521,6 +575,53 @@ TheMap->rif_time_low/high = <some FILETIME>;   // 0x158/0x15c, or the .map cache
 `CreateSceneObjectFromCachedMesh` @ 0x0059da90 is the only opaque piece on that side and
 is the next thing to decompile if (c) is the goal.
 
+### What GkPlus actually implements: (b), plus the map section natively
+
+`src/CustomLevel.cpp` is (b) with the `map` section built through `gls::Create` rather
+than parsed, which is what lets a level exist with no `.gls` and no `.gcs` at all. Five
+decisions carry it, and each was picked over an alternative that does not work:
+
+- **`ConvertParsedObjects` @ 0x004747b0 is the hook, not `LoadGLS`.** Hooking `LoadGLS`
+  and returning a synthetic list means hand-building a `ParsedObjectList`, and
+  `FreeParsedObjectList` pool-frees the header *and* destroys the sentinel and every node
+  through their vtables - the parser creates all of that inline inside `ParseGSH`
+  (0x00478f6c: `pool_alloc(0x10)` header, `pool_alloc(0xc)` sentinel with vtable
+  0x00663064), so there is no helper to reuse. Hooking the *converter* instead means the
+  game builds and frees its own list as usual and GkPlus only calls the map's
+  `toGameObject` slot afterwards.
+- **The level's `ScriptFileName` is a real, generated `.gls`** in `%TEMP%\gkplus\`,
+  holding the script's `#include` list. Roles have to come from somewhere, and the
+  include guards only work within one `LoadGLS` call - N separate calls would re-register
+  every shared `.gsh`, because `ClearParseSymbolTables` runs per call. The prelude can
+  live outside the game folder because the parser opens an `#include` with a bare `fopen`
+  (0x00478c2c) against the *current* directory, which step 7 has already set to Scripts.
+- **The prelude always ends with a filler `shape`.** A script that defines nothing leaves
+  `ParsedObjList` null, `LoadGLS` prints "confused by earlier errors" and returns it, and
+  `LoadLevel` dereferences it. A `shape` needs exactly the `name` + `file` pair the map
+  section already requires, so it resolves to the very rif object `ToMap` loads next.
+- **Which level is loading is read off `ScriptFileName`, not remembered from the menu.**
+  Every entry point writes that global before `LoadLevel` runs, so the test covers Choose
+  Level, `ADD MISSION`, a savegame restore and a multiplayer client alike.
+- **The `.gcs` replacement hooks `ExecuteAllCommands` @ 0x004d62c0, not `LoadLevel`.**
+  That function has exactly one reference in the whole binary - the `CALL` at 0x004e1e00,
+  step 11 - and it sits behind `CMP byte [EBP-0x175],0` / `JZ`, the same `freshStart` byte
+  that gates the step-7 `ExecuteCommandFile(ConsoleFileName)`. So the hook needs no flag
+  of its own and no way to tell `LoadLevel`'s two callers apart: being there *is* "a fresh
+  level start has reached the point its `.gcs` takes effect", and `LoadGame`'s restore
+  skips it exactly as it skips the real `.gcs`.
+
+  The callback runs **before** the original, not after. `ExecuteAllCommands` is a loop -
+  `while (NumCommandsToExecute) PumpQueuedConsoleCommand()` (0x004d62d0) - so a callback
+  that *queues* commands (`ExecuteCommandFile` only appends) has them drained by this same
+  call, which is what the level's own `.gcs` lines would have got. Running it afterwards
+  would leave them to the once-per-frame pump instead.
+
+Placed objects go through `gk::MapSpawn` after `ToMap`, not through the binding hash at
+`ParsedMap+0x1b60`: the hash needs a forged field-9 `ParsedField`, and `MapSpawn` already
+exists and accepts arbitrary coordinates. `gk::LevelRifLocators` supplies the `for "<rif
+object>"` half by replaying `AcquireLevelRifForLocators` (ECX = the rif path, nothing in
+EDX) -> `RifFilterObjectsByName` -> `MapToWorld`.
+
 **Ordering constraint.** `next_entity_id` and `NextInventoryItemId` are reset in step 4
 of `LoadLevel`, well before `ConvertParsedObjects`. Any native path that spawns actors
 must run after that reset and before step 11 (`ExecuteAllCommands`, which runs the
@@ -531,7 +632,16 @@ must run after that reset and before step 11 (`ExecuteAllCommands`, which runs t
 | Offset | Name |
 |--------|------|
 | 0x004e2560 | `BeginLevelSession(bool doLoad)` |
-| 0x004e0980 | `LoadLevel()` |
+| 0x004e0980 | `LoadLevel(bool freshStart)` - `__fastcall`, CL; see §2.2 |
+| 0x004efcc0 | `AddLevel(title, scriptFile, consoleFile)` - list + menu 5 item |
+| 0x004f7650 | `LevelList__GetTitlePtrAt` |
+| 0x00474540 | `LoadGLS(file, mode)` - null on a script that defined nothing |
+| 0x004747b0 | `ConvertParsedObjects(list)` |
+| 0x00474870 | `FreeParsedObjectList(list)` - pool-frees the header too |
+| 0x0043f250 | `ExecuteCommandFile(path)` - **queues** the `.gcs`, step 7; does not run it |
+| 0x004d62c0 | `ExecuteAllCommands()` - drains the queue, step 11. One call site: 0x004e1e00 |
+| 0x004d6120 | `PumpQueuedConsoleCommand()` - the one-per-frame pop the drain loops on |
+| 0x00483420 | `List__Dtor` - empties a list and destroys its sentinel, keeps the header |
 | 0x0047f160 | `ToMap` (ParsedMap `toGameObject`) |
 | 0x0047efa0 | `CheckValue_Map` (the `use ... for ...` handler) |
 | 0x0047eb20 | `CreatePlacedActorEntry(out, name, team, role, token)` |
@@ -566,6 +676,10 @@ must run after that reset and before step 11 (`ExecuteAllCommands`, which runs t
 | 0x007b4e18 | 0x18 | `InitialCameraState` |
 | 0x007b3ea8 | float | `MaxCameraFocusHeight` |
 | 0x006a574c | float | `MinCameraFocusHeight` |
+| 0x007b74dc | `LevelList` (0x10) | `LevelList` - the single-player campaign |
+| 0x007b76b0 | `LevelList` (0x10) | `MultiplayerLevelList` |
+| 0x006b0173 | byte | `FlagChooseLevel` - from `-chooselevel`, read once by SetupMenus |
+| 0x00663c2c | vtable | `List_Member_Base_vftable` - the sentinel vtable list ctors install |
 | 0x007b6dcc | `char*` | `ScriptFileName` (`.gls`) |
 | 0x007b6dd0 | `char*` | `ConsoleFileName` (`.gcs`) |
 | 0x007b9cf0 | int | `LevelLoadReason` (3 = full savegame restore) |

@@ -21,10 +21,10 @@ void ExecuteCommandLine(const char *cmdline) {
   fn(cmdline);
 }
 
-int ExecuteCommandFile(unsigned char *file) {
-  FastCall<int, unsigned char *> fn;
+bool ExecuteCommandFile(const char *fileName) {
+  FastCall<bool, const char *> fn;
   GetObjectAtOffset(fn, 0x0043f250);
-  return fn(file);
+  return fn(fileName);
 }
 
 void RegisterConsoleCommand(const char *name, const char *help,

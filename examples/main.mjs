@@ -10,19 +10,34 @@
 // Copy jsconfig.json and ..\types\ alongside it for autocomplete and type
 // checking in an editor - the JSDoc annotations below are what drive it.
 
-import { actors, camera, tokens } from "gk";
+import { actors, camera, console, levels, tokens } from "gk";
+// A level module is an ordinary module, imported the ordinary way. Its namespace
+// - `map` plus the hooks - is exactly the description `levels.add` wants, so
+// there is nothing else to unpack. Drop this line (and the add() below) if you
+// have not copied levels/ alongside.
+import * as arena from "./levels/arena.mjs";
 
-// console.log writes to the in-game console (` to open it) and to the debugger.
-// This is the host's console, not the `console` exported by "gk" - that one is
-// the game's console object, with print() and the text colours.
+// There is no global console - this one comes from "gk", and carries both the
+// game's console object (print, the text colours, execute) and log/info/warn/
+// error/debug, which write to the in-game console (` to open it) and to the
+// debugger.
 console.log("main.mjs loaded");
 
 let showActors = false;
 
+// A level built from script rather than from a .gls + .gcs pair. The map is
+// validated here, at startup, so a bad field is reported now rather than halfway
+// through a load; the level then shows up in Choose Level, which GkPlus adds a
+// Single Player item for.
+levels.add("Test Arena", arena);
+
 /**
  * Called once at startup, after the game has filled its own menus - which is
- * why this is a hook rather than something you do at module scope. `menus` is
- * the same object as `import { menus } from "gk"`.
+ * why this is a hook rather than something you do at module scope. The argument
+ * is the only way to reach `menus`: there is no export for it, because adding
+ * an item before the game's own would shift every index in its dispatch table.
+ * Keep it in a module-level variable if you need it later (menus.current,
+ * menu.open).
  *
  * @type {import("gk").SetupMenus}
  */
@@ -48,7 +63,9 @@ export function setup_menus(menus) {
 
 /**
  * Called every frame the F11 overlay is open, inside an active ImGui frame.
- * `ImGui` is the same module `import * as ImGui from "ImGui"` gives you.
+ * The argument is the only way to reach ImGui - there is no module to import it
+ * from, because an ImGui call outside this callback is not in a frame and does
+ * not work.
  *
  * Keep Begin/End balanced: an exception thrown from here disables draw_gui for
  * the rest of the session (and is reported to the console), because a

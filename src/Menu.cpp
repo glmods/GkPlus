@@ -94,6 +94,40 @@ void GoToMenu(MenuIndex target, bool remember) {
   fn(target, remember);
 }
 
+LevelList *GetLevelList() {
+  LevelList *p;
+  GetObjectAtOffset(p, 0x007b74dc);
+  return p;
+}
+
+LevelList *GetMultiplayerLevelList() {
+  LevelList *p;
+  GetObjectAtOffset(p, 0x007b76b0);
+  return p;
+}
+
+void AddLevel(const char *title, const char *script_file,
+              const char *console_file) {
+  FastCall<void, const char *, const char *, const char *> fn;
+  GetObjectAtOffset(fn, 0x004efcc0);
+  // All three are strdup'd; none may be null - AddLevel walks each one to
+  // measure it before copying.
+  fn(title ? title : "", script_file ? script_file : "",
+     console_file ? console_file : "");
+}
+
+bool GetChooseLevelEnabled() {
+  unsigned char *p;
+  GetObjectAtOffset(p, 0x006b0173);
+  return *p != 0;
+}
+
+void SetChooseLevelEnabled(bool enabled) {
+  unsigned char *p;
+  GetObjectAtOffset(p, 0x006b0173);
+  *p = enabled ? 1 : 0;
+}
+
 void PlayUiSound(int sound_id) {
   FastCall<void, int> fn;
   GetObjectAtOffset(fn, 0x0058cdd0);

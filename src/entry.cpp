@@ -3,6 +3,7 @@
 
 #include <detours.h>
 
+#include "CustomLevel.h"
 #include "CustomMenu.h"
 #include "Debug.h"
 #include "GUI.h"
@@ -25,8 +26,9 @@ struct Subsystems {
   DebugSystem debug;       // DebugPrint* -> OutputDebugString
   GUISystem gui;           // ImGui/D3D overlay
   InputFixSystem inputfix; // suppress the vestigial DirectInput keyboard acquire
-  CustomMenuSystem menus;  // front-end menu items owned by GkPlus
-  ScriptSystem script;     // QuickJS host; runs gkplus/main.mjs
+  CustomMenuSystem menus;   // front-end menu items owned by GkPlus
+  CustomLevelSystem levels; // levels built from script instead of .gls + .gcs
+  ScriptSystem script;      // QuickJS host; runs gkplus/main.mjs
 };
 
 extern "C" BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID) {

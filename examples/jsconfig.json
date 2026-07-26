@@ -20,5 +20,11 @@
     "noEmit": true,
     "types": []
   },
-  "include": ["*.mjs", "../types/*.d.ts", "types/*.d.ts"]
+  "include": [
+    "*.mjs",
+    "levels/*.mjs",
+    "headers/*.mjs",
+    "../types/*.d.ts",
+    "types/*.d.ts"
+  ]
 }

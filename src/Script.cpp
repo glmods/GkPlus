@@ -17,7 +17,6 @@
 
 #include <cstdio>
 #include <string>
-#include <vector>
 
 namespace gk {
 namespace {
@@ -31,11 +30,12 @@ JSContext *Context = nullptr;
 // does not provide them, or - for DrawGui - after it has thrown.
 JSValue DrawGui = JS_UNDEFINED;
 JSValue SetupMenusFn = JS_UNDEFINED;
-// The two C modules' namespace objects, kept so the exports can be *handed* to
-// the script rather than only importable. These are the same objects
-// `import * as ImGui from "ImGui"` and `import * as gk from "gk"` produce.
+// The two objects the script is handed rather than importing. Both are built
+// directly, and neither is a "gk" export: an ImGui call is only valid inside the
+// overlay's frame, and a menu item may only be added at boot, so each is scoped
+// to the callback that runs at the right moment.
 JSValue ImGuiNamespace = JS_UNDEFINED;
-JSValue GkNamespace = JS_UNDEFINED;
+JSValue MenusNamespace = JS_UNDEFINED;
 
 bool Booted = false;
 
@@ -181,69 +181,25 @@ JSValue Await(JSContext *ctx, JSValue value) {
   }
 }
 
-// --- globals -----------------------------------------------------------------
-
-JSValue ConsoleWrite(JSContext *ctx, JSValueConst, int argc,
-                     JSValueConst *argv) {
-  std::string line;
-  for (int i = 0; i < argc; ++i) {
-    const char *text = JS_ToCString(ctx, argv[i]);
-    if (!text) {
-      return JS_EXCEPTION;
-    }
-    if (i) {
-      line += ' ';
-    }
-    line += text;
-    JS_FreeCString(ctx, text);
-  }
-  js::Log(line.c_str());
-  return JS_UNDEFINED;
-}
-
-const JSCFunctionListEntry ConsoleGlobal[] = {
-    JS_CFUNC_DEF("log", 1, ConsoleWrite),
-    JS_CFUNC_DEF("info", 1, ConsoleWrite),
-    JS_CFUNC_DEF("warn", 1, ConsoleWrite),
-    JS_CFUNC_DEF("error", 1, ConsoleWrite),
-    JS_CFUNC_DEF("debug", 1, ConsoleWrite),
-};
-
-// A global `console`, which QuickJS core does not provide (that lives in
-// quickjs-libc, which this port does not install). It writes to the game console
-// and the debugger, same as an uncaught exception does. Note this is *not* the
-// `console` exported by "gk" - that one is the game's console object, and
-// importing it shadows this inside that module.
-bool InstallGlobals(JSContext *ctx) {
-  JSValue global = JS_GetGlobalObject(ctx);
-  JSValue console = JS_NewObject(ctx);
-  if (JS_IsException(console)) {
-    JS_FreeValue(ctx, global);
-    return false;
-  }
-  if (JS_SetPropertyFunctionList(ctx, console, ConsoleGlobal,
-                                 static_cast<int>(std::size(ConsoleGlobal))) <
-      0) {
-    JS_FreeValue(ctx, console);
-    JS_FreeValue(ctx, global);
-    return false;
-  }
-  bool ok = JS_SetPropertyStr(ctx, global, "console", console) >= 0;
-  JS_FreeValue(ctx, global);
-  return ok;
-}
-
 // --- boot --------------------------------------------------------------------
+//
+// There are no host globals. QuickJS core provides no `console` (that lives in
+// quickjs-libc, which this port does not install) and GkPlus does not add one:
+// `log`/`info`/`warn`/`error`/`debug` are on the "gk" module's `console`
+// alongside the game's own print() and colours, so a script has exactly one
+// console object and reaches it the same way it reaches everything else.
 
-// Forces both C modules to link, and hands back their namespace objects. A C
-// module's exports are only materialised when something imports it, so reaching
-// for JS_GetModuleNamespace on an un-imported module would produce a namespace
-// full of undefined - this is the cheapest correct way to get one, and it fails
-// loudly at boot instead of inside the user's first import.
-bool EvalBootstrap(JSContext *ctx) {
-  static const char Source[] = "import * as ImGui from \"ImGui\";\n"
-                               "import * as gk from \"gk\";\n"
-                               "export { ImGui, gk };\n";
+// Links and evaluates the "gk" module at boot, purely as a check. Nothing here
+// keeps its namespace - the host hands the script no "gk" object at all, and a
+// script that wants one imports it.
+//
+// A C module is not linked until something imports it, and its export list is
+// only validated at that point: a duplicated name makes the module fail to link
+// with a SyntaxError. Doing the first import here reports that as `gkplus
+// bootstrap` instead of against whichever script happened to write
+// `import ... from "gk"` first.
+bool LinkGkModule(JSContext *ctx) {
+  static const char Source[] = "import \"gk\";\n";
 
   JSValue compiled = JS_Eval(ctx, Source, sizeof(Source) - 1, "<gkplus>",
                              JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
@@ -251,28 +207,19 @@ bool EvalBootstrap(JSContext *ctx) {
     js::ReportException(ctx, "gkplus bootstrap");
     return false;
   }
-  auto *module = static_cast<JSModuleDef *>(JS_VALUE_GET_PTR(compiled));
   JSValue result = Await(ctx, JS_EvalFunction(ctx, compiled)); // consumes it
   if (JS_IsException(result)) {
     js::ReportException(ctx, "gkplus bootstrap");
     return false;
   }
   JS_FreeValue(ctx, result);
-
-  JSValue ns = JS_GetModuleNamespace(ctx, module);
-  if (JS_IsException(ns)) {
-    js::ReportException(ctx, "gkplus bootstrap");
-    return false;
-  }
-  ImGuiNamespace = JS_GetPropertyStr(ctx, ns, "ImGui");
-  GkNamespace = JS_GetPropertyStr(ctx, ns, "gk");
-  JS_FreeValue(ctx, ns);
-  if (JS_IsException(ImGuiNamespace) || JS_IsException(GkNamespace)) {
-    js::ReportException(ctx, "gkplus bootstrap");
-    return false;
-  }
   return true;
 }
+
+// The entry module's own path, kept so a relative specifier handed to
+// LoadScriptModule resolves next to it rather than against the process's cwd -
+// which the game moves around constantly while loading a level.
+std::string EntryPath;
 
 // Loads the entry module and picks up its exports. False means nothing is
 // callable afterwards; the reason has already been logged.
@@ -319,21 +266,15 @@ bool LoadEntryModule(JSContext *ctx, const std::string &path) {
   return true;
 }
 
-// Hands the script the `menus` collection - the same object `import { menus }
-// from "gk"` yields. Anything it throws is reported and swallowed, because this
-// runs inside the game's SetupMenus and an exception must not escape into it.
+// Hands the script the `menus` collection, which it can reach no other way.
+// Anything it throws is reported and swallowed, because this runs inside the
+// game's SetupMenus and an exception must not escape into it.
 void CallSetupMenus(JSContext *ctx) {
-  if (JS_IsUndefined(SetupMenusFn)) {
+  if (JS_IsUndefined(SetupMenusFn) || JS_IsUndefined(MenusNamespace)) {
     return;
   }
-  JSValue menus = JS_GetPropertyStr(ctx, GkNamespace, "menus");
-  if (JS_IsException(menus)) {
-    js::ReportException(ctx, "setup_menus");
-    return;
-  }
-  JSValueConst args[] = {menus};
+  JSValueConst args[] = {MenusNamespace};
   JSValue result = JS_Call(ctx, SetupMenusFn, JS_UNDEFINED, 1, args);
-  JS_FreeValue(ctx, menus);
   if (JS_IsException(result)) {
     js::ReportException(ctx, "setup_menus");
   }
@@ -374,6 +315,7 @@ void BootScriptHost() {
     js::Log("could not work out where this DLL lives; no script loaded");
     return;
   }
+  EntryPath = path;
 
   Runtime = JS_NewRuntime();
   if (!Runtime) {
@@ -390,10 +332,20 @@ void BootScriptHost() {
     return;
   }
 
-  if (!js::RegisterGkModule(Context) || !js_init_module_imgui(Context) ||
-      !InstallGlobals(Context) || !EvalBootstrap(Context)) {
+  if (!js::RegisterGkModule(Context) || !LinkGkModule(Context)) {
     js::Log("could not register the script bindings; no script loaded");
     return;
+  }
+
+  // The two handed-over objects. JS_EXCEPTION is not a value the destructor
+  // could free, so neither slot keeps one.
+  ImGuiNamespace = js_imgui_new_namespace(Context);
+  MenusNamespace = js::NewMenusNamespace(Context);
+  for (auto *slot : {&ImGuiNamespace, &MenusNamespace}) {
+    if (JS_IsException(*slot)) {
+      *slot = JS_UNDEFINED;
+      js::ReportException(Context, "gkplus bootstrap");
+    }
   }
 
   // Installed here rather than in the ScriptSystem constructor so that the
@@ -430,8 +382,8 @@ ScriptSystem::~ScriptSystem() {
     JS_FreeValue(Context, DrawGui);
     JS_FreeValue(Context, SetupMenusFn);
     JS_FreeValue(Context, ImGuiNamespace);
-    JS_FreeValue(Context, GkNamespace);
-    DrawGui = SetupMenusFn = ImGuiNamespace = GkNamespace = JS_UNDEFINED;
+    JS_FreeValue(Context, MenusNamespace);
+    DrawGui = SetupMenusFn = ImGuiNamespace = MenusNamespace = JS_UNDEFINED;
     JS_FreeContext(Context);
     Context = nullptr;
   }

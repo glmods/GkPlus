@@ -6,7 +6,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <string_view>
+#include <vector>
 
 // C++ API over Gunlok's GLS/GSH script parser.
 // See gls_system_notes.md for the full reverse-engineering reference.
@@ -373,6 +375,103 @@ Role *ToRole(ParsedThing *thing);
 // section constructor; every field starts at its section default. Returns null
 // for SectionType::Unknown. Refcounted - Release when done.
 ParsedThing *Create(SectionType type);
+
+// --- Reflection --------------------------------------------------------------
+//
+// Every section constructor writes the schema it accepts into the object itself:
+// field_types says which of the 137 global ids this section uses and how they are
+// typed, field_names holds the GLS keyword for each ("walking speed"),
+// field_satisfied starts true for a field that has a default and false for one
+// that is required, and min_values/max_values hold the bounds CheckValue enforces
+// (for String and Custom, min_values[id].boolean is instead "may be none").
+//
+// So the game is its own schema, and nothing here is a hand-maintained table that
+// can drift from gls_system_notes.md. SectionFields builds each list once, by
+// constructing a throwaway instance and reading what its constructor declared.
+
+// The GLS section keyword - "role", "camera track", ... - and its inverse
+// (case-insensitive, and both "camera track" and "camera_track" resolve).
+const char *SectionTypeName(SectionType type);
+SectionType SectionTypeFromName(const char *name);
+
+// Every section type in declaration order, terminated by SectionType::Unknown.
+// SectionType::Directory is included but converting one changes a game directory.
+const SectionType *AllSectionTypes();
+
+struct FieldInfo {
+  FieldId id;
+  const char *name; // the GLS keyword, e.g. "walking speed"
+  FieldType type;
+  // False means the field must be assigned before the object converts: IsValid
+  // fails without it, and the object is only usable as an `abstract` parent.
+  bool optional;
+  // String and Custom only: whether `none` is an accepted value.
+  bool none_ok;
+  // Numeric bounds as CheckValue compares them. Integer and Boolean use the
+  // integral pair, Float the floating one; both are filled for either.
+  int32_t min_integer, max_integer;
+  double min_float, max_float;
+};
+
+// The fields `type` accepts, ordered by id. Empty for SectionType::Unknown.
+const std::vector<FieldInfo> &SectionFields(SectionType type);
+// The one field of `type` whose keyword matches, or null. Matching ignores case
+// and treats '_' and ' ' as the same character, so "walking_speed" finds
+// "walking speed".
+const FieldInfo *FindField(SectionType type, const char *name);
+
+// --- Keyword probing -----------------------------------------------------------
+//
+// Recovers the integer behind a GLS enum keyword (`ai bot`, `type explode`,
+// `action on death must drop`). Those keywords are compiled into the flex DFA
+// rather than stored as strings, so they cannot be read out of the binary - but
+// the parser will happily tell us, if asked in the right shape.
+//
+// ProbeKeywords writes a throwaway script with one section per keyword, each
+// carrying just the field under test:
+//
+//     ammo info GkPlusProbe0 { ammo type flares }
+//     ammo info GkPlusProbe1 { ammo type plasma bolts }
+//
+// parses it, and reads `parsed_values[field]` back out of each object. CheckValue
+// stores a value whether or not the rest of the section is complete, so a
+// one-field section is enough; nothing is converted, so no game state is touched.
+//
+// `out` receives one entry per input keyword, in order.
+//
+// **It stops at the first keyword the parser refuses**, leaving that entry and
+// every later one at `std::nullopt` - so a `nullopt` means "rejected, or never
+// tested", not "rejected". That is not caution: a syntax error **poisons the
+// parser for the rest of the process**. LoadGLS resets its error counter,
+// ParsedObjList and the symbol tables on entry, but not the file stack, and no
+// later parse recovers - even a verbatim copy of a shipped section fails. So
+// feed this only keywords harvested from scripts the game actually parses, and
+// treat a stop as "fix the input and run again".
+//
+// LoadGLS uses destructive global parser state: this must NOT be called while the
+// game is loading a level. From the menu, or from a console command, it is fine.
+bool ProbeKeywords(SectionType section, FieldId field,
+                   const std::vector<std::string> &keywords,
+                   std::vector<std::optional<int32_t>> *out);
+
+// Parses `source` as a .gls and reports how many objects reached
+// ParsedObjList - the bisection tool for working out why a generated script does
+// not parse. -1 means LoadGLS returned nothing at all (a syntax error, or every
+// section demoted to abstract); 0 or more is the object count.
+//
+// Nothing is converted, so this is safe to call repeatedly. Same caveat as
+// ProbeKeywords: destructive global parser state, never during a level load.
+int TryParse(const char *source);
+
+// Clears the converted-object cache a role ParsedThing keeps at +0x1b60, so the
+// next ToRole builds a fresh Role instead of handing back the previous one.
+//
+// This is what makes a parsed role reusable across level loads. ToRole is gated
+// on that dword being null and stores the Role there on success, while
+// DestroyRoles frees every Role between levels - so a role object kept in a
+// script would otherwise resolve to a pointer into a freed pool page on the
+// second load. Harmless for the other section types, which have no cache.
+void ResetConversionCache(ParsedThing *thing);
 
 // Drops one reference; destroys the object (via its virtual dtor, on the
 // game's heap) when the count reaches zero. Converted game objects survive.

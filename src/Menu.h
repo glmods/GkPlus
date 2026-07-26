@@ -116,6 +116,25 @@ static_assert(offsetof(Menu, title_resource_id) == 0x20);
 static_assert(offsetof(Menu, num_items) == 0x24);
 static_assert(offsetof(Menu, first_item_resource_id) == 0x28);
 
+// The payload of a LevelList entry - the third instantiation of the same
+// List<T> as Menu::items. A node is the 0xc-byte List_Member base plus this,
+// which is the 0x18 AddLevel @ 0x004efcc0 pool-allocates.
+//
+// All three strings are owned copies AddLevel makes with the game's malloc.
+// Nothing ever frees them: there is no RemoveLevel, and the two lists live for
+// the process. `title` doubles as the Menus[ChooseSinglePlayerLevel] item label,
+// which the menu stores by pointer.
+struct LevelInfo {
+  pool_string title;   // 0x00 (node +0x0c) menu label and display name
+  pool_string script;  // 0x04 (node +0x10) -> ScriptFileName, the level .gls
+  pool_string console; // 0x08 (node +0x14) -> ConsoleFileName, the level .gcs
+};
+static_assert(sizeof(LevelInfo) == 0xc);
+
+using LevelList = List<LevelInfo>;
+static_assert(sizeof(List_Member<LevelInfo>) == 0x18);
+static_assert(sizeof(LevelList) == 0x10);
+
 // --- Native API over the menu system ----------------------------------------
 
 // English identifier for a front-end menu id (e.g. MenuIndex::Audio -> "Audio").
@@ -141,6 +160,32 @@ int GetInGameMenuSelectedItem();
 
 // GoToMenu @ 0x004fbfa0 (remember = push the current menu as parent).
 void GoToMenu(MenuIndex target, bool remember);
+
+// LevelList @ 0x007b74dc (the single-player campaign, seeded by
+// EnterMainMenuScreen) and MultiplayerLevelList @ 0x007b76b0.
+LevelList *GetLevelList();
+LevelList *GetMultiplayerLevelList();
+
+// AddLevel @ 0x004efcc0 - the game's own level registration, and what the
+// console's `ADD MISSION <script.gls> <console.gcs>` calls. It strdups all three
+// strings, appends a LevelInfo to LevelList, and appends a plain item to
+// Menus[ChooseSinglePlayerLevel] *there and then* - so the level appears in
+// Choose Level immediately, in registration order, and menu 5's dispatch maps
+// item n onto entry n of the list.
+//
+// The game's own way *into* menu 5 is item 3 of the SinglePlayer menu, which is
+// gated on FlagChooseLevel - see below.
+void AddLevel(const char *title, const char *script_file,
+              const char *console_file);
+
+// FlagChooseLevel @ 0x006b0173. WinMain sets it from the `-chooselevel` command
+// line switch, so it is off for an ordinary launch, and **SetupMenus reads it
+// once** to decide whether the SinglePlayer menu gets its "Choose Level" item at
+// all. Setting it afterwards therefore does nothing for that item - only
+// OnMenuItemClicked and SetupCooperativeGameMenu re-read it. Anything wanting to
+// reach menu 5 after boot has to bring its own entry point.
+bool GetChooseLevelEnabled();
+void SetChooseLevelEnabled(bool enabled);
 
 // PlayUiSound @ 0x0058cdd0 - __fastcall with the sound id in ECX and nothing in
 // EDX (the body pushes ECX, a 0 and the sound-engine global, and tail-calls

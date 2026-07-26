@@ -65,8 +65,12 @@ struct Character {
   float aggression;
   float gun_yaw_angle;
   float elevation_angle;
+  // GLS `radius`/`height` pre-multiplied by `size`. A GLS value of 0 is not
+  // "zero-sized": ToRole substitutes derived_radius / derived_height, i.e. the
+  // geometry's own bounding box, so leaving them out is how a role gets its
+  // collision extents from its model.
   float radius_times_size;
-  float heigth_times_size;
+  float height_times_size;
   float size;
   float damage_multiplier;
   float shot_speed_multiplier;
@@ -89,11 +93,20 @@ struct Character {
   Hierarchy *shadow_hierarchy;
   int blob_shadow;
   char *description; // NOT owned: ToCharacter takes it from GetResourceString
-  field field0x94;  // runtime scratch - not set by ToCharacter
-  field field0x98;  // runtime scratch - not set by ToCharacter
-  int field00x9c;   // runtime scratch - not set by ToCharacter
-  int status_window_v;
-  int status_window_u;
+  // Derived geometry, NOT runtime scratch, and not set by ToCharacter - `ToRole`
+  // fills all three after converting the character, from the role's hierarchy or
+  // shape bounding box (or {1,1,1} when it has neither).
+  float derived_radius; // 0x94 max(bbox.x, bbox.z) * 0.5
+  float derived_height; // 0x98 bbox.y
+  // 0x9c only when the hierarchy has more than one node: a value read out of
+  // hierarchy+0x90 +0x14, multiplied by `size`. Zeroed by ToRole otherwise.
+  int derived_hier_extent;
+  // Normalized texture UVs, NOT integers: ToCharacter stores the parsed 0..1024
+  // integer divided by 1024.0 with MOVSS (0x0047df06 / 0x0047df21). They were
+  // typed `int` here and in the DB, which is what made that store decompile as a
+  // nonsensical `(int)(x * 0.0009765625)`.
+  float status_window_v;
+  float status_window_u;
   float strength;
   int weapon;
   int secondary_weapon;
@@ -132,9 +145,14 @@ struct Projectile { // GLS 'projectile'; see role_subobjects_notes.md
 static_assert(sizeof(Projectile) == 0x20);
 
 // ParticleGenerator::type, and the index into the 13-entry ParticleTypeInfos table
-// (0x007c1964) that supplies every per-type default. Names come from the console keyword
-// table in GetParticleIDFromName @ 0x0044c340; 7, 8 and 10 have no keyword and are not yet
-// identified. Explosion is also what that parser returns for an unrecognised name.
+// (0x007c1964) that supplies every per-type default. Explosion is what the console
+// parser returns for an unrecognised name.
+//
+// Two sources, agreeing where they overlap: the console keyword table in
+// GetParticleIDFromName @ 0x0044c340, and the GLS lexer, read out with gls::ProbeKeywords
+// (see gls_system_notes.md). The probe independently reproduced smoke/steam/fire/shot/
+// explosion/big explosion/sparks and supplied Corona and LaserTrail, which the console
+// table does not know. Only id 8 is still unnamed.
 enum class ParticleType : int {
   Smoke = 0,
   Steam = 1,
@@ -143,9 +161,30 @@ enum class ParticleType : int {
   Shot = 4,
   Explosion = 5,
   BigExplosion = 6,
+  Corona = 7,      // GLS `corona`; absent from the console table
   Trail = 9,
+  LaserTrail = 10, // GLS `laser trail`; absent from the console table
   Rain = 11,
   Sparks = 12,
+};
+
+// Role::action_on_death, GLS field 0x5d. Recovered with gls::ProbeKeywords; 0 is the
+// section default and has no keyword, so it means "unspecified" rather than a behaviour.
+enum class ActionOnDeath : int {
+  Unspecified = 0,
+  MustDrop = 1,    // GLS `must drop`
+  MustNotDrop = 2, // GLS `must not drop`
+};
+
+// Role::resistance, GLS field 0x4e. Recovered with gls::ProbeKeywords. Note the values
+// step by 2 rather than being bit flags - 1, 3, 5 and 7 are unaccounted for, so this is
+// NOT a mask and the four keywords are not combinable.
+enum class Resistance : int {
+  None = 0,
+  Laser = 2,       // GLS `resists laser`
+  Explosives = 4,  // GLS `resists explosives`
+  Epulsar = 6,     // GLS `resists epulsar`
+  SmallArms = 8,   // GLS `resists small arms`
 };
 
 // One particle animation channel, 0x18 bytes. The record starts at the *lead* dword, not
@@ -246,6 +285,41 @@ struct ReplaceDestructibility {
   uint8_t pad[3];
 };
 static_assert(sizeof(ReplaceDestructibility) == 0x10);
+
+// GLS `ammo`, filled by ToAmmo @ 0x0047d740. Both strings are strdup'd onto the
+// game pool; `role` is borrowed from the entity hash.
+struct Ammo {
+  float round_time;    // 0x00 GLS 0x14
+  float reload_time;   // 0x04 GLS 0x15
+  int life_timer;      // 0x08 GLS 0x16
+  int magazine_size;   // 0x0c GLS 0x12
+  int sound;           // 0x10 GLS 0x20
+  int salvo_size;      // 0x14 GLS 0x13
+  pool_string file;    // 0x18 GLS 0x01
+  pool_string name;    // 0x1c GLS 0x00
+  // GLS field 0x0b, which the master table calls `projectile` - for an `ammo`
+  // section it is converted with ToRole, so this really is a Role.
+  Role *role;          // 0x20
+  float firing_speed;  // 0x24 GLS 0x2e
+};
+static_assert(sizeof(Ammo) == 0x28);
+
+// One entry of AmmoInfos, filled by ToAmmoInfo @ 0x0047d8f0. The three ints are
+// GL_RESOURCE_IDs, not strings.
+struct AmmoInfo {
+  Hierarchy *hierarchy; // 0x00 set when GLS `shape` 0x05 named a hierarchy
+  Shape *shape;         // 0x04 ... or a shape; never both
+  int ammo_name;        // 0x08 GLS 0x1c
+  int description;      // 0x0c GLS 0x1a
+  int max_per_slot;     // 0x10 GLS 0x1d
+};
+static_assert(sizeof(AmmoInfo) == 0x14);
+
+// Ammo type / weapon type bounds, straight off ParseAmmo's declared max_values:
+// `ammo type` 0x17 tops out at 19 and `weapon type` 0x18 at 33.
+inline constexpr int AmmoTypeCount = 19; // the stride of the Ammo table below
+inline constexpr int MaxAmmoType = 19;
+inline constexpr int MaxWeaponType = 33;
 
 struct InventoryInfo {
   // Refcounted, not pool-owned: the InventoryInfo dtor @ 0x004add40 releases
@@ -369,4 +443,60 @@ int SpawnRole(int team_id, Role *role, Vec3 *position, Vec4 *orientation,
 // nullptr if out of range; and the inverse (AIType::Count if the name is unknown).
 const char *AITypeName(AIType type);
 AIType AITypeFromName(const char *name);
+
+// --- GLS enum keyword tables --------------------------------------------------
+//
+// The keywords for these fields are compiled into the parser's flex DFA, not
+// stored as strings, so none of this could be read out of the binary. Every entry
+// below was recovered by handing the parser a one-field section per keyword and
+// reading the stored integer back (gls::ProbeKeywords, see gls_system_notes.md).
+//
+// Two independent checks passed on the way: `ai` reproduced all 21 values of
+// AIType in order, and destructibility `type` reproduced DestructibilityKind.
+//
+// Names are the GLS spelling, spaces and all - `gk::gls` matches them with '_'
+// and ' ' treated as the same character, so a script may write either.
+struct EnumEntry {
+  const char *name;
+  int value;
+};
+
+// GLS `weapon type` (an `ammo` section, bounded 0..33) and `weapon` /
+// `secondary weapon` (a `character` section, where ParseCharacter declares NO
+// upper bound). Same field id 0x18 and the same numbering as far as it goes, so
+// one table serves all three - but a character's is a wider *inventory item*
+// space whose entries above 33 (the ammo/gadget names: `audio cloak`,
+// `lock decoder`, `terrain scanner`, ...) are not yet recovered.
+//
+// 10 and 15 are unaccounted for - no shipped script names them - and 33 is the
+// section default meaning "none", which has no keyword: `weapon type none` is a
+// syntax error, and the default is reachable only by omitting the field.
+const EnumEntry *WeaponTypeNames(size_t *count);
+const char *WeaponTypeName(int value);   // nullptr when unknown
+int WeaponTypeFromName(const char *name); // -1 when unknown
+
+// GLS `ammo type` (0x17). Complete: 0..18, bounded 0..19 by the constructor.
+const EnumEntry *AmmoTypeNames(size_t *count);
+const char *AmmoTypeName(int value);
+int AmmoTypeFromName(const char *name);
+
+// The two small role enums above, by name.
+const char *ActionOnDeathName(ActionOnDeath value);
+ActionOnDeath ActionOnDeathFromName(const char *name); // Unspecified when unknown
+const char *ResistanceName(Resistance value);
+Resistance ResistanceFromName(const char *name); // None when unknown
+// GLS `type` in a pgenerator (0x41), bounded 0..12 - the 13 ParticleTypeInfos.
+const char *ParticleTypeName(ParticleType value);
+ParticleType ParticleTypeFromName(const char *name); // Explosion when unknown
+
+// AmmoInfos @ 0x007b5d40, indexed by ammo type.
+AmmoInfo *GetAmmoInfos();
+// The Ammo* table @ 0x007b5ec0, indexed `ammo_type + weapon_type * AmmoTypeCount`.
+//
+// It sits 0x180 bytes past AmmoInfos, which is only 0x17c bytes of AmmoInfo[19] -
+// so an ammo type of exactly 19 (which ParseAmmo's max_values permits) writes an
+// AmmoInfo that laps into the first slots of this table. No shipped script does,
+// but that is the game's bound, not a safe one.
+Ammo **GetAmmoTable();
+Ammo *GetAmmo(int ammo_type, int weapon_type);
 } // namespace gk

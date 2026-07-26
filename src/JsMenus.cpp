@@ -389,7 +389,7 @@ const CollectionOps MenusOps = {
 
 } // namespace
 
-void ReleaseCallbacks(JSContext *ctx) {
+void ReleaseMenuCallbacks(JSContext *ctx) {
   // Order matters: stop the game calling in first, then drop the values. The
   // registrations themselves stay - the menus hold pointers into them.
   ClearCustomMenuActions();

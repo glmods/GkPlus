@@ -8,9 +8,9 @@ overlay) run at load. The game binary is actively being reverse engineered in Gh
 via MCP.
 
 On top of that sits a **QuickJS scripting layer**: `src/Script.cpp` boots a runtime during the
-game's `SetupMenus` and runs `<game dir>\gkplus\main.mjs`, which can import the `"gk"` and
-`"ImGui"` C modules, add items to the game's front-end menus and draw an ImGui overlay. See
-"Script host" below.
+game's `SetupMenus` and runs `<game dir>\gkplus\main.mjs`, which can import the `"gk"` C module,
+add items to the game's front-end menus and draw an ImGui overlay through the object its `draw_gui`
+export is handed. See "Script host" below.
 
 ## Build
 
@@ -119,7 +119,8 @@ Overlay configuration in `vcpkg-configuration.json`.
    (each member detaches its detours in its dtor), commits.
 
 `Subsystems` holds only the **hook-installing** subsystems — `MusicSystem`, `DebugSystem`,
-`GUISystem`, `InputFixSystem`, `CustomMenuSystem`, `ScriptSystem`. Everything else is struct-only
+`GUISystem`, `InputFixSystem`, `CustomMenuSystem`, `CustomLevelSystem`, `ScriptSystem`.
+Everything else is struct-only
 or a native-API wrapper that resolves its offsets lazily per call (`GetObjectAtOffset` is cheap
 because `GetBaseAddress()` caches), so those subsystems need no lifecycle object.
 
@@ -183,10 +184,11 @@ Each pair is a header of decompiled structs/enums plus native free-function decl
 `.cpp` implementing them (offset resolution + any behavioral hooks): `src/Actors`, `src/Roles`,
 `src/Map`, `src/Vulnerability` (header-only), `src/Music`, `src/Math`, `src/Menu`, `src/Tokens`,
 `src/Triggers`, `src/Console`, `src/Misc`, `src/Camera`, `src/Debug`, `src/GUI`, `src/InputFix`,
-`src/CustomMenu`, `src/Script`.
+`src/CustomMenu`, `src/CustomLevel`, `src/Script`, `src/MakeRole` (native constructors, see
+below).
 `src/GLS.h/cpp` is the model the rest now follow. The behavioral-hook subsystems (`Music`, `Debug`,
-`GUI`, `InputFix`, `CustomMenu`, `Script`) expose a `*System` RAII class constructed by
-`entry.cpp`; the others are pure struct + native-API.
+`GUI`, `InputFix`, `CustomMenu`, `CustomLevel`, `Script`) expose a `*System` RAII class constructed
+by `entry.cpp`; the others are pure struct + native-API.
 
 ### Script host (`src/Script.h/cpp`)
 
@@ -208,17 +210,40 @@ Four facts pin the design, in decreasing order of how expensive they were to fin
   strings and `gk::Print` both work, and the game's own menus are already populated. That last
   part is load-bearing: `OnMenuItemClicked` switches on the item *index*, so a script item added
   before the game's would shift every index in the dispatch table.
-- **`ImGui` and `gk` are handed to the script as arguments** as well as being importable. Getting
-  a usable namespace object for a C module requires the module to have been *linked*, which only
-  happens when something imports it, so `BootScriptHost` evaluates a three-line internal module
-  (`import * as ImGui from "ImGui"; import * as gk from "gk"; export {ImGui, gk};`) and reads its
-  namespace. Same object identity as the script's own `import * as`, and it fails loudly at boot
-  rather than inside the user's first import.
+- **`ImGui` is not a module — it is only `draw_gui`'s argument.** Every call in it is valid only
+  between `NewFrame` and `Render`, which is exactly the window `draw_gui` runs in, so
+  `js_imgui_new_namespace` (imgui-quickjs) builds a plain object with `JS_SetPropertyFunctionList`
+  and `BootScriptHost` hands it over. Making it importable would let a script call it from module
+  scope or `setup_menus`, where it cannot work. The cost is that a duplicate name in
+  `js_imgui_funcs` is now *silent* — see the export-list convention below, where the `grep`
+  recipe is the only remaining guard.
+- **`menus` is the same story** — it is `setup_menus`' argument and not a `"gk"` export, because
+  the game's own items must already be in place when a script adds one. The host builds it with
+  `js::NewMenusNamespace`.
+- **`LinkGkModule` imports `"gk"` at boot purely as a check**, and keeps nothing. A C module is not
+  linked until something imports it, and its export list is only validated then — a duplicated name
+  fails the link with a `SyntaxError`. Doing the first import at boot reports that as
+  `gkplus bootstrap` rather than against whichever script imported `"gk"` first. (It used to also
+  fetch the namespace for `menus`; if you ever need a C module's namespace from C, note that
+  `JS_GetModuleNamespace` on an un-imported module does not return undefineds —
+  `js_build_module_ns` falls through to the module's unset `func_obj` and crashes.)
 - **Module evaluation returns a promise even without top-level await**, so `Await()` pumps
   `JS_ExecutePendingJob` until it settles, and reports a stuck pending promise instead of spinning.
 - **The entry module's name uses forward slashes.** QuickJS's default normalizer resolves a
   relative specifier by scanning the *importing module's name* for `/`; with `C:\…\main.mjs` it
   finds none and `import "./x.mjs"` silently resolves to `x.mjs` in the process's cwd.
+
+**The host loads exactly one module, and the bindings load none.** `levels.add` used to take a
+module *path* and pull the file in itself, through a `LoadScriptModule` host service; it now takes
+the description object, and a script reaches a level module with an ordinary
+`import * as arena from "./levels/arena.mjs"` — the namespace is already the right shape. That
+deleted the last binding-side module load, so `Script.h` exports only `BootScriptHost`. If a
+binding ever does need to load a script file from C, the answer is
+`Await(ctx, JS_LoadModule(ctx, EntryPath, specifier))` — QuickJS's own C-side `import()`, which
+normalizes, runs the loader, links, evaluates and resolves with the namespace — with the **entry
+module's path** as the base name, which is what makes a relative specifier resolve next to
+`main.mjs` rather than against the cwd the game keeps moving. Do **not** open-code it by evaluating
+a synthetic wrapper module that does the import; that is what the deleted version started as.
 
 Two seams in `src/GUI.h` carry it: `SetOverlayDrawCallback` (inside the ImGui frame, F11 only)
 runs `draw_gui`, and `SetFrameCallback` (once per `PresentScene`, overlay or not) drains the job
@@ -228,8 +253,13 @@ call into a context that does not exist yet. Everything runs on the main thread.
 Nothing a script throws reaches game code: every seam ends at `gk::js::ReportException`, which
 prints the message and stack to the console and the debugger. A `draw_gui` that throws is
 **disabled for the session** — once per frame forever is a flood, not a diagnostic, and a script
-that threw mid-frame has usually left ImGui's stack unbalanced. There is also a global `console`
-(`log`/`info`/`warn`/`error`/`debug`), which QuickJS core does not provide.
+that threw mid-frame has usually left ImGui's stack unbalanced.
+
+**There are no host globals at all.** QuickJS core provides no `console` (that is quickjs-libc,
+which this port does not install) and GkPlus deliberately does not add one — `log`/`info`/`warn`/
+`error`/`debug` live on the `"gk"` module's `console` beside the game's own `print`, colours and
+`execute`, so there is exactly one console object and a script reaches it the way it reaches
+everything else. `js::Log` is still the C-side sink for all of it, including `ReportException`.
 
 ### Custom menu items (`src/CustomMenu.h/cpp`)
 
@@ -256,38 +286,250 @@ There is no removal: `Menu::ClearItems` is all-or-nothing and each item caches i
 Only the **front-end** `Menus[36]` is covered; `InGameMenus[7]` has a separate dispatch
 (`InGameMenu::OnItemActivated`) and is not wired up.
 
-### JavaScript bindings (`src/Js*`)
+### Native constructors (`src/MakeRole.h/cpp`)
 
-The `"gk"` QuickJS C module, exposing seven subsystems to scripts. `src/Js.h` is the public surface
-— `RegisterGkModule`, plus `Log` / `ReportException` / `ReleaseCallbacks` for the host — and
-`src/JsGk.cpp` builds the module from seven namespace objects, one per translation unit:
-`JsCamera`, `JsConsole`, `JsActors`, `JsRoles`, `JsTokens`, `JsTriggers`, `JsMenus`, over shared
-helpers in `src/JsBindings.h` / `src/JsCommon.cpp`.
+The `ToXxx` converters re-expressed over plain description structs, so a game object can be
+built with no `ParsedThing` in sight. One `Make*` per GLS section type that produces an
+object — thirteen of them, covering every converter except `ToMap` (which `CustomLevel`
+drives) and `ParseGLDirs` (which sets game directories rather than building anything):
+
+| GLS section | Converter | Native |
+|---|---|---|
+| shape / hierarchy | `ToShape` / `ToHierarchy` | `MakeShape` / `MakeHierarchy` — pure `.rif` lookups |
+| light | `ToLight` | `MakeLight` |
+| projectile | `ToProjectile` | `MakeProjectile` |
+| pgenerator | `ToParticleGenerator` | `MakeParticleGenerator` |
+| character | `ToCharacter` | `MakeCharacter` |
+| destructibility / frag data / *replace* | slot-8 trio | `MakeDestructibility` / `MakeFragData` / `MakeReplaceDestructibility` |
+| role | `ToRole` | `MakeRole` |
+| ammo / ammo info | `ToAmmo` / `ToAmmoInfo` | `MakeAmmo` / `MakeAmmoInfo` — write the global tables |
+| camera track | `ToCameraTrack` | `MakeCameraTrack` — needs a loaded level |
+
+**Descriptions are in `.gls` units** (degrees, seconds, metres, cycles/sec), because that is
+what a `ParsedThing` holds: `CheckValue` only range-checks and stores, and every conversion
+lives in the converter. Each `Desc`'s defaults are its section constructor's own, read out of
+the `.rdata` constants rather than transcribed.
+
+Five conversions carry real risk and are the reason this is RE work rather than field copying:
+
+- **Angles are BAM** — 4096 to a turn, what indexes the sin/cos tables — and `ToCharacter`
+  uses **two association orders** for the same conversion (`(d/360)*4096` for scan angles,
+  `(d*4096)/360` for aim/sight/yaw/elevation). Same value mathematically, not always the same
+  float, so `MakeRole.h` exposes both.
+- **`walking_speed` is 16.16 fixed point rounded twice** — `round(cycles * 65536)`, then if
+  the character turns, that *already-rounded integer* goes back to float, divides by `size`,
+  re-scales and rounds again. Rounding is `FISTP` under the default control word: nearest-even.
+- **A GLS `radius`/`height` of 0 means "use the model's bounding box"**, and `ToRole` — not
+  `ToCharacter` — computes it. Skipping it yields characters with no collision extents.
+- **`Role::flags` packs ten booleans** in a fixed bit order, and `alpha_fogging` forces
+  `per_vertex_fogging` off rather than reporting a conflict.
+- **Particle TTL is converted at the *calling thread's* clock rate** — client and executor
+  keep separate ones.
+
+Two things deliberately not reproduced: `ToRole`'s leak on the beam-script error path
+(`MakeRole` refuses up front instead), and the converters' habit of leaving allocations
+partly uninitialised — everything here zeroes first, which is also required because several
+mirrors carry `pool_unique_ptr` members that cannot start from garbage.
+
+### Building game objects from script (`src/JsMake.cpp`, the `make` namespace)
+
+The `"gk"` module's `make` namespace is the native constructors above, exposed to JS. It is
+how the shipped `.gsh` headers get re-implemented as `.mjs` modules — no `ParsedThing`, no
+parser, and a definition costs a few dozen bytes rather than 0x1b60:
 
 ```js
-import gk, { camera, console, actors, roles, tokens, triggers, menus } from "gk";
+const role = make.role({
+  identifier: "bug",
+  hierarchy: { rif: "units\\bug.rif", object: "bug", hotspot: "head" },
+  character: { walking_speed: 1.5, strength: 1, aggression: 0.1, weapon: "enemy laser weak" },
+  ai: "background creature",
+  destructibility: { kind: "explode" },
+});
+```
+
+Four things decide the shape:
+
+- **One call builds a whole role.** A Character, Light, Projectile, pgen or Destructibility
+  becomes *owned* by the Role (`RoleDtor` pool-frees all six), so handing the same one to two
+  roles would double-free it at level teardown. Describing them inline makes that
+  unrepresentable rather than merely discouraged. Shapes and hierarchies are the exception —
+  the rif cache owns those — so `make.shape` / `make.hierarchy` hand back reusable handles.
+- **`make.role` registers as it builds**, and `DestroyRoles` clears the hash between levels,
+  so a header module exports *functions* and a level's `define` hook calls them once per load.
+  There is no `register()` step and no conversion cache to reset.
+- **Enum fields take keywords**, resolved through the tables recovered by probing (`ai`,
+  `weapon`, `secondary weapon`, `ammo type`, `weapon type`, `action on death`, `resistance`,
+  particle `type`). A field whose table is not recovered — `interface beam effect` — says so
+  and takes the number.
+- **Ranges are still checked against the game's own bounds.** `gls::FindField` reads
+  `min_values`/`max_values` off the section constructor, so `make` reports the same limits
+  `CheckValue` would have, without going through it.
+
+GLS inheritance has no equivalent and needs none: `child : parent` becomes object spread,
+which does the merge at authoring time instead of inside the game. `abstract` likewise — a
+description is a plain object until something calls `make.role` on it.
+
+### What only the parser can answer (`src/JsGls.cpp`, the `gls` namespace)
+
+Everything else moved to `make`; `gls` keeps the three things a reimplementation cannot
+provide, all of which run the real parser:
+
+- **`gls.schema(section)`** — the field table each section constructor declares *about
+  itself*: `field_types`, `field_names` (the GLS keyword), `field_satisfied` (false =
+  required) and `min_values`/`max_values`. `gls::SectionFields` builds it by constructing a
+  throwaway instance and reading it, so no hand-maintained table can drift from the binary.
+- **`gls.probe(section, field, names)`** — what integer a GLS enum keyword stands for.
+- **`gls.try_parse(source)`** — does this text parse, for bisecting one that does not.
+
+All three inherit the parser's hazards: destructive global state (never during a level load)
+and the poisoning described above.
+
+**The enum keyword tables were recovered by asking the parser.** `ai bot` and friends are
+compiled into the flex DFA — not stored as strings, absent from every shipped header — so
+`gls.probe(section, field, names)` writes a one-field section per keyword, parses it, and
+reads `parsed_values[field]` straight back. `ai`, `weapon type`, `ammo type`,
+`action on death` and `resistance` now accept names (tables in `src/Roles.cpp`); `type` still
+takes a number, because that id is shared by `destructibility` (0..1) and `pgenerator`
+(0..12) and the binding cannot tell which section it is being asked about.
+
+Two independent checks passed: `ai` reproduced all 21 values of `AIType` in order, and
+`destructibility type` reproduced `DestructibilityKind`. Full tables, declared bounds and
+what is still unknown are in `gls_system_notes.md`.
+
+**One parser fact that outranks the rest: a syntax error poisons `LoadGLS` for the whole
+process.** It resets its error counter, `ParsedObjList` and the symbol tables on entry, but
+not the file stack, and nothing afterwards recovers — a verbatim copy of a shipped section
+fails identically. Anything making repeated `LoadGLS` calls (`gls.probe`, `gls.try_parse`,
+a level's `includes`) has to treat the first failure as terminal.
+
+### Script-defined levels (`src/CustomLevel.h/cpp`)
+
+A level with **no `.gls` and no `.gcs`** — only the `.rif` still comes off disk.
+`import * as arena from "./levels/arena.mjs"; levels.add("Test Arena", arena)` registers one;
+the module exports `map` (the GLS map section, field for field), `includes` (the `.gsh` files
+its roles come from, or nothing at all if they are built with `gls` instead), `define(level)`,
+`populate(level)` and `setup(level)`. The whole thing lands in Choose Level.
+
+**`add` takes an object, never a path.** A module namespace already *is* a description object
+with the map under `map`, so the host has no reason to load the file itself — the script's own
+`import` does it, statically, with the editor and the module cache both in play. An inline
+description is the same object with the map fields flat instead of nested, which is the only
+thing `ResolveDescription` has to tell apart, and it can: no `CustomLevelMap` field is called
+`map`.
+
+The three hooks split the way the two script files split: `define` is the `.gls`'s `#include`
+block — it registers roles, and runs per *load* before the map is converted, because the roles
+hash is cleared between levels — `populate` is its `use ... for ...` clauses, and `setup` is
+the whole `.gcs`.
+
+```js
+export const map = { rif: "levels\\level01.rif", object: "Land", camera_plane: "camhund" };
+export const includes = ["defaults.gsh", "gunlok.gsh"];
+export function populate(level) {
+  for (const spot of level.locators("Goodie A"))   // the `for "<rif object>"` clause
+    level.spawn("Rol_GunLok", 1, spot, { as: "gunlok" });   // ... and the `as` clause
+}
+export function setup(level) { console.execute("sunangle 140"); }   // the .gcs
+```
+
+Six facts pin the design; the full reasoning is `level_loading_notes.md` §6.5 and §7.
+
+- **`ConvertParsedObjects` @ 0x004747b0 is the main hook**, not `LoadGLS`: it lets the game
+  build and free its own list, with GkPlus only calling the map's `to_game_object` slot
+  afterwards. `FreeParsedObjectList` is hooked for the null guard both need — `LoadGLS`
+  returns null for a script that defined nothing and the game dereferences it — and
+  `LoadGLS` itself only for the no-`includes` case below.
+- **The map section is built by `gls::Create(SectionType::Map)` at registration time**, not
+  at load time, so a bad field is reported at boot through the game's own `CheckValue`
+  rather than halfway through a level load. The object is kept and re-converted on every
+  load; `to_game_object` neither takes nor drops a reference.
+- **A level that names `includes` gets a generated prelude `.gls`; one that does not touches
+  no file and no parser.** The prelude lives in `%TEMP%\gkplus\` and holds the `#include`
+  list, because the multiple-inclusion guards only work within one `LoadGLS` call
+  (`ClearParseSymbolTables` runs per call) and N separate loads would re-register every
+  shared `.gsh`. It can live outside the game folder because the parser opens an `#include`
+  with a bare `fopen` against the *current* directory, which `LoadLevel` has set to Scripts,
+  and it always ends with a filler `shape` — its `name` + `file` are the two strings the map
+  already requires — because an empty script is the null-list case above.
+
+  With no `includes` there is nothing to parse, so `LoadGLS` is detoured to hand back an
+  empty `ParsedObjectList` built the way `ParseGSH` builds its own. **Letting the parse fail
+  instead is not an option**: a failed parse poisons the parser for the rest of the process,
+  so the next *game* level to load would fail too.
+- **`setup` hooks `ExecuteAllCommands` @ 0x004d62c0, which has exactly one call site** —
+  `LoadLevel` @ 0x004e1e00, step 11, behind the very `freshStart` byte that gates the
+  `ExecuteCommandFile(ConsoleFileName)` queueing the `.gcs` at step 7. So reaching the hook
+  already means "a fresh level start is at the point its `.gcs` would take effect", and a
+  savegame restore skips it for free — no flag of our own, and none of `LoadLevel`'s own
+  callers to disambiguate. It runs the callback **before** the original, because the original
+  loops until the queue is empty, so anything `setup` queues drains in that same call rather
+  than trickling out one per frame through `PumpQueuedConsoleCommand`.
+- **The loading level is identified by `ScriptFileName`, not remembered from the menu**, so
+  Choose Level, `ADD MISSION`, a savegame restore and a multiplayer client all work alike.
+- **Menu 5 needs its own way in.** The game's "Choose Level" item exists only when
+  `FlagChooseLevel` @ 0x006b0173 is set, `WinMain` sets it from the `-chooselevel` switch,
+  and `SetupMenus` reads it once — long before any script runs. So the first registered
+  level appends a "Choose Level" item to Single Player through `CustomMenu`.
+
+Placed objects go through `gk::MapSpawn` after `ToMap` rather than the binding hash at
+`ParsedMap+0x1b60` (which would need a forged field-9 `ParsedField`), so a script can spawn
+at arbitrary coordinates as well as at rif locators. `gk::LevelRifLocators` supplies the
+locator half and is only valid while a load callback is running — `populate` being the window
+`ToMap` spawns a `.gls`'s placed objects in, after the roles are registered and before the
+camera settles. `CurrentCustomLevel()` marks all three windows, and doubles as the
+re-entrancy guard for both hooks, so a callback that parses a `.gls` itself cannot make the
+level build twice.
+
+### JavaScript bindings (`src/Js*`)
+
+The `"gk"` QuickJS C module, exposing ten subsystems to scripts. `src/Js.h` is the public surface
+— `RegisterGkModule`, plus `Log` / `ReportException` / `ReleaseCallbacks` for the host — and
+`src/JsGk.cpp` builds the module from ten namespace objects, one per translation unit:
+`JsCamera`, `JsConsole`, `JsActors`, `JsRoles`, `JsTokens`, `JsTriggers`, `JsMenus`, `JsLevels`,
+`JsGls`, `JsMake`, over shared helpers in `src/JsBindings.h` / `src/JsCommon.cpp`. `JsGk.cpp` also owns
+`ReleaseCallbacks`, which fans out to the per-TU `Release*Callbacks` of the two namespaces that
+hold script values (menus and levels).
+
+```js
+import gk, { camera, console, actors, roles, tokens, triggers, levels, make, gls } from "gk";
 camera.distance = 900;                              // live accessors
 for (const a of actors) if (a.alive) a.health = 50; // iterable
 actors[12].frag();                                  // by id
 actors["tbaa"].set_target(actors["hark"].id, 0);    // by token name
 roles["gunlok"].spawn(0, {x: 0, y: 0, z: 0});
 for (const [name, value] of Object.entries(tokens)) console.print(`${name}=${value}`);
+console.log("actors:", actors.count);               // the host's own logging - no global console
+console.execute("GOD ON");                          // and the game's command surface
 tokens["score"] = 0;                                // upsert; actors/roles throw
-menus.Main.add_item("Open console", (item) => {});  // menus[0], menus["main"] too
-menus[1].add_toggle("Cheats", false, (item) => log(item.value));
+levels.add("Test Arena", arena);                    // `import * as arena` first
+
+export function setup_menus(menus) {                // `menus` is not an export
+  menus.Main.add_item("Open console", (item) => {});  // menus[0], menus["main"] too
+  menus[1].add_toggle("Cheats", false, (item) => log(item.value));
+}
 ```
 
-`actors`, `roles`, `tokens` and `menus` are all **exotic-property collections** built by the same
-scaffolding in `JsCommon.cpp`: indexable, `in`-testable, `Object.keys`/`values`/`entries`-able, and
-iterable over a snapshot. `NewCollection` gives every one of them a non-enumerable `count` and
-`Symbol.iterator`; a namespace only supplies per-collection extras (`roles.ai_types`,
-`menus.current`). Actors, roles and menus are keyed by **id** (names are a lookup convenience and
-are not enumerated); tokens are keyed by **name** and resolve to the bare value, with `lookup_id`
-left null so a token called `"5"` still works.
+**`menus` is the argument to `setup_menus` and nothing else** — `NewMenusNamespace` is declared in
+`src/Js.h` rather than `JsBindings.h`, and `JsGk.cpp`'s `Namespaces` table deliberately omits it.
+Adding a front-end item is a boot-time act (the game's own items must already be there, or every
+index in `OnMenuItemClicked` shifts), so the object is scoped to the callback that runs at that
+moment. It is a plain collection otherwise, and `menus.current` / `menu.open` work whenever — a
+script that wants them later keeps the argument in a module-level variable.
+
+`actors`, `roles`, `tokens`, `menus` (the argument) and `levels` are all **exotic-property
+collections** built by the same scaffolding in `JsCommon.cpp`: indexable, `in`-testable,
+`Object.keys`/`values`/`entries`-able, and iterable over a snapshot. `NewCollection` gives every one
+of them a non-enumerable `count` and `Symbol.iterator`; a namespace only supplies per-collection
+extras (`roles.ai_types`, `menus.current`, `levels.add` / `levels.current`). Actors, roles, menus
+and levels are keyed by **id** (names are a lookup convenience and are not enumerated) — for
+`levels` that id is registration order, which is also the Choose Level order; tokens are keyed by
+**name** and resolve to the bare value, with `lookup_id` left null so a token called `"5"` still
+works.
 
 Every lookup mints a **fresh wrapper**, so `menus[0] !== menus[0]` and likewise for actors and
-roles. Compare `.id`, not object identity. The one exception is a `MenuItem`: `add_item` returns
-the same object the callback receives, because the binding holds it for the item's lifetime.
+roles. Compare `.id`, not object identity. The exceptions are `MenuItem` and `Level`: `add_item`
+and `levels.add` return the same object the callback receives, because the binding holds it for the
+registration's lifetime — and `levels.current` returns that same object too.
 
 `menus` covers the front end only (`Menus[36]`, keyed 0-35 and by the `Menus.inc.h` name, matched
 case-insensitively). A `Menu` wrapper has `id`, `name`, `title` (localized), `count`, `items` (a
@@ -363,7 +605,7 @@ maintains what.
   does not know.
 - **`npx tsc -p types/tsconfig.json` is the check**, and `types/typecheck.ts` asserts in both
   directions: ordinary lines must compile, and every `@ts-expect-error` line must not. A vacuous
-  declaration file (everything `any`) fails it, because all thirteen expect-error directives would
+  declaration file (everything `any`) fails it, because all eighteen expect-error directives would
   go unused.
 
 Three modelling decisions that took a round-trip through `tsc` to settle:
@@ -392,9 +634,11 @@ Three modelling decisions that took a round-trip through `tsc` to settle:
 | `src/InputFix.h/cpp` | `InputFixSystem` - hook-only. Detours `AcquireDInputDevice` to suppress the vestigial DirectInput keyboard acquire and its `WH_KEYBOARD_LL` hook (see `input_notes.md`) |
 | `src/ActorClasses.inc.h` | X-macro listing the 15 Actor subclasses: `GK_ACTOR_CLASS(Name, Parent, Predicate, Kind)`. Drives the JS class table, `kind`, the RTTI ladder and the prototype chain. **Must list every class before its own base** |
 | `src/Menus.inc.h` | X-macro listing all 36 Gunlok menus: `GUNLOK_MENU(Name, Id, TitleResourceId, "English title")`. There are no gaps - ids 11 and 14-20 are identified in `menu_system_notes.md`. Also counted into `gk::MenuCount` |
-| `imgui-quickjs/` | Static library: the `"ImGui"` QuickJS C module, linked into `d3d8.dll` and registered by the script host. Its export list is `JS_CFUNC_DEF` + `JS_OBJECT_DEF` only, which is what makes `JS_SetModuleExportList` legal for it (see the QuickJS conventions) |
+| `imgui-quickjs/` | Static library: the ImGui bindings, linked into `d3d8.dll`. **Not a QuickJS module** — `js_imgui_new_namespace(ctx)` builds a plain object the host passes to `draw_gui`, since an ImGui call outside that frame does not work. `JS_SetPropertyFunctionList` handles the whole export list, `JS_DEF_CGETSET` included (see the QuickJS conventions) |
 | `examples/main.mjs` | A working entry module, JSDoc-annotated against `types/`. Install it as `<Gunlok>\gkplus\main.mjs`; `examples/jsconfig.json` is what type-checks it |
-| `types/` | `.d.ts` for the `"gk"` and `"ImGui"` modules, the generator for the latter, and `typecheck.ts`. See "Type definitions" above |
+| `examples/levels/arena.mjs` | A working level module for `levels.add` — `map` + `includes` + `define` + `populate` + `setup` |
+| `examples/headers/` | `bug.gsh` and part of `defaults.gsh` re-implemented with `gls`, as the worked example of translating a header |
+| `types/` | `.d.ts` for the `"gk"` module and the `ImGui` interface, the generator for the latter, and `typecheck.ts`. See "Type definitions" above |
 
 ## Reverse Engineering Reference
 
@@ -545,6 +789,13 @@ and audit the DB afterwards rather than trusting it.
 - A helper reached only through subsystem X is **not necessarily X's**. `ParticleTypeInfo`'s
   `render_state` ctor/finalise looked particle-specific until a caller check showed the shadow
   renderer and five other subsystems using them. Check callers before baking a prefix into a name.
+- **A register argument spilled in the prologue reads as an uninitialized local.** `LoadLevel`
+  was documented as `StdCall<void>` because its `bool` parameter is `MOV [EBP-0x175],CL` at the
+  third instruction: the decompiler shows a `local_179` with no assignment anywhere and every
+  P-code def marked `INDIRECT`, i.e. "some call might have written it". A local that is *read*
+  several times and *never written* is an argument until proven otherwise — check the first
+  handful of instructions for a store from ECX/EDX, then check what each call site puts there
+  (here `MOV CL,1` vs `XOR CL,CL`, which turned out to be new-level vs savegame-restore).
 - **No `static_assert` means nothing is pinning the layout.** Before trusting a GkPlus struct
   mirror, check it actually has one - `ParticleGenerator` and `Projectile` had none despite
   this file claiming otherwise.
@@ -583,6 +834,13 @@ and audit the DB afterwards rather than trusting it.
   `getInstructionContaining` and walk `getPrevious()` to dump a window around a data reference.
 - Walk to a vtable slot's body with `mem.getInt(vtbl + slot*4)`, masking `& 0xffffffff` (Jython ints
   are signed, so a high address comes back negative and `getAddress` rejects it).
+- **Do not scrape constants out of the decompiler's local variables.** It reuses one local for
+  several `.rdata` symbols, so a regex over `x = DAT_...;` then `field = x;` silently attributes the
+  *last* binding to every use. Scan the disassembly instead, tracking register loads. For the GLS
+  section constructors the pattern is SSE and two encodings matter: `MOVSD xmm,[const]` +
+  `MOVSD [reg+disp],xmm` writes one 8-byte slot, while `MOVAPS xmm,[const]` + `MOVUPS [reg+disp],xmm`
+  writes **two adjacent slots** from a 16-byte constant. Integers and booleans are plain
+  `MOV byte/dword ptr [reg+disp], imm`. `XORPS xmm,xmm` then a store means zero.
 
 ### Game Binary Layout
 
@@ -692,7 +950,7 @@ floats with **no readers**.
 | 0x007b7270 | int* | InGameMenuIndex |
 | 0x006a89b4 | int* | InGameMenuSelectedItem |
 | 0x007ba1dc | void*[7] | InGameMenuPanels |
-| 0x007b74dc | LevelList | levelList (0x10-byte list header `{sentinel, count, cache, cache_valid}`) |
+| 0x007b74dc | LevelList | levelList — `List<LevelInfo>`; a node is 0x18 with `{title, script, console}` at +0x0c/+0x10/+0x14 |
 | 0x007b74ec | float | MouseYNormalized |
 | 0x007b74d0 | float | MouseXNormalized |
 | 0x007b74f0 | LevelList[8] | KeyBindingCategories |
@@ -789,7 +1047,9 @@ CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84
 | 0x004d6090 | FastCall<void, const char*> | ExecuteCommand |
 | 0x004d5d50 | FastCall<void, const char*, const char*, TCallback, int> | RegisterConsoleCommand |
 | 0x0043c800 | StdCall<> | SetupConsoleCommands |
-| 0x0043f250 | FastCall<int, unsigned char*> | ExecuteCommandFile |
+| 0x004d62c0 | StdCall<void> | ExecuteAllCommands — `while (NumCommandsToExecute) PumpQueuedConsoleCommand()`. **Exactly one call site in the binary**: `LoadLevel` @ 0x004e1e00, step 11, behind the `freshStart` byte. That is what makes it the hook for a script level's `.gcs` replacement (see `src/CustomLevel.cpp`) |
+| 0x004d6120 | StdCall<void> | PumpQueuedConsoleCommand — pops one queued line |
+| 0x0043f250 | FastCall<bool, const char*> | ExecuteCommandFile — **queues**, does not run: each line is appended to `CommandsToExecute` and `PumpQueuedConsoleCommand` pops one per frame. `fgets` at 0xfa, `//` comments, and `#` directives (`ONLY IF SAFE` / `ONLY IF HINTS ON` / `CLEAR BATCH` / `EXECUTE IMMEDIATELY` / `NORMAL EXECUTION`). The declared `int` is a **bool in AL** (`MOV AL,1` / `XOR AL,AL`, upper 24 bits are fclose garbage) meaning "the file opened"; none of the six callers reads it |
 
 **Actors:**
 
@@ -829,7 +1089,7 @@ CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84
 
 | Offset | Signature | Name |
 |--------|-----------|------|
-| 0x004e95e0 | StdCall<void> | SetupMenus |
+| 0x004e95e0 | StdCall<void> | SetupMenus (reads FlagChooseLevel @ 0x006b0173 **once**, so the Choose Level item cannot be enabled after boot; `WinMain` sets that flag from `-chooselevel`) |
 | 0x004ecf10 | StdCall<void> | OnMenuItemClicked (action dispatch) |
 | 0x004fbfa0 | FastCall<void, MenuIndex, bool> | GoToMenu (ECX=target, DL=push parent) |
 | 0x004f94f0 | ThisCall<void, Menu*, unsigned, int, unsigned> | Menu::Menu (firstItemId, nLabels, titleId) |
@@ -896,7 +1156,11 @@ CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84
 | Offset | Signature | Name |
 |--------|-----------|------|
 | 0x004e2560 | FastCall<int, char> | BeginLevelSession (CL != 0 -> also LoadLevel) |
-| 0x004e0980 | StdCall<void> | LoadLevel |
+| 0x004e0980 | FastCall<int, bool> | LoadLevel(freshStart) — **not** `StdCall<void>`: the flag arrives in CL, `BeginLevelSession` passes 1 and `LoadGame` passes 0, and it gates the sun setup, the level `.gcs` (`ExecuteCommandFile` + `ExecuteAllCommands`) and the mission-stats reset. The `.gcs` therefore *does* run in single player |
+| 0x004efcc0 | FastCall<void, const char*, const char*, const char*> | AddLevel(title, script, console) — appends to `LevelList` **and** adds the Menus[5] item |
+| 0x00474870 | FastCall<void, ParsedObjectList*> | FreeParsedObjectList — pool-frees the header too |
+| 0x00483420 | FastCall<void, List*> | List__Dtor — empties a list and destroys its sentinel, keeps the header |
+| 0x00483da0 | FastCall<void*, const char*> | AcquireLevelRifForLocators(rifPath) — ECX only, nothing in EDX |
 | 0x0047f160 | ThisCall (member) | ToMap - builds TheMap and spawns placed objects |
 | 0x0047efa0 | ThisCall (member) | CheckValue_Map - handles `use ... in team ... for ...` |
 | 0x00470f20 | ThisCall<void, Map*, void*, Vec3*, LevelMeshHeader*> | Map_Ctor |
@@ -1134,13 +1398,14 @@ the one that bites hardest, because its failure mode is silent.
   `js_default_module_normalize_name` passes through anything not starting with `.`, and resolution
   checks the already-loaded modules — where `JS_NewCModule` registers — before consulting a loader.
   A loader is only needed for the *script's* own files, and `src/Script.cpp` has the minimal one.
-- **A duplicated name in an export list is a latent `SyntaxError`.** `imgui-quickjs` listed
-  `JS_ENUM_DEF(SortDirection)` twice, which cost nothing until something did
+- **A duplicated name in an export list must be grepped for, because nothing checks it any more.**
+  `imgui-quickjs` listed `JS_ENUM_DEF(SortDirection)` twice, which cost nothing until something did
   `import * as ImGui from "ImGui"` — building a namespace object rejects duplicate exports, so the
-  whole module failed to link and the host reported "duplicate exported name 'SortDirection'". A
-  long hand-maintained `JSCFunctionListEntry` array needs a duplicate check, not review:
-  `awk` the array out of the file, `grep -oE 'JS_(CFUNC_DEF\("[A-Za-z0-9_]+"|ENUM_DEF\([A-Za-z0-9_]+)'`,
-  `sort | uniq -d`.
+  whole module failed to link and the host reported "duplicate exported name 'SortDirection'". That
+  check is **gone**: `js_imgui_funcs` is now instantiated with `JS_SetPropertyFunctionList`, which
+  happily sets the same property twice. A long hand-maintained `JSCFunctionListEntry` array
+  therefore needs a duplicate check, not review: `awk` the array out of the file,
+  `grep -oE 'JS_(CFUNC_DEF\("[A-Za-z0-9_]+"|ENUM_DEF\([A-Za-z0-9_]+)'`, `sort | uniq -d`.
 
 JavaScript naming, which is not the C++ naming: `snake_case` for methods and functions
 (`set_target`, `attack_position`), `PascalCase` for classes and types (the `JSClassDef::class_name`

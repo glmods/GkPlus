@@ -275,6 +275,13 @@ Two menus deserve a footnote:
 (`level01`, `prison`, `level02`-`level07`, `level10`, `level09`, `junkyard`, `level11`,
 `level12`, `cityruins`, `level15`) and can be extended from the console with
 `ADD MISSION <script.gls> <console.gcs>` (`CommandAddMission` @ `0x004402b0`).
+
+Both go through `AddLevel` @ `0x004efcc0` — `__fastcall(title, scriptFile, consoleFile)`,
+which strdups all three into a 0x18-byte `List_Member<LevelInfo>` node (`title` @ +0x0c,
+`script` @ +0x10, `console` @ +0x14) **and calls `Menu::AddItem(Menus[5], title)` itself**.
+That is why menu 5 has no populator row above: it is filled one item at a time as levels
+register, which is also what keeps item *n* aligned with list entry *n* for the dispatch.
+Full layout in `level_loading_notes.md` §6.5.
 `MultiplayerLevelList` @ `0x007b76b0` has the equivalent `ADD MULTI MISSION <name> <script>`
 (`CommandAddMultiMission` @ `0x00440390`).
 
@@ -291,7 +298,7 @@ order, not from the string table.
 | 0 Main | Single Player, Multiplayer, Options Menu *(auto, `GL_MENU_MAIN1` x3)*, Credits, Exit Game |
 | 1 Options | Video, Controls, Graphic Detail, Audio *(auto, `GL_MENU_MAIN_OPTIONS1` x4)*, Game Preferences |
 | 4 Keyboard | Camera, Mines, Character control, Gameplay, Active Pause, Recon mode, Formations, Music |
-| 7 SinglePlayer | New Game, Training Level *(auto, `GL_MENU_SINGLE3` x2)*, Load Game, and Choose Level **only if `FlagChooseLevel` @ `0x006b0173`** |
+| 7 SinglePlayer | New Game, Training Level *(auto, `GL_MENU_SINGLE3` x2)*, Load Game, and Choose Level **only if `FlagChooseLevel` @ `0x006b0173`** — `WinMain` @ `0x0046afe2` sets that from the `-chooselevel` command-line switch, and `SetupMenus` reads it **once**, so it cannot be turned on later |
 | 9 Difficulty | Normal, Hard *(auto, `GL_MENU_DIFF2` x2)*, then toggle Health bars |
 | 20 ConfirmScreenMode | "Click here to keep screen mode." |
 | 21 Training | Training Level Area 1..5 *(auto, `GL_MENU_TRAIN1` x5)* |

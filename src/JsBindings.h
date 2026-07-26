@@ -134,7 +134,11 @@ bool EnsureClass(JSContext *ctx, JSClassID *class_id, const JSClassDef *def,
 JSValue NewActorWrapper(JSContext *ctx, Actor *actor);
 JSValue NewRoleWrapper(JSContext *ctx, Role *role);
 
-// --- the seven namespace builders --------------------------------------------
+// The Role behind a wrapper, or null when `v` is anything else. Does NOT throw on
+// a miss - callers use it to accept "a Role, or nothing", so it has to be a test.
+Role *RoleFromWrapper(JSValueConst v);
+
+// --- the nine namespace builders ---------------------------------------------
 
 JSValue NewCameraNamespace(JSContext *ctx);
 JSValue NewConsoleNamespace(JSContext *ctx);
@@ -142,6 +146,18 @@ JSValue NewActorsNamespace(JSContext *ctx);
 JSValue NewRolesNamespace(JSContext *ctx);
 JSValue NewTokensNamespace(JSContext *ctx);
 JSValue NewTriggersNamespace(JSContext *ctx);
-JSValue NewMenusNamespace(JSContext *ctx);
+// NewMenusNamespace is in Js.h: it is the one the host builds directly, because
+// `menus` is setup_menus' argument rather than a "gk" export.
+JSValue NewLevelsNamespace(JSContext *ctx);
+JSValue NewGlsNamespace(JSContext *ctx);
+JSValue NewMakeNamespace(JSContext *ctx);
+
+// --- per-TU callback teardown --------------------------------------------------
+//
+// Every TU that hands a JSValue to a native registration drops it here, and
+// js::ReleaseCallbacks in JsGk.cpp calls the lot. Each also makes its own native
+// registrations inert first, because those outlive the context.
+void ReleaseMenuCallbacks(JSContext *ctx);
+void ReleaseLevelCallbacks(JSContext *ctx);
 
 } // namespace gk::js

@@ -6437,16 +6437,23 @@ const JSCFunctionListEntry js_imgui_funcs[] = {
     JS_CFUNC_DEF("ComboSimple", 3, js_ImGui_ComboSimple),
 };
 
-int js_imgui_init(JSContext *ctx, JSModuleDef *m) {
-  return JS_SetModuleExportList(ctx, m, js_imgui_funcs,
-                                countof(js_imgui_funcs));
-}
 } // namespace
 
-JSModuleDef *js_init_module_imgui(JSContext *ctx) {
-  JSModuleDef *m = JS_NewCModule(ctx, "ImGui", js_imgui_init);
-  if (m) {
-    JS_AddModuleExportList(ctx, m, js_imgui_funcs, countof(js_imgui_funcs));
+// Deliberately not a module. Every function here is only valid between
+// NewFrame and Render, which is the window the host calls draw_gui in, so the
+// object is handed to that one callback instead of being importable from
+// anywhere. JS_SetPropertyFunctionList is also the only instantiation path that
+// honours JS_DEF_CGETSET, should this list ever grow one - JS_SetModuleExportList
+// ends in `default: abort()`.
+JSValue js_imgui_new_namespace(JSContext *ctx) {
+  JSValue ns = JS_NewObject(ctx);
+  if (JS_IsException(ns)) {
+    return ns;
   }
-  return m;
+  if (JS_SetPropertyFunctionList(ctx, ns, js_imgui_funcs,
+                                 countof(js_imgui_funcs)) < 0) {
+    JS_FreeValue(ctx, ns);
+    return JS_EXCEPTION;
+  }
+  return ns;
 }

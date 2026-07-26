@@ -638,6 +638,14 @@ JSValue NewRoleWrapper(JSContext *ctx, Role *role) {
   return obj;
 }
 
+// JS_GetOpaque, not JS_GetOpaque2: callers use this to accept "a Role, or
+// nothing" (frag data's two role slots, an ammo's role), so a miss has to be a
+// null rather than a pending exception.
+Role *RoleFromWrapper(JSValueConst v) {
+  auto *w = static_cast<RoleWrapper *>(JS_GetOpaque(v, RoleClassId));
+  return w ? w->ptr : nullptr;
+}
+
 JSValue NewRolesNamespace(JSContext *ctx) {
   if (!EnsureClass(ctx, &RoleClassId, &RoleClass, RoleProto,
                    static_cast<int>(std::size(RoleProto)))) {

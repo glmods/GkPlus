@@ -71,9 +71,11 @@ applies the unit conversions below. The full GLS field table (ids, ranges, defau
 | 0x88 | shadow_hierarchy | 0x77 | `ToHierarchy` (**owned**) |
 | 0x8c | blob_shadow | 0x5a | - |
 | 0x90 | description | 0x1a | `GetResourceString` |
-| 0x94, 0x98, 0x9c | *(runtime scratch)* | - | **not set by ToCharacter** |
-| 0xa0 | status_window_v | 0x40 | `*(1/1024)` UV |
-| 0xa4 | status_window_u | 0x3f | `*(1/1024)` UV |
+| 0x94 | derived_radius | - | **set by `ToRole`, not `ToCharacter`** — `max(bbox.x, bbox.z) * 0.5` |
+| 0x98 | derived_height | - | **set by `ToRole`** — `bbox.y` |
+| 0x9c | derived_hier_extent | - | **set by `ToRole`** — hierarchy-node extent `* size`, else 0 |
+| 0xa0 | status_window_v | 0x40 | `*(1/1024)` UV — a **float**, see below |
+| 0xa4 | status_window_u | 0x3f | `*(1/1024)` UV — a **float**, see below |
 | 0xa8 | strength | 0x29 | - (hit points; read by `Actor::Ctor`) |
 | 0xac | weapon | 0x18 | - (`33` = none; drives the Actor-subclass choice in `CreateActor`) |
 | 0xb0 | secondary_weapon | 0x19 | - |
@@ -82,7 +84,78 @@ applies the unit conversions below. The full GLS field table (ids, ranges, defau
 
 Angle unit: the game uses a 4096-step circle (sin/cos tables are 0x1000 entries).
 `CharacterDtor` frees only `customisation_hierarchy` (0x84) and `shadow_hierarchy` (0x88).
-Fields 0x94/0x98/0x9c are left uninitialised by the converter (runtime AI scratch).
+
+### 0x94/0x98/0x9c are derived geometry, not scratch
+
+Earlier revisions of this file called them "runtime AI scratch, not set by the converter".
+Half right: `ToCharacter` does not set them — **`ToRole` does**, right after converting the
+character (0x0047dec0..0x0047dfd8). It builds a bounding-box size vector from whichever
+geometry the role has:
+
+| Role has | Size vector |
+|----------|-------------|
+| a hierarchy with `+0x58` set | component-wise `hier[0x68..0x74]` differences |
+| a hierarchy with `+0x58` clear | `{1, 1, 1}` |
+| a shape | component-wise `shape[0x48..0x54]` differences |
+| neither | `{1, 1, 1}` |
+
+then stores `derived_radius = max(size.x, size.z) * 0.5` (`FLOAT_006520a0`) and
+`derived_height = size.y`, and — only when the hierarchy has more than one node —
+`derived_hier_extent = hier[0x90][0x14] * character->size`.
+
+**The consequence is a real gameplay rule, not bookkeeping:** immediately afterwards,
+
+```c
+if (character->radius_times_size == 0.0f) character->radius_times_size = derived_radius;
+if (character->height_times_size == 0.0f) character->height_times_size = derived_height;
+```
+
+so a GLS `radius`/`height` of 0 — which is the *default*, and what almost every shipped
+`character` block leaves it at — does not mean "zero-sized". It means "take the collision
+extents from the model". Any native construction path that skips this produces characters
+with no radius and no height.
+
+### The three constants, and reproducing the conversion exactly
+
+`ToCharacter`'s conversion constants, read out of `.rdata` rather than inferred:
+
+| Address | Value | Used for |
+|---------|-------|----------|
+| 0x00663ca0 | 360.0 | degrees per turn |
+| 0x00663cb0 | 4096.0 | BAM units per turn |
+| 0x00663cc0 | 65536.0 | the 16.16 fixed point `walking_speed` is stored in |
+| 0x00663c40 | 1/1024 | the status-window UV scale |
+| 0x00652190 | 1/65536 | undoes the fixed point for the walking-speed re-scale |
+
+Four details that a casual reimplementation gets wrong, all of them reproduced in
+`gk::MakeCharacter` (`src/MakeRole.cpp`):
+
+- **The degrees→BAM conversion has two association orders.** `scan acceptance angle`
+  and `angular scan rate` compute `(deg / 360) * 4096`; `aim`, `sight angle`,
+  `gun yaw angle` and `elevation angle` compute `(deg * 4096) / 360`. Same value
+  mathematically, not always the same float.
+- **`turning_speed` has no `/360`** — the GLS field is revolutions per second, so it is
+  a bare `* 4096`.
+- **`walking_speed` is rounded twice.** It is first `round(cycles * 65536)` stored as a
+  float; then, if `turning_speed > 0 && size > 0`, that *already-rounded integer* is
+  taken back to float via `* 1/65536`, divided by `size`, re-scaled by 65536 and rounded
+  again. Rounding is `FISTP` under the default control word, i.e. nearest-**even**, not
+  truncation and not `+0.5`.
+- **`status_window_u`/`v` are floats, not ints.** The stores at 0x0047df06 and 0x0047df21
+  are `MOVSS`. Both were typed `int` here and in the Ghidra DB, which is exactly the
+  mistyped-field trap in CLAUDE.md: it made the store decompile as a meaningless
+  `(int)(x * 0.0009765625)` and hid that these are normalized texture UVs.
+
+### Section-constructor defaults are extractable
+
+`ParseCharacter` @ 0x004821b0 writes each field's default straight into
+`parsed_values[id]`, so the whole default table can be read from the binary instead of
+transcribed. The stores are SSE and two encodings matter: `MOVSD` writes one slot from a
+`.rdata` double, while `MOVAPS`/`MOVUPS` writes **two adjacent slots** from a 16-byte
+constant — miss that and half the table comes out attached to the wrong ids. Booleans and
+integers are separate `MOV byte/dword ptr [reg+disp], imm` stores. All 44 of
+`ParseCharacter`'s defaults recovered this way agree with the table in
+`gls_system_notes.md`, which is the first independent check that table has had.
 
 ## 2. Projectile (0x20)
 

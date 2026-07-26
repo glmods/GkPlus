@@ -15,15 +15,20 @@ struct NamespaceEntry {
 // `actors` before `roles` only for readability - a C module's exports are only
 // materialised on import, and nothing here runs at registration time.
 //
-// One name worth knowing about: `import { console } from "gk"` shadows any
-// global `console` inside that module. Nothing collides today (QuickJS core has
-// no console object - that lives in quickjs-libc, which this port does not
-// install), but a host that adds one would.
+// `console` is the only console there is: QuickJS core provides no global one
+// (that lives in quickjs-libc, which this port does not install) and the host
+// does not add one, so log/info/warn/error/debug sit on this namespace next to
+// the game's print() and colours. A script that wants logging imports it.
+//
+// `menus` is not here on purpose: the host builds it with NewMenusNamespace and
+// passes it to setup_menus, so the one object a script can reach is the one it
+// was handed at the moment adding items is correct.
 const NamespaceEntry Namespaces[] = {
-    {"camera", NewCameraNamespace},     {"console", NewConsoleNamespace},
-    {"actors", NewActorsNamespace},     {"roles", NewRolesNamespace},
-    {"tokens", NewTokensNamespace},     {"triggers", NewTriggersNamespace},
-    {"menus", NewMenusNamespace},
+    {"camera", NewCameraNamespace},   {"console", NewConsoleNamespace},
+    {"actors", NewActorsNamespace},   {"roles", NewRolesNamespace},
+    {"tokens", NewTokensNamespace},   {"triggers", NewTriggersNamespace},
+    {"levels", NewLevelsNamespace},   {"make", NewMakeNamespace},
+    {"gls", NewGlsNamespace},
 };
 
 int InitModule(JSContext *ctx, JSModuleDef *m) {
@@ -56,6 +61,14 @@ int InitModule(JSContext *ctx, JSModuleDef *m) {
 }
 
 } // namespace
+
+// Aggregated here rather than owned by one binding TU: each namespace that holds
+// script values releases its own, and this is the single seam Script.cpp calls
+// before JS_FreeContext.
+void ReleaseCallbacks(JSContext *ctx) {
+  ReleaseMenuCallbacks(ctx);
+  ReleaseLevelCallbacks(ctx);
+}
 
 bool RegisterGkModule(JSContext *ctx) {
   // A bare specifier needs no module loader and no normalizer:
