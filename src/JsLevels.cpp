@@ -4,6 +4,7 @@
 #include "JsBindings.h"
 #include "Map.h"
 #include "Roles.h"
+#include "ScriptQueue.h"
 #include "Tokens.h"
 
 #include <cstdio>
@@ -43,18 +44,22 @@ struct LevelBinding {
   JSValue define;
   JSValue populate;
   JSValue setup;
+  JSValue message_received;
   JSValue wrapper;
 };
 
-// The three script hooks, in the order a load runs them. One table so adding a
-// fourth cannot get it read from the module but never released - LevelsAdd,
-// its error paths and ReleaseLevelCallbacks all iterate this.
+// The script hooks: the three a load runs, in that order, and then the inbox,
+// which fires during play instead. One table so adding a fifth cannot get it
+// read from the module but never released - LevelsAdd, its error paths and
+// ReleaseLevelCallbacks all iterate this.
 constexpr JSValue LevelBinding::*LevelHooks[] = {
     &LevelBinding::define,
     &LevelBinding::populate,
     &LevelBinding::setup,
+    &LevelBinding::message_received,
 };
-constexpr const char *LevelHookNames[] = {"define", "populate", "setup"};
+constexpr const char *LevelHookNames[] = {"define", "populate", "setup",
+                                          "message_received"};
 
 std::vector<LevelBinding *> Bindings;
 
@@ -86,6 +91,40 @@ void OnPopulate(CustomLevel *level, void *user) {
 
 void OnSetup(CustomLevel *level, void *user) {
   CallHook(level, user, &LevelBinding::setup, "setup");
+}
+
+// Not CallHook: this one takes the message, and it is the only hook that runs
+// outside a load - so `levels.current` is null while it runs, and the level has
+// to arrive as an argument or a module-level hook could not reach its own Level
+// at all. It comes *second* so that the documented signature stays
+// `message_received(msg)`.
+void OnMessage(CustomLevel *level, const char *json, void *user) {
+  auto *binding = static_cast<LevelBinding *>(user);
+  if (!binding || JS_IsUndefined(binding->message_received)) {
+    return;
+  }
+  JSContext *ctx = binding->ctx;
+  char where[192];
+  std::snprintf(where, sizeof(where), "message_received() for level '%s'",
+                CustomLevelTitle(level));
+
+  // The queue guaranteed this is a well-formed document, so a failure here means
+  // something the native codec accepts and QuickJS does not - worth reporting
+  // rather than swallowing.
+  JSValue message =
+      JS_ParseJSON(ctx, json, std::strlen(json), "<gkplus message>");
+  if (JS_IsException(message)) {
+    ReportException(ctx, where);
+    return;
+  }
+  JSValueConst args[] = {message, binding->wrapper};
+  JSValue result =
+      JS_Call(ctx, binding->message_received, JS_UNDEFINED, 2, args);
+  JS_FreeValue(ctx, message);
+  if (JS_IsException(result)) {
+    ReportException(ctx, where);
+  }
+  JS_FreeValue(ctx, result);
 }
 
 // --- the description object ------------------------------------------------------
@@ -415,6 +454,37 @@ JSValue LevelSpawn(JSContext *ctx, JSValueConst self, int argc,
   return JS_NewInt32(ctx, id);
 }
 
+// send(message) - puts a payload on the engine's script queue, which is what a
+// trigger firing does: this machine delivers it from the per-frame pop, every
+// other player from update 0x67. A string sends the .gcs by name, so
+// `send("wave2.gcs")` runs that file everywhere.
+//
+// Deliberately not level-scoped despite living here: the queue has one channel,
+// so the payload arrives at whichever level is loaded when it is popped, which
+// for anything sent during play is this one. It sits on Level because that is
+// where message_received is, and because inside that hook the wrapper is the only
+// handle a script has.
+JSValue LevelSend(JSContext *ctx, JSValueConst self, int argc,
+                  JSValueConst *argv) {
+  if (!LevelOf(ctx, self)) {
+    return JS_EXCEPTION;
+  }
+  if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0])) {
+    return JS_ThrowTypeError(ctx, "send(message) expects a value");
+  }
+  // ToScriptPayload produces a document either way - a JSON string for a file
+  // name - which is exactly what the queue wants, so sending skips the field
+  // without needing to re-encode anything.
+  std::string payload;
+  if (!ToScriptPayload(ctx, argv[0], &payload)) {
+    return JS_EXCEPTION;
+  }
+  if (!QueueScriptMessage(payload.c_str())) {
+    return JS_ThrowInternalError(ctx, "the script queue refused the message");
+  }
+  return JS_UNDEFINED;
+}
+
 JSValue LevelToString(JSContext *ctx, JSValueConst self, int, JSValueConst *) {
   CustomLevel *level = LevelOf(ctx, self);
   if (!level) {
@@ -432,6 +502,7 @@ const JSCFunctionListEntry LevelProto[] = {
     JS_CGETSET_DEF("loading", GetLevelLoading, nullptr),
     JS_CFUNC_DEF("locators", 1, LevelLocators),
     JS_CFUNC_DEF("spawn", 4, LevelSpawn),
+    JS_CFUNC_DEF("send", 1, LevelSend),
     JS_CFUNC_DEF("toString", 0, LevelToString),
 };
 
@@ -547,8 +618,8 @@ JSValue LevelsAdd(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
 
   CustomLevelMap map;
   std::vector<std::string> includes;
-  auto *binding = new LevelBinding{ctx, JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED,
-                                   JS_UNDEFINED};
+  auto *binding = new LevelBinding{ctx,          JS_UNDEFINED, JS_UNDEFINED,
+                                   JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED};
   auto release_hooks = [&] {
     for (JSValue LevelBinding::*hook : LevelHooks) {
       JS_FreeValue(ctx, binding->*hook);
@@ -586,7 +657,7 @@ JSValue LevelsAdd(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
   desc.reset(ctx);
 
   CustomLevel *level = AddCustomLevel(title, map, includes, OnDefine, OnPopulate,
-                                      OnSetup, binding);
+                                      OnSetup, OnMessage, binding);
   if (!level) {
     // AddCustomLevel has already said why on the console.
     JSValue err = JS_ThrowTypeError(ctx, "could not register the level '%s'",

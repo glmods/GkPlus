@@ -6,6 +6,7 @@
 #include "GLS.h"
 #include "Map.h"
 #include "Memory.h"
+#include "ScriptQueue.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -36,6 +37,7 @@ struct CustomLevel {
   CustomLevelDefine define;
   CustomLevelPopulate populate;
   CustomLevelSetup setup;
+  CustomLevelMessage message;
   void *user;
 };
 
@@ -374,6 +376,21 @@ const CustomLevelMap &CustomLevelDescription(const CustomLevel *level) {
 
 CustomLevel *CurrentCustomLevel() { return Building; }
 
+bool DispatchCustomLevelMessage(const char *json) {
+  if (!json) {
+    return false;
+  }
+  // LevelForCurrentScript, not Building: a message arrives during play, long
+  // after the load callbacks have run and cleared that. ScriptFileName is what
+  // stays set for as long as the level is loaded.
+  CustomLevel *level = LevelForCurrentScript();
+  if (!level || !level->message) {
+    return false;
+  }
+  level->message(level, json, level->user);
+  return true;
+}
+
 std::vector<CustomLevelLocator> LevelRifLocators(const char *object_name) {
   std::vector<CustomLevelLocator> out;
   Map *map = GetCurrentMap();
@@ -444,7 +461,8 @@ CustomLevel *AddCustomLevel(const char *title, const CustomLevelMap &map,
                             const std::vector<std::string> &includes,
                             CustomLevelDefine define,
                             CustomLevelPopulate populate,
-                            CustomLevelSetup setup, void *user) {
+                            CustomLevelSetup setup,
+                            CustomLevelMessage message, void *user) {
   if (!title || !*title) {
     return nullptr;
   }
@@ -470,6 +488,7 @@ CustomLevel *AddCustomLevel(const char *title, const CustomLevelMap &map,
   level->define = define;
   level->populate = populate;
   level->setup = setup;
+  level->message = message;
   level->user = user;
 
   // Only levels that name `includes` need a script at all - those are the ones
@@ -500,6 +519,7 @@ void ClearCustomLevelActions() {
     level->define = nullptr;
     level->populate = nullptr;
     level->setup = nullptr;
+    level->message = nullptr;
     level->user = nullptr;
   }
 }
@@ -514,9 +534,15 @@ CustomLevelSystem::CustomLevelSystem() {
   DetourAttach(&FreeParsedObjectList, HookedFreeParsedObjectList);
   DetourAttach(&LoadGLS, HookedLoadGLS);
   DetourAttach(&ExecuteAllCommands, HookedExecuteAllCommands);
+
+  // No hook of its own - ScriptQueueSystem owns those, and this only says where
+  // a message payload goes once it has one. Order between the two subsystems
+  // does not matter: both sides are file statics.
+  SetScriptMessageHandler(DispatchCustomLevelMessage);
 }
 
 CustomLevelSystem::~CustomLevelSystem() {
+  SetScriptMessageHandler(nullptr);
   DetourDetach(&ConvertParsedObjects, HookedConvertParsedObjects);
   DetourDetach(&FreeParsedObjectList, HookedFreeParsedObjectList);
   DetourDetach(&LoadGLS, HookedLoadGLS);

@@ -10,7 +10,7 @@
 // Copy jsconfig.json and ..\types\ alongside it for autocomplete and type
 // checking in an editor - the JSDoc annotations below are what drive it.
 
-import { actors, camera, console, levels, tokens } from "gk";
+import { actors, camera, console, fx, game, levels, light, tokens, world } from "gk";
 // A level module is an ordinary module, imported the ordinary way. Its namespace
 // - `map` plus the hooks - is exactly the description `levels.add` wants, so
 // there is nothing else to unpack. Drop this line (and the add() below) if you
@@ -86,6 +86,52 @@ export function draw_gui(ImGui) {
     );
     if (slider.changed) {
       camera.distance = slider.value;
+    }
+
+    // The camera's Euler angles, in degrees - what `SET CAMERA ORI` sets.
+    // Assigning the whole object costs one matrix rebuild instead of three.
+    const yaw = ImGui.SliderFloat("camera yaw", camera.yaw, 0, 360);
+    if (yaw.changed) {
+      camera.orientation = { yaw: yaw.value };
+    }
+
+    // game.difficulty replaces the EASY/MEDIUM/HARD/EXTREME gate commands: they
+    // are "re-run this line only on a match", which is an ordinary `if`.
+    ImGui.Text(`difficulty: ${game.difficulty}, mode: ${game.mode}`);
+
+    const god = ImGui.Checkbox("God mode", game.god_mode);
+    game.god_mode = god.value;
+
+    const hovered = game.actor_under_cursor;
+    ImGui.Text(hovered ? `under cursor: #${hovered.id}` : "under cursor: none");
+
+    // The level's atmosphere. `world.fog` reads through a pointer that is null
+    // outside a level, so `available` is the guard.
+    const sun = ImGui.SliderFloat("sun angle", world.sun_angle, 0, 360);
+    if (sun.changed) {
+      world.sun_angle = sun.value;
+    }
+    if (world.fog.available) {
+      const fog = ImGui.SliderFloat("fog", world.fog.value, 0, 1);
+      if (fog.changed) {
+        world.fog.value = fog.value;
+      }
+    } else {
+      ImGui.Text("no level loaded, so no fog");
+    }
+
+    // The command-backed namespaces run the game's own handler, so their
+    // defaults are the console's: explode() with no argument uses the cursor.
+    if (ImGui.Button("Explode at cursor")) {
+      fx.explode();
+    }
+    ImGui.SameLine();
+    if (ImGui.Button("Rain")) {
+      fx.rain(true);
+    }
+    ImGui.SameLine();
+    if (ImGui.Button("Fade in")) {
+      light.fade_in();
     }
 
     if (ImGui.Button("Heal everything")) {

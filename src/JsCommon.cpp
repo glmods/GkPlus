@@ -3,6 +3,8 @@
 #include "Console.h"
 #include "Core.h"
 #include "Js.h"
+#include "Json.h"
+#include "ScriptQueue.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -544,6 +546,62 @@ bool GetVec3ArrayProp(JSContext *ctx, JSValueConst obj, const char *name,
   }
   JS_FreeValue(ctx, list);
   return true;
+}
+
+bool ToScriptPayload(JSContext *ctx, JSValueConst v, std::string *out) {
+  if (JS_IsUndefined(v) || JS_IsNull(v)) {
+    return true;
+  }
+  // A string is a file name, encoded as the JSON string it will travel as - the
+  // same thing the engine-side writer hooks do to a bare name. Storing it raw
+  // instead would make this the one field in the game holding an unencoded path.
+  if (JS_IsString(v)) {
+    const char *s = JS_ToCString(ctx, v);
+    if (!s) {
+      return false;
+    }
+    *out = json::Quote(s);
+    JS_FreeCString(ctx, s);
+    return true;
+  }
+
+  JSValue json = JS_JSONStringify(ctx, v, JS_UNDEFINED, JS_UNDEFINED);
+  if (JS_IsException(json)) {
+    return false;
+  }
+  // JSON.stringify yields undefined - not a document - for a function, a symbol
+  // or undefined itself. Without this, JS_ToCString would hand back the literal
+  // text "undefined" and the queue would go looking for a file called that.
+  if (!JS_IsString(json)) {
+    JS_FreeValue(ctx, json);
+    JS_ThrowTypeError(ctx, "a message must be a JSON-serialisable value");
+    return false;
+  }
+  const char *s = JS_ToCString(ctx, json);
+  JS_FreeValue(ctx, json);
+  if (!s) {
+    return false;
+  }
+  // JS_JSONStringify output is a valid document by construction, which is this
+  // side of the queue's "always JSON" invariant - the writer hooks are the other.
+  *out = s;
+  JS_FreeCString(ctx, s);
+  return true;
+}
+
+bool GetScriptPayloadProp(JSContext *ctx, JSValueConst obj, const char *name,
+                          std::string *out) {
+  JSValue v = JS_UNDEFINED;
+  bool present = false;
+  if (!GetOptionalProp(ctx, obj, name, &v, &present)) {
+    return false;
+  }
+  if (!present) {
+    return true;
+  }
+  bool ok = ToScriptPayload(ctx, v, out);
+  JS_FreeValue(ctx, v);
+  return ok;
 }
 
 JSValue NewNamespace(JSContext *ctx, const JSCFunctionListEntry *props,

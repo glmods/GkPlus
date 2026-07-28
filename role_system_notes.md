@@ -323,6 +323,10 @@ Population paths:
   The insert helpers are `VulnList_AddEntryStart` (0x0044ea80) and that one; both take the
   list *header* in ECX and invalidate `cached_array`.
 
-GkPlus exposes each entry as a `Vulnerability` userdata (`src/Vulnerability.h`) with
-`role`, `vulnerability_role`, `delay`, `duration`, `script` (nil when absent), `type` and
-`actor_scoped`, reachable as `Role.vulnerabilities` / `Actor.vulnerabilities`.
+GkPlus mirrors the struct in `src/Vulnerability.h` (`role`, `vulnerability_role`, `delay`,
+`duration`, `script`, `type`, `actor_scoped`). **It is not exposed to scripts** - an earlier
+revision of this note claimed a `Vulnerability` userdata reachable as `Role.vulnerabilities` /
+`Actor.vulnerabilities`, and no such binding exists: `Vulnerability` appears in `src/Js*.cpp` only
+as the `VulnerabilityType` keyword for `make.role`'s `interface_beam_effect`. Worth knowing before
+relying on it, and worth remembering that nothing in the JS layer *reads* `script` - which is what
+made storing JSON in that field (see `src/ScriptQueue.h`) a writers-only change.

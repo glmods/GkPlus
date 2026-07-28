@@ -373,14 +373,20 @@ int at **+0x04**.
 
 `ToFragData` builds `role`/`replace_role` via `ToRole`. `FragDataDtor` frees `remove`.
 
-### ReplaceDestructibility (0x10) - "swap for another object"
+### ReplaceDestructibility (0x10) - "run a script on death"
 
 ```
 +0x00 vtbl (ReplaceDestructibilityDtor)
 +0x04 tag = 4
-+0x08 char* name     // GLS 'name' 0x00 (owned)
++0x08 char* script   // GLS 'name' 0x00 (owned) - a .gcs FILE NAME, see below
 +0x0c bool  replace  // GLS 'replace' 0x69
 ```
+
+**+0x08 is a script file name, not an identifier**, and the section heading here used to say
+"swap for another object" on the strength of the GLS keyword alone. Its only reader is `Frag`'s
+`case 4` (below), which passes it to `QueueScriptExecution` - so the variant runs a `.gcs` when
+the object dies. `ReplaceDestructibilityDtor` @ 0x00483d00 frees it; nothing else touches it.
+Mirrored as `ReplaceDestructibility::script`.
 
 ### Runtime consumption (`Frag` @ 0x0052e220)
 
@@ -390,7 +396,13 @@ When an actor dies with a destructibility, `Frag` reads `destructibility->tag`:
 - **case 3 (FragData)** - marks the actor (`field_0x7c |= 0x10`); if `blast_damage != 0`
   and `blast_range > 0`, applies area damage in `blast_range^2`; then `SpawnRole`s
   `replace_role` at the actor's position/orientation. If the replacement's hierarchy has
-  node slot 3 present, additional attachment logic runs.
+  node slot 3 present, additional attachment logic runs. It does **not** queue a script -
+  `Frag` contains exactly one `QueueScriptExecution` call and it is in case 4.
+- **case 4 (ReplaceDestructibility)** - `QueueScriptExecution(destructibility + 8)`, i.e. it
+  puts the `script` field on the script queue, then reads `replace` at `+0x0c` into the same
+  local that case 3 fills from `FragData::replace` (so the flag means the same thing in both).
+  This is one of the seven callers of `QueueScriptExecution`; the full inventory is in
+  `threading_model_notes.md`.
 
 (tag `2` is unused by any shipped converter.)
 

@@ -34,6 +34,17 @@ struct Weapon {
 };
 static_assert(sizeof(Weapon) == 0x28);
 
+// Every slot below was checked against the `RET` operand of the function the
+// game puts in it. __thiscall is callee-clean, so `RET n` is ground truth for
+// how many bytes of arguments the callee pops, and a declaration that disagrees
+// drifts ESP by the difference on **every call** - the failure described under
+// "Function Calling Convention" in CLAUDE.md, which surfaces as an access
+// violation with EIP on the stack, nowhere near the call.
+//
+// Nine declarations were wrong and are fixed below. Where the argument's purpose
+// is not known it is `int` with a comment: the arity is measured, the type is
+// not, and one dword is what the slot pops either way. Slot 0 is exempt - MSVC's
+// scalar deleting destructor always takes a hidden `int flags`.
 struct Actor {
   int field0x4;
   bool field0x8;
@@ -45,7 +56,13 @@ struct Actor {
   // entries are only pool-freed by ~Actor when `actor_scoped` is set (the
   // role-supplied ones stay owned by the Role).
   VulnerabilityList vulnerabilities; // 0x10
-  char pad0x20[0x10];
+  char pad0x20[8];
+  // 0x28/0x2c: written only by ChangeOwnerAndTeam (slot 39), which also puts
+  // them in its 0x58 update. The DB's name for that slot says "owner"; nothing
+  // measured here confirms it, so they keep the field0xNN convention. They are
+  // exposed because a team change has to preserve them - see JsActors.cpp.
+  int field0x28;
+  int field0x2c;
   float alarm_delay;          // 0x30
   char pad0x34[0xc];
   void *attachment;           // 0x40 ref-counted; released by slot 52
@@ -143,9 +160,9 @@ struct Actor {
   // 19  base out-params 0.0; CharacterActor returns shield_value (+0x2d0).
   virtual void GetShieldValue(float *) = 0;
   // 20  base no-op; CharacterActor destroys an armor piece, broadcast 0xa6/0xa8.
-  virtual void ApplyArmorDamage() = 0;
+  virtual void ApplyArmorDamage(int) = 0; // RET 0x4: one argument, purpose unknown
   // 21  base no-op; CharacterActor destroys a shield piece, broadcast 0xa6/0xa7.
-  virtual void ApplyShieldDamage() = 0;
+  virtual void ApplyShieldDamage(int) = 0; // RET 0x4: one argument, purpose unknown
   // 22  base returns 100; CharacterActor returns the real ammo count.
   virtual int GetAmmoCount() = 0;
   // 23  base 0; CharacterActor returns the cannot-fire gate (+0x304). Paired w/ slot 95.
@@ -157,7 +174,7 @@ struct Actor {
   // 26  base no-op (ignores arg); MobileActor stores the team-slot index. Setter for 25.
   virtual void SetField0x18c(int) = 0;
   // 27  no-op, never overridden anywhere.
-  virtual void Stub27() = 0;
+  virtual void Stub27(int) = 0; // RET 0x4: one argument, purpose unknown
   // 28  write armor_value (+0xf0). Setter for slot 18.
   virtual void SetArmorValue(float) = 0;
   // 29  base no-op; CharacterActor writes shield_value (+0x2d0). Setter for slot 19.
@@ -204,15 +221,15 @@ struct Actor {
   // 54  base RET 4 (discards); MobileActor stores it to +0x188. Setter for slot 30.
   virtual void SetField0x188(bool) = 0;
   // 55  base no-op; ProjectileActor's is the physics step (integrate/collide/damage).
-  virtual void OnPrePhysics() = 0;
+  virtual void OnPrePhysics(int, int, int) = 0; // RET 0xc: three arguments
   // 56  base no-op.
-  virtual void OnCollisionResponse() = 0;
+  virtual void OnCollisionResponse(int, int) = 0; // RET 0x8: two arguments
   // 57  ray/shape intersection; Pickup/Projectile return 0 to opt out of being hit.
   virtual void Raycast(int *, int, int, int *) = 0;
   // 58  swept intersection; same opt-out as slot 57.
   virtual void SweepTest(int *, int, int, int, int *) = 0;
   // 59  base no-op; in PickupActor this slot is really SetPickupType.
-  virtual void OnDamageReceived() = 0;
+  virtual void OnDamageReceived(int, int) = 0; // RET 0x8: two arguments
   // 60  base false; MobileActor: alive && +0x17c != a global sentinel.
   virtual bool IsTargetable() = 0;
   // 61  visible flag (+0x10d).
@@ -223,14 +240,29 @@ struct Actor {
   virtual bool CanBePickedUp() = 0;
   // 64  Frag: scoring, splash, debris; broadcast 0x6b/0xba (0x37/0x38 for projectiles).
   virtual void Frag() = 0;
-  // 65  set is_dead, run cleanup, broadcast 0x49.
-  virtual void Delete() = 0;
+  // 65  set is_dead, run cleanup, and - **only if the argument is true** -
+  //     broadcast 0x49. RET 0x4: the flag was missing from this declaration, so
+  //     every call both drifted ESP and gated the broadcast on stack garbage.
+  //     Every game call site passes 1.
+  virtual void Delete(bool broadcast) = 0;
   // 66  base no-op; PickupActor stores the script name and broadcasts 0x84.
   virtual void Associate(char *script, char one_shot) = 0;
   // 67  base no-op; MobileActor broadcasts 0x97.
   virtual void Dissociate() = 0;
   // 68  damage/heal pipeline: absorb via armor/shield, frag at 0 strength.
-  virtual bool ApplyDamage(float, bool) = 0;
+  //
+  // **Three stack arguments, not two.** Both implementations end in `RET 0xc`
+  // and __thiscall is callee-clean, so declaring two made every call pop four
+  // bytes more than the caller pushed - the ESP drift CLAUDE.md warns about,
+  // which surfaces as an access violation with EIP on the stack, far from here.
+  //
+  // The third is the **attacker's team id**, or -1 for none.
+  // `MobileActor::ApplyDamage` @ 0x00535ac0 uses it two ways: in Deathmatch it
+  // credits the frag when it differs from the victim's team, and it is the
+  // payload of the 0x9b update it broadcasts. `Actor::ApplyDamage` @ 0x0052f3b0
+  // ignores it - the base is the rule for actors with no shield and no
+  // networked health, and its replication comes from the `Frag` it ends in.
+  virtual bool ApplyDamage(float, bool, int attacker_team) = 0;
   // 69  base no-op; health-changed hook.
   virtual void OnHealthChanged() = 0;
   // 70  really "Update": base syncs model position + broadcast 0x6f, but every
@@ -248,7 +280,7 @@ struct Actor {
   // 75  base false; PickupActor returns has_associated_script (+0x148).
   virtual bool HasCustomAnimation() = 0;
   // 76  base no-op; TrackObjectActor installs a Catmull-Rom spline path.
-  virtual void OnAnimationComplete() = 0;
+  virtual void OnAnimationComplete(int, int, int) = 0; // RET 0xc: three arguments
   // 77  base no-op; TrackObjectActor starts a leg of motion, broadcast 0xad/0xae.
   virtual void OnAnimationEvent() = 0;
   // 78  set target, broadcast 0x56.
@@ -360,7 +392,8 @@ struct MobileActor : Actor {
   // 85  append a tag-10 order record (0x28 bytes) to the order queue (+0x1f0).
   virtual void QueueOrderKind10(int) = 0;
   // 86  append a tag-1 order record carrying a Vec3.
-  virtual void QueueOrderPosition(Vec3 *, int, char) = 0;
+  // RET 0x10: four arguments, one more than was declared.
+  virtual void QueueOrderPosition(Vec3 *, int, char, int) = 0;
   // 87  append a tag-0 order record.
   virtual void QueueOrderTarget(int, char) = 0;
   // 88  issue a move order, gated on can_turn, strength and priority.

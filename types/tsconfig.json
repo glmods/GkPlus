@@ -5,7 +5,10 @@
     "must NOT - an unused directive is itself an error. Run it after touching",
     "either the declarations or the bindings they describe:",
     "",
-    "    npx tsc -p types/tsconfig.json"
+    "    npx -y -p typescript tsc -p types/tsconfig.json",
+    "",
+    "`-p typescript` is not optional: TypeScript is not a dependency of this repo,",
+    "so a bare `npx tsc` refuses to run rather than fetching it."
   ],
   "compilerOptions": {
     "target": "ES2023",

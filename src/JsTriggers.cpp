@@ -1,8 +1,10 @@
 #include "Triggers.h"
 
 #include "JsBindings.h"
+#include "ScriptQueue.h"
 
 #include <iterator>
+#include <string>
 #include <vector>
 
 namespace gk::js {
@@ -115,7 +117,8 @@ JSValue TriggersCreate(JSContext *ctx, JSValueConst, int argc,
     return JS_EXCEPTION;
   }
 
-  const char *script = nullptr;
+  std::string script;
+  bool has_script = false;
   std::vector<const char *> target_names;
   TriggerList targets{};
   InitList(&targets);
@@ -124,26 +127,25 @@ JSValue TriggersCreate(JSContext *ctx, JSValueConst, int argc,
     for (const char *name : target_names) {
       JS_FreeCString(ctx, name);
     }
-    if (script) {
-      JS_FreeCString(ctx, script);
-    }
   };
 
+  // A string is a .gcs name, as it always was; an object is a message that
+  // reaches the level's message_received when the trigger fires, on every
+  // machine. ToScriptPayload encodes the second and leaves the first alone - see
+  // ScriptQueue.h for what the engine then does with each.
   {
     JSValue v = JS_GetPropertyStr(ctx, opts, "script");
     if (JS_IsException(v)) {
       DeleteList(&targets);
       return JS_EXCEPTION;
     }
-    if (!JS_IsUndefined(v) && !JS_IsNull(v)) {
-      script = JS_ToCString(ctx, v);
-      if (!script) {
-        JS_FreeValue(ctx, v);
-        DeleteList(&targets);
-        return JS_EXCEPTION;
-      }
-    }
+    has_script = !JS_IsUndefined(v) && !JS_IsNull(v);
+    bool ok = !has_script || ToScriptPayload(ctx, v, &script);
     JS_FreeValue(ctx, v);
+    if (!ok) {
+      DeleteList(&targets);
+      return JS_EXCEPTION;
+    }
   }
 
   {
@@ -181,8 +183,16 @@ JSValue TriggersCreate(JSContext *ctx, JSValueConst, int argc,
     JS_FreeValue(ctx, list);
   }
 
-  RegisterTriggers(static_cast<TriggerKind>(kind), coords, value, targets,
-                   reinterpret_cast<const unsigned char *>(script), team);
+  {
+    // ToScriptPayload has already encoded it, so the RegisterTriggers hook must
+    // not quote it a second time.
+    EncodedPayloadScope encoded;
+    RegisterTriggers(static_cast<TriggerKind>(kind), coords, value, targets,
+                     has_script ? reinterpret_cast<const unsigned char *>(
+                                      script.c_str())
+                                : nullptr,
+                     team);
+  }
   // No DeleteList here - RegisterTriggers already consumed `targets`.
   release();
   return JS_UNDEFINED;

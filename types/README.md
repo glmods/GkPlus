@@ -24,7 +24,7 @@ Copy `examples/jsconfig.json` and this folder next to your script:
 VS Code picks `jsconfig.json` up on its own. On the command line:
 
 ```bash
-npx tsc -p jsconfig.json
+npx -y -p typescript tsc -p jsconfig.json
 ```
 
 Annotate the two entry points so the checker knows what it is looking at -

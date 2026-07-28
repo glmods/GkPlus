@@ -9,10 +9,22 @@ void Print(const char *what) {
   fn(what);
 }
 
-void ExecuteCommand(const char *cmd) {
+bool ExecuteCommand(const char *cmd) {
+  // The length check is ours, not the game's - see the note in Console.h. Done
+  // here rather than in the binding so that every caller inherits it.
+  if (cmd == nullptr) {
+    return false;
+  }
+  size_t length = 0;
+  while (cmd[length] != '\0') {
+    if (++length > static_cast<size_t>(kConsoleCommandLineMax)) {
+      return false;
+    }
+  }
   FastCall<void, const char *> fn;
   GetObjectAtOffset(fn, 0x004d6090);
   fn(cmd);
+  return true;
 }
 
 void ExecuteCommandLine(const char *cmdline) {
@@ -52,9 +64,47 @@ unsigned *GetConsoleCursorColor() {
   return p;
 }
 
-CommandList *GetConsoleCommandList() {
-  CommandList *p;
-  GetObjectAtOffset(p, 0x007b6aa8);
+int GetRegisteredCommandCount() {
+  int *p;
+  GetObjectAtOffset(p, 0x007b6a70);
+  return *p;
+}
+
+int GetCommandTableBucketCount() {
+  int *p;
+  GetObjectAtOffset(p, 0x007b6a74);
+  return *p;
+}
+
+CommandListElem **GetCommandTable() {
+  CommandListElem **p;
+  GetObjectAtOffset(p, 0x007b6a7c);
   return p;
+}
+
+int GetCommandCondition() {
+  int *p;
+  GetObjectAtOffset(p, 0x006a642c);
+  return *p;
+}
+
+void ForEachConsoleCommand(void *user,
+                           void (*fn)(void *, const CommandData *)) {
+  CommandListElem **buckets = GetCommandTable();
+  const int count = GetCommandTableBucketCount();
+  if (buckets == nullptr || count <= 0) {
+    return;
+  }
+  // Walk every bucket rather than counting down from NumRegisteredCommands the
+  // way CommandListCommands does: that loop walks off the end of the array when
+  // the count and the chains disagree, which they would as soon as anything
+  // registers a command without bumping the counter.
+  for (int i = 0; i < count; ++i) {
+    for (CommandListElem *e = buckets[i]; e != nullptr; e = e->next) {
+      if (e->command != nullptr) {
+        fn(user, e->command);
+      }
+    }
+  }
 }
 } // namespace gk

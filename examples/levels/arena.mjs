@@ -16,7 +16,7 @@
 // What is *not* replaced is the .rif. Geometry still comes out of the game's own
 // asset files; this module supplies everything the two script files used to.
 
-import { console } from "gk";
+import { console, game, triggers } from "gk";
 import { roles as bugRoles } from "../headers/bug.mjs";
 
 /** @type {import("gk").LevelMap} */
@@ -140,12 +140,56 @@ export function setup(level) {
     "give and equip elint mini_plasma_bolts",
     "give elint repair_arm",
 
-    // A death trigger, armed the way a .gcs arms one: the script it names is
-    // still a .gcs on disk - triggers fire console files, not JS.
+    // A death trigger, armed the way a .gcs arms one: it names a .gcs on disk,
+    // and that keeps working unchanged.
     "add trigger death crtbaa.gcs gunlok",
   ]) {
     console.execute(command);
   }
 
+  // The same trigger, armed from JS and carrying *data* instead of a file name.
+  // The object is JSON-encoded, travels the engine's own script queue - so every
+  // machine in a multiplayer game gets it - and arrives at message_received
+  // below. A string in that field would still mean "run this .gcs".
+  triggers.create({
+    kind: triggers.kind.death,
+    targets: ["elint"],
+    script: { kind: "unit_lost", who: "elint" },
+  });
+
   console.log(`${level.title}: setup done`);
+}
+
+/**
+ * The level's inbox: whatever a trigger, a pickup or another machine put on the
+ * script queue that was not a file name.
+ *
+ * This runs during play, not during a load, which is why the level arrives as an
+ * argument - `levels.current` is null outside the load hooks, so there would
+ * otherwise be no way for a module-level function to reach its own Level.
+ *
+ * @param {any} msg the payload, already parsed - its shape is the sender's
+ * @param {import("gk").Level} level
+ */
+export function message_received(msg, level) {
+  switch (msg.kind) {
+    case "unit_lost":
+      console.log(`${level.title}: lost ${msg.who}`);
+      // A message is delivered on *every* machine, and send() rebroadcasts - so
+      // sending from a handler without this guard would emit one copy per player.
+      // `simulation_running` is true only where the simulation runs: single
+      // player, or the multiplayer host.
+      if (game.simulation_running) {
+        level.send({ kind: "mission_failed" });
+      }
+      break;
+
+    case "mission_failed":
+      // Not guarded: this only shows a screen locally, and every machine should.
+      console.execute("stats screen");
+      break;
+
+    default:
+      console.warn(`${level.title}: unhandled message ${JSON.stringify(msg)}`);
+  }
 }

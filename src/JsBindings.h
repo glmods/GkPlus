@@ -59,6 +59,33 @@ bool GetFloatProp(JSContext *ctx, JSValueConst obj, const char *name,
 bool GetVec3ArrayProp(JSContext *ctx, JSValueConst obj, const char *name,
                       Vec3 *out, int count);
 
+// --- script-queue payloads ---------------------------------------------------
+
+// What a script writes into one of the engine's script-name fields - a trigger's
+// script, a pickup's associated script, an interface beam's, a destructibility's -
+// now that those fields carry JSON (see ScriptQueue.h). The result is always a
+// complete JSON document, and the value's type picks which:
+//
+//   * a **string** is a .gcs file name, encoded as a JSON string. That is exactly
+//     what the engine-side writer hooks do to a bare name, so a field written from
+//     a script and one written from a .gls end up looking the same.
+//   * **anything else** is a message, JSON-encoded, and arrives at a script
+//     level's `message_received` instead of being opened as a file.
+//
+// Filling one of GkPlus's own structs with the result needs nothing further
+// (make.role). Passing it to an engine *setter* does: wrap that call in an
+// EncodedPayloadScope, or the writer hook will quote the document again.
+//
+// undefined and null leave *out alone, so a caller's default survives. False
+// means an exception is pending - including for a value JSON.stringify refuses,
+// which would otherwise store the word "undefined" as a file name.
+bool ToScriptPayload(JSContext *ctx, JSValueConst v, std::string *out);
+
+// The same, read off a property. Absent, undefined and null all leave *out
+// alone.
+bool GetScriptPayloadProp(JSContext *ctx, JSValueConst obj, const char *name,
+                          std::string *out);
+
 // --- namespace objects -------------------------------------------------------
 
 // A plain object carrying `props`. This is the only way accessors get installed
@@ -138,10 +165,54 @@ JSValue NewRoleWrapper(JSContext *ctx, Role *role);
 // a miss - callers use it to accept "a Role, or nothing", so it has to be a test.
 Role *RoleFromWrapper(JSValueConst v);
 
-// --- the nine namespace builders ---------------------------------------------
+// --- the namespace builders ---------------------------------------------------
 
 JSValue NewCameraNamespace(JSContext *ctx);
 JSValue NewConsoleNamespace(JSContext *ctx);
+// Game-wide state that belongs to no other namespace: difficulty, the cheat and
+// render flags, the selection, the session toggles.
+JSValue NewGameNamespace(JSContext *ctx);
+// The level's atmosphere - sun, ambient light and fog. Separate from `game`
+// because it is per-level state rather than per-session, and it goes away with
+// the level: every `fog` accessor reports nothing while FogSystem is null.
+JSValue NewWorldNamespace(JSContext *ctx);
+
+// The broadcast-free console commands, as typed namespaces (src/JsCommands.cpp).
+// Unlike everything above, these format and dispatch the game's own command
+// rather than calling a native: every one of those handlers *is* an argument
+// parser, so running it is faithful by construction. See the header comment
+// there for why the split falls where it does.
+JSValue NewFxNamespace(JSContext *ctx);
+JSValue NewLightNamespace(JSContext *ctx);
+JSValue NewObjectivesNamespace(JSContext *ctx);
+JSValue NewMusicNamespace(JSContext *ctx);
+JSValue NewScreenNamespace(JSContext *ctx);
+JSValue NewUnitsNamespace(JSContext *ctx);
+JSValue NewInventoryNamespace(JSContext *ctx);
+JSValue NewTracksNamespace(JSContext *ctx);
+JSValue NewDemoNamespace(JSContext *ctx);
+JSValue NewScriptNamespace(JSContext *ctx);
+
+// Formats `name` followed by `argv` into a console command line and runs it.
+// Numbers become locale-independent decimals, booleans ON/OFF, {x,y,z} three
+// numbers, arrays their elements, and undefined/null stop the line (which is how
+// every optional console argument is spelled). Throws on a string containing
+// whitespace - the console splits on it and has no quoting - and on a line over
+// kConsoleCommandLineMax, which the engine would otherwise copy past the end of
+// its 252-byte buffer.
+//
+// Exported so `camera` and `console` can carry their own command-backed members
+// beside their native ones.
+JSValue RunConsoleCommand(JSContext *ctx, const char *name, int argc,
+                          JSValueConst *argv);
+// The same for a command whose name lives in glres<lang>.dll (ids 10000..10014).
+JSValue RunLocalizedConsoleCommand(JSContext *ctx, unsigned resource_id,
+                                   int argc, JSValueConst *argv);
+// For a handler that consumes the rest of the line (`CopyRemainingArgs` rather
+// than `ConsoleParseWord`) - LOG, SAY, WAIT FOR, PLAY FMV. Whitespace inside a
+// string argument is meaningful there, so it is allowed rather than refused.
+JSValue RunConsoleTextCommand(JSContext *ctx, const char *name, int argc,
+                              JSValueConst *argv);
 JSValue NewActorsNamespace(JSContext *ctx);
 JSValue NewRolesNamespace(JSContext *ctx);
 JSValue NewTokensNamespace(JSContext *ctx);

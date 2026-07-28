@@ -119,7 +119,8 @@ Overlay configuration in `vcpkg-configuration.json`.
    (each member detaches its detours in its dtor), commits.
 
 `Subsystems` holds only the **hook-installing** subsystems — `MusicSystem`, `DebugSystem`,
-`GUISystem`, `InputFixSystem`, `CustomMenuSystem`, `CustomLevelSystem`, `ScriptSystem`.
+`GUISystem`, `InputFixSystem`, `CustomMenuSystem`, `ScriptQueueSystem`, `CustomLevelSystem`,
+`ScriptSystem`.
 Everything else is struct-only
 or a native-API wrapper that resolves its offsets lazily per call (`GetObjectAtOffset` is cheap
 because `GetBaseAddress()` caches), so those subsystems need no lifecycle object.
@@ -176,6 +177,8 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 | `src/List.h` | `List<T>` / `List_Member<T>` / `List_Member_Base<T>` — layout mirror of AvP's `list_tem.hpp`, with sentinel-safe `begin()`/`end()` |
 | `src/HashTable.h` | `HashTableBase<T>` / `HashTable<T>` — layout mirror of AvP's `Hash_tem.hpp`, with bucket-walking `begin()`/`end()` |
 | `src/Memory.h/cpp` | `pool_alloc`/`pool_free` and the `pool_unique_ptr`/`pool_string` ownership markers |
+| `src/Json.h/cpp` | `gk::json::Classify` / `Quote` / `Object` — the script queue's JSON. **The codec is QuickJS** (`JS_ParseJSON` / `JS_JSONStringify`) on a **private `JSRuntime` behind a lock**, because this runs on both game threads and the host's runtime may only be used from one. No modules and no scripts in it, so nothing there is observable from a script. See the `JS_UpdateStackTop` rule in the QuickJS conventions — sharing the runtime across threads disarms its stack guard. Everything in it is UTF-8; codepages are `Encoding.h`'s job |
+| `src/Encoding.h/cpp` | `Utf8FromGameText` / `GameTextFromUtf8` — CP_ACP ↔ UTF-8 via `MultiByteToWideChar`/`WideCharToMultiByte`. **The script queue's edges.** Everything the engine holds in a `char *` is ANSI (a `.gls` is read as bytes; `fopen` reads the codepage) and JSON is UTF-8, so a name is transcoded on the way into a payload and back on the way to `ExecuteCommandFile`. A conversion that fails returns its input unchanged |
 | `src/Varint.h` | Variable-length integer encode/decode utility (currently no callers) |
 
 ### Subsystem sources (struct headers + native API)
@@ -184,11 +187,11 @@ Each pair is a header of decompiled structs/enums plus native free-function decl
 `.cpp` implementing them (offset resolution + any behavioral hooks): `src/Actors`, `src/Roles`,
 `src/Map`, `src/Vulnerability` (header-only), `src/Music`, `src/Math`, `src/Menu`, `src/Tokens`,
 `src/Triggers`, `src/Console`, `src/Misc`, `src/Camera`, `src/Debug`, `src/GUI`, `src/InputFix`,
-`src/CustomMenu`, `src/CustomLevel`, `src/Script`, `src/MakeRole` (native constructors, see
-below).
+`src/CustomMenu`, `src/ScriptQueue`, `src/CustomLevel`, `src/Script`, `src/MakeRole` (native
+constructors, see below).
 `src/GLS.h/cpp` is the model the rest now follow. The behavioral-hook subsystems (`Music`, `Debug`,
-`GUI`, `InputFix`, `CustomMenu`, `CustomLevel`, `Script`) expose a `*System` RAII class constructed
-by `entry.cpp`; the others are pure struct + native-API.
+`GUI`, `InputFix`, `CustomMenu`, `ScriptQueue`, `CustomLevel`, `Script`) expose a `*System` RAII
+class constructed by `entry.cpp`; the others are pure struct + native-API.
 
 ### Script host (`src/Script.h/cpp`)
 
@@ -402,13 +405,129 @@ not the file stack, and nothing afterwards recovers — a verbatim copy of a shi
 fails identically. Anything making repeated `LoadGLS` calls (`gls.probe`, `gls.try_parse`,
 a level's `includes`) has to treat the first failure as terminal.
 
+### The script queue carries JSON (`src/ScriptQueue.h/cpp`)
+
+Gunlok has exactly one channel for "something happened, react to it", and it moves **file names**:
+a trigger fires, `QueueScriptExecution` @ 0x00505080 pushes a `.gcs` name onto `ScriptQueue`
+@ 0x007ba35c *and* broadcasts it as update `0x67`, and every machine runs its own local copy of
+that file. `ScriptQueueSystem` redefines that payload — and the fields it comes from — as **a JSON document**.
+**This is visible on disk and deliberately breaking**: `SaveGame` serialises a trigger's script name
+verbatim, so a save written by this build carries JSON and will not restore correctly in an unpatched
+Gunlok (see `save_system_notes.md`). Reading an older save still works, through the residual path
+below.
+
+- a JSON **string** is the legacy meaning — it names a `.gcs`, run exactly where and when the
+  engine would have run it;
+- **anything else** is a message, handed to `SetScriptMessageHandler`'s handler instead of to the
+  file system. `CustomLevel` installs `DispatchCustomLevelMessage`, which is what makes a script
+  level's `message_received` fire.
+
+**The encoding happens where the value is written, not where it is queued.** Eight hooks: four
+*writers* that quote the bare name the engine hands them, so a script-name field holds a document
+from the moment it is set, and four on the queue itself.
+
+| Hook | Address | Role |
+|---|---|---|
+| `RegisterTriggers` | 0x0043e240 | writer: `TriggerData::script_name`. Covers all 23 game-side registrations — 21 branches of `CommandAddTrigger`, plus `LoadLevel` and `Frag` |
+| `PickupActor::Associate` | 0x005469f0 | writer: `associated_script`. The only implementation that stores — `Actor::Associate` @ 0x0054e640 is a `RET 0x8` stub |
+| `ToRole` | 0x0047cc20 | writer: `Role::interface_beam_script`, which `AddInterfaceBeamVulnerability` later copies *by pointer* into `Vulnerability::script` |
+| `ToReplaceDestructibility` | 0x0047eaa0 | writer: `ReplaceDestructibility::script` |
+| `CommandBatchAndBroadcast` | 0x00448400 | **replaced**: five calls reproduced, name encoded |
+| `MultiplayerRespawnRole` | 0x0050c8b0 | **replaced**: encodes its `.gcs` name, drops the 15-byte leak. `FUN_00511600` is `__thiscall` on `RespawnRoleList` @ 0x007b9d98 — the decompiler hides the ECX `this` |
+| `CommandVulnerability` | 0x0044a600 | wrapped, then every `Vulnerability::script` swept and encoded |
+| `QueueScriptExecution` | 0x00505080 | guards the invariant for what the above do not cover |
+| `RunQueuedScript` | 0x00505310 | host consumer: arms the payload window, runs the original |
+| `ApplyUpdateMessage` | 0x004fde70 | joiner consumer: same, for the `case 0x67` arm inside it |
+| `ExecuteCommandFile` | 0x0043f250 | the one place a payload is consumed; interprets it |
+
+Six things decide the shape, in decreasing order of how much they constrain it:
+
+- **The consumers are not reimplemented — they are bracketed.** Both pop the payload themselves and
+  hand it straight to `ExecuteCommandFile`, so each is wrapped in a *window* that marks provenance
+  and the `ExecuteCommandFile` hook interprets whatever arrives inside one. Replacing either body
+  instead would mean duplicating `MsgQueue_Pop`, the `SetCurrentDirectoryToGLDir(GL_Scripts)` dance
+  and the `pool_free` of the popped buffer — the payload comes from `malloc` @ 0x005e3f72, which is
+  the pool thunk, so `RunQueuedScript` frees it with the pool `free` @ 0x005e3f7b. That the window
+  is unambiguous is *measured*: `RunQueuedScript` is 13 instructions with one
+  `ExecuteCommandFile` call, and `ApplyUpdateMessage` contains exactly one (0x004ff971), reachable
+  only from `case 0x67`, with none of its 164 direct callees reaching it transitively
+  (`directplay_protocol_notes.md` §8.11). `ExecuteCommandFile` has six callers in all, and the
+  other four — `LoadLevel`'s level `.gcs`, the console's own local `BATCH`, and two briefing-screen
+  ones — are outside both windows. The window is also **one-shot**, so a payload that goes on to
+  run a batch file with `#EXECUTE IMMEDIATELY` cannot have that file re-read as a payload.
+- **Neither side guesses what it is holding.** A game-side write is always a bare name — a console
+  argument or a GLS field — and GkPlus's own writes arrive inside an `EncodedPayloadScope`, a
+  call-scoped "already a document, pass it through" that `triggers.create` and `actor.associate`
+  wrap their engine calls in. That replaced an earlier **marker byte** in the stored value: once
+  every writer encodes, there are no longer two representations to tell apart, so the marker had
+  nothing left to do. Content inspection was the design before *that*, and it is wrong in a way no
+  care fixes — a `.gcs` legitimately called `{a}.gcs` reads as an object.
+- **`ToRole`'s cache check is load-bearing.** It early-returns the `Role` it cached at
+  `parsed+0x1b60` (its 13th instruction, 0x0047cc50 — 0x1b60 is `sizeof(ParsedThingBase)`), and
+  nested conversions *do* call it again, since `ToFragData` builds `role` and `replace_role` through
+  it. Reading that slot before calling the original is what stops the field being quoted once per
+  call. `ToReplaceDestructibility` needs no such guard: it pool-allocs a fresh record every time.
+- **A site that queues without storing has to be replaced, not hooked.** `CommandBatchAndBroadcast`
+  (5 calls) and `MultiplayerRespawnRole` (3, plus an error path) are small enough to reproduce, so
+  they are — encoding the name and dropping the allocations both originals leaked.
+  `CommandVulnerability` is 1369 bytes of argument parsing that also fans one `Vulnerability*` out
+  to every actor of a role, so it is wrapped and its result **swept** instead: any vulnerability
+  left holding a non-document gets encoded. A sweep rather than a before/after diff because the
+  diff would have to assume the pool never returns the address it just freed, which that command
+  does free; "is it encoded yet?" holds regardless of how the value got there.
+- **The engine's own events still queue their stock `.gcs`** — `CTFRespawn.gcs`, `RTPRespawn.gcs`,
+  `CaptureFlag_team<N>.gcs` — now properly encoded. GkPlus sends no messages of its own; a script
+  hears from the queue only what a script put there. `MultiplayerRespawnRole`'s replacement must keep
+  appending to `RespawnRoleList` @ 0x007b9d98 exactly where the original did, because that is how the
+  queued `.gcs` finds the actor to equip (see `threading_model_notes.md`).
+- **`OnFlagCaptured` is left alone on purpose.** Its 760 bytes drive two `BroadcastToPlayers`
+  payloads, five `TeamSlots` writes, a vtable getter/setter pair and a "Hark" special case;
+  duplicating its team-to-script switch a few instructions earlier, to encode a name the queue hook
+  encodes anyway, would only add a way to pick the wrong file. So it is the one *local* source that
+  still reaches `ScriptQueuePayload` bare — alongside old savegames and peers without GkPlus, which
+  this process cannot encode at all.
+- **`ScriptQueuePayload` is that decision as a pure function**, and **its return value is always a
+  valid JSON document** — the invariant everything else rests on. Being pure is what lets the
+  harness assert it on every case, including the one documented ambiguity: a residual bare name that
+  happens to *be* a document (a file literally called `123`) is passed through as one.
+- **The payload is UTF-8; the engine is ANSI; `Encoding.h` is the seam.** Every `char *` the game
+  holds is CP_ACP — a `.gls` is read as bytes, and `fopen` reads the codepage — so a name is
+  transcoded on the way into a payload and back on the way to `ExecuteCommandFile`. Carrying the raw
+  bytes instead *looks* like it works, because `gk::json`'s own decoder is byte-exact, and it was the
+  first design; it breaks as soon as a name is embedded in a **message**, since QuickJS decodes that
+  document and silently turns every invalid sequence into U+FFFD (the `UTF8_HAS_ERRORS` throw is
+  commented out in `JS_NewStringLen`), handing the script a path that opens nothing. Transcoding also
+  makes a *script*-authored non-ASCII path work for the first time — it used to reach `fopen` as
+  UTF-8.
+- **QuickJS is the codec throughout.** The script host's context writes a message
+  (`ToScriptPayload`) and reads one (`OnMessage`); `gk::json` does the queue's own encoding on a
+  **private runtime behind a lock**, because the producer and the four writer hooks are executor-side
+  while the consumer is main-side, and one `JSRuntime` may only be used from one thread at a time.
+  That private runtime is what a hand-written parser used to buy — the trade is a lock and
+  `JS_UpdateStackTop` per operation, against a grammar nobody has to maintain.
+- **The producer runs on the executor thread, the consumers on the main thread.** That is what makes
+  interning atoms in the host's runtime a race rather than a nicety, and what makes calling into
+  QuickJS from the handler safe. It holds by call graph: `RunQueuedScript` has one caller (the in-game
+  tick) and `ApplyUpdateMessage` has one (`ClientReceivePump`), whose own three callers are the
+  tick, the multiplayer lobby pump and `UpdateAndDrawMenuScreen` — all main-thread. That last one
+  means an update can be applied **from the front end**, so a message can arrive with no level
+  loaded; it is reported undelivered rather than held. The producer hook is therefore pure string
+  work: no console printing, no game locks.
+- **The message inherits the engine's delivery semantics exactly**, because it *is* the engine's
+  delivery. One dispatch per machine: the host from its own queue, joiners from `0x67` (whose
+  `!IsExecutorRunning()` gate is what stops the host running it twice). The host is throttled to
+  **one payload per frame**; a joiner is not. `QueueScriptMessage` is the way in from native code
+  and calls the *trampoline*, deliberately not the raw address — after `DetourAttach` that entry
+  point is the wrap, which would turn a message into a file name.
+
 ### Script-defined levels (`src/CustomLevel.h/cpp`)
 
 A level with **no `.gls` and no `.gcs`** — only the `.rif` still comes off disk.
 `import * as arena from "./levels/arena.mjs"; levels.add("Test Arena", arena)` registers one;
 the module exports `map` (the GLS map section, field for field), `includes` (the `.gsh` files
 its roles come from, or nothing at all if they are built with `gls` instead), `define(level)`,
-`populate(level)` and `setup(level)`. The whole thing lands in Choose Level.
+`populate(level)`, `setup(level)` and `message_received(msg, level)`. The whole thing lands in
+Choose Level.
 
 **`add` takes an object, never a path.** A module namespace already *is* a description object
 with the map under `map`, so the host has no reason to load the file itself — the script's own
@@ -417,10 +536,17 @@ description is the same object with the map fields flat instead of nested, which
 thing `ResolveDescription` has to tell apart, and it can: no `CustomLevelMap` field is called
 `map`.
 
-The three hooks split the way the two script files split: `define` is the `.gls`'s `#include`
+The three load hooks split the way the two script files split: `define` is the `.gls`'s `#include`
 block — it registers roles, and runs per *load* before the map is converted, because the roles
 hash is cleared between levels — `populate` is its `use ... for ...` clauses, and `setup` is
 the whole `.gcs`.
+
+`message_received` is the fourth slot and the odd one out: it fires **during play**, off the script
+queue (see the section above), so `DispatchCustomLevelMessage` keys it on `LevelForCurrentScript()`
+rather than on `CurrentCustomLevel()` — the latter is null outside a load. That is also why the
+level arrives as the hook's **second** argument: with `levels.current` null while it runs, a
+module-level function would otherwise have no way to reach its own `Level`, and putting the message
+first keeps the documented signature `message_received(msg)`.
 
 ```js
 export const map = { rif: "levels\\level01.rif", object: "Land", camera_plane: "camhund" };
@@ -429,7 +555,14 @@ export function populate(level) {
   for (const spot of level.locators("Goodie A"))   // the `for "<rif object>"` clause
     level.spawn("Rol_GunLok", 1, spot, { as: "gunlok" });   // ... and the `as` clause
 }
-export function setup(level) { console.execute("sunangle 140"); }   // the .gcs
+export function setup(level) {
+  console.execute("sunangle 140");                                  // the .gcs
+  triggers.create({ kind: triggers.kind.death, targets: ["elint"],  // data, not a file
+                    script: { kind: "unit_lost" } });
+}
+export function message_received(msg, level) {                      // ... arrives here
+  if (msg.kind === "unit_lost") level.send({ kind: "mission_failed" });
+}
 ```
 
 Six facts pin the design; the full reasoning is `level_loading_notes.md` §6.5 and §7.
@@ -482,11 +615,80 @@ level build twice.
 
 ### JavaScript bindings (`src/Js*`)
 
-The `"gk"` QuickJS C module, exposing ten subsystems to scripts. `src/Js.h` is the public surface
+**The console command registry is the map of what is still missing, and it is measured**:
+`console_command_notes.md` has all 280 registrations (272 distinct names) classified against the
+JS surface — 7 replaced by plain JavaScript, 33 already reachable, **223 bound**, 9 dev-only, and
+**no gaps**. Every registered command is now reachable through a typed binding. Read it before adding a binding; §1 has the recipe for re-extracting the
+registry from the binary if the classification ever needs rebuilding.
+
+Two facts from it that change how bindings get written:
+
+- **Fifteen command names live in `glres<lang>.dll`, not in the exe.** `EXIT`, `QUIT`, `MENU`,
+  `HELP`, `LINES`, `CONSOLE APPEAR`, `SAY`, `TIME`, `DATE`, `LIST COMMANDS`, `CLEAR HISTORY
+  BUFFER`, `HISTORY BUFFER SIZE`, `HISTORY_BUFFER_LENGTH`, `QUEUE SIZE` and `QUEUE LENGTH` are
+  registered under `GetResourceString` results, so `console.execute("QUIT")` is a no-op on a
+  non-English install. `console.commands` enumerates the registry so those are discoverable.
+- **What makes a command hard to bind is its broadcast, not its setter.** Almost every
+  world-mutating handler is `IsExecutorRunning` → `SuspendExecutor` → mutate →
+  `BroadcastToPlayers(id, …)` → `ResumeExecutor`, and the update id and payload are per-command.
+  §4.1 of the notes lists all 27 broadcasters with their recovered update ids and payload sizes.
+  `camera.tracking` is deliberately read-only for this reason — stopping a track is local, but
+  `TRACK <id>` broadcasts update 0xb4.
+- **There are two kinds of binding here, and the split is load-bearing.** *Native* wrappers
+  (`camera`, `game`, `world`, the `console` colours and registry) exist wherever there is **state
+  to read back**. *Command-backed* namespaces (`fx`, `light`, `objectives`, `music`, `screen`,
+  `units`, `inventory`, `tracks`, `demo`, `script`, the interpolated `camera` moves, the `console`
+  administration) format a console command line and run the game's own handler — because every one
+  of those handlers **is** an argument parser whose defaults come from the map bounds or the cursor,
+  so dispatching it is faithful by construction where a reimplementation would silently diverge.
+  What they add over a raw string: typed arguments, locale-independent numbers, names that survive a
+  translated install, a length check the engine does not do, and per-command whitespace rules.
+  `src/JsCommands.cpp`'s header comment is the full argument.
+- **`ExecuteCommand` @ 0x004d6090 has no length check.** It copies into `ConsoleCommandLine`
+  (`char[252]`) with an unbounded byte loop, and `ConsoleSmallFont` @ 0x007b6a54 is next. `fgets`
+  caps a batch line at 249 so the game cannot reach it, but a script can — `gk::ExecuteCommand`
+  therefore refuses anything over `kConsoleCommandLineMax` and returns false.
+- **Nine binding members do not replicate, and the ones next to them do.** `actor.armor`,
+  `actor.shield`, `actor.set_position`, `actor.set_team`, `actor.mine`, `actor.goto`,
+  `turret.turret_enabled`, `pickup.set_required_item` and `tokens[name] = value` all reach no
+  broadcast, while `actor.health`, `frag`, `remove`, `die`, `set_target`, `associate`, the attack
+  methods and `set_pickup_enabled` do. The console commands beside them broadcast *around* the same
+  setters, which is what makes the difference invisible in single player. `set_team` is the sharpest
+  case: `Actor::ChangeOwnerAndTeam` @ 0x00530470 replicates and `SetTeamId` does not, and the
+  binding took the latter — now fixed, and it was two bugs, because bare `SetTeamId` also left the
+  actor on its **old team's actor list**. **Check the setter, not the command** —
+  `console_command_notes.md` §6 is the full table.
+- **`ApplyDamage` takes three stack arguments and the mirror declared two.** Both overrides end in
+  `RET 0xc`; `__thiscall` is callee-clean, so each call drifted ESP by 4 bytes — the exact failure
+  the calling-convention warning above describes. The third is the attacker's team id (-1 for none),
+  used for Deathmatch frag credit and as the 0x9b payload. The base and mobile versions are also
+  genuinely different functions, not a base and an override that forgot to broadcast: see §6.2.
+- **`triggers.create` is local, and that is correct.** Every machine runs the same `.gcs` and
+  registers its own copy; the payload is what replicates when it fires. So register triggers in
+  `setup` (which runs everywhere) and do *not* guard that with `game.simulation_running` — the
+  opposite of the rule for world mutation.
+- **A time trigger's `value` is a delay in seconds, not a tick deadline.** `RegisterTriggers` does
+  `deadline = GetServerTime64() + ticks_per_second * value` at the calling thread's rate. `gk.d.ts`
+  said "game-tick deadline" and was wrong on both counts.
+- **The trigger is the only durable scheduling there is** (§6.1). `SaveGame` writes the trigger
+  list, its payloads, the WAIT deadlines and the tokens — all of it a deadline plus a name, which is
+  precisely why it can be saved. A JavaScript closure cannot be, so an in-heap timer is
+  session-scoped by construction and a savegame load rewinds the clock under it.
+
+**`game.simulation_running` is the authority test, and any script that mutates the world from a
+message needs it.** It is `IsExecutorRunning` @ 0x00502da0 (`gk::IsSimulationRunning` in `Misc.h`) —
+true in single player and on a multiplayer host, false on a joining client and before a level has
+started one. A message is delivered on *every* machine, so a `message_received` that spawns
+unguarded makes a joining client build a local ghost the host never hears about, and then receive
+the host's copy as well. It is an accessor on a namespace object rather than a plain export because
+a C module's named exports are fixed at instantiation — a top-level `simulation_running` could only
+ever report what was true before any level existed.
+
+The `"gk"` QuickJS C module, exposing eleven subsystems to scripts. `src/Js.h` is the public surface
 — `RegisterGkModule`, plus `Log` / `ReportException` / `ReleaseCallbacks` for the host — and
-`src/JsGk.cpp` builds the module from ten namespace objects, one per translation unit:
+`src/JsGk.cpp` builds the module from eleven namespace objects, one per translation unit:
 `JsCamera`, `JsConsole`, `JsActors`, `JsRoles`, `JsTokens`, `JsTriggers`, `JsMenus`, `JsLevels`,
-`JsGls`, `JsMake`, over shared helpers in `src/JsBindings.h` / `src/JsCommon.cpp`. `JsGk.cpp` also owns
+`JsGls`, `JsMake`, `JsGame`, over shared helpers in `src/JsBindings.h` / `src/JsCommon.cpp`. `JsGk.cpp` also owns
 `ReleaseCallbacks`, which fans out to the per-TU `Release*Callbacks` of the two namespaces that
 hold script values (menus and levels).
 
@@ -537,6 +739,25 @@ snapshot of the game's own entries as `{index, label, type}`), `add_item`, `add_
 `open(remember)`. Unlike the Actor and Role wrappers, `Menu` and `MenuItem` hold pointers that
 outlive every context — into the `.data` array and into a never-freed registration — so neither
 needs a finalizer and neither can dangle.
+
+**Every field that held a `.gcs` name now takes a message object too**, through one helper:
+`js::ToScriptPayload` in `JsCommon.cpp`. A **string** is stored verbatim, so the game struct keeps
+looking exactly like parsed data; **anything else** is `JS_JSONStringify`d and marked with
+`ScriptMessageMarker`, which is what the queue's producer reads. `JSON.stringify` refusing a value
+(a function, a symbol) is a `TypeError` at the call, not a payload named "undefined".
+
+**Four fields have it, and that number comes from the call-site inventory rather than from
+guessing.** `threading_model_notes.md` traces the argument of all seven `QueueScriptExecution`
+callers; every one of them that reads a script-writable field is covered —
+`triggers.create({script})` → `TriggerData+0x54`, `actor.associate(script)` →
+`PickupActor+0x134`, `make.role({interface_beam_script})` → `Vulnerability+0x10`, and
+`make.role({destructibility: {kind: "replace", script}})` → `ReplaceDestructibility+0x08`. The
+last was missed on the first pass, which is the argument for doing the inventory: it is spelled
+`script` here although GLS spells the field `name`, because a queue push is its only reader.
+
+`ToScriptPayload` therefore returns a **field value, not a payload**, and `Level.send(msg)` is the
+one caller that skips the field — so it does the producer's job itself, `UnmarkScriptMessage` for a
+message and `json::Quote` for a name. Anything else queueing directly has to do the same.
 
 Writes go through `CollectionOps::assign`, which only `tokens` supplies — `tokens["score"] = 0` is
 an upsert. The handler **throws** rather than returning false: quickjs hands an exotic
@@ -603,10 +824,14 @@ maintains what.
   It currently types all 197 functions and 28 enums with **zero `any`**, and prints the count of
   anything it could not infer — if that number stops being 0, the C++ grew a shape the generator
   does not know.
-- **`npx tsc -p types/tsconfig.json` is the check**, and `types/typecheck.ts` asserts in both
+- **`npx -y -p typescript tsc -p types/tsconfig.json` is the check** — TypeScript is not a
+  dependency of this repo and there is no `package.json`, so a bare `npx tsc` refuses to run
+  ("This is not the tsc command you are looking for") and `-p typescript` is what fetches it.
+  `examples/jsconfig.json` is the same invocation, and checks the shipped `.mjs` against the same
+  declarations. `types/typecheck.ts` asserts in both
   directions: ordinary lines must compile, and every `@ts-expect-error` line must not. A vacuous
-  declaration file (everything `any`) fails it, because all eighteen expect-error directives would
-  go unused.
+  declaration file (everything `any`) fails it, because all twenty-seven expect-error directives
+  would go unused.
 
 Three modelling decisions that took a round-trip through `tsc` to settle:
 
@@ -657,6 +882,17 @@ Three modelling decisions that took a round-trip through `tsc` to settle:
 - `input_notes.md` - Input subsystem: keyboard runs on Win32 `WM_KEYDOWN` (`MainWindowWndProc` -> `HandleKeyMessage` -> VK->DIK `VkToScanCodeTable` -> the universal `HandleKeyPress4` sink), mouse on Raw Input, and the DirectInput `SysKeyboard` is a vestigial acquired-but-never-read fossil whose `Acquire()` arms the `WH_KEYBOARD_LL` hook that lags system keyboard input under a debugger; the `InputFixSystem` (`src/InputFix.cpp`) detours `AcquireDInputDevice` to suppress it
 - `rif_chunk_format.md` - the `.rif` asset format: 12-byte chunk header, `REBCRIF1` Huffman
   container, all 105 registered chunk types, **and** the AvP upstream mapping (see below)
+- `game_defects_notes.md` - bugs in **Gunlok itself** that reproduce without GkPlus, so nobody
+  re-blames our hooks for them. Currently: `DrawText?` @ 0x005782e0 smashing its stack on any
+  string over ~1024 chars (which makes the training-level debrief fatal), and the fact that the
+  game's own `PrintParseWarning`/`PrintParseError` discard their output. Also collects what
+  actually works for debugging Gunlok - where cdb lives, why `bp d3d8+0x...` silently resolves
+  wrong, and which breakpoints make the game unplayable
+- `console_command_notes.md` - every console command the game registers (280 registrations, 272
+  distinct names, 255 handlers), how the registry and its longest-prefix dispatch actually work,
+  and each command classified against the JS surface. §4 explains the native vs command-backed
+  split, §4.1 lists the 27 broadcasters with their update ids. Includes the localized-command-name
+  hazard, the inert `CommandCondition` gate, and the GkPlus mirror defects the inventory turned up
 - `gls.txt` - Game Level Structure file format quick field list (superseded by gls_system_notes.md)
 
 ### Upstream Source: Aliens vs Predator (1999)
@@ -756,6 +992,25 @@ and audit the DB afterwards rather than trusting it.
   usually makes it a *setter* whose base implementation ignores the value. `Actor` slots 9 and 54
   were documented as per-tick callbacks for exactly this reason; both are `RET 0x4` and pair with
   getter slots 8 and 30.
+- **`RET` vs `RET n` is the ground truth for a calling convention, and Ghidra's label is not.**
+  A function with stack arguments ending in a bare `RET` is caller-clean (`__cdecl`); `RET n` is
+  callee-clean (`__stdcall`, or `__thiscall`/`__fastcall` with stack args past the registers). The
+  DB had `pool_free` @ 0x005715b0 as `__stdcall` when it ends in a bare `RET` at 0x0057166f and
+  every game call site does `CALL free` … `ADD ESP,0x4`. `src/Memory.cpp` believed the label.
+  **Getting this wrong does not fail where you can see it**: calling a `__cdecl` function through a
+  `__stdcall` pointer leaks 4 bytes of stack per call (the compiler emits `sub esp,4` to undo a
+  callee pop that never happens), so ESP drifts until some *later* frame's epilogue returns to
+  garbage. It presents as a non-deterministic access violation with **EIP on the stack** and a
+  faulting module of "unknown", nowhere near the real culprit, and it stays dormant until something
+  calls the function often. Cross-check the convention of every wrapped function against its `RET`,
+  and treat "it worked so far" as meaning "nothing called it in a loop yet".
+
+  The same test applies to **arity**, not just convention, and it is worth running in bulk: `RET n`
+  states exactly how many bytes of arguments a `__thiscall` callee pops, so a declaration with the
+  wrong parameter count drifts ESP by the difference. Sweeping all sixteen Actor vtables (1,460 slot
+  entries) against `src/Actors.h` found **nine wrong declarations** — see `console_command_notes.md`
+  §6.3 for the table and the two false-positive sources (slot 0's hidden destructor flag, and a
+  by-value `Vec3` being 12 bytes). Re-run it after adding any slot.
 - The decompiler's `Class::Method` header line does **not** always match
   `FunctionManager.getParentNamespace()`. Query the namespace; never read ownership off the C output.
 - For a vtable slot, the owning class is the **shallowest** class whose vtable contains that
@@ -1398,6 +1653,16 @@ the one that bites hardest, because its failure mode is silent.
   `js_default_module_normalize_name` passes through anything not starting with `.`, and resolution
   checks the already-loaded modules — where `JS_NewCModule` registers — before consulting a loader.
   A loader is only needed for the *script's* own files, and `src/Script.cpp` has the minimal one.
+- **A runtime used from more than one thread needs `JS_UpdateStackTop` on every entry, or its stack
+  guard is pointing at another thread's stack.** `rt->stack_top` is captured when the runtime is
+  created; `js_check_stack_overflow` compares the current SP against it. Use that runtime from a
+  second thread and the comparison is against an unrelated range, so the guard never fires and a
+  deeply nested `JS_ParseJSON` recurses until the process dies — `0xC00000FD`, reachable from the
+  network, since update `0x67` carries a payload any peer can author. The header says it plainly
+  ("should be called when changing thread"); it is easy to read as advice about *migrating* a
+  runtime rather than about alternating between threads. `src/Json.cpp` calls it under its lock on
+  every operation and sets `JS_SetMaxStackSize` to 256 KB, because the default megabyte is more
+  headroom than either game thread has left by then. A 200k-deep payload is in the harness.
 - **A duplicated name in an export list must be grepped for, because nothing checks it any more.**
   `imgui-quickjs` listed `JS_ENUM_DEF(SortDirection)` twice, which cost nothing until something did
   `import * as ImGui from "ImGui"` — building a namespace object rejects duplicate exports, so the

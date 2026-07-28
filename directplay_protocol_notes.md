@@ -567,6 +567,19 @@ all of them unconditionally — both of `BroadcastToPlayers`' drop mechanisms ar
 
 Total size = `strlen(name) + 1 + 4`.
 
+> **GkPlus always sends a JSON document in that field, never a bare name** (`src/ScriptQueue.cpp`,
+> and the section in `CLAUDE.md`). A JSON string is the name — `"crtbaa.gcs"` — and anything else
+> is a message delivered to a script level's `message_received`, so this message id is now the
+> transport for script-to-script events as well as for file names. The framing is untouched: it is
+> still one NUL-terminated string measured with `strlen_plus1`, so a payload merely gets longer.
+>
+> Interoperation goes both ways, and asymmetrically. A GkPlus recipient runs a **non**-JSON payload
+> as a file name, which is exactly what a vanilla host sends — and since every local push goes
+> through the hook, receiving one is now the *only* way an invalid payload can occur, which makes it
+> a reliable "that peer is not running GkPlus" signal. In the other direction a vanilla recipient
+> gets `"crtbaa.gcs"`, quotes included, tries to open a file by that name and fails; a message it
+> would not have understood in any encoding.
+
 **Only the filename travels; the file contents do not.** Every recipient resolves that name
 against its *own* `Scripts\` directory. The handler in the client update applier
 (`ApplyUpdateMessage`) is:

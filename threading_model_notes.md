@@ -278,12 +278,16 @@ Circular doubly-linked with a sentinel; **push at tail, pop at head** (FIFO).
 | `MsgQueue_Flush` | 0x0056da80 | frees all payloads + nodes; resets the byte counter |
 | `MsgQueueList_PopFront` | 0x0056dc00 | takes `queue+0x20`, **not** the queue base; does no locking of its own |
 
-Two allocators are in play per entry: the **payload** comes from the CRT `malloc`
-(internally locked), the **node** from the game pool allocator (whose lock is compiled
-out — see below). Only the queue's own RW lock serialises the node traffic.
+**Both allocations per entry come out of the game pool.** The **payload** is `malloc`
+@ 0x005e3f72 (`MsgQueue_Push` @ 0x0056d9b3) and the **node** is a direct `pool_alloc`
+@ 0x00571470 (@ 0x0056d9d0) — and the game's `malloc` is a bare `JMP pool_alloc`, so the
+two are the same heap, not the CRT's and the pool's. (An earlier revision of this file
+said the payload was CRT `malloc`, "internally locked"; it is not, and the pool's own lock
+is compiled out — see below.) Only the queue's own RW lock serialises either.
 
 **Payload ownership: the caller of `MsgQueue_Pop` owns the returned buffer and must
-`free()` it.** `RunQueuedScript` is the model: `ExecuteCommandFile(name); free(name);`.
+`free()` it** — the pool `free` @ 0x005e3f7b, which is what `RunQueuedScript` calls
+(@ 0x00505335). `RunQueuedScript` is the model: `ExecuteCommandFile(name); free(name);`.
 Despite the name, `last_popped` is *not* a deferred-free slot on these instances —
 scanning every accessor of all three globals shows nothing ever writes it non-zero, so
 the `free(last_popped)` calls in Push/PopFront/Flush are dead here. It and `cache_flag`
@@ -292,11 +296,34 @@ are generic-container fields this usage never exercises.
 `MsgQueueList_PopFront` recovers the just-unlinked node through the *new* front's stale
 `prev` pointer before fixing it up — correct, but fragile to reordering.
 
+**`ScriptQueue` has exactly one producer and one consumer, and this was checked exhaustively**
+rather than assumed: of the ten references to 0x007ba35c, one is `MsgQueue_Push`
+(`QueueScriptExecution`), one is `MsgQueue_Pop` (`RunQueuedScript`), **four are `MsgQueue_Flush`**
+(`CommandNextLevel`, `StopExecutorThread`, `LoadGame`, `ExecutorThreadProc` — all discards), two are
+the CRT static ctor/dtor pair around its `RWLock`, and one is exception unwind data. Nothing pushes
+to it except `QueueScriptExecution`, which is what lets GkPlus define the payload format at that one
+hook.
+
 | Queue | Direction | Producer | Consumer |
 |-------|-----------|----------|----------|
 | 0x007ba32c | commands: main -> executor | `SendToServer` @ 0x004fdbc0 (or SendEx to server in MP) | thread proc |
 | 0x007ba38c | updates: executor -> main | `BroadcastToPlayers` @ 0x00504bf0 (or SendEx to all players in MP) | `ClientReceivePump` @ 0x004fdc70, called from the in-game tick; applies each via `ApplyUpdateMessage` |
 | 0x007ba35c | trigger script filenames: executor -> main | `QueueScriptExecution` @ 0x00505080 (7 callers, all host-side — see below) | `RunQueuedScript` @ 0x00505310: one `ExecuteCommandFile` per frame on the main thread |
+
+> **Under GkPlus the script-queue payload is always a JSON document, never a bare filename - and so
+> is the field it came from.** `ScriptQueueSystem` (`src/ScriptQueue.cpp`) hooks the four *writers*
+> of a script-name field (`RegisterTriggers`, `PickupActor::Associate`, `ToRole`,
+> `ToReplaceDestructibility`) so a bare name is stored as the JSON string `"crtbaa.gcs"`, and the two
+> consumers unwrap it: a JSON string still means "run this `.gcs`", anything else is a message
+> delivered to a script level's `message_received` instead. `QueueScriptExecution` is still hooked to
+> quote what the writers do not cover - the three sites that queue a literal without storing it,
+> `CommandVulnerability`'s field, an old savegame, and a peer without GkPlus. Nothing about the
+> queue's own mechanics changes; that hook is on the **executor thread** and the consumers on the
+> **main thread**, which is exactly the split this file describes - and the reason the payload codec
+> is hand-written instead of QuickJS's.
+>
+> **A save written this way does not load in an unpatched Gunlok** - `SaveGame` serialises the
+> trigger field verbatim. See `save_system_notes.md`.
 
 `BroadcastToPlayers(msg, size, guaranteed, coords)` in MP: per-player send with position
 relevance filtering (`FUN_00511250`), per-player backlog counters (`0x007b9d84[i]`),
@@ -323,11 +350,43 @@ guard, or being simulation-authority code that broadcasts. This is why a joining
 |--------|---------|--------------|---------------------|
 | `EvaluateTriggers` | 0x0050ccc0 | fires trigger scripts | sole caller is `ExecutorThreadProc` — **executor-only, proven** |
 | `MultiplayerRespawnRole` | 0x0050c8b0 | respawns a role for a team, then queues `CTFRespawn.gcs` / `RTPRespawn.gcs` | sole caller is `EvaluateTriggers` (14 sites) — **executor-only by call graph, proven** |
+
+> **`RespawnRoleList` @ 0x007b9d98 is how the respawn hands the actor to that script.**
+> `MultiplayerRespawnRole` appends the `SpawnRole` result to it (`FUN_00511600`, `__thiscall` on the
+> list header), and the queued `.gcs` then equips the actor at the head with `GIVE ROLE ID` /
+> `GIVE AND EQUIP ROLE ID` — "gives to last respawned actor if it matches role" — and pops it with
+> `NEXT RESPAWN ID` @ 0x0044a530. It is a FIFO rather than a single slot precisely because
+> `RunQueuedScript` drains one script per frame while several respawns can already be pending, so
+> the ids have to stay paired with their scripts. Anything replacing that function must keep
+> appending, or the stock script equips the wrong actor.
 | `CommandBatchAndBroadcast` | 0x00448400 | console command that runs a script file | body is inside `if (LevelLoadReason != 3) if (IsExecutorRunning())` — **guarded, proven** |
 | `Frag` | 0x0052e220 | kill/score credit | Actor vtable slot; broadcasts — *inferred* |
 | `SyncPositionAndBroadcast` | 0x0053d8d0 | position sync | Actor vtable slot; broadcasts — *inferred* |
 | `OnFlagCaptured` | 0x00533120 | CTF capture; queues `CaptureFlag_team<N>.gcs` | called from `SyncPositionAndBroadcast` @ 0x00533720; broadcasts — *inferred* |
 | `OnPickedUp` | 0x00546440 | item pickup; queues the item's `associated_script` | `PickupActor` vtable slot; broadcasts — *inferred* |
+
+#### Where each caller's string comes from
+
+Measured, not inferred: the argument register at each call site, traced back. This is the complete
+set of ways a string can reach the queue, and `QueueScriptExecution` has **exactly seven
+references, all `UNCONDITIONAL_CALL`** — no data references, so it is in no vtable or function
+table and cannot be reached indirectly.
+
+| Caller | Argument | Source of the string |
+|--------|----------|----------------------|
+| `EvaluateTriggers` | `TriggerData+0x54` | `script_name`, `strdup`'d by `RegisterTriggers` — from a `.gls`/`.gcs` `add trigger`, or `gk::RegisterTriggers` |
+| `OnPickedUp` | `PickupActor+0x134` | `associated_script`, set by `Actor` vtable slot 66 (`Associate`) — the console's `ASSOCIATE`, or `actor.associate()` |
+| `Frag` | `Destructibility+0x08`, tag 4 | `ReplaceDestructibility::script` — GLS field 0x00 of the "replace destructibility" section (whose keyword is `name`; it is a `.gcs` path, see `role_subobjects_notes.md`) |
+| `SyncPositionAndBroadcast` @ 0x0053d8d0 | `[[this+0xc]+0x10]` | `Vulnerability::script` — including the one `AddInterfaceBeamVulnerability` @ 0x00510fe0 synthesises from `Role::interface_beam_script`. **Freed immediately after queueing**, so it fires once |
+| `MultiplayerRespawnRole` | stack buffer | the literal `RTPRespawn.gcs` / `TPRespawn.gcs` @ 0x006679d4 |
+| `OnFlagCaptured` | stack buffer | the literal `CaptureFlag_team5.gcs` @ 0x00669574 with the team digit patched |
+| `CommandBatchAndBroadcast` | `g_ConsoleWordBuf` @ 0x006af5f8 | the console line, via `CopyRemainingArgs` — the `BATCHANDBROADCAST` command ("a bit like BATCH but it tells clients to batch it as well"). The open-ended one: any console input reaches it, including `console.execute()` from a script |
+
+So four of the seven read a **field** and two are compile-time literals; the seventh is the console.
+That split is what decides where GkPlus encodes: the four fields have a *writer* to hook
+(`RegisterTriggers`, `PickupActor::Associate`, `ToRole`, `ToReplaceDestructibility` — see
+`src/ScriptQueue.h`), while the other three build a string and queue it with nothing in between, so
+there is nothing to convert and the queue hook handles them.
 
 > **`MultiplayerRespawnRole`'s `IsExecutorRunning()` guard is not what makes it host-side.**
 > The guard covers only the `SpawnRole` call; `QueueScriptExecution` runs unconditionally below
@@ -508,6 +567,9 @@ Native code reaching into game state has to respect the two-thread split:
   update `0x67` carries only the script *filename*, so each client re-runs it against its own
   `Scripts\` directory. A native action driven off a trigger therefore runs once per
   participant, and a client whose script files differ from the host's takes a different path.
+  GkPlus's message channel inherits all of this unchanged, and one property of it for free: a
+  message *does* cross the wire, so a trigger carrying data is consistent across machines in the
+  way a trigger carrying a filename is not.
 
 ## Key addresses summary
 

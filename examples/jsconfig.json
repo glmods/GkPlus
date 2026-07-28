@@ -1,7 +1,8 @@
 {
   "//": [
     "Type-checking for GkPlus entry modules. VS Code picks this up on its own;",
-    "on the command line it is `npx tsc -p jsconfig.json`.",
+    "on the command line it is `npx -y -p typescript tsc -p jsconfig.json` - the",
+    "`-p typescript` part being what fetches a compiler this repo does not depend on.",
     "",
     "Both types/ globs are listed on purpose: `../types` is where they live in",
     "the repo, and `types` is where they end up when you copy this folder into",

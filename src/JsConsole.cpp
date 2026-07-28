@@ -1,8 +1,11 @@
 #include "Console.h"
 
+#include "Encoding.h"
 #include "Js.h"
 #include "JsBindings.h"
+#include "Misc.h"
 
+#include <cstdint>
 #include <iterator>
 #include <string>
 
@@ -57,10 +60,46 @@ JSValue Execute(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
   if (!command) {
     return JS_EXCEPTION;
   }
-  ExecuteCommand(command);
+  bool ran = ExecuteCommand(command);
+  size_t length = std::strlen(command);
   JS_FreeCString(ctx, command);
+  if (!ran) {
+    // The engine copies into a 252-byte buffer with no length check at all, so
+    // a longer line writes through the font pointer that follows it. Refusing
+    // is the fix; truncating would just run a different command.
+    return JS_ThrowRangeError(
+        ctx, "command is %d characters; the game's buffer holds %d",
+        static_cast<int>(length), kConsoleCommandLineMax);
+  }
   return JS_UNDEFINED;
 }
+
+// The console's own administration commands. Six of the eight are registered
+// under names from glres<lang>.dll, which is exactly why they are here rather
+// than left to console.execute.
+#define GK_CONSOLE_COMMAND(fn, command)                                        \
+  JSValue fn(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {     \
+    return RunConsoleCommand(ctx, command, argc, argv);                        \
+  }
+#define GK_CONSOLE_LOCALIZED(fn, id)                                           \
+  JSValue fn(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {     \
+    return RunLocalizedConsoleCommand(ctx, id, argc, argv);                    \
+  }
+
+GK_CONSOLE_COMMAND(Hide, "HIDE CONSOLE")
+// LOG takes the rest of the line, so its note may contain spaces.
+JSValue WriteLog(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+  return RunConsoleTextCommand(ctx, "LOG", argc, argv);
+}
+GK_CONSOLE_COMMAND(PrintVersion, "VERSION")
+GK_CONSOLE_LOCALIZED(SetLines, 10004)
+GK_CONSOLE_LOCALIZED(SetAppear, 10005)
+GK_CONSOLE_LOCALIZED(ClearHistory, 10009)
+GK_CONSOLE_LOCALIZED(HistorySize, 10010)
+GK_CONSOLE_LOCALIZED(QueueSize, 10007)
+
+#undef GK_CONSOLE_COMMAND
+#undef GK_CONSOLE_LOCALIZED
 
 // Queues a file of console commands - what a level's .gcs is. It does not run
 // them: each line is appended to the console's command queue, which pops one
@@ -111,6 +150,80 @@ JSValue SetCursorColor(JSContext *ctx, JSValueConst, JSValueConst v) {
   return JS_UNDEFINED;
 }
 
+// The registered command table, as an array of
+// `{name, help, condition, available}`.
+//
+// It exists because fifteen command names are **localized**: SetupConsoleCommands
+// registers EXIT, QUIT, MENU, HELP, LINES, CONSOLE APPEAR, SAY, TIME, DATE, LIST
+// COMMANDS and the history/queue-size pairs under strings pulled from
+// glres<lang>.dll, so `execute("QUIT")` is a no-op on a non-English install.
+// Enumerating is the only portable way to find those - and the only way to
+// discover what a mod or a future patch added.
+//
+// Encoding: the names and help are the engine's own `char *`, i.e. CP_ACP, so
+// they go through Utf8FromGameText on the way out like every other game string.
+struct CommandCollector {
+  JSContext *ctx;
+  JSValue array;
+  uint32_t index;
+  bool failed;
+};
+
+void CollectCommand(void *user, const CommandData *cmd) {
+  auto *state = static_cast<CommandCollector *>(user);
+  if (state->failed || cmd->name == nullptr) {
+    return;
+  }
+  // The registry holds one deliberately empty name, whose handler is a RET stub
+  // so that a blank console line does nothing. It is not a command.
+  if (cmd->name[0] == '\0') {
+    return;
+  }
+  JSValue entry = JS_NewObject(state->ctx);
+  if (JS_IsException(entry)) {
+    state->failed = true;
+    return;
+  }
+  JS_SetPropertyStr(state->ctx, entry, "name",
+                    JS_NewString(state->ctx, Utf8FromGameText(cmd->name).c_str()));
+  JS_SetPropertyStr(
+      state->ctx, entry, "help",
+      cmd->help == nullptr
+          ? JS_NULL
+          : JS_NewString(state->ctx, Utf8FromGameText(cmd->help).c_str()));
+  JS_SetPropertyStr(state->ctx, entry, "condition",
+                    JS_NewInt32(state->ctx, cmd->condition));
+  JS_SetPropertyStr(state->ctx, entry, "available",
+                    JS_NewBool(state->ctx,
+                               cmd->condition <= GetCommandCondition()));
+  JS_SetPropertyUint32(state->ctx, state->array, state->index++, entry);
+}
+
+// `ECHO ON|OFF` - when off, the console's own printing is suppressed. It is also
+// what `@` toggles for the span of one line.
+JSValue GetEcho(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, GetConsoleEchoEnabled());
+}
+
+JSValue SetEcho(JSContext *ctx, JSValueConst, JSValueConst v) {
+  SetConsoleEchoEnabled(JS_ToBool(ctx, v) != 0);
+  return JS_UNDEFINED;
+}
+
+JSValue GetCommands(JSContext *ctx, JSValueConst) {
+  JSValue array = JS_NewArray(ctx);
+  if (JS_IsException(array)) {
+    return array;
+  }
+  CommandCollector state{ctx, array, 0, false};
+  ForEachConsoleCommand(&state, CollectCommand);
+  if (state.failed) {
+    JS_FreeValue(ctx, array);
+    return JS_EXCEPTION;
+  }
+  return array;
+}
+
 // The whole console surface, host logging included - there is no global
 // `console`, so this object is the only one a script sees.
 const JSCFunctionListEntry ConsoleProps[] = {
@@ -134,6 +247,17 @@ const JSCFunctionListEntry ConsoleProps[] = {
                     JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE),
     JS_CGETSET_DEF2("cursor_color", GetCursorColor, SetCursorColor,
                     JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE),
+    JS_CGETSET_DEF2("echo", GetEcho, SetEcho,
+                    JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE),
+    JS_CGETSET_DEF("commands", GetCommands, nullptr),
+    JS_CFUNC_DEF("hide", 0, Hide),
+    JS_CFUNC_DEF("write_log", 1, WriteLog),
+    JS_CFUNC_DEF("print_version", 0, PrintVersion),
+    JS_CFUNC_DEF("set_lines", 1, SetLines),
+    JS_CFUNC_DEF("set_appear", 1, SetAppear),
+    JS_CFUNC_DEF("clear_history", 0, ClearHistory),
+    JS_CFUNC_DEF("history_size", 1, HistorySize),
+    JS_CFUNC_DEF("queue_size", 1, QueueSize),
 };
 
 } // namespace

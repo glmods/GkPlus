@@ -28,7 +28,15 @@ const NamespaceEntry Namespaces[] = {
     {"actors", NewActorsNamespace},   {"roles", NewRolesNamespace},
     {"tokens", NewTokensNamespace},   {"triggers", NewTriggersNamespace},
     {"levels", NewLevelsNamespace},   {"make", NewMakeNamespace},
-    {"gls", NewGlsNamespace},
+    {"gls", NewGlsNamespace},         {"game", NewGameNamespace},
+    {"world", NewWorldNamespace},
+    // The broadcast-free command clusters (src/JsCommands.cpp).
+    {"fx", NewFxNamespace},           {"light", NewLightNamespace},
+    {"objectives", NewObjectivesNamespace},
+    {"music", NewMusicNamespace},     {"screen", NewScreenNamespace},
+    {"units", NewUnitsNamespace},     {"inventory", NewInventoryNamespace},
+    {"tracks", NewTracksNamespace},   {"demo", NewDemoNamespace},
+    {"script", NewScriptNamespace},
 };
 
 int InitModule(JSContext *ctx, JSModuleDef *m) {

@@ -41,6 +41,23 @@ using CustomLevelDefine = void (*)(CustomLevel *level, void *user);
 // issues console commands.
 using CustomLevelSetup = void (*)(CustomLevel *level, void *user);
 
+// The level's inbox. `json` is a complete JSON document that is not a string -
+// see ScriptQueue.h for why a string is a .gcs name instead - and is valid only
+// for the duration of the call.
+//
+// This is the other half of what a trigger does. Where a .gls trigger names a
+// file and every machine runs its own copy, a trigger built from script can
+// carry a message, and this is where it arrives: on the host from
+// RunQueuedScript, on every joiner from update 0x67, once each, on the main
+// thread. Unlike the three load hooks it fires during play, not during a load,
+// so the level it belongs to is the one the game is *in* rather than the one it
+// is building.
+//
+// Returns nothing - a payload nobody wants is dropped with a note to the
+// debugger.
+using CustomLevelMessage = void (*)(CustomLevel *level, const char *json,
+                                    void *user);
+
 // The `map` section a custom level replaces its .gls with, field for field - see
 // the "map" table in gls_system_notes.md for the ranges. An empty string means
 // "not assigned", which for the four optional fields is the same as leaving the
@@ -92,7 +109,8 @@ CustomLevel *AddCustomLevel(const char *title, const CustomLevelMap &map,
                             const std::vector<std::string> &includes,
                             CustomLevelDefine define,
                             CustomLevelPopulate populate,
-                            CustomLevelSetup setup, void *user);
+                            CustomLevelSetup setup,
+                            CustomLevelMessage message, void *user);
 
 const char *CustomLevelTitle(const CustomLevel *level);
 // The generated prelude, which is also this level's ScriptFileName.
@@ -105,6 +123,16 @@ const CustomLevelMap &CustomLevelDescription(const CustomLevel *level);
 // as the re-entrancy guard for those hooks, so a callback that itself parses a
 // .gls cannot make the level build twice.
 CustomLevel *CurrentCustomLevel();
+
+// Hands a script-queue message to the custom level the game is currently in -
+// the one whose generated script is ScriptFileName, which is set for as long as
+// the level is loaded rather than only while it builds. Returns false when no
+// custom level is loaded or it has no message hook, which is what makes the
+// payload get reported as undelivered.
+//
+// This is ScriptQueueSystem's handler, installed by CustomLevelSystem. It is
+// exported so a harness can drive it without constructing either.
+bool DispatchCustomLevelMessage(const char *json);
 
 // Every object in the loaded level .rif whose name matches, as ToMap reads them:
 // integer locator coordinates scaled by the world unit and offset by the map
@@ -122,7 +150,9 @@ void ClearCustomLevelActions();
 // a custom level's map is converted and its populate callback runs) and
 // FreeParsedObjectList (which shares the same null guard) - plus
 // ExecuteAllCommands, the one place LoadLevel runs the level .gcs, which is
-// where the setup callback goes. RAII, like every other *System -
+// where the setup callback goes. Also installs DispatchCustomLevelMessage as the
+// script queue's message handler, which needs no hook of its own -
+// ScriptQueueSystem owns those. RAII, like every other *System -
 // construct/destroy inside a Detours transaction.
 class CustomLevelSystem {
 public:

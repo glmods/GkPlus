@@ -631,9 +631,26 @@ specular green 0x26, specular blue 0x27, range 0x28.
 ### ??? "replace destructibility" (`ParseUnk2`)
 | Field | ID | Type | Rules |
 |-------|----|------|-------|
-| name | 0x00 | S | req |
+| name | 0x00 | S | req — **a .gcs script name**, see below |
 | replace | 0x69 | B | dflt no |
-Converts to a destructibility record of type 4 `{vtbl, 4, char* name, bool replace}`.
+Converts to a destructibility record of type 4 `{vtbl, 4, char* script, bool replace}`.
+
+**Field 0x00 is a script file name, not an identifier**, so this section means "run a script
+when the object dies". The GLS keyword is `name` and that is what misled the earlier note; the
+evidence is that its *only* reader is `Frag` @ 0x0052e220, whose `case 4` does
+`QueueScriptExecution(destructibility + 8)` and then reads `replace` at `+0x0c` into the same
+local the `frag data` path fills from `FragData::replace`. `ToReplaceDestructibility`
+@ 0x0047eaa0 strdups it and `ReplaceDestructibilityDtor` @ 0x00483d00 frees it; nothing else
+touches the field. It is therefore modelled as `ReplaceDestructibility::script` in `src/Roles.h`
+and spelled `script` in `make.role`'s description. Like every script-name field it carries JSON
+under GkPlus: `ToReplaceDestructibility` is hooked so the name it strdups is stored as the JSON
+string `"x.gcs"`, and a `make.role` description may put a message object there instead
+(`src/ScriptQueue.h`). The same hook exists on `ToRole` for GLS field 0x4c
+(`interface beam script`), which is the other converter that produces a script name.
+
+The **section keyword is still unknown** — `ParseUnk2` is reached from the `destructibility`
+sub-section list, and no shipped header uses it — so "replace destructibility" remains a
+descriptive name, not a recovered one.
 
 ### role (`DoParseRole` / `ParseRole`)
 | Field | ID | Type | Rules |

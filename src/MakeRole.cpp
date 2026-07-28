@@ -702,7 +702,7 @@ bool MakeCameraTrack(const CameraTrackDesc &d) {
   return true;
 }
 
-ReplaceDestructibility *MakeReplaceDestructibility(const char *name,
+ReplaceDestructibility *MakeReplaceDestructibility(const char *script,
                                                    bool replace) {
   void *raw = ZeroedPool(sizeof(ReplaceDestructibility));
   if (!raw) {
@@ -711,7 +711,7 @@ ReplaceDestructibility *MakeReplaceDestructibility(const char *name,
   InstallVtable(raw, 0x00663088); // PTR_ReplaceDestructibilityDtor_00663088
   auto *r = static_cast<ReplaceDestructibility *>(raw);
   r->tag = DestructibilityKind::ReplaceDestructibility;
-  r->name.reset(name ? GameStrdup(name) : nullptr);
+  r->script.reset(script ? GameStrdup(script) : nullptr);
   r->replace = replace;
   r->pad[0] = r->pad[1] = r->pad[2] = 0;
   return r;

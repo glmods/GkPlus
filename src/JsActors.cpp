@@ -2,6 +2,7 @@
 
 #include "JsBindings.h"
 #include "Roles.h"
+#include "ScriptQueue.h"
 #include "Tokens.h"
 
 #include <cmath>
@@ -450,8 +451,16 @@ JSValue ActorDamage(JSContext *ctx, JSValueConst self, int argc,
     return JS_EXCEPTION;
   }
   bool flag = argc > 1 && JS_ToBool(ctx, argv[1]);
+  // The attacker's team, for Deathmatch frag credit and the 0x9b update.
+  // -1 is "nobody", which is what an unattributed script hit should be.
+  int32_t attacker_team = -1;
+  if (argc > 2 && !JS_IsUndefined(argv[2]) &&
+      JS_ToInt32(ctx, &attacker_team, argv[2])) {
+    return JS_EXCEPTION;
+  }
   // slot 68; a negative amount heals.
-  return JS_NewBool(ctx, a->ApplyDamage(static_cast<float>(amount), flag));
+  return JS_NewBool(
+      ctx, a->ApplyDamage(static_cast<float>(amount), flag, attacker_team));
 }
 
 // Both of the destructions we can see. Nulling `ptr` turns every later access
@@ -473,7 +482,9 @@ JSValue ActorRemove(JSContext *ctx, JSValueConst self, int, JSValueConst *) {
   if (!a) {
     return JS_EXCEPTION;
   }
-  a->Delete(); // slot 65
+  // The flag gates the 0x49 broadcast; every game call site passes 1, and a
+  // removal the other players never hear about is not what remove() means.
+  a->Delete(true); // slot 65
   w->ptr = nullptr;
   return JS_UNDEFINED;
 }
@@ -484,18 +495,24 @@ JSValue ActorAssociate(JSContext *ctx, JSValueConst self, int argc,
   if (!a) {
     return JS_EXCEPTION;
   }
-  if (argc < 1) {
+  if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0])) {
     return JS_ThrowTypeError(ctx,
                              "associate(script, one_shot) expects a script");
   }
-  const char *script = JS_ToCString(ctx, argv[0]);
-  if (!script) {
+  // A string is a .gcs name; anything else is a message delivered to the level's
+  // message_received when the item is used or picked up. OnPickedUp puts this
+  // straight on the script queue, so both shapes are what ScriptQueue.h
+  // describes.
+  std::string script;
+  if (!ToScriptPayload(ctx, argv[0], &script)) {
     return JS_EXCEPTION;
   }
   bool one_shot = argc > 1 && JS_ToBool(ctx, argv[1]);
-  // slot 66. PickupActor strdups the name, so our buffer is not retained.
-  a->Associate(const_cast<char *>(script), one_shot ? 1 : 0);
-  JS_FreeCString(ctx, script);
+  // slot 66. PickupActor strdups the name, so our buffer is not retained. The
+  // scope tells that slot's hook the value is already encoded, so it passes it
+  // through rather than quoting a document.
+  EncodedPayloadScope encoded;
+  a->Associate(const_cast<char *>(script.c_str()), one_shot ? 1 : 0);
   return JS_UNDEFINED;
 }
 
@@ -553,7 +570,21 @@ JSValue ActorSetTeam(JSContext *ctx, JSValueConst self, int argc,
   if (JS_ToInt32(ctx, &team, argv[0])) {
     return JS_EXCEPTION;
   }
-  a->SetTeamID(team); // slot 33
+  // Slot 39 rather than the raw SetTeamID at slot 33, for two reasons and only
+  // one of them is replication:
+  //
+  //   * SetTeamID is `this->team_id = team` and nothing else. Both engine call
+  //     sites that change a team (ChangeOwnerAndTeam, and CommandGiveControl,
+  //     which reproduces its team half inline) bracket it with a removal from
+  //     the old team's actor list and an insert into the new one, gated on
+  //     +0x3c. Calling it bare leaves the actor on its old team's list.
+  //   * ChangeOwnerAndTeam broadcasts - update 0x58 with the two +0x28/+0x2c
+  //     fields, then update 0x50 with the team, which is the one GIVE CONTROL
+  //     sends. SetTeamID broadcasts nothing.
+  //
+  // Passing the actor's current +0x28/+0x2c back in is what keeps this a team
+  // change: those are the only other things the slot writes.
+  a->ChangeOwnerAndTeam(a->field0x28, a->field0x2c, team); // slot 39
   return JS_UNDEFINED;
 }
 

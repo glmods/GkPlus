@@ -10,6 +10,7 @@
 #include "InputFix.h"
 #include "Music.h"
 #include "Script.h"
+#include "ScriptQueue.h"
 
 #include <cassert>
 #include <memory>
@@ -27,6 +28,7 @@ struct Subsystems {
   GUISystem gui;           // ImGui/D3D overlay
   InputFixSystem inputfix; // suppress the vestigial DirectInput keyboard acquire
   CustomMenuSystem menus;   // front-end menu items owned by GkPlus
+  ScriptQueueSystem queue;  // the script queue carries JSON, not bare .gcs names
   CustomLevelSystem levels; // levels built from script instead of .gls + .gcs
   ScriptSystem script;      // QuickJS host; runs gkplus/main.mjs
 };

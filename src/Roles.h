@@ -280,8 +280,13 @@ static_assert(sizeof(FragData) == 0x24);
 struct ReplaceDestructibility {
   virtual ~ReplaceDestructibility() = 0;
   DestructibilityKind tag; // = ReplaceDestructibility
-  pool_string name; // GLS 'name' 0x00
-  bool replace;     // GLS 'replace' 0x69
+  // A **script file name**, not an identifier, despite the GLS keyword. Its only
+  // reader is Frag @ 0x0052e220 `case 4`, which hands it to QueueScriptExecution
+  // and then reads `replace` - so this variant is "run a script when the object
+  // dies". Was modelled as `name` after the GLS keyword until that case block was
+  // read; ToReplaceDestructibility @ 0x0047eaa0 strdups it from GLS field 0x00.
+  pool_string script; // GLS 'name' 0x00
+  bool replace;       // GLS 'replace' 0x69
   uint8_t pad[3];
 };
 static_assert(sizeof(ReplaceDestructibility) == 0x10);

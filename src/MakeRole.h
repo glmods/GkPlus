@@ -191,9 +191,13 @@ struct FragDataDesc {
 };
 FragData *MakeFragData(const FragDataDesc &desc);
 
-// The `name` + `replace` destructibility variant - ToReplaceDestructibility
-// @ 0x0047eaa0. `name` is strdup'd onto the game heap.
-ReplaceDestructibility *MakeReplaceDestructibility(const char *name, bool replace);
+// The "run a script on death" destructibility variant - ToReplaceDestructibility
+// @ 0x0047eaa0. `script` is GLS field 0x00, whose keyword is `name`, and it is a
+// .gcs path: Frag's `case 4` queues it (see ReplaceDestructibility in Roles.h).
+// It is strdup'd onto the game heap, and being a script-name field it may equally
+// hold a marked message - see ScriptQueue.h.
+ReplaceDestructibility *MakeReplaceDestructibility(const char *script,
+                                                   bool replace);
 
 // --- role -----------------------------------------------------------------------
 //

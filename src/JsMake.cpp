@@ -448,15 +448,18 @@ Destructibility *ReadDestructibility(JSContext *ctx, JSValueConst v, bool *ok) {
     return MakeDestructibility(DestructibilityKind::Splatter);
   }
   if (kind == "replace") {
-    std::string name;
+    // `script`, not `name`: GLS spells the field `name`, but its only consumer is
+    // Frag queueing it, so it is a .gcs path - and therefore takes a message
+    // object as well, like every other script-name field.
+    std::string script;
     bool replace = false;
-    if (!GetString(ctx, v, "name", &name) ||
+    if (!GetScriptPayloadProp(ctx, v, "script", &script) ||
         !GetBool(ctx, v, "replace", &replace)) {
       *ok = false;
       return nullptr;
     }
     return reinterpret_cast<Destructibility *>(
-        MakeReplaceDestructibility(name.c_str(), replace));
+        MakeReplaceDestructibility(script.c_str(), replace));
   }
   if (kind == "frag") {
     FragDataDesc desc;
@@ -659,7 +662,9 @@ JSValue MakeRoleJs(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
       !GetString(ctx, v, "alternate_hotspot", &alternate) ||
       !GetString(ctx, v, "sever_points", &sever_points) ||
       !GetString(ctx, v, "meta_sound", &meta_sound) ||
-      !GetString(ctx, v, "interface_beam_script", &beam_script) ||
+      // A .gcs name, or a message object - the beam's effect goes on the script
+      // queue like any trigger's, so both shapes work here too.
+      !GetScriptPayloadProp(ctx, v, "interface_beam_script", &beam_script) ||
       !GetEnum(ctx, v, "ai", ResolveAi, "AI type", &ai) ||
       !GetEnum(ctx, v, "action_on_death", ResolveActionOnDeath,
                "action on death", &action_on_death) ||

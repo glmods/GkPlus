@@ -281,6 +281,25 @@ numTriggers x {
 Tokens and pending commands are rebuilt through the normal `SetOrCreateToken` / `TriggerList::CreateTrigger`
 APIs, so the linked lists are reconstructed rather than restored byte-for-byte.
 
+> ### A GkPlus save is not a vanilla save
+>
+> **The `str script` above now carries a JSON document, so saves written by GkPlus will not load
+> correctly in an unpatched Gunlok.** This is deliberate and was decided explicitly, not stumbled
+> into. `TriggerData::script_name` @ +0x54 is written by `RegisterTriggers`, which
+> `ScriptQueueSystem` hooks so that a bare `.gcs` name is stored as the JSON string
+> `"crtbaa.gcs"` — see `src/ScriptQueue.h`. That string is what lands in the save, verbatim, and an
+> unpatched game would try to `fopen` it quotes and all, so **every trigger in a restored save
+> would lose its script**. Nothing warns about it; there is no version field to notice, because
+> the format's version is `sizeof(SaveSettingsBlock)` and the layout did not change.
+>
+> The reverse direction is fine. A save written *before* this change (or by vanilla) restores bare
+> names into that field, and `ScriptQueuePayload` quotes them at the queue exactly as it always
+> did — one of the residual paths that hook still exists for.
+>
+> The same applies to any other field the save serialises as a string and the script queue later
+> reads. Triggers are the only one in this block; `Vulnerability::script` comes back through
+> `ReadActorFixups` and is subject to the same rule.
+
 #### Doors
 
 Guarded by two readiness checks (`0x0056f450` / `0x0056e920` on save, `0x0056eca0` / `0x0056e840`

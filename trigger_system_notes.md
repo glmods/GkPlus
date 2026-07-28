@@ -94,8 +94,19 @@ entry to resolve actor token names to actor IDs. The resolved IDs are used to:
 - Check alert/attack state (BEEN_ALERTED, BEING_ATTACKED)
 
 The field at offset 0x54 stores the **script filename** that is passed to
-`QueueScriptExecution` when the trigger condition is met. This is confirmed by
-the trigger fire handler at 0x0051066d:
+`QueueScriptExecution` when the trigger condition is met.
+
+> **Under GkPlus this field always holds a JSON document.** `RegisterTriggers` is hooked, so a bare
+> name from `ADD TRIGGER` is stored as the JSON string `"crtbaa.gcs"`, and
+> `triggers.create({ script: {...} })` stores an object instead — which the script queue delivers to
+> a level's `message_received` rather than opening as a file. That hook covers all 23 game-side
+> registrations (21 branches of `CommandAddTrigger`, plus `LoadLevel` and `Frag`). The field is still
+> just a `strdup`'d NUL-terminated string. See `src/ScriptQueue.h`.
+>
+> **This is what makes a GkPlus savegame incompatible with an unpatched Gunlok**, since `SaveGame`
+> writes this field verbatim — see `save_system_notes.md`.
+
+This is confirmed by the trigger fire handler at 0x0051066d:
 ```c
 if (triggerData->script_name != NULL) {
     QueueScriptExecution();
