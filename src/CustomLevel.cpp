@@ -432,7 +432,12 @@ std::vector<CustomLevelLocator> LevelRifLocators(const char *object_name) {
 
   List<void *> matches{static_cast<List_Member_Base<void *> *>(block), 0,
                        nullptr, false};
-  ThisCall<void, List<void *> *, void *, const char *> filter;
+  // __fastcall, not __thiscall: it takes the out list in ECX **and** the rif in
+  // EDX (it reads [EDX+0xc] at 0x005aaac8), with only `name` on the stack. A
+  // ThisCall pointer would have put the rif on the stack and left EDX holding
+  // whatever the caller last used, and cleaned 8 bytes where the callee cleans 4.
+  // See the trap in CLAUDE.md: args in ECX *and* EDX means __fastcall.
+  FastCall<void, List<void *> *, void *, const char *> filter;
   GetObjectAtOffset(filter, 0x005aaac0);
   filter(&matches, rif, object_name);
 
@@ -446,7 +451,7 @@ std::vector<CustomLevelLocator> LevelRifLocators(const char *object_name) {
         static_cast<float>(*reinterpret_cast<const int32_t *>(at(0x48))),
         static_cast<float>(*reinterpret_cast<const int32_t *>(at(0x4c)))};
     CustomLevelLocator loc{};
-    loc.position = MapToWorld(map, rif_pos);
+    loc.position = MapToWorld(map, rif, rif_pos);
     loc.orientation = *reinterpret_cast<const Vec4 *>(at(0x50));
     out.push_back(loc);
   }

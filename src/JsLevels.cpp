@@ -472,14 +472,15 @@ JSValue LevelSend(JSContext *ctx, JSValueConst self, int argc,
   if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0])) {
     return JS_ThrowTypeError(ctx, "send(message) expects a value");
   }
-  // ToScriptPayload produces a document either way - a JSON string for a file
-  // name - which is exactly what the queue wants, so sending skips the field
-  // without needing to re-encode anything.
+  // ToScriptPayload produces a complete envelope either way - kind "file" for a
+  // string, kind "message" for anything else - so this queues it verbatim rather
+  // than going through QueueScriptMessage, which would wrap a second time and
+  // turn `send("wave2.gcs")` into a message whose body is an envelope.
   std::string payload;
   if (!ToScriptPayload(ctx, argv[0], &payload)) {
     return JS_EXCEPTION;
   }
-  if (!QueueScriptMessage(payload.c_str())) {
+  if (!QueueScriptPayload(payload.c_str())) {
     return JS_ThrowInternalError(ctx, "the script queue refused the message");
   }
   return JS_UNDEFINED;

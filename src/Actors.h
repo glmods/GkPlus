@@ -645,7 +645,7 @@ static_assert(offsetof(TurretActor, target_angle_yaw) == 0x318);
 // The actor hash @ 0x007ba0d8. Unlike the roles table this one is a real object:
 // its address is passed as `this` to the template's own methods, and 0x0054f2b0 is
 // a byte-for-byte match for AvP's `_base_HashTable::Remove` (chains @ this+0x10,
-// mask @ this+0x0c, n_entries @ this+0x04, `Dealloc?(node, 8)` for the node), so
+// mask @ this+0x0c, n_entries @ this+0x04, `free_sized(node, 8)` for the node), so
 // the field at +0x00 that older notes called `unk1` is the vptr.
 using Actors = HashTable<Actor *>;
 using ActorNode = Actors::Node;

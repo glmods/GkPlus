@@ -96,6 +96,23 @@ Four more things that cost time the first time round:
   rather than including it. If the two disagree the kind/`instanceof` tests fail, which is the
   point of testing the ladder at all.
 
+### Debugging the running game
+
+- `cmake --build build --target copy` fails while `gl.exe` is running (the DLL is locked). A
+  clean exit rewrites `<Gunlok>\scripts\GLkeys.cfg` — a cheap "quit or crashed?" signal.
+- **Prefer no debugger for crash hunting**: launch `gl.exe` directly and read WER's Application
+  Error log plus the exit code. Attaching anything makes Gunlok crawl, and a fault is recorded
+  either way.
+- When you need a stack, **cdb** lives inside the WinDbg MSIX package and cannot be executed in
+  place — copy it out. `game_defects_notes.md` has the recipe and the traps: `bp d3d8+0x...`
+  silently parses `d3d8` as the hex literal 0xD3D8, cdb echoes its whole `-c` list so `.echo`
+  markers appear twice (anchor greps with `^MARKER$`), and cdb will not load our clang PDB —
+  symbolize with `llvm-symbolizer --obj=build/Debug/d3d8.dll --relative-address <rva>`.
+- **`DebugSystem` deliberately leaves `DebugPrintWarning` unhooked** (`RedirectWarnings` in
+  `src/Debug.cpp`): the GLS parser emits one warning per unset field per section, 13,000+ per
+  level load, and redirecting those to `OutputDebugString` makes the game unplayable under any
+  debugger. Re-enabling it is the fastest way to make in-game testing impossible.
+
 ### Dependencies (vcpkg.json)
 
 | Package | Purpose |
@@ -177,7 +194,7 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 | `src/List.h` | `List<T>` / `List_Member<T>` / `List_Member_Base<T>` — layout mirror of AvP's `list_tem.hpp`, with sentinel-safe `begin()`/`end()` |
 | `src/HashTable.h` | `HashTableBase<T>` / `HashTable<T>` — layout mirror of AvP's `Hash_tem.hpp`, with bucket-walking `begin()`/`end()` |
 | `src/Memory.h/cpp` | `pool_alloc`/`pool_free` and the `pool_unique_ptr`/`pool_string` ownership markers |
-| `src/Json.h/cpp` | `gk::json::Classify` / `Quote` / `Object` — the script queue's JSON. **The codec is QuickJS** (`JS_ParseJSON` / `JS_JSONStringify`) on a **private `JSRuntime` behind a lock**, because this runs on both game threads and the host's runtime may only be used from one. No modules and no scripts in it, so nothing there is observable from a script. See the `JS_UpdateStackTop` rule in the QuickJS conventions — sharing the runtime across threads disarms its stack guard. Everything in it is UTF-8; codepages are `Encoding.h`'s job |
+| `src/Json.h/cpp` | `gk::json::Classify` / `Quote` / `Envelope` / `OpenEnvelope` — the two queues' JSON. This file owns the `{kind, body}` envelope's *shape*; the vocabulary of kinds is `ScriptQueue.cpp`'s. **The codec is QuickJS** (`JS_ParseJSON` / `JS_JSONStringify`) on a **private `JSRuntime` behind a lock**, because this runs on both game threads and the host's runtime may only be used from one. No modules and no scripts in it, so nothing there is observable from a script. See the `JS_UpdateStackTop` rule in the QuickJS conventions — sharing the runtime across threads disarms its stack guard. Everything in it is UTF-8; codepages are `Encoding.h`'s job |
 | `src/Encoding.h/cpp` | `Utf8FromGameText` / `GameTextFromUtf8` — CP_ACP ↔ UTF-8 via `MultiByteToWideChar`/`WideCharToMultiByte`. **The script queue's edges.** Everything the engine holds in a `char *` is ANSI (a `.gls` is read as bytes; `fopen` reads the codepage) and JSON is UTF-8, so a name is transcoded on the way into a payload and back on the way to `ExecuteCommandFile`. A conversion that fails returns its input unchanged |
 | `src/Varint.h` | Variable-length integer encode/decode utility (currently no callers) |
 
@@ -197,7 +214,9 @@ class constructed by `entry.cpp`; the others are pure struct + native-API.
 
 One `JSRuntime`, one `JSContext`, one entry module. The entry module is `GKPLUS_SCRIPT` if that
 environment variable is set, otherwise **`gkplus\main.mjs` next to `d3d8.dll`** (i.e. in Gunlok's
-directory). A missing file logs the path it looked for and leaves the game unmodified.
+directory). A missing file logs the path it looked for and leaves the game unmodified. An
+**empty** one does not: it loads, evaluates, exports nothing, and looks exactly like a working
+host that happens to do nothing — check the file is non-empty before debugging the bindings.
 `examples/main.mjs` is a working starting point.
 
 ```js
@@ -405,26 +424,45 @@ not the file stack, and nothing afterwards recovers — a verbatim copy of a shi
 fails identically. Anything making repeated `LoadGLS` calls (`gls.probe`, `gls.try_parse`,
 a level's `includes`) has to treat the first failure as terminal.
 
-### The script queue carries JSON (`src/ScriptQueue.h/cpp`)
+### Both queues carry one JSON envelope (`src/ScriptQueue.h/cpp`)
 
 Gunlok has exactly one channel for "something happened, react to it", and it moves **file names**:
 a trigger fires, `QueueScriptExecution` @ 0x00505080 pushes a `.gcs` name onto `ScriptQueue`
 @ 0x007ba35c *and* broadcasts it as update `0x67`, and every machine runs its own local copy of
-that file. `ScriptQueueSystem` redefines that payload — and the fields it comes from — as **a JSON document**.
+that file. It has a second, unrelated queue for console commands: `CommandsToExecute` @ 0x007b6aa8,
+holding one strdup'd line per node, popped one per frame. `ScriptQueueSystem` redefines **both**
+payloads — and the fields the first comes from — as one JSON object:
+
+```json
+{"kind": "file" | "command" | "message", "body": <contents>}
+```
+
+- **file** — `body` names a `.gcs`, run exactly where and when the engine would have run it.
+- **command** — `body` is a console command line. Every entry on `CommandsToExecute` is one of
+  these; on the script queue it is a command replicated to every machine.
+- **message** — `body` is anything, handed to `SetScriptMessageHandler`'s handler instead of to
+  the file system. `CustomLevel` installs `DispatchCustomLevelMessage`, which is what makes a
+  script level's `message_received` fire. The handler receives the **body**, so the envelope is
+  invisible from JS.
+
+A kind this build does not know is still a well-formed envelope: reported and dropped, never
+opened as a file.
+
+**The envelope is why the format is an object rather than a bare value.** It used to be "a JSON
+string is a file name, anything else is a message", which mis-read a `.gcs` literally called `123`.
+The test is now "is this an object with a string `kind` and a `body`?" (`gk::json::OpenEnvelope`),
+and a colliding file name would have to contain `"` and `:` — both illegal in a Windows path. What
+is not an envelope is a bare name, with no residual doubt. `gls.probe`-style content inspection is
+gone, and so is the marker byte that preceded it.
+
 **This is visible on disk and deliberately breaking**: `SaveGame` serialises a trigger's script name
-verbatim, so a save written by this build carries JSON and will not restore correctly in an unpatched
-Gunlok (see `save_system_notes.md`). Reading an older save still works, through the residual path
-below.
+verbatim *and* walks `CommandsToExecute` writing each pending line, so a save written by this build
+carries envelopes in both and will not restore correctly in an unpatched Gunlok (see
+`save_system_notes.md`). Reading an older save still works, through the residual path below.
 
-- a JSON **string** is the legacy meaning — it names a `.gcs`, run exactly where and when the
-  engine would have run it;
-- **anything else** is a message, handed to `SetScriptMessageHandler`'s handler instead of to the
-  file system. `CustomLevel` installs `DispatchCustomLevelMessage`, which is what makes a script
-  level's `message_received` fire.
-
-**The encoding happens where the value is written, not where it is queued.** Eight hooks: four
-*writers* that quote the bare name the engine hands them, so a script-name field holds a document
-from the moment it is set, and four on the queue itself.
+**The wrapping happens where the value is written, not where it is queued.** Nine hooks: four
+*writers* that wrap the bare name the engine hands them, so a script-name field holds an envelope
+from the moment it is set, and five on the two queues.
 
 | Hook | Address | Role |
 |---|---|---|
@@ -432,17 +470,53 @@ from the moment it is set, and four on the queue itself.
 | `PickupActor::Associate` | 0x005469f0 | writer: `associated_script`. The only implementation that stores — `Actor::Associate` @ 0x0054e640 is a `RET 0x8` stub |
 | `ToRole` | 0x0047cc20 | writer: `Role::interface_beam_script`, which `AddInterfaceBeamVulnerability` later copies *by pointer* into `Vulnerability::script` |
 | `ToReplaceDestructibility` | 0x0047eaa0 | writer: `ReplaceDestructibility::script` |
-| `CommandBatchAndBroadcast` | 0x00448400 | **replaced**: five calls reproduced, name encoded |
-| `MultiplayerRespawnRole` | 0x0050c8b0 | **replaced**: encodes its `.gcs` name, drops the 15-byte leak. `FUN_00511600` is `__thiscall` on `RespawnRoleList` @ 0x007b9d98 — the decompiler hides the ECX `this` |
-| `CommandVulnerability` | 0x0044a600 | wrapped, then every `Vulnerability::script` swept and encoded |
+| `CommandBatchAndBroadcast` | 0x00448400 | **replaced**: five calls reproduced, name wrapped |
+| `MultiplayerRespawnRole` | 0x0050c8b0 | **replaced**: wraps its `.gcs` name, drops the 15-byte leak. `FUN_00511600` is `__thiscall` on `RespawnRoleList` @ 0x007b9d98 — the decompiler hides the ECX `this` |
+| `CommandVulnerability` | 0x0044a600 | wrapped, then every `Vulnerability::script` swept and wrapped |
 | `QueueScriptExecution` | 0x00505080 | guards the invariant for what the above do not cover |
 | `RunQueuedScript` | 0x00505310 | host consumer: arms the payload window, runs the original |
 | `ApplyUpdateMessage` | 0x004fde70 | joiner consumer: same, for the `case 0x67` arm inside it |
-| `ExecuteCommandFile` | 0x0043f250 | the one place a payload is consumed; interprets it |
+| `ExecuteCommandFile` | 0x0043f250 | consumes a script-queue payload; also **sweeps** whatever it just appended to `CommandsToExecute` into `command` envelopes |
+| `PumpQueuedConsoleCommand` | 0x004d6120 | **replaced**: the console queue's consumer, see below |
 
-Six things decide the shape, in decreasing order of how much they constrain it:
+**The console queue is read through the envelope, never written to it.** Its nodes keep the plain
+lines the game put there, and the replaced consumer treats a bare line as `kind: "command"` — the
+branch that had to exist for old savegames anyway. So both queues share one set of meanings and one
+code path, while `CommandsToExecute` keeps byte-for-byte the representation vanilla Gunlok gives it.
 
-- **The consumers are not reimplemented — they are bracketed.** Both pop the payload themselves and
+- **An earlier design rewrote each node into a literal envelope, and it crashed the game.** After
+  every `ExecuteCommandFile` the queue was swept, replacing each payload via the game's `strdup`
+  and `pool_free`. It faulted as a wild call — EIP on the stack, so WER blamed "module: unknown" —
+  in roughly two runs out of three, from inside the sweep's own `pool_free`. The lesson is not
+  "that had a bug": a subsystem that rewrites another allocator's live objects on a hot path buys
+  very little and risks everything, and all the rewrite bought was making the bytes on the queue
+  *look* like the bytes on the wire.
+- **Not writing to it costs nothing**, because the `#` directives, front-insertion, `CLEAR BATCH`,
+  `NumCommandsToExecute` and `SaveGame`'s serialisation of pending lines all keep working by being
+  left alone — and a save written by this build stays readable by vanilla Gunlok.
+- **Consuming still had to be a replacement**, and that is a measurement, not a preference.
+  `PumpQueuedConsoleCommand` copies a node's string into `ConsoleCommandLine` (`char[252]`
+  @ 0x007b6958) with an **unbounded** byte loop at 0x004d61f0, and the next global is
+  `ConsoleSmallFont` @ 0x007b6a54 with nothing in between. An envelope adds ~28 characters to a
+  line `fgets` already allows 249 of — `level06.gcs` ships one 399 characters long — so letting
+  the game pop an envelope would write JSON through a font pointer. The replacement decodes first
+  and puts only the *body* in that buffer, truncating (with a note) if it still does not fit.
+- **The replacement reproduces all three gates exactly** — the `WAIT` deadline, `REAL WAIT` with
+  its TAB cancel, and `WAIT FOR` with the `REPTXT` re-print — plus the `LevelLoadReason == 3`
+  bypass. Every comparison in the original is a signed test on the high dword then an unsigned one
+  on the low (`JL`/`JG`/`JC`), which is what a signed 64-bit `<` compiles to, so they are written
+  as ordinary comparisons. It differs from the original in one way, and it is a fix: it returns on
+  an **empty** queue, where the original walks into the sentinel and reads a payload off a
+  0xc-byte `List_Member_Base` that has no `data` — harmless only because both of its callers test
+  `NumCommandsToExecute` first.
+- A queue entry that is **not** an envelope is the normal case, not an exception: it is a plain
+  line the game queued, run as the console command it always was. Old savegames land here by the
+  same rule rather than through a special case.
+
+Six things decide the shape of the script queue's half, in decreasing order of how much they
+constrain it:
+
+- **The script queue's consumers are not reimplemented — they are bracketed.** Both pop the payload themselves and
   hand it straight to `ExecuteCommandFile`, so each is wrapped in a *window* that marks provenance
   and the `ExecuteCommandFile` hook interprets whatever arrives inside one. Replacing either body
   instead would mean duplicating `MsgQueue_Pop`, the `SetCurrentDirectoryToGLDir(GL_Scripts)` dance
@@ -632,8 +706,10 @@ Two facts from it that change how bindings get written:
   world-mutating handler is `IsExecutorRunning` → `SuspendExecutor` → mutate →
   `BroadcastToPlayers(id, …)` → `ResumeExecutor`, and the update id and payload are per-command.
   §4.1 of the notes lists all 27 broadcasters with their recovered update ids and payload sizes.
-  `camera.tracking` is deliberately read-only for this reason — stopping a track is local, but
-  `TRACK <id>` broadcasts update 0xb4.
+  **But a broadcast is only wire-format work for a *native* binding.** Dispatching the command runs
+  the handler, which broadcasts itself — which is why all 25 broadcasting gaps closed for free once
+  the command-backed surface existed. They are also safe to call unguarded: 24 of the 25 check
+  `IsExecutorRunning`, so a joining client no-ops and takes the host's update instead.
 - **There are two kinds of binding here, and the split is load-bearing.** *Native* wrappers
   (`camera`, `game`, `world`, the `console` colours and registry) exist wherever there is **state
   to read back**. *Command-backed* namespaces (`fx`, `light`, `objectives`, `music`, `screen`,
@@ -741,10 +817,12 @@ outlive every context — into the `.data` array and into a never-freed registra
 needs a finalizer and neither can dangle.
 
 **Every field that held a `.gcs` name now takes a message object too**, through one helper:
-`js::ToScriptPayload` in `JsCommon.cpp`. A **string** is stored verbatim, so the game struct keeps
-looking exactly like parsed data; **anything else** is `JS_JSONStringify`d and marked with
-`ScriptMessageMarker`, which is what the queue's producer reads. `JSON.stringify` refusing a value
-(a function, a symbol) is a `TypeError` at the call, not a payload named "undefined".
+`js::ToScriptPayload` in `JsCommon.cpp`. A **string** becomes a `file` envelope, so a field written
+from a script and one written from a `.gls` end up identical; **anything else** is
+`JS_JSONStringify`d into a `message` envelope. Both go through `FileScriptPayload` /
+`MessageScriptPayload` in `ScriptQueue.h`, which exist so that nothing outside `ScriptQueue.cpp`
+spells a kind. `JSON.stringify` refusing a value (a function, a symbol) is a `TypeError` at the
+call, not a payload named "undefined".
 
 **Four fields have it, and that number comes from the call-site inventory rather than from
 guessing.** `threading_model_notes.md` traces the argument of all seven `QueueScriptExecution`
@@ -755,9 +833,11 @@ callers; every one of them that reads a script-writable field is covered —
 last was missed on the first pass, which is the argument for doing the inventory: it is spelled
 `script` here although GLS spells the field `name`, because a queue push is its only reader.
 
-`ToScriptPayload` therefore returns a **field value, not a payload**, and `Level.send(msg)` is the
-one caller that skips the field — so it does the producer's job itself, `UnmarkScriptMessage` for a
-message and `json::Quote` for a name. Anything else queueing directly has to do the same.
+`ToScriptPayload` returns a **complete envelope**, which is also exactly what the queue wants, so
+`Level.send(msg)` — the one caller that skips the field — hands it to `QueueScriptPayload` rather
+than to `QueueScriptMessage`. That split matters: `QueueScriptMessage` takes a message *body* and
+wraps it, so passing an envelope to it would bury the kind and turn `send("wave2.gcs")` into a
+message whose body is an envelope. Anything else queueing directly has the same choice to make.
 
 Writes go through `CollectionOps::assign`, which only `tokens` supplies — `tokens["score"] = 0` is
 an upsert. The handler **throws** rather than returning false: quickjs hands an exotic
@@ -1393,8 +1473,8 @@ CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84
 | Offset | Signature | Name |
 |--------|-----------|------|
 | 0x00571470 | CDecl<void*, size_t> | pool_alloc — page sub-allocator; falls back to real CRT malloc for big blocks |
-| 0x005715b0 | StdCall<void, void*> | pool_free — returns an emptied page to the real CRT free |
-| 0x005e3f64 | StdCall<void, void*, int> | `Dealloc?` (sized wrapper; discards the size, calls pool_free) |
+| 0x005715b0 | CDecl<void, void*> | pool_free — returns an emptied page to the real CRT free. **`__cdecl`, not `__stdcall`**: bare `RET` at 0x0057166f with one stack argument, and game call sites clean up themselves (`CALL free` then `ADD ESP,0x4`). Calling it through a `StdCall` pointer leaks 4 bytes of stack per call and eventually returns to garbage — see the comment in `src/Memory.cpp` |
+| 0x005e3f64 | CDecl<void, void*, int> | `free_sized` (discards the size, calls pool_free). `__cdecl` for the same reason. Was named `Dealloc?` |
 | 0x005e3f72 | — | `malloc` — bare `JMP pool_alloc` |
 | 0x005e3f7b | — | `free` — bare `JMP pool_free`; **every** `free` in game code goes here |
 | 0x0044e1a0 | FastCall<char*, char*> | `strdup` — game-written, allocates via the malloc thunk |
@@ -1421,7 +1501,7 @@ CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84
 | 0x00470f20 | ThisCall<void, Map*, void*, Vec3*, LevelMeshHeader*> | Map_Ctor |
 | 0x005035b0 | FastCall<int, int, Role*, Vec3*, Vec4*> | ServerSpawnActorForTeam |
 | 0x004fce90 | FastCall<void*, int, Role*, Vec3*, Vec4*> | ClientSpawnActorForTeam |
-| 0x005aaac0 | ThisCall<void, List*, void*, const char*> | RifFilterObjectsByName (ECX=out list, EDX=rif) |
+| 0x005aaac0 | FastCall<void, List*, void*, const char*> | RifFilterObjectsByName — **`__fastcall`**, ECX=out list *and* EDX=rif (read at 0x005aaac8), name on the stack. Was declared `ThisCall`, which put the rif on the stack and left EDX garbage |
 | 0x004ae960 | FastCall<void*, const char*, int> | LoadOrGetRifFile |
 
 **Save System:** (see `save_system_notes.md`)
@@ -1599,7 +1679,7 @@ KERNEL32/USER32/GDI32/ADVAPI32/OLE32/WINMM (Windows API).
 - **Owning pointers in a struct mirror are `pool_unique_ptr<T>` (`src/Memory.h`); owned strings
   are the `pool_string` alias.** There is only **one heap** on the game side — `pool_alloc` is a
   page sub-allocator over the CRT, and the game's `malloc`/`free`/`strdup` are JMP thunks into
-  it — so a decompiled `free(x)` and a decompiled `Dealloc?(x, n)` are the same call and strings
+  it — so a decompiled `free(x)` and a decompiled `free_sized(x, n)` are the same call and strings
   are pool memory like everything else. Do **not** add a CRT-flavoured deleter: this DLL's `/MD`
   UCRT heap is neither the pool nor the game's CRT heap, so calling our `::free` on any of these
   pointers would corrupt it. The deleter is empty, so the member stays pointer-sized and the

@@ -14,32 +14,61 @@ namespace gk {
 // of ApplyUpdateMessage @ 0x004fde70 (joiners, unthrottled). See
 // `threading_model_notes.md` and `directplay_protocol_notes.md` §8.11.
 //
-// The payload is redefined as **a JSON document**:
+// The payload is redefined as **one JSON object**, always the same two fields:
 //
-//   * a JSON **string** is the legacy behaviour - it names a .gcs, which is run
-//     exactly where and when the engine would have run it;
-//   * **anything else** is a message, handed to the handler below instead of to
-//     the file system. `CustomLevel` routes it to a script level's
-//     `message_received`.
+//     {"kind": "file" | "command" | "message", "body": <contents>}
 //
-// **The encoding happens where the value is written, not where it is queued.**
+//   * **file** - `body` is a .gcs name. The legacy behaviour: run exactly where
+//     and when the engine would have run it.
+//   * **command** - `body` is a console command line, executed immediately on
+//     arrival. This is also how every entry on the console's own
+//     `CommandsToExecute` is *interpreted* - see below, and note that those nodes
+//     still hold bare lines rather than envelopes.
+//   * **message** - `body` is anything at all, handed to the handler below
+//     instead of to the file system. `CustomLevel` routes it to a script level's
+//     `message_received`, which receives the **body**, so the envelope is
+//     invisible from JS.
+//
+// A kind this build does not know is still a well-formed envelope: it is reported
+// and dropped, never opened as a file.
+//
+// **The envelope is what makes the format unambiguous**, and it is the reason it
+// is an object rather than a bare value. The previous format was "a JSON string
+// names a file, anything else is a message", which mis-read a .gcs literally
+// called `123`. The test is now "is this an object with a string `kind` and a
+// `body`?"; a file name that could collide would have to contain `"` and `:`,
+// both illegal in a Windows path. Anything that is not an envelope is a bare
+// name, with no residual doubt - see `gk::json::OpenEnvelope`.
+//
+// **The wrapping happens where the value is written, not where it is queued.**
 // Four hooks - RegisterTriggers, PickupActor::Associate, ToRole and
-// ToReplaceDestructibility - quote the bare name the engine hands them, so a
-// script-name field holds a document from the moment it is set. Every field that
+// ToReplaceDestructibility - wrap the bare name the engine hands them, so a
+// script-name field holds an envelope from the moment it is set. Every field that
 // reaches the queue is written through one of those, by the vulnerability sweep
-// below, or by GkPlus's own bindings, which encode in `js::ToScriptPayload`.
+// below, or by GkPlus's own bindings, which wrap in `js::ToScriptPayload`.
 //
 // Neither side has to guess what it is holding. A game-side write is always a
 // bare name (a console argument or a GLS field); GkPlus's own writes arrive inside
-// an EncodedPayloadScope, which says "already a document, pass it through". That
+// an EncodedPayloadScope, which says "already an envelope, pass it through". That
 // is what replaced an earlier marker byte in the stored value: with every writer
-// encoding, there are no longer two representations to tell apart.
+// wrapping, there are no longer two representations to tell apart.
+//
+// **The console queue is read, never written.** `PumpQueuedConsoleCommand` is
+// replaced - it has to be, because its pop copies a node's string into
+// ConsoleCommandLine (char[252]) with an unbounded loop whose buffer abuts
+// ConsoleSmallFont - and the replacement dispatches on the envelope, treating a
+// bare line as kind "command". Nothing writes to `CommandsToExecute`, so the
+// `#` directives, front-insertion, CLEAR BATCH, NumCommandsToExecute and
+// SaveGame's serialisation of pending lines are all untouched. An earlier design
+// rewrote each node into a literal envelope and crashed the game about two runs
+// in three; ScriptQueue.cpp records why.
 //
 // **This is deliberately visible on disk.** SaveGame writes a trigger's script
 // name verbatim (`save_system_notes.md`), so a save written by this build carries
 // JSON and will not load correctly in an unpatched Gunlok. Reading an *older*
 // save still works: a bare name coming back through ReadActorFixups takes the
-// residual path below.
+// residual path below. The *pending console commands* a save also carries are
+// unaffected, since they were never rewritten.
 //
 // Some sites queue a name without ever storing it, so there is no field to
 // convert and the only way to stop a bare name existing is to replace the body.
@@ -120,22 +149,36 @@ bool PayloadIsEncoded();
 // saves in play means "something wrote a field without encoding it".
 std::string ScriptQueuePayload(const char *stored, bool *repaired = nullptr);
 
-// Receives a payload that was a JSON document but not a string. `json` is the
-// raw document text, valid only for the duration of the call. Returns whether
-// anything took it, which is only used for diagnostics.
-using ScriptMessageHandler = bool (*)(const char *json);
+// --- building a payload from GkPlus's own code -----------------------------------
+//
+// The two envelopes a binding needs. Both take **UTF-8** and return a complete
+// document. They exist so that the kind vocabulary stays in ScriptQueue.cpp -
+// nothing else in the codebase spells "file" or "message".
+std::string FileScriptPayload(const char *name);
+std::string MessageScriptPayload(const char *body_json);
+
+// Receives the **body** of a `message` payload - what the sender passed, not the
+// envelope around it, so a script's message_received sees exactly what it sent.
+// `body_json` is raw document text, valid only for the duration of the call.
+// Returns whether anything took it, which is only used for diagnostics.
+using ScriptMessageHandler = bool (*)(const char *body_json);
 
 // Installs the sink for non-string payloads; null drops them. Set by
 // CustomLevelSystem, whose handler is DispatchCustomLevelMessage.
 void SetScriptMessageHandler(ScriptMessageHandler handler);
 
-// Queues `json` as a payload and broadcasts it, exactly as a trigger's script
-// name would be: the local machine delivers it through RunQueuedScript and every
-// other player through update 0x67. `json` must be a complete JSON document -
-// false means it was not, or that the subsystem is not installed.
+// Queues a payload and broadcasts it, exactly as a trigger's script name would
+// be: the local machine delivers it through RunQueuedScript and every other
+// player through update 0x67.
 //
-// A JSON *string* is legal and does what it says: it runs that .gcs everywhere,
-// which is what a trigger firing a file already does.
+// `QueueScriptPayload` takes a **complete envelope** and queues it verbatim -
+// what a caller that already built one (a binding, through ToScriptPayload) wants,
+// since wrapping it again would bury the kind it chose. A `file` envelope is
+// legal and does what it says: it runs that .gcs everywhere, which is what a
+// trigger firing a file already does.
+//
+// `QueueScriptMessage` takes a message **body** and wraps it. False from either
+// means the argument was not what it claimed, or the subsystem is not installed.
 //
 // Two caveats inherited from the engine, neither of which this layer papers
 // over. The local copy is popped by RunQueuedScript at **one per frame**. And
@@ -143,7 +186,8 @@ void SetScriptMessageHandler(ScriptMessageHandler handler);
 // broadcasts from the executor - harmless in single player, where it is a push
 // onto the loopback queue under its own lock, but a multiplayer host sends
 // DirectPlay traffic from wherever this is called.
-bool QueueScriptMessage(const char *json);
+bool QueueScriptPayload(const char *envelope);
+bool QueueScriptMessage(const char *body_json);
 
 // Hooks both ends of the channel. The four writers above encode a name as it is
 // stored; QueueScriptExecution guards the invariant for what they do not cover;

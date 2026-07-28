@@ -519,9 +519,16 @@ accumulated counter, +0x20 last raw sample.
 Time source: `rdtsc >> 20` (`ReadRawClock` @ 0x0044e8a0). `AccumThreadClock64` @ 0x0044df20
 accumulates 22-bit-masked deltas into the calling thread's 64-bit counter — per-thread
 so the last-sample/accumulator pair is never shared between threads. Readers:
-`FUN_00571b60` (32-bit scaled), `FUN_00571bb0` (64-bit scaled, takes a conversion
-struct like game time @ 0x006aaaa0 or trigger time @ 0x006aaad0), `FUN_00571b10`
-(float seconds). WinMain initializes the main clock (`FUN_005718b0(&0x007c07d0, 0)`)
+`FUN_00571b60` (32-bit scaled), `ReadScaledClock64` @ 0x00571bb0 (64-bit scaled; takes a
+`{mul_lo, mul_hi, offset_lo, offset_hi}` conversion struct), `FUN_00571b10`
+(float seconds). There are **three** conversion structs, and `CommandTimerInfo`
+@ 0x0044afb0 prints them with its own labels: `RealTimeClock` @ 0x006aaaa0 ("Real time"),
+`GameTimeClock` @ 0x006aaab8 ("Game time") and `ServerTimeClock` @ 0x006aaad0
+("Server time", read through `GetServerTime64` @ 0x00505340). Earlier revisions of this
+note called 0x006aaaa0 "game time" and 0x006aaad0 "trigger time"; both were wrong —
+`CommandRealWait` (help text: "time is in 'real' seconds") reads 0x006aaaa0, and
+`CommandResetTime` @ 0x0044af90 resyncs 0x006aaab8 *to* 0x006aaad0.
+WinMain initializes the main clock (`FUN_005718b0(&0x007c07d0, 0)`)
 and copies the whole struct to the executor clock if the thread is running; `LoadLevel`
 re-syncs both on level load.
 

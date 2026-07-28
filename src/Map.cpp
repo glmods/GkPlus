@@ -12,10 +12,22 @@ Map *GetCurrentMap() {
   return *the_map;
 }
 
-float GetWorldUnitScale() {
-  FastCall<float *> fn;
-  GetObjectAtOffset(fn, 0x005a9b40);
-  return *fn();
+// There is no global world-unit-scale getter, and 0x005a9b40 was never one: that
+// function is `CopyDword`, a `__fastcall(dest, src)` four-byte copy that returns
+// dest. A previous version of this file called it with no arguments through a
+// `FastCall<float *>`, so it dereferenced whatever the caller had left in EDX and
+// wrote through EDX's counterpart in ECX.
+//
+// ToMap reads the scale straight out of the loaded rif object - it is the first
+// float of the record `AcquireLevelRifForLocators` / `LoadOrGetRifFile` hands back,
+// the same pointer it passes to `RifFilterObjectsByName` in EDX. All three
+// `CopyDword` call sites in ToMap (0x00480f65, 0x00481151, 0x00481898) copy that
+// float into a local and `MULSS` the FILD'd integer locator coordinates by it.
+//
+// So the scale is per-rif data. A caller has to have the rif in hand, which every
+// caller that needs it does.
+float RifUnitScale(const void *rif) {
+  return rif ? *reinterpret_cast<const float *>(rif) : 0.0f;
 }
 
 TeamSlot *GetTeamSlots() {
@@ -34,8 +46,8 @@ Vec3 MapOrigin(const Map *map) {
   return {-map->neg_origin.x, -map->neg_origin.y, -map->neg_origin.z};
 }
 
-Vec3 MapToWorld(const Map *map, Vec3 rif_pos) {
-  float scale = GetWorldUnitScale();
+Vec3 MapToWorld(const Map *map, const void *rif, Vec3 rif_pos) {
+  float scale = RifUnitScale(rif);
   return {rif_pos.x * scale + map->neg_origin.x,
           rif_pos.y * scale + map->neg_origin.y,
           rif_pos.z * scale + map->neg_origin.z};

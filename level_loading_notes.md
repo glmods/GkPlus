@@ -333,7 +333,7 @@ argument with `0x80000000` before storing it at 0x11c, and `ToMap` *adds* that
 field to scaled rif locator coordinates. The net effect on a placed object is
 
 ```
-pos = rif_locator_pos * GetWorldUnitScale() - origin
+pos = rif_locator_pos * RifUnitScale(rif) - origin
 ```
 
 `gk::MapOrigin` flips the sign back, returning the origin the map was actually
@@ -445,7 +445,7 @@ for (binding in map->bindings) {
             Role *role = ToRole(binding->role);
             Vec3f pos  = (Vec3f){ (float)(int)O[0x44], (float)(int)O[0x48],
                                   (float)(int)O[0x4c] };   // FILD: signed int32
-            pos *= *GetWorldUnitScale();                 // 0x005a9b40
+            pos *= *(float *)rif;                        // the rif's own unit scale
             pos += TheMap->neg_origin;                   // 0x11c, NEGATED origin
             Vec4f quat = { O[0x50], O[0x54], O[0x58], O[0x5c] };
 
@@ -462,7 +462,16 @@ for (binding in map->bindings) {
 Notes:
 
 - Locator coordinates in the rif are **integers** (`FILD`, signed), converted to float
-  and scaled by `*GetWorldUnitScale()`, then offset by the map origin.
+  and scaled by the rif's own unit scale, then offset by the map origin.
+- **The unit scale is `*(float *)rif`** - the first float of the object
+  `AcquireLevelRifForLocators` @ 0x00483da0 / `LoadOrGetRifFile` @ 0x004ae960 return,
+  the same handle `ToMap` passes to `RifFilterObjectsByName` in EDX. It is **per-rif
+  data; there is no world-unit-scale global or getter.** Earlier revisions of this file
+  claimed `*GetWorldUnitScale()` at 0x005a9b40; that function is `CopyDword`, a
+  `__fastcall(dest, src)` four-byte copy returning dest, and `ToMap`'s three calls to it
+  (0x00480f65, 0x00481151, 0x00481898) are copying that float into a local before the
+  `MULSS`. `gk::RifUnitScale` / `gk::MapToWorld` in `src/Map.h` take the rif for this
+  reason.
 - `TeamSlots` @ 0x007b3ec4 / `NumTeamSlots` @ 0x007b3ec0, stride 0xc4. A slot with
   `active` (`+0x69`) `== 0` means the whole team is skipped - this is how `extreme`-only
   and multiplayer-only teams are excluded without touching the bindings. The bound check
@@ -658,7 +667,7 @@ must run after that reset and before step 11 (`ExecuteAllCommands`, which runs t
 | 0x005aa5c0 | `RifFindObjectByName(rif, name, &origin)` |
 | 0x005aaac0 | `RifFilterObjectsByName(list, rif, name)` |
 | 0x00483da0 | `AcquireLevelRifForLocators(rifPath)` |
-| 0x005a9b40 | `GetWorldUnitScale` -> `float*` |
+| 0x005a9b40 | `CopyDword(dest, src)` - `__fastcall` 4-byte copy returning dest. **Not** a world-unit-scale getter |
 | 0x0044fef0 | `LoadOrBuildSectionAdjacency` (`.map` sidecar) |
 | 0x005035b0 | `ServerSpawnActorForTeam(team, role, pos, ori)` |
 | 0x004fce90 | `ClientSpawnActorForTeam(team, role, pos, ori)` |

@@ -26,10 +26,10 @@ template <typename T> struct pool_deleter {
 //
 //   malloc     @ 0x005e3f72 -> JMP pool_alloc
 //   free       @ 0x005e3f7b -> JMP pool_free
-//   `Dealloc?` @ 0x005e3f64 -> CALL pool_free (sized wrapper; discards the size)
+//   free_sized @ 0x005e3f64 -> CALL pool_free (sized wrapper; discards the size)
 //   strdup     @ 0x0044e1a0 -> game-written, allocates through that malloc thunk
 //
-// So a decompiled `free(x)` and a decompiled `Dealloc?(x, n)` are the same call,
+// So a decompiled `free(x)` and a decompiled `free_sized(x, n)` are the same call,
 // and strings are pool memory like everything else - there is no second
 // "CRT-allocated" category to model, and a deleter calling this DLL's own ::free
 // would be wrong for every pointer here (our /MD UCRT heap is neither the pool nor

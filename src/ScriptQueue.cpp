@@ -5,6 +5,7 @@
 #include "DetourUtils.h"
 #include "Encoding.h"
 #include "Json.h"
+#include "List.h"
 #include "Math.h"
 #include "Memory.h"
 #include "Menu.h"
@@ -31,6 +32,9 @@ FastCall<void, const char *> QueueScriptExecution;
 StdCall<void> RunQueuedScript;
 FastCall<void, unsigned *> ApplyUpdateMessage;
 FastCall<bool, const char *> ExecuteCommandFile;
+// Kept only so Detours has a pointer to patch: HookedPumpQueuedConsoleCommand
+// replaces the body outright and never calls through this.
+StdCall<void> PumpQueuedConsoleCommand;
 // Named after the Ghidra DB rather than after gk::RegisterTriggers, which is the
 // wrapper in Triggers.h - a trampoline of the same name would make every use of
 // either ambiguous inside namespace gk.
@@ -110,11 +114,29 @@ bool ShouldEncode(const char *value) {
   return value && *value && !PayloadIsEncoded();
 }
 
-// A game string on its way into a payload: ANSI out of the engine, UTF-8 into the
-// JSON. Every writer below goes through this rather than quoting the bytes it was
-// handed - see Encoding.h for why passing them through only appears to work.
-std::string QuoteGameText(const char *ansi) {
-  return json::Quote(Utf8FromGameText(ansi).c_str());
+// The vocabulary of payload kinds. `gk::json` owns the envelope's shape and
+// nothing else, so this is the only place the three names are spelled.
+constexpr const char *KindFile = "file";
+constexpr const char *KindCommand = "command";
+constexpr const char *KindMessage = "message";
+
+// A .gcs name as a payload: `{"kind":"file","body":"<name>"}`.
+std::string FileEnvelope(const char *utf8) {
+  return json::Envelope(KindFile, json::Quote(utf8).c_str());
+}
+
+// The same for a string on its way out of the engine: ANSI in, UTF-8 into the
+// JSON. Every writer below goes through this rather than wrapping the bytes it
+// was handed - see Encoding.h for why passing them through only appears to work.
+std::string FileEnvelopeFromGameText(const char *ansi) {
+  return FileEnvelope(Utf8FromGameText(ansi ? ansi : "").c_str());
+}
+
+// Whether a stored value is already one of ours. This is the whole of the
+// "has it been encoded yet?" test, and unlike the old one - "does it parse as
+// any JSON document at all?" - it has no false positives: see Json.h.
+bool IsEnvelope(const char *text) {
+  return json::OpenEnvelope(text, nullptr, nullptr);
 }
 
 // RegisterTriggers @ 0x0043e240 - the only writer of TriggerData::script_name, and
@@ -129,9 +151,9 @@ void __fastcall HookedRegisterTriggers(TriggerKind kind, Vec3 *coords,
     AddTriggerToGlobalList(kind, coords, value, targets, script, team);
     return;
   }
-  std::string quoted = QuoteGameText(name);
+  std::string envelope = FileEnvelopeFromGameText(name);
   AddTriggerToGlobalList(kind, coords, value, targets,
-                         reinterpret_cast<const unsigned char *>(quoted.c_str()),
+                         reinterpret_cast<const unsigned char *>(envelope.c_str()),
                          team);
 }
 
@@ -153,8 +175,8 @@ void AssociateAbi::HookedAssociate(char *script, bool one_shot) {
     (this->*Associate)(script, one_shot);
     return;
   }
-  std::string quoted = QuoteGameText(script);
-  (this->*Associate)(const_cast<char *>(quoted.c_str()), one_shot);
+  std::string envelope = FileEnvelopeFromGameText(script);
+  (this->*Associate)(const_cast<char *>(envelope.c_str()), one_shot);
 }
 
 // Replaces an owned pool string with `text`, allocated the way the converter
@@ -180,8 +202,8 @@ Role *__fastcall HookedToRole(void *parsed) {
   if (!role || !fresh || !ShouldEncode(role->interface_beam_script)) {
     return role;
   }
-  std::string quoted = QuoteGameText(role->interface_beam_script);
-  if (char *fresh_string = RepoolString(quoted.c_str())) {
+  std::string envelope = FileEnvelopeFromGameText(role->interface_beam_script);
+  if (char *fresh_string = RepoolString(envelope.c_str())) {
     // Safe to release: Roles.h records this field as leaked - RoleDtor does not
     // free it - so nothing else will touch the old allocation.
     pool_free(role->interface_beam_script);
@@ -199,8 +221,8 @@ ReplaceDestructibility *__fastcall HookedToReplaceDestructibility(void *parsed) 
   if (!record || !ShouldEncode(record->script.get())) {
     return record;
   }
-  std::string quoted = QuoteGameText(record->script.get());
-  if (char *fresh_string = RepoolString(quoted.c_str())) {
+  std::string envelope = FileEnvelopeFromGameText(record->script.get());
+  if (char *fresh_string = RepoolString(envelope.c_str())) {
     record->script.reset(fresh_string); // frees the old through pool_free
   }
   return record;
@@ -249,6 +271,16 @@ void ConsolePrint(const char *text) {
   fn(text);
 }
 
+// ExecuteCommand @ 0x004d6090 - runs one line immediately, the same entry point
+// typing it takes. Resolved here rather than through Console.h so that the
+// trampoline named ExecuteCommandFile in this namespace cannot be confused with
+// the wrapper of the same name.
+void ExecuteConsoleCommand(const char *line) {
+  FastCall<void, const char *> fn;
+  GetObjectAtOffset(fn, 0x004d6090);
+  fn(line);
+}
+
 // Console `BATCHANDBROADCAST` @ 0x00448400 - "a bit like BATCH but it tells
 // clients to batch it as well". Five calls in the original, all reproduced; the
 // guard included, since `LevelLoadReason == 3` is what stops a savegame restore
@@ -264,8 +296,8 @@ void __fastcall HookedCommandBatchAndBroadcast(int, char *) {
   copy_remaining_args(word_buf);
 
   EnterScriptsDirectory();
-  std::string payload = QuoteGameText(word_buf);
-  QueueScriptExecution(payload.c_str()); // the trampoline: already encoded
+  std::string payload = FileEnvelopeFromGameText(word_buf);
+  QueueScriptExecution(payload.c_str()); // the trampoline: already an envelope
   LeaveScriptsDirectory();
 }
 
@@ -295,9 +327,9 @@ void __fastcall HookedMultiplayerRespawnRole(char *role_name, int team, Vec3 pos
     add_entry(respawn_list, &spawned);
   }
   // GameMode 5 is CaptureTheFlag; everything else takes the RTP script. Both are
-  // our own ASCII literals, so they need no transcoding - only encoding.
+  // our own ASCII literals, so they need no transcoding - only wrapping.
   std::string payload =
-      json::Quote(GetGameMode() == 5 ? "CTFRespawn.gcs" : "RTPRespawn.gcs");
+      FileEnvelope(GetGameMode() == 5 ? "CTFRespawn.gcs" : "RTPRespawn.gcs");
   QueueScriptExecution(payload.c_str());
 }
 
@@ -316,15 +348,17 @@ void __fastcall HookedMultiplayerRespawnRole(char *role_name, int team, Vec3 pos
 // value got there. Every other writer encodes, so the only things this can find
 // are this command's own work and a vulnerability restored from an older save.
 //
-// The residual ambiguity is a console-set script file named exactly `123` or
-// `null`, which would already be a document and is left alone.
+// This used to have a residual ambiguity - a console-set script file named
+// exactly `123` or `null` parses as a document and was left alone - which the
+// envelope removes: those are not envelopes, so they get wrapped like any other
+// bare name.
 void EncodeVulnerability(Vulnerability *vuln) {
   if (!vuln || !vuln->script || !*vuln->script.get() ||
-      json::Classify(vuln->script.get()) != json::Kind::Invalid) {
+      IsEnvelope(vuln->script.get())) {
     return;
   }
-  std::string quoted = QuoteGameText(vuln->script.get());
-  if (char *fresh = GameStrdup(quoted.c_str())) {
+  std::string envelope = FileEnvelopeFromGameText(vuln->script.get());
+  if (char *fresh = GameStrdup(envelope.c_str())) {
     vuln->script.reset(fresh); // frees the old through pool_free
   }
 }
@@ -350,6 +384,288 @@ void __fastcall HookedCommandVulnerability(int length, char *args) {
       }
     }
   }
+}
+
+// --- the console command queue -----------------------------------------------------
+//
+// CommandsToExecute @ 0x007b6aa8 is handled through the same envelope dispatch as
+// the script queue, but **GkPlus never writes to it**. Its nodes keep holding the
+// plain lines the game put there, and the consumer treats a bare line as
+// kind "command" - the branch that already had to exist for savegames written
+// before the envelope. So the two queues share one set of meanings and one code
+// path, and the console queue keeps byte-for-byte the representation vanilla
+// Gunlok gives it.
+//
+// **That is the second design here, and the first one crashed.** The queue used
+// to be swept after every ExecuteCommandFile, rewriting each node's payload into
+// a literal `{"kind":"command",...}` with the game's own strdup and pool_free.
+// It reproduced as a wild call - EIP on the stack, so WER blamed "module:
+// unknown" - roughly two runs in three, from inside the sweep's pool_free. The
+// lesson is not "that had a bug" but that a subsystem which rewrites another
+// allocator's live objects on a hot path buys very little and risks everything:
+// the only thing the rewrite added was that the bytes on the queue *looked* like
+// the bytes on the wire.
+//
+// Two facts make not writing to it free:
+//
+//   * the consumer must be replaced anyway. PumpQueuedConsoleCommand copies a
+//     node's string into ConsoleCommandLine (char[252] @ 0x007b6958) with an
+//     unbounded byte loop at 0x004d61f0, and the next global is ConsoleSmallFont
+//     @ 0x007b6a54 with nothing in between - so an envelope arriving here from
+//     anywhere has to be decoded before it reaches that buffer, and the decode
+//     is the same code that handles a bare line.
+//   * nothing else has to change. The `#` directives, front-insertion, CLEAR
+//     BATCH, NumCommandsToExecute and SaveGame's serialisation of pending lines
+//     all keep working because they are simply left alone, and a save written by
+//     this build stays readable by vanilla Gunlok.
+
+constexpr size_t ConsoleCommandLineSize = 252;
+
+char *ConsoleCommandLineBuffer() {
+  char *p;
+  GetObjectAtOffset(p, 0x007b6958);
+  return p;
+}
+
+// The pump's own save area for the line the player is typing, immediately after
+// the buffer it shadows and the same size.
+char *ConsoleCommandLineSaveArea() {
+  char *p;
+  GetObjectAtOffset(p, 0x007b6c68);
+  return p;
+}
+
+List<char *> *ConsoleQueue() {
+  List<char *> *p;
+  GetObjectAtOffset(p, 0x007b6aa8);
+  return p;
+}
+
+void ConsoleExecuteCommandLine(const char *line) {
+  FastCall<void, const char *> fn;
+  GetObjectAtOffset(fn, 0x004d59e0);
+  fn(line);
+}
+
+// The flattened-pointer cache the list rebuilds lazily. Every engine site that
+// touches the queue drops it, and so must anything that changes a payload in
+// place - the cache holds the `char *`s themselves, not their addresses.
+void InvalidateConsoleQueueCache() {
+  void **cache;
+  GetObjectAtOffset(cache, 0x007b6ab0);
+  unsigned char *valid;
+  GetObjectAtOffset(valid, 0x007b6ab4);
+  *valid = 0;
+  if (*cache) {
+    pool_free(*cache);
+    *cache = nullptr;
+  }
+}
+
+// --- the pump's gates ---------------------------------------------------------
+//
+// Transcribed from 0x004d6120. Every comparison there is a signed test on the
+// high dword followed by an unsigned one on the low (JL/JG/JC), which is exactly
+// what a signed 64-bit `<` compiles to - so these read as ordinary comparisons
+// without changing a single outcome.
+
+long long ReadScaledClock64(unsigned *conversion) {
+  FastCall<long long, unsigned *> fn;
+  GetObjectAtOffset(fn, 0x00571bb0);
+  return fn(conversion);
+}
+
+long long ServerTime64() {
+  FastCall<long long> fn;
+  GetObjectAtOffset(fn, 0x00505340);
+  return fn();
+}
+
+template <typename T> T *GlobalAt(unsigned offset) {
+  T *p;
+  GetObjectAtOffset(p, offset);
+  return p;
+}
+
+// The REPTXT hint, re-printed while a `wait for` holds the queue. The original
+// reaches this as an outlined tail at 0x0056e7f0.
+void ReprintRepeatText() {
+  if (!*GlobalAt<unsigned char>(0x007ba3cc)) { // RepeatTextActive
+    return;
+  }
+  long long *deadline = GlobalAt<long long>(0x007ba4d0);
+  if (ReadScaledClock64(GlobalAt<unsigned>(0x006aaaa0)) < *deadline) {
+    return;
+  }
+  StdCall<void> hide_console;
+  GetObjectAtOffset(hide_console, 0x0043fa20);
+  hide_console();
+  ConsolePrint(GlobalAt<char>(0x007ba3d0)); // RepeatTextBuf
+  StdCall<void> arm_deadline;
+  GetObjectAtOffset(arm_deadline, 0x0056ea30);
+  arm_deadline();
+}
+
+// False means "do not pop this frame". A savegame restore bypasses all three,
+// which is what stops a restored queue from being held by a restored deadline.
+bool ConsoleQueueGatesPass() {
+  if (LevelLoadReason() == 3) {
+    return true;
+  }
+
+  long long *wait = GlobalAt<long long>(0x007b9c88); // WaitDeadline
+  if (*wait != 0) {
+    // The simulation's clock while one is running, the front end's otherwise -
+    // the same choice CommandWait made when it set the deadline.
+    long long now = IsSimulationRunning()
+                        ? ServerTime64()
+                        : ReadScaledClock64(GlobalAt<unsigned>(0x006aaab8));
+    if (now < *wait) {
+      return false;
+    }
+    *wait = 0;
+  }
+
+  long long *real_wait = GlobalAt<long long>(0x007b9c90); // RealWaitDeadline
+  if (*real_wait != 0) {
+    long long now = ReadScaledClock64(GlobalAt<unsigned>(0x006aaaa0));
+    if (now < *real_wait) {
+      // REAL WAIT OR CLICK. Both flags must be set: the first says this wait is
+      // cancellable, the second that the key has been pressed. It is TAB, not
+      // the mouse the help text claims - NotifyWaitCancelKey @ 0x004d6500 is the
+      // only writer and both of its callers test KEY_Tab.
+      if (!*GlobalAt<unsigned char>(0x007b9c98) ||
+          !*GlobalAt<unsigned char>(0x007b9c99)) {
+        return false;
+      }
+    }
+    // One 16-bit store in the original, clearing both flags at once.
+    *GlobalAt<unsigned short>(0x007b9c98) = 0;
+    *real_wait = 0;
+  }
+
+  StdCall<bool> is_wait_for_set;
+  GetObjectAtOffset(is_wait_for_set, 0x0056ec90);
+  if (is_wait_for_set()) {
+    StdCall<bool> check_wait_for;
+    GetObjectAtOffset(check_wait_for, 0x0056eab0);
+    if (!check_wait_for()) {
+      ReprintRepeatText();
+      return false;
+    }
+    StdCall<void> disarm_repeat;
+    GetObjectAtOffset(disarm_repeat, 0x0056ea20);
+    disarm_repeat();
+  }
+  return true;
+}
+
+// --- popping one -------------------------------------------------------------
+
+// Unlinks the head, destroying the node through vtable slot 0 - the scalar
+// deleting destructor, with 1 for "free it too" - exactly as the original does.
+// The node is pool memory, so nothing here may use our own operator delete.
+void UnlinkFirstConsoleCommand(List<char *> *queue) {
+  List_Member_Base<char *> *sentinel = queue->sentinel;
+  List_Member_Base<char *> *first = sentinel->next;
+  if (first != sentinel) {
+    sentinel->next = first->next;
+    if (List_Member_Base<char *> *removed = sentinel->next->prev) {
+      ThisCall<void, void *, int> destroy = reinterpret_cast<
+          ThisCall<void, void *, int>>((*reinterpret_cast<void ***>(removed))[0]);
+      destroy(removed, 1);
+    }
+    sentinel->next->prev = sentinel;
+    --queue->n_entries;
+  }
+  InvalidateConsoleQueueCache();
+}
+
+// One payload off the console queue. Uniform with the script queue's consumer -
+// same three kinds, same handler - because a restored savegame or a future build
+// can put any of them here.
+void DispatchConsolePayload(const char *payload) {
+  std::string kind;
+  std::string body;
+  std::string text;
+
+  if (json::OpenEnvelope(payload, &kind, &body)) {
+    if (kind == KindMessage) {
+      if (!Handler || !Handler(body.c_str())) {
+        Note("message went undelivered", payload);
+      }
+      return;
+    }
+    if (json::Classify(body.c_str(), &text) != json::Kind::String) {
+      Note("payload body is not a string", payload);
+      return;
+    }
+    text = GameTextFromUtf8(text.c_str());
+    if (kind == KindFile) {
+      ExecuteCommandFile(text.c_str());
+      return;
+    }
+    if (kind != KindCommand) {
+      Note("unknown payload kind, dropped", payload);
+      return;
+    }
+  } else {
+    // Not an envelope, which is the **normal** case here: GkPlus never writes to
+    // this queue, so every node the game queued holds a plain line. It is a
+    // console command, which is all it ever was. Old savegames land here too, by
+    // the same rule rather than as a special case.
+    text = payload ? payload : "";
+  }
+
+  if (text.size() >= ConsoleCommandLineSize) {
+    // Cannot happen from a queued line - fgets caps those at 249 - but a message
+    // from the wire is not bounded by anything, and this buffer's neighbour is a
+    // font pointer.
+    Note("queued command too long for ConsoleCommandLine, truncated",
+         text.c_str());
+    text.resize(ConsoleCommandLineSize - 1);
+  }
+
+  // Borrow the console's line buffer the way the original does, and put back
+  // whatever the player was typing: commands parse their own arguments off this
+  // global, so the text has to be *in* it rather than merely passed to it.
+  char *line = ConsoleCommandLineBuffer();
+  char *saved = ConsoleCommandLineSaveArea();
+  std::snprintf(saved, ConsoleCommandLineSize, "%s", line);
+  std::snprintf(line, ConsoleCommandLineSize, "%s", text.c_str());
+  ConsoleExecuteCommandLine(line);
+  std::snprintf(line, ConsoleCommandLineSize, "%s", saved);
+}
+
+// Replaces PumpQueuedConsoleCommand @ 0x004d6120 outright; the trampoline exists
+// only so Detours has something to patch and is deliberately never called.
+//
+// One difference from the original, and it is a fix: this returns on an empty
+// queue. The original walks into the sentinel and reads a payload off it - a
+// List_Member_Base is 0xc bytes and has no `data` - which is only ever harmless
+// because both of its callers test NumCommandsToExecute first.
+void __stdcall HookedPumpQueuedConsoleCommand() {
+  if (!ConsoleQueueGatesPass()) {
+    return;
+  }
+  List<char *> *queue = ConsoleQueue();
+  if (!queue || !queue->sentinel) {
+    return;
+  }
+  List_Member_Base<char *> *first = queue->sentinel->next;
+  if (!first || first == queue->sentinel) {
+    return;
+  }
+
+  // Take the payload and unlink before running it, as the original does, so a
+  // command that queues more - BATCH, or a message handler that sends - sees the
+  // node already gone.
+  char *&stored = entry_of(first)->data;
+  std::string payload = stored ? stored : "";
+  pool_free(stored);
+  UnlinkFirstConsoleCommand(queue);
+
+  DispatchConsolePayload(payload.c_str());
 }
 
 // --- the queue hooks -------------------------------------------------------------
@@ -395,21 +711,17 @@ bool __fastcall HookedExecuteCommandFile(const char *file) {
   }
   PayloadPending = false;
 
-  std::string name;
-  switch (json::Classify(file, &name)) {
-  case json::Kind::String: {
-    // The legacy meaning, spelled as JSON. The engine has already set the
-    // current directory to Scripts, so this is the call it was going to make -
-    // back through the encoding boundary first, because fopen reads a char *
-    // through the active codepage and the payload held UTF-8.
-    std::string ansi = GameTextFromUtf8(name.c_str());
-    return ExecuteCommandFile(ansi.c_str());
-  }
-  case json::Kind::Invalid: {
-    // Nothing local can produce this: the queue hook above cannot emit a
-    // non-document, and update 0x67 is the only message that reaches here. So it
-    // came off the wire from a vanilla peer. Run it as it stands, since that is
-    // what it means and what it needs.
+  std::string kind;
+  std::string body;
+  if (!json::OpenEnvelope(file, &kind, &body)) {
+    // Nothing local can produce this: every writer wraps, and the queue hook
+    // guards what they miss. So it came off the wire from a vanilla peer, or out
+    // of a savegame written before the format changed. Run it as it stands,
+    // since that is what it means and what it needs.
+    //
+    // This branch used to double as "a document that is not a string", which is
+    // where the old format's ambiguity lived. It no longer has to guess: a bare
+    // name cannot be an envelope (Json.h), so reaching here *is* the answer.
     static bool reported = false;
     if (!reported) {
       reported = true;
@@ -419,8 +731,34 @@ bool __fastcall HookedExecuteCommandFile(const char *file) {
     }
     return ExecuteCommandFile(file);
   }
-  default:
-    if (!Handler || !Handler(file)) {
+
+  // Both of these carry a JSON string; anything else is a malformed envelope,
+  // which only a peer running a broken build could send.
+  if (kind == KindFile || kind == KindCommand) {
+    std::string text;
+    if (json::Classify(body.c_str(), &text) != json::Kind::String) {
+      Note("payload body is not a string", file);
+      return true;
+    }
+    // Back through the encoding boundary: fopen and the console both read a
+    // char * through the active codepage, and the body held UTF-8.
+    std::string ansi = GameTextFromUtf8(text.c_str());
+    if (kind == KindFile) {
+      // The engine has already set the current directory to Scripts, so this is
+      // the call it was going to make.
+      return ExecuteCommandFile(ansi.c_str());
+    }
+    // A command runs where it lands: it arrived already scheduled, so putting it
+    // back on the console queue would cost it a frame and change the order it
+    // was sent in.
+    ExecuteConsoleCommand(ansi.c_str());
+    return true;
+  }
+
+  if (kind == KindMessage) {
+    // The *body*, not the envelope - a script's message_received sees what it
+    // sent, which is what keeps the envelope invisible from JS.
+    if (!Handler || !Handler(body.c_str())) {
       // Not on the console: a message arrives once per trigger firing on every
       // machine, and a level that ignores one would flood it.
       Note("message went undelivered", file);
@@ -430,6 +768,12 @@ bool __fastcall HookedExecuteCommandFile(const char *file) {
     // file.
     return true;
   }
+
+  // A kind this build does not know - a newer GkPlus at the other end. Dropped
+  // rather than run: the one thing it must not become is an fopen of its own
+  // JSON.
+  Note("unknown payload kind, dropped", file);
+  return true;
 }
 
 } // namespace
@@ -446,34 +790,48 @@ std::string ScriptQueuePayload(const char *stored, bool *repaired) {
   if (repaired) {
     *repaired = false;
   }
-  if (stored && json::Classify(stored) != json::Kind::Invalid) {
+  if (IsEnvelope(stored)) {
     return stored;
   }
   if (repaired) {
     *repaired = true;
   }
-  // Quote accepts any byte string, so this branch cannot fail - which is what
-  // makes the return value unconditionally a document.
-  return QuoteGameText(stored);
+  // Envelope and Quote both degrade to a document rather than failing, so this
+  // branch cannot - which is what makes the return value unconditionally one.
+  return FileEnvelopeFromGameText(stored);
+}
+
+std::string FileScriptPayload(const char *name) {
+  return FileEnvelope(name ? name : "");
+}
+
+std::string MessageScriptPayload(const char *body_json) {
+  return json::Envelope(KindMessage, body_json);
 }
 
 void SetScriptMessageHandler(ScriptMessageHandler handler) {
   Handler = handler;
 }
 
-bool QueueScriptMessage(const char *json) {
-  if (!json || json::Classify(json) == json::Kind::Invalid) {
+bool QueueScriptPayload(const char *envelope) {
+  if (!IsEnvelope(envelope)) {
     return false;
   }
   if (!QueueScriptExecution) {
     // Deliberately not falling back to the raw address: after DetourAttach that
-    // entry point is the hook, which would re-encode a document that is already
-    // one.
-    Note("not installed, message dropped", json);
+    // entry point is the hook, which would wrap an envelope in another one.
+    Note("not installed, payload dropped", envelope);
     return false;
   }
-  QueueScriptExecution(json);
+  QueueScriptExecution(envelope);
   return true;
+}
+
+bool QueueScriptMessage(const char *body_json) {
+  if (!body_json || json::Classify(body_json) == json::Kind::Invalid) {
+    return false;
+  }
+  return QueueScriptPayload(MessageScriptPayload(body_json).c_str());
 }
 
 ScriptQueueSystem::ScriptQueueSystem() {
@@ -481,6 +839,7 @@ ScriptQueueSystem::ScriptQueueSystem() {
   GetObjectAtOffset(RunQueuedScript, 0x00505310);
   GetObjectAtOffset(ApplyUpdateMessage, 0x004fde70);
   GetObjectAtOffset(ExecuteCommandFile, 0x0043f250);
+  GetObjectAtOffset(PumpQueuedConsoleCommand, 0x004d6120);
   GetObjectAtOffset(AddTriggerToGlobalList, 0x0043e240);
   GetObjectAtOffset(ToRole, 0x0047cc20);
   GetObjectAtOffset(ToReplaceDestructibility, 0x0047eaa0);
@@ -494,6 +853,7 @@ ScriptQueueSystem::ScriptQueueSystem() {
   ::DetourAttach(&RunQueuedScript, HookedRunQueuedScript);
   ::DetourAttach(&ApplyUpdateMessage, HookedApplyUpdateMessage);
   ::DetourAttach(&ExecuteCommandFile, HookedExecuteCommandFile);
+  ::DetourAttach(&PumpQueuedConsoleCommand, HookedPumpQueuedConsoleCommand);
   ::DetourAttach(&AddTriggerToGlobalList, HookedRegisterTriggers);
   ::DetourAttach(&ToRole, HookedToRole);
   ::DetourAttach(&ToReplaceDestructibility, HookedToReplaceDestructibility);
@@ -508,6 +868,7 @@ ScriptQueueSystem::~ScriptQueueSystem() {
   ::DetourDetach(&RunQueuedScript, HookedRunQueuedScript);
   ::DetourDetach(&ApplyUpdateMessage, HookedApplyUpdateMessage);
   ::DetourDetach(&ExecuteCommandFile, HookedExecuteCommandFile);
+  ::DetourDetach(&PumpQueuedConsoleCommand, HookedPumpQueuedConsoleCommand);
   ::DetourDetach(&AddTriggerToGlobalList, HookedRegisterTriggers);
   ::DetourDetach(&ToRole, HookedToRole);
   ::DetourDetach(&ToReplaceDestructibility, HookedToReplaceDestructibility);

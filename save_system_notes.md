@@ -286,15 +286,23 @@ APIs, so the linked lists are reconstructed rather than restored byte-for-byte.
 > **The `str script` above now carries a JSON document, so saves written by GkPlus will not load
 > correctly in an unpatched Gunlok.** This is deliberate and was decided explicitly, not stumbled
 > into. `TriggerData::script_name` @ +0x54 is written by `RegisterTriggers`, which
-> `ScriptQueueSystem` hooks so that a bare `.gcs` name is stored as the JSON string
-> `"crtbaa.gcs"` — see `src/ScriptQueue.h`. That string is what lands in the save, verbatim, and an
-> unpatched game would try to `fopen` it quotes and all, so **every trigger in a restored save
-> would lose its script**. Nothing warns about it; there is no version field to notice, because
-> the format's version is `sizeof(SaveSettingsBlock)` and the layout did not change.
+> `ScriptQueueSystem` hooks so that a bare `.gcs` name is stored as the envelope
+> `{"kind":"file","body":"crtbaa.gcs"}` — see `src/ScriptQueue.h`. That string is what lands in the
+> save, verbatim, and an unpatched game would try to `fopen` it braces and all, so **every trigger
+> in a restored save would lose its script**. Nothing warns about it; there is no version field to
+> notice, because the format's version is `sizeof(SaveSettingsBlock)` and the layout did not change.
 >
-> The reverse direction is fine. A save written *before* this change (or by vanilla) restores bare
-> names into that field, and `ScriptQueuePayload` quotes them at the queue exactly as it always
-> did — one of the residual paths that hook still exists for.
+> **The pending console-command queue is *not* affected.** `SaveGame` also walks
+> `CommandsToExecute` @ 0x007b6aa8 (0x005081ea onwards) writing a length and the bytes of each
+> queued line, but GkPlus never writes to that queue — its nodes keep the plain lines the game put
+> there, and the replaced `PumpQueuedConsoleCommand` interprets a bare line as a console command.
+> So this half of the save stays byte-compatible in both directions. An earlier design rewrote
+> those nodes into JSON envelopes, which would have broken it; it was removed after it crashed the
+> game (see `src/ScriptQueue.cpp`).
+>
+> The reverse direction is fine for the trigger field too. A save written *before* this change (or
+> by vanilla) restores bare names into it, and `ScriptQueuePayload` wraps them at the queue — one
+> of the residual paths that hook still exists for.
 >
 > The same applies to any other field the save serialises as a string and the script queue later
 > reads. Triggers are the only one in this block; `Vulnerability::script` comes back through

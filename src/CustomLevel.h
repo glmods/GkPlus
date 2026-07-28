@@ -81,7 +81,7 @@ struct CustomLevelMap {
 };
 
 // One placed object read out of the level .rif, in the coordinates ToMap would
-// have spawned it at: MapToWorld(TheMap, integer locator position).
+// have spawned it at: MapToWorld(TheMap, rif, integer locator position).
 struct CustomLevelLocator {
   Vec3 position;
   Vec4 orientation;

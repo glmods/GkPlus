@@ -175,4 +175,127 @@ std::string Quote(const char *value) {
   return out.empty() ? std::string{"\"\""} : out;
 }
 
+std::string Envelope(const char *kind, const char *body_json) {
+  // The last-resort value, for the two failures QuickJS can have here: no
+  // context at all, and an allocation. Still an envelope, so a consumer sees a
+  // kind it does not know rather than something no parser accepts.
+  static const char *const Degraded = "{\"kind\":\"\",\"body\":null}";
+
+  Locked locked;
+  JSContext *ctx = locked.ctx();
+  if (!ctx) {
+    return Degraded;
+  }
+
+  // The body is parsed rather than pasted in as text. Concatenating would be
+  // cheaper and would work for every caller here, but it would also let one bad
+  // body escape as a document nobody can parse, and "always a document" is the
+  // invariant the queue rests on.
+  JSValue body = JS_NULL;
+  if (body_json) {
+    body = JS_ParseJSON(ctx, body_json, std::strlen(body_json), "<body>");
+    if (JS_IsException(body)) {
+      ClearException(ctx);
+      JS_FreeValue(ctx, body);
+      body = JS_NULL;
+    }
+  }
+
+  JSValue obj = JS_NewObject(ctx);
+  if (JS_IsException(obj)) {
+    ClearException(ctx);
+    JS_FreeValue(ctx, obj);
+    JS_FreeValue(ctx, body);
+    return Degraded;
+  }
+  // Both setters consume the value they are given, body included.
+  JS_SetPropertyStr(ctx, obj, "kind", JS_NewString(ctx, kind ? kind : ""));
+  JS_SetPropertyStr(ctx, obj, "body", body);
+
+  std::string out = StringifyAndFree(ctx, obj);
+  return out.empty() ? std::string{Degraded} : out;
+}
+
+bool OpenEnvelope(const char *text, std::string *kind, std::string *body_json) {
+  if (kind) {
+    kind->clear();
+  }
+  if (body_json) {
+    body_json->clear();
+  }
+  if (!text) {
+    return false;
+  }
+  Locked locked;
+  JSContext *ctx = locked.ctx();
+  if (!ctx) {
+    return false;
+  }
+
+  JSValue parsed = JS_ParseJSON(ctx, text, std::strlen(text), "<payload>");
+  if (JS_IsException(parsed)) {
+    ClearException(ctx);
+    JS_FreeValue(ctx, parsed);
+    return false;
+  }
+  // JS_IsObject is true for an array too, and an array is not one of ours - it
+  // is a message body a peer might send at the top level by mistake, and it
+  // should take the residual path rather than be opened.
+  if (!JS_IsObject(parsed) || JS_IsArray(parsed)) {
+    JS_FreeValue(ctx, parsed);
+    return false;
+  }
+
+  JSValue kind_value = JS_GetPropertyStr(ctx, parsed, "kind");
+  if (JS_IsException(kind_value)) {
+    ClearException(ctx);
+    JS_FreeValue(ctx, kind_value);
+    JS_FreeValue(ctx, parsed);
+    return false;
+  }
+  if (!JS_IsString(kind_value)) {
+    JS_FreeValue(ctx, kind_value);
+    JS_FreeValue(ctx, parsed);
+    return false;
+  }
+  const char *kind_text = JS_ToCString(ctx, kind_value);
+  JS_FreeValue(ctx, kind_value);
+  if (!kind_text) {
+    ClearException(ctx);
+    JS_FreeValue(ctx, parsed);
+    return false;
+  }
+  std::string kind_out = kind_text;
+  JS_FreeCString(ctx, kind_text);
+
+  JSValue body = JS_GetPropertyStr(ctx, parsed, "body");
+  JS_FreeValue(ctx, parsed);
+  if (JS_IsException(body)) {
+    ClearException(ctx);
+    JS_FreeValue(ctx, body);
+    return false;
+  }
+  // A body must be *present*. JSON cannot express undefined, so this only fires
+  // for an object that has no `body` at all - which is not an envelope.
+  if (JS_IsUndefined(body)) {
+    JS_FreeValue(ctx, body);
+    return false;
+  }
+
+  // Consumes `body`. The only value this can refuse is one JSON.stringify
+  // rejects, and nothing that came back out of JS_ParseJSON is such a value.
+  std::string body_out = StringifyAndFree(ctx, body);
+  if (body_out.empty()) {
+    return false;
+  }
+
+  if (kind) {
+    *kind = std::move(kind_out);
+  }
+  if (body_json) {
+    *body_json = std::move(body_out);
+  }
+  return true;
+}
+
 } // namespace gk::json

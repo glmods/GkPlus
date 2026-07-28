@@ -69,4 +69,36 @@ Kind Classify(const char *text, std::string *value = nullptr);
 // because ScriptQueuePayload's contract rests on that.
 std::string Quote(const char *value);
 
+// --- the payload envelope ----------------------------------------------------
+//
+// Every payload on either queue is one JSON object:
+//
+//     {"kind": "<kind>", "body": <anything>}
+//
+// This file owns the *shape*; the vocabulary of kinds is ScriptQueue.h's. That
+// split is why these take a `kind` string rather than an enum - a kind this build
+// does not know is still a well-formed envelope, and the consumer needs to say so
+// rather than have the codec reject it.
+//
+// **The envelope is what removes the old ambiguity.** The format used to be "a
+// JSON string is a file name, anything else is a message", which mis-read a .gcs
+// literally called `123` as a message. The test is now "is this an object with a
+// string `kind` and a `body`?", and the only file name that could collide would
+// have to contain `"` and `:` - both illegal in a Windows path. Anything that is
+// not an envelope is a bare name, with no residual doubt.
+
+// Composes an envelope. `body_json` must be a complete JSON document; a null or
+// unparseable one becomes `null`, so the result is a valid document either way -
+// ScriptQueuePayload's contract rests on that, exactly as it does for Quote.
+std::string Envelope(const char *kind, const char *body_json);
+
+// Splits one apart. True only for an object carrying a string `kind` and a
+// `body`; an array, a bare string, a number and anything unparseable are all
+// false, which is what puts them on the residual bare-name path.
+//
+// `*body_json` receives the body **as JSON text**, not decoded - a message body
+// is handed on for the script host's own context to parse, and a file or command
+// body is a JSON string the caller decodes with Classify. One rule for all three.
+bool OpenEnvelope(const char *text, std::string *kind, std::string *body_json);
+
 } // namespace gk::json

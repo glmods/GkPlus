@@ -153,7 +153,7 @@ struct Map : MapBase, RefCountedBase {
   List<void *> field0x10c;  // 0x10c
   // NEGATED map origin - Map_Ctor XORs each component of its `origin` argument
   // with 0x80000000 before storing it, and ToMap ADDs this to scaled rif
-  // locator coordinates. Net effect: pos = rif_pos * world_unit_scale - origin.
+  // locator coordinates. Net effect: pos = rif_pos * RifUnitScale(rif) - origin.
   Vec3 neg_origin;        // 0x11c
   Vec3 bounds_min;        // 0x128 world bounds, read as a pair by LoadLevel
   Vec3 bounds_max;        // 0x134
@@ -211,8 +211,6 @@ static_assert(sizeof(TeamSlot) == 0xc4);
 
 // TheMap @ 0x00739090; null outside a loaded level.
 Map *GetCurrentMap();
-// GetWorldUnitScale @ 0x005a9b40 (the game returns a float*; this dereferences).
-float GetWorldUnitScale();
 // TeamSlots @ 0x007b3ec4 (stride 0xc4) / NumTeamSlots @ 0x007b3ec0.
 TeamSlot *GetTeamSlots();
 int GetNumTeamSlots();
@@ -220,9 +218,16 @@ int GetNumTeamSlots();
 // The map origin the level was built with. Map stores it negated (see neg_origin);
 // this flips it back.
 Vec3 MapOrigin(const Map *map);
-// Convert a .rif locator position (integer world units) into the world-space
-// position ToMap would spawn a placed object at: rif_pos * world_unit_scale - origin.
-Vec3 MapToWorld(const Map *map, Vec3 rif_pos);
+// The world-unit scale of a loaded rif: the first float of the object
+// `AcquireLevelRifForLocators` @ 0x00483da0 / `LoadOrGetRifFile` @ 0x004ae960
+// return. This is **per-rif data, not a global** - there is no world-unit-scale
+// getter in the binary (see the comment in Map.cpp). Zero for a null rif.
+float RifUnitScale(const void *rif);
+// Convert a .rif locator position (integer rif units) into the world-space
+// position ToMap would spawn a placed object at:
+// rif_pos * RifUnitScale(rif) - origin. `rif` is the same handle passed to
+// `RifFilterObjectsByName`.
+Vec3 MapToWorld(const Map *map, const void *rif, Vec3 rif_pos);
 
 // The placed-object tail of ToMap minus the rif lookup: runs both spawn factories
 // exactly as ToMap does, so on a listen host the executor and the client each get

@@ -560,7 +560,7 @@ bool ToScriptPayload(JSContext *ctx, JSValueConst v, std::string *out) {
     if (!s) {
       return false;
     }
-    *out = json::Quote(s);
+    *out = FileScriptPayload(s);
     JS_FreeCString(ctx, s);
     return true;
   }
@@ -582,9 +582,10 @@ bool ToScriptPayload(JSContext *ctx, JSValueConst v, std::string *out) {
   if (!s) {
     return false;
   }
-  // JS_JSONStringify output is a valid document by construction, which is this
-  // side of the queue's "always JSON" invariant - the writer hooks are the other.
-  *out = s;
+  // JS_JSONStringify output is a valid document by construction, so the envelope
+  // built around it is one too - this side of the queue's "always JSON"
+  // invariant, with the writer hooks as the other.
+  *out = MessageScriptPayload(s);
   JS_FreeCString(ctx, s);
   return true;
 }
