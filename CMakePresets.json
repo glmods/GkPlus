@@ -17,7 +17,8 @@
             "cacheVariables": {
                 "VCPKG_TARGET_TRIPLET": "x86-windows-static-md",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-                "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/clang-toolchain.cmake"
+                "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/clang-toolchain.cmake",
+                "VCPKG_MANIFEST_FEATURES": "rimutil"
             }
         },
         {

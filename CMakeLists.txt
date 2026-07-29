@@ -62,6 +62,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Menu.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Misc.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Music.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Repl.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Roles.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Script.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ScriptQueue.cpp"
@@ -69,7 +70,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Triggers.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/World.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/exports.def")
-target_link_libraries(GkPlus PRIVATE detours imgui::imgui d3d8to9 d3d9 qjs imgui-quickjs)
+target_link_libraries(GkPlus PRIVATE detours imgui::imgui d3d8to9 d3d9 qjs imgui-quickjs ws2_32)
 set_target_properties(GkPlus
     PROPERTIES
     OUTPUT_NAME "d3d8"

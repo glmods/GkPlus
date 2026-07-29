@@ -3,7 +3,9 @@
 #include <quickjs.h>
 
 namespace gk {
-// The QuickJS host: one runtime, one context, one entry module.
+// The QuickJS host: one runtime, one entry module. Usually one context too, but
+// the REPL channel (src/Repl.h) adds a second on the same runtime when
+// GKPLUS_REPL_PORT is set.
 //
 // Boot point is a detour on SetupMenus @ 0x004e95e0, which WinMain calls exactly
 // once - after LoadResourceStringTable and the console, and before the first

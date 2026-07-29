@@ -30,11 +30,21 @@ StdCall<> ReleaseDirect3DDevice;
 StdCall<> PresentScene;
 StdCall<int> ResetD3D1;
 FastCall<int, int, int, int, int> ResetD3D2;
-StdCall<int> DoEvents;
 
 bool ShowGUI = false;
 
 // The native seams (see GUI.h). Null until something installs a callback.
+//
+// If you are hunting for a function that ticks once per frame: 0x0044dfc0 is not
+// it, whatever its name suggests. GkPlus called it DoEvents and detoured it on
+// the strength of that name; the hook was a pure passthrough in every revision
+// from the initial commit until it was deleted, and the detour only ever cost a
+// trampoline. It is a per-thread monotonic clock accumulator (both game threads,
+// many calls per frame from the render path), and reading it as a message pump
+// cost real debugging time - it is named AccumulateThreadClock in the Ghidra DB
+// now, with a plate comment. The two seams that do work are HookedPresentScene
+// and, because the game stops presenting entirely whenever its window is
+// inactive, the WM_TIMER handled in HookedWndProc below.
 OverlayDrawCallback OverlayDraw = nullptr;
 FrameCallback Frame = nullptr;
 
@@ -64,10 +74,10 @@ void __stdcall HookedReleaseDirect3DDevice() {
 
 void __stdcall HookedPresentScene() {
   // Before the overlay check on purpose: this is the once-per-frame heartbeat,
-  // and it has to keep ticking while the overlay is hidden.
-  if (Frame) {
-    Frame();
-  }
+  // and it has to keep ticking while the overlay is hidden. It covers in-game
+  // and level loads only - the front end presents nothing, so CustomMenu.cpp
+  // drives the same callback there (see RunFrameCallback in GUI.h).
+  RunFrameCallback();
 
   if (!*DirectXDevice || !ShowGUI) {
     return PresentScene();
@@ -103,10 +113,27 @@ int __fastcall HookedResetD3D2(int arg1, int arg2, int arg3, int arg4) {
   return res;
 }
 
-int __stdcall HookedDoEvents() { return DoEvents(); }
+// Our own timer id, and the re-entrancy guard for the callback it drives - a
+// script running inside the callback could in principle pump a message and land
+// back here.
+constexpr UINT_PTR FrameWakeupTimer = 0x476b01;
+constexpr UINT FrameWakeupMs = 20;
+bool InFrameWakeup = false;
 
 LRESULT WINAPI HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam,
                              LPARAM lParam) {
+  // Ours, and the game has never heard of it: handled here and not forwarded.
+  // This is the only heartbeat that survives the window losing focus - see
+  // SetFrameWakeupEnabled in GUI.h for why that is not a nicety.
+  if (msg == WM_TIMER && wParam == FrameWakeupTimer) {
+    if (!InFrameWakeup) {
+      InFrameWakeup = true;
+      RunFrameCallback();
+      InFrameWakeup = false;
+    }
+    return 0;
+  }
+
   if (msg == WM_KEYDOWN && wParam == VK_F11) {
     ShowGUI = !ShowGUI;
   }
@@ -129,6 +156,23 @@ void SetOverlayDrawCallback(OverlayDrawCallback callback) {
 
 void SetFrameCallback(FrameCallback callback) { Frame = callback; }
 
+void RunFrameCallback() {
+  if (Frame) {
+    Frame();
+  }
+}
+
+void SetFrameWakeupEnabled(bool enabled) {
+  if (!GameWindow || !*GameWindow) {
+    return; // GUISystem has not resolved the window yet
+  }
+  if (enabled) {
+    ::SetTimer(*GameWindow, FrameWakeupTimer, FrameWakeupMs, nullptr);
+  } else {
+    ::KillTimer(*GameWindow, FrameWakeupTimer);
+  }
+}
+
 GUISystem::GUISystem() {
   GetObjectAtOffset(WndProc, 0x0046aad0);
   GetObjectAtOffset(GameWindow, 0x006b02b8);
@@ -139,7 +183,6 @@ GUISystem::GUISystem() {
   GetObjectAtOffset(PresentScene, 0x00574d30);
   GetObjectAtOffset(ResetD3D1, 0x00574ec0);
   GetObjectAtOffset(ResetD3D2, 0x00575160);
-  GetObjectAtOffset(DoEvents, 0x0044dfc0);
 
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
@@ -156,7 +199,6 @@ GUISystem::GUISystem() {
   DetourAttach(&PresentScene, HookedPresentScene);
   DetourAttach(&ResetD3D1, HookedResetD3D1);
   DetourAttach(&ResetD3D2, HookedResetD3D2);
-  DetourAttach(&DoEvents, HookedDoEvents);
 }
 
 GUISystem::~GUISystem() {
@@ -167,6 +209,5 @@ GUISystem::~GUISystem() {
   DetourDetach(&PresentScene, HookedPresentScene);
   DetourDetach(&ResetD3D1, HookedResetD3D1);
   DetourDetach(&ResetD3D2, HookedResetD3D2);
-  DetourDetach(&DoEvents, HookedDoEvents);
 }
 } // namespace gk

@@ -269,8 +269,13 @@ a synthetic wrapper module that does the import; that is what the deleted versio
 
 Two seams in `src/GUI.h` carry it: `SetOverlayDrawCallback` (inside the ImGui frame, F11 only)
 runs `draw_gui`, and `SetFrameCallback` (once per `PresentScene`, overlay or not) drains the job
-queue. Both are installed by `BootScriptHost`, not by the `ScriptSystem` ctor, so they can never
-call into a context that does not exist yet. Everything runs on the main thread.
+queue and then pumps the REPL channel. Both are installed by `BootScriptHost`, not by the
+`ScriptSystem` ctor, so they can never call into a context that does not exist yet. Everything runs
+on the main thread.
+
+One runtime, but not necessarily one context: `StartRepl` adds a second one for the debug channel
+(see "The REPL channel"). It is started *before* `LoadEntryModule`, because a REPL is most useful
+exactly when `main.mjs` is missing or throws — both of which make `BootScriptHost` return early.
 
 Nothing a script throws reaches game code: every seam ends at `gk::js::ReportException`, which
 prints the message and stack to the console and the debugger. A `draw_gui` that throws is
@@ -282,6 +287,173 @@ which this port does not install) and GkPlus deliberately does not add one — `
 `error`/`debug` live on the `"gk"` module's `console` beside the game's own `print`, colours and
 `execute`, so there is exactly one console object and a script reaches it the way it reaches
 everything else. `js::Log` is still the C-side sink for all of it, including `ReportException`.
+
+### The REPL channel (`src/Repl.h/cpp`)
+
+A loopback socket that evaluates JavaScript in the running game. **Off unless
+`GKPLUS_REPL_PORT` names a port**, and bound to `127.0.0.1` only — it executes
+arbitrary code in the game process, and the game already takes attacker-authored
+payloads off the network (update `0x67`), so a wildcard bind would be remote code
+execution on whoever is playing. One line of NDJSON each way, UTF-8:
+
+```
+-> {"code": "actors.count", "id": 7}       `id` optional, echoed back
+<- {"ok": true, "value": "37", "id": 7}
+<- {"ok": false, "error": "TypeError: ...", "stack": "..."}
+```
+
+#### Using it
+
+Set the port in the environment the game inherits, and launch `gl.exe` directly —
+Steam will not pass the variable through:
+
+```
+GKPLUS_REPL_PORT=9222 "<Gunlok>/gl.exe"
+```
+
+The listener opens during `SetupMenus`, about a second in, and logs
+`repl: listening on 127.0.0.1:9222` to the game console. Then anything that speaks
+TCP will do:
+
+```
+printf 'actors.count\n' | nc 127.0.0.1 9222
+```
+
+**A line that is not a JSON object with a string `code` is treated as source**, so
+one-liners work with no quoting ceremony. Multi-line source has to ride in the
+object form, because a newline is the frame delimiter:
+
+```
+{"code": "for (const a of actors) if (!a.alive) console.print(a.id);\nactors.count", "id": 3}
+```
+
+Everything the `"gk"` module exports is already a global — all 21 namespaces,
+enumerated at boot, plus the default export as `gk` — so there is nothing to
+import and no host object to reach for:
+
+```
+actors.count                       // 158
+[...actors].filter(a => a.alive).length
+roles["gunlok"].id
+game.simulation_running            // the authority test, false on a joining client
+console.print("hello")             // goes to the game's own console
+```
+
+Evaluation is **global scope, not module scope**: the expression's value comes
+straight back, and `var`/`function` persist between lines, so a session
+accumulates state. The cost is that `import` is a syntax error there — which
+costs little, since the prelude has already put everything importable in scope.
+
+**Do not expect a relative dynamic `import()` to work from the REPL.** Not
+measured, but it follows from the normalizer rule documented under "Script host":
+QuickJS resolves a relative specifier by scanning the *importing* script's name
+for `/`, and the REPL evaluates under the name `<repl>`, which has none — so
+`import("./x.mjs")` should land against the process's current directory, which
+the game moves around during a level load, rather than next to `main.mjs`. A
+bare specifier needs no normalizer and should be fine. If you need this, measure
+it first and replace this paragraph with what you find.
+
+Worth knowing before leaning on it:
+
+- **A snippet runs on the game's own thread, inside the frame callback.** It can
+  see and mutate live game state, and while it runs the game does not advance. A
+  `JS_SetInterruptHandler` deadline throws after 5 s so a runaway loop cannot wedge
+  the process — but it **cannot interrupt a native call**, only JavaScript.
+- **`ImGui` is not reachable**, by construction: the frame callback runs outside
+  the ImGui frame, so those calls would be invalid. `draw_gui` is where they live.
+- **It shares the runtime with `main.mjs`** but has its own context, so `actors`
+  at the socket is the very collection the entry module sees, while globals seeded
+  here never leak into the script's `globalThis`.
+- Limits, all of them there so a wedged client degrades into a dropped connection
+  rather than an unbounded allocation: 4 concurrent connections, a 1 MiB cap on a
+  single un-terminated line, 8 MiB of unread replies, and results over 64 K
+  characters are elided with a note.
+- **Replies are formatted, not round-trippable.** `value` is display text —
+  `JSON.stringify` where that works, `[object Object]` where it throws (a circular
+  structure, a getter that raises). Do not parse it.
+
+Verified against a running game in all four states — front-end menu and in-level,
+window focused and unfocused — and offline by the harness described at the end of
+this section.
+
+Five things pin the design:
+
+- **No thread, because the frame callback already exists.** `StartRepl` only opens
+  the listener; `PumpRepl` accepts, reads, evaluates and writes from `OnFrame`,
+  on the thread that owns the runtime. That is why none of `src/Json.cpp`'s
+  locking or `JS_UpdateStackTop` applies here. A blocking `accept` on a worker
+  would buy nothing — every snippet would still have to be marshalled back to the
+  main thread to run — and would cost a second thread on the host `JSRuntime`,
+  which is the hazard `Json.cpp` exists to work around.
+- **`PresentScene` is not a sufficient heartbeat, because Gunlok stops running
+  frames entirely while its window is inactive** — which is exactly the state a
+  debug channel is used in, since you are typing in a terminal. All of this is
+  measured on a running game, not inferred:
+  - `OnActivateApp` @ 0x0046f400 clears `HasWindowFocus` @ 0x006a3744 on focus
+    loss and calls `FUN_00574960`, which releases the D3D resources and clears
+    `DAT_007c1230`;
+  - `RenderSceneAndPresent` @ 0x00574c50 wraps its whole body — scene,
+    `EndScene`, the `PresentScene` call — in `if (DAT_007c1230 != 0)`, so the
+    frame hook never fires;
+  - yet the process still spins a full core and `SendMessageTimeout(WM_NULL)`
+    answers in 7 ms, so the main thread is in a loop that pumps messages.
+
+  **How much else stops depends on where you are, and only the gate is
+  constant.** At the front-end menus both per-thread clock accumulators
+  (`DAT_007c07e8` main, `DAT_007c07b8` executor) read **+0 over four seconds** —
+  the game is not merely unrendered, it is not running. In a loaded level the
+  same two clocks keep advancing (~10,300 per 3 s each, measured unfocused), so
+  the simulation continues and only rendering is gated. `PresentScene` is
+  unreachable either way, which is the part that matters for the heartbeat; do
+  not generalise the menu measurement into "the game pauses on focus loss".
+
+  A message is therefore the only way in. `SetFrameWakeupEnabled` (GUI.h) puts a
+  **WM_TIMER** on the game window, handled in the existing `HookedWndProc`, which
+  runs `RunFrameCallback` on the main thread ~50×/s regardless of focus. Verified
+  A/B: with `HasWindowFocus` 0 and the gate 0, the previous build timed out and
+  this one answers 12/12 at 10–37 ms. **WM_TIMER rather than a thread posting
+  `PostMessage`**, because `StopRepl` runs from `DllMain(DLL_PROCESS_DETACH)` and
+  waiting on a worker thread under the loader lock deadlocks; `KillTimer` is a
+  plain USER32 call and is safe there.
+
+  Two traps cost most of an afternoon here, both worth keeping:
+  **reachability is not execution** — the front-end frame `FUN_0046eae0` *does*
+  call `RunGameFrame()`, so a caller-graph search says the front end reaches
+  `PresentScene`, when the call inside is gated off; read the guard, don't trust
+  the edge. And **the state that looks like "front end vs in-game" was window
+  focus all along** — the same menu screen answers or doesn't depending only on
+  whether the window is active, so sample the condition rather than the scenario.
+- **Its own `JSContext` on the host's runtime.** Same runtime is the same object
+  graph — `actors` at the socket is the collection `main.mjs` sees — while the
+  separate context keeps the globals it seeds off the entry module's
+  `globalThis`, so "there are no host globals" stays true for scripts. The cost is
+  per-context prototypes: `RegisterGkModule` runs again on the REPL context
+  (`RegisterClass` in `JsCommon.cpp` is already a no-op for the runtime half), and
+  a wrapper is branded by whichever context minted it.
+- **Global-scope eval, not module.** It hands the expression's value straight back
+  and lets `var`/`function` persist between lines, which module scope does neither
+  of. `import` is the thing given up, and the prelude covers it by enumerating
+  `import * as ns from "gk"` onto `globalThis` — enumerated, not listed, so a
+  namespace added to `JsGk.cpp`'s table appears without anyone remembering.
+- **One rule decides what a line is**: an object with a string `code` is a
+  request, anything else is source. That keeps `nc 127.0.0.1 <port>` usable for a
+  one-liner (`actors.count` is not JSON at all; `1` is JSON but not an object)
+  while multi-line source rides as `{"code": "..."}` with its newlines escaped.
+  The one ambiguity is a JS object literal that happens to have a string `code`
+  property.
+- **`JS_SetInterruptHandler` on a deadline**, armed only around a REPL eval, so a
+  runaway loop throws instead of freezing the game. It cannot interrupt a *native*
+  call that hangs — only JavaScript.
+
+`JSON.stringify` **throws** on a circular structure or a getter that raises rather
+than returning `undefined`; the formatter needs both fallbacks, and a test
+asserting only `ok: true` passes on the error path too.
+
+This is one of the layers that *can* be exercised outside Gunlok (see
+"Runtime-testing outside the game"): `Repl.cpp` reaches only `js::RegisterGkModule`,
+`Log`, `ReportException` and `ReleaseCallbacks`, so a harness supplying those four
+plus a one-namespace `"gk"` module drives the whole protocol over a real socket
+with `PumpRepl` standing in for the frame hook.
 
 ### Custom menu items (`src/CustomMenu.h/cpp`)
 
@@ -1114,6 +1286,7 @@ document order. Nothing exported has been loaded back into Gunlok yet.
 
 | File | Purpose |
 |------|---------|
+| `src/Repl.h/cpp` | The loopback JavaScript REPL: `StartRepl` / `PumpRepl` / `StopRepl`, owned by `BootScriptHost` rather than by `Subsystems` (it installs no detour). Off unless `GKPLUS_REPL_PORT` is set. See "The REPL channel" above |
 | `src/InputFix.h/cpp` | `InputFixSystem` - hook-only. Detours `AcquireDInputDevice` to suppress the vestigial DirectInput keyboard acquire and its `WH_KEYBOARD_LL` hook (see `input_notes.md`) |
 | `src/ActorClasses.inc.h` | X-macro listing the 15 Actor subclasses: `GK_ACTOR_CLASS(Name, Parent, Predicate, Kind)`. Drives the JS class table, `kind`, the RTTI ladder and the prototype chain. **Must list every class before its own base** |
 | `src/Menus.inc.h` | X-macro listing all 36 Gunlok menus: `GUNLOK_MENU(Name, Id, TitleResourceId, "English title")`. There are no gaps - ids 11 and 14-20 are identified in `menu_system_notes.md`. Also counted into `gk::MenuCount` |

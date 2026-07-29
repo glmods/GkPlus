@@ -57,7 +57,7 @@ struct Actor {
   // role-supplied ones stay owned by the Role).
   VulnerabilityList vulnerabilities; // 0x10
   char pad0x20[8];
-  // 0x28/0x2c: written only by ChangeOwnerAndTeam (slot 39), which also puts
+  // 0x28/0x2c: written only by ChangeOwnerAndTeam (slot 80), which also puts
   // them in its 0x58 update. The DB's name for that slot says "owner"; nothing
   // measured here confirms it, so they keep the field0xNN convention. They are
   // exposed because a team change has to preserve them - see JsActors.cpp.

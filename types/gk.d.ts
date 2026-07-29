@@ -261,6 +261,10 @@ declare module "gk" {
     readonly role: Role | null;
     /** What this actor is currently attacking. */
     readonly target: Actor | null;
+    /** The team this actor is on. Read-only by design: writing goes through
+     *  `set_team()`, because changing a team re-registers the actor on two team
+     *  actor lists and broadcasts, which an assignment would not look like. */
+    readonly team: number;
     /** The actor's centre, which is not its position - `set_position` moves the
      *  origin, this is the middle of its bounding volume. */
     readonly center: Vec3;
@@ -317,12 +321,12 @@ declare module "gk" {
     /** Takes the target's **id**, not the wrapper - see `actor.id`. */
     set_target(id: number, mode?: number): void;
     clear_target(): void;
-    /** Moves the actor to another team.
+    /** Moves the actor to another team. Read the current one with `actor.team`.
      *
-     *  Goes through `ChangeOwnerAndTeam` (slot 39) rather than the raw
+     *  Goes through `ChangeOwnerAndTeam` (slot 80) rather than the raw
      *  `SetTeamId`, which fixes two things at once: the raw setter writes the
      *  field and nothing else, leaving the actor on its **old team's actor
-     *  list**, and it broadcasts nothing. Slot 39 does the list move and sends
+     *  list**, and it broadcasts nothing. Slot 80 does the list move and sends
      *  updates 0x58 and 0x50 - the latter being what `GIVE CONTROL` sends. */
     set_team(id: number): void;
     /** Moves the actor. Goes through the engine's own setter, so the

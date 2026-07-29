@@ -126,7 +126,11 @@ const someone = actors[1];
 if (someone) {
   const health: number = someone.health;
   someone.health = 50;
+  const team: number = someone.team;
   someone.set_team(2);
+  // @ts-expect-error - read-only: a team change is a list move plus two
+  // broadcasts, so it goes through set_team rather than looking like a field
+  someone.team = 2;
   const alive: boolean = someone.alive;
   // @ts-expect-error - goto is a MobileActor member, not on every actor
   someone.goto({ x: 0, y: 0, z: 0 });

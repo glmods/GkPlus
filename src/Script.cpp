@@ -14,6 +14,7 @@
 #include "Core.h"
 #include "GUI.h"
 #include "Js.h"
+#include "Repl.h"
 
 #include <cstdio>
 #include <string>
@@ -283,7 +284,12 @@ void CallSetupMenus(JSContext *ctx) {
 
 // --- the seams ---------------------------------------------------------------
 
-void OnFrame() { PumpJobs(); }
+// The job queue first: the REPL settles promises off the same queue, so it should
+// start from a drained one rather than pick up whatever the last frame left.
+void OnFrame() {
+  PumpJobs();
+  PumpRepl();
+}
 
 void OnOverlayDraw() {
   if (!Context || JS_IsUndefined(DrawGui)) {
@@ -353,6 +359,10 @@ void BootScriptHost() {
   SetOverlayDrawCallback(OnOverlayDraw);
   SetFrameCallback(OnFrame);
 
+  // Before the entry module on purpose: a REPL is most useful precisely when
+  // main.mjs is missing or throws, and LoadEntryModule returns early on both.
+  StartRepl(Runtime);
+
   if (!LoadEntryModule(Context, path)) {
     return;
   }
@@ -376,6 +386,11 @@ ScriptSystem::ScriptSystem() {
 ScriptSystem::~ScriptSystem() {
   SetOverlayDrawCallback(nullptr);
   SetFrameCallback(nullptr);
+
+  // Before the context and the runtime below: the REPL's own context lives on
+  // that runtime, and its teardown clears the shared menu/level registrations
+  // that the host context's ReleaseCallbacks clears again a moment later.
+  StopRepl();
 
   if (Context) {
     js::ReleaseCallbacks(Context);

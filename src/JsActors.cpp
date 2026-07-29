@@ -557,6 +557,23 @@ JSValue ActorClearTarget(JSContext *ctx, JSValueConst self, int,
   return JS_UNDEFINED;
 }
 
+// Read-only, and paired with set_team() rather than made a read/write accessor -
+// the same shape `target` and set_target() already have. Changing a team is not
+// a field write: it re-registers the actor on two team actor lists and sends
+// updates 0x58 and 0x50, and `actor.team = n` would read like an assignment.
+//
+// The field directly, because there is no getter to call. Slot 33 (SetTeamId)
+// is write-only and has no counterpart, and slot 25 - the nearest thing - is a
+// different quantity: MobileActor returns a team *slot* index from +0x18c, not
+// the team id at +0xbc.
+JSValue GetTeam(JSContext *ctx, JSValueConst self) {
+  Actor *a = Resolve(ctx, self);
+  if (!a) {
+    return JS_EXCEPTION;
+  }
+  return JS_NewInt32(ctx, a->team_id);
+}
+
 JSValue ActorSetTeam(JSContext *ctx, JSValueConst self, int argc,
                      JSValueConst *argv) {
   Actor *a = Resolve(ctx, self);
@@ -570,7 +587,7 @@ JSValue ActorSetTeam(JSContext *ctx, JSValueConst self, int argc,
   if (JS_ToInt32(ctx, &team, argv[0])) {
     return JS_EXCEPTION;
   }
-  // Slot 39 rather than the raw SetTeamID at slot 33, for two reasons and only
+  // Slot 80 rather than the raw SetTeamID at slot 33, for two reasons and only
   // one of them is replication:
   //
   //   * SetTeamID is `this->team_id = team` and nothing else. Both engine call
@@ -584,7 +601,7 @@ JSValue ActorSetTeam(JSContext *ctx, JSValueConst self, int argc,
   //
   // Passing the actor's current +0x28/+0x2c back in is what keeps this a team
   // change: those are the only other things the slot writes.
-  a->ChangeOwnerAndTeam(a->field0x28, a->field0x2c, team); // slot 39
+  a->ChangeOwnerAndTeam(a->field0x28, a->field0x2c, team); // slot 80
   return JS_UNDEFINED;
 }
 
@@ -808,6 +825,7 @@ const JSCFunctionListEntry ActorProto[] = {
     JS_CGETSET_DEF("valid", GetValid, nullptr),
     JS_CGETSET_DEF("role", GetRole, nullptr),
     JS_CGETSET_DEF("target", GetTarget, nullptr),
+    JS_CGETSET_DEF("team", GetTeam, nullptr),
     JS_CGETSET_DEF("center", GetCenter, nullptr),
     JS_CGETSET_DEF("hotspot", GetHotspotName, nullptr),
     JS_CGETSET_DEF("ammo", GetAmmo, nullptr),
