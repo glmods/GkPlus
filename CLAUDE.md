@@ -932,6 +932,184 @@ Three modelling decisions that took a round-trip through `tsc` to settle:
   so `actors.count` is `number` while `actors["hark"]` is `Actor | undefined`. `tokens` is the one
   whose index signature is not `readonly`.
 
+### The Blender addon (`blender/`)
+
+Import/export of `.rif` geometry, in **pure Python** — no compiled extension, so it installs as a
+plain zip and shares nothing with `d3d8.dll`. `blender/README.md` is the user-facing half.
+
+`blender/pyproject.toml` is a **uv project for the tooling only** — `uv run tools/build_zip.py`
+builds `dist/io_scene_rif-<version>.zip`, `uv run --group dev ruff check .` lints. **The addon
+itself must stay dependency-free**: Blender ships its own interpreter and an extension cannot pull
+wheels at install time, so nothing in `[dependency-groups]` may ever be imported from
+`io_scene_rif/`. `blender_manifest.toml` owns the version (Blender reads it) and the build fails if
+`pyproject.toml` disagrees, which is the only thing stopping the two from drifting. `build_zip.py`
+lists its payload explicitly rather than globbing, so a stray file cannot ship.
+
+The split is the point: `io_scene_rif/rif.py` (container: huffman, chunk tree, serialization),
+`io_scene_rif/shapes.py` (REBSHAPE geometry), `io_scene_rif/bmpnames.py` (the texture table) and
+`io_scene_rif/rim.py` (`.RIM` textures: IFF container, DXT1/DXT3 decode) import **no `bpy`**, so
+`blender/tests/` exercises them over all 563 shipped files with Blender absent — the opposite of
+`src/`, where nothing runs outside Gunlok. `io_scene_rif/scene.py` and
+`io_scene_rif/__init__.py` are the only files that touch Blender.
+
+Seven things pin the design, in decreasing order of how much everything else rests on them:
+
+- **The scene is the whole file: export reads nothing but the scene.** Every chunk becomes a
+  Blender datablock — objects, mesh datablocks, lights, Actions, mesh attributes, and typed
+  `int32`/`float32`/string properties for the rest. There is no source-file parameter and **no
+  opaque byte storage anywhere**, so a `.blend` moved to a machine that has never seen the original
+  `.rif` still produces one. `tests/test_scene.py` enforces exactly that: build the scene, save a
+  `.blend`, *reset Blender*, reopen, export. The rule is container chunks → objects, leaf chunks →
+  typed fields on the parent, with `rif_id` / `rif_index` / `rif_absorbed` carrying the structure.
+- **The bar is semantic equivalence, not byte equivalence**, and that is what lets the exporter
+  regenerate instead of mirror. `SHPCENTR` is recomputed; `SHPPCINF` is discarded (681 of 9,357
+  shipped shapes have none and every AvP path guards its lookup); `SHPMRGDT` and `SHPVTINT` are
+  *authored* per-element data so they become mesh attributes and survive an edit rather than going
+  stale. Nothing is silently dropped when you edit a mesh. The byte-exact round-trip test still
+  guards the **container** layer (`tests/test_roundtrip.py`, 563/563) and the **typed field** layer
+  (`tests/test_schema.py`, `encode(decode(body)) == body` for 485,663 leaf chunks across 44 ids) —
+  those two are what make the scene able to stop referencing the file.
+- **An object finds its shape by id, never by position.** `OBJHEAD1+0x38` (`shape_id_no`) matches
+  `SHPHEAD1+0x14` (`file_id_num`), which is what AvP's `Object_Chunk::assoc_with_shape_no` does.
+  That resolves all 9,313 objects in the shipped files with no shape claimed twice, and it
+  **differs from document order in 86 of the 563 files (15.3%)** — pairing the two lists
+  positionally, which an earlier version did on the strength of "the counts match", attaches
+  geometry to the wrong transform in one file in seven. Matching counts do not imply matching
+  order.
+- **A level-of-detail variant is moved onto its base part's bone, and its placement is frozen.**
+  `L<n>#<part>` is a naming convention, not a chunk (full description in `rif_chunk_format.md`):
+  the engine swaps that mesh onto the hierarchy node driving `<part>`, so no `OBJCHIER` node binds
+  a variant and nothing would animate it. `_build_armature` therefore parents it to the base's
+  bone **at the base's transform**, and `_object_chunk`/`_dumobj_chunk` skip the usual
+  `matrix_world` write-back for anything carrying `rif_lod_base`. Both halves are needed: the
+  shipped sets are parked beside the model (Gunlok MkII's L5 at +1200 on X) while their vertices
+  are already in the base's local frame, so the stored placement is dead data that would be
+  destroyed by recomputing it — and preserving it keeps the round-trip byte-exact whether or not
+  that reading is right. The guard is "base exists and is bound, variant is not":
+  `destructorfrag.RIF` has nine parts genuinely *named* `L7#head` etc. with no base, bound
+  directly. 1,477 of 1,518 variants qualify; the rest stay loose, as they are in-game.
+- **Moving a mesh onto a bone changes what a click selects, and that broke animation playback.**
+  Once the variants coincided with the parts they replace, clicking the chest selected `L5#Chest`
+  instead — and the Action editor targets the *active object*, so choosing a sequence assigned it
+  to a mesh with no bone channels while the armature went on playing the one bound at import. It
+  presents as "every action plays the first action", nowhere near the animation code, and it is
+  invisible to any test that assigns actions to the armature directly, which is what every probe
+  did before the user's `animation_data.action_slot` came back `<<NONE>>` on a mesh. Variants are
+  therefore hidden with **`hide_set`** (the eye) — not `hide_viewport` (the monitor), which drops
+  the object from the depsgraph and freezes `matrix_world`, making the placement unverifiable and
+  reporting 1,309 phantom drifts — and the importer leaves the rig selected as well as active.
+  When a change adds objects to the scene, check selection, not just geometry and transforms.
+- **A texture is a name, and the name is all the `.rif` has.** A polygon carries an *index*
+  (`colour & 0xfff`) into one file-level table, `BMPNAMES` under `REBENVDT` — decoded in
+  `bmpnames.py`, layout in `rif_chunk_format.md`. So the three parts live apart: the **table** on
+  the collection (`rif_bmpnames`, kept whole and in order, so entries no polygon references
+  survive), the **index** and the **name** on a per-import material (`rif_texture_index` /
+  `rif_bmp_name`), and the **image** as a packed Blender image that is never written back.
+  Retexturing is editing `rif_bmp_name`; a name the table does not list appends an entry at a
+  fresh index. Four things this rests on, each measured over all 563 files:
+  - **The table's `index` is a stable id, not a list position** — entries are stored in
+    *descending* index order and are sparse (`Maze.RIF` has `[10, 9, 8, 5, 4, 1]`). It resolves
+    1,518,963 of 1,766,071 polygons; of the rest 22,331 are the `0xfff` untextured sentinel and
+    215,517 of the remaining 224,747 are in `_shadow` files, whose polygons carry junk texture
+    *and* UV indices. No table has a duplicate index or name.
+  - **The table is the one thing held to byte-exactness**, because it is carried rather than
+    regenerated — including the *uninitialised* padding after each name (`Units\baddies3.RIM` is
+    followed by `00 f5`, not by NULs). `encode(decode(body)) == body` for all 527 tables.
+  - **Its chunk position belongs to whichever datablock absorbed the container it sits in**, and
+    that is *not* always the collection: `REBENVDT` holds a `LIGHTSET` in 34 files, which makes it
+    an object rather than data folded onto the collection. Assuming the collection loses every
+    material name in exactly those files (`Maze`, `S3 Level`) — which is what `_note_table_owner`
+    and `_table_location` exist for, and what `tests/test_scene.py` caught.
+  - **Materials are per-import, not shared by name**, because an index only means anything inside
+    its own file: the same `.RIM` is entry 11 in one level and entry 4 in the next. Images *are*
+    shared, which is where the cost is.
+  - **A Blender image filled through `pixels` does not survive a `.blend` round trip** — it is a
+    *generated* image and comes back blank, which no import-then-export test catches unless it
+    reopens the file and reads a pixel. So a decoded texture is written out as a PNG (`zlib` is
+    stdlib), loaded, packed, and the temp file removed; that also hands the sRGB tagging to
+    Blender instead of reimplementing a transfer function.
+- **The UV index is 20 bits in the four shapes that need it, and 16 everywhere else.** AvP's
+  `ChunkPoly::GetUVIndex` folds `colour` bits 12-15 in whenever they are set; Gunlok does that
+  only in `city ruins`, `level07`, `level15` and `level12`, whose UV tables hold 65,663..77,669
+  entries. Reading those with the nibble reproduces `uv_index == polygon index` for 282,412 of
+  their 282,454 polygons; without it every index past 65,535 **wraps into range** and quietly
+  wears another polygon's UVs — which is what the exporter did until the scene test grew a UV
+  check. Everywhere else the nibble is not an index at all (it takes all 15 values, and 99.05% of
+  the polygons carrying it have no usable UV entry either way), so the rule is a property of the
+  *shape*: `shapes.Shape.extended_uv`, `decode_uv_index`, `encode_colour`.
+- **A `SHPUVCRD` UV is a texel coordinate, not a fraction**, so it is divided by the size of the
+  texture its polygon names and multiplied back on export (`scene.uv_scale` / `uv_to_blender`).
+  Feeding the raw value to Blender tiles a 1024×1024 texture 1024 times across every face, which
+  is what the first version did. Three things pin it, all in `rif_chunk_format.md`: the 99th
+  percentile of `|u|` lands within 7% of each texture's own width for every size in the game;
+  AvP casts the float straight to the int its renderer wants in texel space
+  (`chnkload.cpp:2390`); and 374,658 of 376,641 sampled pairs are whole numbers — *not all*, so
+  nothing may round. **V grows downward** (Direct3D convention), measured at 86.3% of the 8,916
+  axis-aligned wall polygons in the shipped levels, so it is flipped as well as scaled. Both
+  directions are bit-exact in float32 because every texture is a power of two. The scale is
+  re-derived at export from the material's *current* texture, not replayed, so retexturing onto a
+  different size rescales the UVs — with `rif_uv_scale` on the material as the fallback for a
+  `.blend` opened where the textures are not installed.
+- **`.RIM` is IFF, not a RIF chunk file** — big-endian sizes, 4-character ids, `LIST`/`FORM`/`PROP`
+  groups, odd bodies padded — carrying DXT1/DXT3 in an `S3TC` chunk whose 22-byte header is
+  documented in `rif_chunk_format.md`. The **payload is little-endian** even though the container
+  is not, which is settled by content rather than inspection: `lava.RIM` decodes orange, and a
+  red/blue swap would make it blue. 490 of the 513 shipped textures decode; the other 23 are the
+  `*_fmv_*` set, which stores palettized `CMAP`/`BODY` variants and no S3TC. **There is no
+  writer** — that would need a DXT compressor and a mip chain, and re-compressing a lossy format
+  to change a name nobody edited is the wrong trade.
+- **Files are written uncompressed.** 150 of the 563 shipped files already are, and the game reads
+  them, so the Huffman *compressor* is never needed. `huffman/huffman_compress.cpp` still exists for
+  byte-parity work.
+- **Porting `HuffmanDecode` needs two things the C hides.** Shift counts are masked to 5 bits on
+  x86, so `x << 32` is `x << 0` and not zero — Python shifts by the full count and silently corrupts
+  the bit window. And it reads up to a word past the end of the compressed block; without padding
+  the input, the 64 largest files stop exactly 4 bytes short.
+- **`rif_chunk_format.md` was wrong about most of the chunks that matter** and is now corrected
+  there: `SHPRAWVT` is int32 triples (not floats), `SHPPOLYS` is
+  `{engine_type, normal_index, flags, colour, vert_ind[5]}` and always triangles, `SHPUVCRD` is an
+  indexed list rather than one entry per polygon, `SHPCENTR` is int32 centre + float radius about
+  the **origin**, `OBASEQFR` is a fixed 44-byte keyframe (quaternion + int32 position + normalized
+  16.16 time + frame index) rather than a variable sub-frame array, `STDLIGHT` is 84 bytes of pure
+  integers whose 0x10 field is an orthonormal 3×3 in 16.16, `SHPMRGDT` is one int32 per polygon,
+  and `SHPVTINT` is a 16-byte header plus one int32 per vertex that hangs off `RBOBJECT`, not off a
+  shape. AvP's `ChunkPoly` is *not* Gunlok's — it has an explicit `num_verts` and `vert_ind[4]`.
+  Every one of those was measured across all 563 files; the old entries read like plausible
+  guesses, which is what they were.
+- **Blender cannot hold two faces on the same three vertices**, and the shipped assets contain
+  them (doubled or reverse-wound triangles): 775 across 193 shapes, and 28 of Maskelyn MkII's 44
+  polygons. **Drop them deliberately, before `from_pydata`** — letting `validate()` remove them
+  renumbers `me.polygons` out from under the source list, so every face after the first duplicate
+  takes the *previous* face's texture, UVs, flags and merge group. That was invisible for as long
+  as the tests compared per-face data as unordered counters, which a permutation satisfies.
+  Such a shape loses one face on import and is therefore
+  flagged as edited on export even when untouched. `engine_type`, `flags` and "did this polygon
+  have a UV entry" have no Blender equivalent either and ride as **face attributes**; the last one
+  cannot be inferred from the values, because a zero-length UV entry and one holding three `(0,0)`
+  pairs are different on the wire and both occur. A new UV layer is also **not zero-initialised** —
+  Blender seeds it with a per-face box mapping, so an untextured polygon silently acquires
+  `(0,0)/(1,0)/(1,1)` and reads back as an edit unless the importer overwrites it.
+- **RIF is Y-down, and the swizzle has to carry the orientation too, not just the position.** A
+  biped's parts all sit at negative Y — feet nearest the origin (~-100), top of the head furthest
+  (~-1990) — so the body extends in -Y from the ground and **-Y is up**; assembled in Blender a
+  character spans Z = 0.000 to 2.589 m with its feet exactly on the ground plane. The map is
+  `(x, y, z) -> (x, z, -y)`, a **-90°** rotation about X, and a placed object's quaternion needs
+  the same change of basis (`m q m⁻¹`) or it lands in the right spot facing the wrong way. The
+  determinant is +1 so it does not mirror, which is correct because RIF is right-handed —
+  `shapes.face_normal` takes an ordinary right-handed cross product of raw RIF coordinates and
+  matches the shipped `SHPPNORM` on 99.91% of 1.77M faces. Single-shape vertex extents do **not**
+  settle this (characters are articulated per-part meshes, roughly symmetric about their own
+  origins); the part *placements* do.
+- **`obj.matrix_world` is stale until `bpy.context.view_layer.update()`**, which makes an assembled
+  model look collapsed — the first attempt at this measurement reported a 0.765 m character
+  because every part was still at the identity.
+  `OBJHEAD1` is `{int flags, char[16] name, int32[3] location, float[4] quaternion (x,y,z,w)}`;
+  the exporter rewrites only those 28 bytes and leaves the undecoded remainder alone.
+
+Not verified against the game: the import scale (a convention — the engine's factor comes from map
+data at level load, not a constant), the Y-up→Z-up assumption, and shape-to-`RBOBJECT` pairing by
+document order. Nothing exported has been loaded back into Gunlok yet.
+
 ### Other
 
 | File | Purpose |
@@ -944,6 +1122,8 @@ Three modelling decisions that took a round-trip through `tsc` to settle:
 | `examples/levels/arena.mjs` | A working level module for `levels.add` — `map` + `includes` + `define` + `populate` + `setup` |
 | `examples/headers/` | `bug.gsh` and part of `defaults.gsh` re-implemented with `gls`, as the worked example of translating a header |
 | `types/` | `.d.ts` for the `"gk"` module and the `ImGui` interface, the generator for the latter, and `typecheck.ts`. See "Type definitions" above |
+| `blender/` | The Blender `.rif` import/export addon and its five test harnesses. Pure Python, unrelated to `d3d8.dll`. See "The Blender addon" above |
+| `huffman/`, `utils/rifutil` | The C++ REBCRIF1 codec and its CLI. The Python port in `blender/io_scene_rif/rif.py` is decode-only; this is the only compressor |
 
 ## Reverse Engineering Reference
 
@@ -961,7 +1141,8 @@ Three modelling decisions that took a round-trip through `tsc` to settle:
 - `save_system_notes.md` - `.sav`/`.msv` savegame format: full field-by-field stream layout, the header-only "carry to next level" variant, the team carry-over roster, and why the console `SAVE`/`LOAD` commands are the demo system instead
 - `input_notes.md` - Input subsystem: keyboard runs on Win32 `WM_KEYDOWN` (`MainWindowWndProc` -> `HandleKeyMessage` -> VK->DIK `VkToScanCodeTable` -> the universal `HandleKeyPress4` sink), mouse on Raw Input, and the DirectInput `SysKeyboard` is a vestigial acquired-but-never-read fossil whose `Acquire()` arms the `WH_KEYBOARD_LL` hook that lags system keyboard input under a debugger; the `InputFixSystem` (`src/InputFix.cpp`) detours `AcquireDInputDevice` to suppress it
 - `rif_chunk_format.md` - the `.rif` asset format: 12-byte chunk header, `REBCRIF1` Huffman
-  container, all 105 registered chunk types, **and** the AvP upstream mapping (see below)
+  container, all 105 registered chunk types, the `.RIM` texture format (IFF + S3TC, the one
+  asset format that is *not* RIF chunks), **and** the AvP upstream mapping (see below)
 - `game_defects_notes.md` - bugs in **Gunlok itself** that reproduce without GkPlus, so nobody
   re-blames our hooks for them. Currently: `DrawText?` @ 0x005782e0 smashing its stack on any
   string over ~1024 chars (which makes the training-level debrief fatal), and the fact that the
@@ -1606,7 +1787,11 @@ base subobject's vptr/`refcount` @ 0xa4/0xa8, `adjacency_built` @ 0xac, `scene_o
 
 **The origin at 0x11c is stored negated** (`Map_Ctor` XORs each component with
 0x80000000) and `ToMap` *adds* it, so a placed object lands at
-`rif_pos * world_unit_scale - origin`. 0x24..0x88 and 0x8c..0xa4 are still unmapped -
+`rif_pos * RifUnitScale(rif) - origin`, where the scale is **`*(float *)rif`** — the
+first float of the object `AcquireLevelRifForLocators`/`LoadOrGetRifFile` return. It is
+per-rif data; there is **no world-unit-scale global or getter**, and 0x005a9b40 (once
+misnamed `GetWorldUnitScale`) is `CopyDword`, a `__fastcall(dest, src)` 4-byte copy.
+0x24..0x88 and 0x8c..0xa4 are still unmapped -
 they are reached only through `__thiscall` methods called directly on `TheMap`.
 
 Roles are the "entity" hash @ 0x007b48f0 (`{num_entities, num_buckets, mask, buckets}`);

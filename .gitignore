@@ -11,4 +11,7 @@ vcpkg/
 *.code-workspace
 /.mcp.json
 /.claude/settings.local.json
+/**/__pycache__/
+/blender/.venv/
+/blender/dist/
 CMakeUserPresets.json

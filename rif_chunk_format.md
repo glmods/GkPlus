@@ -83,6 +83,7 @@ Container chunk bodies consist entirely of concatenated child chunks. Some also 
 | `CUTSCUSR` | `Cutscene_User_Chunk`         | 0x005d81c0 | Cutscene user data container. |
 | `CUTTRACK` | (Cutscene_Track_Chunk)        | 0x005d8c90 | Cutscene track container. |
 | `SUBRIFFL` | (Sub_RIF_File_Chunk)          | 0x005b0ec0 | External RIF file reference. Opens and loads another .rif file. |
+| `OBINTDT\0` | `Object_Interface_Data_Chunk` | 0x005b30a0 | **A container, not a leaf** - and its id is seven characters NUL-padded, `b"OBINTDT\0"`. Every one of the 9,313 in the shipped assets is a child of `RBOBJECT` holding a single `OBJNOTES`, usually the editor's placeholder "Enter notes here". Treating it as a leaf hides 9,313 chunks |
 
 ---
 
@@ -131,7 +132,7 @@ Body is a fixed number of int32/float values read directly.
 
 | Chunk ID   | Purpose                    | Address    | Body Format |
 |------------|----------------------------|------------|-------------|
-| `SHPCENTR` | Shape center point         | 0x005b90d0 | 4 x float (16 bytes: Vec3 center + 1 extra) |
+| `SHPCENTR` | Shape center point         | 0x005b90d0 | **int32 x3 centre + float radius** (16 bytes). The centre is `(min+max)/2` per axis with C's truncate-toward-zero division - exact for all 9,244 shipped shapes. The radius is the distance of the furthest vertex from the **origin**, not from that centre (AvP's `ChunkShape::radius`, "radius of points about 0,0,0"). It is only accurate to float32 in about three quarters of the files and drifts up to 3.2 absolute in the rest, so it is partly stale authoring output rather than a function of the final vertex list |
 | `FRAGDATA` | Fragment data              | 0x005bad50 | 4 x int32 (16 bytes) |
 | `FRAGLOCN` | Fragment location          | 0x005badd0 | Vec3 position + Vec3 orientation + 1 int32 (28 bytes) |
 | `HIERBBOX` | Hierarchy bounding box     | 0x005cc3b0 | 2 x Vec3 (24 bytes: min + max) |
@@ -143,13 +144,13 @@ Body starts with an element count or size, followed by an array of fixed-size en
 
 | Chunk ID   | Purpose                  | Address    | Body Format |
 |------------|--------------------------|------------|-------------|
-| `SHPRAWVT` | Shape raw vertices       | 0x005b8250 | Array of Vec3 (count = body_size / 12) |
-| `SHPPNORM` | Shape polygon normals    | 0x005b8650 | Array of Vec3 (count = body_size / 12) |
-| `SHPVNORM` | Shape vertex normals     | 0x005b8430 | Array of Vec3 (count = body_size / 12) |
+| `SHPRAWVT` | Shape raw vertices       | 0x005b8250 | Array of **int32** x3 (count = body_size / 12). AvP's `ChunkVectorInt` - these are integers, not floats |
+| `SHPPNORM` | Shape polygon normals    | 0x005b8650 | Array of float x3 (count = body_size / 12). AvP's `ChunkVectorFloat` |
+| `SHPVNORM` | Shape vertex normals     | 0x005b8430 | Array of float x3 (count = body_size / 12). AvP's `ChunkVectorFloat` |
 | `SHPVFLAG` | Shape vertex flags       | 0x005b8360 | Array of uint32 (count = body_size / 4) |
 | `SHPPOLYS` | Shape polygons           | 0x005b8930 | Array of polygon structs (count = body_size / 36). See below. |
-| `SHPMRGDT` | Shape merge data         | 0x005b96c0 | Array of int32 (count from parameter) |
-| `HIDEGDIS` | Hierarchy edge display   | 0x005cc1c0 | uint32 count + count x uint32 |
+| `SHPMRGDT` | Shape merge data         | 0x005b96c0 | **Exactly one int32 per polygon** - AvP's `Shape_Merge_Data_Chunk` is `{int *merge_data; int num_polys}` with `chunk_size = 12 + num_polys*4`, and the element count equals the `SHPPOLYS` polygon count in all 9,357 shipped shapes. Values are a merge-group id, mostly `-1` (none) with small positive ids. Authored per-polygon data, **not** derived from geometry, so it belongs on the polygon rather than being regenerable |
+| `HIDEGDIS` | Hierarchy degradation distances | 0x005cc1c0 | uint32 `num_detail_levels` + that many int32 distances. AvP's `Hierarchy_Degradation_Distance_Chunk`; the count is 10 in all 13 shipped files that carry one. Sits at the **file root**, and drives the `L<n>#` level-of-detail convention below. Was documented as "hierarchy edge display" |
 | `SHPPRPRO` | Shape preprocessed data  | 0x005bae70 | uint32 count + count x int32 (+ additional context) |
 | `CUTPOINT` | Cutscene points          | 0x005d91a0 | uint32 count + count x 16 bytes (4 x float) |
 | `CTUSSPPO` | Cutscene special points  | 0x005d8a80 | uint32 count + count x 36 bytes (9 x float) |
@@ -159,14 +160,50 @@ Body starts with an element count or size, followed by an array of fixed-size en
 
 #### SHPPOLYS Polygon Entry (36 bytes / 0x24)
 
+Measured across all 1,766,071 polygons in the 563 shipped `.rif` files.
+
 | Offset | Size | Type   | Description              |
 |--------|------|--------|--------------------------|
-| 0x00   | 4    | int32  | Field 0                  |
-| 0x04   | 4    | int32  | Texture/material index   |
-| 0x08   | 4    | int32  | Field 2                  |
-| 0x0C   | 4    | int32  | Field 3                  |
-| 0x10   | 4    | int32  | Vertex index / -1 sentinel|
-| 0x14   | 20   | ...    | Additional vertex/face data |
+| 0x00   | 4    | int32  | `engine_type` - render/material mode. Only ever 2, 3, 7 or 24 |
+| 0x04   | 4    | int32  | `normal_index` - index into `SHPPNORM`; sequential in every shipped shape |
+| 0x08   | 4    | int32  | `flags`                  |
+| 0x0C   | 4    | uint32 | `colour` - packs the material refs, see below |
+| 0x10   | 20   | int32[5] | `vert_ind[5]` - vertex indices, `-1` terminated |
+
+**Every polygon is a triangle**: exactly three valid indices and `-1` in both spare slots, in
+all 1,766,071 of them, with every index in range.
+
+This is *not* AvP's `ChunkPoly` (`CHNKTYPE.HPP`), which is
+`{engine_type, normal_index, flags, colour, num_verts, vert_ind[4]}`. Gunlok dropped the
+explicit `num_verts` and widened the index array to five, keeping the same 36-byte stride.
+
+`colour` packs two indices:
+
+- **texture index** = `colour & 0xfff`, into the file-level `BMPNAMES` table (Gunlok has no
+  `SHPTEXFN` - it never appears in a shipped file).
+- **UV index** = `colour >> 16`, into `SHPUVCRD` - **except in the four shapes whose UV table
+  does not fit in 16 bits**, where bits 12-15 carry the top of it.
+
+AvP's `ChunkPoly::GetUVIndex` folds bits 12-15 in as a 20-bit index whenever they are set.
+Gunlok uses that **only where it has to**, and the two halves of that are each measured across
+all 1,766,071 shipped polygons:
+
+- **Four shipped shapes have more than 65,535 UV entries**: `city ruins` (77,669), `level07`
+  (70,764), `level15` (68,358) and `level12` (65,663), each storing one entry per polygon in
+  document order. Reading those with the nibble reproduces `uv_index == polygon index` for
+  **282,412 of their 282,454 polygons**; ignoring it reproduces 262,118, because every index
+  past 65,535 wraps *into range* and silently picks another polygon's UVs. That is the failure
+  mode to watch for - it does not look like an error anywhere.
+- **In every other shape the nibble is not an index.** It takes all fifteen values with no
+  pattern (0x3 on 78,643 polygons, 0x8 on 50,160, 0xe on 45,949), folding it in puts 244,763
+  indices out of range against 12,097 without it, and **99.05% of the polygons carrying it have
+  no usable UV entry either way** - they are the untextured junk that fills the `_shadow`
+  meshes.
+
+So the rule is a property of the *shape*, not of the polygon: a table that cannot be addressed
+in 16 bits is read with the nibble, one that can is not. Both are decidable from the file. (An
+earlier revision of this document said the extended encoding was simply unused, which is right
+for 9,353 of the 9,357 shapes and wrong for the four biggest.)
 
 ### Struct + String Chunks
 
@@ -178,7 +215,7 @@ Body contains a fixed struct followed by (or interspersed with) null-terminated 
 | `INDSOUND` | Indexed sound              | 0x005cecf0 | int32 index + string wav_name + additional data |
 | `TRAKSOUN` | Track sound                | 0x005b3d70 | 6 x int32 (24 bytes) + string name |
 | `SOUNDOB2` | Sound object v2            | 0x005ce360 | 3 x int32 (12 bytes) + string name (or empty if null) |
-| `SHPVTINT` | Shape vertex tint          | 0x005d2df0 | 8-char name + int32 count + count x int32 |
+| `SHPVTINT` | Shape vertex intensities   | 0x005d2df0 | **16-byte header then one int32 per vertex.** A child of `RBOBJECT`, never of a shape - all 4,668 of them - so it is per-*object* vertex lighting, not shape data. AvP calls it `Shape_Vertex_Intensities_Chunk` and keeps it in `LTCHUNK.CPP` with the lighting; `Projload.cpp` looks it up on the object. The array length matches the vertex count of the **id-paired** shape (see `OBJHEAD1`) in 4,666 of 4,668 cases - which is what independently confirms both this layout and the pairing rule |
 | `CTUSRDAT` | Cutscene user data         | 0x005d8500 | string name + (padded to 4-byte boundary) + additional bytes |
 
 ### Complex Struct Chunks
@@ -187,10 +224,10 @@ These chunks have multi-field bodies that don't fit simple patterns.
 
 | Chunk ID   | Purpose                    | Address    | Body Format |
 |------------|----------------------------|------------|-------------|
-| `ENDTHEAD` | Environment data header    | 0x005ca340 | int32 + 16-char name + int32 (24 bytes) |
+| `ENDTHEAD` | Environment data header    | 0x005ca340 | `flags` + `lock_user[16]` + `version_no`, 24 bytes. AvP's `Environment_Data_Header_Chunk` - the same `flags`/`lock_user`/`version_no` idiom as `OBJHEAD1` and `SHPHEAD1` |
 | `ANIFRADT` | Anim frame data            | 0x005b7860 | 1 x int32 + 4 x int32 (at offsets 5-8 from source) |
 | `ANISEQDT` | Anim sequence data         | 0x005b7500 | 8 x int32 (32 bytes) |
-| `OBJNOTES` | Object notes               | 0x005b30a0 | Raw byte data (text), size = body_size |
+| `OBJNOTES` | Object notes               | 0x005b30a0 | Raw text, NUL-terminated and padded. Always inside an `OBINTDT`, never at the top level |
 | `CONSHAPE` | Connection shape           | 0x005b7c40 | Minimal data (container-like structure with no actual data) |
 | `SUBSHPHD` | Sub-shape header           | 0x005b6860 | References parent shape info. Default index = -1. |
 | `DUMOBJTX` | Dummy object transform     | 0x005d2540 | Delegated to internal function FUN_005d2700 |
@@ -205,41 +242,82 @@ These chunks copy many consecutive fields from the stream.
 
 Contains object metadata, position, orientation, and properties.
 
-| Offset | Size  | Type    | Description                  |
-|--------|-------|---------|------------------------------|
-| 0x00   | 4     | int32   | Lock flags                   |
-| 0x04   | 16    | char[]  | Object name (strncpy, 16)    |
-| 0x14   | 4     | int32   | (padding/extra)              |
-| 0x18   | 12    | Vec3    | Location (x, y, z)           |
-| 0x24   | 12    | Vec3    | Orientation / angles          |
-| 0x30   | 4     | int32   | Module vis object flags       |
-| 0x34+  | ...   | ...     | Additional properties         |
+**Fully decoded.** AvP's `Object_Header_Chunk::fill_data_block` (`win95/OBCHUNK.CPP`)
+is the authoritative write order and every offset matches Gunlok exactly.
+
+| Offset | Size  | Type      | Description                  |
+|--------|-------|-----------|------------------------------|
+| 0x00   | 4     | int32     | `flags`. Only two values ship: 0x400 (8,810 objects) and 0xFC00 (503 - the same count as `AVPSTRAT`) |
+| 0x04   | 16    | char[16]  | `lock_user` - **the editor's lock holder, not the name.** `Player` in 6,383 objects, uninitialised junk in 2,783 |
+| 0x14   | 12    | int32[3]  | `location`, rif units        |
+| 0x20   | 16    | float[4]  | `orientation` quaternion (x, y, z, w); unit in all 9,313 |
+| 0x30   | 4     | int32     | `index_num` - unique within the file, in all 563 |
+| 0x34   | 4     | int32     | `version_no` - AvP bumps it per save; 421 distinct values ship |
+| 0x38   | 4     | int32     | `shape_id_no` - the id of the `REBSHAPE` this object draws |
+| 0x3c   | ...   | string    | `o_name` - **the object's name**, NUL-terminated, padded to a 4-byte boundary |
+
+**The name is the trailing string, not the field at 0x04.** `len(body) == 0x3c +
+padded name` holds for **all 9,313 shipped objects**, which is exactly what the
+64..96 byte size range is. Reading 0x04 instead yields `Player` or mojibake and
+hides every real name: `Head`, `Waist`, `Ribs`, `Chest`, `Foot Right`,
+`Upper Arm Right`, `Index Right A`.
+
+**An object finds its shape by id, never by position.** AvP's
+`Object_Chunk::assoc_with_shape_no` (`win95/OBCHUNK.CPP`) walks the file's shapes
+comparing `hdptr->shape_id_no == shphd->file_id_num`, and the same pair carries it
+in Gunlok: **`OBJHEAD1+0x38` against `SHPHEAD1+0x14`**. Measured over all 563 files,
+that resolves **all 9,313 objects with no shape claimed twice**, and it **differs
+from document order in 86 files (15.3%)** - so pairing the two lists positionally
+silently attaches geometry to the wrong transform.
+
+Two independent checks agree with it: the orientation at 0x20 is a unit quaternion
+whose identity case reads `(0, 0, 0, 1)`, and `SHPVTINT`'s per-vertex array length
+matches the **id-paired** shape's vertex count in 4,666 of 4,668 cases.
 
 #### `DUMOBJDT` - Dummy Object Data (0x005d22c0)
 
-| Offset | Size  | Type    | Description                  |
-|--------|-------|---------|------------------------------|
-| 0x00   | 12    | Vec3    | Position                     |
-| 0x0C   | 12    | Vec3    | Orientation                  |
-| 0x18   | 12    | Vec3    | Scale / extra vectors        |
-| 0x24   | 16    | int32[4]| Additional properties        |
+**Fully decoded**, from AvP's `Dummy_Object_Data_Chunk` (`win95/DummyObjectChunk.cpp`).
+
+| Offset | Size  | Type      | Description                  |
+|--------|-------|-----------|------------------------------|
+| 0x00   | 12    | int32[3]  | `location`, rif units        |
+| 0x0C   | 12    | int32[3]  | `min_extents`                |
+| 0x18   | 12    | int32[3]  | `max_extents`                |
+| 0x24   | 16    | float[4]  | `orientation` quaternion; unit in all 6,847 |
+| 0x34   | ...   | string    | `name`, NUL-terminated, padded with AvP's `(strlen + 4) & ~3` |
+
+`len(body) == 0x34 + padded name` for all 6,847 shipped dummies, which is what the
+60..80 byte size range is. The name is what an `OBJHIERD` binds to - 1,488
+hierarchy nodes animate a dummy rather than an object.
+
+A nice confirmation of the Y-down convention falls out of this: **`min_extents.y >
+max_extents.y` in 6,843 of the 6,847**, because with Y increasing downwards the
+"minimum" corner is the bottom one, and the bottom has the larger Y.
 
 #### `STDLIGHT` - Standard Light (0x005d2b70)
 
-Large struct (~68+ bytes):
+**Exactly 84 bytes**, all 3,794 of them, and **entirely integers** - there is not a
+single float in this chunk. Reading the earlier "float[2] intensity / range" fields as
+floats yields denormals and NaNs, which is what gave it away.
 
-| Offset | Size  | Type    | Description                  |
-|--------|-------|---------|------------------------------|
-| 0x00   | 4     | int32   | Light type                   |
-| 0x04   | 8     | float[2]| Intensity / range            |
-| 0x0C   | 4     | int32   | Field                        |
-| 0x10   | 4     | int32   | Field                        |
-| 0x14   | 12    | float[3]| Color / direction            |
-| 0x20   | 16    | float[4]| Position / orientation       |
-| 0x30   | 4     | int32   | Additional flags             |
-| 0x34   | 12    | float[3]| More color/direction data    |
-| 0x40   | 4     | int32   | Field                        |
-| 0x44+  | ...   | ...     | Extended light properties    |
+| Offset | Size | Type      | Description                  |
+|--------|------|-----------|------------------------------|
+| 0x00   | 4    | int32     | Light id / type (0..1105)    |
+| 0x04   | 12   | int32[3]  | Position, rif units          |
+| 0x10   | 36   | int32[9]  | 3x3 orientation matrix, 16.16 fixed point, row major |
+| 0x34   | 4    | int32     | 16.16 scalar, 0.2 .. 2.0 - brightness |
+| 0x38   | 4    | int32     | 79 .. 2044                   |
+| 0x3c   | 4    | int32     | Range / radius, rif units (3000 .. 357300) |
+| 0x40   | 4    | uint32    | Colour, `0x00RRGGBB`         |
+| 0x44   | 4    | int32     | Flags - only ever 3 or 7     |
+| 0x48   | 4    | int32     | Always 1                     |
+| 0x4c   | 8    | int32[2]  | Always zero                  |
+
+The two load-bearing claims are measured: the nine dwords at 0x10 form an
+**orthonormal 3x3 matrix once divided by 65536, in 100.00% of all 3,794 lights**
+(rows unit length and mutually perpendicular to within 2e-3), and every value of the
+0x40 field is `<= 0xFFFFFF` across its 320 distinct values, with the palette reading
+as light colours (`#FFFFFF`, `#FFFFBF`, `#FFFF57`, `#FF6600`).
 
 #### `PLOBJLIT` - Placed Object Light (0x005d2c80)
 
@@ -247,21 +325,79 @@ Large struct (~60+ bytes) with position, color, and attenuation data.
 
 #### `OBASEQFR` - OB Anim Sequence Frame (0x005cd470)
 
-| Offset | Size  | Type    | Description                  |
-|--------|-------|---------|------------------------------|
-| 0x00   | 36    | int32[9]| Frame header (9 fields)      |
-| 0x24   | 4     | int32   | Field 9 (parent/chunk_size)  |
-| 0x28   | 4     | int32   | Field 10 (num sub-frames)    |
-| 0x2C   | n*4   | int32[] | Sub-frame data array         |
+One keyframe of an object-hierarchy animation: a rotation, a position and a time.
+The body is **always exactly 44 bytes** - all 323,334 of them across the 563 shipped
+files - so there is no sub-frame array and no variable tail.
+
+| Offset | Size | Type      | Description                  |
+|--------|------|-----------|------------------------------|
+| 0x00   | 16   | float[4]  | Rotation quaternion (x, y, z, w) |
+| 0x10   | 12   | int32[3]  | Position, rif units          |
+| 0x1c   | 4    | int32     | Normalized time, 16.16 fixed point (65536 = end of sequence) |
+| 0x20   | 4    | int32     | Frame index within the sequence |
+| 0x24   | 4    | int32     | Flags - only the top byte (0x27) is ever non-zero |
+| 0x28   | 4    | int32     | Always zero                  |
+
+Each field is measured, not inferred:
+
+- The first four floats are a **unit quaternion in 100.000% of the 323,334 frames**
+  (`|q| - 1` under 1e-3).
+- `0x1c` is **non-decreasing across every one of the 28,577 sequences** and is **0 on
+  the first frame of all of them**, with a maximum of 65530. It is a position within
+  the sequence, not a duration: for evenly-spaced sequences the last frame lands on
+  `(N-1)/N * 65536` (31 frames -> 63421, 81 -> 64726, 12 -> 60074, each within 3).
+  The real duration is the sibling `OBASEQTM`, in milliseconds.
+- `0x20` counts frames: the value 0 occurs exactly 28,577 times, once per sequence.
+- `0x24` is 0 in 313,130 frames and `0x80000000` in 9,666; the low three bytes are
+  zero in all but 11. Treat it as a byte of flags at 0x27.
+- `0x28` is zero in every frame.
+
+An animation is bound to a hierarchy node structurally, not by index: `OBASEQFR` only
+ever appears under `OBJCHIER/.../OBANSEQS/OBANSEQC`, never under `REBSHAPE`. There is
+no vertex-morph animation in the shipped assets - `ANIMSEQU`/`ANIMFRAM` do not occur.
+
+#### `SHPHEAD1` - Shape Header (0x005b8b30)
+
+**Fully decoded**, from AvP's `Shape_Header_Chunk::fill_data_block`. The 68-byte
+minimum body size is exactly this header with an empty name list.
+
+| Offset | Size  | Type      | Description                  |
+|--------|-------|-----------|------------------------------|
+| 0x00   | 4     | int32     | `flags`                      |
+| 0x04   | 16    | char[16]  | `lock_user` - the editor's lock holder |
+| 0x14   | 4     | int32     | **`file_id_num`** - the shape's id, what `OBJHEAD1+0x38` matches against |
+| 0x18   | 4     | int32     | `num_verts` - matches the `SHPRAWVT` count in all 9,357 shapes |
+| 0x1c   | 4     | int32     | `num_polys` - matches the `SHPPOLYS` count in all 9,357 |
+| 0x20   | 4     | float     | `radius`                     |
+| 0x24   | 24    | int32[6]  | bounds, interleaved `max.x, min.x, max.y, min.y, max.z, min.z` |
+| 0x3c   | 4     | int32     | `version_no`                 |
+| 0x40   | 4     | int32     | count of associated object names |
+| 0x44   | ...   | strings   | that many NUL-terminated names, packed |
+
+Note the bounds are **max before min on each axis**, which is easy to get backwards.
 
 #### `OBASEQHD` - OB Anim Sequence Header (0x005cd610)
 
-| Offset | Size  | Type    | Description                  |
-|--------|-------|---------|------------------------------|
-| 0x00   | 12    | int32[3]| Header fields                |
-| 0x0C   | 4     | int32   | Count of sub-entries         |
-| 0x10   | n*4   | int32[] | Sub-entry array              |
-| ...    | ...   | string  | Name string (after array)    |
+**Fully decoded**, from AvP's
+`Object_Animation_Sequence_Header_Chunk::fill_data_block`.
+
+| Offset | Size  | Type      | Description                  |
+|--------|-------|-----------|------------------------------|
+| 0x00   | 4     | int32     | `num_frames` - **always 65536** in Gunlok, i.e. 1.0 in 16.16, matching the normalized `OBASEQFR` time rather than a count |
+| 0x04   | 4     | int32     | `sequence_number` - always 0 |
+| 0x08   | 4     | int32     | `sub_sequence_number` - 62 distinct values |
+| 0x0c   | 4     | int32     | `num_extra_data` - always 0  |
+| 0x10   | n*4   | int32[]   | `extra_data`, absent in every shipped file |
+| 0x10   | ...   | string    | `sequence_name`, padded with `(strlen + 4) & ~3` |
+
+`len(body) == 0x10 + padded name` holds for **all 29,550**, which is what pins the
+name to 0x10. Every name begins `Dz` - that is a convention in the source assets,
+not a field, so the sequences really are called `DzSeq_Stand`, `DzSeq_Walk`,
+`DzSeq_Die`. (An earlier revision of this file called `Dz` a constant 2-byte field
+and put the name at 0x12; the size arithmetic only works from 0x10.)
+
+**973 of the 29,550 sequences carry no `OBASEQFR` at all**, so an empty animation is
+normal data rather than a parse failure.
 
 #### `ALTLOCAT` - Alternate Location (0x005b4130)
 
@@ -289,9 +425,51 @@ These chunks build internal linked lists during loading:
 | `HSETCOLL` | Hierarchy set collection   | 0x005cbe90 |
 | `OBHALTSH` | OB hierarchy alt shape     | 0x005cb7e0 |
 | `CUTEVENT` | Cutscene event             | 0x005d9400 |
-| `SHPHEAD1` | Shape header v1            | 0x005b8b30 |
-| `SHPPCINF` | Shape PC info              | 0x005ba7b0 |
+| `SHPHEAD1` | Shape header v1 - **fully decoded**, see below | 0x005b8b30 |
+| `SHPPCINF` | Shape poly change info - AvP's `Shape_Poly_Change_Info_Chunk`. **Optional**: 681 of the 9,357 shipped shapes have none, and every AvP path guards on `lookup_single_child` returning null, so a writer may omit it | 0x005ba7b0 |
 | `BMPMD5ID` | Bitmap MD5 ID              | 0x005d15c0 |
+
+### Level of detail: the `L<n>#` object-name convention
+
+Detail levels are not a chunk. They are a **naming convention on object names**: an
+`RBOBJECT` or `DUMMYOBJ` called `L<n>#<base part name>`, `n` in `1`..`9`, is a variant
+of the part called `<base part name>` in the same file. 1,518 of them across 38 of the
+563 shipped files; only levels 5 and 7 are ever authored.
+
+Gunlok's `BuildObjectLodChain` @ 0x005b2910 builds the 10-slot chain for one part, and
+matches AvP's `Projload.cpp` (`ob_name[0]=='L' && ob_name[1] && ob_name[2]=='#'`, level
+`o_name[1]-'0'`, base `strcmp(&o_name[3], base_name)`). Two passes with different
+meanings:
+
+- an **`RBOBJECT`** variant supplies a *replacement shape* at level `name[1]-'0'`;
+- a **`DUMMYOBJ`** variant sets a *cull cutoff* at `name[1]-'1'` — the part is not drawn
+  at that level or beyond. Elint MkII culls its finger joints, neck pistons and right
+  hand this way.
+
+A level with neither entry inherits the previous level's shape. The switch distances are
+the file-root `HIDEGDIS`.
+
+Three things a reader/writer has to know:
+
+- **The match is byte-exact**, so the four typo'd variants in `Skorn MkII.RIF`
+  (`L5#Face Pipe RIght`, `L5#Face Pipe left`) are dead in-game. 32 variants name a base
+  object that does not exist and 9 name one no hierarchy node binds; both are legal and
+  simply never selected.
+- **No `OBJCHIER` node binds a variant.** The engine reaches it through the base's name,
+  so a variant has no hierarchy node and no animation of its own — it is drawn at the
+  transform of the *base part's* node.
+- **A variant's own `OBJHEAD1`/`DUMOBJDT` placement is dead data.** The shipped sets are
+  parked beside the model (Gunlok MkII's L5 set at +1200 on X, its L7 at -1200), yet the
+  vertices are already in the base part's local frame: across all 1,258 variant/base mesh
+  pairs the local-frame centroid distance has a median of 35 rif units against a
+  ~2,000-unit-tall character, and applying the stored placement *raises* it to a median
+  of 115 (p90 1,202). That is what AvP's loader implies by keeping only the shape
+  (`deg_ptr->shape = low_detail_array[i]`) and discarding the object.
+
+`destructorfrag.RIF` is the trap: nine of its parts are genuinely *named* `L7#head`,
+`L7#pelvis` and so on with no base object, and its hierarchy binds those names directly.
+They are ordinary parts that happen to match the pattern, so anything acting on the
+convention has to require that the base exists and the variant is itself unbound.
 
 ### Version/Name Management Chunks
 
@@ -302,14 +480,95 @@ These chunks perform lookups and management rather than storing simple data:
 | `BMNAMVER` | Bitmap name version        | 0x005cf730 | Manages versioning of bitmap names. Complex deduplication logic. |
 | `BMNAMEXT` | Bitmap name extension      | 0x005cfba0 | Extends bitmap name data. Creates if not exists. |
 | `SHBMPNAM` | Shape bitmap names         | 0x005d0530 | Bitmap name list for a shape. Linked list of entries. |
-| `OBJHIERD` | Object hierarchy data      | 0x005cb1e0 | String name + hierarchy position lookup. |
+| `OBJHIERD` | Object hierarchy data      | 0x005cb1e0 | `{int32 num_extra_data, int32[n] extra_data, name}` - the count is 0 in all 5,250 shipped nodes so the name starts at 4. **The name is the object the node animates**: AvP's `Object_Hierarchy_Data_Chunk::find_object_for_this_section` resolves it with `strcmp` against each object's name. It reaches 3,541 `RBOBJECT` and 1,488 `DUMMYOBJ`; 221 nodes match nothing, which AvP treats as a null object, so a dangling node is legal. Node names are the skeleton - `Waist`, `Thigh Right`, `Shin Right`, `Chest`, `Hand Right`, `Index Right A` |
 
 ### Texture Chunks
 
 | Chunk ID   | Purpose                    | Address    | Body Format |
 |------------|----------------------------|------------|-------------|
-| `SHPTEXFN` | Shape texture filenames    | 0x005b94d0 | uint32 count + count x string (null-terminated filenames) |
-| `SHPUVCRD` | Shape UV coordinates       | 0x005b9330 | uint32 num_polys + per-poly: uint32 num_verts + num_verts x 2 x float (UV pairs) |
+| `BMPNAMES` | **The file's texture table** - fully decoded, see below | 0x005cfed0 | uint32 `count \| version << 16` + per entry a 20-byte record and a padded name |
+| `SHPTEXFN` | Shape texture filenames    | 0x005b94d0 | uint32 count + count x string (null-terminated filenames). **Registered but never used** - it does not appear in a single shipped file, which is why the texture index is a `BMPNAMES` lookup |
+| `SHPUVCRD` | Shape UV coordinates       | 0x005b9330 | uint32 count + per entry: uint32 num_verts + num_verts x 2 x float (UV pairs), in **texels** - see below. An **indexed list keyed by a polygon's `colour >> 16`**, not one entry per polygon - 139 shapes have fewer entries than polygons, and 534 contain polygons whose index points past the end (concentrated in the untextured `_shadow` meshes). A zero-length entry and an entry of three `(0,0)` pairs are different and both occur |
+
+#### `SHPUVCRD` units: texels, not fractions
+
+**A stored UV is a texel coordinate**, running 0..width and 0..height rather than
+0..1, so it only means anything alongside the size of the texture the polygon
+names. Three independent things say so:
+
+- **It scales with the texture.** Across 375,000 shipped UV pairs, the 99th
+  percentile of `|u|` lands within 7% of the texture's own width for every size
+  in the game: 1,095 for the 1024-wide textures, 510 for the 512s, 255 for the
+  256s. A fraction would not know the difference.
+- **AvP casts the float straight to the int its renderer wants**, which is texel
+  space: `chnkload.cpp:2390` does `(int)cshp_ptr->uv_list[UVIndex].vert[j].u`,
+  and the sprite path a few lines down builds the same number as
+  `f->UVCoords[l][0] << 16` - an integer texel in 16.16.
+- **They are whole numbers**: 374,658 of the 376,641 sampled pairs are integral.
+  Not all, so a reader must keep them as floats.
+
+**V grows downward**, i.e. `v = 0` is the *top* row of the image, as in Direct3D.
+Measured on the 8,916 polygons across the shipped levels that are near-vertical,
+show at least 40% of their texture's height, and are mapped axis-aligned (one
+edge at constant V and level in the world): **86.3% put the low V at the top of
+the wall**, and 16 of the 17 levels with a usable sample lean that way, several
+overwhelmingly (`level10` 3,286 to 68, `level01` 114 to 1). The minority is
+artists deliberately flipping a texture on a face, which is legal and expected.
+
+Anything mapping these into a bottom-up UV space (Blender, OpenGL) has to divide
+by the texture size *and* flip V. Both are exact in float32, because every
+texture in the game is a power of two from 8 to 1024.
+
+#### `BMPNAMES` - Global Bitmap Names (AvP's `Chunk_With_BMPs`)
+
+The table a polygon's texture index resolves against. **527 of the 563 shipped files carry
+one**, always as a child of the file-level `REBENVDT`, holding 1,601 entries between them.
+Layout is AvP's `Chunk_With_BMPs` (`3dc/win95/BMPNAMES.CPP`) verbatim.
+
+`Chunk_With_BMPs_Ctor` @ 0x005cfed0 is the parser (shared with the never-shipped
+`BMPLSTST`); `RifLoad_BMPNAMES` @ 0x005d1870 is its loader and `BMP_Name_Ctor`
+@ 0x005cf4b0 builds one entry.
+
+| Offset | Size | Type   | Description                  |
+|--------|------|--------|------------------------------|
+| 0x00   | 4    | uint32 | entry `count` in the low 16 bits, table `version` in the high 16 |
+| 0x04   | 4    | uint32 | `flags` - `BMPN_Flags` |
+| 0x08   | 4    | int32  | **`index`** - what a polygon's `colour & 0xfff` matches |
+| 0x0c   | 4    | int32  | `version_num` in the low 20 bits, `enum_id` in the top 12 |
+| 0x10   | 4    | int32  | `priority` - palette-generation priority, PC in the low byte |
+| 0x14   | 4    | uint32 | `transparency_colour_union` - see below |
+| 0x18   | ...  | string | the name, NUL-terminated and padded to `strlen + (4 - strlen % 4)` |
+
+Five things measured across all 1,601 entries rather than read off the AvP source:
+
+- **`index` is a stable id, not a position.** Entries are stored in *descending* index
+  order and the values are sparse - `Maze.RIF` holds `[10, 9, 8, 5, 4, 1]` for six
+  entries. Matching a polygon's texture index against it resolves **1,518,963 of the
+  1,766,071 shipped polygons**; of the remainder 22,331 are the `0xfff` untextured
+  sentinel and 215,517 of the last 224,747 are in `_shadow` files, whose polygons carry
+  junk texture *and* UV indices because the meshes are never textured. **No table has a
+  duplicate index or a duplicate name.**
+- **`flags` is `0x0100010c` in every single entry**: `ChunkBMPFlag_IFF` plus
+  `PriorityAndTransparencyAreValid` and both mip-map requests. The IFF flag is the
+  load-bearing one - it means the name is a path relative to the textures root and that
+  everything about the image lives in the image file.
+- **With that flag set, `transparency_colour_union` holds the image size**, width in the
+  low 16 bits and height in the high 16 (AvP's `SHIFT_W`/`SHIFT_H`). It agrees with the
+  `.RIM`'s own header in 1,580 of the 1,597 entries whose file is on disk, so it is
+  authoring output that can go stale rather than a second source of truth.
+- **The name is a path relative to `<game>\Graphics`**, in whatever case the artist typed:
+  `Units\baddies3.RIM` and `units\baddies3.RIM` both ship and name the same file. Folded
+  case-insensitively, 1,597 of the 1,601 resolve against the install; the other four name
+  files Gunlok does not ship.
+- **The padding after a name is not always NUL.** The writer pads out of uninitialised
+  memory - `Units\baddies3.RIM` is followed by `00 f5` - so a reader that regenerates the
+  padding cannot rebuild the chunk byte for byte.
+
+`priority` is `6` in every shipped entry, and the binary agrees with the measurement
+rather than merely with AvP's header: `BMP_Name_Ctor` @ 0x005cf4b0 initialises a fresh
+entry to `flags = 0x10c` and `priority = 6`, which is `DEFAULT_BMPN_FLAGS` and
+`DEFAULT_BMPN_PRIORITY`. The `0x0100010c` in the files is those defaults plus the IFF
+flag the loader sets.
 
 ---
 
@@ -393,6 +652,7 @@ Chunk (base, 0x24 bytes)
 | `BMNAMEXT` | Mgmt     | Bitmap name extension          |
 | `BMNAMVER` | Mgmt     | Bitmap name version            |
 | `BMPMD5ID` | Complex  | Bitmap MD5 identifier          |
+| `BMPNAMES` | Struct   | **The file's texture table**   |
 | `CONSHAPE` | Minimal  | Connection shape               |
 | `CONSTYPE` | Fixed    | Connection type (1 x int32)    |
 | `CTUSNDPR` | Fixed    | Cutscene sound props (6 x int32)|
@@ -412,7 +672,7 @@ Chunk (base, 0x24 bytes)
 | `FRAGDATA` | Fixed    | Fragment data (4 x int32)      |
 | `FRAGLOCN` | Vec3     | Fragment location              |
 | `FRMMORPH` | Complex  | Frame morph data               |
-| `HIDEGDIS` | Array    | Hierarchy edge display flags   |
+| `HIDEGDIS` | Array    | Hierarchy degradation distances |
 | `HIERBBOX` | Vec3     | Hierarchy bounding box         |
 | `HSETCOLL` | Complex  | Hierarchy set collection       |
 | `INDSOUND` | Mixed    | Indexed sound (index + wav)    |
@@ -478,6 +738,62 @@ The following chunk IDs are referenced in the RIF viewer (`rifviewer/main.js`) a
 
 Gunlok dropped the sprite family (AvP's 2D sprite path) and the `FRAGTYPE` container, keeping
 only `FRAGDATA`/`FRAGLOCN`.
+
+---
+
+## The texture images: `.RIM`
+
+A `BMPNAMES` entry names a `.RIM` under `<game>\Graphics` (`Units\baddies3.RIM` ->
+`Graphics\Units\baddies3.RIM`), 513 of which ship. **A `.RIM` is not a RIF chunk file.**
+It is ordinary **IFF**: 4-character ids, **big-endian** sizes, odd bodies padded to an
+even boundary, and `LIST`/`FORM`/`PROP`/`CAT ` group chunks whose body opens with a
+4-character type. Every one of those four things is the opposite of the container above,
+so nothing in `rif.py` reads one.
+
+The shape is the same in all 513:
+
+```
+LIST:ILBM
+  PROP:ILBM         BMHD (shared properties) + TRAN
+  FORM:ILBM         BMHD + S3TC              <- the image
+  LIST:MIPM
+    FORM:MIPM       CONT, FLAG
+    LIST:ILBM       FORM:ILBM per mip level, each BMHD + S3TC
+```
+
+`BMHD` is the standard 20-byte ILBM header (`width`, `height`, `x`, `y`, `nPlanes`,
+`masking`, `compression`, pad, `transparentColor`, aspect, page size) - but **`nPlanes`
+is not a bit depth here**: a 256x256 DXT3 font declares 3 and a 512x512 DXT1 declares 17.
+The four-character code inside `S3TC` is what says how to decode the payload.
+
+### `S3TC` - the pixels
+
+A 22-byte header then the raw DXT payload. Measured across all **3,423** S3TC chunks in
+the shipped textures: the declared size, the size implied by this header's own dimensions
+and the actual body length agree in every one.
+
+| Offset | Size | Type    | Description |
+|--------|------|---------|-------------|
+| 0x00   | 4    | uint32  | zero in all 3,423 |
+| 0x04   | 4    | char[4] | the DXT four-character code, **byte-reversed** (`1TXD` = DXT1) |
+| 0x08   | 6    | bytes   | `01 35 00 52 02 60`, identical in all 3,423 |
+| 0x0e   | 2    | uint16  | width, big-endian |
+| 0x10   | 2    | uint16  | height, big-endian |
+| 0x12   | 4    | uint32  | payload size, big-endian |
+| 0x16   | ...  | bytes   | DXT1 or DXT3 blocks, ordinary little-endian S3TC |
+
+**The DXT payload itself is little-endian**, unlike everything around it - the 5:6:5
+endpoints decode as normal RGB565. That is settled by content rather than by inspection:
+`lava.RIM` decodes to mean RGB `175, 109, 20` (orange, as lava should be), which a
+red/blue swap would turn into blue.
+
+3,385 payloads are DXT1 and 38 are DXT3. Of the **365 distinct textures the shipped `.rif`
+files actually name**, 361 are DXT1, 3 are DXT3, 4 name files the install does not ship,
+and **one is not S3TC at all**: the `*_fmv_*` ground textures store three palettized
+`CMAP`/`BODY` variants (and no mip chain), which is 23 of the 513 files.
+
+The reader is `blender/io_scene_rif/rim.py`, exercised over all 513 by
+`blender/tests/test_rim.py`. There is no writer: nothing here compresses DXT.
 
 ---
 

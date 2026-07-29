@@ -1,0 +1,44 @@
+[project]
+name = "gkplus-rif"
+version = "0.1.0"
+description = "Blender import/export for Rebellion RIF assets used by Gunlok (2000)"
+requires-python = ">=3.11"
+# The addon must stay dependency-free: Blender ships its own interpreter and an
+# extension cannot pull wheels at install time. Anything added here is for the
+# tooling in this directory only, never for io_scene_rif/.
+dependencies = []
+
+[dependency-groups]
+dev = ["ruff>=0.6"]
+
+[tool.uv]
+# Nothing here is importable as an installed package -- io_scene_rif is loaded by
+# Blender from a zip, and the tools are run as scripts.
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "C4", "SIM"]
+ignore = [
+    # The addon's Blender-facing half is written against bpy's own idioms.
+    "B008",
+    # %-formatting is used throughout, deliberately and consistently. Rewriting
+    # 80 call sites to f-strings would be churn with no reader benefit.
+    "UP031",
+    # zip(strict=) is the right default, but several of these zips are
+    # *intentionally* ragged -- pairing Blender polygons against source polygons
+    # is short by exactly the faces Blender could not represent, and that
+    # shortfall is the thing being measured. Length agreement is asserted
+    # explicitly where it matters.
+    "B905",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Blender operator properties are annotated assignments that ruff reads as
+# unused, and the addon must import bpy before its siblings.
+"io_scene_rif/__init__.py" = ["E402"]
+"tests/*.py" = ["E402"]
