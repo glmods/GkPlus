@@ -1,0 +1,28 @@
+[project]
+name = "gkpbr"
+version = "0.1.0"
+description = "Generate PBR map sets from Gunlok's .RIM textures"
+requires-python = ">=3.11"
+# This is a *tool*, not part of the addon, which is why it may have dependencies
+# at all: `blender/io_scene_rif` must stay importable by Blender's own
+# interpreter with nothing installed, so the generator lives here and the addon
+# only ever reads the PNGs and the manifest it writes.
+dependencies = [
+    "numpy>=1.26",
+    "pillow>=10.0",
+    "google-genai>=0.3",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.6"]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "C4", "SIM"]
+ignore = ["UP031", "B905"]
