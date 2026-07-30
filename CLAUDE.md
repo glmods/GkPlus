@@ -1233,7 +1233,10 @@ wheels at install time, so nothing in `[dependency-groups]` may ever be imported
 lists its payload explicitly rather than globbing, so a stray file cannot ship.
 
 The split is the point: `io_scene_rif/rif.py` (container: huffman, chunk tree, serialization),
-`io_scene_rif/shapes.py` (REBSHAPE geometry), `io_scene_rif/bmpnames.py` (the texture table) and
+`io_scene_rif/shapes.py` (REBSHAPE geometry), `io_scene_rif/heads.py` (the record chunks —
+`OBJHEAD1`, `SHPHEAD1`, `OBJHIERD`, `OBASEQHD`, `OBASEQFR` — plus the keyframe-timing rule),
+`io_scene_rif/bmpnames.py` (the texture table),
+`io_scene_rif/sounds.py` (the `INDSOUND` sound table) and
 `io_scene_rif/rim.py` (`.RIM` textures: IFF container, DXT1/DXT3 decode) import **no `bpy`**, so
 `blender/tests/` exercises them over all 563 shipped files with Blender absent — the opposite of
 `src/`, where nothing runs outside Gunlok. `io_scene_rif/scene.py` and
@@ -1243,10 +1246,12 @@ These pin the design, in roughly decreasing order of how much everything else re
 (the list grows; deliberately not numbered, because the count kept going stale):
 
 - **The scene is the whole file: export reads nothing but the scene.** Every chunk becomes a
-  Blender datablock — objects, mesh datablocks, lights, Actions, mesh attributes, and typed
-  `int32`/`float32`/string properties for the rest. There is no source-file parameter and **no
-  opaque byte storage anywhere**, so a `.blend` moved to a machine that has never seen the original
-  `.rif` still produces one. `tests/test_scene.py` enforces exactly that: build the scene, save a
+  Blender datablock — objects, mesh datablocks, lights, an armature, Actions, Speakers, mesh
+  attributes, and typed `int32`/`float32`/string properties for the rest. **Export** takes no
+  source-file parameter and there is **no opaque byte storage anywhere**, so a `.blend` moved to a
+  machine that has never seen the original `.rif` still produces one. *Import* does read outside
+  the file, but only for the pictures and the audio — a `.RIM` and a `.wav` are named by the `.rif`
+  and stored beside it, and neither is ever written back. `tests/test_scene.py` enforces exactly that: build the scene, save a
   `.blend`, *reset Blender*, reopen, export. The rule is container chunks → objects, leaf chunks →
   typed fields on the parent, with `rif_id` / `rif_index` / `rif_absorbed` carrying the structure.
 - **The bar is semantic equivalence, not byte equivalence**, and that is what lets the exporter
@@ -1257,6 +1262,24 @@ These pin the design, in roughly decreasing order of how much everything else re
   guards the **container** layer (`tests/test_roundtrip.py`, 563/563) and the **typed field** layer
   (`tests/test_schema.py`, `encode(decode(body)) == body` for 485,663 leaf chunks across 44 ids) —
   those two are what make the scene able to stop referencing the file.
+- **`SHPHEAD1` is regenerated, not carried, and finding that out is what `heads.py` is for.** It
+  looks like an id chunk and is not: after `flags`/`lock_user`/`file_id_num` it holds `num_verts`,
+  `num_polys`, `radius` and the min/max bounds, all of which AvP's from-buffer constructor reads
+  straight into its shape record — and `ToRole` derives a character's collision extents from a
+  shape's bounds whenever the GLS gives `radius`/`height` as 0. Carried through `rif_absorbed` like
+  any other chunk, as it was, it goes stale the instant a vertex moves. Recomputing is safe:
+  `num_verts`, `num_polys` and both corners reproduce the stored values in **9,357/9,357** shipped
+  shapes, so an unedited file is unchanged but for `radius`. That one is bit-exact in 42% and
+  drifts a median 7e-7 relative (p90 5e-4, four shapes past 1%) — and it is regenerated **anyway**,
+  because it is the same quantity `SHPCENTR` carries, the two are byte-identical in all 9,244
+  shapes that have both, and `SHPCENTR` was already being recomputed. Carrying one and recomputing
+  the other would make every export disagree with itself in 58% of shapes.
+- **The 16 bytes at `OBJHEAD1+0x04` are AvP's `lock_user`**, the editor's lock owner — not a name
+  and not junk. Earlier revisions of this file called them "a separate (often uninitialised) tag",
+  which was right that they are not the name and wrong that they carry nothing: 8,136 of the 9,313
+  shipped objects have something there. They are authored, so they are carried; zeroing them was
+  what made a rebuilt header fail to reproduce 87% of the shipped ones, which is how the field got
+  identified.
 - **An object finds its shape by id, never by position.** `OBJHEAD1+0x38` (`shape_id_no`) matches
   `SHPHEAD1+0x14` (`file_id_num`), which is what AvP's `Object_Chunk::assoc_with_shape_no` does.
   That resolves all 9,313 objects in the shipped files with no shape claimed twice, and it
@@ -1298,16 +1321,17 @@ These pin the design, in roughly decreasing order of how much everything else re
   - **The table's `index` is a stable id, not a list position** — entries are stored in
     *descending* index order and are sparse (`Maze.RIF` has `[10, 9, 8, 5, 4, 1]`). It resolves
     1,518,963 of 1,766,071 polygons; of the rest 22,331 are the `0xfff` untextured sentinel and
-    215,517 of the remaining 224,747 are in `_shadow` files, whose polygons carry junk texture
+    215,517 of the remaining 224,777 are in `_shadow` files, whose polygons carry junk texture
     *and* UV indices. No table has a duplicate index or name.
   - **The table is the one thing held to byte-exactness**, because it is carried rather than
     regenerated — including the *uninitialised* padding after each name (`Units\baddies3.RIM` is
     followed by `00 f5`, not by NULs). `encode(decode(body)) == body` for all 527 tables.
   - **Its chunk position belongs to whichever datablock absorbed the container it sits in**, and
-    that is *not* always the collection: `REBENVDT` holds a `LIGHTSET` in 34 files, which makes it
-    an object rather than data folded onto the collection. Assuming the collection loses every
-    material name in exactly those files (`Maze`, `S3 Level`) — which is what `_note_table_owner`
-    and `_table_location` exist for, and what `tests/test_scene.py` caught.
+    that is *not* always the collection: `REBENVDT` holds a `LIGHTSET` in **62** of the 563 files
+    (every file has exactly one `REBENVDT`), which makes it an object rather than data folded onto
+    the collection. Assuming the collection loses every material name in exactly those files
+    (`Maze`, `S3 Level`, `city ruins`, `level01`…) — which is what `_note_table_owner` and
+    `_table_location` exist for, and what `tests/test_scene.py` caught.
   - **Materials are per-import, not shared by name**, because an index only means anything inside
     its own file: the same `.RIM` is entry 11 in one level and entry 4 in the next. Images *are*
     shared, which is where the cost is.
@@ -1408,13 +1432,143 @@ These pin the design, in roughly decreasing order of how much everything else re
   origins); the part *placements* do.
 - **`obj.matrix_world` is stale until `bpy.context.view_layer.update()`**, which makes an assembled
   model look collapsed — the first attempt at this measurement reported a 0.765 m character
-  because every part was still at the identity.
-  `OBJHEAD1` is `{int flags, char[16] name, int32[3] location, float[4] quaternion (x,y,z,w)}`;
-  the exporter rewrites only those 28 bytes and leaves the undecoded remainder alone.
+  because every part was still at the identity. `OBJHEAD1` is
+  `{int flags, char[16] lock_user, int32[3] location, float[4] quaternion (x,y,z,w), int index_num,
+  int version_no, int shape_id_no, char[] name}` (`heads.py`, from AvP's
+  `Object_Header_Chunk::fill_data_block`); a routine export rewrites only the location and
+  orientation and leaves the rest alone, and the name and shape id move only when the UI is used to
+  move them.
+
+### Authoring a file, rather than editing an imported one
+
+Export reads exactly the properties **import** minted — `rif_id`, `rif_index`, `rif_objhead`,
+`rif_absorbed` — so a datablock created any other way is skipped in silence. `scene.py`'s
+authoring section and seven operators in `__init__.py` are the way in (`scene.rif_new`,
+`object.rif_add`, `object.rif_add_sequence`, `object.rif_new_shape_id`, `scene.rif_add_sound`,
+`pose.rif_set_sound`, `action.rif_toggle_setting`, beside the import and export pair), with three
+panels over them — Object, Speaker data and Material. `scene.rif_new` builds a `REBINFF2`
+collection carrying the file-level chunks (`RIFVERIN`, `REBENVDT` +
+`ENDTHEAD`/`RIFFNAME`/`BMNAMEXT`/`BMNAMVER`) laid out as `SQUARE.RIF` — the smallest shipped file,
+1,004 bytes — carries them, and `object.rif_add` gives a selected mesh an `RBOBJECT`/`REBSHAPE`
+pair with a fresh shape id. `tests/test_authoring.py` drives all of it inside Blender.
+
+Four things there are worth keeping:
+
+- **No `BMPNAMES` is created up front.** `_new_table_location` already knows how to append one
+  after `REBENVDT`'s children the first time a material names a texture, which is the path the 36
+  shipped files without a table would take. Seeding an empty one would only add a second way to
+  get there. `BMNAMEXT` is 52 bytes in **all 316 shipped chunks** regardless of how many entries
+  the table holds — it is a fixed record, not a parallel array — so emitting it zeroed is not a
+  guess about its size scaling. (247 files have none at all, which is why it is a chunk count and
+  not a file count.)
+- **A RIF name is not `obj.name`.** The engine resolves by `strcmp` against `OBJHEAD1+0x3c` — the
+  map's `name`, every `for "<rif object>"` spawn point, `OBJHIERD`'s node binding — and the
+  exporter never regenerates that from the outliner, which is uniquified anyway. `rif_object_name`
+  (an RNA property with get/set over the stored body) is the setter; `DUMMYOBJ` is the exception
+  and keeps using `rif_name`, because `_dumobj_chunk` re-appends from there.
+- **Duplicating an object duplicates its shape id, and that one is fatal.** Re-import pairs both
+  objects with the first shape and orphans the second mesh, so export **refuses** a collection with
+  a shared id rather than writing it. A duplicated *name* is left alone: it is legal, and
+  `RifFilterObjectsByName` returning several matches is how a level spawns more than one actor
+  from one clause. `rif_shape_id` writes both halves of the pair at once, which is the whole point
+  of having it — setting only `OBJHEAD1`'s would leave the object naming a shape nothing claims.
+- **A spawn locator is an ordinary object with geometry, not an empty and not a dummy.**
+  `level01.RIF`'s `Goodie A`..`Goodie D` are `RBOBJECT`s carrying a 24-vertex marker mesh and its
+  `camhund` camera plane is a 4-vertex quad — and the id pairing resolves **all 9,313 objects
+  across the 563 files**, so no shipped object is geometry-less at all. `object.rif_add` will make
+  one from an empty because that is the obvious gesture, but nothing in the assets attests it;
+  a small mesh is the choice with evidence behind it. (An earlier draft of this section had it
+  backwards, claiming a geometry-less object was "what the shipped files' unpaired objects are" —
+  there are none.)
+
+**A rig is authorable too, and the animation half is where the measuring was.** An armature adopts
+as the file's `OBJCHIER` tree, nesting comes from `bone.parent` rather than the `rif_path` strings
+an import recorded, and each node's `OBJHIERD` is regenerated from the object actually parented to
+that bone — so renaming that object (which the UI now offers) follows into the binding instead of
+silently breaking the rig. The findings that pin the sequence half:
+
+- **The frame list comes from the F-curves.** It used to be the stored list, merely *sampled* — so
+  inserting a keyframe changed what a pose looked like but never how many frames a sequence had,
+  and an Action made from scratch produced nothing at all.
+- **But a frame's `time` is authored, not computed, so imported keys are anchors.** Only 3,712 of
+  the 27,731 non-trivial shipped sequences match `floor(k*65536/n)` and none match
+  `k*65536/(n-1)`, so recomputing on every export would rewrite 87% of the game's animation on a
+  round trip that changed nothing. A key from the file keeps its exact time; only a new key is
+  placed, by interpolating between neighbours. `heads.sequence_times` reproduces all 27,731 exactly
+  and takes a clean insertion in all 27,731. The from-scratch fallback scales by the **clip's**
+  frame extent, not each bone's — otherwise two bones keyed over different ranges disagree about
+  where one moment sits, which is the bug the test caught.
+- **`OBASEQHD`'s first field is not `num_frames`** despite AvP's name for it: it is **65536 in all
+  29,550** shipped sequences, i.e. the 16.16 span a frame's `time` is a position within.
+  `sub_sequence_number` *is* recovered — a **per-file sequence id**, distinct within each of the
+  4,270 `OBANSEQS` nodes and identical across nodes for the same name in all 912 (file, name)
+  pairs — so a new Action allocates one and every bone's copy shares it.
+- **`OBASEQFR.flags` is a sound index**, not opaque: AvP's `HierarchyFrame_SoundIndexMask` decodes
+  Gunlok cleanly (bits 0-23 zero in 323,323 of 323,334 frames; index 0 in 322,796 and 1..17 in the
+  538 that trigger a sound). So a new key gets **0**, not a copy of its neighbour's — copying would
+  duplicate that neighbour's sound.
+- **And the index resolves entirely inside the `.rif`** — traced in Ghidra, full write-up in
+  `rif_chunk_format.md`. `BuildRifFileObject` @ 0x005a9b50 zeroes a **128-slot pointer array at
+  rif+0x10** (matching the 0x7f mask exactly) and installs every `INDSOUND` chunk at
+  `rif->sounds[chunk->index]` — the chunk declares its own slot. They are **direct children of the
+  file root**, not of `REBENVDT`: the `lookup_child` is on `rif+0xc`, the root File_Chunk, and all
+  240 shipped chunks sit at depth 1 under `REBINFF2`. (An earlier revision of this file said
+  `REBENVDT`, inferred from an unrelated lookup a few instructions earlier in the same function —
+  the measurement, not the neighbouring code, is what settles it.) `MakeHierarchyFrame`
+  @ 0x005ae510 does `rif->sounds[idx]` and reads a **path string** off the entry
+  (`Robots\GL_click08.wav`) plus min/max distance in mm, volume and a pitch offset. The rif is
+  threaded through `GetHierarchy` → `BuildHierarchy` → `BuildHierarchyNode` →
+  `BuildSequenceList` → `BuildSequence` for no other purpose than this lookup. So a sound is
+  authorable with no external table: emit an `INDSOUND` and reference its index.
+  **A dangling index is normal shipped data** — 12 of the 52 files with sound events use an index
+  no `INDSOUND` declares, and the engine's null-slot check makes that silent. `SOUNDDIR` is *not*
+  on this path; nothing looks that chunk up by id.
+- **Bit 31 of `OBASEQFR.flags` marks the sequence's origin frame** — recovered, and *not* ignored,
+  which was the standing suspicion. Set in 9,693 frames. `MakeHierarchyFrame` @ 0x005ae74f puts `4`
+  into the built frame's own flags (+0x24); `BuildSequence` @ 0x005ae037 scans for the **first**
+  frame carrying it, sets flag `0x4` on the sequence (+0x14), and **rebases every frame onto it** —
+  subtracting its position, then rotating by the conjugate of its rotation
+  (`XOR 0x80000000` on `w`). `OffsetSequenceFrames` @ 0x005945b0 then skips any sequence so
+  flagged, where it would otherwise offset every frame. So a sequence with an origin frame is
+  stored in that frame's local space; one without is absolute and gets offset at use. Marking the
+  wrong frame silently re-anchors the whole animation, which is why the addon preserves it and does
+  not yet offer to set it.
+- **A sound is authored as a Blender Speaker, and that is a UI choice, not a storage one.** The
+  table splits three ways like textures already do: the **entries** become one Speaker per slot
+  (its `distance_reference`/`distance_max`/`volume` *are* the stored mm and 0-127 fields, so the
+  falloff is visible and audible), the **index** becomes `rif_sound_events` on the Action —
+  `{bone, frame, index}`, because a sound belongs to a sequence at a time — and the **audio** is
+  loaded from the install for audition and never written back. Deleting a speaker removes the
+  sound. The index is **split out of `flags` on import and spliced back on export**, so there is
+  one place a sound is edited and the residual bits nobody understands are preserved untouched.
+  Speakers deliberately carry no `rif_id`, so `_rebuild` skips them like any unadopted object and
+  the table is rebuilt from them separately.
+- **A sequence's three optional chunks are *nearly* per-sequence, and the "nearly" is the whole
+  design.** `OBASEQTM` (milliseconds), `OBASEQSP` (`{speed mm/s, angle, spare}`) and `OBASEQFL`
+  (`Loops` 0x04 / `NoLoop` 0x08, plus an unexplained 0x80 on 181 chunks) are all AvP's and all
+  optional — 590, 722 and 582 of 29,550 sequences carry one, each on a *subset* of that sequence's
+  bones. For 908 of the 912 (file, sequence) pairs with an `OBASEQTM` every bone agrees, but four
+  do not (`game_cursor.RIF`'s `DzSeq_Walk` has 800, 600 and 1000 on three bones) and two disagree
+  on flags. **So the file's per-bone body is authoritative and is left untouched**; the Action-level
+  property is an *override* applied only to settings the user actually edited (`rif_seq_edited`).
+  Two guards, both load-bearing and both proven by deliberately removing them: `rif_seq_edited`
+  (without it the divergent files collapse to one value) and `rif_seq_had` (without it a duration
+  shipped on three bones of eighty comes back on all eighty — breaks four files).
+  Present and absent are distinct states, so these are ID properties that exist or do not, and the
+  UI toggles them rather than offering a sentinel.
+  **The first design got this wrong**, on a measurement that counted "the bones disagree" and "at
+  least one bone lacks it" and found the same number — which does not imply the *present* values
+  agree. The full scene round-trip caught it on `Binary Laser MkI.RIF`. Counting two conditions
+  that coincide is not the same as testing the one you care about.
 
 Not verified against the game: the import scale (a convention — the engine's factor comes from map
-data at level load, not a constant), the Y-up→Z-up assumption, and shape-to-`RBOBJECT` pairing by
-document order. Nothing exported has been loaded back into Gunlok yet.
+data at level load, not a constant), the Y-up→Z-up assumption, and a *generated* sequence's timing,
+which follows the dominant shipped convention rather than a rule read out of the engine. Nothing
+exported has been loaded back into Gunlok yet, which matters most for a file built from scratch,
+where every chunk is generated rather than carried. `DUMMYOBJ` still cannot be authored (whether
+`RifFilterObjectsByName` looks at dummies is unmeasured), and a frame's **origin bit is preserved
+but never set** — what it does is recovered, but choosing the wrong frame re-anchors a whole
+animation inside the engine, where nothing here can see the result.
 
 ### Other
 
@@ -1430,7 +1584,7 @@ document order. Nothing exported has been loaded back into Gunlok yet.
 | `examples/levels/arena.mjs` | A working level module for `levels.add` — `map` + `includes` + `define` + `populate` + `setup` |
 | `examples/headers/` | `bug.gsh` and part of `defaults.gsh` re-implemented with `gls`, as the worked example of translating a header |
 | `types/` | `.d.ts` for the `"gk"` module and the `ImGui` interface, the generator for the latter, and `typecheck.ts`. See "Type definitions" above |
-| `blender/` | The Blender `.rif` import/export addon and its five test harnesses. Pure Python, unrelated to `d3d8.dll`. See "The Blender addon" above |
+| `blender/` | The Blender `.rif` import/export addon and its eight test harnesses. Pure Python, unrelated to `d3d8.dll`. See "The Blender addon" above |
 | `huffman/`, `utils/rifutil` | The C++ REBCRIF1 codec and its CLI. The Python port in `blender/io_scene_rif/rif.py` is decode-only; this is the only compressor |
 | `utils/rimutil` | `.RIM` <-> PNG CLI over spng + libsquish, both directions, both image forms. `compress` takes `--format dxt1\|dxt3\|body` (default **dxt3**) and `--raw`; **dxt5 is refused by name**, because `TextureFormatCandidates` @ 0x006ac348 lists only DXT1/DXT3 and `SurfaceDesc_SetCompressedFormat` @ 0x005c6820 drops any other fourcc *silently* — a DXT5 file renders with garbage alpha rather than failing. `body` is exactly lossless and needs no DXT compressor — it picks `masking 2` only when every transparent texel shares one RGB (otherwise an `ALPH` chunk, since the RGB *under* transparency is what bilinear filtering blends into neighbours), and `check_lossless` re-derives every pixel before writing. Format details in `rif_chunk_format.md`; tests in `utils/rimutil/tests` |
 

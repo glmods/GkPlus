@@ -30,10 +30,19 @@ SCHEMA = {
     b"OBASEQFR": [
         ("rotation", F32, 4),      # unit quaternion (x, y, z, w) in 100% of 323,334
         ("position", I32, 3),      # rif units
-        ("time", I32, 1),          # normalized 16.16, 0 at the first frame
-        ("frame_index", I32, 1),   # 0-based within the sequence
-        ("flags", I32, 1),         # only the top byte is ever set
-        ("field_0x28", I32, 1),    # always zero
+        # AvP's at_frame_no: a position in the 0..OBASEQHD.num_frames span, 0 at
+        # the first frame in all 28,577 monotonic sequences. **Authored, not
+        # derived** - no formula reproduces the shipped values (see
+        # rif_chunk_format.md), which is why the exporter anchors rather than
+        # recomputes.
+        ("time", I32, 1),
+        # AvP's frame_ref_no, and this one *is* derived: it equals the frame's
+        # position in the list in 323,334 of 323,334.
+        ("frame_index", I32, 1),
+        # Sound index in bits 24-30 (AvP's HierarchyFrame_SoundIndexMask), flag
+        # mask in bits 0-23 (zero in 323,323 of 323,334), and bit 31 unrecovered.
+        ("flags", I32, 1),
+        ("num_extra_data", I32, 1),  # AvP's; zero in every shipped frame
     ],
     b"STDLIGHT": [
         ("light_id", I32, 1),
@@ -55,9 +64,20 @@ SCHEMA = {
     b"RIFVERIN": [("version", I32, 1)],
     b"AMBIENCE": [("ambience", I32, 1)],
     b"BMNAMVER": [("version", I32, 1)],
+    # AvP's sequence flags (animobs.hpp): Loops 0x04, NoLoop 0x08,
+    # NoInterpolation 0x10, HalfFrameRate 0x20, plus two Mummy-specific bits.
+    # Gunlok ships exactly four values -- 0x4, 0x8, 0x84, 0x88 -- so it is
+    # loop-or-not plus a 0x80 whose meaning is not recovered, and the two loop
+    # bits are never set together.
     b"OBASEQFL": [("flags", I32, 1)],
-    b"OBASEQTM": [("duration_ms", I32, 1)],
-    b"OBASEQSP": [("speed", I32, 3)],
+    b"OBASEQTM": [("duration_ms", I32, 1)],  # AvP's sequence_time, milliseconds
+    # AvP's Object_Animation_Sequence_Speed_Chunk: a movement speed in mm/second
+    # and a heading in degrees, which `get_sequence_vector` turns into a unit
+    # direction. Gunlok leaves both `angle` and `spare` zero in all 582 shipped
+    # chunks and uses speeds of 1400..3000 mm/s -- walking and running pace.
+    # (This was one field `("speed", I32, 3)` until the layout was read off AvP;
+    # it round-tripped either way, but named all three after the first.)
+    b"OBASEQSP": [("sequence_speed", I32, 1), ("angle", I32, 1), ("spare", I32, 1)],
     b"CUTTRFOV": [("fov", F32, 3)],
     b"ENVSDSCL": [("sound_scale", F32, 2)],
     b"CTUSNDPR": [("sound_properties", I32, 6)],

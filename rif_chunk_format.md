@@ -116,9 +116,9 @@ Body is a fixed number of int32/float values read directly.
 | `RIFVERIN` | RIF version info           | 0x005b18e0 | 1 x int32 (version) |
 | `AMBIENCE` | Ambient settings           | 0x005d3410 | 1 x int32 |
 | `ENVSDSCL` | Environment sound scale    | 0x005cab80 | 2 x float (8 bytes) |
-| `OBASEQFL` | OB anim sequence flags     | 0x005cd8c0 | 1 x int32 (flags) |
-| `OBASEQTM` | OB anim sequence time      | 0x005cd7e0 | 1 x int32 (time) |
-| `OBASEQSP` | OB anim sequence speed     | 0x005cd840 | 3 x int32 (12 bytes) |
+| `OBASEQFL` | OB anim sequence flags     | 0x005cd8c0 | 1 x int32 - **fully decoded**, see below |
+| `OBASEQTM` | OB anim sequence time      | 0x005cd7e0 | 1 x int32 - `sequence_time`, **milliseconds** |
+| `OBASEQSP` | OB anim sequence speed     | 0x005cd840 | `{sequence_speed mm/s, angle deg, spare}` |
 | `SHPFLAGS` | Shape flags                | 0x005b9170 | 1 x uint32 (flags) |
 | `LITSCALE` | Light scale                | 0x005d3010 | 1 x float (scale) |
 | `MODFLAGS` | Module flags               | 0x005b37c0 | 2 x int32 (8 bytes) |
@@ -376,6 +376,18 @@ minimum body size is exactly this header with an empty name list.
 
 Note the bounds are **max before min on each axis**, which is easy to get backwards.
 
+**Everything from 0x18 to 0x3b is derived from the geometry, so it can go stale.**
+AvP's from-buffer constructor reads all six values straight into `shape_data`, and
+Gunlok derives a role's collision extents from a shape's bounds whenever the GLS
+gives `radius`/`height` as 0 - so a tool that edits a mesh has to rewrite this
+chunk, not carry it. Recomputing them from `SHPRAWVT`/`SHPPOLYS` reproduces the
+stored `num_verts`, `num_polys` and both bound corners in **9,357/9,357** shipped
+shapes. `radius` is the exception at 42% bit-exact, drifting a median 7e-7
+relative (p90 5e-4, four shapes past 1%); it is the same quantity `SHPCENTR`
+holds and the two are **byte-identical in all 9,244 shapes carrying both**, so
+the pair has to be regenerated together or not at all. `blender/tests/test_heads.py`
+is the measurement.
+
 #### `OBASEQHD` - OB Anim Sequence Header (0x005cd610)
 
 **Fully decoded**, from AvP's
@@ -385,7 +397,7 @@ Note the bounds are **max before min on each axis**, which is easy to get backwa
 |--------|-------|-----------|------------------------------|
 | 0x00   | 4     | int32     | `num_frames` - **always 65536** in Gunlok, i.e. 1.0 in 16.16, matching the normalized `OBASEQFR` time rather than a count |
 | 0x04   | 4     | int32     | `sequence_number` - always 0 |
-| 0x08   | 4     | int32     | `sub_sequence_number` - 62 distinct values |
+| 0x08   | 4     | int32     | `sub_sequence_number` - **a per-file sequence id**, see below |
 | 0x0c   | 4     | int32     | `num_extra_data` - always 0  |
 | 0x10   | n*4   | int32[]   | `extra_data`, absent in every shipped file |
 | 0x10   | ...   | string    | `sequence_name`, padded with `(strlen + 4) & ~3` |
@@ -398,6 +410,143 @@ and put the name at 0x12; the size arithmetic only works from 0x10.)
 
 **973 of the 29,550 sequences carry no `OBASEQFR` at all**, so an empty animation is
 normal data rather than a parse failure.
+
+**`sub_sequence_number` is the id that matches one sequence across the skeleton.**
+It is distinct among the sequences of each of the 4,270 `OBANSEQS` nodes, and
+identical across nodes for the same sequence name in **all 912 (file, name) pairs
+with no exceptions** - so every node's copy of `DzSeq_Walk` carries one number.
+Anything generating a new sequence has to allocate a fresh one and use it on
+every node, not write 0. `sequence_number` (0x04) is 0 everywhere and appears to
+be unused.
+
+**A frame's `time` (`OBASEQFR+0x1c`) is authored, not derived.** It is a position
+in the 0..`num_frames` span this header declares, but no formula reproduces the
+shipped values: only 3,712 of the 27,731 non-trivial sequences match
+`floor(k * 65536 / n)` and **none** match `k * 65536 / (n-1)`. The first frame is
+at 0 in all 28,577 monotonic sequences; the last is wherever the animator left it,
+never reaching 65536 (the largest observed is 65530). `frame_index`
+(`OBASEQFR+0x20`) *is* derivable - it equals the frame's position in the list in
+**323,334 of 323,334**.
+
+**`OBASEQFR.flags` (0x24) is a sound index, and it resolves entirely inside the
+`.rif`.** AvP's `animobs.hpp` splits the word with
+`HierarchyFrame_SoundIndexMask 0x7f000000` (`get_sound_index()` is `>> 24`) and
+`HierarchyFrame_FlagMask 0x00ffffff`, and both hold in Gunlok: the low 24 bits are
+zero in 323,323 of 323,334 frames, and the sound index is 0 in 322,796 with values
+1..17 in the 538 frames that trigger one. `OBASEQFR+0x28` is AvP's
+`num_extra_data`, zero in every shipped frame, which is why the body is a fixed
+44 bytes.
+
+The resolution is `MakeHierarchyFrame` @ 0x005ae510, reached as
+`GetHierarchy` -> `BuildHierarchy` -> `BuildHierarchyNode` -> `BuildSequenceList`
+-> `BuildSequence`, every step threading the **rif file object** through in EDX
+purely so this lookup can happen:
+
+```
+005ae75b  TEST EAX,0x7f000000                     ; any sound on this frame?
+005ae760  JZ   ...                                ; no
+005ae769  SAR  EAX,0x18
+005ae76c  AND  EAX,0x7f                           ; 0..127
+005ae772  MOV  EAX,[ECX + EAX*0x4 + 0x10]         ; rif->sounds[index]
+005ae77b  JZ   ...                                ; empty slot -> silently skipped
+005ae792  MOV  EAX,[EAX + 0x2c]                   ; the entry's path string
+005ae799  CALL strchr(path, '\')                  ; +1 -> basename
+```
+
+**Bit 31 marks the sequence's origin frame**, and it is not in either AvP mask.
+Set in 9,693 shipped frames. It is load-bearing, not decorative - it decides the
+frame every other frame in the sequence is expressed relative to:
+
+1. `MakeHierarchyFrame` @ 0x005ae74f: a set sign bit puts `4` into the built
+   frame's own flags at `+0x24`.
+2. `BuildSequence` @ 0x005ae037 scans the sequence for the **first** frame
+   carrying that, sets flag `0x4` on the sequence itself (`+0x14`), and
+   **rebases every frame onto it** - subtracting its position (the `SUBSS` loop
+   at 0x005ae0c0) then rotating by the conjugate of its rotation
+   (`XOR EAX,0x80000000` on `w` at 0x005ae06d).
+3. `OffsetSequenceFrames` @ 0x005945b0 then **skips** any sequence so flagged,
+   where it would otherwise offset every frame's position by a vector.
+
+So a sequence with an origin frame is stored in that frame's local space and the
+engine leaves it alone afterwards; one without is stored absolutely and gets
+offset at use. Marking the wrong frame silently re-anchors the whole animation.
+
+#### `OBASEQTM` / `OBASEQFL` / `OBASEQSP` - a sequence's optional settings
+
+All three are AvP's (`animobs.cpp`, `animobs.hpp`) and all three are **optional**:
+590, 722 and 582 of the 29,550 shipped sequences carry one. Their accessors are
+`get_sequence_time` / `get_sequence_flags` / `get_sequence_speed`, each a
+`lookup_single_child` on one `OBANSEQC`.
+
+| Chunk | Layout | Shipped values |
+|-------|--------|----------------|
+| `OBASEQTM` | `int32 sequence_time` | milliseconds; 45 distinct, all round (1000 in 165, 2000 in 55, 1500 in 37) |
+| `OBASEQSP` | `int32 sequence_speed` (mm/s), `int32 angle` (degrees), `int32 spare` | speed 1400..3000 - walking and running pace; **`angle` and `spare` are 0 in all 582** |
+| `OBASEQFL` | `int32 flags` | exactly four values ship: `0x4`, `0x8`, `0x84`, `0x88` |
+
+`OBASEQFL`'s bits, from AvP: `MummySequenceFlag_UpperSequence` 0x01 and
+`_LowerSequence` 0x02 (neither used here), `SequenceFlag_Loops` **0x04**,
+`SequenceFlag_NoLoop` **0x08**, `SequenceFlag_NoInterpolation` 0x10,
+`SequenceFlag_HalfFrameRate` 0x20. So Gunlok uses it as loop-or-not plus a
+**0x80 that is not in AvP's list**, carried by 181 chunks and unexplained. The two
+loop bits are never set together.
+
+**Each is stored on a subset of the bones that have the sequence, and is
+*nearly* - but not quite - a per-sequence value.** For 908 of the 912
+(file, sequence) pairs carrying an `OBASEQTM`, every bone that has one has the
+same value. The exceptions are real: `game_cursor.RIF`'s `DzSeq_Walk` carries
+800, 600 and 1000 on three different bones, `Binary Laser MkI.RIF` and
+`skyburn.RIF` disagree the same way, and `warflash.RIF` has `DzSeq_Die` and
+`DzSeq_Fire` flagged `Loops` on one bone and `NoLoop` on another. `OBASEQSP`
+never disagrees.
+
+So a tool must treat the per-bone value as authoritative. It must also remember
+*which* bones carried a chunk, or a file that shipped a duration on three bones
+of eighty comes back carrying it on all eighty.
+
+(An earlier revision of this entry claimed these were per-sequence outright. The
+measurement behind it counted "the bones disagree" and "at least one bone lacks
+it" and got the same number - which does not imply the *present* values agree.
+A scene round-trip over all 563 files is what caught it.)
+
+They sit after the frames, and where after them varies (position 3, 12, 22, 32,
+33, 34, 35, 102, ... - it tracks the frame count). When all three are present the
+order is `OBASEQFL`, `OBASEQTM`, `OBASEQSP`.
+
+#### `INDSOUND` - Indexed Sound (`Indexed_Sound_Chunk` @ 0x005cecf0)
+
+The table the index above selects from. `BuildRifFileObject` @ 0x005a9b50
+`memset`s a **128-entry pointer array at rif+0x10** (0x200 bytes, matching the
+0x7f mask exactly) and installs every `INDSOUND` at `rif->sounds[chunk->index]` -
+the chunk declares its own slot rather than taking document order.
+
+**They are direct children of the file root**, not of `REBENVDT`: the
+`lookup_child` at 0x005a9c40 is on `rif+0xc`, the root `File_Chunk`, and all 240
+shipped chunks sit at depth 1 under `REBINFF2`. (An earlier revision of this
+entry said `REBENVDT`, inferred from the `lookup_single_child("REBENVDT")` a few
+instructions earlier in the same function. Adjacent code is not evidence.)
+
+Body layout, all 240 shipped chunks across 52 files decoding cleanly:
+
+| Offset | Size | Type | Description |
+|--------|------|------|-------------|
+| 0x00 | 4 | int32 | `index` - 1..17 in the shipped set; the array holds 128 |
+| 0x04 | ... | string | path, e.g. `Robots\GL_click08.wav`, NUL-terminated and padded to 4 with **uninitialised junk** (0xcd) |
+| +0 | 4 | int32 | min distance, mm - 5000 in 231, 20000 in 9 |
+| +4 | 4 | int32 | max distance, mm - 40000 in 237, 10000 in 2, 50000 in 1 |
+| +8 | 4 | int32 | volume, 0..127 |
+| +12 | 4 | int32 | pitch offset? 0 in 225, else -640 / 512 / -1280 |
+| +16 | 8 | int32[2] | always zero |
+
+The runtime object is `body + 0x28`, which is why `MakeHierarchyFrame` reads the
+index at `+0x28` and the path at `+0x2c`.
+
+**A dangling index is normal shipped data, not corruption.** 12 of the 52 files
+with sound events reference at least one index no `INDSOUND` declares -
+`vlowhark.RIF` uses 1/2/3 and declares none at all - and the `JZ` on the null
+slot is what makes that silent. Every used index resolves in only 40 of the 52.
+`SOUNDDIR` (19 files) is *not* part of this path: the `INDSOUND` path already
+carries its own folder, and nothing looks the `SOUNDDIR` chunk up by id.
 
 #### `ALTLOCAT` - Alternate Location (0x005b4130)
 

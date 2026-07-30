@@ -57,10 +57,12 @@ import bpy
 import mathutils
 
 from . import bmpnames
+from . import heads
 from . import rif
 from . import rim
 from . import schema
 from . import shapes as shp
+from . import sounds as snd
 
 #: RIF integer units to Blender metres. The engine's own factor is per-rif data
 #: read at level load (see gk::RifUnitScale), not a constant this addon can know,
@@ -198,7 +200,12 @@ def _get_fields(datablock, chunk_id):
 
 #: Properties the addon keeps for its own bookkeeping. These are *not* chunk
 #: fields and must never be written back into a chunk body.
-_STRUCTURAL = frozenset(("rif_id", "rif_index", "rif_absorbed", "rif_scale", "rif_y_down",
+_STRUCTURAL = frozenset(("rif_seq_duration_ms", "rif_seq_flags", "rif_seq_speed",
+                         "rif_seq_had", "rif_seq_edited",
+                         "rif_sounds", "rif_sound_index", "rif_sound_path",
+                         "rif_sound_pitch", "rif_sound_padding", "rif_sound_extra",
+                         "rif_sound_events", "rif_sound_dir",
+                         "rif_id", "rif_index", "rif_absorbed", "rif_scale", "rif_y_down",
                          "rif_shape_index", "rif_texture_index", "rif_pair",
                          "rif_name", "rif_bound", "rif_objhead", "rif_dumobjdt",
                          "rif_rest", "rif_rig_parented", "rif_lod_base",
@@ -443,6 +450,229 @@ def _unpack_entry(raw):
     }
 
 
+# --------------------------------------------------------------------------
+# sounds
+# --------------------------------------------------------------------------
+#
+# An animation keyframe names a sound by an index into a 128-slot table the file
+# carries itself, one INDSOUND chunk per used slot (:mod:`sounds`). Three things
+# come out of that, and each lands where it belongs:
+#
+# - the **table** is file data -> `rif_sounds` on the collection, kept whole and
+#   in order, so an entry no keyframe references survives;
+# - the **index** is what a keyframe stores -> `rif_sound_events` on the Action,
+#   because a sound is a property of a sequence at a time;
+# - the **audio** is not in the `.rif` at all -> a Speaker object per entry,
+#   loaded from the install for audition and never written back.
+#
+# The Speaker is the editing surface rather than the storage: it carries the
+# entry's path, distances and volume as real speaker settings, so you can hear a
+# footstep and see its falloff, and export rebuilds the table from the speakers.
+
+#: The chunk lifted out of the absorbed tree because the scene models it properly.
+_SOUND_CHUNKS = frozenset((b"INDSOUND",))
+
+
+def _read_sound_table(root, collection):
+    """Lift every ``INDSOUND`` onto the collection. Returns ``{index: entry}``.
+
+    Unlike ``BMPNAMES`` there is no container to locate: all 240 shipped chunks
+    are direct children of the file root, so they absorb onto the collection like
+    any other root-level leaf and their own child index is the path.
+    """
+    entries = []
+    for i, kid in enumerate(root.children or ()):
+        if kid.id != b"INDSOUND":
+            continue
+        try:
+            entry = snd.decode(kid.body)
+        except snd.SoundError:
+            # A table this build cannot read stays where it is, as typed fields,
+            # and the file still round-trips.
+            return {}
+        entry["chunk_index"] = i
+        entries.append(entry)
+    collection["rif_sounds"] = [_pack_sound(e) for e in entries]
+    return {int(e["index"]): e for e in entries}
+
+
+def _pack_sound(entry):
+    out = dict(entry)
+    out["padding"] = list(entry.get("padding") or ())
+    out["extra"] = list(entry.get("extra") or ())
+    return out
+
+
+def _unpack_sound(raw):
+    out = {"path": raw["path"], "index": int(raw["index"]),
+           "padding": list(raw.get("padding") or ()),
+           "extra": list(raw.get("extra") or ()),
+           "chunk_index": int(raw.get("chunk_index", -1))}
+    for name in snd.TRAILING:
+        out[name] = int(raw.get(name, 0))
+    return out
+
+
+def _sound_root(source_path, override):
+    """The install's ``Sound`` directory, found the way textures find ``Graphics``."""
+    if override:
+        return override if os.path.isdir(override) else None
+    if not source_path:
+        return None
+    cur = os.path.dirname(os.path.abspath(source_path))
+    while True:
+        for name in os.listdir(cur) if os.path.isdir(cur) else ():
+            if name.lower() == "sound" and os.path.isdir(os.path.join(cur, name)):
+                return os.path.join(cur, name)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return None
+        cur = parent
+
+
+def _resolve_sound(entry, root_dir):
+    """The ``.wav`` on disk for an entry, or None.
+
+    The stored path is relative to the install's ``Sound`` folder and uses
+    backslashes; a path with no folder part is looked up directly under it. The
+    match is case-insensitive because the shipped entries are not consistent --
+    ``Robots`` and ``robots`` both appear for the same directory.
+    """
+    if not root_dir:
+        return None
+    parts = [p for p in entry["path"].replace("\\", "/").split("/") if p]
+    cur = root_dir
+    for i, part in enumerate(parts):
+        if not os.path.isdir(cur):
+            return None
+        match = next((n for n in os.listdir(cur) if n.lower() == part.lower()), None)
+        if match is None:
+            return None
+        cur = os.path.join(cur, match)
+        if i == len(parts) - 1:
+            return cur if os.path.isfile(cur) else None
+    return None
+
+
+def _build_speakers(collection, table, root_dir):
+    """One Speaker per table entry: the editing surface for the sound table.
+
+    Speakers deliberately get **no** ``rif_id``: they are not chunks, so
+    ``_rebuild`` skips them the way it skips any unadopted object, and the table
+    is rebuilt from them separately.
+    """
+    made = 0
+    loaded = 0
+    for index in sorted(table):
+        entry = table[index]
+        spk = bpy.data.speakers.new("snd_%02d_%s" % (index, snd.basename(entry["path"])))
+        obj = bpy.data.objects.new(spk.name, spk)
+        collection.objects.link(obj)
+        _apply_sound_entry(spk, entry)
+        path = _resolve_sound(entry, root_dir)
+        if path is not None:
+            try:
+                spk.sound = bpy.data.sounds.load(path, check_existing=True)
+                loaded += 1
+            except Exception:  # noqa: BLE001 - a missing sound never fails an import
+                pass
+        made += 1
+    return made, loaded
+
+
+def _apply_sound_entry(spk, entry):
+    """Table entry -> real Speaker settings, so the falloff is visible."""
+    spk["rif_sound_index"] = int(entry["index"])
+    spk["rif_sound_path"] = entry["path"]
+    spk["rif_sound_pitch"] = int(entry.get("pitch", 0))
+    spk["rif_sound_padding"] = list(entry.get("padding") or ())
+    spk["rif_sound_extra"] = list(entry.get("extra") or ())
+    spk["rif_index"] = int(entry.get("chunk_index", -1))
+    # Millimetres in the file, metres in Blender -- the same 1/1000 the rest of
+    # the addon uses for rif units at the default scale, but fixed here because
+    # these are real distances rather than model coordinates.
+    spk.distance_reference = int(entry.get("min_distance", 0)) / 1000.0
+    spk.distance_max = int(entry.get("max_distance", 0)) / 1000.0
+    spk.volume = max(0.0, min(1.0, int(entry.get("volume", 0)) / float(snd.VOLUME_MAX)))
+
+
+def _sound_entry_from_speaker(obj):
+    """The reverse: a Speaker back into a table entry."""
+    spk = obj.data
+    path = spk.get("rif_sound_path", "") or ""
+    if not path and spk.sound is not None:
+        path = os.path.basename(bpy.path.abspath(spk.sound.filepath))
+    entry = snd.make_entry(int(spk.get("rif_sound_index", 0)), path)
+    entry["min_distance"] = int(round(spk.distance_reference * 1000.0))
+    entry["max_distance"] = int(round(spk.distance_max * 1000.0))
+    entry["volume"] = int(round(max(0.0, min(1.0, spk.volume)) * snd.VOLUME_MAX))
+    entry["pitch"] = int(spk.get("rif_sound_pitch", 0))
+    pad = list(spk.get("rif_sound_padding") or ())
+    if pad:
+        entry["padding"] = pad
+    entry["extra"] = list(spk.get("rif_sound_extra") or ())
+    entry["chunk_index"] = int(obj.get("rif_index", -1))
+    return entry
+
+
+def sound_speakers(collection):
+    """Every Speaker in the collection that stands for a table entry."""
+    return [o for o in collection.objects
+            if o.type == "SPEAKER" and o.data is not None
+            and "rif_sound_index" in o.data]
+
+
+def sound_table(collection):
+    """The table this export will write.
+
+    **The speakers are the table** when there are any: they are what the user
+    edits, so an entry whose speaker was deleted is *dropped*, which is how a
+    sound is removed. The stored ``rif_sounds`` is the fallback for a ``.blend``
+    that has none -- one saved before speakers existed, or an import that could
+    not build them.
+    """
+    entries = [_sound_entry_from_speaker(o) for o in sound_speakers(collection)]
+    if not entries:
+        entries = [_unpack_sound(r) for r in collection.get("rif_sounds", ())]
+    entries.sort(key=lambda e: (e.get("chunk_index", -1), e["index"]))
+    return entries
+
+
+def next_sound_index(collection):
+    used = {e["index"] for e in sound_table(collection)}
+    for i in range(1, snd.TABLE_SLOTS):
+        if i not in used:
+            return i
+    return 0
+
+
+def _sound_chunks(collection):
+    """``[(path, Chunk)]`` for the table, in ``_emit_from``'s injection form."""
+    out = []
+    used = set()
+    for e in sound_table(collection):
+        i = e.get("chunk_index", -1)
+        if i < 0 or i in used:
+            i = _next_free_root_index(collection, used)
+        used.add(i)
+        out.append(("INDSOUND:%d" % i, rif.Chunk(b"INDSOUND", snd.encode(e))))
+    return out
+
+
+def _next_free_root_index(collection, used):
+    taken = set(used) | {_path_index(p) for p, _ in _absorbed_entries(collection)
+                         if "/" not in p}
+    for obj in collection.objects:
+        if "rif_id" in obj:
+            taken.add(int(obj.get("rif_index", 0)))
+            if obj.data is not None and obj.data.get("rif_id") in ("REBSHAPE", "SUBSHAPE"):
+                taken.add(int(obj.data.get("rif_index", 0)))
+    i = 0
+    while i in taken:
+        i += 1
+    return i
+
+
 def _texture_root(source_path, override):
     if override:
         return override if os.path.isdir(override) else None
@@ -633,9 +863,10 @@ def _has_alpha(image):
 # chunk tree -> scene
 # --------------------------------------------------------------------------
 
-#: An object names its shape by id, not by position.
-OBJHEAD1_SHAPE_ID = 0x38   # AvP's Object_Header_Chunk::shape_id_no
-SHPHEAD1_FILE_ID = 0x14    # AvP's Shape_Header_Chunk::file_id_num
+#: An object names its shape by id, not by position. Both records are laid out
+#: in :mod:`heads`; these are the two fields the pairing needs.
+OBJHEAD1_SHAPE_ID = heads.OBJHEAD1_SHAPE_ID
+SHPHEAD1_FILE_ID = heads.SHPHEAD1_FILE_ID
 
 
 def _shape_pairs(root):
@@ -728,10 +959,11 @@ def _float_to_bits(f):
 #: for all 9,313 shipped objects, which is what the 64..96 byte size range is.
 #:
 #: The 16 bytes at 0x04 are *not* the name: they read ``Player`` in 6,383 objects
-#: and binary junk in 2,783, across 59 distinct values, so that is a separate
-#: (often uninitialised) tag. Reading it as the name hid every real name --
-#: ``Head``, ``Waist``, ``Ribs``, ``Chest``, ``Foot Right``, ``Index Right A``.
-OBJHEAD1_NAME = 0x3C
+#: and binary junk in 2,783, across 59 distinct values. That field is AvP's
+#: ``lock_user`` (:mod:`heads`), the editor's lock owner. Reading it as the name
+#: hid every real name -- ``Head``, ``Waist``, ``Ribs``, ``Chest``,
+#: ``Foot Right``, ``Index Right A``.
+OBJHEAD1_NAME = heads.OBJHEAD1_NAME
 #: ``DUMOBJDT`` is the same shape with a 52-byte header, for all 6,847 of them.
 #: AvP's loader gives the fields exactly: ``location``, ``min_extents`` and
 #: ``max_extents`` as int32 triples, then a quaternion, then the name. The
@@ -745,27 +977,18 @@ DUMOBJ_MAX = 0x18
 DUMOBJ_ORIENT = 0x24
 
 
-def _trailing_name(body, offset):
-    if len(body) <= offset:
-        return ""
-    text = body[offset:].split(b"\0")[0]
-    if not text or not all(32 <= b < 127 for b in text):
-        return ""
-    return text.decode("ascii")
-
-
-def _objhead_name(body):
-    return _trailing_name(body, OBJHEAD1_NAME)
+_trailing_name = heads.trailing_name
+_objhead_name = heads.objhead_name
 
 
 #: Leaf chunks that get their own object instead of folding into the parent.
 LEAF_AS_OBJECT = frozenset((b"STDLIGHT",))
 
 
-#: ``OBASEQHD`` is ``{int32 num_frames, sequence_number, sub_sequence_number,
-#: num_extra_data, int32[num_extra_data], name}`` -- AvP's
-#: ``Object_Animation_Sequence_Header_Chunk::fill_data_block``. ``num_extra_data``
-#: is 0 in all 29,550 shipped sequences, so the name always starts at 0x10.
+#: ``OBASEQHD`` is laid out in :mod:`heads`. AvP's first field is ``num_frames``
+#: and **Gunlok does not use it as one** -- it is 65536 in all 29,550 shipped
+#: sequences, i.e. the full 16.16 span a frame's ``time`` is a position within.
+#: ``num_extra_data`` is 0 in all of them, so the name always starts at 0x10.
 #:
 #: An earlier revision put it at 0x12, reading the leading ``Dz`` as a constant
 #: field because it is present in every sequence. It is not a field: the size
@@ -773,7 +996,7 @@ LEAF_AS_OBJECT = frozenset((b"STDLIGHT",))
 #: holds for all 29,550 only when the name starts at 0x10. ``Dz`` is a naming
 #: convention in the source assets, so the sequences really are called
 #: ``DzSeq_Stand``, ``DzSeq_Walk``, and so on.
-OBASEQHD_NAME = 0x10
+OBASEQHD_NAME = heads.SEQHEAD_NAME
 
 
 def _sequence_name(seq_chunk, fallback):
@@ -894,7 +1117,15 @@ def _build_armature(collection, root, targets, scale, y_down, fps):
         bone["rif_path"] = path
         bone["rif_index"] = index
         bone["rif_bound"] = bound or ""
-        bone["rif_absorbed"] = _pack_absorbed(_absorb(chunk, set()))
+        bone["rif_absorbed"] = _pack_absorbed(_absorb(chunk, {b"OBJHIERD"}))
+        # OBJHIERD is regenerated from the bound object's *current* name, so its
+        # position has to be remembered separately. It is child 0 in 5,038 of the
+        # 5,250 nodes that have one and child 1 in the other 212 -- and some
+        # nodes have none at all, which is why -1 is a distinct case rather than
+        # a default of 0.
+        kids = list(chunk.children or ())
+        bone["rif_hierd_index"] = next(
+            (i for i, k in enumerate(kids) if k.id == b"OBJHIERD"), -1)
         seqs = chunk.find(b"OBANSEQS")
         if seqs is not None:
             bone["rif_anim_index"] = list(chunk.children or ()).index(seqs)
@@ -1030,6 +1261,7 @@ def _build_actions(arm_obj, records, names, scale, y_down, fps):
             new_curve = action.fcurves.new
 
         frames_meta = []
+        sound_events = []
         for path, order, seq in entries:
             bone_name = names[path]
             pose_bone = arm_obj.pose.bones.get(bone_name)
@@ -1042,6 +1274,7 @@ def _build_actions(arm_obj, records, names, scale, y_down, fps):
             duration_s = 1.0
             if tm is not None and len(tm.body) >= 4:
                 duration_s = max(struct.unpack_from("<i", tm.body, 0)[0], 1) / 1000.0
+            _read_sequence_settings(action, seq)
 
             # A sequence with no frames still has to be recorded: 973 of the
             # game's 29,550 are empty, and skipping them here drops the chunk.
@@ -1050,7 +1283,7 @@ def _build_actions(arm_obj, records, names, scale, y_down, fps):
                 base = 'pose.bones["%s"].' % bpy.utils.escape_identifier(bone_name)
                 curves = {p: [new_curve(data_path=base + p, index=i) for i in range(n)]
                           for p, n in (("location", 3), ("rotation_quaternion", 4))}
-            meta = []
+            keys = []
             for fr in frames:
                 props = schema.decode(b"OBASEQFR", fr.body)
                 t = props["time"] / FIXED_ONE * duration_s * fps
@@ -1068,17 +1301,43 @@ def _build_actions(arm_obj, records, names, scale, y_down, fps):
                 for i, v in enumerate((quat.w, quat.x, quat.y, quat.z)):
                     curves["rotation_quaternion"][i].keyframe_points.insert(
                         t, v, options={"FAST"})
-                meta.append({"time": props["time"], "frame_index": props["frame_index"],
-                             "flags": _to_signed32(props["flags"]),
-                             "field_0x28": props["field_0x28"]})
+                # Anchored on the Blender frame, not on a position in the list:
+                # export now emits whatever keyframes the F-curves actually
+                # carry, so a key has to be recognisable as one that came from
+                # the file however many have been inserted around it.
+                #
+                # The sound index is split out of `flags` rather than carried
+                # inside it, so there is one place a sound is written. What is
+                # left is the residual -- bit 31 and AvP's low flag mask -- which
+                # nothing here understands and everything here preserves.
+                flags = _to_unsigned32(props["flags"])
+                sound = heads.frame_sound_index(flags)
+                keys.append({"frame": t, "time": props["time"],
+                             "flags": _to_signed32(flags & ~heads.FRAME_SOUND_INDEX_MASK)})
+                if sound:
+                    sound_events.append({"bone": bone_name, "frame": t, "index": sound})
             for group in curves.values():
                 for fc in group:
                     fc.update()
+            # OBASEQHD is regenerated (the name follows the Action, the id is
+            # allocated per sequence), so it must not also ride along here or
+            # every sequence would export two of them.
             frames_meta.append({"bone": bone_name, "path": path, "order": order,
-                                "duration_s": duration_s, "frames": meta,
-                                "absorbed": _pack_absorbed(_absorb(seq, {b"OBASEQFR"}))})
+                                "duration_s": duration_s, "keys": keys,
+                                "absorbed": _pack_absorbed(
+                                    _absorb(seq, {b"OBASEQFR", b"OBASEQHD"}))})
+            if "rif_sub_sequence" not in action:
+                head = seq.find(b"OBASEQHD")
+                if head is not None:
+                    _n, _s, sub = heads.seqhead_fields(head.body)
+                    action["rif_sub_sequence"] = sub
 
         action["rif_bones"] = frames_meta
+        # A sound belongs to the sequence at a time, not to a bone: it lives on
+        # exactly one bone in 196 of the 208 shipped cases and on every bone in
+        # none of them. The bone is still recorded, so an untouched export puts
+        # the event back on the one that carried it.
+        action["rif_sound_events"] = sound_events
         made += 1
 
     # Every Action starts at frame 0, so one is simply made active and switching
@@ -1098,6 +1357,128 @@ def _build_actions(arm_obj, records, names, scale, y_down, fps):
     return made
 
 
+# --------------------------------------------------------------------------
+# per-sequence settings: OBASEQTM, OBASEQFL, OBASEQSP
+# --------------------------------------------------------------------------
+#
+# All three are optional -- 590, 722 and 582 of the 29,550 shipped sequences
+# carry one -- and each is stored on a *subset* of the bones that have the
+# sequence.
+#
+# They are **nearly** per-sequence: for 908 of the 912 (file, sequence) pairs
+# that carry an OBASEQTM, every bone that has one has the same value. But not
+# all. `game_cursor.RIF`'s DzSeq_Walk carries 800, 600 and 1000 on three
+# different bones, `Binary Laser MkI.RIF` and `skyburn.RIF` disagree the same
+# way, and `warflash.RIF` has one sequence flagged Loops on one bone and NoLoop
+# on another. So the file's own per-bone value is authoritative and is left
+# exactly where it is; the Action-level property is an *override*, applied only
+# to the chunks whose setting the user actually edited (`rif_seq_edited`).
+#
+# (An earlier revision called these per-sequence outright. The measurement behind
+# that counted "the bones disagree" and "at least one bone lacks it" and found
+# the same number -- which does not imply the *present* values agree. The scene
+# round-trip caught it on Binary Laser MkI.RIF.)
+#
+# **Present and absent are different states**, which is why these are ID
+# properties that exist or do not, rather than numbers with a sentinel: adding
+# `OBASEQTM` to a sequence that never had one is an edit, and so is removing it.
+
+#: Action property <-> chunk. The value is a plain int except for the speed,
+#: which is the three fields `schema` names.
+SEQUENCE_SETTINGS = {
+    b"OBASEQTM": "rif_seq_duration_ms",
+    b"OBASEQFL": "rif_seq_flags",
+    b"OBASEQSP": "rif_seq_speed",
+}
+
+
+def _read_sequence_settings(action, seq):
+    """Lift a sequence's optional settings onto its Action, once.
+
+    ``rif_seq_had`` records which of the three the *file* carried, on any bone.
+    Without it export cannot tell "this bone legitimately has no OBASEQTM" from
+    "the user just added a duration", and would append one to all 80 bones of a
+    sequence that shipped it on three.
+    """
+    had = set(action.get("rif_seq_had", ()))
+    for cid, prop in SEQUENCE_SETTINGS.items():
+        kid = seq.find(cid)
+        if kid is None:
+            continue
+        had.add(cid.decode("ascii"))
+        if prop in action:
+            continue
+        props = schema.decode(cid, kid.body)
+        if cid == b"OBASEQSP":
+            action[prop] = [int(props.get("sequence_speed", 0)),
+                            int(props.get("angle", 0)), int(props.get("spare", 0))]
+        elif cid == b"OBASEQFL":
+            action[prop] = _to_signed32(props.get("flags", 0))
+        else:
+            action[prop] = int(props.get("duration_ms", 0))
+    action["rif_seq_had"] = sorted(had)
+
+
+def _sequence_setting_body(action, cid):
+    """The chunk body an Action's setting encodes to, or None when it has none."""
+    prop = SEQUENCE_SETTINGS[cid]
+    if prop not in action:
+        return None
+    value = action[prop]
+    if cid == b"OBASEQSP":
+        vals = list(value) + [0, 0, 0]
+        return schema.encode(cid, {"sequence_speed": int(vals[0]),
+                                   "angle": int(vals[1]), "spare": int(vals[2])})
+    if cid == b"OBASEQFL":
+        return schema.encode(cid, {"flags": _to_signed32(_to_unsigned32(int(value)))})
+    return schema.encode(cid, {"duration_ms": int(value)})
+
+
+def _apply_sequence_settings(action, extras):
+    """Rewrite the settings chunks in one sequence's absorbed extras, in place.
+
+    Substituting into the absorbed list rather than appending is what keeps a
+    chunk's position: it sits after the frames, but *where* after them varies and
+    nothing about that is worth regenerating.
+
+    **Only a setting the user edited is touched.** An untouched one keeps the
+    file's own body, which is what preserves the handful of sequences whose bones
+    genuinely carry different values. An edited one is substituted everywhere, or
+    dropped everywhere if it was removed -- that is how you remove one.
+
+    A setting the Action has and this bone's sequence does not is appended **only
+    when the file never had it on any bone** (``rif_seq_had``). Otherwise a
+    sequence that shipped its duration on three bones of eighty would come back
+    carrying it on all eighty.
+    """
+    edited = set(action.get("rif_seq_edited", ()))
+    if not edited:
+        return list(extras)
+
+    had = set(action.get("rif_seq_had", ()))
+    out = []
+    seen = set()
+    for index, chunk in extras:
+        if chunk.id in SEQUENCE_SETTINGS and chunk.id.decode("ascii") in edited:
+            body = _sequence_setting_body(action, chunk.id)
+            seen.add(chunk.id)
+            if body is None:
+                continue  # removed on the Action
+            chunk = rif.Chunk(chunk.id, body)
+        out.append((index, chunk))
+    top = max([i for i, _c in out], default=-1) + 1
+    for cid in (b"OBASEQFL", b"OBASEQTM", b"OBASEQSP"):
+        if cid in seen or cid.decode("ascii") not in edited \
+                or cid.decode("ascii") in had:
+            continue
+        body = _sequence_setting_body(action, cid)
+        if body is not None:
+            # The order the shipped files use when all three are present.
+            out.append((top, rif.Chunk(cid, body)))
+            top += 1
+    return out
+
+
 def _rest_relative(bone):
     """A bone's rest transform relative to its parent, which is what a pose basis
     is measured against: ``pose_local = rest_relative @ matrix_basis``."""
@@ -1106,76 +1487,214 @@ def _rest_relative(bone):
     return bone.parent.matrix_local.inverted() @ bone.matrix_local
 
 
-def _armature_chunks(arm_obj, scale, y_down, fps):
-    """The armature back into ``[(index, OBJCHIER chunk)]`` for the file root."""
-    arm = arm_obj.data
-    by_path = {}
-    for bone in arm.bones:
-        path = bone.get("rif_path")
-        if path:
-            by_path[path] = bone
+def _bone_binding(arm_obj, bone):
+    """The object name this node drives, followed through a rename.
 
-    # Actions, grouped by the bone they animate, so a bone can rebuild its own
-    # OBANSEQS from the Actions that mention it.
+    The binding is a *name*, resolved by ``strcmp`` -- so reading it back off the
+    object actually parented to this bone is what makes renaming that object
+    (which the UI now offers) keep the rig working, instead of silently leaving
+    the node pointing at a name nothing answers to.
+
+    A level-of-detail variant rides a bone too and is deliberately not a binding:
+    no node binds one, which is the whole reason `_build_armature` has to place
+    it by hand. When the bone drives no object, or several, the imported value is
+    kept -- "two nodes binding one name is legal" cuts both ways.
+    """
+    driven = [obj for obj in arm_obj.children
+              if obj.parent_type == "BONE" and obj.parent_bone == bone.name
+              and obj.get("rif_rig_parented") and "rif_lod_base" not in obj]
+    if len(driven) == 1:
+        name = rif_object_name(driven[0])
+        if name:
+            return name
+    return bone.get("rif_bound", "") or ""
+
+
+def _armature_chunks(arm_obj, scale, y_down, fps):
+    """The armature back into ``[(index, OBJCHIER chunk)]`` for the file root.
+
+    **Nesting comes from ``bone.parent``, not from the ``rif_path`` strings an
+    import recorded.** Those paths are still carried, because they are what an
+    absorbed chunk's position is relative to, but reading the tree out of them
+    meant a bone added or re-parented in Blender could not change the file: a new
+    bone had no path at all and was skipped in silence, and a re-parented one
+    went back exactly where it came from.
+    """
+    arm = arm_obj.data
+    bones = list(arm.bones)
+
+    # Actions, grouped by the bone they animate. The grouping is read from the
+    # F-curve data paths rather than from stored metadata, so an Action that
+    # gained a bone -- or that never had metadata because a script made it --
+    # still reaches the file.
     per_bone = {}
-    for action in bpy.data.actions:
-        if action.get("rif_id") != "OBANSEQC":
-            continue
-        for entry in action.get("rif_bones", ()):
-            per_bone.setdefault(entry["bone"], []).append((action, entry))
+    for action in _rif_actions(arm_obj):
+        meta = {entry["bone"]: entry for entry in action.get("rif_bones", ())}
+        # The **union** of "has curves" and "had a sequence chunk". Curves alone
+        # is not enough: 973 of the game's 29,550 sequences carry no frames at
+        # all, and an empty sequence produces no F-curve to be found by, so
+        # keying on curves alone silently drops the chunk.
+        for bone_name in set(meta) | _animated_bones(action):
+            per_bone.setdefault(bone_name, []).append((action, meta.get(bone_name)))
+
+    sub_ids = _sequence_ids(arm_obj)
 
     made = {}
-
-    def chunk_for(path):
-        if path in made:
-            return made[path]
-        bone = by_path[path]
+    for index, bone in enumerate(bones):
         children = list(_emit_from(bone.get("rif_absorbed")))
 
-        seqs = _sequences_for(bone, per_bone.get(bone.name, ()), arm_obj, scale, y_down, fps)
+        # Regenerated rather than carried, because the name in it *is* the
+        # binding and it has to follow a rename. Emitted only when there is a
+        # binding to express or the node already had the chunk -- some shipped
+        # nodes have neither, and inventing an empty one for those would add a
+        # chunk nobody asked for.
+        binding = _bone_binding(arm_obj, bone)
+        hierd_index = int(bone.get("rif_hierd_index", 0 if binding else -1))
+        if binding or hierd_index >= 0:
+            # Half a step before whatever held that index, so it lands back in
+            # its own slot without having to renumber every sibling around it.
+            children.append((max(hierd_index, 0) - 0.5,
+                             rif.Chunk(b"OBJHIERD", heads.make_objhierd(binding))))
+
+        seqs = _sequences_for(bone, per_bone.get(bone.name, ()), arm_obj,
+                              scale, y_down, fps, sub_ids)
         if seqs is not None:
             children.append((bone.get("rif_anim_index", len(children)), seqs))
 
-        chunk = rif.Chunk(b"OBJCHIER", b"", [])
-        made[path] = (chunk, children)
-        return made[path]
-
-    for path in sorted(by_path, key=lambda p: p.count("/")):
-        chunk_for(path)
+        made[bone.name] = (rif.Chunk(b"OBJCHIER", b"", []), children,
+                           int(bone.get("rif_index", index)))
 
     roots = []
-    for path, (chunk, _kids) in made.items():
-        head, _, last = path.rpartition("/")
-        index = int(last.rpartition(":")[2])
-        if head and head in made:
-            made[head][1].append((by_path[path].get("rif_index", 0), chunk))
+    for bone in bones:
+        chunk, _kids, index = made[bone.name]
+        parent = bone.parent
+        if parent is not None and parent.name in made:
+            made[parent.name][1].append((index, chunk))
         else:
             roots.append((index, chunk))
 
-    for chunk, children in made.values():
+    for chunk, children, _index in made.values():
         children.sort(key=lambda t: t[0])
         chunk.children = [c for _, c in children]
     return roots
 
 
-def _sequences_for(bone, entries, arm_obj, scale, y_down, fps):
+def _rif_actions(arm_obj):
+    """Every Action that should become a sequence, in a stable order.
+
+    An Action earns this by being marked -- ``rif_id`` from an import, or the
+    same key set by *Add Action to Gunlok RIF*. Auto-detecting instead would
+    sweep up every scratch Action in the file, and an Action is not owned by the
+    object it happens to be assigned to.
+    """
+    out = [a for a in bpy.data.actions if a.get("rif_id") == "OBANSEQC"]
+    out.sort(key=lambda a: (int(a.get("rif_index", 0)), a.name))
+    return out
+
+
+def _animated_bones(action):
+    """The pose bones an Action has curves for."""
+    found = set()
+    for fc in _iter_fcurves(action):
+        if fc.data_path.startswith('pose.bones["'):
+            rest = fc.data_path[len('pose.bones["'):]
+            end = rest.find('"]')
+            if end > 0:
+                found.add(rest[:end].replace('\\"', '"').replace("\\\\", "\\"))
+    return found
+
+
+def _sequence_ids(arm_obj):
+    """``{action name: sub_sequence_number}``, allocating one per new sequence.
+
+    That field is a per-file sequence id -- the same value on every node's copy
+    of one sequence, distinct between sequences (see `heads.make_seqhead`) -- so
+    a new Action needs a number nothing else in the file is using, and it has to
+    be the same number on every bone.
+    """
+    ids, used = {}, set()
+    for action in _rif_actions(arm_obj):
+        stored = action.get("rif_sub_sequence")
+        if stored is not None:
+            ids[action.name] = int(stored)
+            used.add(int(stored))
+    nxt = max(used, default=-1) + 1
+    for action in _rif_actions(arm_obj):
+        if action.name not in ids:
+            ids[action.name] = nxt
+            action["rif_sub_sequence"] = nxt
+            used.add(nxt)
+            nxt += 1
+    return ids
+
+
+def _sequences_for(bone, entries, arm_obj, scale, y_down, fps, sub_ids):
     """One bone's Actions back into its OBANSEQS chunk."""
     if not entries:
         return None
     out = []
-    for action, entry in entries:
-        out.append((entry["order"], _bone_sequence_chunk(action, entry, arm_obj,
-                                                         scale, y_down, fps)))
+    for order, (action, entry) in enumerate(entries):
+        position = int(entry["order"]) if entry else int(action.get("rif_index", order))
+        out.append((position, _bone_sequence_chunk(action, entry, bone.name, arm_obj,
+                                                   scale, y_down, fps, sub_ids)))
     out.sort(key=lambda t: t[0])
     children = out + list(_emit_from(bone.get("rif_anim_absorbed")))
     children.sort(key=lambda t: t[0])
     return rif.Chunk(b"OBANSEQS", b"", [c for _, c in children])
 
 
-def _bone_sequence_chunk(action, entry, arm_obj, scale, y_down, fps):
-    """One (Action, bone) pair back into an OBANSEQC chunk."""
-    bone_name = entry["bone"]
-    duration_s = float(entry.get("duration_s", 1.0)) or 1.0
+def _action_extent(action):
+    """``(first, last)`` keyframe position over every bone this Action animates.
+
+    Read off the curves rather than from ``action.frame_range``, which pads a
+    single-key Action out to a whole frame and would put that key's `time`
+    somewhere other than 0.
+    """
+    lo, hi = None, None
+    for fc in _iter_fcurves(action):
+        for kp in fc.keyframe_points:
+            f = float(kp.co[0])
+            lo = f if lo is None or f < lo else lo
+            hi = f if hi is None or f > hi else hi
+    return None if lo is None else (lo, hi)
+
+
+def _keyframe_positions(curves):
+    """Every distinct frame any of this bone's curves has a key at, sorted.
+
+    The union rather than one curve's, because Blender keys each channel
+    separately and a `.rif` frame is a bone's whole transform: a key on Z alone
+    still has to become an OBASEQFR, with the other channels sampled there.
+    """
+    seen = []
+    for group in curves.values():
+        for fc in group.values():
+            for kp in fc.keyframe_points:
+                f = float(kp.co[0])
+                if not any(abs(f - g) < 1e-4 for g in seen):
+                    seen.append(f)
+    return sorted(seen)
+
+
+def _bone_sequence_chunk(action, entry, bone_name, arm_obj, scale, y_down, fps, sub_ids):
+    """One (Action, bone) pair back into an OBANSEQC chunk.
+
+    **The frame list comes from the F-curves, not from what the import recorded.**
+    It used to be the other way round -- the stored list was iterated and the
+    curves merely sampled at those times -- which meant inserting a keyframe in
+    Blender changed what a pose looked like but could never change how many
+    frames the sequence had, and an Action created from scratch produced nothing
+    at all.
+
+    What the import recorded is still used, as *anchors*: a key that came from
+    the file keeps its exact ``time``, because those values are authored and no
+    formula reproduces them (see `heads.sequence_times`).
+    """
+    # `duration_s` is deliberately not read here any more. It was how the old
+    # code turned a stored `time` back into a frame position to sample at;
+    # positions now come from the keyframes themselves, and the duration itself
+    # rides through untouched in OBASEQTM.
+    entry = entry or {}
     rest_rel = _rest_relative(arm_obj.data.bones[bone_name])
 
     base = 'pose.bones["%s"].' % bpy.utils.escape_identifier(bone_name)
@@ -1184,9 +1703,18 @@ def _bone_sequence_chunk(action, entry, arm_obj, scale, y_down, fps):
         if fc.data_path.startswith(base):
             curves.setdefault(fc.data_path[len(base):], {})[fc.array_index] = fc
 
+    anchors = [(float(k["frame"]), int(k["time"])) for k in entry.get("keys", ())]
+    # An imported sequence with no keys at all is one of the 973 empty ones; it
+    # still has to come back, so an empty frame list is not the same as no entry.
+    positions = _keyframe_positions(curves)
+    times = heads.sequence_times(positions, anchors, _action_extent(action))
+    flags_at = {float(k["frame"]): int(k["flags"]) for k in entry.get("keys", ())}
+    sounds_at = [(float(e["frame"]), int(e["index"]))
+                 for e in action.get("rif_sound_events", ())
+                 if e["bone"] == bone_name]
+
     frames = []
-    for n, meta in enumerate(entry.get("frames", ())):
-        t = float(meta["time"]) / FIXED_ONE * duration_s * fps
+    for n, (t, time_value) in enumerate(zip(positions, times)):
         loc = [curves.get("location", {}).get(i).evaluate(t)
                if curves.get("location", {}).get(i) else 0.0 for i in range(3)]
         quat = [curves.get("rotation_quaternion", {}).get(i).evaluate(t)
@@ -1195,19 +1723,37 @@ def _bone_sequence_chunk(action, entry, arm_obj, scale, y_down, fps):
         basis = (mathutils.Matrix.Translation(loc)
                  @ mathutils.Quaternion(quat).to_matrix().to_4x4())
         local = rest_rel @ basis
+        # The residual flags -- bit 31 and AvP's low mask -- are preserved from the
+        # file and never generated; a new key gets 0, which is what 96.8% of
+        # shipped frames carry. The sound index is spliced back in from the
+        # Action's own event list, so a sound is edited in exactly one place.
+        flags = next((v for f, v in flags_at.items() if abs(f - t) < 1e-4), 0)
+        sound = next((v for f, v in sounds_at if abs(f - t) < 1e-4), 0)
+        flags = (_to_unsigned32(flags) & ~heads.FRAME_SOUND_INDEX_MASK) \
+            | ((sound & 0x7F) << 24)
         props = {
             "rotation": list(quat_to_rif(local.to_quaternion(), y_down)),
             "position": list(to_rif(local.to_translation(), scale, y_down)),
-            "time": int(meta["time"]),
-            "frame_index": int(meta["frame_index"]),
-            "flags": _to_signed32(int(meta["flags"])),
-            "field_0x28": int(meta["field_0x28"]),
+            "time": int(time_value),
+            # `frame_index` is the position in the list, in 323,334 of 323,334
+            # shipped frames, so it is regenerated and insertion renumbers.
+            "frame_index": n,
+            "flags": _to_signed32(flags),
+            "num_extra_data": 0,  # zero in every shipped frame
         }
         frames.append((n, rif.Chunk(b"OBASEQFR", schema.encode(b"OBASEQFR", props))))
 
-    children = frames + list(_emit_from(entry.get("absorbed")))
-    children.sort(key=lambda t: t[0])
-    return rif.Chunk(b"OBANSEQC", b"", [c for _, c in children])
+    # Order is not negotiable and not guessed: OBASEQHD is child 0 in all 29,550
+    # shipped sequences, the frames follow it, and the optional extras
+    # (OBASEQFL / OBASEQTM / OBASEQSP / HIERBBOX) come after those. Offsetting
+    # the absorbed extras past the frame count is what keeps that true when a
+    # sequence gains keys.
+    name = action.get("rif_sequence", action.name)
+    head = rif.Chunk(b"OBASEQHD", heads.make_seqhead(name, sub_ids.get(action.name, 0)))
+    extras = _apply_sequence_settings(action, _emit_from(entry.get("absorbed")))
+    extras = sorted(extras, key=lambda t: t[0])
+    ordered = [head] + [c for _, c in frames] + [c for _, c in extras]
+    return rif.Chunk(b"OBANSEQC", b"", ordered)
 
 
 
@@ -1495,6 +2041,9 @@ def build_scene(root, name, scale=DEFAULT_SCALE, y_down=True, fps=30.0,
     stats["texture_root"] = root_dir
     stats["textures"] = len(_CTX["textures"])
 
+    _CTX["sounds"] = _read_sound_table(root, collection)
+    stats["sounds"] = len(_CTX["sounds"])
+
     kids = list(root.children or ())
     pairs = _shape_pairs(root)
     consumed = set(pairs.values())
@@ -1505,6 +2054,8 @@ def build_scene(root, name, scale=DEFAULT_SCALE, y_down=True, fps=30.0,
             continue  # built as the mesh of the object that names it
         if kid.id == b"OBJCHIER":
             continue  # the armature owns the whole hierarchy
+        if kid.id in _SOUND_CHUNKS and _CTX["sounds"]:
+            continue  # lifted onto the collection as a table, rebuilt on export
         if kid.children is None and kid.id not in LEAF_AS_OBJECT:
             absorbed.append(("%s:%d" % (kid.name, i), schema.decode(kid.id, kid.body)))
             continue
@@ -1522,6 +2073,10 @@ def build_scene(root, name, scale=DEFAULT_SCALE, y_down=True, fps=30.0,
         stats["objects"] += 1
 
     collection["rif_absorbed"] = _pack_absorbed(absorbed)
+    sound_dir = _sound_root(source_path, "") if load_images else None
+    collection["rif_sound_dir"] = sound_dir or ""
+    stats["speakers"], stats["sounds_loaded"] = _build_speakers(
+        collection, _CTX["sounds"], sound_dir)
     stats["images"] = len(_CTX["images"])
     stats["missing_textures"] = sorted(_CTX["missing_textures"])
     stats["undecodable_textures"] = sorted(_CTX["undecodable_textures"])
@@ -1722,10 +2277,42 @@ def _shape_chunk_from_mesh(obj, me, scale, y_down, stats, textures=None):
         (5, rif.Chunk(b"SHPCENTR", shp.centre_body(verts))),
         (6, rif.Chunk(b"SHPMRGDT", struct.pack("<%di" % len(merge), *merge))),
     ]
-    children += [(7 + i, c) for i, (_, c) in enumerate(_emit_absorbed(me))]
+    absorbed = [c for _, c in _emit_absorbed(me)]
+    _sync_shape_header(absorbed, obj, verts, len(polys))
+    children += [(7 + i, c) for i, c in enumerate(absorbed)]
     children.sort(key=lambda t: t[0])
     stats["shapes"] += 1
     return rif.Chunk(b"REBSHAPE", b"", [c for _, c in children])
+
+
+def _sync_shape_header(children, obj, verts, num_polys):
+    """Bring this shape's ``SHPHEAD1`` back in line with the mesh, in place.
+
+    ``SHPHEAD1`` is not just an id: it carries ``num_verts``, ``num_polys``,
+    ``radius`` and the bounding box, all of which AvP's loader reads straight
+    into its shape record -- and Gunlok derives a role's collision extents from
+    the bounds whenever the GLS gives ``radius``/``height`` as 0. Carried
+    through unchanged, as every other absorbed chunk is, it goes stale the moment
+    a vertex moves, and for a shape authored in Blender it would never have been
+    right in the first place.
+
+    So the derived half is regenerated and the authored half (``flags``,
+    ``lock_user``, ``version_no``) is kept. The associated-object name list is
+    regenerated too, from the object that owns this mesh: AvP rebuilds it from
+    the same source on output, and it is what its by-name association falls back
+    to when the id pairing finds nothing. A shape **no object claims** -- Elint
+    MkII ships two -- has no such source, so its list is carried instead of being
+    emptied.
+    """
+    head = next((c for c in children if c.id == b"SHPHEAD1"), None)
+    if head is None:
+        return
+    names = heads.shphead_names(head.body)
+    if obj.get("rif_id") == "RBOBJECT":
+        name = rif_object_name(obj)
+        names = [name] if name else []
+    head.body = heads.sync_shphead(head.body, heads.shphead_file_id(head.body),
+                                   verts, num_polys, names)
 
 
 def _vtint_chunk(obj, me):
@@ -1859,7 +2446,8 @@ def rebuild_tree(collection, scale=None, y_down=None, fps=None):
     scale = collection.get("rif_scale", DEFAULT_SCALE) if scale is None else scale
     y_down = bool(collection.get("rif_y_down", True)) if y_down is None else y_down
     fps = float(collection.get("rif_fps", 30.0)) if fps is None else fps
-    stats = {"shapes": 0, "objects": 0, "lights": 0, "textures": 0, "new_textures": 0}
+    stats = {"shapes": 0, "objects": 0, "lights": 0, "textures": 0, "new_textures": 0,
+             "sounds": 0}
     # Read the rest pose, not whatever the animation system is posing right now.
     # This also runs the depsgraph, which export needs because matrix_world is
     # stale until it does.
@@ -1911,9 +2499,12 @@ def _rebuild(collection, scale, y_down, fps, stats):
         return rif.Chunk(cid, b"", [c for _, c in children])
 
     # File-level leaves (RIFVERIN, HIDEGDIS, ...) live on the collection, and so
-    # does the texture table -- as a table, so it is rebuilt rather than replayed.
-    top = _emit_from(collection.get("rif_absorbed"),
-                     table_extra if table_owner == "" else ())
+    # do the texture table and the sound table -- as tables, so they are rebuilt
+    # rather than replayed.
+    injected = list(table_extra) if table_owner == "" else []
+    injected += _sound_chunks(collection)
+    stats["sounds"] = len(injected) - (len(table_extra) if table_owner == "" else 0)
+    top = _emit_from(collection.get("rif_absorbed"), injected)
 
     for obj in by_parent.get(None, ()):
         if obj.type == "ARMATURE":
@@ -1926,3 +2517,415 @@ def _rebuild(collection, scale, y_down, fps, stats):
 
     top.sort(key=lambda t: t[0])
     return rif.Chunk(b"REBINFF2", b"", [c for _, c in top]), stats
+
+
+# --------------------------------------------------------------------------
+# authoring
+# --------------------------------------------------------------------------
+#
+# Everything above assumes the scene came from `build_scene`, because the
+# structural properties it reads -- `rif_id`, `rif_index`, `rif_objhead`,
+# `rif_absorbed` -- only exist on datablocks the importer minted. A mesh added
+# with Add > Mesh has none of them and `_rebuild` skips it in silence.
+#
+# So this section is the other way in: mint those properties directly. Two
+# identities are all that a hand-made object needs beyond its geometry, and both
+# are invisible in Blender's own UI, which is why they get accessors here rather
+# than being left to whoever remembers the byte offsets:
+#
+# - **the name**, which lives at OBJHEAD1+0x3c and is what the engine resolves by
+#   `strcmp` -- the map section's `name`, every `for "<rif object>"` spawn point,
+#   and OBJHIERD's node binding. Renaming the *Blender* object does not touch it.
+# - **the shape id**, OBJHEAD1+0x38 against SHPHEAD1+0x14, which is what pairs an
+#   object with its geometry. Duplicating an object in Blender duplicates the id
+#   too, and two objects claiming one shape is not representable on re-import.
+
+
+def rif_collections():
+    """Every collection in the file that stands for a RIF."""
+    return [c for c in bpy.data.collections if c.get("rif_id") == "REBINFF2"]
+
+
+def collection_for(obj):
+    """The RIF collection ``obj`` belongs to, or None."""
+    for coll in rif_collections():
+        if obj.name in coll.objects:
+            return coll
+    return None
+
+
+def _objhead(obj):
+    return heads.from_words(obj.get("rif_objhead", []))
+
+
+def _set_objhead(obj, body):
+    obj["rif_objhead"] = heads.to_words(body)
+
+
+def rif_object_name(obj):
+    """The name this object answers to *inside the file*.
+
+    For an ``RBOBJECT`` that is the trailing string in ``OBJHEAD1``; a
+    ``DUMMYOBJ`` keeps its own ``rif_name``, because ``_dumobj_chunk`` re-appends
+    the name from there on export.
+    """
+    if obj.get("rif_id") == "RBOBJECT":
+        return heads.objhead_name(_objhead(obj))
+    return obj.get("rif_name", "") or ""
+
+
+def set_rif_object_name(obj, name):
+    """Rename ``obj`` in the file, and follow it in the outliner.
+
+    Blender may uniquify ``obj.name``; the RIF name is stored separately and is
+    the authoritative one, so a suffixed outliner entry does not reach the file.
+    """
+    name = (name or "").strip()
+    cid = obj.get("rif_id")
+    if cid == "RBOBJECT":
+        _set_objhead(obj, heads.set_objhead_name(_objhead(obj), name))
+    elif cid != "DUMMYOBJ":
+        return False
+    obj["rif_name"] = name  # what the rig pass matches OBJHIERD against
+    if name:
+        obj.name = name
+    return True
+
+
+def _absorbed_entries(datablock):
+    return list(_unpack_absorbed(datablock.get("rif_absorbed")))
+
+
+def _rewrite_absorbed(datablock, cid, props):
+    """Replace the fields of the first absorbed ``cid``, keeping its path."""
+    entries = _absorbed_entries(datablock)
+    target = cid.decode("latin-1")
+    for i, (path, _fields) in enumerate(entries):
+        if path.rpartition("/")[2].rpartition(":")[0] == target:
+            entries[i] = (path, dict(props))
+            datablock["rif_absorbed"] = _pack_absorbed(entries)
+            return True
+    return False
+
+
+def _absorbed_body(datablock, cid):
+    target = cid.decode("latin-1")
+    for path, fields in _absorbed_entries(datablock):
+        if path.rpartition("/")[2].rpartition(":")[0] == target:
+            return heads.from_words(fields.get(schema.GENERIC_FIELD, []))
+    return b""
+
+
+def rif_shape_id(obj):
+    """The id pairing this object with its geometry, or -1."""
+    if obj.get("rif_id") != "RBOBJECT":
+        return -1
+    return heads.objhead_shape_id(_objhead(obj))
+
+
+def set_rif_shape_id(obj, shape_id):
+    """Set the id on **both** halves of the pair.
+
+    Setting only one of them is the failure this exists to prevent: the object
+    would name a shape that no ``SHPHEAD1`` claims, and re-import would give it
+    no mesh at all.
+    """
+    if obj.get("rif_id") != "RBOBJECT":
+        return False
+    _set_objhead(obj, heads.set_objhead_shape_id(_objhead(obj), shape_id))
+    me = obj.data
+    if me is not None and me.get("rif_id") in ("REBSHAPE", "SUBSHAPE"):
+        body = _absorbed_body(me, b"SHPHEAD1")
+        if body:
+            body = bytearray(body.ljust(heads.SHPHEAD1_HEADER, b"\0"))
+            struct.pack_into("<i", body, heads.SHPHEAD1_FILE_ID, shape_id)
+            _rewrite_absorbed(me, b"SHPHEAD1",
+                              {schema.GENERIC_FIELD: heads.to_words(bytes(body))})
+    return True
+
+
+def shape_id_users(collection):
+    """``{shape id: [object name, ...]}`` for every object that claims one."""
+    out = {}
+    for obj in collection.objects:
+        if obj.get("rif_id") != "RBOBJECT" or obj.data is None:
+            continue
+        out.setdefault(rif_shape_id(obj), []).append(obj.name)
+    return out
+
+
+def next_shape_id(collection):
+    used = [sid for sid in shape_id_users(collection) if sid >= 0]
+    return max(used, default=0) + 1
+
+
+def next_chunk_index(collection):
+    """The next free ``rif_index`` among the file's top-level children.
+
+    Objects, their meshes and the collection's own absorbed leaves all share one
+    numbering, because ``_rebuild`` sorts every top-level child by it.
+    """
+    used = [_path_index(path) for path, _ in _absorbed_entries(collection)
+            if "/" not in path]
+    for obj in collection.objects:
+        if "rif_id" not in obj:
+            continue
+        used.append(int(obj.get("rif_index", 0)))
+        if obj.data is not None and obj.data.get("rif_id") in ("REBSHAPE", "SUBSHAPE"):
+            used.append(int(obj.data.get("rif_index", 0)))
+    return max(used, default=-1) + 1
+
+
+#: The file-level chunks a new RIF starts with, in the order and at the sizes
+#: ``SQUARE.RIF`` -- the smallest shipped file, 1,004 bytes -- carries them.
+#: ``BMPNAMES`` is deliberately absent: ``_new_table_location`` appends it after
+#: ``REBENVDT``'s children the first time a material names a texture, which is
+#: also how the 36 shipped files without a table would gain one. ``BMNAMEXT`` is
+#: 52 bytes in all 563 files regardless of how many textures the table holds, so
+#: emitting it zeroed is not a guess about its contents scaling.
+def _file_level_chunks(stem):
+    endthead = bytearray(24)  # {flags, lock_user[16], version_no}
+    return [
+        ("RIFVERIN:0", {"version": 0}),
+        ("REBENVDT:1/ENDTHEAD:0", {schema.GENERIC_FIELD: heads.to_words(endthead)}),
+        ("REBENVDT:1/RIFFNAME:1", {"name": stem, "size": len(heads.pad_name(stem))}),
+        ("REBENVDT:1/BMNAMEXT:2", {schema.GENERIC_FIELD: [0] * 13}),
+        ("REBENVDT:1/BMNAMVER:3", {"version": 1}),
+    ]
+
+
+def new_collection(name, scale=DEFAULT_SCALE, y_down=True, fps=30.0):
+    """An empty RIF, ready for :func:`adopt_object` and then export."""
+    stem = os.path.splitext(os.path.basename(name))[0] or "untitled"
+    collection = bpy.data.collections.new(name)
+    bpy.context.scene.collection.children.link(collection)
+    collection["rif_id"] = "REBINFF2"
+    collection["rif_scale"] = scale
+    collection["rif_y_down"] = y_down
+    collection["rif_fps"] = fps
+    collection["rif_bmpnames"] = []
+    collection["rif_bmpnames_version"] = 1
+    collection["rif_absorbed"] = _pack_absorbed(_file_level_chunks(stem))
+    return collection
+
+
+def adopt_object(collection, obj, name=None):
+    """Give ``obj`` the properties that make it part of ``collection``'s file.
+
+    A mesh becomes an ``RBOBJECT`` with its own ``REBSHAPE``; an empty becomes an
+    ``RBOBJECT`` with no geometry. Returns a message on refusal, ``None`` on
+    success.
+
+    **The empty is the unattested case, and a mesh is the way a shipped level
+    does it.** ``level01.RIF``'s spawn points are ordinary ``RBOBJECT``s carrying
+    a 24-vertex marker mesh, and its ``camhund`` camera plane is a 4-vertex quad;
+    across all 563 files the id pairing resolves every one of the 9,313 objects,
+    so **no shipped object is geometry-less**. An empty is therefore a shape the
+    format allows and the assets never take -- offered because it is the obvious
+    thing to reach for, but a small mesh is the choice with evidence behind it.
+
+    ``DUMMYOBJ`` is not offered at all: whether the engine's
+    ``RifFilterObjectsByName`` -- which is what resolves a ``for "<rif object>"``
+    spawn point -- looks at dummies has not been measured.
+    """
+    if "rif_id" in obj:
+        return "%s is already in a RIF collection" % obj.name
+    if obj.type not in ("MESH", "EMPTY", "ARMATURE"):
+        return "%s is a %s; only meshes, empties and armatures can be RIF objects" % (
+            obj.name, obj.type.lower())
+
+    if obj.type == "ARMATURE":
+        # An armature is the file's OBJCHIER tree, not an object in it, so it
+        # takes none of the per-object bookkeeping below -- `_rebuild` routes it
+        # to `_armature_chunks` before ever reading `rif_objhead`. Without the
+        # marker it is skipped in silence like any other unadopted datablock.
+        obj["rif_id"] = "OBJCHIER"
+        for bone in obj.data.bones:
+            adopt_bone(obj, bone)
+        _link_into(collection, obj)
+        return None
+
+    name = (name or obj.name).strip() or "object"
+    index = next_chunk_index(collection)
+    shape_id = -1
+
+    me = obj.data if obj.type == "MESH" else None
+    if me is not None:
+        shape_id = next_shape_id(collection)
+        me["rif_id"] = "REBSHAPE"
+        me["rif_index"] = index + 1
+        me["rif_absorbed"] = _pack_absorbed([
+            ("SHPHEAD1:0", {schema.GENERIC_FIELD: heads.to_words(
+                # The counts and bounds here are provisional: every export
+                # regenerates them from the mesh (see `_sync_shape_header`), so
+                # this only has to be a well-formed record with the right id.
+                heads.make_shphead([name], shape_id, [], 0))}),
+        ])
+        _ensure_mesh_attributes(me)
+
+    obj["rif_id"] = "RBOBJECT"
+    obj["rif_index"] = index
+    obj["rif_name"] = name
+    _set_objhead(obj, heads.make_objhead(name, shape_id=shape_id))
+
+    # OBINTDT holds the editor's note string and is present on all 9,313 shipped
+    # objects, so a new one gets an empty note rather than no chunk.
+    obj["rif_absorbed"] = _pack_absorbed([
+        ("OBINTDT\0:0/OBJNOTES:0", {schema.GENERIC_FIELD: heads.to_words(b"\0\0\0\0")}),
+    ])
+
+    _link_into(collection, obj)
+    if obj.rotation_mode != "QUATERNION":
+        obj.rotation_mode = "QUATERNION"
+    return None
+
+
+def _link_into(collection, obj):
+    if obj.name in collection.objects:
+        return
+    for other in list(obj.users_collection):
+        other.objects.unlink(obj)
+    collection.objects.link(obj)
+
+
+def adopt_bone(arm_obj, bone):
+    """Give a hand-added bone the bookkeeping export reads.
+
+    Only ``rif_index`` (its order among its siblings) is really needed -- nesting
+    comes from ``bone.parent`` and the binding is regenerated -- so this is
+    mostly about making a new bone indistinguishable from an imported one in the
+    panel. A bone with no ``rif_path`` still exports; the path is carried only so
+    an absorbed chunk knows where it came from.
+    """
+    if "rif_index" in bone:
+        return False
+    siblings = [b for b in arm_obj.data.bones if b.parent is bone.parent]
+    bone["rif_index"] = max((int(b.get("rif_index", -1)) for b in siblings), default=-1) + 1
+    bone["rif_bound"] = ""
+    bone["rif_absorbed"] = _pack_absorbed([])
+    bone["rif_hierd_index"] = 0
+    return True
+
+
+def adopt_action(arm_obj, action, name=None):
+    """Mark an Action as one of this rig's sequences.
+
+    Marked rather than auto-detected: an Action is not owned by the object it is
+    assigned to, and sweeping up every Action with pose-bone curves would export
+    whatever someone was experimenting with. ``_sequence_ids`` allocates the
+    per-file sequence id on the next export.
+    """
+    if action.get("rif_id") == "OBANSEQC":
+        return "%s is already a sequence" % action.name
+    existing = _rif_actions(arm_obj)
+    action["rif_id"] = "OBANSEQC"
+    action["rif_sequence"] = (name or action.name).strip() or action.name
+    action["rif_index"] = max((int(a.get("rif_index", -1)) for a in existing), default=-1) + 1
+    action.use_fake_user = True
+    for bone_name in _animated_bones(action):
+        bone = arm_obj.data.bones.get(bone_name)
+        if bone is not None:
+            adopt_bone(arm_obj, bone)
+    return None
+
+
+def add_sound(collection, path, sound_file=None):
+    """Add a table entry, as a Speaker. Returns the new Speaker object.
+
+    ``path`` is what the file stores, relative to the install's ``Sound`` folder
+    and backslash-separated (``Robots\\GL_click08.wav``). The audio is optional
+    and only ever loaded for audition -- export writes the path, never the wave.
+    """
+    index = next_sound_index(collection)
+    entry = snd.make_entry(index, path)
+    spk = bpy.data.speakers.new("snd_%02d_%s" % (index, snd.basename(path)))
+    obj = bpy.data.objects.new(spk.name, spk)
+    collection.objects.link(obj)
+    _apply_sound_entry(spk, entry)
+    if sound_file and os.path.isfile(sound_file):
+        # A sound that will not load is never worth failing the operator: the
+        # path is what exports, and the audio is only for audition.
+        with contextlib.suppress(Exception):
+            spk.sound = bpy.data.sounds.load(sound_file, check_existing=True)
+    return obj
+
+
+def sound_events(action):
+    """``[{bone, frame, index}]`` for one Action, as stored."""
+    out = []
+    for e in action.get("rif_sound_events", ()):
+        out.append({"bone": e["bone"], "frame": float(e["frame"]), "index": int(e["index"])})
+    return out
+
+
+def set_sound_event(action, bone_name, frame, index):
+    """Put (or clear, with ``index`` 0) a sound on one key of one bone.
+
+    Matched with the same tolerance keyframe anchors use, so an event set here
+    lands on an existing key rather than beside it.
+    """
+    events = [e for e in sound_events(action)
+              if not (e["bone"] == bone_name and abs(e["frame"] - frame) < 1e-4)]
+    if index:
+        events.append({"bone": bone_name, "frame": float(frame), "index": int(index)})
+    events.sort(key=lambda e: (e["bone"], e["frame"]))
+    action["rif_sound_events"] = events
+    return True
+
+
+def sequence_setting(action, cid):
+    """One optional setting's value, or None when the sequence has none."""
+    prop = SEQUENCE_SETTINGS[cid]
+    if prop not in action:
+        return None
+    value = action[prop]
+    return list(value) if cid == b"OBASEQSP" else int(value)
+
+
+def set_sequence_setting(action, cid, value):
+    """Set a setting, or remove it with ``value=None``.
+
+    Removing is a real edit -- most sequences carry none of the three -- so this
+    deletes the property rather than storing a sentinel.
+
+    Marks the setting **edited**, which is what licenses export to overwrite the
+    file's own per-bone bodies with this one value. Until then they are left
+    alone, because a few shipped sequences really do carry different values on
+    different bones.
+    """
+    prop = SEQUENCE_SETTINGS[cid]
+    if value is None:
+        if prop in action:
+            del action[prop]
+    else:
+        action[prop] = [int(v) for v in value] if cid == b"OBASEQSP" else int(value)
+    edited = set(action.get("rif_seq_edited", ()))
+    edited.add(cid.decode("ascii"))
+    action["rif_seq_edited"] = sorted(edited)
+
+
+def rif_armature(collection):
+    """The collection's rig, or None. There is at most one."""
+    for obj in collection.objects if collection else ():
+        if obj.type == "ARMATURE":
+            return obj
+    return None
+
+
+#: A polygon's engine type, flags and "did this have UVs" have no Blender
+#: equivalent, so they ride as face attributes. Export defaults each of them
+#: when the layer is missing; creating them up front is what makes them
+#: *editable* in the spreadsheet rather than fixed at the default.
+def _ensure_mesh_attributes(me):
+    for attr_name, kind, default in (("rif_engine_type", "INT", 3),
+                                     ("rif_flags", "INT", 0),
+                                     ("rif_merge_group", "INT", -1)):
+        if me.attributes.get(attr_name) is None:
+            attr = me.attributes.new(attr_name, kind, "FACE")
+            for item in attr.data:
+                item.value = default
+    if me.attributes.get("rif_has_uv") is None:
+        attr = me.attributes.new("rif_has_uv", "BOOLEAN", "FACE")
+        has_uv = bool(me.uv_layers)
+        for item in attr.data:
+            item.value = has_uv

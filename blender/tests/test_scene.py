@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(HERE, "..", "io_scene_rif"))
 
 import bmpnames  # noqa: E402
+import heads  # noqa: E402
 import rif  # noqa: E402
 import schema  # noqa: E402
 import shapes as shp  # noqa: E402
@@ -90,15 +91,15 @@ def summarize(root):
                     # the way in and back on the way out, so this is what proves
                     # the two halves agree.
                     #
-                    # Compared to a hundredth of a texel rather than exactly:
-                    # scaling is exact (every texture is a power of two) but the
-                    # V *flip* is not, because `1 - v/h` moves a fractional value
-                    # to an exponent where float32 has fewer bits left for it.
-                    # The drift is around 3e-5 of a texel, i.e. 3e-8 of the
-                    # image, and only the 0.5% of shipped UVs that are not whole
-                    # numbers can show it at all.
+                    # Kept at full precision and reconciled with a tolerance by
+                    # `uv_residue` below. This used to round to a hundredth of a
+                    # texel instead, to absorb the V-flip drift -- but rounding
+                    # does not absorb drift, it only moves the cliff: a value
+                    # sitting within 3e-5 of a `.xx5` boundary lands on either
+                    # side of it and reads as a whole hundredth of difference.
+                    # `Skeleton.RIF`'s skull has 11 such coordinates.
                     "uvs": collections.Counter(
-                        (p.texture_index,) + tuple(round(c, 2) for uv in (s.uvs_for(p) or ())
+                        (p.texture_index,) + tuple(c for uv in (s.uvs_for(p) or ())
                                                    for c in uv)
                         for p in s.polys),
                 }
@@ -113,16 +114,88 @@ def summarize(root):
         lights.append((tuple(p["position"]), p["colour"], p["range"]))
     lights.sort()
 
+    # Name, id and every frame time -- not just the frame count. Export
+    # regenerates OBASEQHD and places each frame's `time` itself, so a count
+    # alone would pass while the sequence was renamed, re-ided or re-timed.
     seqs = []
     for c in root.walk():
         if c.id != b"OBANSEQC":
             continue
-        seqs.append(len([k for k in (c.children or ()) if k.id == b"OBASEQFR"]))
-    seqs.sort()
+        frames = [k for k in (c.children or ()) if k.id == b"OBASEQFR"]
+        head = c.find(b"OBASEQHD")
+        decoded = [schema.decode(b"OBASEQFR", k.body) for k in frames]
+        times = tuple(d["time"] for d in decoded)
+        # The whole flags word, so the sound index -- which is now split out of it
+        # on import and spliced back on export -- has to come back bit for bit,
+        # along with the residual nobody understands.
+        flags = tuple(d["flags"] & 0xFFFFFFFF for d in decoded)
+        # The three optional settings are now regenerated from Action properties
+        # rather than carried, so which sequences have them -- and on which bones
+        # -- has to come back exactly. Most carry none, and that is a state too.
+        optional = tuple(bytes(c.find(cid).body) if c.find(cid) is not None else None
+                         for cid in (b"OBASEQTM", b"OBASEQFL", b"OBASEQSP"))
+        seqs.append((heads.seqhead_name(head.body) if head is not None else "",
+                     heads.seqhead_fields(head.body)[2] if head is not None else -1,
+                     len(frames), times, flags, optional))
+    seqs.sort(key=lambda s: (s[0], s[1], s[2], s[3], s[4],
+                             tuple(b"" if x is None else x for x in s[5])))
+
+    # The sound table is held to byte-exactness, like the texture table: it is
+    # carried rather than regenerated, so an export that touched no speaker has
+    # no reason to disturb a byte -- uninitialised path padding included.
+    sound_bodies = sorted(bytes(c.body) for c in root.walk() if c.id == b"INDSOUND")
+
+    # OBJHIERD is regenerated from the object each node drives, so the bindings
+    # are what proves a rename followed the rig instead of breaking it.
+    bindings = sorted(heads.objhierd_name(c.body)
+                      for c in root.walk() if c.id == b"OBJHIERD")
 
     table = next((c for c in root.walk() if c.id == b"BMPNAMES"), None)
     return {"objects": objects, "lights": lights, "sequences": seqs,
+            "bindings": bindings, "sounds": sound_bodies,
             "table": table.body if table is not None else None}
+
+
+#: How far a UV coordinate may move through an import/export cycle before it
+#: counts as a difference, in texels. The V flip is the only inexact step --
+#: `1 - v/h` moves a fractional value to an exponent where float32 has fewer bits
+#: left for it, while the scaling either side is exact because every texture in
+#: the game is a power of two. Measured worst case across the shipped files is
+#: **3.05e-05** texels (median 1.9e-05), so this is 30x headroom and still a
+#: thousandth of a pixel.
+UV_TOLERANCE = 1e-3
+
+
+def uv_residue(got_uvs, want_uvs):
+    """The UV sets in ``got`` that no set in ``want`` accounts for.
+
+    Exact matches cancel in the multiset difference, which is nearly all of them.
+    Whatever is left is then paired off against the *lost* sets within
+    :data:`UV_TOLERANCE` -- so a polygon whose V drifted by a hundred-thousandth
+    of a texel cancels, and one that genuinely gained a UV does not.
+
+    Rounding the keys instead, which is what this replaced, cannot do that: it
+    buys a tolerance everywhere except at the bucket boundaries, which is exactly
+    where a small drift shows up.
+    """
+    gained = got_uvs - want_uvs
+    if not gained:
+        return gained
+    lost = want_uvs - got_uvs
+    out = collections.Counter()
+    for key, count in gained.items():
+        for other in list(lost):
+            if lost[other] <= 0 or len(other) != len(key) or other[0] != key[0]:
+                continue
+            if all(abs(x - y) <= UV_TOLERANCE for x, y in zip(key[1:], other[1:])):
+                take = min(count, lost[other])
+                count -= take
+                lost[other] -= take
+                if not count:
+                    break
+        if count:
+            out[key] = count
+    return out
 
 
 def compare(name, want, got):
@@ -159,8 +232,8 @@ def compare(name, want, got):
             check(False, "%s: %s gained texture indices %r"
                   % (name, a["name"], dict(sb["textures"] - sa["textures"])))
             break
-        gained_uvs = sb["uvs"] - sa["uvs"]
-        if sa and gained_uvs:
+        gained_uvs = uv_residue(sb["uvs"], sa["uvs"]) if sa else collections.Counter()
+        if gained_uvs:
             sample = next(iter(gained_uvs))
             check(False, "%s: %s has %d UV set(s) that were not in the source, e.g. %r"
                   % (name, a["name"], sum(gained_uvs.values()), sample[:7]))
@@ -168,7 +241,13 @@ def compare(name, want, got):
     check(want["lights"] == got["lights"],
           "%s: %d lights match (%d in)" % (name, len(got["lights"]), len(want["lights"])))
     check(want["sequences"] == got["sequences"],
-          "%s: animation frame counts match (%d sequences)" % (name, len(want["sequences"])))
+          "%s: sequences match by name, id, frame count, every frame time, every "
+          "flags word and all three optional chunks (%d sequences)"
+          % (name, len(want["sequences"])))
+    check(want["sounds"] == got["sounds"],
+          "%s: %d INDSOUND entr(ies) rebuild byte for byte" % (name, len(want["sounds"])))
+    check(want["bindings"] == got["bindings"],
+          "%s: %d hierarchy binding(s) match" % (name, len(want["bindings"])))
     check((want["table"] is None) == (got["table"] is None),
           "%s: texture table presence differs" % name)
     if want["table"] is not None and got["table"] is not None:
