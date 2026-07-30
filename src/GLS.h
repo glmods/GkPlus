@@ -336,6 +336,72 @@ static_assert(sizeof(ParsedObjectList) == 0x10);
 // itself loading a level.
 ParsedObjectList *LoadGLS(const char *file, int mode = 1);
 
+// --- Parsing from memory --------------------------------------------------------
+//
+// The parser does not need a file. It takes its input through a source object with
+// a 3-slot vtable {dtor, Read, GetFileName} - the file-backed one is `File`
+// @ vtbl 0x00652904, and the *second pass* already uses a memory-backed
+// implementation of the same shape (`ReadRecordedText` @ 0x004770a0, no FILE * in
+// sight). Better still, `File` is itself a hybrid: File::ReadFile @ 0x00477ac0
+// reads its FILE * and then TOPS UP from an in-memory tail whenever that read came
+// up short, which is how LoadGLS guarantees a trailing newline for a file that
+// lacks one (it puts a 2-byte "\n" there).
+//
+// So a File whose FILE * is null and whose tail is a whole script feeds the parser
+// entirely from memory, using the game's own class. Two measurements make that
+// safe rather than merely clever:
+//
+//   * a null FILE * is NOT fatal. LoadGLS reports it through PrintParseError,
+//     which increments ParseErrorCount @ 0x00739a38 - and that global has no
+//     readers anywhere in the binary. What poisons the parser after a syntax error
+//     is the un-reset file stack, not this counter.
+//   * PushFileToParserStack @ 0x00477140 is the only seam between LoadGLS building
+//     the File and ParseGSH consuming it, and it takes the source as its only
+//     argument. Five call sites, all inside the parser.
+//
+// `display_name` is what the parser calls the source in its diagnostics, and it is
+// a NAME, not a path: nothing opens it. It does end up inside a synthesized
+// '# line 1 "<name>"' directive that pass 2 re-lexes, so it must not contain a
+// double quote. Backslashes are fine (every shipped script has paths in strings).
+//
+// Same hazards as LoadGLS otherwise: destructive global parser state, one thread,
+// never during a level load, and a syntax error poisons every later parse.
+ParsedObjectList *ParseSource(const char *source, const char *display_name,
+                              int mode = 1);
+
+// The arming half of ParseSource, for the one caller that cannot use it: a hook on
+// LoadGLS itself, which has to reach the original through its own Detours
+// trampoline rather than through gls::LoadGLS (that holds the raw address and
+// would re-enter the hook). Arm, then call the trampoline:
+//
+//   gls::SourceTextScope armed{file, source};
+//   return LoadGLS(file, mode);   // the hook's trampoline
+//
+// The arming is one-shot - it is consumed by the first pushed source whose name
+// matches, so an #include inside the text cannot be hijacked - and scoped, so a
+// name that never arrives leaves nothing behind.
+class SourceTextScope {
+public:
+  SourceTextScope(const char *display_name, const char *source);
+  ~SourceTextScope();
+  SourceTextScope(const SourceTextScope &) = delete;
+  SourceTextScope &operator=(const SourceTextScope &) = delete;
+
+private:
+  const char *previous_name_;
+  const char *previous_text_;
+};
+
+// Detours PushFileToParserStack, which is what lets ParseSource hand the parser a
+// source text instead of a file. RAII, like every other *System - construct and
+// destroy inside a Detours transaction. Nothing else in this header needs it: the
+// rest resolves its offsets lazily per call.
+class GlsSystem {
+public:
+  GlsSystem();
+  ~GlsSystem();
+};
+
 // Converts every parsed object into live game data (roles are registered in the
 // roles hash, ammo fills the ammo tables, maps load level geometry, ...) and
 // releases the objects. The list must not be used afterwards.
@@ -427,7 +493,7 @@ const FieldInfo *FindField(SectionType type, const char *name);
 // rather than stored as strings, so they cannot be read out of the binary - but
 // the parser will happily tell us, if asked in the right shape.
 //
-// ProbeKeywords writes a throwaway script with one section per keyword, each
+// ProbeKeywords builds a throwaway script in memory - one parse per keyword, each
 // carrying just the field under test:
 //
 //     ammo info GkPlusProbe0 { ammo type flares }

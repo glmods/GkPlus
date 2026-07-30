@@ -1643,7 +1643,10 @@ declare module "gk" {
     destructibility?: DestructibilityDesc;
     inventory_shape?: AssetRef;
     inventory_hierarchy?: AssetRef;
-    /** An AI keyword (`bot`, `turret`, `background creature`, ...) or its id. */
+    /** An AI keyword or its id. The keyword is the **underscored** name from
+     *  `roles.ai_types` (`bot`, `turret`, `background_creature`), matched with a
+     *  plain strcmp - the GLS spelling `background creature` raises a RangeError,
+     *  it is not folded. */
     ai?: string | number;
     /** `must drop` / `must not drop`, or the id. */
     action_on_death?: string | number;
@@ -1735,9 +1738,12 @@ declare module "gk" {
     ammo(desc: AmmoDesc): boolean;
     /** Fills AmmoInfos[ammo_type]. */
     ammo_info(desc: AmmoInfoDesc): boolean;
-    /** Needs a loaded level: it binds against the level .rif by name. */
+    /** Needs a loaded level: it offsets the path by the map origin. `name` is
+     *  matched against the cutscene tracks in the .rif named by `file`; both
+     *  are required. */
     camera_track(desc: {
       name: string;
+      file: string;
       pgen?: ParticleGeneratorDesc;
       pgen2?: ParticleGeneratorDesc;
     }): boolean;
@@ -1818,13 +1824,19 @@ declare module "gk" {
    *  `levels.add` and arrives at every load callback. */
   export interface Level {
     readonly title: string;
-    /** The generated prelude script, which is this level's ScriptFileName. */
+    /** This level's ScriptFileName - `gkplus\<slug>.gls`. A virtual name: no file
+     *  of that name exists, and nothing on any load path opens it. */
     readonly script_file: string;
     /** A snapshot of the map description, rebuilt on every read. */
     readonly map: Required<LevelMap>;
     /** True while any of this level's load callbacks is running: `define`,
      *  `populate` or `setup`. */
     readonly loading: boolean;
+
+    /** `levels.start(this, options)` - starts this level, no menus, no
+     *  briefing. Deferred to the next turn of the message loop; see
+     *  `levels.start` for what that means and what it throws. */
+    start(options?: { difficulty?: DifficultyName | number }): boolean;
 
     /** Every object of that name in the level .rif, in the coordinates the game
      *  would have spawned a placed object at. Throws outside a load callback,
@@ -1934,7 +1946,54 @@ declare module "gk" {
      *  Either way the map is validated here, through the game's own field
      *  checks, so a bad value throws now rather than halfway through a load. */
     add(title: string, source: LevelDescription | LevelModule): Level;
+
+    /** Every level `start` will take by name: the campaign missions the main
+     *  menu seeds, anything `screen.add_mission` added, and every level
+     *  `levels.add` registered - they all live in the game's one LevelList, in
+     *  Choose Level order. */
+    readonly startable: readonly StartableLevel[];
+
+    /** Starts a level outright, with no menus and no briefing screen.
+     *
+     *  The target is a `Level` from `levels.add`, a title from `startable`
+     *  (case-insensitive), or `{script, console}` for a .gls that was never
+     *  registered. `difficulty` takes the same names `game.difficulty` does
+     *  and defaults to "medium".
+     *
+     *  **The load happens at the next turn of the message loop, not here.**
+     *  LoadLevel may not run inside the renderer, and in a level the script
+     *  host's frame callback is driven from inside PresentScene - so this is
+     *  callable from anywhere (the REPL, `draw_gui`, a `message_received`) and
+     *  returns as soon as the request is accepted. Everything that can be
+     *  wrong with the *request* still throws right here; watch `game.state` or
+     *  `actors.count` for the result.
+     *
+     *  Single player only: the sequence forces `GameMode`, so it throws while
+     *  a multiplayer session is live. */
+    start(
+      target: Level | string | { script: string; console?: string },
+      options?: { difficulty?: DifficultyName | number },
+    ): boolean;
+
+    /** Ends the session and returns to the main menu. Deferred like `start`. */
+    quit(): boolean;
+
+    /** True between `start`/`quit` and the load actually running. A second
+     *  request while one is pending throws rather than replacing it. */
+    readonly start_pending: boolean;
+
     [Symbol.iterator](): IterableIterator<Level>;
+  }
+
+  /** One entry of the game's LevelList - what `levels.start` accepts by name. */
+  export interface StartableLevel {
+    /** Position in Choose Level, which is also the list order. */
+    readonly index: number;
+    readonly title: string;
+    /** The .gls, or a script-defined level's virtual `gkplus\\<slug>.gls`. */
+    readonly script: string;
+    /** The .gcs. Empty for every script-defined level. */
+    readonly console: string;
   }
 
   /** The levels this script registered, keyed by registration order and by

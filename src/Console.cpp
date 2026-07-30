@@ -77,9 +77,18 @@ int GetCommandTableBucketCount() {
 }
 
 CommandListElem **GetCommandTable() {
-  CommandListElem **p;
+  // Three stars, and the dereference, are both load-bearing: 0x007b6a7c *holds* the
+  // bucket array rather than being it. Every game reader loads the value
+  // (`MOV EAX,[0x007b6a7c]` in RegisterConsoleCommand, CommandListCommands,
+  // FreeCommands, ...), so returning the address of the global instead walked
+  // `&CommandTableBuckets` as if it were the array: element 0 was the real array
+  // pointer chased as a chain node, and element 1 onwards were the neighbouring
+  // globals - ConsoleTextScrollTarget @ 0x007b6a80 is a float. It faulted on the
+  // first `e->command` every time, which made `console.commands` a guaranteed
+  // access violation.
+  CommandListElem ***p;
   GetObjectAtOffset(p, 0x007b6a7c);
-  return p;
+  return *p;
 }
 
 int GetCommandCondition() {

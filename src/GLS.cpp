@@ -2,11 +2,19 @@
 
 #include "Console.h"
 #include "Core.h"
+#include "Memory.h"
 
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h> // GetTempPath / CreateDirectory / DeleteFile for the probe
+#include <windows.h> // before detours.h, which needs its architecture macros
+
+#include <detours.h>
+
+// Not DetourUtils.h: its gk::DetourAttach overloads are for __thiscall member
+// pointers, and merely declaring them inside namespace gk hides the global
+// templates that handle a plain function pointer.
 
 #include <cstdio>
+#include <cstring>
 #include <iterator>
 
 namespace gk::gls {
@@ -101,6 +109,113 @@ SectionType ParsedThing::type() const {
 ParsedObjectList *LoadGLS(const char *file, int mode) {
   EnsureResolved();
   return Game.LoadGLS(file, mode);
+}
+
+// --- Parsing from memory --------------------------------------------------------
+
+namespace {
+// The parser's file-backed input source: the game's `File`, vtbl @ 0x00652904.
+// LoadGLS builds it inline, so there is no constructor to call and no dtor to
+// reproduce - the vtable's own slot 0 owns every field below. See the header for
+// why a null FILE * plus a text tail is a complete in-memory source.
+struct ParserSource {
+  void *vtbl;
+  void *gls_file;    // FILE *, from _fopen. Null is not fatal.
+  char *text_buffer; // pool memory, freed by File::Dtor @ 0x004779f0
+  char *text_cursor; // read cursor into text_buffer
+  char *file_name;   // pool memory, freed by File::Dtor
+};
+static_assert(sizeof(ParserSource) == 0x14);
+
+// Resolved into a trampoline by DetourAttach, so calling through this runs the
+// original.
+FastCall<void, ParserSource *> PushFileToParserStack;
+// __cdecl, and it must be the *game's* fclose: the FILE * came from the game's CRT,
+// which is not this DLL's.
+CDecl<int, void *> CloseFile;
+
+// Armed by SourceTextScope, consumed by the first matching push. Not thread-safe,
+// and does not need to be: the parser is main-thread-only and its global state
+// already says so.
+struct {
+  const char *name = nullptr;
+  const char *text = nullptr;
+} Armed;
+
+// Replaces the 2-byte "\n" LoadGLS allocated with the whole script, so the parser
+// reads `text` and then hits EOF.
+bool InstallSourceText(ParserSource *source, const char *text) {
+  size_t len = std::strlen(text);
+  // +2, not +1: room to append the trailing newline the buffer being replaced
+  // existed to supply.
+  char *buffer = static_cast<char *>(pool_alloc(len + 2));
+  if (!buffer) {
+    return false;
+  }
+  std::memcpy(buffer, text, len);
+  if (len == 0 || buffer[len - 1] != '\n') {
+    buffer[len++] = '\n';
+  }
+  buffer[len] = '\0';
+
+  // Pool memory both ways: File::Dtor frees text_buffer with the game's free, and
+  // this DLL's ::free would be the wrong heap entirely (see Memory.h).
+  pool_free(source->text_buffer);
+  source->text_buffer = buffer;
+  source->text_cursor = buffer;
+
+  // A display name is not a path, so this should always be null already. If a file
+  // of that name does happen to exist, its bytes would be read *before* ours -
+  // close it, so the text is the whole input either way.
+  if (source->gls_file) {
+    CloseFile(source->gls_file);
+    source->gls_file = nullptr;
+  }
+  return true;
+}
+
+void __fastcall HookedPushFileToParserStack(ParserSource *source) {
+  if (Armed.text && source && source->file_name &&
+      std::strcmp(source->file_name, Armed.name) == 0 &&
+      InstallSourceText(source, Armed.text)) {
+    // One-shot: whatever the text #includes must reach the real file.
+    Armed.name = nullptr;
+    Armed.text = nullptr;
+  }
+  PushFileToParserStack(source);
+}
+} // namespace
+
+SourceTextScope::SourceTextScope(const char *display_name, const char *source)
+    : previous_name_{Armed.name}, previous_text_{Armed.text} {
+  if (display_name && source) {
+    Armed.name = display_name;
+    Armed.text = source;
+  }
+}
+
+SourceTextScope::~SourceTextScope() {
+  Armed.name = previous_name_;
+  Armed.text = previous_text_;
+}
+
+ParsedObjectList *ParseSource(const char *source, const char *display_name,
+                              int mode) {
+  if (!source || !display_name) {
+    return nullptr;
+  }
+  SourceTextScope armed{display_name, source};
+  return LoadGLS(display_name, mode);
+}
+
+GlsSystem::GlsSystem() {
+  GetObjectAtOffset(PushFileToParserStack, 0x00477140);
+  GetObjectAtOffset(CloseFile, 0x005f0127);
+  DetourAttach(&PushFileToParserStack, HookedPushFileToParserStack);
+}
+
+GlsSystem::~GlsSystem() {
+  DetourDetach(&PushFileToParserStack, HookedPushFileToParserStack);
 }
 
 void ConvertParsedObjects(ParsedObjectList *list) {
@@ -387,20 +502,6 @@ const FieldInfo *FindField(SectionType type, const char *name) {
 }
 
 namespace {
-// Where the probe script goes. Not the game's Scripts directory - nothing here
-// should leave anything behind in the user's install - and an absolute path works
-// because LoadGLS fopen's its top-level file directly.
-std::string ProbeScriptPath() {
-  char temp[MAX_PATH]{};
-  DWORD len = GetTempPathA(sizeof(temp), temp);
-  if (len == 0 || len >= sizeof(temp)) {
-    return {};
-  }
-  std::string dir = std::string{temp} + "gkplus";
-  CreateDirectoryA(dir.c_str(), nullptr);
-  return dir + "\\gls_probe.gls";
-}
-
 // A value that satisfies `field` without tripping its bounds. Only needed to make
 // the section *complete*: an object missing any required field is quietly demoted
 // to abstract ("abstract definition not declared with 'abstract'") and then left
@@ -449,20 +550,7 @@ int TryParse(const char *source) {
   if (!source) {
     return -1;
   }
-  std::string path = ProbeScriptPath();
-  if (path.empty()) {
-    return -1;
-  }
-  std::FILE *file = std::fopen(path.c_str(), "w");
-  if (!file) {
-    return -1;
-  }
-  std::fputs(source, file);
-  if (std::fclose(file) != 0) {
-    return -1;
-  }
-  ParsedObjectList *list = LoadGLS(path.c_str(), 1);
-  DeleteFileA(path.c_str());
+  ParsedObjectList *list = ParseSource(source, "<gkplus try_parse>");
   if (!list) {
     return -1;
   }
@@ -489,11 +577,6 @@ bool ProbeKeywords(SectionType section, FieldId field,
   // Reflection first: asking for a field the section does not accept would
   // produce a script the parser rejects wholesale, and a confusing empty result.
   if (!info || !info->name) {
-    return false;
-  }
-
-  std::string path = ProbeScriptPath();
-  if (path.empty()) {
     return false;
   }
 
@@ -554,18 +637,9 @@ bool ProbeKeywords(SectionType section, FieldId field,
   bool any = false;
   bool reported = false;
   for (size_t i = 0; i < keywords.size(); ++i) {
-    std::FILE *file = std::fopen(path.c_str(), "w");
-    if (!file) {
-      return false;
-    }
-    std::fprintf(file, "%s GkPlusProbe\n{\n\t%s %s\n%s}\n", section_name,
-                 info->name, keywords[i].c_str(), filler.c_str());
-    bool written = std::fclose(file) == 0;
-    if (!written) {
-      return false;
-    }
-
-    ParsedObjectList *list = LoadGLS(path.c_str(), 1);
+    std::string script = std::string{section_name} + " GkPlusProbe\n{\n\t" +
+                         info->name + " " + keywords[i] + "\n" + filler + "}\n";
+    ParsedObjectList *list = ParseSource(script.c_str(), "<gkplus probe>");
     bool got = false;
     if (list) {
       for (ParsedThing *thing : *list) {
@@ -589,8 +663,6 @@ bool ProbeKeywords(SectionType section, FieldId field,
     // is worse than stopping.
     if (!got) {
       reported = true;
-      std::string script = std::string{section_name} + " GkPlusProbe\n{\n\t" +
-                           info->name + " " + keywords[i] + "\n" + filler + "}\n";
       std::string why = "gls probe: stopped at '" + keywords[i] +
                         "' - a failed parse poisons every later one, so the "
                         "remaining keywords are untested, not rejected. Script:";
@@ -601,7 +673,6 @@ bool ProbeKeywords(SectionType section, FieldId field,
       break;
     }
   }
-  DeleteFileA(path.c_str());
   (void)reported;
   return any;
 }

@@ -136,8 +136,8 @@ Overlay configuration in `vcpkg-configuration.json`.
    (each member detaches its detours in its dtor), commits.
 
 `Subsystems` holds only the **hook-installing** subsystems — `MusicSystem`, `DebugSystem`,
-`GUISystem`, `InputFixSystem`, `CustomMenuSystem`, `ScriptQueueSystem`, `CustomLevelSystem`,
-`ScriptSystem`.
+`GUISystem`, `InputFixSystem`, `CustomMenuSystem`, `ScriptQueueSystem`, `gls::GlsSystem`,
+`CustomLevelSystem`, `ScriptSystem`.
 Everything else is struct-only
 or a native-API wrapper that resolves its offsets lazily per call (`GetObjectAtOffset` is cheap
 because `GetBaseAddress()` caches), so those subsystems need no lifecycle object.
@@ -204,11 +204,22 @@ Each pair is a header of decompiled structs/enums plus native free-function decl
 `.cpp` implementing them (offset resolution + any behavioral hooks): `src/Actors`, `src/Roles`,
 `src/Map`, `src/Vulnerability` (header-only), `src/Music`, `src/Math`, `src/Menu`, `src/Tokens`,
 `src/Triggers`, `src/Console`, `src/Misc`, `src/Camera`, `src/Debug`, `src/GUI`, `src/InputFix`,
-`src/CustomMenu`, `src/ScriptQueue`, `src/CustomLevel`, `src/Script`, `src/MakeRole` (native
-constructors, see below).
+`src/CustomMenu`, `src/ScriptQueue`, `src/CustomLevel`, `src/Script`, `src/Session` (starting a
+level without the menus, see below), `src/MakeRole` (native constructors, see below).
 `src/GLS.h/cpp` is the model the rest now follow. The behavioral-hook subsystems (`Music`, `Debug`,
-`GUI`, `InputFix`, `CustomMenu`, `ScriptQueue`, `CustomLevel`, `Script`) expose a `*System` RAII
-class constructed by `entry.cpp`; the others are pure struct + native-API.
+`GUI`, `InputFix`, `CustomMenu`, `ScriptQueue`, `GLS`, `CustomLevel`, `Script`) expose a `*System`
+RAII class constructed by `entry.cpp`; the others are pure struct + native-API.
+
+`GlsSystem` is the odd one there: `src/GLS` is otherwise pure struct + native-API, and its single
+detour (`PushFileToParserStack`) exists only so `gls::ParseSource` can hand the parser a **source
+text instead of a file**. The parser's input is a source object with a
+`{dtor, Read, GetFileName}` vtable, and `File::ReadFile` already tops up from an in-memory tail
+after its `fread` — so a null `FILE *` plus that buffer is a complete parse, using the game's own
+class. Full mechanism, and the three measurements it rests on (an unopenable root file is
+harmless because `ParseErrorCount` has no readers; that detour is the only seam; the source name
+is re-lexed inside a `# line` directive so it must not contain a quote) are in
+`gls_system_notes.md` under "Parser input sources". It is what lets a script-defined level, a
+`gls.probe` and a `gls.try_parse` all run with **nothing written to disk**.
 
 ### Script host (`src/Script.h/cpp`)
 
@@ -336,6 +347,7 @@ actors.count                       // 158
 [...actors].filter(a => a.alive).length
 roles["gunlok"].id
 game.simulation_running            // the authority test, false on a joining client
+levels.start("level01.gls")        // into a level from the menu, no keystrokes
 console.print("hello")             // goes to the game's own console
 ```
 
@@ -497,7 +509,7 @@ drives) and `ParseGLDirs` (which sets game directories rather than building anyt
 | destructibility / frag data / *replace* | slot-8 trio | `MakeDestructibility` / `MakeFragData` / `MakeReplaceDestructibility` |
 | role | `ToRole` | `MakeRole` |
 | ammo / ammo info | `ToAmmo` / `ToAmmoInfo` | `MakeAmmo` / `MakeAmmoInfo` — write the global tables |
-| camera track | `ToCameraTrack` | `MakeCameraTrack` — needs a loaded level |
+| camera track | `ToCameraTrack` | `MakeCameraTrack` — needs a loaded level, and both `name` and `file` |
 
 **Descriptions are in `.gls` units** (degrees, seconds, metres, cycles/sec), because that is
 what a `ParsedThing` holds: `CheckValue` only range-checks and stores, and every conversion
@@ -580,7 +592,7 @@ and the poisoning described above.
 
 **The enum keyword tables were recovered by asking the parser.** `ai bot` and friends are
 compiled into the flex DFA — not stored as strings, absent from every shipped header — so
-`gls.probe(section, field, names)` writes a one-field section per keyword, parses it, and
+`gls.probe(section, field, names)` builds a one-field section per keyword in memory, parses it, and
 reads `parsed_values[field]` straight back. `ai`, `weapon type`, `ammo type`,
 `action on death` and `resistance` now accept names (tables in `src/Roles.cpp`); `type` still
 takes a number, because that id is shared by `destructibility` (0..1) and `pgenerator`
@@ -817,24 +829,40 @@ Six facts pin the design; the full reasoning is `level_loading_notes.md` §6.5 a
   build and free its own list, with GkPlus only calling the map's `to_game_object` slot
   afterwards. `FreeParsedObjectList` is hooked for the null guard both need — `LoadGLS`
   returns null for a script that defined nothing and the game dereferences it — and
-  `LoadGLS` itself only for the no-`includes` case below.
+  `LoadGLS` itself only for the no-`includes` case below. The fourth hook,
+  `EnterMainMenuScreen`, has nothing to do with loading: it is where these levels reach
+  `LevelList`, and it has to be *after* the campaign seed — see "getting into the game's
+  LevelList" below.
 - **The map section is built by `gls::Create(SectionType::Map)` at registration time**, not
   at load time, so a bad field is reported at boot through the game's own `CheckValue`
   rather than halfway through a level load. The object is kept and re-converted on every
   load; `to_game_object` neither takes nor drops a reference.
-- **A level that names `includes` gets a generated prelude `.gls`; one that does not touches
-  no file and no parser.** The prelude lives in `%TEMP%\gkplus\` and holds the `#include`
-  list, because the multiple-inclusion guards only work within one `LoadGLS` call
-  (`ClearParseSymbolTables` runs per call) and N separate loads would re-register every
-  shared `.gsh`. It can live outside the game folder because the parser opens an `#include`
-  with a bare `fopen` against the *current* directory, which `LoadLevel` has set to Scripts,
-  and it always ends with a filler `shape` — its `name` + `file` are the two strings the map
-  already requires — because an empty script is the null-list case above.
+- **Nothing a custom level needs is ever written to disk, and its `ScriptFileName` names no
+  file.** That name is a virtual `gkplus\<slug>.gls` (the title with every non-alphanumeric
+  character folded to `_`), and a level that names `includes` gets the `#include` list as a
+  **source text**, parsed from memory through `gls::ParseSource` — the parser takes its input
+  through a source object, so a null `FILE *` plus a text buffer is a complete parse. One
+  source rather than one `LoadGLS` per include, because the multiple-inclusion guards only
+  hold within a single call (`ClearParseSymbolTables` runs per call). The `#include` lines
+  still resolve, because the parser opens one with a bare `fopen` against the *current*
+  directory, which `LoadLevel` has set to Scripts. It always ends with a filler `shape` —
+  its `name` + `file` are the two strings the map already requires — because an empty script
+  is the null-list case above.
 
-  With no `includes` there is nothing to parse, so `LoadGLS` is detoured to hand back an
-  empty `ParsedObjectList` built the way `ParseGSH` builds its own. **Letting the parse fail
+  With no `includes` there is nothing to parse at all, so `LoadGLS` hands back an empty
+  `ParsedObjectList` built the way `ParseGSH` builds its own. **Letting the parse fail
   instead is not an option**: a failed parse poisons the parser for the rest of the process,
   so the next *game* level to load would fail too.
+
+  **The name's shape is dictated by four consumers, not chosen.** A three-letter extension
+  and more than four characters, because `ToMap` and `LoadOrBuildSectionAdjacency` overwrite
+  the last three in place for `.cut`/`.map` (both optional caches, and they land in
+  `<Gunlok>\gkplus`); no double quote, because `PushFileToParserStack` puts the name in a
+  `# line` directive that pass 2 re-lexes; and **machine-independent**, which the absolute
+  `%TEMP%` path it replaced was not — `SaveGame` serialises it verbatim and
+  `ApplyUpdateMessage` `strdup`s it off a network payload on a joining client, so a path
+  under one user's profile made a custom-level save unportable and a multiplayer join match
+  no registration at all.
 - **`setup` hooks `ExecuteAllCommands` @ 0x004d62c0, which has exactly one call site** —
   `LoadLevel` @ 0x004e1e00, step 11, behind the very `freshStart` byte that gates the
   `ExecuteCommandFile(ConsoleFileName)` queueing the `.gcs` at step 7. So reaching the hook
@@ -850,6 +878,14 @@ Six facts pin the design; the full reasoning is `level_loading_notes.md` §6.5 a
   and `SetupMenus` reads it once — long before any script runs. So the first registered
   level appends a "Choose Level" item to Single Player through `CustomMenu`.
 
+**Both paths are verified in a running game** (`level_loading_notes.md` §6.5.1): 140 roles from an
+in-memory prelude of six `.gsh` files with nothing on disk, 6 actors from `populate`, fog and sun
+from `setup`, and 7 actors on the no-`includes` path where `LoadGLS` never runs. Two naming traps
+came out of that run and cost a load each: **a script spawns a role by its GLS `identifier`, not by
+the section symbol** (`"gunlok"`, never `"Rol_GunLok"` - `examples/levels/arena.mjs` had it wrong,
+which is how it went unnoticed), and **`actor.name` is a reverse token lookup that loses to any
+numeric token sharing the id's value** (actor 0 reads as `RES`, not `gunlok`).
+
 Placed objects go through `gk::MapSpawn` after `ToMap` rather than the binding hash at
 `ParsedMap+0x1b60` (which would need a forged field-9 `ParsedField`), so a script can spawn
 at arbitrary coordinates as well as at rif locators. `gk::LevelRifLocators` supplies the
@@ -858,6 +894,67 @@ locator half and is only valid while a load callback is running — `populate` b
 camera settles. `CurrentCustomLevel()` marks all three windows, and doubles as the
 re-entrancy guard for both hooks, so a callback that parses a `.gls` itself cannot make the
 level build twice.
+
+### Starting a level programmatically (`src/Session.h/cpp`)
+
+`levels.start(target, {difficulty})` puts the game in a level with no menus and no briefing
+screen. `target` is a `Level` from `levels.add`, a title from `levels.startable`, or
+`{script, console}` for a `.gls` that was never registered; `levels.quit()` is the way back.
+
+```js
+levels.start("Test Arena", { difficulty: "hard" });          // by title
+levels.start({ script: "level01.gls", console: "level01.gcs" });
+arena.start();                                                // on the Level itself
+```
+
+This exists because driving the front end is not viable: menu activation runs from the
+**window procedure**, the front end does not run a frame at all while the window is
+unfocused (see `SetFrameWakeupEnabled` in `src/GUI.h`), and `GoToMenu` leaves
+`ChosenMenuItem` at `0x100` = "nothing selected", so synthetic keystrokes depend on focus
+*and* on a selection the game deliberately clears. Full sequence and its three hazards are
+in `level_loading_notes.md` §7.5; the two that cost a crash each:
+
+- **`LeaveFrontEndScreen` @ 0x004e8dd0 is once per front-end session.** Its first two
+  branches are null-guarded and the rest is not — it releases a reference on ~40 menu
+  sprites and zeroes each global on the way out, so a second call faults. `SpriteScrollUp`
+  @ 0x007b7d0c is the "is the front end up?" predicate.
+- **`ClearTeamCarryOverState` @ 0x004da230 is `__thiscall`** and takes the global
+  `TeamCarryOverState` in ECX. A missing register argument pops exactly as many bytes as a
+  correct call, so the `RET`-form sweep is blind to it — this is what the companion
+  ECX/EDX-read check is for.
+
+**The load is deferred by one turn of the message loop, and that is structural.** `LoadLevel`
+may not run inside the renderer, and the script host's frame callback is driven from inside
+`HookedPresentScene` whenever a level is up. So `Session.cpp` queues the request and drains
+it from a private `WM_APP` message handled in `HookedWndProc` — `SetMessageLoopCallback` /
+`PostMessageLoopWork` in `src/GUI.h`, which is the seam to reuse for anything else that
+reloads the world. Everything wrong with the *request* (unknown level, bad difficulty, a
+quote in the path, a multiplayer session, a start already pending) still throws at the call;
+only the load itself is asynchronous, so poll `game.state` or `actors.count`.
+
+**`levels.startable` is the game's one `LevelList`**, which holds the campaign, anything
+`ADD MISSION` added, and — because `AddCustomLevel` registers through the same `AddLevel` —
+every script-defined level. One lookup serves all three.
+
+**Registering a level and listing it are separate acts, and the order is load-bearing.**
+`EnterMainMenuScreen` seeds its fifteen campaign missions only when `LevelList` is empty
+(`CMP dword [0x007b74e0],0` then `JNZ` past all fifteen `AddLevel` calls *and* the block
+that seeds `ScriptFileName`/`ConsoleFileName` from the first entry), and `levels.add` runs
+during `SetupMenus`, which is earlier. Calling `AddLevel` at registration time therefore
+cost the player the whole campaign — Choose Level held only the script-defined levels, menu
+7's "new game" launched the first of *those* (it starts `LevelList.sentinel->next`), and the
+default script name was never set.
+
+So `CustomLevel.cpp` holds its levels back and appends them from a detour on
+`EnterMainMenuScreen`, after the original has had the empty list it insists on
+(`ReconcileLevelList`). The result is campaign 0-14 then script-defined levels from 15,
+which is also the Choose Level order, and it is stable: `LevelList` is cleared only by
+`ShutdownMenuSystem` at process exit and `EnterMainMenuScreen` never touches `Menus[5]`, so
+returning to the menu neither re-seeds nor duplicates. A level registered *after* the first
+main-menu entry — from the REPL, say — is appended immediately instead. **Idempotency is a
+per-level `listed` flag, not a re-read of the list**, because two levels may legitimately
+share a title. `CustomLevelByTitle` covers the window in between, so
+`levels.start("My Level")` works from the moment `levels.add` returns.
 
 ### JavaScript bindings (`src/Js*`)
 
@@ -906,6 +1003,23 @@ Two facts from it that change how bindings get written:
   binding took the latter — now fixed, and it was two bugs, because bare `SetTeamId` also left the
   actor on its **old team's actor list**. **Check the setter, not the command** —
   `console_command_notes.md` §6 is the full table.
+- **The `RET`-form sweep never covered the free functions a mirror resolves by address**, and the
+  first in-game run of `make` and `console.commands` found three defects sitting in that gap — a
+  missing dereference in `GetCommandTable`, a `FastCall` that is really `__thiscall` with two stack
+  args (`HierarchyResolveNamedPointPos`, which made every `make.role` with a `hotspot` fault), and
+  `MakeCameraTrack`'s bind (0x005aa920 is `__fastcall(track /*ECX*/, rif /*EDX*/, name,
+  Vec3 by value)` — all four wrong). `console_command_notes.md` §6.5 has all three and the recipe:
+  for a declared arity, `__fastcall` puts the first two *integral* args in registers (floats never)
+  and `__thiscall` only `this`, so the expected operand is `4 * stack_args`. That sweep has now been
+  run over **every** `GetObjectAtOffset` in `src/` and is clean (§6.5.1) — read it before adding a
+  native call, because two of its three traps (per-site declaration resolution, and the four
+  tail-jump functions with no `RET` of their own) make a naive run report defects that are not there.
+- **The `RET` test cannot see a register argument, so pair it with an ECX/EDX read check.** Calling
+  `AcquireLevelRifForLocators` @ 0x00483da0 with *no* argument — which `MakeCameraTrack` did, on the
+  belief that it falls back to the loaded level rif — pops exactly as many bytes as calling it
+  correctly. It does not fall back: it `strlen`s ECX with no null check, and `ToCameraTrack` passes
+  the section's own `file` field. The check is "does the target read ECX (or EDX) before writing it?"
+  and it costs one pass over the first few instructions.
 - **`ApplyDamage` takes three stack arguments and the mirror declared two.** Both overrides end in
   `RET 0xc`; `__thiscall` is callee-clean, so each call drifted ESP by 4 bytes — the exact failure
   the calling-convention warning above describes. The third is the attacker's team id (-1 for none),
@@ -952,6 +1066,7 @@ console.log("actors:", actors.count);               // the host's own logging - 
 console.execute("GOD ON");                          // and the game's command surface
 tokens["score"] = 0;                                // upsert; actors/roles throw
 levels.add("Test Arena", arena);                    // `import * as arena` first
+levels.start("Test Arena", {difficulty: "hard"});   // no menus, no briefing
 
 export function setup_menus(menus) {                // `menus` is not an export
   menus.Main.add_item("Open console", (item) => {});  // menus[0], menus["main"] too
@@ -1287,6 +1402,7 @@ document order. Nothing exported has been loaded back into Gunlok yet.
 | File | Purpose |
 |------|---------|
 | `src/Repl.h/cpp` | The loopback JavaScript REPL: `StartRepl` / `PumpRepl` / `StopRepl`, owned by `BootScriptHost` rather than by `Subsystems` (it installs no detour). Off unless `GKPLUS_REPL_PORT` is set. See "The REPL channel" above |
+| `src/Session.h/cpp` | `StartLevel` / `QueueLevelStart` / `QueueReturnToMainMenu` — a level start with no menus and no briefing, deferred to the message loop. Installs no detour and has no `*System`: it registers `SetMessageLoopCallback` on first use. See "Starting a level programmatically" above |
 | `src/InputFix.h/cpp` | `InputFixSystem` - hook-only. Detours `AcquireDInputDevice` to suppress the vestigial DirectInput keyboard acquire and its `WH_KEYBOARD_LL` hook (see `input_notes.md`) |
 | `src/ActorClasses.inc.h` | X-macro listing the 15 Actor subclasses: `GK_ACTOR_CLASS(Name, Parent, Predicate, Kind)`. Drives the JS class table, `kind`, the RTTI ladder and the prototype chain. **Must list every class before its own base** |
 | `src/Menus.inc.h` | X-macro listing all 36 Gunlok menus: `GUNLOK_MENU(Name, Id, TitleResourceId, "English title")`. There are no gaps - ids 11 and 14-20 are identified in `menu_system_notes.md`. Also counted into `gk::MenuCount` |
@@ -1317,7 +1433,10 @@ document order. Nothing exported has been loaded back into Gunlok yet.
   container, all 105 registered chunk types, the `.RIM` texture format (IFF + S3TC, the one
   asset format that is *not* RIF chunks), **and** the AvP upstream mapping (see below)
 - `game_defects_notes.md` - bugs in **Gunlok itself** that reproduce without GkPlus, so nobody
-  re-blames our hooks for them. Currently: `DrawText?` @ 0x005782e0 smashing its stack on any
+  re-blames our hooks for them. Also the debugging recipes, and the one that matters most: WER
+  already writes a full dump to `%LOCALAPPDATA%\CrashDumps\gl.exe.<pid>.dmp`, and
+  `cdb -z <dump> -c ".ecxr; k 40; q"` plus `llvm-symbolizer` on the printed `d3d8+0x...` RVAs
+  resolves a crash to file and line - where **every live attach failed** to walk the stack at all. Currently: `DrawText?` @ 0x005782e0 smashing its stack on any
   string over ~1024 chars (which makes the training-level debrief fatal), and the fact that the
   game's own `PrintParseWarning`/`PrintParseError` discard their output. Also collects what
   actually works for debugging Gunlok - where cdb lives, why `bp d3d8+0x...` silently resolves

@@ -791,12 +791,13 @@ JSValue MakeAmmoInfoJs(JSContext *ctx, JSValueConst, int argc,
 JSValue MakeCameraTrackJs(JSContext *ctx, JSValueConst, int argc,
                           JSValueConst *argv) {
   if (argc < 1 || !JS_IsObject(argv[0])) {
-    return JS_ThrowTypeError(ctx, "camera_track({name, pgen, pgen2})");
+    return JS_ThrowTypeError(ctx, "camera_track({name, file, pgen, pgen2})");
   }
   JSValueConst v = argv[0];
   CameraTrackDesc d;
   std::string name;
-  if (!GetString(ctx, v, "name", &name)) {
+  std::string file;
+  if (!GetString(ctx, v, "name", &name) || !GetString(ctx, v, "file", &file)) {
     return JS_EXCEPTION;
   }
   for (auto [key, slot] :
@@ -816,6 +817,7 @@ JSValue MakeCameraTrackJs(JSContext *ctx, JSValueConst, int argc,
     JS_FreeValue(ctx, g);
   }
   d.name = name.empty() ? nullptr : name.c_str();
+  d.file = file.empty() ? nullptr : file.c_str();
   return JS_NewBool(ctx, MakeCameraTrack(d));
 }
 

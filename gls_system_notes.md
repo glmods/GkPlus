@@ -75,10 +75,15 @@ current frame rate; the ` * 60.0` variant handles minutes).
 | 0x00478400 | `ParseGSH` | yacc parser (all grammar actions) |
 | 0x004747b0 | `ConvertParsedObjects(ParsedObjectList*)` | Calls `toGameObject` (vtbl slot 7) on every parsed object, releasing refs and updating the loading bar. |
 | 0x00474870 | `FreeParsedObjectList(ParsedObjectList*)` | Releases remaining refs and frees the list itself. |
-| 0x00477000 | `PrintParseError(fmt, ...)` | Increments error counter |
-| 0x00477050 | `PrintParseWarning(fmt, ...)` | |
-| 0x00477140 | `PushFileToParserStack(File*)` | `#include` support |
+| 0x00477000 | `PrintParseError(fmt, ...)` | Increments `ParseErrorCount`, which **nothing reads** - see below |
+| 0x00477050 | `PrintParseWarning(fmt, ...)` | Increments `ParseWarningCount`, likewise unread |
+| 0x00477140 | `PushFileToParserStack(File*)` | Pushes an input source; `#include` support, and the seam an in-memory parse uses |
 | 0x00477f70 | `PopFileFromParserStack` | |
+| 0x00477ac0 | `File::ReadFile(buf, size)` | Source vtbl slot 1: `fread`, then top up from an in-memory tail |
+| 0x00477aa0 | `File::GetFileName` | Source vtbl slot 2 |
+| 0x004779f0 | `File::Dtor` | `fclose` if non-null, then frees `file_name` and `text_buffer` with the game's `free` |
+| 0x004770a0 | `ReadRecordedText(buf, size)` | The *pass-2* source's slot 1: replays recorded chunks, no `FILE*` at all |
+| 0x00477b10 | `RecordParsedText(ParseData*, char*)` | Appends one chunk to the pass-1 recording |
 | 0x0047aa70 | `ClearParseSymbolTables` | |
 | 0x0047b5f0 | `IsSymbolDefined(char*)` | |
 | 0x0047b670 | `RegisterInSymbolTable(char*, ParsedThingBase*)` | |
@@ -123,6 +128,91 @@ tag** for a parsed object.
 `DoParseXxx` merely `malloc`s the object (0x1b60 bytes; `role` allocates 0x1b68 - the
 extra dword at +0x1b60 caches the converted `Role*`) and calls the real ctor.
 
+## Parser input sources: the parse does not need a file
+
+**The parser reads through a source object, not a `FILE*`.** Both implementations share a
+3-slot vtable `{dtor, Read(buf, size), GetFileName()}`, and one of them has no file in it
+at all - which is what makes `gls::ParseSource` (`src/GLS.cpp`) possible, and what killed
+the last of GkPlus's generated-file tricks.
+
+| Source | vtbl | Size | Slots | Used for |
+|---|---|---|---|---|
+| `File` | 0x00652904 | 0x14 | `File::Dtor` / `File::ReadFile` / `File::GetFileName` | pass 1, and every `#include` |
+| `ParseData` | 0x0065292c | 0x4c | `ParseDataSource_Dtor` / `ReadRecordedText` / `ParseDataSource_GetFileName` | pass 2, replaying the recording |
+
+`File` (built inline by `LoadGLS`, so there is no constructor to call):
+
+| Offset | Field | Notes |
+|---|---|---|
+| +0x00 | vtbl | 0x00652904 |
+| +0x04 | `gls_file` | `FILE*` from `_fopen(name, "r")` @ 0x005f067e. **May be null** |
+| +0x08 | `text_buffer` | in-memory tail, pool memory; `File::Dtor` frees it |
+| +0x0c | `text_cursor` | read cursor into it |
+| +0x10 | `file_name` | pool memory; freed by the dtor |
+
+`File::ReadFile` is already a hybrid - it reads the file and then **tops up from
+`text_cursor` whenever the `fread` came up short**:
+
+```c
+n = gls_file ? fread(buffer, 1, size, gls_file) : 0;
+while (n < size && *text_cursor) buffer[n++] = *text_cursor++;
+```
+
+`LoadGLS` puts a 2-byte `"\n"` there, so a file whose last line has no newline still
+lexes. Point that buffer at a whole script and leave `gls_file` null and the parser reads
+it entirely from memory, through the game's own class.
+
+Three measurements are what make that a supported path rather than a stunt:
+
+- **A null `FILE*` is not fatal.** `LoadGLS` reports it with `PrintParseError("unable to
+  open file '%hs'")`, which increments `ParseErrorCount` @ 0x00739a38 - and that global
+  has **no readers anywhere in the binary** (one zeroing write in `LoadGLS`, two `INC`s in
+  `PrintParseError`/`PrintFatalError`, nothing else). Same for `ParseWarningCount`
+  @ 0x00739a3c. So what poisons the parser after a syntax error is the un-reset file
+  stack, *not* an error count, and an unopenable root file costs one invisible message.
+- **`PushFileToParserStack` is the only seam.** It takes the source as its one argument,
+  and it is called exactly five times in the binary: twice by `LoadGLS` (the pass-1 file,
+  then the pass-2 recording) and three times by `ParseGSH` for `#include`. A detour there
+  can swap `text_buffer` between construction and the first read. GkPlus's `GlsSystem`
+  installs exactly that.
+- **The pass-2 source proves the abstraction.** `ReadRecordedText` walks a list-of-lists
+  of recorded chunks, emitting one space between chunks, and its object has no `FILE*`
+  field - so `Read` + `GetFileName` really is the whole interface.
+
+Two traps for anyone building a source:
+
+- **`text_buffer` is freed with the game's `free`**, i.e. the pool (`File::Dtor`
+  @ 0x004779f0). A replacement has to come from `pool_alloc`, never from this DLL's
+  `::malloc` - see the heap discussion in `src/Memory.h` - and the buffer being replaced
+  wants freeing the same way.
+- **The source's name is re-lexed.** When `PreviousScriptFile` is set (i.e. during pass 1)
+  `PushFileToParserStack` does `sprintf(buf, "\n# line 1 \"%hs\"\n", name)` and hands it
+  to `RecordParsedText`, so pass 2 lexes that directive back. A **double quote** in the
+  name therefore corrupts the parse. Backslashes are fine - every shipped script has
+  `file "levels\level01.rif"` in it - which is why GkPlus's synthetic level identity is
+  path-shaped (`gkplus\<slug>.gls`) and its probe names are `<gkplus probe>`-style.
+
+`gls::ParseSource(source, display_name, mode)` is the wrapper; `gls::SourceTextScope` is
+its arming half, for a caller that is itself inside a `LoadGLS` hook and must reach the
+original through its own trampoline. The arming is one-shot, consumed by the first pushed
+source whose name matches, so an `#include` inside the text still reaches the real file.
+
+`src/CustomLevel.cpp` (a level's `includes` prelude), `gls::TryParse` and
+`gls::ProbeKeywords` all use it, and none of the three writes a file any more.
+
+**Verified in the running game**, not just reasoned about:
+
+- `gls.try_parse('shape … { name "Land" file "levels\\level01.rif" }')` returns **1** - the source
+  text reaches the parser and produces an object, from a name that is not a file.
+- The same with `#include "scripts\defaults.gsh"` returns **6**, so an `#include` inside an
+  in-memory source resolves and contributes objects like any other.
+- A custom level naming six `.gsh` files had **140 roles registered** by the time its `define` hook
+  ran, with nothing written to disk. The bare `#include "defaults.gsh"` spelling is the correct one
+  during a load: `LoadLevel` sets the cwd with `SetCurrentDirectoryToGLDir(0)` at 0x004e0e28,
+  immediately before the `LoadGLS` call, and GL dir 0 is Scripts. At the *front end* the cwd is the
+  game root instead, which is why the same probe returns 1 there and 6 with a `scripts\` prefix -
+  worth knowing when using `gls.try_parse` from the REPL.
+
 ## Global State (offsets from base)
 
 | Offset | Type | Name |
@@ -130,7 +220,9 @@ extra dword at +0x1b60 caches the converted `Role*`) and calls the real ctor.
 | 0x007b3cfc | `ParsedObjectList*` | `ParsedObjList` - result list built during pass 2 |
 | 0x007b3d00 | int | `g_LoadGLS_Param2` - mode bitmask from `LoadGLS` |
 | 0x00739a4c | int | `g_ParsePassCounter` - 1/2 before each pass, 0 while running |
-| 0x007399c0 | `ParseData*` | `PreviousScriptFile` - pass-1 replay buffer |
+| 0x007399c0 | `ParseData*` | `PreviousScriptFile` - the pass-2 source; non-null during pass 1 is also what makes `PushFileToParserStack` emit a `# line` directive |
+| 0x00739a38 | int | `ParseErrorCount` - incremented by `PrintParseError`/`PrintFatalError`, **read by nothing** |
+| 0x00739a3c | int | `ParseWarningCount` - same, for `PrintParseWarning` |
 | 0x00739a50 | int | `g_CurrentLineNumber` |
 | 0x00739a58 | char[] | `g_CurrentFilename` |
 | 0x007b3cd8 | list | `g_ConditionalStack` (#ifdef nesting) |
@@ -821,7 +913,7 @@ directory. Loaded at startup from `gldirs.gls` via `LoadGLDirs` @ 0x466b30.
 | `ToReplaceDestructibility` | 0x47eaa0 | 0x10-byte record `{vtbl, 4, char* name, bool replace}` |
 | `ToAmmo` | 0x47d740 | fills `AmmoInfos` ammo slot `[weapon_type*19 + ammo_type]` (table of `Ammo*` at AmmoInfos+0x180) |
 | `ToAmmoInfo` | 0x47d8f0 | fills `AmmoInfos[ammo_type]` (0x14-byte `AmmoInfo` records at +0) |
-| `ToCameraTrack` | 0x47d9f0 | camera track object (0xa0) + pgen/pgen2 |
+| `ToCameraTrack` | 0x47d9f0 | camera track object (0xa0) + pgen/pgen2. `AcquireLevelRifForLocators(file)` (ECX, field 0x01), `CameraTrack_Ctor` @ 0x4dc660 on `pool_alloc(0xa0)`, pgen/pgen2 -> +0x68/+0x6c, then `LoadCameraTrackFromRif` @ 0x5aa920 — `bool __fastcall(track /*ECX*/, rif /*EDX*/, name, Vec3 map origin **by value**)`, `RET 0x10`. That walks the rif's REBENVDT -> SPECLOBJ, `_stricmp`s `name` against each `CUTSHEAD` child's `CUTSCDAT` name (+0x28) and hands the match to `CameraTrack_LoadFromCutscene` @ 0x5bf060 with `*(float *)rif` as the unit scale. False destroys the track through slot 0. DEFECT: a failed `pool_alloc` is written through |
 | `ToMap` | 0x47f160 | loads the level geometry itself (huge) - see `level_loading_notes.md` |
 | `ParseGLDirs` | 0x466c20 | sets game resource directories |
 

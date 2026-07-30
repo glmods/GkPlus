@@ -97,12 +97,16 @@ struct CustomLevelLocator {
 // then kept and re-converted on every load of this level.
 //
 // `includes` are .gls/.gsh files - the role, character and ammo definitions the
-// level's actors need. They are written into a generated prelude script that
-// becomes this level's ScriptFileName, so the parser resolves them in one pass
-// with its multiple-inclusion guards intact, exactly as a hand-written level's
+// level's actors need. They become an in-memory prelude script, handed to the
+// parser through gls::ParseSource, so the parser resolves them in one pass with
+// its multiple-inclusion guards intact, exactly as a hand-written level's
 // `#include` block would. Paths are relative to the game's Scripts directory.
 // A level that builds its definitions through `gk::gls` needs none of them and
 // passes an empty list, which is the "no GLS parsing at all" case.
+//
+// Nothing here is written to disk: the level's ScriptFileName is a virtual name
+// that no code path opens. Two titles that differ only in punctuation collapse to
+// the same one, and the second registration is refused.
 //
 // Registrations are never freed and never move.
 CustomLevel *AddCustomLevel(const char *title, const CustomLevelMap &map,
@@ -113,8 +117,16 @@ CustomLevel *AddCustomLevel(const char *title, const CustomLevelMap &map,
                             CustomLevelMessage message, void *user);
 
 const char *CustomLevelTitle(const CustomLevel *level);
-// The generated prelude, which is also this level's ScriptFileName.
+// This level's ScriptFileName - a virtual name, not a file that exists.
 const char *CustomLevelScriptFile(const CustomLevel *level);
+
+// A registered level with this title, matched case-insensitively, or null.
+//
+// Registering and appearing in the game's LevelList are separate acts here -
+// listing waits for the first EnterMainMenuScreen so the campaign gets the
+// empty list it insists on - so this finds a level from the moment
+// AddCustomLevel returns, which the game's own list does not.
+CustomLevel *CustomLevelByTitle(const char *title);
 const CustomLevelMap &CustomLevelDescription(const CustomLevel *level);
 
 // The custom level LoadLevel is building right now, or null when the game is
@@ -150,10 +162,12 @@ void ClearCustomLevelActions();
 // a custom level's map is converted and its populate callback runs) and
 // FreeParsedObjectList (which shares the same null guard) - plus
 // ExecuteAllCommands, the one place LoadLevel runs the level .gcs, which is
-// where the setup callback goes. Also installs DispatchCustomLevelMessage as the
-// script queue's message handler, which needs no hook of its own -
-// ScriptQueueSystem owns those. RAII, like every other *System -
-// construct/destroy inside a Detours transaction.
+// where the setup callback goes, and EnterMainMenuScreen, which is where these
+// levels reach the game's LevelList (it seeds the campaign only into an *empty*
+// list, so registering must not put anything there first). Also installs
+// DispatchCustomLevelMessage as the script queue's message handler, which needs
+// no hook of its own - ScriptQueueSystem owns those. RAII, like every other
+// *System - construct/destroy inside a Detours transaction.
 class CustomLevelSystem {
 public:
   CustomLevelSystem();

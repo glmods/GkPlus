@@ -21,6 +21,30 @@ void SetFrameCallback(FrameCallback callback);
 // cheap, because it is called from two independent places (see below).
 void RunFrameCallback();
 
+// A callback run from HookedWndProc in response to a private WM_APP message,
+// which PostMessageLoopWork() posts to the game window. One slot, like the two
+// callbacks above; Session.cpp owns it.
+//
+// **The frame callback is not a safe place for anything that reloads the
+// world.** In a level it is driven from inside HookedPresentScene - i.e. from
+// within the game's own render/present path - so a LoadLevel from there would
+// tear down and rebuild the D3D resources underneath the frame that is still
+// being presented. draw_gui is worse again: it runs between NewFrame and
+// Render, so anything that throws or reloads leaves ImGui's stack unbalanced.
+//
+// A posted message lands at exactly the point the game does this kind of work
+// itself: WM_KEYDOWN -> MainWindowWndProc -> HandleKeyMessage -> ... ->
+// MenuScreenInputHandler -> OnMenuItemClicked is how every menu transition and
+// every level start reaches the engine, and that is the top of the message
+// loop, outside the renderer. PostMessage rather than SendMessage because the
+// poster is usually the main thread itself, already inside a frame.
+//
+// Returns false if the game window is not resolved yet, or if PostMessage
+// failed - in which case the work was NOT scheduled.
+using MessageLoopCallback = void (*)();
+void SetMessageLoopCallback(MessageLoopCallback callback);
+bool PostMessageLoopWork();
+
 // Enables (or removes) a WM_TIMER on the game window that runs the frame
 // callback from HookedWndProc, roughly every 20 ms, in addition to the
 // PresentScene hook.

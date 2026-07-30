@@ -25,6 +25,7 @@
     "*.mjs",
     "levels/*.mjs",
     "headers/*.mjs",
+    "leveltest/*.mjs",
     "../types/*.d.ts",
     "types/*.d.ts"
   ]

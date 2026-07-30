@@ -14,7 +14,7 @@
 //   character Chr_Bug : Chr_DefaultBaddie   ...defaults.Chr_DefaultBaddie
 //   walking speed 1.5                    walking_speed: 1.5
 //   draw vision cone no                  draw_vision_cone: false
-//   ai background creature               ai: "background creature"
+//   ai background creature               ai: "background_creature"
 //   character none                       (omit it)
 //   destructibility Des_Explode          destructibility: { kind: "explode" }
 //
@@ -90,7 +90,7 @@ export function Rol_Bug() {
     hierarchy: Hcy_Bug,
     character: Chr_Bug,
     identifier: "bug",
-    ai: "background creature",
+    ai: "background_creature",
     reflective: false,
   });
 }

@@ -330,14 +330,21 @@ bool MakeAmmoInfo(const AmmoInfoDesc &desc);
 // --- camera track --------------------------------------------------------------------
 
 // A GLS `camera track`. Unlike every other converter this one needs a *loaded
-// level*: it binds itself by name against the level .rif and offsets by the map
-// origin, so it is only meaningful from inside a level load (a level module's
+// level*: it binds itself by name against a .rif and offsets by the map origin,
+// so it is only meaningful from inside a level load (a level module's
 // `define`/`populate`, or the ToRole-equivalent window).
 //
-// Returns false when there is no level rif, or when the named track is not in it -
-// in which case the object is destroyed again, exactly as the converter does.
+// `name` is matched against the CUTSCDAT name of each CUTSHEAD chunk under
+// REBENVDT/SPECLOBJ in the rif `file` names - not against a rif *object*, which
+// is what an earlier comment here claimed. Both are required: `file` reaches
+// AcquireLevelRifForLocators, which strlen's it with no null check.
+//
+// Returns false when the rif does not load, or when no cutscene in it carries
+// that name - in which case the object is destroyed again, exactly as the
+// converter does.
 struct CameraTrackDesc {
-  const char *name = nullptr;         // 0x00 the track's object name in the rif
+  const char *name = nullptr;         // 0x00 the cutscene track's name
+  const char *file = nullptr;         // 0x01 the .rif holding it
   ParticleGenerator *pgen = nullptr;  // 0x07
   ParticleGenerator *pgen2 = nullptr; // 0x08
 };

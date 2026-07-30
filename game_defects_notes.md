@@ -129,3 +129,27 @@ under any debugger (each call is a synchronous round-trip). That is why
   WER's Application Error log plus the exit code; a clean exit writes
   `scripts\GLkeys.cfg`. Undebugged the game loads a level and exits in ~22s; under
   cdb with the warning redirect on it could not finish the parse in 40s.
+- **WER already writes full dumps, and `cdb -z` on one beats every live attach.**
+  Crashes land in `%LOCALAPPDATA%\CrashDumps\gl.exe.<pid>.dmp` (~6 MB) with no
+  configuration needed. `cdb -z <dump> -c ".ecxr; k 40; q"` gives a complete stack;
+  **attaching to the live process does not** - `-pv` (non-invasive) reports "Could
+  not fetch any stack frames" for the faulting thread, and an invasive `-p` attach
+  breaks in on its own thread, reports "Unable to get initial context information"
+  for `k`, and killed the target on `qd` twice out of two. Symbolize our frames from
+  the RVAs the stack prints (`d3d8+0x3c25d`) with
+  `llvm-symbolizer --obj=build/Debug/d3d8.dll --relative-address 0x3c25d`. That took
+  a `make.role` fault from "the game stopped responding" to
+  `MakeRoleJs -> MakeRole (MakeRole.cpp:447) -> HierarchyResolveNamedPointPos ->
+  ___ascii_stricmp` in one command.
+- **"Not responding" is not evidence of a spin, and neither is high CPU.** Gunlok
+  burns a full core at the front end normally, so a climbing `Process.CPU` says
+  nothing. The fault above presented as a hang - `Responding: False`, CPU rising,
+  main thread parked in `ZwWaitForMultipleObjects` - and was an access violation
+  all along, with that wait being WER's own error reporting. Read the Application
+  Error log before concluding anything about a wedged process.
+- **The REPL is a debugger you already have.** Most of this session's findings came
+  from `GKPLUS_REPL_PORT=9222` plus a 30-line TCP client, not from cdb: it reads
+  live game state (`roles.count`, `[...roles].map(r => r.name)`), and a binding that
+  crashes the game names itself, because the snippet that stopped answering is the
+  one that did it. Note the failure mode, though - **a crash looks like a socket
+  timeout**, so check the process afterwards rather than trusting the timeout.

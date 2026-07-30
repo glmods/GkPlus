@@ -47,6 +47,7 @@ bool ShowGUI = false;
 // inactive, the WM_TIMER handled in HookedWndProc below.
 OverlayDrawCallback OverlayDraw = nullptr;
 FrameCallback Frame = nullptr;
+MessageLoopCallback MessageLoopWork = nullptr;
 
 IDirect3DDevice9 *GetDX9Device() {
   return (*DirectXDevice)->GetProxyInterface();
@@ -75,8 +76,10 @@ void __stdcall HookedReleaseDirect3DDevice() {
 void __stdcall HookedPresentScene() {
   // Before the overlay check on purpose: this is the once-per-frame heartbeat,
   // and it has to keep ticking while the overlay is hidden. It covers in-game
-  // and level loads only - the front end presents nothing, so CustomMenu.cpp
-  // drives the same callback there (see RunFrameCallback in GUI.h).
+  // and level loads only - the front end presents nothing, and nothing else
+  // calls RunFrameCallback, so at the menus the WM_TIMER below is the *only*
+  // driver. (A previous version of this comment credited CustomMenu.cpp with
+  // covering the front end. It never has.)
   RunFrameCallback();
 
   if (!*DirectXDevice || !ShowGUI) {
@@ -120,6 +123,12 @@ constexpr UINT_PTR FrameWakeupTimer = 0x476b01;
 constexpr UINT FrameWakeupMs = 20;
 bool InFrameWakeup = false;
 
+// Our own message id, and the same guard for it. WM_APP is the range Windows
+// reserves for an application's private messages, so nothing the game or a
+// library sends can collide with it.
+constexpr UINT WM_GKPLUS_MESSAGE_LOOP_WORK = WM_APP + 0x6b01;
+bool InMessageLoopWork = false;
+
 LRESULT WINAPI HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam,
                              LPARAM lParam) {
   // Ours, and the game has never heard of it: handled here and not forwarded.
@@ -130,6 +139,19 @@ LRESULT WINAPI HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam,
       InFrameWakeup = true;
       RunFrameCallback();
       InFrameWakeup = false;
+    }
+    return 0;
+  }
+
+  // Likewise ours. See SetMessageLoopCallback in GUI.h: this is the seam for
+  // work that must NOT run inside the renderer, and the re-entrancy guard is
+  // load-bearing rather than defensive - the callback reloads the world, and
+  // LoadLevel pumps messages while it does.
+  if (msg == WM_GKPLUS_MESSAGE_LOOP_WORK) {
+    if (!InMessageLoopWork && MessageLoopWork) {
+      InMessageLoopWork = true;
+      MessageLoopWork();
+      InMessageLoopWork = false;
     }
     return 0;
   }
@@ -155,6 +177,17 @@ void SetOverlayDrawCallback(OverlayDrawCallback callback) {
 }
 
 void SetFrameCallback(FrameCallback callback) { Frame = callback; }
+
+void SetMessageLoopCallback(MessageLoopCallback callback) {
+  MessageLoopWork = callback;
+}
+
+bool PostMessageLoopWork() {
+  if (!GameWindow || !*GameWindow) {
+    return false; // GUISystem has not resolved the window yet
+  }
+  return ::PostMessageW(*GameWindow, WM_GKPLUS_MESSAGE_LOOP_WORK, 0, 0) != 0;
+}
 
 void RunFrameCallback() {
   if (Frame) {

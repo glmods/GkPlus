@@ -18,6 +18,7 @@
 // templates that handle a plain function pointer.
 
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -27,11 +28,13 @@ namespace gk {
 // has to be the same gk::CustomLevel those declarations name.
 struct CustomLevel {
   std::string title;
-  // This level's ScriptFileName. A generated prelude .gls when the level asked
-  // for `includes`, and otherwise a name that is never opened - see
-  // HookedLoadGLS.
+  // This level's ScriptFileName: a virtual name that is never a file on disk -
+  // see VirtualScriptName.
   std::string script_file;
-  bool has_prelude = false;
+  // The .gls source this level's `includes` become, parsed straight out of memory
+  // by HookedLoadGLS. Empty means the level builds its definitions with `make` or
+  // `gls` and never touches the parser at all.
+  std::string prelude_source;
   CustomLevelMap map;
   gls::ParsedThing *parsed_map; // built once, re-converted on every load
   CustomLevelDefine define;
@@ -39,6 +42,10 @@ struct CustomLevel {
   CustomLevelSetup setup;
   CustomLevelMessage message;
   void *user;
+  // Whether this level has reached the game's LevelList yet. See
+  // ReconcileLevelList: registration and listing are deliberately separate, so
+  // the campaign gets to be first.
+  bool listed = false;
 };
 
 namespace {
@@ -59,6 +66,11 @@ FastCall<gls::ParsedObjectList *, const char *, int> LoadGLS;
 // call is. So hooking it needs no "is a level loading?" test of its own: reaching
 // it already means a fresh level start is at the point its .gcs would run.
 StdCall<void> ExecuteAllCommands;
+
+// The front-end entry point, hooked for one reason: it is where the game's own
+// fifteen campaign missions reach LevelList, and it only puts them there **if
+// the list is empty**. See ReconcileLevelList.
+StdCall<void> EnterMainMenuScreen;
 
 // unique_ptr, not by value: AddLevel hands the game a copy of every string, but
 // `parsed_map` is handed to ToMap and `this` reaches a populate callback, so a
@@ -95,25 +107,30 @@ CustomLevel *LevelForCurrentScript() {
   return nullptr;
 }
 
-// --- the generated prelude ---------------------------------------------------
+// --- the level's identity -----------------------------------------------------
 
-// Where the prelude for `title` lives. Not the game's Scripts directory: the
-// parser opens an #include with a bare fopen against the *current* directory,
-// which LoadLevel has already set to Scripts, so the prelude itself can sit
-// anywhere and its includes still resolve. Keeping it out of the game folder
-// means registering a level leaves nothing behind in the user's install.
-std::string PreludePath(const char *title) {
-  char temp[MAX_PATH]{};
-  DWORD len = GetTempPathA(sizeof(temp), temp);
-  if (len == 0 || len >= sizeof(temp)) {
-    return {};
-  }
-  std::string dir = std::string{temp} + "gkplus";
-  CreateDirectoryA(dir.c_str(), nullptr);
-
-  // The name reaches the player only as the .cut/.map sidecar stem, but it does
-  // have to be a legal filename and it has to end in a three-letter extension,
-  // because ToMap builds "<ScriptFileName minus 3 chars>cut" in place.
+// This level's ScriptFileName. Nothing ever opens it - the prelude is parsed from
+// memory (gls::ParseSource) and there is no .gcs - so it is an identity rather
+// than a path, and the shape it has is what the engine's own derivations need:
+//
+//   * a stem plus a THREE-letter extension, because ToMap builds
+//     "<ScriptFileName minus 3 chars>cut" in place and LoadOrBuildSectionAdjacency
+//     does the same for ".map";
+//   * more than four characters, which is the length LoadOrBuildSectionAdjacency
+//     guards that overwrite with;
+//   * no double quote, since PushFileToParserStack sprintf's the name into a
+//     '# line 1 "<name>"' directive that pass 2 re-lexes;
+//   * MACHINE-INDEPENDENT, which is the whole reason this is not the absolute
+//     %TEMP% path it used to be. SaveGame serialises ScriptFileName verbatim and
+//     ApplyUpdateMessage strdup's it out of a network payload on a joining client,
+//     so an absolute path under one user's profile made a custom-level save
+//     unportable and a multiplayer join silently fail to match any registration.
+//
+// The two derived cache names stay legal and land next to main.mjs in
+// <Gunlok>\gkplus (ToMap restores the cwd to the game root before deriving them).
+// Both are optional: the .cut read is an OPEN_EXISTING that has an explicit
+// rebuild path, and the .map one is skipped the same way.
+std::string VirtualScriptName(const char *title) {
   std::string stem;
   for (const char *c = title; *c; ++c) {
     stem += (*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
@@ -121,21 +138,22 @@ std::string PreludePath(const char *title) {
                 ? *c
                 : '_';
   }
-  return dir + "\\" + stem + ".gls";
+  return "gkplus\\" + stem + ".gls";
 }
 
-bool WritePrelude(const CustomLevel &level,
-                  const std::vector<std::string> &includes) {
-  std::FILE *file = std::fopen(level.script_file.c_str(), "w");
-  if (!file) {
-    return false;
-  }
-  std::fprintf(file,
-               "// Generated by GkPlus for the custom level \"%s\".\n"
-               "// Rewritten every time the level is registered.\n\n",
-               level.title.c_str());
+// The .gls a level's `includes` amount to, as a string. It is handed to the parser
+// straight out of memory, which is why this is the whole of what used to be a file
+// in %TEMP%: the parser's input is a source object, not a path (see GLS.h).
+//
+// One script rather than one LoadGLS call per include, because the multiple-
+// inclusion guards only hold within a single call - ClearParseSymbolTables runs per
+// call - so N separate parses would re-register every shared .gsh.
+std::string PreludeSource(const CustomLevel &level,
+                          const std::vector<std::string> &includes) {
+  std::string source = "// Generated by GkPlus for the custom level \"" +
+                       level.title + "\".\n\n";
   for (const std::string &include : includes) {
-    std::fprintf(file, "#include \"%s\"\n", include.c_str());
+    source += "#include \"" + include + "\"\n";
   }
   // A script that defines nothing leaves ParsedObjList null, which makes LoadGLS
   // report "confused by earlier errors" and hand LoadLevel a null list. The
@@ -143,15 +161,11 @@ bool WritePrelude(const CustomLevel &level,
   // always defines one object. A shape needs exactly the two strings the map
   // section already requires, and resolves to the very rif object ToMap loads a
   // moment later - so this costs one hit on the rif cache and nothing else.
-  std::fprintf(file,
-               "\n// Keeps the parsed-object list non-empty; see CustomLevel.cpp.\n"
-               "shape GkPlusLevelGeometry\n"
-               "{\n"
-               "\tname \"%s\"\n"
-               "\tfile \"%s\"\n"
-               "}\n",
-               level.map.object_name.c_str(), level.map.rif_file.c_str());
-  return std::fclose(file) == 0;
+  source += "\n// Keeps the parsed-object list non-empty; see CustomLevel.cpp.\n"
+            "shape GkPlusLevelGeometry\n{\n\tname \"" +
+            level.map.object_name + "\"\n\tfile \"" + level.map.rif_file +
+            "\"\n}\n";
+  return source;
 }
 
 // --- the parsed map section ---------------------------------------------------
@@ -245,9 +259,9 @@ void __fastcall HookedConvertParsedObjects(gls::ParsedObjectList *list) {
   // Null is reachable and the game dereferences it without checking: LoadGLS
   // hands back null for a script that defined nothing (it prints "confused by
   // earlier errors" and returns the never-created ParsedObjList). The prelude
-  // always defines its filler shape so this should not happen, but a missing or
-  // unreadable prelude would land exactly here, and a crash inside LoadLevel is
-  // a much worse diagnostic than an empty level.
+  // source always defines its filler shape so this should not happen, but an
+  // #include that fails to parse would land exactly here, and a crash inside
+  // LoadLevel is a much worse diagnostic than an empty level.
   if (list) {
     ConvertParsedObjects(list);
   }
@@ -319,20 +333,32 @@ gls::ParsedObjectList *NewEmptyParsedList() {
   return list;
 }
 
-// A level that builds everything with `make` has no .gls to parse - but LoadLevel
-// calls LoadGLS(ScriptFileName) unconditionally, and letting that fail is not an
-// option: a failed parse poisons the parser for the rest of the process, so the
-// next *game* level to load would fail too.
+// LoadLevel calls LoadGLS(ScriptFileName) unconditionally, and a custom level's
+// ScriptFileName names no file. Letting the open fail is not an option for the
+// level that asked for `includes` - it would parse nothing - and pointless for the
+// one that did not.
 //
-// Handing back an empty list instead means such a level never touches the parser
-// at all. A level that did ask for `includes` still gets its generated prelude
-// and the real LoadGLS.
+// So both cases are served here without a file existing:
+//
+//   * `includes` become a source text, parsed from memory. gls::SourceTextScope
+//     rather than gls::ParseSource, because the original has to be reached through
+//     *this hook's* trampoline: gls::LoadGLS holds the raw address and would come
+//     straight back in here.
+//   * no `includes` means the parser is never involved at all, and an empty list
+//     built the way ParseGSH builds its own goes back instead. That also keeps a
+//     failed parse from poisoning every later one, which would take the next
+//     *game* level down with it.
 gls::ParsedObjectList *__fastcall HookedLoadGLS(const char *file, int mode) {
   if (file) {
     for (const std::unique_ptr<CustomLevel> &level : Levels) {
-      if (!level->has_prelude && level->script_file == file) {
+      if (level->script_file != file) {
+        continue;
+      }
+      if (level->prelude_source.empty()) {
         return NewEmptyParsedList();
       }
+      gls::SourceTextScope armed{file, level->prelude_source.c_str()};
+      return LoadGLS(file, mode);
     }
   }
   return LoadGLS(file, mode);
@@ -359,6 +385,50 @@ void EnsureChooseLevelEntry() {
                     nullptr);
 }
 
+// --- getting into the game's LevelList, without displacing the campaign -------
+//
+// **Registering a level and listing it are separate acts, and the order
+// matters.** EnterMainMenuScreen @ 0x004e7e50 seeds LevelList with the fifteen
+// campaign missions only when the list is *empty* - it opens with
+// `CMP dword [0x007b74e0],0` / `JNZ 0x004e81d2`, and that jump skips all fifteen
+// AddLevel calls and the block after them that seeds ScriptFileName /
+// ConsoleFileName from the first entry. A script registers during SetupMenus,
+// which runs earlier, so calling AddLevel there cost the player the whole
+// campaign: Choose Level held only the script-defined levels, menu 7's "new
+// game" launched the first of them (it starts `LevelList.sentinel->next`), and
+// the default script name was never set at all.
+//
+// So the levels wait, and this appends them after the seed has had its turn.
+// Idempotent by the `listed` flag rather than by re-reading the list, because
+// two levels may legitimately share a title.
+//
+// Nothing here rebuilds anything: LevelList is cleared only by
+// ShutdownMenuSystem at process exit, and EnterMainMenuScreen does not touch
+// Menus[5], so the append happens exactly once per level per process and each
+// one keeps the index AddLevel gave it. That index has to stay put - menu 5's
+// dispatch walks the list positionally by ChosenMenuItem.
+bool MainMenuEntered = false;
+
+void ReconcileLevelList() {
+  for (const std::unique_ptr<CustomLevel> &level : Levels) {
+    if (level->listed) {
+      continue;
+    }
+    // The game copies all three strings and appends the Choose Level item
+    // itself. The .gcs slot is empty on purpose: a custom level's triggers and
+    // setup are the setup callback's job, and ExecuteCommandFile on a missing
+    // file is a no-op.
+    AddLevel(level->title.c_str(), level->script_file.c_str(), "");
+    level->listed = true;
+  }
+}
+
+void __stdcall HookedEnterMainMenuScreen() {
+  EnterMainMenuScreen();
+  MainMenuEntered = true;
+  ReconcileLevelList();
+}
+
 } // namespace
 
 const char *CustomLevelTitle(const CustomLevel *level) {
@@ -367,6 +437,18 @@ const char *CustomLevelTitle(const CustomLevel *level) {
 
 const char *CustomLevelScriptFile(const CustomLevel *level) {
   return level ? level->script_file.c_str() : "";
+}
+
+CustomLevel *CustomLevelByTitle(const char *title) {
+  if (!title) {
+    return nullptr;
+  }
+  for (const std::unique_ptr<CustomLevel> &level : Levels) {
+    if (_stricmp(level->title.c_str(), title) == 0) {
+      return level.get();
+    }
+  }
+  return nullptr;
 }
 
 const CustomLevelMap &CustomLevelDescription(const CustomLevel *level) {
@@ -487,7 +569,7 @@ CustomLevel *AddCustomLevel(const char *title, const CustomLevelMap &map,
 
   auto level = std::make_unique<CustomLevel>();
   level->title = title;
-  level->script_file = PreludePath(title);
+  level->script_file = VirtualScriptName(title);
   level->map = map;
   level->parsed_map = parsed;
   level->define = define;
@@ -497,24 +579,34 @@ CustomLevel *AddCustomLevel(const char *title, const CustomLevelMap &map,
   level->user = user;
 
   // Only levels that name `includes` need a script at all - those are the ones
-  // whose roles come from .gsh files. A level built entirely with `make` gets no
-  // file on disk and never reaches the parser.
-  level->has_prelude = !includes.empty();
-  if (level->script_file.empty() ||
-      (level->has_prelude && !WritePrelude(*level, includes))) {
-    Fail(title, "could not write the generated script");
-    gls::Release(parsed);
-    return nullptr;
+  // whose roles come from .gsh files. A level built entirely with `make` or `gls`
+  // leaves this empty and never reaches the parser.
+  if (!includes.empty()) {
+    level->prelude_source = PreludeSource(*level, includes);
+  }
+
+  // script_file is the identity every load path is matched on, so two levels
+  // holding the same one would make the second unreachable. Titles differing only
+  // in punctuation collide, since that is what VirtualScriptName folds away.
+  for (const std::unique_ptr<CustomLevel> &existing : Levels) {
+    if (existing->script_file == level->script_file) {
+      Fail(title, "another level already uses that script name - the titles "
+                  "differ only in punctuation");
+      gls::Release(parsed);
+      return nullptr;
+    }
   }
 
   CustomLevel *raw = level.get();
   Levels.push_back(std::move(level));
 
-  // The game copies all three strings and appends the Choose Level item itself.
-  // The .gcs slot is empty on purpose: a custom level's triggers and setup are
-  // the setup callback's job, and ExecuteCommandFile on a missing file is a
-  // no-op.
-  AddLevel(title, raw->script_file.c_str(), "");
+  // Listing is deferred to the first EnterMainMenuScreen so the campaign gets
+  // the empty list it insists on - see ReconcileLevelList. Once that has
+  // happened the order is settled and a later registration (from the REPL, say,
+  // or a module that runs after boot) can be appended at once.
+  if (MainMenuEntered) {
+    ReconcileLevelList();
+  }
   EnsureChooseLevelEntry();
   return raw;
 }
@@ -534,11 +626,13 @@ CustomLevelSystem::CustomLevelSystem() {
   GetObjectAtOffset(FreeParsedObjectList, 0x00474870);
   GetObjectAtOffset(LoadGLS, 0x00474540);
   GetObjectAtOffset(ExecuteAllCommands, 0x004d62c0);
+  GetObjectAtOffset(EnterMainMenuScreen, 0x004e7e50);
 
   DetourAttach(&ConvertParsedObjects, HookedConvertParsedObjects);
   DetourAttach(&FreeParsedObjectList, HookedFreeParsedObjectList);
   DetourAttach(&LoadGLS, HookedLoadGLS);
   DetourAttach(&ExecuteAllCommands, HookedExecuteAllCommands);
+  DetourAttach(&EnterMainMenuScreen, HookedEnterMainMenuScreen);
 
   // No hook of its own - ScriptQueueSystem owns those, and this only says where
   // a message payload goes once it has one. Order between the two subsystems
@@ -552,5 +646,6 @@ CustomLevelSystem::~CustomLevelSystem() {
   DetourDetach(&FreeParsedObjectList, HookedFreeParsedObjectList);
   DetourDetach(&LoadGLS, HookedLoadGLS);
   DetourDetach(&ExecuteAllCommands, HookedExecuteAllCommands);
+  DetourDetach(&EnterMainMenuScreen, HookedEnterMainMenuScreen);
 }
 } // namespace gk

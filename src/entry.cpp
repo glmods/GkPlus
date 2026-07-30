@@ -6,6 +6,7 @@
 #include "CustomLevel.h"
 #include "CustomMenu.h"
 #include "Debug.h"
+#include "GLS.h"
 #include "GUI.h"
 #include "InputFix.h"
 #include "Music.h"
@@ -29,6 +30,7 @@ struct Subsystems {
   InputFixSystem inputfix; // suppress the vestigial DirectInput keyboard acquire
   CustomMenuSystem menus;   // front-end menu items owned by GkPlus
   ScriptQueueSystem queue;  // the script queue carries JSON, not bare .gcs names
+  gls::GlsSystem gls;       // lets the GLS parser take a source text, not a file
   CustomLevelSystem levels; // levels built from script instead of .gls + .gcs
   ScriptSystem script;      // QuickJS host; runs gkplus/main.mjs
 };

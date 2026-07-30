@@ -442,7 +442,16 @@ Role *MakeRole(const RoleDesc &d) {
     r->hotspot_point = {0, 0, 0};
     if (d.hotspot) {
       r->hotspot.reset(GameStrdup(d.hotspot));
-      FastCall<void, Hierarchy *, Vec3 *, const char *> resolve;
+      // ThisCall, not FastCall, and that is measured rather than chosen: the
+      // hierarchy arrives in ECX (`MOV EDI,ECX` at 0x005948bb) but BOTH remaining
+      // arguments are on the stack - the out Vec3 at [EBP+8] (written by the
+      // `MOVQ [EBX]` / `MOV [EBX+8]` pair) and the node name at [EBP+0xc] (the
+      // second operand of the stricmp at 0x005948d2) - and it ends in `RET 0x8`.
+      // Declared __fastcall the Vec3 went to EDX where nothing reads it, the name
+      // landed in the out-pointer slot, and the name argument was read off
+      // whatever the caller's stack happened to hold: an access violation inside
+      // ___ascii_stricmp, every time, which is what make.role used to do.
+      ThisCall<void, Hierarchy *, Vec3 *, const char *> resolve;
       GetObjectAtOffset(resolve, 0x00594890); // HierarchyResolveNamedPointPos
       resolve(r->hierarchy, &r->hotspot_point, d.hotspot);
     }
@@ -451,7 +460,7 @@ Role *MakeRole(const RoleDesc &d) {
     r->alternate_hotspot_point = r->hotspot_point;
     if (d.alternate_hotspot) {
       r->alternate_hotspot.reset(GameStrdup(d.alternate_hotspot));
-      FastCall<void, Hierarchy *, Vec3 *, const char *> resolve;
+      ThisCall<void, Hierarchy *, Vec3 *, const char *> resolve;
       GetObjectAtOffset(resolve, 0x00594890);
       resolve(r->hierarchy, &r->alternate_hotspot_point, d.alternate_hotspot);
     }
@@ -659,14 +668,14 @@ bool MakeAmmoInfo(const AmmoInfoDesc &d) {
 // --- camera track ----------------------------------------------------------------------
 
 bool MakeCameraTrack(const CameraTrackDesc &d) {
-  if (!d.name) {
+  // Both are required by the converter, and `file` is not merely optional here:
+  // AcquireLevelRifForLocators strlen's ECX with no null check.
+  if (!d.name || !d.file) {
     return false;
   }
-  // AcquireLevelRifForLocators with nothing in ECX, exactly as the converter
-  // calls it - it falls through to the already-loaded global rif.
-  FastCall<void *> acquire_rif;
+  FastCall<void *, const char *> acquire_rif;
   GetObjectAtOffset(acquire_rif, 0x00483da0);
-  void *rif = acquire_rif();
+  void *rif = acquire_rif(d.file);
   if (!rif) {
     return false;
   }
@@ -688,12 +697,17 @@ bool MakeCameraTrack(const CameraTrackDesc &d) {
   track[0x1a] = d.pgen;  // +0x68
   track[0x1b] = d.pgen2; // +0x6c
 
-  // Binds the track to the rif object of that name, offset by the map origin.
-  // Failure destroys the object through its own slot 0, which is what the
-  // converter does rather than leaking it.
-  FastCall<char, const char *, float, float, float> bind;
+  // LoadCameraTrackFromRif: walks the rif's REBENVDT/SPECLOBJ for the CUTSHEAD
+  // whose CUTSCDAT name matches, and loads the path into the track offset by the
+  // map origin. Failure destroys the object through its own slot 0, which is what
+  // the converter does rather than leaking it.
+  //
+  // The track is in ECX and the rif in EDX; the name and a *by-value* Vec3 are the
+  // only stack arguments, which is the RET 0x10. Passing the origin as three
+  // floats instead would push the same 12 bytes but move the name into ECX.
+  FastCall<char, void *, void *, const char *, Vec3> bind;
   GetObjectAtOffset(bind, 0x005aa920);
-  if (!bind(d.name, map->neg_origin.x, map->neg_origin.y, map->neg_origin.z)) {
+  if (!bind(track, rif, d.name, map->neg_origin)) {
     auto **vtbl = static_cast<void ***>(static_cast<void *>(track));
     auto dtor = reinterpret_cast<ThisCall<void *, void *, unsigned char>>((*vtbl)[0]);
     dtor(track, 1);

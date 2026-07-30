@@ -357,7 +357,9 @@ const ammoOk: boolean = make.ammo({
   role: Rol_Bug,
 });
 const infoOk: boolean = make.ammo_info({ ammo_type: "flares", shape: hcy, max_per_slot: 50 });
-make.camera_track({ name: "camtrack1" });
+make.camera_track({ name: "first contact", file: "levels\\level01.rif" });
+// @ts-expect-error - `file` is required: it reaches a strlen with no null check
+make.camera_track({ name: "first contact" });
 
 // @ts-expect-error - the destructibility variants are discriminated on `kind`
 make.role({ identifier: "x", destructibility: { kind: "shatter" } });
@@ -434,6 +436,26 @@ const asModule: LevelModule = {
   message_received(msg, level) {},
 };
 const fromModule: Level = levels.add("From A Module", asModule);
+
+// --- starting a level, with no menus in the way ----------------------------------
+const started: boolean = levels.start(arena);
+levels.start(arena, { difficulty: "hard" });
+levels.start("level01", { difficulty: 2 });
+levels.start({ script: "level01.gls", console: "level01.gcs" });
+arena.start({ difficulty: "easy" });
+const pending: boolean = levels.start_pending;
+const quitToMenu: boolean = levels.quit();
+for (const entry of levels.startable) {
+  const where: number = entry.index;
+  const what: string = entry.title + entry.script + entry.console;
+}
+
+// @ts-expect-error - difficulty is a name or a number, not a boolean
+levels.start(arena, { difficulty: true });
+// @ts-expect-error - {console} alone names no level
+levels.start({ console: "level01.gcs" });
+// @ts-expect-error - the startable inventory is read-only
+levels.startable[0].title = "x";
 
 // @ts-expect-error - `object` is required; a rif alone does not name a map
 levels.add("Broken", { rif: "levels\\level01.rif" });

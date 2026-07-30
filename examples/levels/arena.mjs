@@ -85,16 +85,16 @@ export function populate(level) {
   for (const spot of level.locators("Goodie A")) {
     // `as` creates a token holding the new actor's id, which is how the engine
     // names actors - the `as "gunlok"` clause of a `use`.
-    level.spawn("Rol_GunLok", 1, spot, { as: "gunlok" });
+    level.spawn("gunlok", 1, spot, { as: "gunlok" });
   }
   for (const spot of level.locators("Goodie B")) {
-    level.spawn("Rol_Elint", 1, spot, { as: "elint" });
+    level.spawn("elint", 1, spot, { as: "elint" });
   }
 
   // Nothing forces you to use locators, though - a bare position works, which a
   // .gls has no way of expressing.
   for (let i = 0; i < 4; ++i) {
-    level.spawn("Rol_Archore", 2, { x: 40 + i * 6, y: 4, z: -24 });
+    level.spawn("archore", 2, { x: 40 + i * 6, y: 4, z: -24 });
   }
 
   // "bug" is the `identifier` of a role define() registered from headers/bug.mjs

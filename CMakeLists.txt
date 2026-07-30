@@ -66,6 +66,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Roles.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Script.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ScriptQueue.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Session.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Tokens.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Triggers.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/World.cpp"

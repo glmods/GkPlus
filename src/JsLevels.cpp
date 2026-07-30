@@ -3,8 +3,11 @@
 #include "Js.h"
 #include "JsBindings.h"
 #include "Map.h"
+#include "Menu.h"
+#include "Misc.h"
 #include "Roles.h"
 #include "ScriptQueue.h"
+#include "Session.h"
 #include "Tokens.h"
 
 #include <cstdio>
@@ -496,6 +499,11 @@ JSValue LevelToString(JSContext *ctx, JSValueConst self, int, JSValueConst *) {
   return JS_NewString(ctx, buf);
 }
 
+// Defined with the rest of the start machinery further down, because it shares
+// ReadDifficulty and QueueStart with levels.start().
+JSValue LevelStart(JSContext *ctx, JSValueConst self, int argc,
+                   JSValueConst *argv);
+
 const JSCFunctionListEntry LevelProto[] = {
     JS_CGETSET_DEF("title", GetLevelTitle, nullptr),
     JS_CGETSET_DEF("script_file", GetLevelScriptFile, nullptr),
@@ -504,6 +512,7 @@ const JSCFunctionListEntry LevelProto[] = {
     JS_CFUNC_DEF("locators", 1, LevelLocators),
     JS_CFUNC_DEF("spawn", 4, LevelSpawn),
     JS_CFUNC_DEF("send", 1, LevelSend),
+    JS_CFUNC_DEF("start", 1, LevelStart),
     JS_CFUNC_DEF("toString", 0, LevelToString),
 };
 
@@ -704,9 +713,228 @@ JSValue GetCurrent(JSContext *ctx, JSValueConst) {
   return NewLevelWrapper(ctx, level);
 }
 
+// --- starting a level ----------------------------------------------------------
+
+// The game's LevelList @ 0x007b74dc holds every startable level: the 15-mission
+// campaign EnterMainMenuScreen seeds, anything ADD MISSION added, and - because
+// AddCustomLevel registers through the same AddLevel - every script-defined
+// level too. So one lookup serves all three and `startable` is the honest
+// inventory of what start() will accept.
+bool FindListedLevel(const char *name, LevelStartRequest *out) {
+  LevelList *list = GetLevelList();
+  if (!list) {
+    return false;
+  }
+  for (const LevelInfo &info : *list) {
+    if (info.title && _stricmp(info.title.get(), name) == 0) {
+      out->script = info.script ? info.script.get() : "";
+      out->console = info.console ? info.console.get() : "";
+      return true;
+    }
+  }
+  return false;
+}
+
+// `difficulty` accepts the same names game.difficulty does, or the raw 0..3.
+// Absent leaves the request's default (medium), which is what the New Game
+// menu's first item produces.
+bool ReadDifficulty(JSContext *ctx, JSValueConst options, int *out) {
+  if (!JS_IsObject(options)) {
+    return true;
+  }
+  JSValue v = JS_GetPropertyStr(ctx, options, "difficulty");
+  if (JS_IsException(v)) {
+    return false;
+  }
+  if (JS_IsUndefined(v) || JS_IsNull(v)) {
+    JS_FreeValue(ctx, v);
+    return true;
+  }
+  if (JS_IsNumber(v)) {
+    int32_t d = 0;
+    int rc = JS_ToInt32(ctx, &d, v);
+    JS_FreeValue(ctx, v);
+    if (rc < 0) {
+      return false;
+    }
+    *out = d;
+    return true;
+  }
+  const char *name = JS_ToCString(ctx, v);
+  JS_FreeValue(ctx, v);
+  if (!name) {
+    return false;
+  }
+  for (int i = static_cast<int>(Difficulty::Easy);
+       i <= static_cast<int>(Difficulty::Extreme); ++i) {
+    if (_stricmp(name, DifficultyName(i)) == 0) {
+      JS_FreeCString(ctx, name);
+      *out = i;
+      return true;
+    }
+  }
+  JS_ThrowRangeError(ctx, "difficulty must be easy, medium, hard or extreme");
+  JS_FreeCString(ctx, name);
+  return false;
+}
+
+// Turns start()'s first argument into a request. A Level wrapper and a title
+// both resolve through LevelList; an object with `script` is the escape hatch
+// for a .gls that was never registered.
+bool ReadStartTarget(JSContext *ctx, JSValueConst target,
+                     LevelStartRequest *out) {
+  if (JS_IsString(target)) {
+    const char *name = JS_ToCString(ctx, target);
+    if (!name) {
+      return false;
+    }
+    bool found = FindListedLevel(name, out);
+    if (!found) {
+      // Registered but not listed yet: listing waits for the first
+      // EnterMainMenuScreen so the campaign gets the empty LevelList it
+      // insists on, and a script can call start() before that has happened.
+      if (CustomLevel *level = CustomLevelByTitle(name)) {
+        out->script = CustomLevelScriptFile(level);
+        out->console = "";
+        found = true;
+      }
+    }
+    if (!found) {
+      JS_ThrowRangeError(ctx, "no level named '%s' - see levels.startable",
+                         name);
+    }
+    JS_FreeCString(ctx, name);
+    return found;
+  }
+  if (JS_IsObject(target)) {
+    // A Level wrapper: start it by the virtual script name it registered under,
+    // which is exactly what the Choose Level item would have set.
+    if (auto *level = static_cast<CustomLevel *>(
+            JS_GetOpaque(target, LevelClassId))) {
+      out->script = CustomLevelScriptFile(level);
+      out->console = "";
+      return true;
+    }
+    JSValue script = JS_GetPropertyStr(ctx, target, "script");
+    if (JS_IsException(script)) {
+      return false;
+    }
+    if (!JS_IsUndefined(script)) {
+      const char *text = JS_ToCString(ctx, script);
+      JS_FreeValue(ctx, script);
+      if (!text) {
+        return false;
+      }
+      out->script = text;
+      JS_FreeCString(ctx, text);
+      JSValue console = JS_GetPropertyStr(ctx, target, "console");
+      if (JS_IsException(console)) {
+        return false;
+      }
+      if (!JS_IsUndefined(console) && !JS_IsNull(console)) {
+        const char *ctext = JS_ToCString(ctx, console);
+        JS_FreeValue(ctx, console);
+        if (!ctext) {
+          return false;
+        }
+        out->console = ctext;
+        JS_FreeCString(ctx, ctext);
+      } else {
+        JS_FreeValue(ctx, console);
+      }
+      return true;
+    }
+    JS_FreeValue(ctx, script);
+  }
+  JS_ThrowTypeError(ctx, "start(level) takes a Level, a title, or {script, "
+                         "console}");
+  return false;
+}
+
+JSValue QueueStart(JSContext *ctx, const LevelStartRequest &request) {
+  if (const char *refusal = LevelStartRefusal(request)) {
+    return JS_ThrowTypeError(ctx, "%s", refusal);
+  }
+  return JS_NewBool(ctx, QueueLevelStart(request));
+}
+
+JSValue LevelsStart(JSContext *ctx, JSValueConst, int argc,
+                    JSValueConst *argv) {
+  if (argc < 1) {
+    return JS_ThrowTypeError(ctx, "start(level, options?)");
+  }
+  LevelStartRequest request;
+  if (!ReadStartTarget(ctx, argv[0], &request) ||
+      !ReadDifficulty(ctx, argc > 1 ? argv[1] : JS_UNDEFINED,
+                      &request.difficulty)) {
+    return JS_EXCEPTION;
+  }
+  return QueueStart(ctx, request);
+}
+
+// The same thing spelled on a Level wrapper, so a script that just registered
+// one can start it without naming it again.
+JSValue LevelStart(JSContext *ctx, JSValueConst self, int argc,
+                   JSValueConst *argv) {
+  CustomLevel *level = LevelOf(ctx, self);
+  if (!level) {
+    return JS_EXCEPTION;
+  }
+  LevelStartRequest request;
+  request.script = CustomLevelScriptFile(level);
+  if (!ReadDifficulty(ctx, argc > 0 ? argv[0] : JS_UNDEFINED,
+                      &request.difficulty)) {
+    return JS_EXCEPTION;
+  }
+  return QueueStart(ctx, request);
+}
+
+JSValue LevelsQuit(JSContext *ctx, JSValueConst, int, JSValueConst *) {
+  return JS_NewBool(ctx, QueueReturnToMainMenu());
+}
+
+JSValue GetPending(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, LevelStartPending());
+}
+
+// Everything start() will take by name, in the order the Choose Level menu
+// shows it - the game keeps item n aligned with list entry n.
+JSValue GetStartable(JSContext *ctx, JSValueConst) {
+  JSValue out = JS_NewArray(ctx);
+  if (JS_IsException(out)) {
+    return out;
+  }
+  LevelList *list = GetLevelList();
+  if (!list) {
+    return out;
+  }
+  uint32_t i = 0;
+  for (const LevelInfo &info : *list) {
+    JSValue entry = JS_NewObject(ctx);
+    if (JS_IsException(entry)) {
+      JS_FreeValue(ctx, out);
+      return JS_EXCEPTION;
+    }
+    JS_SetPropertyStr(ctx, entry, "index", JS_NewInt32(ctx, i));
+    JS_SetPropertyStr(ctx, entry, "title",
+                      JS_NewString(ctx, info.title ? info.title.get() : ""));
+    JS_SetPropertyStr(ctx, entry, "script",
+                      JS_NewString(ctx, info.script ? info.script.get() : ""));
+    JS_SetPropertyStr(ctx, entry, "console",
+                      JS_NewString(ctx, info.console ? info.console.get() : ""));
+    JS_SetPropertyUint32(ctx, out, i, entry);
+    ++i;
+  }
+  return out;
+}
+
 const JSCFunctionListEntry LevelsProps[] = {
     JS_CFUNC_DEF("add", 2, LevelsAdd),
     JS_CGETSET_DEF("current", GetCurrent, nullptr),
+    JS_CFUNC_DEF("start", 2, LevelsStart),
+    JS_CFUNC_DEF("quit", 0, LevelsQuit),
+    JS_CGETSET_DEF("startable", GetStartable, nullptr),
+    JS_CGETSET_DEF("start_pending", GetPending, nullptr),
 };
 
 const CollectionOps LevelsOps = {

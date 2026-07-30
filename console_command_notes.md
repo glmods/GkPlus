@@ -688,6 +688,76 @@ result because "we checked and it was clean" is worth as much as a finding:
   `ReplaceDestructibility` declare only a virtual destructor, and `Role` itself has no vtable at all.
   Slot 0 is exempt for the reason in §6.3.
 
+### 6.5 Three mirror defects the *first in-game run* turned up
+
+The §6.3/§6.4 sweeps covered **vtable slots**. They could not cover the free functions a mirror
+resolves by address, and all three defects below sat in that gap - each one a guaranteed crash that
+no amount of building or type-checking would show, and each found within minutes of first exercising
+the code in the running game.
+
+- **`GetCommandTable` was missing a dereference** (`src/Console.cpp`). 0x007b6a7c *holds* the bucket
+  array; every game reader loads the value (`MOV EAX,[0x007b6a7c]` in `RegisterConsoleCommand`,
+  `CommandListCommands`, `FreeCommands`, …). The accessor returned `&CommandTableBuckets` instead, so
+  `ForEachConsoleCommand` treated the array pointer as bucket 0's chain head and the neighbouring
+  globals as buckets 1..n - `ConsoleTextScrollTarget` @ 0x007b6a80 is a `float`. **`console.commands`
+  was a guaranteed access violation**; it now enumerates 257 commands.
+- **`HierarchyResolveNamedPointPos` @ 0x00594890 was declared `FastCall`, and it is `__thiscall`
+  with two *stack* arguments** (`RET 0x8`). The hierarchy does arrive in ECX, but the out-`Vec3` is
+  `[EBP+8]` (it is what the `MOVQ [EBX]` / `MOV [EBX+8]` pair writes) and the node name is
+  `[EBP+0xc]` (the second operand of the `stricmp` at 0x005948d2). Declared `__fastcall` the `Vec3`
+  went to EDX where nothing reads it, the name landed in the out-pointer slot, and the *name*
+  argument came off whatever the caller's stack held. **Every `make.role` with a `hotspot` faulted
+  inside `___ascii_stricmp`**; it now resolves (`head` -> `{0, -0.014, 0.073}` on `units\bug.rif`).
+- **`MakeCameraTrack` had *two* wrong calls, and the second is the interesting one.** 0x005aa920 is
+  now `LoadCameraTrackFromRif`:
+  `bool __fastcall(void *track /*ECX*/, void *rif /*EDX*/, const char *name, Vec3 map_origin)` -
+  one dword and a **by-value `Vec3`** on the stack, which is the `RET 0x10`. It looks up
+  REBENVDT -> SPECLOBJ in the rif, collects every `CUTSHEAD` child and `_stricmp`s `name` against
+  each one's `CUTSCDAT` name (+0x28), then hands the match to
+  `CameraTrack_LoadFromCutscene` @ 0x005bf060 with `*(float *)rif` (the rif unit scale) and the
+  origin. Declared as `FastCall<char, const char *, float, float, float>` the name went to ECX, EDX
+  was never set, and 12 bytes were pushed for a callee that pops 16.
+  The second defect is that `AcquireLevelRifForLocators` was called **with no argument at all**, on
+  the belief that it falls through to the already-loaded level rif. It does not: `ToCameraTrack`
+  passes the section's own `file` field (0x01, `parsed+0x240`) in ECX, and the callee `strlen`s it
+  with no null check. `CameraTrackDesc` therefore grew a `file` member - the GLS section has always
+  had one, and the shipped scripts spell both
+  (`camera track { file "levels\level01.rif" name "first contact" }`).
+  Verified in a running game: 50 hits and 50 misses interleaved, plus 300 misses in a loop, with the
+  process still answering the REPL afterwards and no WER record.
+
+**The lesson is the coverage gap, not the three bugs.** A `RET`-form sweep is cheap and mechanical,
+and it was only ever run against vtables. Re-run it over every `GetObjectAtOffset` in `src/`: for a
+declared arity, `__fastcall` puts the first two *integral* arguments in registers (floats never) and
+`__thiscall` only `this`, so the expected `RET` operand is `4 * stack_args` - and a disagreement is a
+defect, not a modelling choice.
+
+#### 6.5.1 That sweep, run over all of `src/`
+
+Every `GetObjectAtOffset` in `src/` (231 sites; 110 distinct address/declaration pairs resolve to a
+`.text` function through a convention template) now agrees with its target's `RET` form. **Zero
+mismatches.** What it took to get a trustworthy answer:
+
+- **Resolve the declaration per call site, not per name.** `fn` is a local in a dozen files; keying
+  on the identifier alone attributes the last declaration seen to every site and produces ~40
+  phantom findings.
+- **Four tail-jump functions have no `RET` of their own** and must be followed: `ClearCameraTrack`
+  @ 0x00487e30 -> 0x00487a00, the `ToRole` thunk @ 0x0047cc10 -> 0x0047cc20, `GetServerTime64`
+  @ 0x00505340 -> `ReadScaledClock64` (with ECX preloaded), and `SetIsFogEnabled` @ 0x00472230 ->
+  0x004697d0, which **overwrites its own argument slot** before jumping so the tail callee's
+  `RET 0x4` is what makes the whole chain `__stdcall`-clean.
+- **`"long long".split()[-1]` is `"long"`**, and a size table that misses that silently counts a
+  64-bit argument as 4 bytes - which is exactly how `RegisterTriggers`' correct declaration reads as
+  a 4-byte mismatch. `TriggerList` is a `List<T>`, 16 bytes by value.
+
+**The `RET` test is blind to register arguments**, which is how the
+`AcquireLevelRifForLocators` defect above survived it - a missing ECX argument changes no `RET`
+operand. The companion check is: for a target declared with fewer than two register arguments, walk
+from its entry and look for a *read* of ECX (or EDX) before any write. Over the 60 such sites it
+reports two false positives, both `LEA EDX,[ECX+1]`-shaped writes, and nothing else; run against the
+unfixed source it flags 0x00483da0 at `PUSH ECX` and 0x005aa920 at `MOV EAX,EDX`, which is the
+self-test that the check can fail at all.
+
 ### 6.1 Durable scheduling
 
 `SaveGame` @ 0x00507a80 records every piece of the engine's scheduling: the trigger list (each

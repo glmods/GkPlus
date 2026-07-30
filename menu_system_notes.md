@@ -276,6 +276,25 @@ Two menus deserve a footnote:
 `level12`, `cityruins`, `level15`) and can be extended from the console with
 `ADD MISSION <script.gls> <console.gcs>` (`CommandAddMission` @ `0x004402b0`).
 
+**The seed is guarded on the list being empty**, and that guard has teeth. `EnterMainMenuScreen`
+opens with `CMP dword [0x007b74e0],0` / `JNZ 0x004e81d2` - 0x007b74e0 is `LevelList.n_entries` -
+and jumps past all fifteen `AddLevel` calls *and* the block after them that seeds `ScriptFileName`
+/ `ConsoleFileName` from the first entry. So whoever registers first wins the whole list, and
+three things ride on it: Choose Level's contents, menu 7 item 0 ("new game"), which starts
+`LevelList.sentinel->next` - the **first** entry, not `level01` by name - and whether the default
+script name is ever set at all.
+
+GkPlus registers script-defined levels during `SetupMenus`, which is *before* the first
+`EnterMainMenuScreen`, so calling `AddLevel` there suppressed the entire campaign. It no longer
+does: `src/CustomLevel.cpp` separates registering from listing and appends its levels from a
+detour on `EnterMainMenuScreen`, after the original has had its empty list. The order that
+produces is campaign 0-14 then script-defined levels from 15, which is also the Choose Level
+order, and it is stable - `LevelList` is cleared only by `ShutdownMenuSystem` at process exit and
+`EnterMainMenuScreen` never touches `Menus[5]`, so returning to the menu neither re-seeds nor
+duplicates.
+
+`ADD MISSION` appends to the same list at any time.
+
 Both go through `AddLevel` @ `0x004efcc0` — `__fastcall(title, scriptFile, consoleFile)`,
 which strdups all three into a 0x18-byte `List_Member<LevelInfo>` node (`title` @ +0x0c,
 `script` @ +0x10, `console` @ +0x14) **and calls `Menu::AddItem(Menus[5], title)` itself**.

@@ -143,6 +143,20 @@ Notes:
   debrief screen (`GL_MISDEB_FILENAME`) and chains to the next briefing or `EnterMainMenuScreen`.
 - The screen id is `GetResourceString((isBriefing ^ 1) + GL_MISBRF_FILENAME)`, i.e.
   `isBriefing=1` -> GL_MISBRF (briefing), `isBriefing=0` -> GL_MISDEB (debrief).
+- **Neither script is specified anywhere; both names are derived.** The briefing is
+  `ScriptFileName` with its last three characters overwritten with `brf` (guarded by
+  `len > 4`), and the **debrief is the fixed literal `debrief.dbf`** - one file shared by
+  every level in the game, not a per-level script. The single exception is
+  `ScriptFileName == "Training Level.gls"`, compared with `_mbsicmp`, which takes a
+  script-free path instead (`IsTrainingDebrief` + a 3-second fade). So a custom level whose
+  `ScriptFileName` names no file gets no briefing and starts immediately - the
+  `NumCommandsToExecute == 0` branch calls `BeginLevelSession` inline. Giving one a
+  briefing means serving that `.brf` from memory through the `ExecuteCommandFile` hook;
+  nothing does that yet.
+- The debrief screen is only reached from `CommandNextLevel` @ 0x004f6ba0 (`NEXT LEVEL`),
+  which first requires the current level *not* to be the last node in `LevelList` -
+  otherwise it just sets `LevelLoadReason = 1` and returns. Since `AddLevel` appends,
+  a single registered custom level makes `NEXT LEVEL` a no-op.
 - Front-end call sites pass the `BeginLevelSession` load flag in **CL** (`MOV CL,1`) — arg 1 of
   the `__fastcall`, not DL.
 - Training area (menu 21) and campaign-advance (`CommandNextLevel` @0x004f6ba0) reach the same
@@ -590,24 +604,55 @@ is the next thing to decompile if (c) is the goal.
 than parsed, which is what lets a level exist with no `.gls` and no `.gcs` at all. Five
 decisions carry it, and each was picked over an alternative that does not work:
 
-- **`ConvertParsedObjects` @ 0x004747b0 is the hook, not `LoadGLS`.** Hooking `LoadGLS`
-  and returning a synthetic list means hand-building a `ParsedObjectList`, and
-  `FreeParsedObjectList` pool-frees the header *and* destroys the sentinel and every node
-  through their vtables - the parser creates all of that inline inside `ParseGSH`
-  (0x00478f6c: `pool_alloc(0x10)` header, `pool_alloc(0xc)` sentinel with vtable
-  0x00663064), so there is no helper to reuse. Hooking the *converter* instead means the
-  game builds and frees its own list as usual and GkPlus only calls the map's
+- **The map is built from a hook on `ConvertParsedObjects` @ 0x004747b0, not on
+  `LoadGLS`.** Having `LoadGLS` return a fully synthetic list means hand-building a
+  `ParsedObjectList`, and `FreeParsedObjectList` pool-frees the header *and* destroys the
+  sentinel and every node through their vtables - the parser creates all of that inline
+  inside `ParseGSH` (0x00478f6c: `pool_alloc(0x10)` header, `pool_alloc(0xc)` sentinel
+  with vtable 0x00663064), so there is no helper to reuse. Hooking the *converter* instead
+  means the game builds and frees its own list as usual and GkPlus only calls the map's
   `toGameObject` slot afterwards.
-- **The level's `ScriptFileName` is a real, generated `.gls`** in `%TEMP%\gkplus\`,
-  holding the script's `#include` list. Roles have to come from somewhere, and the
-  include guards only work within one `LoadGLS` call - N separate calls would re-register
-  every shared `.gsh`, because `ClearParseSymbolTables` runs per call. The prelude can
-  live outside the game folder because the parser opens an `#include` with a bare `fopen`
+
+  `LoadGLS` **is** hooked, but only to decide what the parse reads: a source text for a
+  level with `includes`, and for one without, the hand-built empty list above - which is
+  the one case where reproducing `ParseGSH`'s layout is unavoidable, and it is 20 lines
+  rather than a whole node graph.
+- **The level's `ScriptFileName` names no file at all.** It is a virtual
+  `gkplus\<slug>.gls`, where the slug is the title with every non-alphanumeric character
+  folded to `_`, and nothing on any load path opens it. A level that names `includes` gets
+  the `#include` list as a **source text** instead, handed to the parser by
+  `gls::ParseSource` - the parser's input is a source object, not a path, so a null
+  `FILE*` plus a text buffer is a complete parse (the mechanism, and the three
+  measurements behind it, are in `gls_system_notes.md` under "Parser input sources"). The
+  `#include` lines still resolve, because the parser opens an include with a bare `fopen`
   (0x00478c2c) against the *current* directory, which step 7 has already set to Scripts.
-- **The prelude always ends with a filler `shape`.** A script that defines nothing leaves
-  `ParsedObjList` null, `LoadGLS` prints "confused by earlier errors" and returns it, and
-  `LoadLevel` dereferences it. A `shape` needs exactly the `name` + `file` pair the map
-  section already requires, so it resolves to the very rif object `ToMap` loads next.
+  One source text rather than one `LoadGLS` per include, because the multiple-inclusion
+  guards only hold within a single call - `ClearParseSymbolTables` runs per call, so N
+  calls would re-register every shared `.gsh`.
+
+  **The shape of that name is dictated, not chosen.** It needs a three-letter extension
+  and more than four characters, because `ToMap` and `LoadOrBuildSectionAdjacency`
+  overwrite the last three characters in place to build `.cut` and `.map`; no double
+  quote, because `PushFileToParserStack` puts the name in a re-lexed `# line` directive;
+  and it must be **machine-independent**, which the `%TEMP%` absolute path it replaced was
+  not. `SaveGame` serialises `ScriptFileName` verbatim and `ApplyUpdateMessage` @ 0x004fdf3b
+  `strdup`s it out of a network payload on a joining client, so an absolute path under one
+  user's profile made a custom-level savegame unportable and a multiplayer join match no
+  registration at all - the client would load the geometry and run none of the callbacks.
+- **The two derived cache names are legal, optional and land in `<Gunlok>\gkplus`.**
+  `ToMap` restores the cwd to the game root (0x0047f24d) before deriving `.cut`, and the
+  read is an `OPEN_EXISTING` with an explicit rebuild branch, so a missing directory costs
+  a re-bake and nothing else. Note the cache is keyed on the level identity but *not* on
+  the map description: changing `max_vertices_per_section` and reloading reuses the old
+  sectioning until the `.rif` timestamp changes. That was equally true of the `%TEMP%`
+  scheme.
+- **The prelude source always ends with a filler `shape`.** A script that defines nothing
+  leaves `ParsedObjList` null, `LoadGLS` prints "confused by earlier errors" and returns
+  it, and `LoadLevel` dereferences it. A `shape` needs exactly the `name` + `file` pair
+  the map section already requires, so it resolves to the very rif object `ToMap` loads
+  next. A level with **no** `includes` skips the parser entirely and gets an empty
+  `ParsedObjectList` built the way `ParseGSH` builds its own - letting the parse fail
+  instead is not an option, since that poisons every later parse in the process.
 - **Which level is loading is read off `ScriptFileName`, not remembered from the menu.**
   Every entry point writes that global before `LoadLevel` runs, so the test covers Choose
   Level, `ADD MISSION`, a savegame restore and a multiplayer client alike.
@@ -625,6 +670,37 @@ decisions carry it, and each was picked over an alternative that does not work:
   call, which is what the level's own `.gcs` lines would have got. Running it afterwards
   would leave them to the once-per-frame pump instead.
 
+### 6.5.1 Measured in a running game
+
+Both paths were exercised end to end, in-game, with the REPL reading the state back:
+
+| | |
+|---|---|
+| a level naming six `.gsh` `includes` | **140 roles** registered before `define`, from an in-memory prelude; nothing on disk |
+| its `populate` | 6 actors spawned, and the `as:` clauses created the tokens the `.gcs` half names them by |
+| its `setup` | fog 0.67 and sun 140 applied, i.e. the `ExecuteAllCommands` hook lands where the `.gcs` would |
+| a level with **no** `includes` | 7 actors from one `make.role`-built role; `LoadGLS` never ran |
+| the virtual `ScriptFileName` | `gkplus\Test_Level_Parsed.gls` matched on load; no file of that name exists |
+
+Two traps that cost a run each, both about *names* rather than mechanism:
+
+- **A script spawns a role by its GLS `identifier`, never by the section symbol.** `Rol_GunLok` is
+  the symbol; the roles hash is keyed on the `identifier` field, so the name that works is `GUNLOK`
+  (`GetRoleByName` @ 0x004ae030 compares with `__mbsicmp`, so case does not matter - the spelling
+  does). `examples/levels/arena.mjs` had all three of `Rol_GunLok`/`Rol_Elint`/`Rol_Archore`, none of
+  which can ever resolve, which is how this went unnoticed: nothing had run it.
+- **`actor.name` is a reverse token lookup and it lies when values collide.** After a load, actor 0
+  reported `'RES'`, not `'gunlok'` - `FindTokenWithValue(0.0)` finds the level's own `RES=0` token
+  before the `gunlok=0` one that `as:` created. Any numeric token sharing a value with an actor id
+  shadows that actor's name.
+
+**Open, and not chased:** entries from a previous load appear to survive in the roles hash. Two
+consecutive loads of the same script-defined level left four entries - `testbug`, `null`, `testbug`,
+`null`, ids restarting at 0 because `LoadLevel` step 4 resets `next_entity_id` - where
+`DestroyRoles` should have left one. A controlled single-load sequence enumerates exactly, so the
+collection itself is fine; what is unclear is whether the stale entries are freed-and-recycled
+`Role*`s the hash still holds.
+
 Placed objects go through `gk::MapSpawn` after `ToMap`, not through the binding hash at
 `ParsedMap+0x1b60`: the hash needs a forged field-9 `ParsedField`, and `MapSpawn` already
 exists and accepts arbitrary coordinates. `gk::LevelRifLocators` supplies the `for "<rif
@@ -635,6 +711,67 @@ EDX) -> `RifFilterObjectsByName` -> `MapToWorld`.
 of `LoadLevel`, well before `ConvertParsedObjects`. Any native path that spawns actors
 must run after that reset and before step 11 (`ExecuteAllCommands`, which runs the
 `.gcs`), or tokens the trigger scripts expect will not exist yet.
+
+## 7.5 Starting a level with no menus (`src/Session.cpp`)
+
+The front-end route to a running level is a four-screen state machine, and none of it is a
+single call:
+
+| Screen | What its dispatch actually does |
+|---|---|
+| 7 SinglePlayer item 0 / 5 ChooseLevel item *n* | frees and re-`strdup`s `ScriptFileName` + `ConsoleFileName` from a `LevelList` entry, `ResetMissionStats(true)`, then `GoToMenu(9)` |
+| 9 NewSinglePlayerGame items 0/1 | `GameDifficulty = item + 1`, `EnterSinglePlayerMode()`, `LeaveFrontEndScreen()`, `ShowBriefingOrDebriefScreen(true)` |
+| the briefing | `BeginLevelSession(true)` - i.e. `GameState = 0x12` then `LoadLevel(freshStart = true)` |
+
+**The shortcut is the game's own.** `LoadGame` @ 0x00505730, restoring a "carry to the next
+level" header-only save, does `EndLevelSession(); BeginLevelSession(true);` with no menu and
+no briefing at all. `StartLevel` reproduces that, having first set the state the two menu
+screens would have set:
+
+```
+ResetMissionStats(true)                 // 0x004fcc30, __fastcall(char) in ECX
+ClearTeamCarryOverState(&TeamCarryOverState)  // 0x004da230, __thiscall - see below
+FreeAuxTeamCarryOverStates()            // 0x004dafd0
+ScriptFileName / ConsoleFileName        // pool_free the old, game strdup the new
+EnterSinglePlayerMode()                 // 0x004f94c0 - GameMode = SinglePlayer
+GameDifficulty = 0..3
+LevelLoadReason = 0                     // NOT 3; a previous LoadGame leaves it at 3
+LeaveFrontEndScreen()                   // 0x004e8dd0 - ONLY when the front end is up
+EndLevelSession()                       // 0x004e2710 - free when nothing is running
+BeginLevelSession(true)                 // 0x004e2560
+```
+
+Three things this rests on, two of them found by crashing the game:
+
+- **`LeaveFrontEndScreen` is once per front-end session, not idempotent.** Its first two
+  branches are null-guarded, which is exactly as far as a quick read gets you; past the
+  video-settings block it releases a reference on ~40 menu sprites with no guard at all
+  (`MOV ECX,[SpriteScrollUp]; ADD ECX,0x9c; ADD [ECX+4],-1`) and zeroes each global on the
+  way out. A second call faults at 0x004e8eb7, which is what starting a level from *inside*
+  a level did. `SpriteScrollUp` @ 0x007b7d0c is the predicate: `EnterMainMenuScreen`
+  @ 0x004e82be creates it and this function zeroes it, and they are its only two writers.
+- **`ClearTeamCarryOverState` @ 0x004da230 is `__thiscall`.** `MOV EBX,ECX` is its second
+  instruction and `[EBX+4]` its third; `LoadGame` does `MOV ECX,0x7b6d70` immediately
+  before the call. Declared with no argument it faults at 0x004da242. `RET`-form checking
+  cannot see this - a missing *register* argument pops exactly as many bytes as a correct
+  call - which is the argument for the companion ECX/EDX-read check in
+  `console_command_notes.md` §6.5.1. Run on these ten functions it flags this one and clears
+  the other nine.
+- **`EndLevelSession` and its coop twin are guarded by `LevelSessionStarted` @ 0x007b6dd8**
+  and return early when no session was ever begun. That is what lets one code path serve
+  both "start from the menus" and "switch levels mid-game".
+
+**Where it may run.** `LoadLevel` must not run inside the renderer, and the script host's
+frame callback is driven from inside `HookedPresentScene` whenever a level is up - so the
+request is queued and drained from a private `WM_APP` message handled in `HookedWndProc`
+(`SetMessageLoopCallback` in `src/GUI.h`). That is the same point in the message loop the
+game reaches `OnMenuItemClicked` from. Everything wrong with the *request* is still reported
+synchronously at the call; only the load is deferred.
+
+Verified in a running game, one process throughout: a cold start from the menu, a switch
+between two levels while one was running, `levels.quit()` back to the menu, a start after
+that quit, a shipped `level01.gls`/`level01.gcs` (156 actors, 259 roles), `ADD MISSION` plus
+start-by-title (`prison.gls`, 187 actors), and all five refusal paths. No WER record.
 
 ## 8. Address summary
 
