@@ -2003,6 +2003,86 @@ declare module "gk" {
     readonly [title: string]: Level | undefined;
   };
 
+  // --- mods ------------------------------------------------------------------
+
+  /** One mounted mod: an archive or a directory under
+   *  `<Gunlok>\gkplus\mods`. */
+  export interface Mod {
+    /** The entry name inside the mods directory, e.g. `"20-tweaks.zip"`. */
+    readonly name: string;
+    /** Absolute path on disk. */
+    readonly path: string;
+    /** False for a plain directory. */
+    readonly archive: boolean;
+    /** Search-path position: 0 wins a conflict. Same as the collection index. */
+    readonly priority: number;
+  }
+
+  export interface ModsMembers {
+    readonly count: number;
+    [Symbol.iterator](): IterableIterator<Mod>;
+
+    /** `<Gunlok>\gkplus\mods\`, with a trailing backslash. */
+    readonly dir: string;
+    /** Where `gl.exe` lives, with a trailing backslash. Every VFS path is
+     *  relative to this. */
+    readonly game_dir: string;
+    /** False only if the mod filesystem could not start at all. Having no mods
+     *  installed is not the same thing and reports true. */
+    readonly available: boolean;
+    /** How many file opens have been answered from a mod rather than from disk.
+     *  The only way to tell "mounted" from "actually being read", since a
+     *  replaced asset looks identical from outside the game. */
+    readonly served: number;
+    /** The VFS paths behind the last 64 of those, newest first. Answers "is my
+     *  file being picked up, and under what name" - which nothing else can,
+     *  because the engine assembles that name from a GLDir and a string inside
+     *  a `.gls`. */
+    readonly recent: string[];
+
+    /** Mounts an extra archive or directory at the highest priority. Throws if
+     *  PhysicsFS cannot read it. */
+    mount(path: string): void;
+    /** The VFS path the engine would get if it opened `gamePath` right now, or
+     *  null if no mod provides it. Resolved against the process's current
+     *  directory exactly as a game open is, so prefer `mods.game_dir + ...`. */
+    resolve(gamePath: string): string | null;
+    /** Whether a mod provides this VFS path. */
+    exists(vpath: string): boolean;
+    /** The file's contents decoded as UTF-8, or null. Use `read_bytes` for
+     *  anything the engine would read as ANSI bytes. */
+    read(vpath: string): string | null;
+    read_bytes(vpath: string): ArrayBuffer | null;
+    /** Every regular file at or below `dir` (the whole VFS if omitted), as VFS
+     *  paths, sorted. */
+    files(dir?: string): string[];
+  }
+
+  /** The mod filesystem: archives and directories layered over Gunlok's data
+   *  tree, so a mod can add or replace any file the engine loads without
+   *  touching the base install.
+   *
+   *  A mod is a `.zip` (or any archive PhysicsFS reads) or a directory under
+   *  `<Gunlok>\gkplus\mods`, and **its contents mirror the game's own directory
+   *  tree** - `rif/units/bug.rif`, `scripts/defaults.gsh`, `sound/robots.dat`.
+   *  That is forced by the engine rather than chosen: every loader chdirs to one
+   *  of its seven configured directories and then opens a relative name, so
+   *  "where in the game tree" is the only thing an interception can reconstruct.
+   *
+   *  Mods mount in ascending name order and **a later name wins**, so
+   *  `20-tweaks.zip` overrides `10-base.zip`. Index 0 is the highest priority.
+   *
+   *  Paths are case- and separator-insensitive. Music and FMV are the one gap:
+   *  Bink opens those inside its own DLL, out of reach of the interception.
+   *
+   *      for (const mod of mods) console.log(mod.priority, mod.name);
+   *      mods.files("scripts").filter(p => p.endsWith(".gsh"));
+   */
+  export type Mods = ModsMembers & {
+    readonly [index: number]: Mod | undefined;
+    readonly [name: string]: Mod | undefined;
+  };
+
   // --- the module ------------------------------------------------------------
 
   export const camera: Camera;
@@ -2016,6 +2096,7 @@ declare module "gk" {
   export const gls: Gls;
   export const game: Game;
   export const world: World;
+  export const mods: Mods;
   export const fx: Fx;
   export const light: Light;
   export const objectives: Objectives;
@@ -2044,6 +2125,7 @@ declare module "gk" {
     gls: Gls;
     game: Game;
     world: World;
+    mods: Mods;
     fx: Fx;
     light: Light;
     objectives: Objectives;

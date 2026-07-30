@@ -6,6 +6,7 @@
 #include "CustomLevel.h"
 #include "CustomMenu.h"
 #include "Debug.h"
+#include "FileHooks.h"
 #include "GLS.h"
 #include "GUI.h"
 #include "InputFix.h"
@@ -24,6 +25,11 @@ namespace gk {
 // Menu, Console, Tokens, Triggers, Misc, Camera, ...) resolve their offsets
 // lazily per call and need no member here.
 struct Subsystems {
+  // First, and deliberately: it patches gl.exe's file imports, and everything
+  // the game subsequently loads - including the assets read during WinMain,
+  // before any other subsystem's hook can fire - has to go through it for a mod
+  // to be able to replace them.
+  FileHookSystem files;    // mod archives layered over the game's data tree
   MusicSystem music;       // MusicTrack-ctor volume fix
   DebugSystem debug;       // DebugPrint* -> OutputDebugString
   GUISystem gui;           // ImGui/D3D overlay

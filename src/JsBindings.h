@@ -222,6 +222,10 @@ JSValue NewTriggersNamespace(JSContext *ctx);
 JSValue NewLevelsNamespace(JSContext *ctx);
 JSValue NewGlsNamespace(JSContext *ctx);
 JSValue NewMakeNamespace(JSContext *ctx);
+// The mod filesystem (src/Vfs.h): which archives are mounted, and what they
+// provide. Read-only from script apart from mount(); the interception that makes
+// the engine consult it is installed long before any script runs.
+JSValue NewModsNamespace(JSContext *ctx);
 
 // --- per-TU callback teardown --------------------------------------------------
 //

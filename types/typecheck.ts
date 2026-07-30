@@ -28,6 +28,7 @@ import gk, {
   tracks,
   triggers,
   units,
+  mods,
   world,
 } from "gk";
 // @ts-expect-error - `menus` is not an export: it is only setup_menus'
@@ -682,3 +683,35 @@ tracks.set("lift_a", { x: 0 }, { x: 1 }, { x: 2 }, { x: 3 }, true);
 tracks.open_door(1);
 tracks.toggle_door(1);
 screen.stats();
+
+// --- mods ----------------------------------------------------------------------
+
+const modCount: number = mods.count;
+const modsDir: string = mods.dir;
+const modsGameDir: string = mods.game_dir;
+const modsUp: boolean = mods.available;
+const modsServed: number = mods.served;
+const modsRecent: string[] = mods.recent;
+mods.mount("C:/mods/extra.zip");
+const resolved: string | null = mods.resolve(mods.game_dir + "rif/units/bug.rif");
+const modHas: boolean = mods.exists("rif/units/bug.rif");
+const modText: string | null = mods.read("scripts/defaults.gsh");
+const modBytes: ArrayBuffer | null = mods.read_bytes("rif/units/bug.rif");
+const modFiles: string[] = mods.files();
+const modScripts: string[] = mods.files("scripts");
+for (const mod of mods) {
+  const name: string = mod.name;
+  const path: string = mod.path;
+  const isArchive: boolean = mod.archive;
+  const priority: number = mod.priority;
+}
+if (mods[0] !== undefined) {
+  const first: string = mods[0].name;
+}
+if (mods["20-tweaks.zip"] !== undefined) {
+  const byName: string = mods["20-tweaks.zip"].path;
+}
+// @ts-expect-error - mounting is an action with a result, not an assignment
+mods[0] = { name: "x", path: "y", archive: true, priority: 0 };
+// @ts-expect-error - `served` is a count the host owns
+mods.served = 0;

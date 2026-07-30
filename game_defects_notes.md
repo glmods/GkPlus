@@ -137,6 +137,40 @@ command-name hazard in `console_command_notes.md`).
 
 ---
 
+## 4. The process faults on exit via the console `QUIT`
+
+**Status:** open, undiagnosed. Reproduces every time. Harmless to the player — the
+process is leaving anyway — but it means **process-exit cleanup cannot be relied on**.
+
+Sending `QUIT` from the console (or `console.execute("QUIT")` from the REPL) exits
+the process *and* leaves a WER minidump in `%LOCALAPPDATA%\CrashDumps`. Observed on
+four consecutive runs; a `TerminateProcess` (Task Manager, `Stop-Process`) leaves no
+dump, so it is the ordinary exit path that faults, not the kill.
+
+**It is not GkPlus's mod loader**, and that is an A/B measurement rather than an
+assumption: the build from before `FileHookSystem` existed produces a dump on the
+same `QUIT` (`gl.exe.35284.dmp`). Whether it is *some other* part of GkPlus or
+vanilla Gunlok has not been established — testing that needs a run with the mod
+removed entirely, which nobody has done.
+
+### The consequence that matters
+
+Anything that tidies up in `DllMain(DLL_PROCESS_DETACH)` is best-effort only, and
+that is compounded by `entry.cpp` destroying the `Subsystems` aggregate in reverse
+declaration order — a fault in an earlier destructor takes out every later one.
+`vfs::Shutdown()` removing its `%TEMP%\gkplus-vfs-<pid>` tree was written that way
+and never ran; the working mechanism is the startup sweep in `Vfs.cpp`, which
+removes any such directory whose pid is no longer alive. Prefer that shape — *clean
+up other people's leftovers on the way in* — over trusting the way out.
+
+### Where to start if someone picks this up
+
+WER already wrote the dump; `cdb -z <dump> -c ".ecxr; k 40; q"` plus
+`llvm-symbolizer` on the `d3d8+0x...` RVAs is the recipe below. The dumps from the
+session that found this are gone (WER keeps a bounded ring), so reproduce first.
+
+---
+
 ## Debugging Gunlok: what actually works
 
 - **cdb is at** `C:\Program Files\WindowsApps\Microsoft.WinDbg_*\x86\cdb.exe`. It

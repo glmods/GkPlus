@@ -24,6 +24,8 @@ find_package(d3d8to9 MODULE REQUIRED)
 
 find_package(qjs CONFIG REQUIRED)
 
+find_package(PhysFS CONFIG REQUIRED)
+
 add_subdirectory(imgui-quickjs)
 
 add_library(GkPlus MODULE
@@ -36,6 +38,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Debug.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Encoding.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/entry.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/FileHooks.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/GLS.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/GUI.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/InputFix.cpp"
@@ -50,6 +53,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsLevels.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsMake.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsMenus.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/JsMods.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsRoles.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsTokens.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsTriggers.cpp"
@@ -69,9 +73,11 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Session.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Tokens.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Triggers.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Vfs.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/World.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/exports.def")
-target_link_libraries(GkPlus PRIVATE detours imgui::imgui d3d8to9 d3d9 qjs imgui-quickjs ws2_32)
+target_link_libraries(GkPlus PRIVATE detours imgui::imgui d3d8to9 d3d9 qjs imgui-quickjs ws2_32
+    $<IF:$<TARGET_EXISTS:PhysFS::PhysFS>,PhysFS::PhysFS,PhysFS::PhysFS-static>)
 set_target_properties(GkPlus
     PROPERTIES
     OUTPUT_NAME "d3d8"

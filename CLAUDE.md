@@ -4,7 +4,7 @@ A 32-bit Windows DLL mod for the game **Gunlok** (2000). Built as a `d3d8.dll` p
 into the game via Microsoft Detours. It is a **native C++ reverse-engineering library**: the
 decompiled game structs live in headers, a typed native API wraps the game's own functions and
 globals, and a handful of behavioral hooks (music volume fix, input fix, debug redirect, ImGui/D3D
-overlay) run at load. The game binary is actively being reverse engineered in Ghidra, accessible
+overlay, and a PhysicsFS-backed mod filesystem layered over the game's data tree) run at load. The game binary is actively being reverse engineered in Ghidra, accessible
 via MCP.
 
 On top of that sits a **QuickJS scripting layer**: `src/Script.cpp` boots a runtime during the
@@ -122,6 +122,7 @@ Four more things that cost time the first time round:
 | detours | Microsoft Detours - function hooking |
 | quickjs-ng | QuickJS JavaScript engine |
 | dear-bindings | ImGui language bindings |
+| physfs | Archive + search-path filesystem behind the mod loader (`src/Vfs.cpp`) |
 
 Custom vcpkg ports in `ports/` for: d3d8to9, detours, quickjs-ng, dear-bindings.
 Overlay configuration in `vcpkg-configuration.json`.
@@ -135,9 +136,14 @@ Overlay configuration in `vcpkg-configuration.json`.
 2. `DllMain(DLL_PROCESS_DETACH)`: opens a Detours transaction, destroys the `Subsystems` aggregate
    (each member detaches its detours in its dtor), commits.
 
-`Subsystems` holds only the **hook-installing** subsystems — `MusicSystem`, `DebugSystem`,
-`GUISystem`, `InputFixSystem`, `CustomMenuSystem`, `ScriptQueueSystem`, `gls::GlsSystem`,
-`CustomLevelSystem`, `ScriptSystem`.
+`Subsystems` holds only the **hook-installing** subsystems — `FileHookSystem`,
+`MusicSystem`, `DebugSystem`, `GUISystem`, `InputFixSystem`, `CustomMenuSystem`,
+`ScriptQueueSystem`, `gls::GlsSystem`, `CustomLevelSystem`, `ScriptSystem`.
+`FileHookSystem` is deliberately **first**: it patches gl.exe's file imports, and assets
+loaded during `WinMain` (before any other hook can fire) have to pass through it for a mod
+to replace them. Destruction is reverse order, so it also unpatches last — and per
+`game_defects_notes.md` §4 a fault in an earlier destructor can prevent that entirely, so
+nothing there may depend on running.
 Everything else is struct-only
 or a native-API wrapper that resolves its offsets lazily per call (`GetObjectAtOffset` is cheap
 because `GetBaseAddress()` caches), so those subsystems need no lifecycle object.
@@ -205,10 +211,15 @@ Each pair is a header of decompiled structs/enums plus native free-function decl
 `src/Map`, `src/Vulnerability` (header-only), `src/Music`, `src/Math`, `src/Menu`, `src/Tokens`,
 `src/Triggers`, `src/Console`, `src/Misc`, `src/Camera`, `src/Debug`, `src/GUI`, `src/InputFix`,
 `src/CustomMenu`, `src/ScriptQueue`, `src/CustomLevel`, `src/Script`, `src/Session` (starting a
-level without the menus, see below), `src/MakeRole` (native constructors, see below).
+level without the menus, see below), `src/MakeRole` (native constructors, see below),
+`src/FileHooks` (mod loading, see below).
 `src/GLS.h/cpp` is the model the rest now follow. The behavioral-hook subsystems (`Music`, `Debug`,
-`GUI`, `InputFix`, `CustomMenu`, `ScriptQueue`, `GLS`, `CustomLevel`, `Script`) expose a `*System`
-RAII class constructed by `entry.cpp`; the others are pure struct + native-API.
+`GUI`, `InputFix`, `CustomMenu`, `ScriptQueue`, `GLS`, `CustomLevel`, `Script`, `FileHooks`) expose a
+`*System` RAII class constructed by `entry.cpp`; the others are pure struct + native-API.
+
+`FileHookSystem` is the one that does not resolve *offsets* at all: it patches gl.exe's import table
+and detours two functions in the exe's private CRT copy, and its lookup half (`src/Vfs`) touches no
+game memory whatsoever.
 
 `GlsSystem` is the odd one there: `src/GLS` is otherwise pure struct + native-API, and its single
 detour (`PushFileToParserStack`) exists only so `gls::ParseSource` can hand the parser a **source
@@ -338,7 +349,7 @@ object form, because a newline is the frame delimiter:
 {"code": "for (const a of actors) if (!a.alive) console.print(a.id);\nactors.count", "id": 3}
 ```
 
-Everything the `"gk"` module exports is already a global — all 21 namespaces,
+Everything the `"gk"` module exports is already a global — all 22 namespaces,
 enumerated at boot, plus the default export as `gk` — so there is nothing to
 import and no host object to reach for:
 
@@ -956,6 +967,91 @@ per-level `listed` flag, not a re-read of the list**, because two levels may leg
 share a title. `CustomLevelByTitle` covers the window in between, so
 `levels.start("My Level")` works from the moment `levels.add` returns.
 
+### Mod loading (`src/Vfs.h/cpp`, `src/FileHooks.h/cpp`)
+
+Archives and directories layered over Gunlok's data tree, so a mod can add or replace any
+file the engine loads with nothing in the base install changing. A mod is a `.zip` (or any
+archive PhysicsFS reads) or a plain directory under `<Gunlok>\gkplus\mods`, and its
+contents **mirror the game's own directory tree**:
+
+```
+gkplus/mods/bigger-bugs.zip
+  rif/units/bug.rif          <- replaces <Gunlok>\rif\units\bug.rif
+  scripts/defaults.gsh
+  sound/robots.dat
+```
+
+Mods mount in ascending name order and **a later name wins** (`20-tweaks.zip` beats
+`10-base.zip`); `mods[0]` is the highest priority. `file_io_notes.md` is the measurement
+this rests on — read §1 and §5 before touching either file.
+
+Five things decide the shape, in decreasing order of how much else depends on them:
+
+- **The interception is gl.exe's import table, not Detours on kernel32.** Every file call
+  in the exe is `CALL dword ptr [slot]` or `MOV reg,[slot]` + `CALL reg`, and both read the
+  slot at run time — so one pointer write per slot catches every call site, and catches
+  *only* gl.exe. GkPlus's own runtime, PhysicsFS and D3D resolve through this DLL's imports
+  and are untouched, which is also what makes the whole thing non-recursive. Nine slots:
+  `CreateFileA`, `ReadFile`, `SetFilePointer`, `GetFileSize`, `GetFileTime`,
+  `GetFileAttributesA`, `CloseHandle`, plus `WriteFile` and `SetEndOfFile` to refuse a
+  write to a virtual file. Each patch verifies the slot currently holds the expected
+  `kernel32` export and refuses otherwise, because a mistyped offset would otherwise
+  overwrite an unrelated `.rdata` pointer and crash somewhere unrelated.
+- **The layout is forced, not chosen.** Every loader does
+  `SetCurrentDirectoryToGLDir(<category>)` and then opens a *relative* name, so "where in
+  the game tree" is the only thing a hook can reconstruct. `Resolve` runs the name through
+  `GetFullPathNameA` (CWD join + `.`/`..` collapse), requires the result under the game
+  directory, and uses the remainder.
+- **PhysicsFS is case-SENSITIVE inside an archive** (`case_sensitive = 1` in its zip
+  archiver) while a mounted directory is not, so `Vfs.cpp` keeps a lowercased index of
+  everything mounted and resolves through it. This is not a nicety: the casing the engine
+  asks for is undiscoverable, being half `gldirs.gls` (`rif`) and half a `.gls` or exe
+  literal (`bitmaps\water.rim`, `User Interface/Main Menu.RIF`). The index also
+  deduplicates the merged view, which raw `PHYSFS_enumerate` does not — it reports a name
+  once per search-path element, so a naive recursive walk multiplies every file under a
+  directory two mods share.
+- **Two shapes of interception, because the CRT cannot take a virtual handle.** A
+  virtualized `CreateFileA` returns a **real kernel handle** (an unsignalled event) with
+  the bytes held beside it — genuine rather than invented, so an API this layer does not
+  hook (D3DX reaches `CreateFileMappingA`) gets a valid handle of the wrong type and fails
+  in an orderly way. gl.exe's statically linked UCRT would instead need `CreateFileW`,
+  `GetFileType`, `SetFilePointerEx` and the rest of lowio, so `fopen`/`freopen` are
+  detoured directly and a hit is written out to `%TEMP%\gkplus-vfs-<pid>\` for the real
+  `fopen` to open (`vfs::Materialize`). Both of those are gl.exe's private CRT copy, so
+  GkPlus's own runtime is unaffected.
+- **Only `OPEN_EXISTING` is virtualized**, which is exact rather than cautious: all 31
+  `CreateFileA` sites use `OPEN_EXISTING` (21) or `CREATE_ALWAYS` (9) and there is no
+  `OPEN_ALWAYS` anywhere, so this covers every read and cannot intercept a write. Access
+  rights are deliberately *not* part of the test — `IsFirstFileNewer` @ 0x004af430 opens
+  `GENERIC_READ|GENERIC_WRITE` and only reads timestamps, and it has to see the mod's file
+  or a stale `.opt` wins.
+
+Three smaller decisions that are easy to get wrong later:
+
+- **`GetFileTime` reports the archive entry's own mtime**, so the engine's `.opt`/`.map`/
+  `.cut` freshness checks keep working instead of being defeated. **`GetFileAttributesA`
+  reports `FILE_ATTRIBUTE_READONLY`**, and that is load-bearing: the rif recompressor at
+  0x005b03b0 rewrites its input in place unless that bit is set, which would write mod
+  content into the base install.
+- **Cleanup does not trust `DLL_PROCESS_DETACH`.** `Vfs.cpp` sweeps `%TEMP%` at startup for
+  any `gkplus-vfs-<pid>` whose pid is no longer alive. `Shutdown()` still tries on the way
+  out, but the game faults on exit already (`game_defects_notes.md` §4) and it never ran.
+- **`mods.served` / `mods.recent` exist because a working mod is invisible** — the replaced
+  asset loads and the game looks identical. They are the only way to tell "mounted" from
+  "being read", and `recent` reports the VFS path, which answers "under what name did the
+  engine ask for my file".
+
+**Verified in a running game**: level01 loaded with its 2.79 MB huffman `.rif` served
+through a virtual handle (three opens) and its `.gcs` through a materialized temp file, 158
+actors, and a token only the modded `.gcs` sets read back 4242. An unmodded level loaded in
+the same session with `mods.served` unchanged, so the passthrough path is untouched.
+
+Not covered, deliberately: **Bink** (`BinkOpen` takes a file name and opens it inside
+BINKW32.DLL, off gl.exe's IAT, so music and FMV still come off disk), `glres<lang>.dll`
+(LoadLibrary needs a real file), and **directory enumeration** —
+`EnumerateFilesIntoFileList` is unhooked, so a mod cannot add a savegame or multiplayer
+level to those menus; `levels.add` is the route for that.
+
 ### JavaScript bindings (`src/Js*`)
 
 **The console command registry is the map of what is still missing, and it is measured**:
@@ -1046,11 +1142,11 @@ the host's copy as well. It is an accessor on a namespace object rather than a p
 a C module's named exports are fixed at instantiation — a top-level `simulation_running` could only
 ever report what was true before any level existed.
 
-The `"gk"` QuickJS C module, exposing eleven subsystems to scripts. `src/Js.h` is the public surface
+The `"gk"` QuickJS C module, exposing twelve subsystems to scripts. `src/Js.h` is the public surface
 — `RegisterGkModule`, plus `Log` / `ReportException` / `ReleaseCallbacks` for the host — and
-`src/JsGk.cpp` builds the module from eleven namespace objects, one per translation unit:
+`src/JsGk.cpp` builds the module from twelve namespace objects, one per translation unit:
 `JsCamera`, `JsConsole`, `JsActors`, `JsRoles`, `JsTokens`, `JsTriggers`, `JsMenus`, `JsLevels`,
-`JsGls`, `JsMake`, `JsGame`, over shared helpers in `src/JsBindings.h` / `src/JsCommon.cpp`. `JsGk.cpp` also owns
+`JsGls`, `JsMake`, `JsGame`, `JsMods`, over shared helpers in `src/JsBindings.h` / `src/JsCommon.cpp`. `JsGk.cpp` also owns
 `ReleaseCallbacks`, which fans out to the per-TU `Release*Callbacks` of the two namespaces that
 hold script values (menus and levels).
 
@@ -1065,6 +1161,8 @@ for (const [name, value] of Object.entries(tokens)) console.print(`${name}=${val
 console.log("actors:", actors.count);               // the host's own logging - no global console
 console.execute("GOD ON");                          // and the game's command surface
 tokens["score"] = 0;                                // upsert; actors/roles throw
+for (const mod of mods) console.log(mod.priority, mod.name);   // what is mounted
+console.log(mods.served, mods.recent[0]);           // ... and what it actually served
 levels.add("Test Arena", arena);                    // `import * as arena` first
 levels.start("Test Arena", {difficulty: "hard"});   // no menus, no briefing
 
@@ -1081,7 +1179,7 @@ index in `OnMenuItemClicked` shifts), so the object is scoped to the callback th
 moment. It is a plain collection otherwise, and `menus.current` / `menu.open` work whenever — a
 script that wants them later keeps the argument in a module-level variable.
 
-`actors`, `roles`, `tokens`, `menus` (the argument) and `levels` are all **exotic-property
+`actors`, `roles`, `tokens`, `menus` (the argument), `levels` and `mods` are all **exotic-property
 collections** built by the same scaffolding in `JsCommon.cpp`: indexable, `in`-testable,
 `Object.keys`/`values`/`entries`-able, and iterable over a snapshot. `NewCollection` gives every one
 of them a non-enumerable `count` and `Symbol.iterator`; a namespace only supplies per-collection
@@ -1574,6 +1672,8 @@ animation inside the engine, where nothing here can see the result.
 
 | File | Purpose |
 |------|---------|
+| `src/Vfs.h/cpp` | The mod filesystem: mount, case-folded index, lookup, read, `Materialize`. Pure lookup — touches no game memory, so it is the half a harness can exercise. See "Mod loading" above |
+| `src/FileHooks.h/cpp` | `FileHookSystem` — the nine IAT patches and the two static-CRT detours that make the engine consult `src/Vfs`, plus the virtual-handle table and the `mods.served`/`mods.recent` diagnostics |
 | `src/Repl.h/cpp` | The loopback JavaScript REPL: `StartRepl` / `PumpRepl` / `StopRepl`, owned by `BootScriptHost` rather than by `Subsystems` (it installs no detour). Off unless `GKPLUS_REPL_PORT` is set. See "The REPL channel" above |
 | `src/Session.h/cpp` | `StartLevel` / `QueueLevelStart` / `QueueReturnToMainMenu` — a level start with no menus and no briefing, deferred to the message loop. Installs no detour and has no `*System`: it registers `SetMessageLoopCallback` on first use. See "Starting a level programmatically" above |
 | `src/InputFix.h/cpp` | `InputFixSystem` - hook-only. Detours `AcquireDInputDevice` to suppress the vestigial DirectInput keyboard acquire and its `WH_KEYBOARD_LL` hook (see `input_notes.md`) |
@@ -1620,6 +1720,13 @@ animation inside the engine, where nothing here can see the result.
   and each command classified against the JS surface. §4 explains the native vs command-backed
   split, §4.1 lists the 27 broadcasters with their update ids. Includes the localized-command-name
   hazard, the inert `CommandCondition` gate, and the GkPlus mirror defects the inventory turned up
+- `file_io_notes.md` - every way the game opens a file, for anyone building a virtual filesystem
+  or mod loader: the four properties that make one possible (all I/O through the IAT, no overlapped
+  I/O at any of the 31 `CreateFileA` sites, no file I/O on the executor thread, whole-file reads for
+  `.rif` and sound), the chdir-per-category `GLDir` scheme, the classified read/write site tables for
+  both the Win32 and CRT `fopen` families, the two memory-source seams the engine already has (the
+  GLS parser and the image loader) and the two it does not (Bink, `glres<lang>.dll`), the IAT slot
+  map, and the PhysicsFS assessment in §6
 - `gls.txt` - Game Level Structure file format quick field list (superseded by gls_system_notes.md)
 
 ### Upstream Source: Aliens vs Predator (1999)

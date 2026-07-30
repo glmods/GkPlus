@@ -11,7 +11,8 @@
         "d3d8to9",
         "detours",
         "quickjs-ng",
-        "dear-bindings"
+        "dear-bindings",
+        "physfs"
     ],
     "features": {
         "rimutil": {
