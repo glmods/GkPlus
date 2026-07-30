@@ -97,6 +97,46 @@ under any debugger (each call is a synchronous round-trip). That is why
 
 ---
 
+## 3. `GetResourceString` @ 0x00579000 walks its table with no terminator
+
+The localized string lookup is a five-instruction linear scan with **no end check**:
+
+```
+00579000  MOV EAX,dword ptr [ECX]        ; the table head
+00579002  CMP dword ptr [EAX],EDX        ; is this the id?
+00579004  JZ  0x0057900d
+00579006  ADD EAX,0x14                   ; next 0x14-byte entry
+00579009  CMP dword ptr [EAX],EDX        ; <-- faults here
+0057900b  JNZ 0x00579006                 ; ... forever
+0057900d  MOV ECX,dword ptr [EAX + 0x4]
+00579010  TEST ECX,ECX
+00579012  MOV EAX,0x7c14b4               ; a default string when the entry is null
+00579017  CMOVNZ EAX,ECX
+```
+
+Ask for an id the table does not hold and the loop runs off the end of the resource
+image and dereferences unmapped memory: **`0xc0000005` at fault offset `0x00179009`**
+(RVA; the address is 0x00579009, and both the faulting module and the application are
+`gl.exe`). Note the function *does* handle a **null** entry — that is what the
+0x7c14b4 default is for — so the missing case it does not handle is a **absent** id,
+not an empty one.
+
+Observed twice while testing `.RIM` writing, on exit both times, in two separate
+runs. It is not GkPlus's: one of the two runs had served no modded file at all, and
+the reproduction is a stock code path with ~400 call sites (`SetupMenus`,
+`RegisterAllKeyBindings`, `OnMenuItemClicked`, `LoadLevel`, most console commands).
+It has not been narrowed to a specific caller or string id — the evidence is the
+fault address plus the fact that it fired with and without mods present.
+
+Practical consequence: **a Gunlok crash whose faulting offset is `0x00179009` is a
+missing localized string, not whatever you were testing.** Worth checking first,
+because it is reached from almost everywhere and it presents as a plain access
+violation in `gl.exe` with no other clue. Likely more reachable on a non-English
+install, where `glres<lang>.dll` may hold a different set of ids (see the localized
+command-name hazard in `console_command_notes.md`).
+
+---
+
 ## Debugging Gunlok: what actually works
 
 - **cdb is at** `C:\Program Files\WindowsApps\Microsoft.WinDbg_*\x86\cdb.exe`. It

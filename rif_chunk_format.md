@@ -750,21 +750,74 @@ even boundary, and `LIST`/`FORM`/`PROP`/`CAT ` group chunks whose body opens wit
 4-character type. Every one of those four things is the opposite of the container above,
 so nothing in `rif.py` reads one.
 
-The shape is the same in all 513:
+The shape is the same in all 513, and the image chunk is one of two things:
 
 ```
 LIST:ILBM
-  PROP:ILBM         BMHD (shared properties) + TRAN
-  FORM:ILBM         BMHD + S3TC              <- the image
+  PROP:ILBM         TRAN            (shared properties; also ALPH, in one file)
+  FORM:ILBM         BMHD + S3TC          <- a DXT image
+                    BMHD + CMAP + BODY   <- ... or a palettized one
   LIST:MIPM
-    FORM:MIPM       CONT, FLAG
-    LIST:ILBM       FORM:ILBM per mip level, each BMHD + S3TC
+    FORM:MIPM       CONT (level count), FLAG
+    LIST:ILBM       FORM:ILBM per mip level
 ```
 
-`BMHD` is the standard 20-byte ILBM header (`width`, `height`, `x`, `y`, `nPlanes`,
-`masking`, `compression`, pad, `transparentColor`, aspect, page size) - but **`nPlanes`
-is not a bit depth here**: a 256x256 DXT3 font declares 3 and a 512x512 DXT1 declares 17.
-The four-character code inside `S3TC` is what says how to decode the payload.
+**`PROP:ILBM` holds only `TRAN`** - in all 513 files, and `ALPH` beside it in
+`Ground\tree_alpha.RIM`. It never holds a `BMHD`: every `BMHD` sits inside a `FORM:ILBM`
+next to the image it describes. (An earlier revision of this section said
+"`BMHD` (shared properties) + `TRAN`", which is wrong.)
+
+`CONT` is the mip-level count and is present in all 513; `0` (no mip chain) ships and works,
+because the mip walk in `RimOpenAndScan` is skipped when `CONT` is absent or zero. `FLAG` is
+in 328 of them and its purpose has not been determined. `GRAB` is registered by the binary
+but appears in no shipped file.
+
+### Which image chunk wins: `BODY` first, `S3TC` second
+
+`RimOpenAndScan` @ 0x005dd6b0 enumerates `ILBM`->**`BODY`** first, and only when that finds
+nothing does it enumerate `ILBM`->`S3TC` and set the "is DXT" flag at `RimImage+0x81`. So a
+palettized image takes priority, and a file carrying both would have its `S3TC` ignored.
+**Uncompressed `.RIM` is a first-class path, not a fallback** - which is what makes a `.RIM`
+writer possible without a DXT compressor.
+
+Of the 513 shipped files, **490 are S3TC with no `BODY`, 23 are `BODY`+`CMAP` with no
+`S3TC`, and none have both**. The 23 are 16 `*_fmv_*` ground textures and seven others -
+`Bitmaps\MPLAY_maze`, `Ground\tree_alpha`, `Ground\tree_bark`, `Structures\EOG_cylinder`,
+`Units\Command Wheel 01`, `Units\english load save`, `Units\save screen`. So this is not a
+quirk of one art pipeline for the FMV ground: it is used for UI, unit and structure textures
+too.
+
+`BMHD` is the standard 20-byte ILBM header, read field for field by `BmhdChunk_Serialize`
+@ 0x005e0410. **`nPlanes` means different things on the two paths**: on the `BODY` path it is
+a genuine bitplane count and `nPlanes == ceil(log2(CMAP entries))` in all 77 palettized
+images; on the `S3TC` path it is never read at all, which is why it holds nonsense there (a
+256x256 DXT3 font declares 3, a 512x512 DXT1 declares 17). The four-character code inside
+`S3TC` is what says how to decode a DXT payload.
+
+### The IFF chunk classes the binary registers
+
+`IffChunk_Register` @ 0x005e1d00 is the IFF analogue of `Chunk::Register` @ 0x005d4ae0, with
+its own 13 static-init constructors at 0x0043c5f0..0x0043c7f0 (same
+`PUSH pfnCreate / MOV ECX,id / CALL` shape as the RIF ones, so they are invisible to an xref
+search until that range is disassembled).
+
+| Id | Parent | Create | Class size | Purpose |
+|----|--------|--------|-----------|---------|
+| `BMHD` | `ILBM` | 0x005e0c90 | 0x28 | the 20-byte ILBM BitMapHeader |
+| `CMAP` | `ILBM` | 0x005e0ce0 | 0x1c | palette, 3 bytes RGB per entry |
+| `BODY` | `ILBM` | 0x005e0d30 | 0x44 | planar bitplane pixels |
+| `GRAB` | `ILBM` | 0x005e0da0 | - | `{s16 x, s16 y}` hotspot; in no shipped file |
+| `ALPH` | `ILBM` | 0x005e1160 | 0x4c | alpha plane |
+| `S3TC` | `ILBM` | 0x005e1220 | 0x30 | DXT payload |
+| `TRAN` | `ILBM` | 0x005e1110 | - | RGB colour key |
+| `CONT` | `MIPM` | 0x005e11d0 | - | mip-level count |
+| `FLAG` | `MIPM` | 0x005e1260 | - | not determined |
+| `CAT `/`FORM`/`LIST`/`PROP` | (global) | 0x005e2a20/2960/29c0/2a80 | - | the IFF group chunks |
+
+The load path is `AcquireRimTexture` @ 0x005a15b0 (hash + cache only, opens nothing) ->
+`RimOpenAndScan` -> `RimBindImageChunks` @ 0x005ddf30 -> `RimConvertRows` @ 0x005ddbc0.
+`RimLoadErrorCode` @ 0x00838b0c carries the failure: **8** for a malformed/unsupported image
+and **9** for a `BODY` with no `CMAP`.
 
 ### `S3TC` - the pixels
 
@@ -774,13 +827,22 @@ and the actual body length agree in every one.
 
 | Offset | Size | Type    | Description |
 |--------|------|---------|-------------|
-| 0x00   | 4    | uint32  | zero in all 3,423 |
+| 0x00   | 4    | uint32  | `flags` - zero in all 3,423 |
 | 0x04   | 4    | char[4] | the DXT four-character code, **byte-reversed** (`1TXD` = DXT1) |
-| 0x08   | 6    | bytes   | `01 35 00 52 02 60`, identical in all 3,423 |
+| 0x08   | 2    | uint16  | `redWeight` = 309 |
+| 0x0a   | 2    | uint16  | `blueWeight` = 82 |
+| 0x0c   | 2    | uint16  | `greenWeight` = 608 |
 | 0x0e   | 2    | uint16  | width, big-endian |
 | 0x10   | 2    | uint16  | height, big-endian |
 | 0x12   | 4    | uint32  | payload size, big-endian |
 | 0x16   | ...  | bytes   | DXT1 or DXT3 blocks, ordinary little-endian S3TC |
+
+The three weights are the compressor's **perceptual channel weights in per-mille** - they sum
+to 999, and the ordering (red, blue, green) is what makes 309 / 82 / 608 read as a luma-ish
+weighting rather than as noise. They are byte-identical in all 3,423 chunks, and nothing in
+the loader reads them, so a writer copies them verbatim. (This document previously recorded
+them as "6 identical bytes"; `utils/rimutil/rimutil.cpp`'s `S3tcData` had the field split
+right all along.)
 
 **The DXT payload itself is little-endian**, unlike everything around it - the 5:6:5
 endpoints decode as normal RGB565. That is settled by content rather than by inspection:
@@ -789,11 +851,227 @@ red/blue swap would turn into blue.
 
 3,385 payloads are DXT1 and 38 are DXT3. Of the **365 distinct textures the shipped `.rif`
 files actually name**, 361 are DXT1, 3 are DXT3, 4 name files the install does not ship,
-and **one is not S3TC at all**: the `*_fmv_*` ground textures store three palettized
-`CMAP`/`BODY` variants (and no mip chain), which is 23 of the 513 files.
+and **one is not S3TC at all**: the `*_fmv_*` ground textures store palettized `CMAP`/`BODY`
+variants instead, which is 23 of the 513 files - see below.
+
+#### Only DXT1 and DXT3 exist as far as Gunlok is concerned
+
+**Do not write DXT2, DXT4 or DXT5.** Four independent places in the binary agree, and the
+failure mode for DXT5 is silent rather than loud, which is why this is worth stating:
+
+- `TextureFormatCandidates` @ 0x006ac348 is a 13-entry list - `R8G8B8` through `X4R4G4B4`,
+  then `DXT1`, `DXT3`, terminator. `EnumerateTextureFormats` @ 0x005a4d60 probes only these
+  against the device, so DXT5 is never even *asked about*, let alone used.
+- `SurfaceDesc_SetCompressedFormat` @ 0x005c6820 is a two-value whitelist that **fails
+  silently**: a fourcc that is not DXT1 or DXT3 leaves the field at whatever it held, with no
+  error. `SurfaceDesc_IsCompressedFormat` / `_GetCompressedFormat` recognise the same two.
+- `PickPreferredTextureFormat` @ 0x005761f0 considers only those two among the compressed
+  formats.
+- `RimOpenAndScan` tests for `DXT1` *only*, and maps everything else to "8 alpha bits" - i.e.
+  it treats an unknown fourcc as DXT3.
+
+**A DXT5 `.RIM` would not be rejected; it would be mis-rendered.** DXT5 and DXT3 share the
+same 16-byte block size, so `RimBindImageChunks` derives an identical pitch and bpp from the
+payload size and `RimConvertRows` memcpy's the blocks verbatim. The result is a texture whose
+RGB is roughly right and whose alpha is garbage - DXT5's interpolated alpha read as DXT3's
+explicit 4-bit alpha. No error is raised anywhere on that path.
+
+So the choice is only ever DXT1 vs DXT3: **DXT1** for opaque or 1-bit-alpha (4 bpp, and what
+361 of the 365 named textures use), **DXT3** for graded alpha (8 bpp, 3 textures). Note that
+`D3DFormatToString` @ 0x005a44b0 *names* all five DXT variants - it is a debug log table, not
+a capability list, and `rimutil`'s `case 'DXT5':` in `decompressS3tc` is likewise a decoder
+convenience that no shipped file reaches.
+
+#### The fourcc picks the surface format, through the alpha-depth rule
+
+`ChooseSurfaceFormatForImage` @ 0x005c7880 selects the destination surface, and the whole
+decision turns on the image's **alpha bits** - `RimImage+0x50`, vtable slot 4, which
+`RimOpenAndScan` sets to `(fourcc == 'DXT1') ? 0 : 8`:
+
+| alpha bits | compressed surface accepted | uncompressed fallback must satisfy |
+|-----------|------------------------------|------------------------------------|
+| `< 2`     | `DXT1` only                  | `alpha_bits <= format.maxAlphaBits`, so R5G6B5, X1R5G5B5, A8R8G8B8 ... all qualify |
+| `>= 2`    | `DXT3` only                  | the same test, which among the 13 candidates only **A8R8G8B8** passes |
+
+So the fourcc is *not* discarded after the DXT1 test - it survives twice over, as the 0-or-8
+alpha depth that selects DXT1-vs-DXT3, and as the raw argument to
+`SurfaceDesc_SetCompressedFormat`, which is where a DXT5 value is silently dropped. The whole
+DXT5 failure is now traced end to end: fourcc `DXT5` -> alpha bits 8 -> a **DXT3** surface is
+chosen -> `SetCompressedFormat('DXT5')` no-ops so the surface stays DXT3 -> DXT5 blocks are
+memcpy'd into it.
+
+**This is also the one respect in which DXT1 is not redundant.** Writing every texture as DXT3
+is otherwise free - the RGB block encoding is identical, and an encoder only picks DXT1's
+three-colour mode when it needs the 1-bit alpha - but it forces every image to `alpha_bits = 8`,
+whose only uncompressed fallback is A8R8G8B8, itself gated on `Use32BitTextures`. With DXT3
+compression unavailable *and* 32-bit textures off, such an image can find no format at all and
+`DecodeImageToSurface` reports `RimLoadErrorCode = 3`. On hardware that has DXT3 this never
+fires, which is why "DXT3 everywhere" is a reasonable choice for a modern target and not a
+correctness question.
+
+Not verified: whether the **renderer** keys blending or alpha-testing off a texture's alpha
+depth. Every use of `alpha_bits` traced here is format selection, and Gunlok's polygons carry
+their own `engine_type`/`flags` (see `SHPPOLYS` above), which is where translucency lives - so
+the expectation is that DXT3-vs-DXT1 is a storage decision only. The load path is traced; the
+draw path is not.
+
+### `BMHD` - the header
+
+The standard 20-byte ILBM BitMapHeader, unmodified. Offsets are into the chunk body; the
+in-memory `BmhdChunk` puts the same fields at body + 0x14. All multi-byte fields are
+big-endian, like every size in the container.
+
+| Offset | Size | Type   | Field | Read by the loader? |
+|--------|------|--------|-------|---------------------|
+| 0x00   | 2    | uint16 | `width` | yes |
+| 0x02   | 2    | uint16 | `height` | yes |
+| 0x04   | 2    | int16  | `x` | no |
+| 0x06   | 2    | int16  | `y` | no |
+| 0x08   | 1    | uint8  | `nPlanes` | on the `BODY` path only |
+| 0x09   | 1    | uint8  | `masking` | yes - **must be 0 or 2** |
+| 0x0a   | 1    | uint8  | `compression` | as the `BODY` codec; see below |
+| 0x0b   | 1    | uint8  | `flags` | no |
+| 0x0c   | 2    | uint16 | `transparentColor` | when `masking == 2` |
+| 0x0e   | 1    | uint8  | `xAspect` | no |
+| 0x0f   | 1    | uint8  | `yAspect` | no |
+| 0x10   | 2    | uint16 | `pageWidth` | no |
+| 0x12   | 2    | uint16 | `pageHeight` | no |
+
+**`compression` is a three-valued discriminator for the whole image, not a boolean**:
+`0` = raw planar `BODY`, `1` = ByteRun1 planar `BODY`, `2` = S3TC. Every one of the 3,423 S3TC
+chunks declares `2`, and the 77 palettized images declare `0` (41) or `1` (36). Which path
+runs is decided by *which chunk is present*, not by this field - nothing in the loader reads it
+on the S3TC path - but a writer should still set `2` for an S3TC image to match every shipped
+file. `rimutil`'s `enum class Compression { None, RunLength, S3tc }` already had this right.
+
+**`masking` must be 0 (none) or 2 (`transparentColor` is a transparent palette index).**
+`RimConvertRows` dispatches on `(has ALPH, masking)` to one of four index->pixel converters
+and sets `RimLoadErrorCode = 8` for anything else, so ILBM's mask plane (1) and lasso (3) are
+both rejected. Shipped files use 0 everywhere except `Units\Command Wheel 01.RIM`, which uses 2.
+
+### `CMAP` + `BODY` - the palettized path
+
+- **`CMAP` is mandatory**, 3 bytes RGB per entry, any number of entries. A `BODY` with no
+  `CMAP` fails with `RimLoadErrorCode = 9`.
+- **A `FORM:ILBM` may appear several times, once per palette depth**, and
+  `RimBindImageChunks` picks the one with the most `CMAP` entries that is still within the
+  caller's colour cap. `Ground\city_fmv_road_1024.RIM` carries 14 planes / 14,105 entries,
+  8 / 256 and 4 / 16 of the same 512x512 image; the high-depth variant is how the artists'
+  tool stored a near-truecolour image without DXT. The variant set thins out at small mip
+  sizes (the 32x32 level of `Command Wheel 01` has only 8- and 4-plane forms).
+- **That cap is 0 - meaning no cap - on any true-colour destination**, so the largest palette
+  in the file wins. `DecodeImageToSurface` @ 0x005c68c0 passes
+  `(dest_is_palettized ? 1 << dest_palette_bits : 0)`, and `RimBindImageChunks` treats 0 as
+  unbounded. A high-depth `CMAP` is therefore genuinely reachable rather than dead weight,
+  which is what makes the point below possible.
+
+##### `BODY` can carry true colour, at a price
+
+Since the cap is unbounded and `IffBodyDecodeScanline` accumulates into a **uint32** index
+(so `nPlanes` up to 31 works), a `BODY` whose `CMAP` holds one entry per distinct colour is an
+*exactly lossless* encoding of any image. `nPlanes = ceil(log2(distinct colours))`, and the
+shipped set already exercises the high end: `Ground\tree_alpha.RIM` carries 19 planes and
+90,319 palette entries.
+
+Two things make this a fallback rather than the obvious choice:
+
+- **The cost scales with distinct colours, and the worst case beats raw RGBA.** A 1024x1024
+  image with a unique colour per pixel needs 20 planes: 2.5 MB of indices plus 3 MB of palette,
+  against 4 MB for uncompressed 32-bit, 1 MB for DXT3 and 0.5 MB for DXT1. A realistic
+  photographic texture at ~200k distinct colours lands around 3 MB. There is **no direct-RGB
+  pixel chunk** in the format - the registered vocabulary is `BMHD`/`CMAP`/`BODY`/`GRAB`/
+  `ALPH`/`S3TC`/`TRAN` - so palettized is the only non-DXT option there is.
+- **It is only *displayed* in true colour if a 32-bit surface is chosen.** The converters in
+  `RimConvertRows` write into whatever `ChooseSurfaceFormatForImage` picked; an exact palette
+  landing in R5G6B5 is still 16-bit output. The 32-bit candidates are gated on
+  `Use32BitTextures`, which is a user setting the file cannot influence.
+
+So `BODY` is the right tool for *losslessness* (and for avoiding a DXT compressor entirely),
+not for cheap photographic fidelity.
+- **`BODY` is planar, MSB-first** (`IffBodyDecodeScanline` @ 0x005e0a30). One scanline is
+  `nPlanes` consecutive plane-rows; plane row *p* contributes bit *p* of each pixel's palette
+  index, most significant pixel first within each byte:
+
+  ```
+  for y in 0..height-1:
+      for p in 0..nPlanes-1:
+          for x in 0..width-1:              # ceil(width/8) bytes, MSB = lowest x
+              index[y][x] |= bit(x) << p
+  ```
+
+- **`compression`: 0 is raw, anything else is ByteRun1/PackBits** - `n < 0x80` is a literal
+  run of `n+1` bytes, `n > 0x80` repeats the next byte `0x101-n` times, `0x80` is a no-op.
+  Both values ship, and both are exercised by shipped assets. `IffBodyEncodeScanline`
+  @ 0x005e0690 is the game's own writer for both, so neither is a legacy path.
+
+**A plane row is padded to a byte, not to a word.** This is the one place Gunlok deviates
+from the ILBM specification, which requires rows of an even number of bytes, and it is the
+trap most likely to break a writer built from the spec. It is only observable where
+`ceil(width/8)` is odd, i.e. the 8-pixel-wide mip levels: both of them consume exactly
+`ceil(width/8) * nPlanes * height` bytes and neither matches word padding.
+
+Verified across all 23 palettized files: **77 `BODY` images (palette variants and mip levels
+included) decode with exact stream consumption, every index lands inside its own `CMAP`, and
+`nPlanes == ceil(log2(entries))` in all 77.**
+
+### `ALPH` - the alpha plane
+
+A 6-byte header then a blob, and it reuses the `BODY` decoder wholesale
+(`AlphChunk_BeginDecode` @ 0x005e0f70 copies its own `width`/`compression`/`bits` into the
+same slots `BodyChunk_BeginDecode` fills from the `BMHD`, with `bits` playing the role of
+`nPlanes`):
+
+| Offset | Size | Type   | Field |
+|--------|------|--------|-------|
+| 0x00   | 2    | uint16 | `width` |
+| 0x02   | 2    | uint16 | `height` |
+| 0x04   | 1    | uint8  | `bits` - becomes the plane count |
+| 0x05   | 1    | uint8  | `compression` - 0 raw, else ByteRun1 |
+| 0x06   | ...  | bytes  | planar alpha, same layout as `BODY` |
+
+Its presence is what routes `RimConvertRows` to the two alpha-aware converters, with
+`RimImage+0x50` = `ALPH.bits`. On the `S3TC` path that field is set from the fourcc instead
+(`DXT1` -> 0, otherwise 8).
+
+**Open question: whether an `ALPH` inside a `PROP:ILBM` is found at all.** The only shipped
+`ALPH` is in the `PROP` of `Ground\tree_alpha.RIM`, but `RimOpenAndScan` looks it up with
+`IffChunk_FindChild` against the `ILBM`. Whether IFF `PROP` properties are merged into that
+lookup scope has not been read out of the binary. It does not affect writing a file - put
+`ALPH` in the `FORM` and the question is moot - but it does decide whether that one texture
+gets its alpha. The same doubt applies to `TRAN`, and there it is academic: every shipped
+`TRAN` body is eight zero bytes, and `RimBindImageChunks` gates the colour key on the first
+byte being non-zero, so no shipped file applies one either way.
 
 The reader is `blender/io_scene_rif/rim.py`, exercised over all 513 by
-`blender/tests/test_rim.py`. There is no writer: nothing here compresses DXT.
+`blender/tests/test_rim.py`, and it reads the `S3TC` path only. There is still no writer there,
+but the reason has changed: nothing in the addon compresses DXT, and **the palettized path needs
+no compressor at all** - a `BMHD` + `CMAP` + uncompressed planar `BODY` with `CONT = 0` is a
+configuration the shipped files already use. `utils/rimutil` does write it.
+
+### Confirmed in the running game
+
+Everything above was measured against the shipped assets; this section is the end-to-end check,
+because a shared misreading of the format would satisfy every self-consistency test.
+
+All 28 textures `level01.rif` names were re-encoded from their own decoded pixels as **raw
+`BODY`** (`rimutil compress --format body --raw`) and served to Gunlok through GkPlus's PhysFS
+mod overlay, so no Steam asset was modified. Result: `mods.served` reached **28 of 28**, the
+level loaded with its usual 158 actors and a running simulation, and the scene rendered
+correctly.
+
+Against a baseline capture of the same camera with the stock DXT1 textures, static geometry
+differs by a mean absolute error of **0.9-1.9 per channel** (max 35-119), concentrated on edges.
+That is the *right* difference: the `BODY` copies are lossless, so what shows up is DXT1's block
+artifacts being absent from them. Corruption - a wrong plane count, word-padded rows, a mangled
+palette - would have produced a garbled image, not a sub-2 LSB edge delta.
+
+The set exercised the interesting paths as well as the ordinary one: `Units\alpha junk.RIM` has
+graded alpha and therefore round-tripped through an `ALPH` chunk, and the palettes ranged from
+1,851 to 59,746 entries (11 to 16 bitplanes).
+
+One thing this did *not* cover: a `masking = 2` transparent index, which none of level01's
+textures needed. That path is covered by the synthetic cases in `utils/rimutil/tests` but has
+not been seen by the engine.
 
 ---
 

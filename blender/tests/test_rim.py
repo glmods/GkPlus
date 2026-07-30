@@ -9,9 +9,9 @@ Two claims, both over the whole asset set and neither needing Blender:
   ``BMPNAMES`` in the game. That is what lets the exporter rewrite the table
   from the scene without disturbing a file whose textures nobody touched.
 - **Every texture a shipped .rif names decodes**, and its dimensions agree with
-  the table's own claim about them. The one documented exception is the
-  palettized ``*_fmv_*`` set, which carries no S3TC image; it is counted, not
-  tolerated silently.
+  the table's own claim about them. The documented exception is the palettized
+  set -- 23 files with a ``CMAP``/``BODY`` image and no S3TC, which ``rim.py``
+  does not read; they are counted, not tolerated silently.
 """
 
 import collections

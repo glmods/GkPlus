@@ -1239,7 +1239,8 @@ The split is the point: `io_scene_rif/rif.py` (container: huffman, chunk tree, s
 `src/`, where nothing runs outside Gunlok. `io_scene_rif/scene.py` and
 `io_scene_rif/__init__.py` are the only files that touch Blender.
 
-Seven things pin the design, in decreasing order of how much everything else rests on them:
+These pin the design, in roughly decreasing order of how much everything else rests on them
+(the list grows; deliberately not numbered, because the count kept going stale):
 
 - **The scene is the whole file: export reads nothing but the scene.** Every chunk becomes a
   Blender datablock — objects, mesh datablocks, lights, Actions, mesh attributes, and typed
@@ -1341,10 +1342,28 @@ Seven things pin the design, in decreasing order of how much everything else res
   groups, odd bodies padded — carrying DXT1/DXT3 in an `S3TC` chunk whose 22-byte header is
   documented in `rif_chunk_format.md`. The **payload is little-endian** even though the container
   is not, which is settled by content rather than inspection: `lava.RIM` decodes orange, and a
-  red/blue swap would make it blue. 490 of the 513 shipped textures decode; the other 23 are the
-  `*_fmv_*` set, which stores palettized `CMAP`/`BODY` variants and no S3TC. **There is no
-  writer** — that would need a DXT compressor and a mip chain, and re-compressing a lossy format
-  to change a name nobody edited is the wrong trade.
+  red/blue swap would make it blue. `rim.py` decodes 490 of the 513 shipped textures; the other 23
+  are palettized `CMAP`/`BODY` with no S3TC — 16 `*_fmv_*` ground textures and seven UI/unit/
+  structure ones, so this is not one art pipeline's quirk.
+- **The palettized path is the engine's *preferred* one, and it is why a `.RIM` writer is now
+  reachable.** `RimOpenAndScan` @ 0x005dd6b0 enumerates `ILBM`→`BODY` first and only falls back to
+  `ILBM`→`S3TC`, so a file carrying both would have its DXT ignored. `BODY` is planar ILBM —
+  `CMAP` of 3-byte RGB entries (**mandatory**; absent is error 9), `nPlanes` MSB-first bitplane
+  rows per scanline, each `ceil(width/8)` bytes, optionally ByteRun1-compressed — and `BMHD.masking`
+  must be 0 or 2, never ILBM's mask plane or lasso. **A plane row is padded to a byte, not to the
+  word boundary the ILBM spec requires**, which is only visible at the 8-pixel mip levels and is the
+  trap that would break a writer built from the spec. Verified over all 77 palettized images in the
+  shipped set: exact stream consumption, every index inside its `CMAP`,
+  `nPlanes == ceil(log2(entries))`. Full layout, the 13-entry IFF chunk registry and the engine
+  addresses are in `rif_chunk_format.md`. So the standing "no writer" reason is now only half true:
+  nothing here compresses DXT, but the palettized form needs no compressor at all.
+- **Verified in the running game.** All 28 textures `level01.rif` names were re-encoded as raw
+  `BODY` with `rimutil` and served to Gunlok through GkPlus's PhysFS mod overlay (`gkplus\mods\`,
+  so no Steam asset was touched). `mods.served` reached 28/28, the level loaded with its usual 158
+  actors, and the scene rendered correctly — the difference against the stock DXT1 build is
+  0.9–1.9 mean absolute error per channel on static geometry, confined to edges, which is DXT1's
+  block artifacts being *absent* from the lossless copy rather than any fault in it. So the format
+  description above is confirmed end to end, not just self-consistent.
 - **Files are written uncompressed.** 150 of the 563 shipped files already are, and the game reads
   them, so the Huffman *compressor* is never needed. `huffman/huffman_compress.cpp` still exists for
   byte-parity work.
@@ -1413,6 +1432,7 @@ document order. Nothing exported has been loaded back into Gunlok yet.
 | `types/` | `.d.ts` for the `"gk"` module and the `ImGui` interface, the generator for the latter, and `typecheck.ts`. See "Type definitions" above |
 | `blender/` | The Blender `.rif` import/export addon and its five test harnesses. Pure Python, unrelated to `d3d8.dll`. See "The Blender addon" above |
 | `huffman/`, `utils/rifutil` | The C++ REBCRIF1 codec and its CLI. The Python port in `blender/io_scene_rif/rif.py` is decode-only; this is the only compressor |
+| `utils/rimutil` | `.RIM` <-> PNG CLI over spng + libsquish, both directions, both image forms. `compress` takes `--format dxt1\|dxt3\|body` (default **dxt3**) and `--raw`; **dxt5 is refused by name**, because `TextureFormatCandidates` @ 0x006ac348 lists only DXT1/DXT3 and `SurfaceDesc_SetCompressedFormat` @ 0x005c6820 drops any other fourcc *silently* — a DXT5 file renders with garbage alpha rather than failing. `body` is exactly lossless and needs no DXT compressor — it picks `masking 2` only when every transparent texel shares one RGB (otherwise an `ALPH` chunk, since the RGB *under* transparency is what bilinear filtering blends into neighbours), and `check_lossless` re-derives every pixel before writing. Format details in `rif_chunk_format.md`; tests in `utils/rimutil/tests` |
 
 ## Reverse Engineering Reference
 

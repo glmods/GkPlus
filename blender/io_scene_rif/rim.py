@@ -12,15 +12,30 @@ this is a separate module rather than a mode of that one.
 The shape is the same in all 513::
 
     LIST:ILBM
-      PROP:ILBM         BMHD (shared properties) + TRAN
-      FORM:ILBM         BMHD + S3TC          <- the image
+      PROP:ILBM         TRAN          (shared properties; also ALPH, in one file)
+      FORM:ILBM         BMHD + S3TC          <- a DXT image
+                        BMHD + CMAP + BODY   <- ... or a palettized one
       LIST:MIPM
-        FORM:MIPM       CONT, FLAG
-        LIST:ILBM       FORM:ILBM per mip level, each BMHD + S3TC
+        FORM:MIPM       CONT (level count), FLAG
+        LIST:ILBM       FORM:ILBM per mip level
+
+``PROP:ILBM`` holds only ``TRAN``, never a ``BMHD`` -- every ``BMHD`` sits in a
+``FORM:ILBM`` beside the image it describes.
 
 Only the first ``FORM:ILBM`` carrying an ``S3TC`` is read. The mip chain is
 discarded on purpose: Blender generates its own, and a mip level here is just
 the same image at half size.
+
+**This module reads the S3TC path only, and that is a gap rather than the whole
+format.** Gunlok's loader looks for ``ILBM``->``BODY`` *first* and falls back to
+``ILBM``->``S3TC``, so the palettized form is the priority path in the engine;
+23 of the 513 shipped files use it (:func:`decode` returns ``None`` for those).
+It is planar ILBM: ``CMAP`` of 3-byte RGB entries, ``BODY`` of ``nPlanes``
+MSB-first bitplane rows per scanline each ``ceil(width/8)`` bytes -- padded to a
+**byte**, not to the word boundary the ILBM spec requires -- optionally
+ByteRun1-compressed. Full layout, offsets and the engine addresses are in
+``rif_chunk_format.md`` under "The texture images: .RIM". That path is also the
+answer to the missing writer: it needs no DXT compressor.
 
 **The S3TC body is a 22-byte header then the raw DXT payload**, which is
 measured rather than inferred -- across all 3,423 S3TC chunks in the shipped
