@@ -148,6 +148,40 @@ class EXPORT_SCENE_OT_rif(bpy.types.Operator, ExportHelper):
         description="Which imported collection to write. Empty uses the only one present",
         default="",
     )
+    textures: EnumProperty(
+        name="Textures",
+        description=(
+            "Write the images as .RIM files too. The .rif itself only ever "
+            "stores their names"
+        ),
+        items=(
+            ("NONE", "None", "Write only the .rif. The names still go in it"),
+            ("CHANGED", "Changed only",
+             "Write the textures whose pixels no longer match the .RIM they were "
+             "imported from - what a mod needs and nothing else"),
+            ("ALL", "All", "Write every texture the file names, edited or not"),
+        ),
+        default="NONE",
+    )
+    texture_dir: StringProperty(
+        name="Textures folder",
+        description=(
+            "Where the .RIM files go, laid out the way the game's Graphics "
+            "folder is. Point it at a mod (gkplus\\mods\\<name>\\graphics), not "
+            "at the install, unless you mean to overwrite it"
+        ),
+        default="",
+        subtype="DIR_PATH",
+    )
+    compress_textures: BoolProperty(
+        name="Compress textures",
+        description=(
+            "Pack the written .RIM files with ByteRun1, which 36 of the shipped "
+            "textures use. Off writes them raw - larger, and the form verified "
+            "end to end in the running game"
+        ),
+        default=True,
+    )
 
     def execute(self, context):
         target, error = _sole_collection(self.collection)
@@ -171,6 +205,25 @@ class EXPORT_SCENE_OT_rif(bpy.types.Operator, ExportHelper):
             )
             return {"CANCELLED"}
 
+        # Vertex lighting is read from `rif_light` by name and never averaged or
+        # padded at export, so a mesh whose attribute no longer describes it is
+        # refused here rather than discovered as a raise mid-write.
+        lighting = sc.lighting_problems(target)
+        if lighting:
+            self.report({"ERROR"}, lighting[0] if len(lighting) == 1
+                        else "%s (and %d other mesh(es))" % (lighting[0],
+                                                             len(lighting) - 1))
+            return {"CANCELLED"}
+
+        # Checked before anything is written, so a missing folder does not leave
+        # a .rif on disk whose textures never followed it.
+        texture_root = bpy.path.abspath(self.texture_dir) if self.texture_dir else ""
+        if self.textures != "NONE" and not os.path.isdir(texture_root):
+            self.report({"ERROR"},
+                        "Set the Textures folder to write .RIM files, or set "
+                        "Textures to None")
+            return {"CANCELLED"}
+
         try:
             root, stats = sc.rebuild_tree(target)
             rif.save(self.filepath, root)
@@ -185,6 +238,57 @@ class EXPORT_SCENE_OT_rif(bpy.types.Operator, ExportHelper):
             summary += " (%d added)" % stats["new_textures"]
         if stats.get("sounds"):
             summary += ", %d sound(s)" % stats["sounds"]
+
+        if self.textures != "NONE":
+            written = sc.write_textures(target, texture_root,
+                                        changed_only=self.textures == "CHANGED",
+                                        compress=self.compress_textures)
+            summary += ("; %d .RIM written (%.1f MB)"
+                        % (written["written"], written["bytes"] / (1024.0 * 1024.0)))
+            if written["unchanged"]:
+                summary += ", %d unchanged" % written["unchanged"]
+            if written["failed"]:
+                name, why = written["failed"][0]
+                self.report(
+                    {"WARNING"},
+                    "%s; %d texture(s) could not be written (%s: %s)"
+                    % (summary, len(written["failed"]), name, why),
+                )
+                return {"FINISHED"}
+            if written["no_image"]:
+                # The .rif is complete either way -- it stores the name -- so this
+                # is a warning about the mod, not about the model.
+                self.report(
+                    {"WARNING"},
+                    "%s; %d material(s) name a texture but carry no image, so "
+                    "nothing was written for them (%s)"
+                    % (summary, len(written["no_image"]),
+                       ", ".join(written["no_image"][:3])),
+                )
+                return {"FINISHED"}
+        # Never let this one pass as INFO: the faces are gone from the file, and
+        # keeping them would have crashed the game while it built section
+        # adjacency, with a fault that names neither this file nor the polygon.
+        if stats.get("degenerate_faces"):
+            self.report(
+                {"WARNING"},
+                "%s; dropped %d face(s) whose corners coincide once quantized to "
+                "RIF integer units -- keeping them crashes Gunlok during level "
+                "load. Merge by Distance and check for zero-area faces if you "
+                "did not expect any." % (summary, stats["degenerate_faces"]),
+            )
+            return {"FINISHED"}
+        # Likewise never INFO: the object was marked as carrying lighting and
+        # now does not, which is a chunk that used to be in the file and is not.
+        if stats.get("lighting_dropped"):
+            self.report(
+                {"WARNING"},
+                "%s; %d object(s) lost their vertex lighting because the %r "
+                "attribute was deleted. Re-create it with Enable Vertex Lighting "
+                "if that was not deliberate." % (summary, stats["lighting_dropped"],
+                                                 sc.LIGHT_COLOR_ATTR),
+            )
+            return {"FINISHED"}
         self.report({"INFO"}, summary)
         return {"FINISHED"}
 
@@ -465,6 +569,208 @@ class OBJECT_OT_rif_new_shape_id(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _lighting_targets(context):
+    """The mesh objects these two operators act on: the selection, else the active."""
+    objs = [o for o in (context.selected_objects or []) if o.type == "MESH"]
+    if not objs and context.object is not None and context.object.type == "MESH":
+        objs = [context.object]
+    return objs
+
+
+class OBJECT_OT_rif_enable_lighting(bpy.types.Operator):
+    """Give this mesh baked vertex lighting: a white rif_light to paint or bake into"""
+
+    bl_idname = "object.rif_enable_lighting"
+    bl_label = "Enable Vertex Lighting"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(_lighting_targets(context))
+
+    def execute(self, context):
+        done, fresh = 0, 0
+        for obj in _lighting_targets(context):
+            _name, had = sc.enable_lighting(obj.data)
+            done += 1
+            fresh += 0 if had else 1
+        if not done:
+            self.report({"ERROR"}, "No mesh selected")
+            return {"CANCELLED"}
+        msg = "%s on %d mesh(es)" % (sc.LIGHT_COLOR_ATTR, done)
+        if fresh:
+            msg += "; %d had no lighting and start white" % fresh
+        msg += (". It is active and it is what exports, so Bake > Target > "
+                "Active Color Attribute writes the file's lighting directly.")
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class OBJECT_OT_rif_adopt_color_attribute(bpy.types.Operator):
+    """Fold the active colour attribute into rif_light, the one that exports"""
+
+    bl_idname = "object.rif_adopt_color_attribute"
+    bl_label = "Use Active Color Attribute"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(_lighting_targets(context))
+
+    def execute(self, context):
+        done, refused, last = 0, [], None
+        for obj in _lighting_targets(context):
+            source, why = sc.adopt_color_attribute(obj.data)
+            if why is None:
+                done += 1
+                last = source
+            else:
+                refused.append(why)
+        if not done:
+            self.report({"ERROR"}, refused[0] if refused else "No mesh selected")
+            return {"CANCELLED"}
+        msg = "Adopted %s into %s on %d mesh(es)" % (last, sc.LIGHT_COLOR_ATTR, done)
+        if refused:
+            msg += "; skipped %d (%s)" % (len(refused), refused[0])
+        self.report({"WARNING"} if refused else {"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class OBJECT_OT_rif_navmesh_preview(bpy.types.Operator):
+    """Mark the faces a character can stand on, the way the engine decides it"""
+
+    bl_idname = "object.rif_navmesh_preview"
+    bl_label = "Preview Navmesh"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(_lighting_targets(context))
+
+    def execute(self, context):
+        done, refused, last = 0, [], None
+        for obj in _lighting_targets(context):
+            stats, why = sc.navmesh_preview(obj)
+            if why is None:
+                done += 1
+                last = stats
+            else:
+                refused.append(why)
+        if not done:
+            self.report({"ERROR"}, refused[0] if refused else "No mesh selected")
+            return {"CANCELLED"}
+
+        msg = ("%d/%d faces walkable; %d island(s), largest %d. Blocked: %d facing down, "
+               "%d steeper than 45 deg, %d flagged 0x100. Walkable faces are selected."
+               % (last["walkable"], last["faces"], last["islands"], last["largest"],
+                  last["faces_down"], last["too_steep"], last["blocked_flag"]))
+        # A navmesh in many pieces is the thing worth shouting about: units can
+        # only path within one island, so a fragmented one looks fine and plays
+        # broken. The threshold is calibrated against shipped levels rather than
+        # chosen -- level01/02/03/06 put 57.8%, 61.6%, 66.1% and 66.7% of their
+        # walkable faces in the largest island (and hundreds of islands is
+        # normal: 523, 420, 699, 1014). So the count means little and the share
+        # means a lot, and 40% sits clear of the observed range in both
+        # directions.
+        fragmented = last["walkable"] and last["largest"] < 0.4 * last["walkable"]
+        self.report({"WARNING"} if fragmented or refused else {"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class SCENE_OT_rif_preview_setup(bpy.types.Operator):
+    """Shade the RIF the way Gunlok does: texture times baked vertex lighting"""
+
+    # The docstring is the tooltip, so the reasoning lives here instead: this
+    # builds one Emission material per texture that multiplies `rif_light` by
+    # that texture **in gamma space**, the way D3D8 fixed function does, and puts
+    # the viewport in Material Preview under the Standard view transform. Why
+    # each of those is forced rather than chosen is in `scene.py`'s preview
+    # section. Reversible: the authored materials are recorded, never lost.
+
+    bl_idname = "scene.rif_preview_setup"
+    bl_label = "Set Up Gunlok Preview"
+    bl_options = {"REGISTER", "UNDO"}
+
+    shadow_casters: BoolProperty(
+        name="Shadow objects cast only",
+        description=(
+            "Turn camera visibility off and shadow visibility on for a "
+            "`_shadow` object, which is the role the engine gives it: a "
+            "low-polygon silhouette for shadow volumes, never drawn"
+        ),
+        default=True)
+
+    @classmethod
+    def poll(cls, context):
+        return bool(sc.rif_collections())
+
+    def execute(self, context):
+        stats, why = sc.preview_setup(shadow_casters=self.shadow_casters)
+        if why is not None:
+            self.report({"ERROR"}, why)
+            return {"CANCELLED"}
+
+        msg = ("%d object(s), %d material(s) previewing texture x %s"
+               % (stats["objects"], stats["materials"], sc.LIGHT_COLOR_ATTR))
+        if stats["lit"]:
+            msg += "; %d mesh(es) had no %s and got one" % (stats["lit"],
+                                                            sc.LIGHT_COLOR_ATTR)
+        if stats["untextured"]:
+            msg += "; %d material(s) have no texture and show the light alone" % (
+                stats["untextured"])
+        if stats["shadow"]:
+            msg += "; %d shadow object(s) now cast only" % stats["shadow"]
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class SCENE_OT_rif_preview_restore(bpy.types.Operator):
+    """Put the authored materials and the colour management back"""
+
+    bl_idname = "scene.rif_preview_restore"
+    bl_label = "Restore Authored Materials"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return sc.PREVIEW_STATE_PROP in context.scene or sc.preview_is_active()
+
+    def execute(self, context):
+        stats, why = sc.preview_restore()
+        if why is not None:
+            self.report({"ERROR"}, why)
+            return {"CANCELLED"}
+        self.report({"INFO"},
+                    "Restored %d slot(s) on %d object(s); removed %d unused preview "
+                    "material(s)" % (stats["materials"], stats["objects"],
+                                     stats["removed"]))
+        return {"FINISHED"}
+
+
+class OBJECT_OT_rif_new_light_id(bpy.types.Operator):
+    """Give this light an id no other light in the file claims"""
+
+    bl_idname = "object.rif_new_light_id"
+    bl_label = "Assign Fresh Light ID"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return obj is not None and obj.get("rif_id") == "STDLIGHT"
+
+    def execute(self, context):
+        obj = context.object
+        target = sc.collection_for(obj)
+        if target is None:
+            self.report({"ERROR"}, "%s is not in a RIF collection" % obj.name)
+            return {"CANCELLED"}
+        light_id = sc.next_light_id(target)
+        obj["rif_light_id"] = light_id
+        self.report({"INFO"}, "%s is now light %d" % (obj.name, light_id))
+        return {"FINISHED"}
+
+
 # The two identities live inside chunk bodies stored as int32 arrays, so without
 # these accessors editing one means hand-packing bytes into a custom property.
 def _get_object_name(self):
@@ -512,6 +818,9 @@ class OBJECT_PT_rif(bpy.types.Panel):
         if obj.type == "ARMATURE":
             self._draw_rig(obj, layout)
             return
+        if chunk_id == "STDLIGHT":
+            self._draw_light(obj, layout)
+            return
         if chunk_id in ("RBOBJECT", "DUMMYOBJ"):
             # Deliberately not obj.name: the outliner name is uniquified by
             # Blender and is not what the engine resolves by strcmp.
@@ -532,6 +841,102 @@ class OBJECT_PT_rif(bpy.types.Panel):
             box.label(text="Shape ID shared with %d other object(s)" % (len(sharing) - 1),
                       icon="ERROR")
             box.label(text="Export refuses this; assign a fresh id.")
+
+        self._draw_vertex_lighting(obj, layout)
+
+    @staticmethod
+    def _draw_vertex_lighting(obj, layout):
+        """The baked lighting: the only lighting in a .rif the game actually reads."""
+        me = obj.data
+        box = layout.box()
+        box.label(text="Vertex lighting (SHPVTINT)", icon="LIGHT")
+
+        # Two separate questions, and conflating them is the bug this design
+        # avoids: does the object carry a chunk (the marker), and is there an
+        # attribute to paint (which the preview also mints, without the marker).
+        paint = me.color_attributes.get(sc.LIGHT_COLOR_ATTR)
+        if not sc.has_lighting(me):
+            box.label(text="None. Enable to start one, white.", icon="INFO")
+            if paint is not None:
+                box.label(text="%s exists for the preview but is not exported yet."
+                               % sc.LIGHT_COLOR_ATTR, icon="INFO")
+        else:
+            why = sc.lighting_refusal(me) if paint is not None else None
+            if paint is None:
+                box.label(text="Marked, but %s is gone; export drops it."
+                               % sc.LIGHT_COLOR_ATTR, icon="ERROR")
+            elif why is not None:
+                box.label(text="Export refuses this mesh's lighting.", icon="ERROR")
+                box.label(text=why)
+            else:
+                box.label(text="%d value(s), one per vertex -- paint or bake %s"
+                               % (len(me.vertices), sc.LIGHT_COLOR_ATTR))
+        col = box.column(align=True)
+        col.operator(OBJECT_OT_rif_enable_lighting.bl_idname,
+                     text="Enable Vertex Lighting", icon="COLOR")
+        col.operator(OBJECT_OT_rif_adopt_color_attribute.bl_idname,
+                     text="Use Active Color Attribute", icon="IMPORT")
+
+        # Seeing it is a separate act from editing it: Solid mode draws vertex
+        # colour *or* texture and has no way to combine them, so the engine's
+        # `texture x diffuse` needs a material and Material Preview.
+        row = box.row(align=True)
+        row.operator(SCENE_OT_rif_preview_setup.bl_idname,
+                     text="Preview As In Game", icon="SHADING_RENDERED")
+        if sc.preview_is_active():
+            row.operator(SCENE_OT_rif_preview_restore.bl_idname,
+                         text="", icon="LOOP_BACK")
+
+        nav = layout.box()
+        nav.label(text="Navmesh", icon="MESH_GRID")
+        walk = me.attributes.get(sc.NAV_WALKABLE_ATTR)
+        if walk is None:
+            nav.label(text="Characters walk on the level's own polygons.", icon="INFO")
+        else:
+            n = sum(1 for d in walk.data if d.value)
+            nav.label(text="%d of %d face(s) walkable" % (n, len(me.polygons)))
+        nav.operator(OBJECT_OT_rif_navmesh_preview.bl_idname,
+                     text="Preview Navmesh", icon="MESH_GRID")
+
+    @staticmethod
+    def _draw_light(obj, layout):
+        """A light's panel: what the datablock carries, and what it does not.
+
+        Colour, brightness and range are real light settings, so they are edited
+        in the Light data tab rather than duplicated here. What is left is the
+        three chunk fields Blender has nowhere to put.
+        """
+        collection = sc.collection_for(obj)
+        row = layout.row(align=True)
+        row.label(text="Light ID %s" % obj.get("rif_light_id", "?"))
+        row.operator(OBJECT_OT_rif_new_light_id.bl_idname, text="", icon="FILE_REFRESH")
+
+        # Duplicating a light in Blender copies its id along with everything
+        # else, and the id is unique within the file in all 38 shipped files
+        # that have lights. Whether the engine minds is not measured, so this
+        # warns rather than refusing the export the way a shared shape id does.
+        if collection is not None:
+            mine = obj.get("rif_light_id")
+            sharing = [o for o in collection.objects
+                       if o.get("rif_id") == "STDLIGHT" and o.get("rif_light_id") == mine]
+            if len(sharing) > 1:
+                box = layout.box()
+                box.label(text="Light ID shared with %d other light(s)" % (len(sharing) - 1),
+                          icon="ERROR")
+                box.label(text="No shipped file does this; assign a fresh id.")
+
+        light = obj.data
+        if not light.use_custom_distance:
+            box = layout.box()
+            box.label(text="Custom Distance is off; range exports as 0", icon="ERROR")
+            box.label(text="Set it in Light > Custom Distance.")
+        scale = (collection.get("rif_scale", sc.DEFAULT_SCALE) if collection
+                 else sc.DEFAULT_SCALE)
+        col = layout.column(align=True)
+        col.label(text="Brightness %.3f (energy; 0.2 - 2.0 in the game)" % (light.energy,))
+        col.label(text="Range %d rif units"
+                       % (int(round(light.cutoff_distance / scale))
+                          if light.use_custom_distance else 0))
 
     @staticmethod
     def _draw_rig(obj, layout):
@@ -736,10 +1141,17 @@ def _menu_object(self, context):
     self.layout.operator(OBJECT_OT_rif_add_sequence.bl_idname,
                          text="Add Action to Gunlok RIF")
     self.layout.operator(SCENE_OT_rif_add_sound.bl_idname, text="Add Gunlok RIF Sound")
+    self.layout.operator(SCENE_OT_rif_preview_setup.bl_idname,
+                         text="Set Up Gunlok Preview")
+    self.layout.operator(SCENE_OT_rif_preview_restore.bl_idname,
+                         text="Restore Authored Materials")
 
 
 _CLASSES = (IMPORT_SCENE_OT_rif, EXPORT_SCENE_OT_rif, SCENE_OT_rif_new,
             OBJECT_OT_rif_add, OBJECT_OT_rif_add_sequence, OBJECT_OT_rif_new_shape_id,
+            OBJECT_OT_rif_new_light_id, OBJECT_OT_rif_navmesh_preview,
+            OBJECT_OT_rif_enable_lighting, OBJECT_OT_rif_adopt_color_attribute,
+            SCENE_OT_rif_preview_setup, SCENE_OT_rif_preview_restore,
             SCENE_OT_rif_add_sound, POSE_OT_rif_set_sound,
             ACTION_OT_rif_toggle_setting,
             OBJECT_PT_rif, DATA_PT_rif_sound, MATERIAL_PT_rif)

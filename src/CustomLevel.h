@@ -71,7 +71,11 @@ struct CustomLevelMap {
   std::string rif_file;    // GLS `file`, e.g. "levels\\level01.rif" - required
   std::string object_name; // GLS `name`, e.g. "Land"                - required
   std::string bitmap;      // loading/HUD bitmap; empty = `none`
-  std::string camera_plane;             // .loc locator name; empty = `none`
+  // Vestigial - naming a rif object here ("camhund") changes nothing observable:
+  // the plane the engine derives from it has no readers, and the .loc shape it
+  // selects is the one the empty-field fallback picks anyway. See
+  // level_loading_notes.md 4.1. Empty = `none`, as most shipped levels have it.
+  std::string camera_plane;
   double max_camera_distance = 60.0;    // 10..500
   std::string max_camera_focus_height;  // .loc locator name
   std::string min_camera_focus_height;  // .loc locator name

@@ -2,20 +2,37 @@
 
     python blender/tests/test_rim.py "<Gunlok dir>"
 
-Two claims, both over the whole asset set and neither needing Blender:
+Four claims, all over the whole asset set and none needing Blender:
 
 - **The texture table rebuilds byte for byte.** ``bmpnames.encode(*decode(body))``
   reproduces the chunk exactly, uninitialised name padding included, for every
   ``BMPNAMES`` in the game. That is what lets the exporter rewrite the table
   from the scene without disturbing a file whose textures nobody touched.
 - **Every texture a shipped .rif names decodes**, and its dimensions agree with
-  the table's own claim about them. The documented exception is the palettized
-  set -- 23 files with a ``CMAP``/``BODY`` image and no S3TC, which ``rim.py``
-  does not read; they are counted, not tolerated silently.
+  the table's own claim about them. Both image forms are covered: 490 S3TC and
+  23 palettized.
+- **Every one of them re-encodes and comes back identical** -- the claim that
+  ``rim.encode`` is exactly lossless, made against every picture in the game
+  rather than against a sample. The palette is checked to be minimal
+  (``nPlanes == ceil(log2(colours))``) while it is there, which is what the
+  engine's own files do. A whole second pass through ByteRun1 is spent only on
+  the 23 the game itself ships packed; everywhere else it is checked as what it
+  is, a byte-stream codec, over that image's own planar payload.
+- **The codec survives a width that is not a multiple of eight**, which the
+  shipped set never exercises: the base-level widths in the game are
+  ``8, 128, 256, 512, 1024, 1600, 1800`` and every one divides by eight, so the
+  partial group at the end of a plane row -- where the two halves of the planar
+  codec have to agree about which bits are padding -- is reachable only from
+  synthetic data. Those cases run first, and need no Gunlok install.
+
+It takes about twenty minutes: 513 textures decoded and re-encoded is a few
+hundred million pixels through pure Python.
 """
 
 import collections
+import math
 import os
+import random
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "io_scene_rif"))
@@ -33,9 +50,89 @@ def walk_files(root, ext):
                 yield os.path.join(dirpath, nm)
 
 
-def main(game_dir):
+def round_trip(width, height, rgba, failures, label, modes=(False, True)):
+    """encode -> decode -> the same pixels. -> the palette, or ``None`` on failure."""
+    palette = None
+    for compress in modes:
+        try:
+            blob = rim.encode(width, height, rgba, compress)
+            back = rim.decode(blob)
+        except Exception as exc:  # noqa: BLE001
+            failures.append((label, "encode(compress=%s): %r" % (compress, exc)))
+            return None
+        if back is None:
+            failures.append((label, "re-encoded to something with no image"))
+            return None
+        if (back.width, back.height) != (width, height):
+            failures.append((label, "came back %dx%d, not %dx%d"
+                             % (back.width, back.height, width, height)))
+        elif back.rgba != bytes(rgba):
+            differing = sum(a != b for a, b in zip(back.rgba, bytes(rgba)))
+            failures.append((label, "%d of %d bytes differ after a round trip"
+                             % (differing, len(rgba))))
+        if palette is None:
+            palette = rim.palettize(width, height, rgba)
+            want = max(1, math.ceil(math.log2(palette.colours)))
+            if palette.planes != want:
+                failures.append((label, "%d colours in %d planes, not %d"
+                                 % (palette.colours, palette.planes, want)))
+            # ByteRun1 as a byte-stream codec, which is what it is -- so the
+            # packed path is covered on every image without paying for a second
+            # palettization and IFF walk on each of them.
+            planar = rim.encode_planar(palette.indices, width, height, palette.planes)
+            if rim.unpack_byterun1(rim.pack_byterun1(planar), len(planar))[:len(planar)] != planar:
+                failures.append((label, "ByteRun1 does not round-trip its own output"))
+    return palette
+
+
+def synthetic(failures):
+    """Sizes and alpha shapes the shipped textures do not have.
+
+    A width that is not a multiple of eight is the one that matters: the last
+    group of a plane row is then partial, and both halves of the planar codec
+    have to agree about which bits in it are padding. Every texture in the game
+    is a power of two, so nothing in the corpus reaches that path.
+    """
+    rng = random.Random(20260731)
     stats = collections.Counter()
+    for width in (1, 2, 3, 7, 8, 9, 15, 16, 17, 33):
+        for height in (1, 3):
+            for kind in ("opaque", "cutout", "graded", "flat", "blank"):
+                px = bytearray()
+                for _ in range(width * height):
+                    if kind == "flat":
+                        px += b"\x40\x80\xc0\xff"
+                        continue
+                    if kind == "blank":
+                        # Nothing opaque at all, so the palette is the
+                        # transparent entry and nothing else.
+                        px += b"\x00\x00\x00\x00"
+                        continue
+                    rgb = bytes(rng.randrange(256) for _ in range(3))
+                    if kind == "opaque":
+                        alpha = 255
+                    elif kind == "cutout":
+                        # One colour under every transparent texel, which is what
+                        # a transparent palette index can represent.
+                        alpha = rng.choice((0, 255))
+                        rgb = b"\xff\x00\xff" if not alpha else rgb
+                    else:
+                        alpha = rng.randrange(256)
+                    px += rgb + bytes((alpha,))
+                label = "%dx%d %s" % (width, height, kind)
+                palette = round_trip(width, height, bytes(px), failures, label)
+                if palette is not None:
+                    stats["synthetic images"] += 1
+                    if palette.masking:
+                        stats["... with a transparent index"] += 1
+                    elif palette.alpha is not None:
+                        stats["... with an ALPH chunk"] += 1
+    return stats
+
+
+def main(game_dir):
     failures = []
+    stats = synthetic(failures)
 
     # ---- the tables --------------------------------------------------------
     tables = {}
@@ -91,41 +188,59 @@ def main(game_dir):
     else:
         index = rim.TextureIndex(root_dir)
 
+    # Every .RIM in the install, named by a .rif or not, decoded exactly once --
+    # a megapixel texture is expensive enough in pure Python that the pass below
+    # takes the summary rather than loading it again.
     formats = collections.Counter()
-    for key, entry in sorted(tables.items()):
+    seen = {}
+    for path in sorted(walk_files(root_dir, ".rim")) if root_dir else ():
+        rel = os.path.relpath(path, root_dir)
+        try:
+            tex = rim.load(path)
+        except Exception as exc:  # noqa: BLE001
+            failures.append((rel, repr(exc)))
+            continue
+        if tex is None:
+            stats["all .RIM with no image at all"] += 1
+            continue
+        stats["all .RIM decoded"] += 1
+        stats["... as " + tex.format] += 1
+        seen[os.path.normcase(path)] = (tex.width, tex.height, tex.format)
+        if len(tex.rgba) != tex.width * tex.height * 4:
+            failures.append((rel, "decoded %d bytes for %dx%d"
+                             % (len(tex.rgba), tex.width, tex.height)))
+        png = rim.to_png(tex)
+        if png[:8] != b"\x89PNG\r\n\x1a\n" or len(png) < 64:
+            failures.append((rel, "PNG encode produced %d bytes" % len(png)))
+
+        # Raw everywhere, and both ways on the files the game itself ships
+        # palettized -- ByteRun1 is covered as a stream codec on all of them.
+        palette = round_trip(tex.width, tex.height, tex.rgba, failures, rel,
+                             (False, True) if tex.format == "BODY" else (False,))
+        if palette is None:
+            continue
+        stats["re-encoded losslessly"] += 1
+        if palette.masking:
+            stats["... with a transparent index"] += 1
+        elif palette.alpha is not None:
+            stats["... with an ALPH chunk"] += 1
+        stats["widest palette"] = max(stats["widest palette"], palette.planes)
+
+    for _key, entry in sorted(tables.items()):
         path = index.resolve(entry["name"])
         if path is None:
             stats["named textures missing from the install"] += 1
             continue
-        try:
-            tex = rim.load(path)
-        except Exception as exc:  # noqa: BLE001
-            failures.append((key, repr(exc)))
+        summary = seen.get(os.path.normcase(path))
+        if summary is None:
+            stats["named textures with no image at all"] += 1
             continue
-        if tex is None:
-            stats["named textures with no S3TC image"] += 1
-            continue
-        formats[tex.fourcc] += 1
+        width, height, image_format = summary
+        formats[image_format] += 1
         stats["named textures decoded"] += 1
-        if len(tex.rgba) != tex.width * tex.height * 4:
-            failures.append((key, "decoded %d bytes for %dx%d"
-                             % (len(tex.rgba), tex.width, tex.height)))
         declared = bmpnames.size(entry)
-        if declared and declared != (tex.width, tex.height):
+        if declared and declared != (width, height):
             stats["table size disagrees with the image"] += 1
-        png = rim.to_png(tex)
-        if png[:8] != b"\x89PNG\r\n\x1a\n" or len(png) < 64:
-            failures.append((key, "PNG encode produced %d bytes" % len(png)))
-
-    # Every .RIM in the install, named by a .rif or not.
-    if root_dir:
-        for path in sorted(walk_files(root_dir, ".rim")):
-            try:
-                tex = rim.load(path)
-            except Exception as exc:  # noqa: BLE001
-                failures.append((os.path.relpath(path, root_dir), repr(exc)))
-                continue
-            stats["all .RIM decoded" if tex is not None else "all .RIM with no S3TC"] += 1
 
     for key, val in sorted(stats.items()):
         print("%-42s %d" % (key, val))

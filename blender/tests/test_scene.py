@@ -19,6 +19,7 @@ carried whole rather than regenerated, so an import/export cycle that touches no
 material has no reason to disturb a single byte of it.
 """
 
+import array
 import collections
 import os
 import struct
@@ -34,6 +35,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "io_scene_rif"))
 import bmpnames  # noqa: E402
 import heads  # noqa: E402
 import rif  # noqa: E402
+import rim  # noqa: E402
 import schema  # noqa: E402
 import shapes as shp  # noqa: E402
 from io_scene_rif import scene as sc  # noqa: E402
@@ -71,19 +73,28 @@ def summarize(root):
         if j is not None:
             s = shp.read_shape(kids[j])
             if s is not None:
-                # Blender cannot hold two faces on the same vertex set, so the
-                # export legitimately comes back short by exactly that many.
+                # Two deliberate, disjoint losses, counted in pipeline order.
+                # `collisions`: Blender cannot hold two faces on the same vertex
+                # set, so import drops them. `degenerate`: export drops a
+                # triangle whose corners coincide once quantized, because it
+                # crashes the game's section-adjacency build (see
+                # shapes.welds_degenerate) -- counted only among the faces that
+                # survived import, so the two never double-count.
+                welded = shp.weld_map(s.verts)
                 seen = set()
-                collisions = 0
+                collisions = degenerate = 0
                 for p in s.polys:
                     key = frozenset(p.verts)
                     if key in seen:
                         collisions += 1
+                    elif shp.welds_degenerate(p.verts, welded):
+                        degenerate += 1
                     seen.add(key)
                 entry["shape"] = {
                     "nverts": len(s.verts),
                     "npolys": len(s.polys),
                     "collisions": collisions,
+                    "degenerate": degenerate,
                     "verts": sorted(tuple(v) for v in s.verts),
                     "engine_types": collections.Counter(p.engine_type for p in s.polys),
                     "textures": collections.Counter(p.texture_index for p in s.polys),
@@ -217,10 +228,12 @@ def compare(name, want, got):
             check(False, "%s: %s geometry differs (%d verts vs %d)"
                   % (name, a["name"], sb["nverts"], sa["nverts"]))
             break
-        if sa and sb["npolys"] != sa["npolys"] - sa["collisions"]:
-            check(False, "%s: %s has %d polys, expected %d (%d source - %d collisions)"
-                  % (name, a["name"], sb["npolys"], sa["npolys"] - sa["collisions"],
-                     sa["npolys"], sa["collisions"]))
+        if sa and sb["npolys"] != sa["npolys"] - sa["collisions"] - sa["degenerate"]:
+            check(False, "%s: %s has %d polys, expected %d (%d source - %d collisions "
+                         "- %d degenerate)"
+                  % (name, a["name"], sb["npolys"],
+                     sa["npolys"] - sa["collisions"] - sa["degenerate"],
+                     sa["npolys"], sa["collisions"], sa["degenerate"]))
             break
         # Nothing invented: every polygon that came back must have been in the
         # source, allowing for the faces Blender could not represent.
@@ -378,12 +391,101 @@ def check_retexture(path):
           "%s: no polygon still names the index the material left (%d)" % (name, was))
 
 
+def check_texture_export(path):
+    """Writing the images back out, which is a second output beside the .rif.
+
+    The three claims, in the order they can fail:
+
+    - **An untouched image is recognised as untouched.** That is not a flag
+      lookup -- it re-reads the pixels out of Blender and digests them -- so it
+      only holds if ``pixels`` gives back exactly the bytes the ``.RIM`` decoded
+      to, through a ``.blend`` save and reload. If Blender's colour management
+      were in the way, every texture in the game would read as edited.
+    - **An edited one is written**, at the path its ``BMPNAMES`` name spells,
+      under the folder the export was pointed at.
+    - **What lands there is what Blender held**, decoded back and compared pixel
+      for pixel rather than merely being a file that exists.
+    """
+    name = os.path.basename(path)
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    sc.build_scene(rif.load(path), name, source_path=path)
+
+    # The reload is the point: an image that did not survive it has no pixels to
+    # write, and would look like a texture that simply did not change.
+    blend = os.path.join(tempfile.gettempdir(), "rif_texture_test.blend")
+    bpy.ops.wm.save_as_mainfile(filepath=blend)
+    bpy.ops.wm.read_homefile(use_empty=True)
+    bpy.ops.wm.open_mainfile(filepath=blend)
+    collection = bpy.data.collections.get(name)
+    check(collection is not None, "%s: collection survived for the texture export" % name)
+    if collection is None:
+        return
+
+    targets = [(mat, image, bmp) for mat, image, bmp in sc.texture_targets(collection)
+               if image is not None]
+    check(bool(targets), "%s: has a material with an image to write" % name)
+    if not targets:
+        return
+
+    root = tempfile.mkdtemp(prefix="rif_tex_")
+    stats = sc.write_textures(collection, root, changed_only=True)
+    check(stats["written"] == 0 and not stats["failed"],
+          "%s: nothing to write before an edit (%d written, %d unchanged, %s)"
+          % (name, stats["written"], stats["unchanged"], stats["failed"][:1]))
+    check(stats["unchanged"] == len(targets),
+          "%s: all %d image(s) read back identical to their .RIM (%d did)"
+          % (name, len(targets), stats["unchanged"]))
+
+    # Edit one, the way painting would.
+    _mat, image, bmp_name = targets[0]
+    count = image.size[0] * image.size[1] * 4
+    buf = array.array("f", bytes(4 * count))
+    image.pixels.foreach_get(buf)
+    buf[1::4] = array.array("f", [0.0]) * (count // 4)  # green to zero
+    image.pixels.foreach_set(buf)
+    image.update()
+
+    stats = sc.write_textures(collection, root, changed_only=True)
+    check(stats["written"] == 1 and not stats["failed"],
+          "%s: the edited image is the only one written (%d written, %s)"
+          % (name, stats["written"], stats["failed"][:1]))
+
+    destination = os.path.join(root, bmp_name.replace("\\", os.sep))
+    check(os.path.isfile(destination),
+          "%s: written to %s, mirroring the game's layout"
+          % (name, bmp_name.replace("\\", "/")))
+    if not os.path.isfile(destination):
+        return
+    texture = rim.load(destination)
+    _w, _h, rgba = sc.image_rgba(image)
+    check(texture is not None and (texture.width, texture.height) == tuple(image.size),
+          "%s: the written .RIM is %s, the image is %dx%d"
+          % (name, texture and "%dx%d" % (texture.width, texture.height),
+             image.size[0], image.size[1]))
+    check(texture is not None and texture.rgba == rgba,
+          "%s: the written .RIM holds exactly the pixels Blender had" % name)
+    check(texture is not None and texture.rgba[1::4].count(0) == len(texture.rgba) // 4,
+          "%s: and the edit is in it" % name)
+
+    stats = sc.write_textures(collection, root, changed_only=False)
+    check(stats["written"] == len(targets) and not stats["failed"],
+          "%s: 'All' writes every named texture (%d of %d)"
+          % (name, stats["written"], len(targets)))
+
+    for dirpath, _dirs, names in os.walk(root):
+        for nm in names:
+            os.remove(os.path.join(dirpath, nm))
+    if os.path.exists(blend):
+        os.remove(blend)
+
+
 def run(game_dir, limit):
     targets = pick(game_dir, limit)
     check(bool(targets), "found .rif files under %s" % game_dir)
     print("testing %d file(s)\n" % len(targets))
 
     tmp = tempfile.gettempdir()
+    richest = (0, None)  # the most-textured file, which is the one worth writing back
     for path in targets:
         name = os.path.basename(path)
         want = summarize(rif.load(path))
@@ -405,6 +507,8 @@ def run(game_dir, limit):
             continue
 
         textures = check_textures(name, reopened, want["table"]) or (0, 0)
+        if textures[1] > richest[0]:
+            richest = (textures[1], path)
 
         out_root, out_stats = sc.rebuild_tree(reopened)
         out_path = os.path.join(tmp, "rif_scene_out.rif")
@@ -425,6 +529,12 @@ def run(game_dir, limit):
     if textured:
         print("\nretexture: %s" % os.path.basename(textured))
         check_retexture(textured)
+    if richest[1]:
+        # The one with the most images, not the first with a table: "writes every
+        # named texture" says nothing about a file that names one.
+        print("\ntexture export: %s (%d image(s))"
+              % (os.path.basename(richest[1]), richest[0]))
+        check_texture_export(richest[1])
 
     print("\n%s" % ("-" * 60))
     print("%d checks passed" % PASSES[0])

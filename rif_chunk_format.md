@@ -300,24 +300,144 @@ max_extents.y` in 6,843 of the 6,847**, because with Y increasing downwards the
 single float in this chunk. Reading the earlier "float[2] intensity / range" fields as
 floats yields denormals and NaNs, which is what gave it away.
 
-| Offset | Size | Type      | Description                  |
-|--------|------|-----------|------------------------------|
-| 0x00   | 4    | int32     | Light id / type (0..1105)    |
-| 0x04   | 12   | int32[3]  | Position, rif units          |
-| 0x10   | 36   | int32[9]  | 3x3 orientation matrix, 16.16 fixed point, row major |
-| 0x34   | 4    | int32     | 16.16 scalar, 0.2 .. 2.0 - brightness |
-| 0x38   | 4    | int32     | 79 .. 2044                   |
-| 0x3c   | 4    | int32     | Range / radius, rif units (3000 .. 357300) |
-| 0x40   | 4    | uint32    | Colour, `0x00RRGGBB`         |
-| 0x44   | 4    | int32     | Flags - only ever 3 or 7     |
-| 0x48   | 4    | int32     | Always 1                     |
-| 0x4c   | 8    | int32[2]  | Always zero                  |
+**It is AvP's `Light_Data` field for field** (`win95/LTCHUNK.HPP`): 21 int32 in
+exactly this order, which is exactly 84 bytes. That is what names the three fields
+this table used to describe only by offset - `spread` at 0x38, `local_light_flags`
+at 0x48 and the two `pad` words at 0x4c.
+
+| Offset | Size | Type      | AvP name            | Description                  |
+|--------|------|-----------|---------------------|------------------------------|
+| 0x00   | 4    | int32     | `light_number`      | **Unique within a file** in all 38 that have lights, but not `0..n-1` (only 10 of the 38) - an editor-assigned id, not a position |
+| 0x04   | 12   | int32[3]  | `location`          | Position, rif units          |
+| 0x10   | 36   | int32[9]  | `orientation`       | 3x3 matrix, 16.16 fixed point, row major |
+| 0x34   | 4    | int32     | `brightness`        | 16.16 scalar, 0.2 .. 2.0     |
+| 0x38   | 4    | int32     | `spread`            | 67 distinct values, 79 .. 2044; **1000 in 2,955 of 3,794** |
+| 0x3c   | 4    | int32     | `range`             | Rif units, 3,000 .. 357,300  |
+| 0x40   | 4    | uint32    | `colour`            | `0x00RRGGBB`                 |
+| 0x44   | 4    | int32     | `engine_light_flags`| Only ever 3 (1,915) or 7 (1,879) |
+| 0x48   | 4    | int32     | `local_light_flags` | Always 1                     |
+| 0x4c   | 8    | int32[2]  | `pad1`, `pad2`      | Always zero                  |
 
 The two load-bearing claims are measured: the nine dwords at 0x10 form an
 **orthonormal 3x3 matrix once divided by 65536, in 100.00% of all 3,794 lights**
 (rows unit length and mutually perpendicular to within 2e-3), and every value of the
 0x40 field is `<= 0xFFFFFF` across its 320 distinct values, with the palette reading
 as light colours (`#FFFFFF`, `#FFFFBF`, `#FFFF57`, `#FF6600`).
+
+#### `LIGHTSET` - Light Set (0x005d2a00) and `LTSETHDR` (0x005d2ab0)
+
+**Where every light in the game lives, and the only place one can live.** Measured
+over all 563 shipped files: **62 have a `LIGHTSET`, always exactly one, and always
+a direct child of the file-level `REBENVDT`** - so a light set is at depth 2, under
+the root. All 3,794 `STDLIGHT` chunks are children of one; none sits anywhere else.
+
+A set holds `LTSETHDR` first, then its lights, then `AMBIENCE`. **24 of the 62 carry
+no lights at all**, so an empty set is ordinary shipped data rather than a state to
+avoid. Both leaves are byte-identical in all 62 files:
+
+| Chunk | Size | Body |
+|-------|------|------|
+| `LTSETHDR` | 12 | AvP's `char[8] light_set_name` + `int pad`: `"NORMALLT"` then four zero bytes, in 62 of 62 |
+| `AMBIENCE` | 4  | int32 `2048`, in 62 of 62 |
+
+Order is not load-bearing - AvP's `Objsetup.cpp` reaches the header with
+`lookup_single_child("LTSETHDR")` - but the Blender addon reproduces it anyway,
+since matching the shipped layout costs nothing.
+
+#### `AMBIENCE` is a global ambient *floor*, and none of this family is read
+
+`Lighting_Ambience_Chunk` holds one `int ambience` (`win95/LTCHUNK.HPP:215`), and
+AvP shows exactly what it is for. `Objsetup.cpp:3465` copies it into `GlobalAmbience`
+and the renderer clamps **upward** against it, per channel and identically on all
+three:
+
+```c
+if (redI > ONE_FIXED) redI = ONE_FIXED;
+else if (redI < GlobalAmbience) redI = GlobalAmbience;   /* and green, and blue */
+```
+
+So it is a **`max()`, not an addition; a scalar, not a colour; and not directional**
+- the black level below which no surface may go. The scale is 16.16
+(`ONE_FIXED = 65536`, `System.h:54`), so Gunlok's 2048 is **0.03125 = 3.1% of full
+brightness**.
+
+**But Gunlok never reads it - nor any of the lighting family.** The rif consumers
+look a chunk up by its id string (`BuildRifFileObject` @ 0x005a9b50 does
+`lookup_single_child(this, "REBENVDT")` and `lookup_child(..., "INDSOUND", ...)`),
+and MSVC pools identical literals, so a consumer shares the one copy of the id. Each
+of `LIGHTSET`, `LTSETHDR`, `STDLIGHT`, `AMBIENCE`, `PLOBJLIT` and `LITSCALE` occurs
+**once** in the image and is referenced **only** from its own class ctors and its
+`RifRegisterCtor_` thunk - every referrer lands in the contiguous
+0x005d29xx-0x005d35xx LTCHUNK run. The control matters as much as the result:
+`SHPVTINT` (referenced by `BuildHierarchyNode` and `RifFindObjectByName`),
+`INDSOUND` (`BuildRifFileObject`), `REBENVDT`, `OBJHIERD`, `OBASEQFR`, `SHPPOLYS`
+and `OBJHEAD1` all show consumers outside their own translation unit, so the test
+does detect one when there is one.
+
+Runtime lighting therefore comes from **`SHPVTINT`** - the baked per-vertex
+intensities, which *are* read - plus the sun globals (`SunLightColor` @ 0x007b9cc8,
+`SunDirection` @ 0x007b9ce0). The placed lights and the ambient floor in a `.rif` are
+**editor-time data that produced those baked values**; the shipped engine ignores
+them. Two residual caveats, both unmeasured: a consumer could in principle build the
+id string at run time, and there is no generic "walk every chunk and call a virtual"
+pass to hide behind - `BuildRifFileObject` is the only tree-level sweep and it
+handles `REBENVDT` and `INDSOUND` only.
+
+#### `SHPVTINT` - Shape Vertex Intensities (0x005d2df0)
+
+**The baked per-vertex lighting, and the only lighting in a `.rif` the game reads.**
+A child of `RBOBJECT`, never of a shape - all 4,668 of them - so it is per-*object*.
+`RifFindObjectByName` and `BuildHierarchyNode` `lookup_single_child` it and hand it
+to the shape builder at 0x005ab300.
+
+| Offset | Size | Type       | Description                  |
+|--------|------|------------|------------------------------|
+| 0x00   | 8    | char[8]    | `light_set_name` - **the selector**, see below. `"NORMALLT"` in all 4,668 |
+| 0x08   | 4    | int32      | 0 in all 4,668               |
+| 0x0c   | 4    | int32      | `num_vertices` - equals the array length in **4,668 of 4,668** |
+| 0x10   | 4*n  | uint32[n]  | One packed colour per vertex |
+
+**The name is how a chunk is chosen, which is what `LTSETHDR` exists for.** An object
+may carry one `SHPVTINT` per light set, and AvP's `Projload.cpp:1424` walks them
+taking the one whose name matches the active set:
+`strncmp(temp_svic->light_set_name, ::light_set_name, 8)`. Gunlok ships exactly one
+name - `NORMALLT`, on all 4,668 chunks *and* all 62 `LTSETHDR` bodies - so a chunk
+written with a zeroed name would simply never be found.
+
+**Each value is a packed colour, not a scalar**, and **Gunlok uses it undecoded**.
+`BuildShapeVertexBuffers` @ 0x005ab300 fills a 0x24-byte vertex whose `+0x18` is the
+D3DCOLOR `diffuse`, and the assignment is:
+
+```c
+if (!shpvtint) diffuse = 0xFFFFFFFF;                       // unlit -> opaque white
+else { diffuse = shpvtint->values[vert]; diffuse |= 0xFF000000; }
+```
+
+So the stored `0x00RRGGBB` **is** the vertex colour. Gunlok does **not** perform AvP's
+`sqrt((r*r + g*g + b*b) / 3)` reduction (`Projload.cpp`) - that is AvP's software
+renderer and does not describe this engine. The two also differ in a way that matters:
+AvP's `r = v >> 16` has no mask and would misbehave on a value with a non-zero top
+byte, which most of Gunlok's have.
+
+**The top byte is ignored**, because alpha is OR'd to `0xFF` regardless. That settles
+what the measurement could not: over the 1,477,397 shipped values the top byte is
+`0xFF` in 1,242,285 and `0x00` in 234,985, with ~127 carrying junk - and nothing reads
+any of it. The low three bytes each take all 256 values independently. The commonest
+values are `0xFF080808` (194,978) and `0xFFFFFFFF` (194,428): a dark grey and white.
+Nothing here is 16.16 and nothing is 0..255 - **no value falls in 0..65536 at all**.
+
+**The pixel is `texture x diffuse`, multiplied in gamma space.** `InitBuiltinMaterials`
+@ 0x005757b2 gives `Mat_Opaque` `COLOROP = D3DTOP_MODULATE` with
+`COLORARG1 = D3DTA_TEXTURE` and `COLORARG2 = D3DTA_DIFFUSE`, and the same for the
+alpha channel. This is D3D8 fixed function, which has no linear workflow - so a
+renderer that multiplies the two in *linear* space and converts back does not match:
+sRGB is piecewise rather than a pure power law, so the identity
+`(a^g * b^g)^(1/g) = a*b` fails by up to **7.4/255**, worst in the dark midrange where
+this engine's lighting lives (2.3 LSB at light `0x08`, 7.4 at `0x40`, 0 at `0xff`).
+
+Note that `num_vertices` being trusted makes it dangerous to carry: the engine
+allocates `12 * num_vertices` and iterates that many times, so a chunk whose count
+disagrees with its array reads past the body. The Blender addon regenerates it.
 
 #### `PLOBJLIT` - Placed Object Light (0x005d2c80)
 
@@ -1119,8 +1239,11 @@ both rejected. Shipped files use 0 everywhere except `Units\Command Wheel 01.RIM
 Since the cap is unbounded and `IffBodyDecodeScanline` accumulates into a **uint32** index
 (so `nPlanes` up to 31 works), a `BODY` whose `CMAP` holds one entry per distinct colour is an
 *exactly lossless* encoding of any image. `nPlanes = ceil(log2(distinct colours))`, and the
-shipped set already exercises the high end: `Ground\tree_alpha.RIM` carries 19 planes and
-90,319 palette entries.
+shipped set already exercises the high end: `Ground\city_dest_fmv_1024.RIM` carries 19 planes
+and 283,304 palette entries, and `Ground\tree_alpha.RIM` 17 planes and 90,319 entries. (An
+earlier revision of this file attributed the 19 planes to `tree_alpha`, which contradicted the
+`ceil(log2(entries))` rule two paragraphs down; the rule is right and holds for all 65
+base-level `BODY` variants.)
 
 Two things make this a fallback rather than the obvious choice:
 
@@ -1191,11 +1314,12 @@ gets its alpha. The same doubt applies to `TRAN`, and there it is academic: ever
 `TRAN` body is eight zero bytes, and `RimBindImageChunks` gates the colour key on the first
 byte being non-zero, so no shipped file applies one either way.
 
-The reader is `blender/io_scene_rif/rim.py`, exercised over all 513 by
-`blender/tests/test_rim.py`, and it reads the `S3TC` path only. There is still no writer there,
-but the reason has changed: nothing in the addon compresses DXT, and **the palettized path needs
-no compressor at all** - a `BMHD` + `CMAP` + uncompressed planar `BODY` with `CONT = 0` is a
-configuration the shipped files already use. `utils/rimutil` does write it.
+`blender/io_scene_rif/rim.py` reads **both** paths and writes the palettized one, exercised over
+all 513 by `blender/tests/test_rim.py`. Writing needs no DXT compressor - which the addon could
+not carry, being dependency-free - because a `BMHD` + `CMAP` + planar `BODY` with `CONT = 0` is a
+configuration the shipped files already use, and one palette entry per distinct colour makes it
+exactly lossless. It emits the same bytes `utils/rimutil` does for the same image, raw and
+ByteRun1 alike, so the two writers can be diffed rather than each trusted alone.
 
 ### Confirmed in the running game
 

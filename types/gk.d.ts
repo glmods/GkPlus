@@ -1794,7 +1794,14 @@ declare module "gk" {
     object: string;
     /** Loading/HUD bitmap; omitted means `none`. */
     bitmap?: string;
-    /** Name of a .loc locator; omitted means `none`. */
+    /**
+     * Vestigial - set it or omit it, nothing observable changes. It names an object in
+     * the level .rif (`"camhund"`, a flat quad above the map) and the engine derives a
+     * world-space plane from it that no code reads, plus picks which shape the `.loc`
+     * sidecar collapses onto - a choice the omitted-field fallback makes identically in
+     * every shipped level. Omitted means `none`, as 11 of the shipped levels ship it.
+     * See `level_loading_notes.md` §4.1.
+     */
     camera_plane?: string;
     /** 10..500. Defaults to 60. */
     max_camera_distance?: number;

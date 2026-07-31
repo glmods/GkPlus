@@ -171,6 +171,146 @@ session that found this are gone (WER keeps a bounded ring), so reproduce first.
 
 ---
 
+## 5. `PolygonAdjacencyTest` @ 0x0048ecf0 overflows a 3-element buffer on degenerate level geometry
+
+**Status:** open, unpatched in the game; **worked around in the Blender exporter**
+(`shapes.welds_degenerate`), which drops the geometry that triggers it.
+
+**Severity:** fatal, and *diagnostically* nasty — it is a `/GS` fast-fail, so
+running under a debugger suppresses the WER dump and the fault names neither the
+asset nor the polygon.
+
+### Mechanism
+
+`PolygonAdjacencyTest` is polygon vtable **slot 0x50**, `__thiscall(this, other)`,
+"do these two polygons share an edge?". It walks `this`'s three vertex pointers,
+scans `other`'s vertex-pointer array for each, and appends every match — **by
+pointer identity** — to a local `Vec3[3]`:
+
+```c
+_eh_vector_constructor_iterator_(&shared, 0xc, 3, ...);   // 3 x 12 bytes, at EBP-0x38
+...
+dst = (undefined4 *)((int)&shared + count * 0xc);         // no bound on `count`
+if (v == other_verts[i]) { count++; dst[0] = ...; dst[1] = ...; dst[2] = ...; }
+```
+
+It returns true when exactly **2** matched — a shared edge — after which it
+projects the edge and validates the connection.
+
+There is no capacity check. `shared` is at `EBP-0x38` and the function's `/GS`
+cookie is at `EBP-0x14`, so the **fourth** match writes its first dword exactly
+onto the cookie:
+
+```
+-0x38 + 3 * 0xc = -0x14
+```
+
+The epilogue's `__security_check_cookie` then fast-fails with
+`STATUS_STACK_BUFFER_OVERRUN` (**0xc0000409**, subcode 0x2
+`FAST_FAIL_STACK_COOKIE_CHECK_FAILURE`) — *not* an access violation.
+
+### What produces four matches
+
+Matches are `sum over this's 3 corners of (occurrences of that corner in other)`.
+With `this` non-degenerate the total can never exceed 3, because `other` has only
+three slots. So the overflow requires **`this` to carry a repeated vertex pointer**
+*and* `other` to repeat a vertex `this` also has — i.e. two polygons that are both
+degenerate once the loader has welded vertex records by position, meeting in the
+same section-grid cell. Observed peak was **9**.
+
+A triangle becomes degenerate at the weld when two of its corners land on the same
+position. `SHPRAWVT` is **integer**, so this includes corners that were distinct in
+the authoring tool and collapsed on quantization — which is how an exporter creates
+them without any modelling error.
+
+### Call path
+
+```
+ToMap+0x2587
+  LoadOrBuildSectionAdjacency+0x307        @ 0x0044fef0 — the .cut sidecar builder
+    BuildPolygonAdjacencyGrid+0x137        @ 0x0048aa00 — triple-nested grid loop
+      PolygonAdjacencyTest+0x87d           @ 0x0048ecf0 — slot 0x50
+        __security_check_cookie → __report_gsfailure
+```
+
+`BuildPolygonAdjacencyGrid` walks the level's 3D section grid (dimensions at
+`+0x6c`/`+0x68`/`+0x64`, cells at `+0x34`), and for each polygon rescans the 26
+neighbouring cells, calling slot 0x50 on each candidate pair and linking accepted
+ones through slots 0x58 / 0x5c.
+
+### Why the shipped assets are not evidence that this is safe
+
+**14 shipped files contain degenerate-after-weld triangles** — `corps
+building.RIF` has 22, `gastowerfrag.RIF` 14, `boulders2.RIF` 9 — and the game
+plays fine. That is not because the geometry is harmless:
+
+> Every one of the 14 is under `RIF\Objects` or `RIF\Units`. **No file under
+> `RIF\Levels` contains a single one.**
+
+Only level map geometry reaches `LoadOrBuildSectionAdjacency`, via `ToMap`. A prop
+or frag model never goes through section adjacency, so its degenerate triangles are
+merely invisible (zero area) rather than fatal. Measured across all 563 shipped
+`.rif` files.
+
+### Reproduction
+
+Register a script-defined level (`src/CustomLevel`) whose `map.rif` names a mesh
+containing two degenerate-after-weld triangles that share the duplicated vertex,
+and start it. Confirmed twice on a custom level built from a Blender export:
+
+- **Predicted from the file alone** — 20 degenerate triangles among 244,883, giving
+  48 overflowing pairs — then reproduced at that exact instruction.
+- Removing **only** those 20 triangles let the level load — 18 s, 141 roles, and a
+  `Test_Level_Parsed.map` written, which no crashing run ever reached. Nothing else
+  changed.
+
+An earlier revision of the same mesh had 245,598 polys with 65.7% duplicate vertex
+positions and 211 degenerate-after-weld triangles, and crashed identically.
+
+### Detecting it before it crashes
+
+`blender/io_scene_rif/shapes.py`:
+
+```python
+welded = shp.weld_map(verts)              # quantized positions -> first index
+shp.welds_degenerate(tri, welded)         # does this triangle lose a corner?
+```
+
+The exporter drops such triangles in `_shape_chunk_from_mesh` and reports the count
+as a **warning** (`stats["degenerate_faces"]`) — they have zero area and render
+nothing, so dropping them everywhere is cheaper than working out which shape will
+become a map. `tests/test_scene.py` accounts for that loss alongside the duplicate
+faces Blender cannot hold; the two are counted disjointly, in pipeline order.
+
+### Why the crash is hard to see
+
+Two traps, both of which cost time here:
+
+- **Under a debugger there is no WER dump**, because the debugger takes the
+  exception first. A crash "with no log" is the expected appearance, not evidence
+  that nothing crashed. Run without one — see the recipe below.
+- **It is not an AV**, so `sxe av` does not catch it and the WER entry reads
+  `0xc0000409` at `__report_gsfailure`, hundreds of KB from the real culprit. The
+  faulting frame is the *caller* of `__security_check_cookie`.
+
+### If we decide to fix it in the game
+
+Hooking slot 0x50 is unattractive — it is a per-polygon-pair predicate called from
+inside the grid sweep (every polygon against the contents of 26 neighbouring
+cells; the call count was not measured, but it scales with polygon count and is
+plainly hot), and it is a vtable slot on a polygon rather than a free function.
+Fixing the asset costs nothing and is where the exporter guard already sits.
+Recorded here only so nobody re-diagnoses it.
+
+### Ghidra
+
+`PolygonAdjacencyTest` @ 0x0048ecf0 and `BuildPolygonAdjacencyGrid` @ 0x0048aa00
+were `FUN_`-named; both now carry plate comments with the above. `RET`-form and
+arity were not re-derived — the calling convention comes from the call site at
+0x0048ab35 (`MOV ECX,EBX` / `PUSH EDI` / `CALL [EAX+0x50]`).
+
+---
+
 ## Debugging Gunlok: what actually works
 
 - **cdb is at** `C:\Program Files\WindowsApps\Microsoft.WinDbg_*\x86\cdb.exe`. It

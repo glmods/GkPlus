@@ -44,17 +44,21 @@ SCHEMA = {
         ("flags", I32, 1),
         ("num_extra_data", I32, 1),  # AvP's; zero in every shipped frame
     ],
+    # Field for field AvP's `Light_Data` (win95/LTCHUNK.HPP): 21 int32 in exactly
+    # this order, and Gunlok's chunk is exactly 84 bytes in all 3,794. That is
+    # what names `spread`, `local_flags` and `pad` -- they were `field_0x38`,
+    # `field_0x48` and `field_0x4c` while only their offsets were known.
     b"STDLIGHT": [
-        ("light_id", I32, 1),
+        ("light_id", I32, 1),      # unique within a file in all 38 that have lights
         ("position", I32, 3),      # rif units
         ("orientation", I32, 9),   # orthonormal 3x3, 16.16, row major, in 100% of 3,794
         ("brightness", I32, 1),    # 16.16, 0.2 .. 2.0
-        ("field_0x38", I32, 1),
-        ("range", I32, 1),         # rif units
+        ("spread", I32, 1),        # 67 distinct values, 1000 in 2,955 of 3,794
+        ("range", I32, 1),         # rif units, 3,000 .. 357,300
         ("colour", U32, 1),        # 0x00RRGGBB
-        ("flags", I32, 1),         # 3 or 7
-        ("field_0x48", I32, 1),    # always 1
-        ("field_0x4c", I32, 2),    # always zero
+        ("flags", I32, 1),         # AvP's engine_light_flags; 3 or 7, nothing else
+        ("local_flags", I32, 1),   # AvP's local_light_flags; always 1
+        ("pad", I32, 2),           # AvP's pad1/pad2; always zero
     ],
     b"SHPCENTR": [
         ("centre", I32, 3),        # (min+max)/2, truncating toward zero

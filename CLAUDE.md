@@ -1335,7 +1335,8 @@ The split is the point: `io_scene_rif/rif.py` (container: huffman, chunk tree, s
 `OBJHEAD1`, `SHPHEAD1`, `OBJHIERD`, `OBASEQHD`, `OBASEQFR` — plus the keyframe-timing rule),
 `io_scene_rif/bmpnames.py` (the texture table),
 `io_scene_rif/sounds.py` (the `INDSOUND` sound table) and
-`io_scene_rif/rim.py` (`.RIM` textures: IFF container, DXT1/DXT3 decode) import **no `bpy`**, so
+`io_scene_rif/rim.py` (`.RIM` textures: IFF container, DXT1/DXT3 decode, palettized `BODY` both
+ways) import **no `bpy`**, so
 `blender/tests/` exercises them over all 563 shipped files with Blender absent — the opposite of
 `src/`, where nothing runs outside Gunlok. `io_scene_rif/scene.py` and
 `io_scene_rif/__init__.py` are the only files that touch Blender.
@@ -1464,12 +1465,15 @@ These pin the design, in roughly decreasing order of how much everything else re
   groups, odd bodies padded — carrying DXT1/DXT3 in an `S3TC` chunk whose 22-byte header is
   documented in `rif_chunk_format.md`. The **payload is little-endian** even though the container
   is not, which is settled by content rather than inspection: `lava.RIM` decodes orange, and a
-  red/blue swap would make it blue. `rim.py` decodes 490 of the 513 shipped textures; the other 23
-  are palettized `CMAP`/`BODY` with no S3TC — 16 `*_fmv_*` ground textures and seven UI/unit/
-  structure ones, so this is not one art pipeline's quirk.
-- **The palettized path is the engine's *preferred* one, and it is why a `.RIM` writer is now
-  reachable.** `RimOpenAndScan` @ 0x005dd6b0 enumerates `ILBM`→`BODY` first and only falls back to
-  `ILBM`→`S3TC`, so a file carrying both would have its DXT ignored. `BODY` is planar ILBM —
+  red/blue swap would make it blue. 490 of the 513 shipped textures are S3TC; the other 23 are
+  palettized `CMAP`/`BODY` with no S3TC — 16 `*_fmv_*` ground textures and seven UI/unit/
+  structure ones, so this is not one art pipeline's quirk. `rim.py` reads both.
+- **The palettized path is the engine's *preferred* one, and it is the one `rim.py` writes.**
+  `RimOpenAndScan` @ 0x005dd6b0 enumerates `ILBM`→`BODY` first and only falls back to
+  `ILBM`→`S3TC`, so a file carrying both would have its DXT ignored — and among several
+  palette-depth variants of one picture `RimBindImageChunks` takes the largest `CMAP`, its colour
+  cap being unbounded on a true-colour destination. `decode` follows both rules, so it shows what
+  the player would see rather than whichever chunk comes first. `BODY` is planar ILBM —
   `CMAP` of 3-byte RGB entries (**mandatory**; absent is error 9), `nPlanes` MSB-first bitplane
   rows per scanline, each `ceil(width/8)` bytes, optionally ByteRun1-compressed — and `BMHD.masking`
   must be 0 or 2, never ILBM's mask plane or lasso. **A plane row is padded to a byte, not to the
@@ -1477,8 +1481,44 @@ These pin the design, in roughly decreasing order of how much everything else re
   trap that would break a writer built from the spec. Verified over all 77 palettized images in the
   shipped set: exact stream consumption, every index inside its `CMAP`,
   `nPlanes == ceil(log2(entries))`. Full layout, the 13-entry IFF chunk registry and the engine
-  addresses are in `rif_chunk_format.md`. So the standing "no writer" reason is now only half true:
-  nothing here compresses DXT, but the palettized form needs no compressor at all.
+  addresses are in `rif_chunk_format.md`.
+- **Writing needs no compressor, which is the only reason the addon can do it at all.** One
+  palette entry per distinct colour is exactly lossless, so `rim.encode` quantizes nothing;
+  `nPlanes` follows from the count (up to 31, since the scanline decoder accumulates into a
+  uint32), and alpha goes to a transparent palette index when every transparent texel shares one
+  RGB and to an `ALPH` chunk otherwise — **that choice is not cosmetic**, because the RGB under a
+  transparent texel is what bilinear filtering blends into its opaque neighbours. DXT stays in
+  `utils/rimutil`, where libsquish is. The two writers emit **identical bytes** for the same
+  image, raw and ByteRun1 alike, which is what makes them cross-checkable rather than separately
+  believed. Cost: 2–6× a DXT payload, and about a second per 1024² image in pure Python.
+  All 513 shipped textures decode, re-encode and come back byte-identical (`test_rim.py`, ~20
+  min); the partial group at the end of a plane row is **not** reachable from the shipped set —
+  every width in the game divides by eight — so it is covered by synthetic cases instead.
+- **`image.pixels` is how pixels come back out of Blender, and it is exact.** For an 8-bit image
+  it is the stored byte over 255 with no colour management in the way: an untouched texture reads
+  back identical to the `.RIM` it was decoded from, on 4.2 and 5.2, through a `.blend` save and
+  reload, alpha included. `Image.save()` to a PNG or a raw TGA reproduces the same bytes and is
+  50× faster than the PNG route — but both go through a temp file and `Image.file_format`, which
+  is shared datablock state, and one probe caught Blender writing the **packed PNG verbatim** when
+  asked for a TGA. `pixels` has no format to disagree about. Two traps around it: **do not touch
+  `colorspace_settings` to read** — changing it re-reads a packed image from its packed bytes and
+  silently discards unsaved paint — and row 0 is the *bottom* in Blender and the *top* in a `.RIM`,
+  the same flip the UVs get. (`image.pixels` is not the `color` vs `color_srgb` hazard from the
+  vertex-lighting work; that one is about attributes.)
+- **"Has this texture been edited?" is a digest taken at import, not `is_dirty`.** `is_dirty` means
+  *unsaved* edits and clears on a `.blend` save, so paint-save-reopen would read as untouched;
+  `rif_rim_crc` is stamped in `_image_for` and never updated, so the test is "do these pixels still
+  match the file they came from". It is stored as a **hex string**, because an ID property is a
+  signed C int and `zlib.crc32` uses all 32 bits — storing the number raises `OverflowError` mid
+  import on half of all images. That got through a three-file test run and failed on the fourth
+  file of a ten-file one, which is the argument for widening the sample rather than trusting a
+  green run.
+- **The textures are a second output, so they have their own destination.** `write_textures` is
+  called by the export operator, not by `rebuild_tree` — the model goes to the file the user
+  picked and the images go to a mod tree mirroring `Graphics`, and the default is to write
+  **nothing**. "Changed only" is the useful setting: a re-export of an untouched level would
+  otherwise turn 28 DXT textures into 28 larger `BODY` files pixel-identical to what the player
+  already has.
 - **Verified in the running game.** All 28 textures `level01.rif` names were re-encoded as raw
   `BODY` with `rimutil` and served to Gunlok through GkPlus's PhysFS mod overlay (`gkplus\mods\`,
   so no Steam asset was touched). `mods.served` reached 28/28, the level loaded with its usual 158
@@ -1499,7 +1539,10 @@ These pin the design, in roughly decreasing order of how much everything else re
   indexed list rather than one entry per polygon, `SHPCENTR` is int32 centre + float radius about
   the **origin**, `OBASEQFR` is a fixed 44-byte keyframe (quaternion + int32 position + normalized
   16.16 time + frame index) rather than a variable sub-frame array, `STDLIGHT` is 84 bytes of pure
-  integers whose 0x10 field is an orthonormal 3×3 in 16.16, `SHPMRGDT` is one int32 per polygon,
+  integers whose 0x10 field is an orthonormal 3×3 in 16.16 — and is **AvP's `Light_Data` field for
+  field** (21 int32, `win95/LTCHUNK.HPP`), which is what named `spread` @ 0x38, `local_flags` @ 0x48
+  and the `pad` pair @ 0x4c; they were `field_0x38`/`field_0x48`/`field_0x4c` in `schema.py` and in
+  the stored `rif_*` properties while only their offsets were known. `SHPMRGDT` is one int32 per polygon,
   and `SHPVTINT` is a 16-byte header plus one int32 per vertex that hangs off `RBOBJECT`, not off a
   shape. AvP's `ChunkPoly` is *not* Gunlok's — it has an explicit `num_verts` and `vert_ind[4]`.
   Every one of those was measured across all 563 files; the old entries read like plausible
@@ -1517,6 +1560,41 @@ These pin the design, in roughly decreasing order of how much everything else re
   pairs are different on the wire and both occur. A new UV layer is also **not zero-initialised** —
   Blender seeds it with a per-face box mapping, so an untextured polygon silently acquires
   `(0,0)/(1,0)/(1,1)` and reads back as an edit unless the importer overwrites it.
+- **Export drops a triangle whose corners coincide once quantized, and that is a crash fix, not
+  tidiness.** `SHPRAWVT` is integer, so `to_rif` can collapse two vertices Blender considers
+  distinct; the engine welds vertex records by position at load, and such a triangle then carries
+  a *repeated* vertex pointer. Gunlok's polygon adjacency predicate (slot 0x50,
+  `PolygonAdjacencyTest` @ 0x0048ecf0) collects shared vertices into a fixed `Vec3[3]` with **no
+  bound check**, so two of them meeting in one section-grid cell reach 4+ matches and the fourth
+  write lands exactly on the function's `/GS` cookie — `0xc0000409` inside
+  `LoadOrBuildSectionAdjacency`, naming neither the file nor the polygon, and **invisible under a
+  debugger** because it suppresses the WER dump. `shapes.weld_map` / `welds_degenerate` is the
+  test, `_shape_chunk_from_mesh` drops before appending anything parallel (so `polys`/`uv_lists`/
+  `merge` stay in step and `uv_index` stays contiguous), and the count is reported as a
+  **warning**, never INFO. **The shipped set does not license skipping this**: 14 files do carry
+  such triangles (`corps building.RIF` 22, `gastowerfrag.RIF` 14) but every one is under
+  `RIF\Objects` or `RIF\Units` and **none under `RIF\Levels`** — only level geometry reaches
+  section adjacency, so a prop's are merely invisible. `test_scene.py` counts this loss beside the
+  duplicate-face one, disjointly and in pipeline order (import drops duplicates, export drops
+  degenerates from the survivors). Full write-up in `game_defects_notes.md` §5.
+- **The navmesh is the level's own polygons, and the addon can show you which ones.**
+  Gunlok authors, loads and generates no separate nav data: `BuildNavPolygons` @ 0x004888d0
+  builds one 0x40-byte record per map polygon and `BuildPolygonAdjacencyGrid` links the
+  walkable ones, which is precisely `(flags & 0x100) == 0 && normal.y < 0` — RIF is Y-down,
+  so a **negative** Y faces up. Bit 0x100 is set by the loader for anything steeper than
+  **45°** (`ny² + 1e-5 < nx² + nz²`, the epsilon putting the limit exactly on 45) and
+  *also* survives the `& 0x3fffc1` mask, so it doubles as an authored blocker — level01
+  marks 1,914 faces that way. `shapes.is_walkable` / `nav_islands` mirror it and
+  **Preview Navmesh** (`object.rif_navmesh_preview`) writes `rif_walkable` and
+  `rif_nav_island` FACE attributes and leaves the walkable faces selected. It deliberately
+  writes **no colour attribute**: export is name-gated on `rif_light` so one left here could
+  never *become* the lighting on its own, but `adopt_color_attribute` reads whichever one is
+  *active*, so leaving one puts a navmesh preview one click from adoption. **The metric that
+  matters is the largest island's share, not the island count**: shipped levels run
+  32–45% walkable across 420–1,014 islands with 58–67% in the largest, so a mesh at 33%
+  walkable but 2% in the largest is broken — that is what 21.7% open edges (against
+  level01's 6.8%) does, and it leaves the walkable *fraction* looking fine. Full
+  derivation in `level_loading_notes.md` §5.5.
 - **RIF is Y-down, and the swizzle has to carry the orientation too, not just the position.** A
   biped's parts all sit at negative Y — feet nearest the origin (~-100), top of the head furthest
   (~-1990) — so the body extends in -Y from the ground and **-Y is up**; assembled in Blender a
@@ -1541,8 +1619,9 @@ These pin the design, in roughly decreasing order of how much everything else re
 
 Export reads exactly the properties **import** minted — `rif_id`, `rif_index`, `rif_objhead`,
 `rif_absorbed` — so a datablock created any other way is skipped in silence. `scene.py`'s
-authoring section and seven operators in `__init__.py` are the way in (`scene.rif_new`,
-`object.rif_add`, `object.rif_add_sequence`, `object.rif_new_shape_id`, `scene.rif_add_sound`,
+authoring section and eight operators in `__init__.py` are the way in (`scene.rif_new`,
+`object.rif_add`, `object.rif_add_sequence`, `object.rif_new_shape_id`,
+`object.rif_new_light_id`, `scene.rif_add_sound`,
 `pose.rif_set_sound`, `action.rif_toggle_setting`, beside the import and export pair), with three
 panels over them — Object, Speaker data and Material. `scene.rif_new` builds a `REBINFF2`
 collection carrying the file-level chunks (`RIFVERIN`, `REBENVDT` +
@@ -1550,7 +1629,7 @@ collection carrying the file-level chunks (`RIFVERIN`, `REBENVDT` +
 1,004 bytes — carries them, and `object.rif_add` gives a selected mesh an `RBOBJECT`/`REBSHAPE`
 pair with a fresh shape id. `tests/test_authoring.py` drives all of it inside Blender.
 
-Four things there are worth keeping:
+Five things there are worth keeping:
 
 - **No `BMPNAMES` is created up front.** `_new_table_location` already knows how to append one
   after `REBENVDT`'s children the first time a material names a texture, which is the path the 36
@@ -1570,6 +1649,103 @@ Four things there are worth keeping:
   `RifFilterObjectsByName` returning several matches is how a level spawns more than one actor
   from one clause. `rif_shape_id` writes both halves of the pair at once, which is the whole point
   of having it — setting only `OBJHEAD1`'s would leave the object naming a shape nothing claims.
+- **The game does not read lights at all**, so authoring one is a fidelity feature, not a way to
+  light a level. Each of `LIGHTSET`/`LTSETHDR`/`STDLIGHT`/`AMBIENCE`/`PLOBJLIT`/`LITSCALE` occurs
+  once in gl.exe's image and is referenced only from its own class ctors and `RifRegisterCtor_`
+  thunk — all inside the 0x005d29xx-0x005d35xx LTCHUNK run — while the rif consumers look chunks up
+  by **id string** (`BuildRifFileObject` @ 0x005a9b50: `lookup_single_child(this, "REBENVDT")`,
+  `lookup_child(..., "INDSOUND", ...)`) and MSVC pools identical literals. The control is what makes
+  that conclusive: `SHPVTINT`, `INDSOUND`, `REBENVDT`, `OBJHIERD`, `OBASEQFR`, `SHPPOLYS` and
+  `OBJHEAD1` all show referrers outside their own TU. Runtime lighting is **`SHPVTINT`** (baked
+  per-vertex intensity, read by `BuildHierarchyNode` and `RifFindObjectByName`) plus the sun
+  globals; the `.rif`'s lights are the editor-time input that baked it. `AMBIENCE` is likewise not
+  a light: AvP's `Objsetup.cpp` puts it in `GlobalAmbience` and the renderer clamps every channel
+  **up** to it (`if (redI < GlobalAmbience) redI = GlobalAmbience`) — a `max()`, scalar and
+  colourless, 16.16 with `ONE_FIXED` 65536, so Gunlok's 2048 is a 3.1% black floor.
+- **`SHPVTINT` is therefore where lighting is authored, and two of its four header words are not
+  opaque.** `[0:2]` is the light set *name* and is the **selector** — an object may carry one chunk
+  per light set and the loader takes the one matching the active `LTSETHDR`
+  (`strncmp(svic->light_set_name, ::light_set_name, 8)`, `Projload.cpp:1424`), so a chunk written
+  with a zeroed name is never found; Gunlok ships `NORMALLT` on all 4,668 chunks and all 62
+  headers. `[3]` is `num_vertices`, equal to the array length in 4,668 of 4,668, and the engine
+  **trusts** it — it allocates `12 * num_vertices` and iterates that many times, so a stale count
+  reads past the body. `_vtint_chunk` regenerates it instead of carrying it, the same rule
+  `SHPHEAD1`'s counts follow; carrying it meant any mesh edit that changed the vertex count wrote a
+  self-inconsistent chunk. The per-vertex value is a **packed `0x00RRGGBB`**, not a scalar and not
+  16.16 — no shipped value lands in 0..65536 at all.
+- **The scene stores the paintable form and nothing else: `rif_light`, a `BYTE_COLOR` POINT
+  attribute, *is* the exported value.** That rests entirely on `color_srgb`, never `color` —
+  reading a `BYTE_COLOR` through Blender's `color` property converts sRGB↔linear and loses a
+  least-significant bit on **157 of 256** values per channel, while `color_srgb` is the stored
+  byte: **256/256 exact** through a `.blend` save and reload, alpha included. Confirmed end to end
+  rather than in the abstract — **1,086 of 1,087** shipped `SHPVTINT` chunks over a 25-file sample
+  survive import→export byte-identical. The sole exception is not a loss: `level05_shadow.RIF`
+  ships 13,098 values for a **13,016-vertex shape**, and the export truncates to the mesh. That is
+  a different quantity from the `num_vertices` agreement above — the header matches its *own* array
+  in 4,668 of 4,668, while the array matches the **id-paired shape's** vertex count in only 4,666
+  (`level15_shadow.RIF` is the other, and `rif_chunk_format.md` records the same 4,666). The tail
+  no vertex indexes is unread by the engine, and the packed-int design truncated it identically,
+  so this is neither new nor lossy. There was a packed-int mirror
+  (`rif_vertex_intensity`) with two operators converting between them; it is gone, because two
+  attributes that can desync is a failure mode and "I painted and forgot to pack" is another.
+- **What replaced it is a name gate, and the gate is the whole design.** Export reads `rif_light`
+  **by name** and never `color_attributes.active_color`, which is Blender-wide UI state a bake, a
+  preview or any other feature repoints freely — so nothing can become the file's lighting by
+  accident. `adopt_color_attribute` is the deliberate way in, and is therefore the **only** place
+  the two lossy reductions happen: a **corner-domain** attribute averaged per vertex (Blender's
+  default domain and a common bake target; the file cannot express per-corner) and the clamp at
+  1.0, which makes a bright lamp saturate to white — indistinguishable from a bake that never ran,
+  and it cost a test failure before the energy was dropped to 20 W. Export **raises** on a
+  `rif_light` it cannot read as one value per vertex rather than averaging or padding, with
+  `lighting_problems` as the pre-flight check beside the shared-shape-id one.
+- **Presence is a separate question from the attribute, and conflating them adds chunks.** The
+  marker is `rif_vtint_header` — the chunk's own header, which exists exactly when the object
+  carries a chunk — so the preview can mint a white `rif_light` for an unlit mesh (the engine draws
+  no-`SHPVTINT` as white diffuse, and a `ShaderNodeAttribute` naming a missing attribute reads
+  black) without every mesh you *look at* acquiring lighting. Marker with the attribute deleted is
+  neither a refusal nor a silent loss: the chunk is dropped and counted into
+  `stats["lighting_dropped"]`, which export reports as a warning.
+- **Previewing that lighting has to multiply in gamma space, and the naive material is wrong by
+  7.43/255.** The engine's shading is `texel × diffuse` on the stored bytes — `BuildShapeVertexBuffers`
+  @ 0x005ab300 assigns `diffuse = shpvtint->values[vert] | 0xFF000000` (undecoded, top byte ignored,
+  `0xFFFFFFFF` with no `SHPVTINT`) and `InitBuiltinMaterials` @ 0x005757b2 gives `Mat_Opaque`
+  `COLOROP = MODULATE, ARG1 = TEXTURE, ARG2 = DIFFUSE`. That is D3D8 fixed function, so the multiply
+  is on the **gamma-encoded** numbers. Doing it in linear space instead — which is what
+  Color Attribute × Image Texture → Emission does — would only be equivalent if sRGB were a pure
+  power law; the piecewise toe below 0.04045 makes `(aᵍ·bᵍ)^(1/g) = a·b` fail by up to **7.43 LSB**,
+  worst in the dark midrange the game actually uses (2.30 at light `0x08`, 6.49 at `0x20`, 7.43 at
+  `0x40`, 0 at `0xff`). A pure 2.2 power law gives **exactly 0.0**, which is what identifies the toe
+  rather than any imprecision. So `scene.rif_preview_setup` runs *both* operands through an exact
+  linear→sRGB encode to recover `byte / 255` (an sRGB image and a `BYTE_COLOR` attribute are alike
+  sRGB storage that Blender linearises on read), multiplies, and decodes the product back before
+  Emission — every conversion **exact piecewise, built from Math nodes**, because `ShaderNodeGamma`
+  is a pure power law and the shader node set has no colour-space conversion node at all. Encoding
+  the texture rather than **setting the image to Non-Color** is the one non-obvious choice, and it
+  is not fastidiousness: an image is a *shared* datablock, so writing its colour space would leave
+  every authored material rendering a linearised texture as raw once the preview was restored.
+  Rendered end to end this
+  reproduces `texel * light / 255` at **0.00 LSB**. Three things fall out: Solid mode cannot do this
+  *at all* (`View3DShading.color_type` is VERTEX **or** TEXTURE with no blend property, which is why
+  it needs a material), the view transform must be **Standard** with Look/Exposure/Gamma neutralised
+  (Filmic and AgX are tone mappings and roll off instead of clamping at 1.0), and Emission makes the
+  world irrelevant — identical pixels at world strength 0 and 20 — so scene lighting is left alone.
+  The test renders the naive graph beside the real one and asserts it **fails**, since a tolerance
+  nothing violates would prove nothing.
+- **A light is not in the object list at all, and that is what makes adopting one different.**
+  All 3,794 shipped `STDLIGHT` chunks are children of a `LIGHTSET`, and all 62 `LIGHTSET`s are
+  a direct child of the file-level `REBENVDT` — one per file, never more, and 24 of the 62 hold no
+  lights, so an empty set is ordinary data. `adopt_object` therefore routes a `LIGHT` to
+  `_adopt_light`, which takes none of the shape/`OBJHEAD1` bookkeeping and instead calls
+  `lightset_for`. The work is in `_promote_rebenvdt`: in the 502 files without lights `REBENVDT`
+  is *absorbed* onto the collection as a path prefix (`_is_data_only`), and a `LIGHTSET` object
+  needs a parent **object**, so the first light lifts that container into one — moving its
+  absorbed children and, if it owned it, `rif_bmpnames_path`. Getting that wrong loses the texture
+  table, which is why `_table_location` scans objects as well as the collection.
+  Two smaller ones: Blender's 1000 W default `energy` would export a 16.16 `brightness` a thousand
+  times past the shipped 0.2..2.0, so adoption normalises it to 1.0 (adoption is the one moment
+  that cannot be confused with an edit); and `light_id` is allocated past the highest in the file
+  because it is unique per file in all 38 that have lights but is **not** `0..n-1` (only 10 of the
+  38), i.e. an editor-assigned id rather than a position.
 - **A spawn locator is an ordinary object with geometry, not an empty and not a dummy.**
   `level01.RIF`'s `Goodie A`..`Goodie D` are `RBOBJECT`s carrying a 24-vertex marker mesh and its
   `camhund` camera plane is a 4-vertex quad — and the id pairing resolves **all 9,313 objects
@@ -1695,7 +1871,7 @@ animation inside the engine, where nothing here can see the result.
 - `actor_vtable_notes.md` - Actor class hierarchy, all 83+ vtable slots, subclass sizes, constructor addresses
 - `trigger_system_notes.md` - 22 trigger types, data structures, console command syntax, function addresses
 - `gls_system_notes.md` - GLS/GSH script parser: pipeline, ParsedThingBase layout, per-section field tables (types/ranges/defaults), ToXxx converters, C++ API is `src/GLS.h`
-- `level_loading_notes.md` - How a level is built: `BeginLevelSession` -> `LoadLevel` -> `ToMap`, the `.cut`/`.map`/`.opt`/`.loc` sidecar caches, the `LevelMeshHeader` geometry format, the `use <role> in team <n> for "<rif object>"` placed-object binding hash on `ParsedMap+0x1b60`, both spawn factories, and the three seams for replacing the `.gls` path with a native level builder
+- `level_loading_notes.md` - How a level is built: `BeginLevelSession` -> `LoadLevel` -> `ToMap`, the `.cut`/`.map`/`.opt`/`.loc` sidecar caches, the `LevelMeshHeader` geometry format, the `use <role> in team <n> for "<rif object>"` placed-object binding hash on `ParsedMap+0x1b60`, both spawn factories, the three seams for replacing the `.gls` path with a native level builder, and (§5.5) **the navmesh — which is just the level's own polygons**: a face is walkable iff `(flags & 0x100) == 0 && normal.y < 0`, where 0x100 is both an authored blocker and the loader's verdict on a **45° slope limit**
 - `role_system_notes.md` - `Role` (0xc0) field-by-field: the entity hash table (0x007b48f0), lifecycle (`CreateRole`/`ToRole`/`RoleDtor`/`DestroyRoles`), the two embedded 16-byte list headers (vulnerabilities @ 0x68, sever points @ 0xac), the `flags` bitfield, `InventoryInfo`, pickup classification via `character->aggression*10`, the `ai` -> Actor-subclass dispatch (`CreateActor`), the spawn path (`SpawnRole`), three `ToRole` defects, and (§10) the whole vulnerability subsystem - `Vulnerability` (0x1c), `VulnerabilityType`, the 0xc-byte list sentinel, and the four population paths
 - `role_subobjects_notes.md` - the four `Role` sub-objects: `Character` (0xb8, with `ToCharacter`'s unit conversions), `Projectile` (0x20), `ParticleGenerator` (0xd4: GLS fields, the five 0x18-byte `PGenChannel` records, the `ParticleType` enum, and the template -> emitter map from `ParticleEmitter_Ctor`), and the 3-variant `Destructibility` family (base 0x8 / `FragData` 0x24 / `ReplaceDestructibility` 0x10, dispatched on the `+0x04` tag by `Frag` @ 0x0052e220)
 - `threading_model_notes.md` - Two game threads (main "client" + executor "server"), loopback message queues (full `MsgQueue`/`MsgQueueList`/`MsgQueueNode` layouts), pause handshake, per-thread clocks/RNG, which GkPlus hooks run on which thread, and the four script-execution entry points (all main-thread; host uses `ScriptQueue`, MP joiners use update `0x67`)
@@ -1711,8 +1887,12 @@ animation inside the engine, where nothing here can see the result.
   already writes a full dump to `%LOCALAPPDATA%\CrashDumps\gl.exe.<pid>.dmp`, and
   `cdb -z <dump> -c ".ecxr; k 40; q"` plus `llvm-symbolizer` on the printed `d3d8+0x...` RVAs
   resolves a crash to file and line - where **every live attach failed** to walk the stack at all. Currently: `DrawText?` @ 0x005782e0 smashing its stack on any
-  string over ~1024 chars (which makes the training-level debrief fatal), and the fact that the
-  game's own `PrintParseWarning`/`PrintParseError` discard their output. Also collects what
+  string over ~1024 chars (which makes the training-level debrief fatal), the fact that the
+  game's own `PrintParseWarning`/`PrintParseError` discard their output, and (§5)
+  `PolygonAdjacencyTest` @ 0x0048ecf0 overflowing a 3-element buffer during
+  `LoadOrBuildSectionAdjacency` on **level** geometry containing degenerate-after-weld
+  triangles - a `/GS` fast-fail (0xc0000409), so it is not an AV and **a debugger suppresses
+  the dump entirely**. Also collects what
   actually works for debugging Gunlok - where cdb lives, why `bp d3d8+0x...` silently resolves
   wrong, and which breakpoints make the game unplayable
 - `console_command_notes.md` - every console command the game registers (280 registrations, 272

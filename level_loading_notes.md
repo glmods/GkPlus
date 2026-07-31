@@ -15,13 +15,111 @@ Companion documents: `gls_system_notes.md` (the script parser), `rif_chunk_forma
 | `<level>.rif` | the `map` section's `file` field | `ToMap`, indirectly via `LoadOrGetRifFile` |
 | `<level>.gcs` | `ConsoleFileName` @ 0x007b6dd0 | `ExecuteCommandFile`, multiplayer only |
 
-Plus three **derived cache/sidecar files**, all optional and all regenerated when stale:
+Plus four **derived cache/sidecar files**, all optional and all regenerated when stale:
 
 | File | Built by | Contents |
 |------|----------|----------|
 | `<ScriptFileName>.cut` | `ToMap` | baked mesh (`level01.cut`, `prison.cut`, ...) |
 | `<ScriptFileName>.map` | `LoadOrBuildSectionAdjacency` | per-section adjacency graph |
+| `<ScriptFileName>.shd` | `BakeStaticShadows` @ 0x005542c0 | baked static shadows, see below |
 | `<level rif>.opt` / `.loc` | shipped with the rif | optimisation data / locators |
+
+### The `_shadow` rifs and the `.shd` cache
+
+`levels\level01_shadow.rif` and its 24 siblings are a **low-polygon stand-in for the
+level, used as the shadow *caster*** when the engine bakes static shadows at load.
+They are named by two `map` section fields and reached with one call:
+
+```
+shadow object rif  "levels\level01_shadow.rif"     -> Map+0x160
+shadow object name "Land"                          -> Map+0x164
+GetShape(map->shadow_object_rif, map->shadow_object_name)   // 0x004ae570, (file, name)
+   -> CreateSceneObjectFromRifObject                        // 0x00599f80
+```
+
+Each one holds **exactly one `RBOBJECT`, named to match `shadow object name`** (always
+`Land` in the shipped set), and is far cheaper than the level it stands for -
+`level01_shadow` is 6,977 polygons against `level01`'s 36,200. They carry no
+`DUMMYOBJ`, no cutscene chunks, and several have no `LIGHTSET` at all; their polygons'
+texture and UV indices are junk, which is why 215,517 of the 224,777 unresolved
+polygons in the whole asset set are in these files. None of that matters to a shadow
+caster, which only needs silhouettes.
+
+**The bake is gated on the highest shadow setting.** `LoadLevel` step 8 runs it only
+when `ShadowQuality == 3` **and** `LevelLoadReason != 3` (a savegame restore skips it),
+and `ApplyShadowQuality` case 3 runs it again if the player raises the setting while a
+map is loaded. `ShadowQuality` is 0..3: 0 installs `CommandRem` as the renderer (a
+stub - shadows off), 1 and 2 pick cheaper renderers, and only 3 sets
+`ShadowsHighestQuality`.
+
+**A map need not name one.** 25 of the 33 shipped `.gls` files do; the 8 that do not
+are multiplayer, test and training levels (`mplay_dockyard`, `railway`, `test`,
+`training05`, ...). `BakeStaticShadows` branches at 0x00554525 on
+`shadow_object_rif` being null and takes a second, near-identical path that casts from
+the level's own geometry instead. So the `_shadow` rif is an optimisation, not a
+requirement.
+
+**The result is cached in `<ScriptFileName>.shd`**, keyed the same way `.cut` and
+`.map` are - `ScriptFileName` with its last three characters overwritten, so
+`level01.gls` becomes `level01.shd`. The header is an 8-byte `FILETIME` compared with
+`CompareFileTime` against the level rif's own timestamp at `Map+0x158`, so editing the
+`.rif` invalidates it. Writing clears read-only first
+(`SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL)`) and uses `CREATE_ALWAYS`.
+
+#### The `.shd` payload: a silhouette-edge table
+
+The read and write paths agree field for field, so the container is certain:
+
+```
+FILETIME   rif_mtime;        // 8 bytes, compared against Map+0x158
+uint32     count;
+ShadowEdge edges[count];     // 0x64 (100) bytes each
+```
+
+Records are appended to a **pointer-anchored `List<T>` at `Map+0xfc`** (`Map_Ctor`
+initialises it; `List_AddEntry` @ 0x00558320 is the template's own `add_entry`), and
+its `n_entries` at `Map+0x100` doubles as the "already baked" early-out at the top of
+`BakeStaticShadows`. The write loop walks that list emitting each node's `data`.
+
+**What a record is: one edge of the caster mesh, with the normals of the faces that
+share it.** That is the classic shadow-volume precomputation - at render time an edge
+is on the silhouette exactly when one of its two faces points at the light and the
+other does not.
+
+| Offset | Type | Meaning |
+|--------|------|---------|
+| 0x00 | `float *v0` | build-time pointer to endpoint 0 in the caster's vertex array |
+| 0x04 | `float *v1` | build-time pointer to endpoint 1 |
+| 0x08 | `Vec3 normal[2]` | the up-to-two adjacent face normals |
+| 0x20 | `int num_faces` | 1 or 2 - the append at 0x005549e0 does `normal[num_faces++] = n`, capped at 2 |
+| 0x24 | `Vec3 p0` | endpoint 0 **by value** |
+| 0x30 | `Vec3 p1` | endpoint 1 by value |
+| 0x3c | `int` | written beside them, unidentified |
+| 0x40 | `Vec3` | constructed but never filled by the bake - runtime scratch |
+| 0x4c | `Vec3` | " |
+| 0x58 | `Vec3` | " |
+
+Edges are welded through a **64-bucket `HashTable`** (`HashTable_Ctor(6)`) keyed by
+`ShadowEdge_Hash` - `abs(round(*v0 + *v1))` - and compared with
+`ShadowEdge_SameEdge`, which tests both endpoint orderings, because two faces sharing
+an edge reference it in opposite winding. So each edge is stored once carrying both
+normals.
+
+Three things worth knowing:
+
+- **`v0`/`v1` are pointers and they are serialized verbatim**, so they dangle after a
+  reload. That is not fatal because the geometry that survives is the pair of `Vec3`
+  copies at 0x24/0x30, written by the bake at 0x00554b09/0x00554b1b in both halves.
+  Reading those two as the endpoints is an inference from the write pattern plus the
+  pointer problem, not something a consumer was traced to confirm.
+- **The last three `Vec3`s and the int at 0x3c are unidentified.** They are
+  constructed on the read path and touched by the record's own method
+  (`FUN_00557010` takes the address of all five `Vec3`s), but the bake does not fill
+  0x40/0x4c/0x58, so they are most likely per-frame scratch that happens to be
+  serialized.
+- **This is why the caster is low-poly.** Edge count scales with polygon count and
+  each edge costs 100 bytes plus a volume extrusion per frame, so a 6,977-polygon
+  stand-in for a 36,200-polygon level is the whole point of the `_shadow` rif.
 
 ### `.cut` is NOT a cutscene file
 
@@ -279,7 +377,7 @@ CreateSceneObjectFromCachedMesh()                     @ 0x0059da90
 | Parsed field | Destination |
 |--------------|-------------|
 | `bitmap` 0x02 | `Map->bitmap` @ 0xcc (owned `char*`) |
-| `camera plane` 0x50 | locator lookup -> `InitialCameraState` @ 0x007b4e18 |
+| `camera plane` 0x50 | rif-object lookup -> `MapCameraPlane` @ 0x007b4e18 (see §4.1) |
 | `max camera focus height` 0x52 | locator `+0x48` -> `Map+0x150` -> `MaxCameraFocusHeight` @ 0x007b3ea8 |
 | `min camera focus height` 0x53 | locator `+0x48` -> `Map+0x144` -> `MinCameraFocusHeight` @ 0x006a574c |
 | `shadow object rif` 0x54 | `Map->shadow_object_rif` @ 0x160 |
@@ -356,8 +454,86 @@ built with.
 **`max camera distance` (0x51) is parsed, range-checked and then never read.**
 `MaxCameraDist1 = MaxCameraDist2` comes from globals only.
 
-If `camera plane` is absent the `.loc` entry with the extreme value of `locator+0x64`
-is used instead.
+### 4.1 `camera plane` - what `camhund` actually does
+
+The field names an **object inside the level `.rif`** (`camhund` in `level01.gls`), the same
+namespace as a `use ... for "<rif object>"` spawn point. It is used twice, and only the
+first use survives into the running game.
+
+**Use 1 - it is the shape the `.loc` sidecar collapses onto** (cold path, `ToMap`
+@ 0x00480020). `RifCollectShapeChunks` @ 0x005b09f0 gathers every `REBSHAPE` in the level
+rif; exactly one is kept, all the others are deleted, and every surviving object that is
+not named `"sky"` is re-pointed at the kept one through
+`Object_Chunk__assoc_with_shape` @ 0x005b1fc0 (0x004802c3). *That* is what makes
+`<level rif>.loc` a locators-only rif — the named locators keep their transforms while the
+level geometry goes away, and they all share one tiny mesh. `camhund` is a 4-vertex quad,
+i.e. deliberately the cheapest thing in the file.
+
+With no `camera plane` field, or a name that matches no object, the fallback at
+0x004800d7 keeps the shape with the **fewest polygons** (minimum of `Shape_Chunk+0x64`;
+the selection is a `CMOVGE` at 0x004800f3, so a tie keeps the earlier one in document
+order). So the field only makes the choice *deterministic*.
+
+**And on the shipped data it does not even do that**, which is what makes the whole field
+vestigial rather than merely obscure. Measured over the 24 shipped `.gls` with a
+resolvable map section (`blender/io_scene_rif` decodes the rifs):
+
+| | levels |
+|---|---|
+| `camera plane none` | 11 — including campaign 10/11/12, junkyard, Training_Level and most mplay maps; `railway.gls` has `camera plane none // TODO` |
+| names it, object **absent from the rif** | 6 — Maze, city ruins, level06, level09, mplay_atlantic, mplay_warehouse. The byte string `camhund` does not occur anywhere in those files, as an `RBOBJECT` name or otherwise, so the lookup fails and the fallback runs |
+| names it, object present | 7 |
+
+Of those 7, **six resolve to the unique 2-polygon/4-vertex minimum** — precisely the
+shape the fallback would have kept. The seventh (`prison`) has a nine-way tie among
+2-poly quads, so the field selects a different but equivalent one. The field therefore
+never changes the *kind* of shape kept. Six levels shipping a dangling name is itself the
+evidence that nothing depends on it.
+
+`Shape_Chunk`'s geometry fields, read off the chunk emitter @ 0x005b5090 (each sub-chunk
+is guarded on its own pointer): `+0x58` num_verts, `+0x5c` `int32[3]` verts (`SHPRAWVT`),
+`+0x64` num_polys, `+0x68` polys (`SHPPOLYS`), `+0x6c` `float[3]` polygon normals
+(`SHPPNORM`), `+0x70`/`+0x74` uv count/list (`SHPUVCRD`).
+
+**Use 2 - it defines a world-space plane, and nothing reads it** (`ToMap` @ 0x00480d19,
+writes at 0x004812bc). `RifFilterObjectsByName` finds the object — in the `.loc` rif on a
+warm load, which is exactly why use 1 has to keep it — and then
+
+```
+MapCameraPlane.point  = AffineTransform(placement, shape->verts[0]  * RifUnitScale(rif))
+MapCameraPlane.normal = Mat3Transform(rotation,    shape->pnorms[0])
+```
+
+where `placement` is `OBJHEAD1`'s quaternion (`obj+0x50..0x5c`) plus its `int32` location
+(`obj+0x44..0x4c`) scaled by the rif unit scale and offset by `Map->neg_origin` — the same
+placement rule as a spawned object. Fallback (0x00481358):
+`point = (0, 1.5*bounds_max.y - 0.5*bounds_min.y, 0)`, `normal = (0,1,0)`.
+`FUN_004af4d0` (called from `WinMain` and early in `LoadLevel`) presets
+`point = normal = (0,0,1)`.
+
+`MapCameraPlane` @ 0x007b4e18 is `{Vec3 point, Vec3 normal}`, 0x18 bytes, and **has no
+readers**. Checked three ways: Ghidra references to each of the six dwords (writes only);
+every scalar operand in `.text` landing in `[0x7b4d80, 0x7b4ec0]`; and every initialised
+dword in the image matching one of the six addresses. The only hits are the eight writes
+in `ToMap` and `FUN_004af4d0`. The near misses are the backwards-`Vec3` idiom
+(`XOR EAX,EAX` / `SUB EAX,4` / `[EAX + <end+4>]`) walking `CameraCoords` @ 0x007b4e0c —
+`FUN_00484e40` at 0x0048703b and 0x004872bb, and `WaitCond_IsScreenScrolled` at 0x0056fd67.
+Contrast the sibling fields `Min`/`MaxCameraFocusHeight`, which the camera update genuinely
+reads (five sites each).
+
+**What it was evidently meant to be.** `camhund` in `level01.RIF` is 4 vertices forming a
+20,000 x 20,000 unit *horizontal* quad (2 triangles, normal `(0,1,0)`), placed at
+`(0, -60000, 0)` with identity rotation. RIF is Y-down, so that is 60,000 units **above**
+the origin, clear of `Land`'s Y extent of -28,433..30,000. That is a ground/picking plane —
+the surface you intersect a screen ray with, or clamp the camera against. The art was
+authored, the parser field exists, `ToMap` computes the plane, and nothing consumes it.
+
+So `camera plane` is **vestigial**: the plane has no readers, and its one remaining side
+effect reproduces the fallback. The surviving members of the same family are
+`min`/`max camera focus height`, which name locator objects the same way and *are* read —
+five sites each in the camera update `FUN_00484e40`. It joins `max camera distance` as
+parsed-and-discarded, and a script-defined level can set it or omit it with no observable
+difference.
 
 ### Phase C - populate the world
 
@@ -519,6 +695,84 @@ classes and differ from the executor-side sizes in `actor_vtable_notes.md`:
 
 Actor id source is `DAT_007b68e4`.
 
+## 5.5 The navmesh: there isn't one
+
+**Characters walk on the level's own polygons.** Nothing separate is authored, loaded or
+generated - the `.gls` names no nav data and the `.rif` carries none. `BuildNavPolygons`
+@ 0x004888d0 turns the map geometry into an array of 0x40-byte nav polygons, and the
+walkable subset of *those* is the navmesh.
+
+### The nav polygon (0x40 bytes)
+
+`NavPolygon_Ctor` @ 0x0048dbb0, vtable 0x00663e60. Filled by `BuildNavPolygons`:
+
+| Off | Field | Source |
+|-----|-------|--------|
+| 0x00 | vptr | 0x00663e60; slot 0x50 is `PolygonAdjacencyTest` |
+| 0x08 | `Vec3 normal` | `ObjectRotation * SHPPNORM[normal_index]`, via `Mat3Transform` @ 0x0058e8c0 |
+| 0x14 | `int flags` | `SHPPOLYS.flags & 0x3fffc1`, plus 0x100 if too steep |
+| 0x20 | `Vertex *v[3]` | the three world-space vertex records |
+| 0x34 | `Vec3` | centroid, written through vtable slot 0x14 |
+
+Positions go through the affine `AffineTransform` @ 0x0058e7f0 (translation at
+`this[3]/[7]/[0xb]`); normals through the **rotation-only** `Mat3Transform`. So an object
+that still carries an `OBJHEAD1` rotation is classified in the orientation it will load
+with, not the one its stored vertices imply - which is exactly how a terrain exported with
+an unapplied Blender rotation ends up unwalkable.
+
+### What "walkable" means, exactly
+
+Two fields, one test, and it is the filter at the top of `BuildPolygonAdjacencyGrid`
+@ 0x0048aa00 - a pair is not even handed to slot 0x50 unless **both** polygons pass:
+
+```c
+(poly->flags & 0x100) == 0        // +0x14
+poly->normal.y      <  0          // +0x0c -- RIF is Y-down, so negative Y faces UP
+```
+
+and `BuildNavPolygons` is what decides the first of those:
+
+```c
+flags = SHPPOLYS.flags & 0x3fffc1;
+if (ny*ny + 1e-5 < nx*nx + nz*nz)  flags |= 0x100;   // steeper than 45 degrees
+if (ny == 0.0)                     ny = -1e-5;       // nudge, always steep anyway
+```
+
+The constant at 0x00663f4c is `1e-5`, a tie-break epsilon: for a unit normal
+`ny² + 1e-5 >= nx² + nz²` solves to `|ny| >= 0.70710`, i.e. **a slope limit of exactly
+45 degrees**. Written component-wise rather than as an angle, so it does not assume the
+normal is normalized.
+
+**Bit 0x100 survives the `0x3fffc1` mask, so it is an authored blocker as well as the
+loader's slope verdict** - level01 sets it on 1,914 polygons by hand. That is the way to
+mark a face off-limits without moving geometry.
+
+### Adjacency
+
+Two walkable polygons are linked when they share **exactly two** vertex records - a shared
+edge - which is what `PolygonAdjacencyTest` (slot 0x50) returns true for; see
+`game_defects_notes.md` §5 for its buffer overflow. The comparison is by *pointer*, so it
+is the loader's welded vertices that matter, not `SHPRAWVT` indices. The resulting graph is
+what the `.map` sidecar caches.
+
+Since a unit can only path inside one connected component, **the number of islands and the
+share of walkable faces in the largest one are the health metric**, and the count alone
+means little. Measured with this reproduced offline (`shapes.is_walkable` / `nav_islands`):
+
+| level | faces | walkable | islands | largest island |
+|-------|-------|----------|---------|----------------|
+| level01 | 29,045 | 32.0% | 523 | 57.8% of walkable |
+| level02 | 17,161 | 39.6% | 420 | 61.6% |
+| level03 | 39,008 | 44.6% | 699 | 66.1% |
+| level06 | 30,794 | 37.9% | 1,014 | 66.7% |
+
+So hundreds of islands is normal and 58-67% in the largest is what a shipped level looks
+like. A custom terrain measured at 33.2% walkable but **11,780 islands with only 2.0% in
+the largest**, because 21.7% of its edges were open (89,144 of 411,604) against level01's
+6.8% - open edges and T-junctions cut the graph apart while leaving the walkable *fraction*
+looking healthy. The Blender addon exposes all of this through **Preview Navmesh**
+(`object.rif_navmesh_preview`).
+
 ## 6. Sidecar caches
 
 ### `<ScriptFileName>.map` - `LoadOrBuildSectionAdjacency` @ 0x0044fef0
@@ -533,9 +787,12 @@ neighbourSectionId}` over `Map->sections[0 .. Map->num_sections)` (0x88/0x8c).
 
 ### `<level rif>.opt` / `.loc`
 
-Loaded by `FUN_005b03b0` from the RIFs directory during the cold path only. `.loc`
-holds the named locators used for the camera plane and the focus-height fields;
-entries named `"sky"` are filtered out of the geometry list.
+Written and re-read by `FUN_005b03b0` (the rif recompressor) from the RIFs directory
+during the cold path only. `.loc` is the level rif stripped down to its **named locator
+objects** — the camera plane, the focus-height markers and the `use ... for` spawn points —
+built by deleting every `REBSHAPE` except one and re-pointing every object at that
+survivor; see §4.1, which is also where the camera-plane object's real job is. Objects
+named `"sky"` are excluded from the rebind.
 
 ## 6.5 Registering a level: `AddLevel` and `LevelList`
 
@@ -819,7 +1076,7 @@ start-by-title (`prison.gls`, 187 actors), and all five refusal paths. No WER re
 | 0x0073909c | int | `MapAuxObjectCount` |
 | 0x007b3ec0 | int | `NumTeamSlots` |
 | 0x007b3ec4 | `TeamSlot*` (stride 0xc4) | `TeamSlots` |
-| 0x007b4e18 | 0x18 | `InitialCameraState` |
+| 0x007b4e18 | 0x18 | `MapCameraPlane` - `{Vec3 point, Vec3 normal}`, **no readers** (was `InitialCameraState`) |
 | 0x007b3ea8 | float | `MaxCameraFocusHeight` |
 | 0x006a574c | float | `MinCameraFocusHeight` |
 | 0x007b74dc | `LevelList` (0x10) | `LevelList` - the single-player campaign |

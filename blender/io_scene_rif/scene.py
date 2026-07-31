@@ -47,11 +47,14 @@ Chunks that become something native rather than an object:
 """
 
 import contextlib
+import json
 import math
 import os
 import re
+import array
 import struct
 import tempfile
+import zlib
 
 import bpy
 import mathutils
@@ -100,10 +103,13 @@ GEOMETRY_CHUNKS = frozenset(
 #: - ``SHPMRGDT`` is exactly one int32 per polygon in all 9,357 shipped shapes
 #:   (AvP's ``{int *merge_data; int num_polys}``) -> a face attribute.
 #: - ``SHPVTINT`` is per-vertex lighting and a child of ``RBOBJECT``, never of a
-#:   shape, in all 4,668 cases -> a vertex attribute on the object's mesh.
+#:   shape, in all 4,668 cases -> a **colour** attribute on the object's mesh.
+#:   It is the one entry here that is not stored as the int32 the wire holds:
+#:   see the "Baked vertex lighting" section for why the paintable form is the
+#:   stored one, and :data:`VTINT_HEADER_PROP` for what says it exists at all.
 ATTRIBUTE_CHUNKS = {
     b"SHPMRGDT": ("rif_merge_group", "INT", "FACE"),
-    b"SHPVTINT": ("rif_vertex_intensity", "INT", "POINT"),
+    b"SHPVTINT": ("rif_light", "BYTE_COLOR", "POINT"),
 }
 
 #: Preprocessed render data with no known generator. **Discarded on load and
@@ -800,6 +806,11 @@ def _image_for(name):
     # ordered `c0 <= c1`, and every image here is written out as RGBA either
     # way, so the decoder's answer is recorded rather than re-derived.
     image["rif_has_alpha"] = texture.has_alpha
+    # What "unchanged since it was imported" means at export time. A digest
+    # rather than a flag, because `is_dirty` is about unsaved edits and resets
+    # on a `.blend` save -- paint, save, reopen, and the edit would look like no
+    # edit at all.
+    image["rif_rim_crc"] = _digest(texture.rgba)
     _CTX["images"][key] = image
     return image
 
@@ -860,6 +871,135 @@ def _has_alpha(image):
 
 
 # --------------------------------------------------------------------------
+# writing the textures back out
+# --------------------------------------------------------------------------
+#
+# The `.rif` stores a name; the image lives beside the install as a `.RIM`, and
+# until now this addon only ever read one. Writing them back is what makes a
+# retexture more than a rename -- and it is a *separate* output from the `.rif`,
+# because the two go to different places: the model into the file the user
+# picked, the textures into a mod tree mirroring the game's `Graphics` folder.
+#
+# Three things decide the shape:
+#
+# - **`image.pixels` is the way back out, and it is exact.** For an 8-bit image
+#   Blender hands back the stored byte over 255 with no colour management in the
+#   way -- measured on Blender 4.2 and 5.2, across a `.blend` save and reload:
+#   every byte of every channel survives, alpha included. `Image.save()` to a
+#   PNG or a raw TGA reproduces the same bytes, but both go through a temporary
+#   file and `Image.file_format`, which is shared state on the datablock, and
+#   one probe caught Blender writing the packed PNG verbatim when asked for a
+#   TGA. `pixels` has no format to disagree about.
+# - **Row 0 is the bottom in Blender and the top in a `.RIM`**, the same flip the
+#   UVs get.
+# - **Unchanged textures are not written**, because the alternative is a mod that
+#   ships megabytes of `BODY` re-encodings of textures the player already has,
+#   pixel for pixel. `rif_rim_crc` is stamped at import and never updated, so the
+#   test is "do these pixels still match the file they came from" rather than
+#   anything about Blender's dirty flag, which a `.blend` save clears.
+
+#: Blender's own sRGB encode, for the rare image whose buffer is float. An 8-bit
+#: buffer needs none of this -- ``pixels`` is already the stored byte over 255 --
+#: but a float one holds scene-linear values, and this is the transfer function
+#: Blender itself would apply on the way to an 8-bit file.
+def _linear_to_srgb(v):
+    if v <= 0.0031308:
+        return v * 12.92
+    return 1.055 * (v ** (1.0 / 2.4)) - 0.055
+
+
+def _digest(rgba):
+    """A texture's pixels as a short string.
+
+    Hex rather than the number ``zlib.crc32`` returns, because an ID property is
+    a **signed** C int and a checksum uses the whole 32 bits -- storing one
+    raises ``OverflowError`` on the 50% of images whose digest happens to have
+    the top bit set, which is a crash in the middle of an import.
+    """
+    return "%08x" % zlib.crc32(rgba)
+
+
+def image_rgba(image):
+    """An image datablock -> ``(width, height, RGBA bytes)``, row 0 at the top."""
+    width, height = image.size
+    if not width or not height:
+        raise ValueError("%r is %dx%d" % (image.name, width, height))
+    if image.channels != 4:
+        raise ValueError("%r has %d channels, not RGBA" % (image.name, image.channels))
+    buf = array.array("f", bytes(4 * width * height * 4))
+    image.pixels.foreach_get(buf)
+    if image.is_float:
+        buf = array.array("f", map(_linear_to_srgb, buf))
+    flat = bytes(0 if v <= 0.0 else 255 if v >= 1.0 else int(v * 255.0 + 0.5)
+                 for v in buf)
+    stride = width * 4
+    return width, height, b"".join(
+        flat[y * stride:(y + 1) * stride] for y in range(height - 1, -1, -1))
+
+
+def texture_targets(collection):
+    """``[(material, image or None, name)]`` for the textures this file names."""
+    out = []
+    for mat in _materials_in(collection):
+        name = (mat.get("rif_bmp_name", "") or "").strip()
+        if not name:
+            continue
+        image = next((node.image for node in
+                      (mat.node_tree.nodes if mat.use_nodes and mat.node_tree else ())
+                      if node.type == "TEX_IMAGE" and node.image is not None), None)
+        out.append((mat, image, name))
+    return out
+
+
+def _texture_destination(root, name):
+    """Where a ``BMPNAMES`` name lands under ``root``, or ``None`` if it escapes it."""
+    relative = name.replace("\\", "/").lstrip("/")
+    full = os.path.normpath(os.path.join(root, relative))
+    if os.path.commonpath([os.path.abspath(root), os.path.abspath(full)]) \
+            != os.path.abspath(root):
+        return None
+    return full
+
+
+def write_textures(collection, root, changed_only=True, compress=True):
+    """Write each named texture as a ``.RIM`` under ``root``. -> stats.
+
+    ``changed_only`` skips an image whose pixels still match the ``.RIM`` it was
+    imported from. Anything the addon did not import -- a texture painted from
+    scratch, or one imported before this was recorded -- has no digest and is
+    always written, which is the safe way round.
+    """
+    stats = {"written": 0, "unchanged": 0, "no_image": [], "failed": [], "bytes": 0}
+    for _mat, image, name in texture_targets(collection):
+        if image is None:
+            stats["no_image"].append(name)
+            continue
+        destination = _texture_destination(root, name)
+        if destination is None:
+            stats["failed"].append((name, "the name points outside the textures folder"))
+            continue
+        try:
+            width, height, rgba = image_rgba(image)
+        except Exception as exc:  # noqa: BLE001
+            stats["failed"].append((name, str(exc)))
+            continue
+        if changed_only and image.get("rif_rim_crc") == _digest(rgba):
+            stats["unchanged"] += 1
+            continue
+        try:
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            blob = rim.encode(width, height, rgba, compress)
+            with open(destination, "wb") as fh:
+                fh.write(blob)
+        except (OSError, rim.RimError) as exc:
+            stats["failed"].append((name, str(exc)))
+            continue
+        stats["written"] += 1
+        stats["bytes"] += len(blob)
+    return stats
+
+
+# --------------------------------------------------------------------------
 # chunk tree -> scene
 # --------------------------------------------------------------------------
 
@@ -911,6 +1051,34 @@ def _shape_pairs(root):
 
 
 
+#: What a fresh ``LIGHTSET`` holds, and it is measured rather than chosen. All
+#: 563 shipped files were scanned: **62 have a ``LIGHTSET``, always exactly one,
+#: always a direct child of the file-level ``REBENVDT``**, and every one of the
+#: 3,794 ``STDLIGHT`` chunks in the game is a child of one -- there is no such
+#: thing as a light anywhere else. The set holds ``LTSETHDR`` first, then the
+#: lights, then ``AMBIENCE``; both of those leaves are byte-identical in all 62,
+#: which is why they can be constants instead of parameters. 24 of the 62 carry
+#: no lights at all, so an empty set is normal shipped data rather than a state
+#: to avoid.
+LIGHTSET_HEADER = b"NORMALLT\0\0\0\0"   # AvP's char[8] light_set_name + int pad
+LIGHTSET_AMBIENCE = 2048
+
+#: A new light's ``spread``: the mode of the shipped values (2,955 of 3,794).
+LIGHT_SPREAD = 1000
+
+#: A new ``SHPVTINT``'s header, as the four int32 it is stored as: the light set
+#: name (which selects the chunk -- see :func:`_vtint_chunk`), the word that is 0
+#: in all 4,668 shipped chunks, and a placeholder count that export regenerates.
+VTINT_HEADER = list(struct.unpack("<3i", LIGHTSET_HEADER[:8] + b"\0\0\0\0")) + [0]
+
+#: A new light's brightness, as Blender energy. ``_light_chunk`` writes
+#: ``energy * 65536`` because the chunk's field is 16.16, and every shipped light
+#: lands in 0.2 .. 2.0 -- so Blender's own 1000 W default would export a
+#: brightness three orders of magnitude past anything in the game. Adoption
+#: converts it once, which is the only moment that can be told from an edit.
+LIGHT_ENERGY = 1.0
+
+
 def _apply_light(obj, light_chunk, index, scale, y_down):
     props = schema.decode(b"STDLIGHT", light_chunk.body)
     light = obj.data
@@ -926,7 +1094,7 @@ def _apply_light(obj, light_chunk, index, scale, y_down):
     obj.rotation_mode = "QUATERNION"
     obj.rotation_quaternion = matrix_to_blender(props["orientation"], y_down)
     # Everything the light datablock cannot express stays as typed fields.
-    for key in ("light_id", "field_0x38", "flags", "field_0x48", "field_0x4c"):
+    for key in ("light_id", "spread", "flags", "local_flags", "pad"):
         obj["rif_" + key] = _to_signed32(props[key]) if not isinstance(props[key], list) \
             else [_to_signed32(x) for x in props[key]]
     obj["rif_id"] = "STDLIGHT"
@@ -1935,15 +2103,21 @@ def _build(chunk, index, parent_obj, collection, pairs, root_kids, stats):
         obj["rif_objhead"] = data
         skip.update((b"OBJHEAD1", b"SHPVTINT"))
 
-        # SHPVTINT is per-vertex lighting held on the object; it belongs on the mesh.
+        # SHPVTINT is per-vertex lighting held on the object; it belongs on the
+        # mesh, and it lands as the paintable colour attribute directly -- that
+        # is the stored form, not a view of one (see "Baked vertex lighting").
+        # The header rides along as the marker that says this object has a chunk
+        # at all, which an all-white attribute could not.
         vt = chunk.find(b"SHPVTINT")
         if vt is not None and obj.data is not None and len(vt.body) >= 16:
             n = (len(vt.body) - 16) // 4
             vals = struct.unpack_from("<%di" % n, vt.body, 16)
-            attr = obj.data.attributes.new("rif_vertex_intensity", "INT", "POINT")
-            for i in range(min(n, len(obj.data.vertices))):
-                attr.data[i].value = _to_signed32(vals[i])
-            obj.data["rif_vtint_header"] = list(struct.unpack_from("<4i", vt.body, 0))
+            attr_name, _existed = white_light_attribute(obj.data)
+            attr = obj.data.color_attributes[attr_name]
+            for i in range(min(n, len(attr.data))):
+                r, g, b, a = unpack_light(vals[i])
+                attr.data[i].color_srgb = (r / 255.0, g / 255.0, b / 255.0, a / 255.0)
+            obj.data[VTINT_HEADER_PROP] = list(struct.unpack_from("<4i", vt.body, 0))
     elif cid in (b"REBSHAPE", b"SUBSHAPE"):
         # A shape no object claims -- Elint MkII ships two, of 4 vertices each.
         # It still gets a real mesh rather than an empty, or its geometry would be
@@ -2241,7 +2415,15 @@ def _shape_chunk_from_mesh(obj, me, scale, y_down, stats, textures=None):
     polys = []
     uv_lists = []
     merge = []
+    # Dropped before anything parallel is appended, so polys/uv_lists/merge stay
+    # in step and `uv_index` stays contiguous. See shapes.welds_degenerate: a
+    # triangle that loses a corner to the weld crashes the game while it builds
+    # section adjacency, and the fault names neither the file nor the polygon.
+    welded = shp.weld_map(verts)
     for tri in me.loop_triangles:
+        if shp.welds_degenerate(tri.vertices, welded):
+            stats["degenerate_faces"] += 1
+            continue
         face = tri.polygon_index
         # `texels`, not `scale`: `scale` is this function's rif-units-to-metres
         # parameter, and shadowing it here would be a quiet way to write a mesh
@@ -2315,13 +2497,47 @@ def _sync_shape_header(children, obj, verts, num_polys):
                                    verts, num_polys, names)
 
 
-def _vtint_chunk(obj, me):
-    attr = me.attributes.get("rif_vertex_intensity")
-    if attr is None:
+def _vtint_chunk(obj, me, stats):
+    """The baked per-vertex lighting back into ``SHPVTINT``.
+
+    Reads :data:`LIGHT_COLOR_ATTR` **by name**, never the active colour
+    attribute: what a bake or a preview happens to have pointed Blender at is
+    not a decision about the file. Gated on :data:`VTINT_HEADER_PROP`, so a
+    paintable attribute minted for the preview does not add a chunk.
+
+    Three outcomes, and the split is deliberate. No marker: no chunk, silently --
+    the object never had one. Marker but no attribute: no chunk, **counted**, so
+    export can say a chunk went away rather than losing it quietly. Marker and an
+    attribute that cannot be read as one value per vertex: **raise**, because that
+    is a mesh edit having outrun the lighting, and silently averaging or padding
+    is the failure this whole design exists to prevent.
+
+    Two of the four header words are not opaque, and both matter:
+
+    - **``[0:2]`` is the light set's name**, and it is the *selector*. An object
+      may carry one chunk per light set and AvP's loader takes the one matching
+      the active set (``strncmp(svic->light_set_name, ::light_set_name, 8)``), so
+      a chunk authored with a zeroed name is simply never found. Gunlok ships
+      ``NORMALLT`` on all 4,668 chunks and on all 62 ``LTSETHDR``s, which is why
+      a new one defaults to it rather than to zeros.
+    - **``[3]`` is ``num_vertices``**, equal to the array length in 4,668 of
+      4,668, and the engine trusts it -- it allocates and iterates that many
+      times. Editing the mesh changes the array, so this is regenerated rather
+      than carried, exactly as ``SHPHEAD1``'s counts are. Carrying it meant a
+      mesh that gained or lost a vertex wrote a chunk whose declared count
+      disagreed with its own data.
+    """
+    if not has_lighting(me):
         return None
-    header = list(me.get("rif_vtint_header", [0, 0, 0, 0]))
-    vals = [attr.data[i].value for i in range(len(me.vertices))]
-    body = struct.pack("<4i", *header[:4]) + struct.pack("<%di" % len(vals), *vals)
+    if me.color_attributes.get(LIGHT_COLOR_ATTR) is None:
+        stats["lighting_dropped"] = stats.get("lighting_dropped", 0) + 1
+        return None
+    vals, why = lighting_values(me)
+    if why is not None:
+        raise ValueError(why)
+    header = (list(me.get(VTINT_HEADER_PROP, VTINT_HEADER)) + [0, 0, 0, 0])[:4]
+    header[3] = len(vals)
+    body = struct.pack("<4i", *header) + struct.pack("<%di" % len(vals), *vals)
     return rif.Chunk(b"SHPVTINT", body)
 
 
@@ -2345,7 +2561,7 @@ def _object_chunk(obj, scale, y_down, stats):
     children = [(0, rif.Chunk(b"OBJHEAD1", struct.pack("<%di" % len(data), *data)))]
 
     if obj.data is not None:
-        vt = _vtint_chunk(obj, obj.data)
+        vt = _vtint_chunk(obj, obj.data, stats)
         if vt is not None:
             children.append((1, vt))
     children += [(2 + i, c) for i, (_, c) in enumerate(_emit_absorbed(obj))]
@@ -2388,12 +2604,12 @@ def _light_chunk(obj, scale, y_down):
             obj.rotation_quaternion if obj.rotation_mode == "QUATERNION"
             else obj.matrix_local.to_quaternion(), y_down),
         "brightness": int(round(light.energy * FIXED_ONE)),
-        "field_0x38": obj.get("rif_field_0x38", 0),
+        "spread": obj.get("rif_spread", LIGHT_SPREAD),
         "range": int(round((light.cutoff_distance if light.use_custom_distance else 0.0) / scale)),
         "colour": colour,
         "flags": obj.get("rif_flags", 3),
-        "field_0x48": obj.get("rif_field_0x48", 1),
-        "field_0x4c": list(obj.get("rif_field_0x4c", [0, 0])),
+        "local_flags": obj.get("rif_local_flags", 1),
+        "pad": list(obj.get("rif_pad", [0, 0])),
     }
     return rif.Chunk(b"STDLIGHT", schema.encode(b"STDLIGHT", props))
 
@@ -2447,7 +2663,7 @@ def rebuild_tree(collection, scale=None, y_down=None, fps=None):
     y_down = bool(collection.get("rif_y_down", True)) if y_down is None else y_down
     fps = float(collection.get("rif_fps", 30.0)) if fps is None else fps
     stats = {"shapes": 0, "objects": 0, "lights": 0, "textures": 0, "new_textures": 0,
-             "sounds": 0}
+             "sounds": 0, "degenerate_faces": 0, "lighting_dropped": 0}
     # Read the rest pose, not whatever the animation system is posing right now.
     # This also runs the depsgraph, which export needs because matrix_world is
     # stale until it does.
@@ -2713,8 +2929,9 @@ def adopt_object(collection, obj, name=None):
     """Give ``obj`` the properties that make it part of ``collection``'s file.
 
     A mesh becomes an ``RBOBJECT`` with its own ``REBSHAPE``; an empty becomes an
-    ``RBOBJECT`` with no geometry. Returns a message on refusal, ``None`` on
-    success.
+    ``RBOBJECT`` with no geometry; a light becomes a ``STDLIGHT`` under the
+    file's ``LIGHTSET``, which is created on first use. Returns a message on
+    refusal, ``None`` on success.
 
     **The empty is the unattested case, and a mesh is the way a shipped level
     does it.** ``level01.RIF``'s spawn points are ordinary ``RBOBJECT``s carrying
@@ -2730,9 +2947,15 @@ def adopt_object(collection, obj, name=None):
     """
     if "rif_id" in obj:
         return "%s is already in a RIF collection" % obj.name
-    if obj.type not in ("MESH", "EMPTY", "ARMATURE"):
-        return "%s is a %s; only meshes, empties and armatures can be RIF objects" % (
-            obj.name, obj.type.lower())
+    if obj.type not in ("MESH", "EMPTY", "ARMATURE", "LIGHT"):
+        return ("%s is a %s; only meshes, empties, armatures and lights can be "
+                "RIF objects" % (obj.name, obj.type.lower()))
+
+    if obj.type == "LIGHT":
+        # A light is not an object in the file's object list at all -- it lives
+        # under REBENVDT's LIGHTSET -- so it takes none of the shape/OBJHEAD1
+        # bookkeeping below.
+        return _adopt_light(collection, obj)
 
     if obj.type == "ARMATURE":
         # An armature is the file's OBJCHIER tree, not an object in it, so it
@@ -2786,6 +3009,420 @@ def _link_into(collection, obj):
     for other in list(obj.users_collection):
         other.objects.unlink(obj)
     collection.objects.link(obj)
+
+
+# --------------------------------------------------------------------------
+# Lights: the LIGHTSET a new one needs to live in
+# --------------------------------------------------------------------------
+
+def _next_child_index(datablock, children=()):
+    """The next free index among a container's own children.
+
+    Absorbed leaves and child objects share one numbering, because ``_rebuild``
+    merges the two and sorts by it. The number is a sort key and nothing else --
+    it orders the children and is then dropped, never written to the file.
+    """
+    used = [_path_index(path) for path, _ in _absorbed_entries(datablock)
+            if "/" not in path]
+    used += [int(o.get("rif_index", 0)) for o in children]
+    return max(used, default=-1) + 1
+
+
+def _children_of(collection, parent, chunk_id=None):
+    objs = [o for o in collection.objects if o.parent == parent and "rif_id" in o]
+    if chunk_id is not None:
+        objs = [o for o in objs if o.get("rif_id") == chunk_id]
+    return objs
+
+
+def _rebenvdt_object(collection):
+    for obj in collection.objects:
+        if obj.get("rif_id") == "REBENVDT":
+            return obj
+    return None
+
+
+def _promote_rebenvdt(collection):
+    """The file-level ``REBENVDT`` as a real object, creating it if it is absorbed.
+
+    A container becomes a Blender object exactly when something inside it needs
+    one (:func:`_is_data_only`), so in the 502 shipped files with no lights
+    ``REBENVDT`` is a path prefix on the collection rather than a datablock.
+    Adding the first light is what stops that being true, and this performs the
+    same lift the importer already does for the 62 files that have a
+    ``LIGHTSET``. Returns ``None`` if there is no ``REBENVDT`` at all, which no
+    shipped file and no :func:`new_collection` produces.
+    """
+    existing = _rebenvdt_object(collection)
+    if existing is not None:
+        return existing
+
+    entries = _absorbed_entries(collection)
+    prefix = next((path.partition("/")[0] for path, _ in entries
+                   if path.partition("/")[0].rpartition(":")[0] == "REBENVDT"), None)
+    if prefix is None:
+        return None
+
+    kept, moved = [], []
+    for path, props in entries:
+        head, sep, tail = path.partition("/")
+        if head != prefix:
+            kept.append((path, props))
+        elif sep:
+            moved.append((tail, props))
+        # A bare "REBENVDT:n" entry is the empty-container marker; the object is
+        # now that container, so it is dropped rather than carried.
+
+    obj = bpy.data.objects.new("REBENVDT", None)
+    obj["rif_id"] = "REBENVDT"
+    obj["rif_index"] = _path_index(prefix)
+    obj["rif_absorbed"] = _pack_absorbed(moved)
+
+    # The texture table's recorded location has to move with it: the path is
+    # relative to whichever datablock stores it, and that has just changed.
+    table = collection.get("rif_bmpnames_path")
+    if table and table.partition("/")[0] == prefix:
+        obj["rif_bmpnames_path"] = table.partition("/")[2]
+        del collection["rif_bmpnames_path"]
+
+    collection["rif_absorbed"] = _pack_absorbed(kept)
+    _link_into(collection, obj)
+    return obj
+
+
+def lightset_for(collection, create=True):
+    """The collection's ``LIGHTSET`` object, building one if it has none."""
+    for obj in collection.objects:
+        if obj.get("rif_id") == "LIGHTSET":
+            return obj
+    if not create:
+        return None
+    parent = _promote_rebenvdt(collection)
+    if parent is None:
+        return None
+
+    obj = bpy.data.objects.new("LIGHTSET", None)
+    obj["rif_id"] = "LIGHTSET"
+    obj["rif_index"] = _next_child_index(parent, _children_of(collection, parent))
+    obj["rif_absorbed"] = _pack_absorbed([
+        ("LTSETHDR:0", {schema.GENERIC_FIELD: heads.to_words(LIGHTSET_HEADER)}),
+        ("AMBIENCE:1", {"ambience": LIGHTSET_AMBIENCE}),
+    ])
+    obj.parent = parent
+    _link_into(collection, obj)
+    return obj
+
+
+def next_light_id(collection):
+    """A file-unique ``light_id``.
+
+    Unique within the file in all 38 that have lights, but **not** ``0..n-1`` --
+    only 10 of the 38 are numbered that way -- so it is an id the editor handed
+    out, not a position. Allocating past the highest reproduces that.
+    """
+    used = [int(o.get("rif_light_id", 0)) for o in collection.objects
+            if o.get("rif_id") == "STDLIGHT"]
+    return max(used, default=-1) + 1
+
+
+def _place_ambience_last(collection, lightset):
+    """Keep ``AMBIENCE`` after the lights, which is where all 62 shipped sets put it.
+
+    Only the ordering is at stake -- AvP's loader reaches both leaves through
+    ``lookup_single_child``, so nothing depends on it -- but matching the shipped
+    layout costs one rewrite of a sort key that never reaches the file.
+    """
+    highest = max((int(o.get("rif_index", 0))
+                   for o in _children_of(collection, lightset, "STDLIGHT")), default=0)
+    entries = _absorbed_entries(lightset)
+    for i, (path, props) in enumerate(entries):
+        if path.rpartition(":")[0] == "AMBIENCE":
+            entries[i] = ("AMBIENCE:%d" % (highest + 1), props)
+            lightset["rif_absorbed"] = _pack_absorbed(entries)
+            return
+
+
+# --------------------------------------------------------------------------
+# Baked vertex lighting: the paintable colour attribute IS the stored value
+# --------------------------------------------------------------------------
+#
+# `SHPVTINT` is one packed 0xAARRGGBB per vertex on the wire, and the scene holds
+# it as `rif_light`, a per-vertex BYTE_COLOR attribute -- the form the viewport
+# draws, Vertex Paint edits, and a Cycles bake can target directly
+# (Bake > Output > Target > Active Color Attribute). Export packs it back.
+#
+# **Read and write it through `color_srgb`, never `color`.** `color` converts
+# sRGB bytes to and from linear floats, and measured over all 256 values per
+# channel that loses a least-significant bit on 157 of them. `color_srgb` is the
+# stored byte: 256/256 exact through a .blend save and reload, alpha included.
+# That measurement is what makes storing the colour form lossless, and so what
+# makes it safe to store *only* that -- there is no packed mirror to desync from,
+# and no bake that lands in the scene but not in the file.
+#
+# It is **name-gated**, and that is the whole discipline. Export reads
+# `rif_light` and nothing else -- never `color_attributes.active_color`, which
+# is Blender-wide UI state that a bake, a preview, or any other feature can
+# repoint. So an attribute that is not this one cannot become the file's
+# lighting by accident; :func:`adopt_color_attribute` is the deliberate way to
+# fold one in, and it is where the corner-domain averaging and the clamp live.
+#
+# Two states have to stay distinguishable and the attribute alone cannot do it:
+# an object that ships no `SHPVTINT` at all (the engine defaults it to
+# 0xFFFFFFFF) and one that ships an all-white chunk. :data:`VTINT_HEADER_PROP`
+# is the marker, which it can be because it is already the chunk's own header --
+# it exists exactly when the object carries a chunk, and it carries the light set
+# name that selects it. That is what lets the preview mint a white `rif_light`
+# to render through without silently adding a chunk to every unlit mesh.
+
+#: The stored, paintable, exported attribute: one BYTE_COLOR per vertex.
+LIGHT_COLOR_ATTR = "rif_light"
+
+#: The mesh property holding the chunk's own 4-int header, and -- by its mere
+#: presence -- "this object carries a SHPVTINT". Set on import for an object that
+#: had one, and by :func:`enable_lighting` for one being lit for the first time.
+VTINT_HEADER_PROP = "rif_vtint_header"
+
+#: 0xFFFFFFFF as a signed int32: white, fully opaque. What a vertex with no
+#: lighting yet gets, so a mesh that never had a SHPVTINT can still be baked to.
+LIGHT_WHITE = -1
+
+
+def _byte(x):
+    """A 0..1 float to 0..255, clamped -- a bake can return values past 1.0."""
+    if x <= 0.0:
+        return 0
+    if x >= 1.0:
+        return 255
+    return int(round(x * 255.0))
+
+
+def unpack_light(v):
+    """Packed 0xAARRGGBB -> ``(r, g, b, a)`` bytes."""
+    u = v & 0xFFFFFFFF
+    return ((u >> 16) & 0xFF, (u >> 8) & 0xFF, u & 0xFF, (u >> 24) & 0xFF)
+
+
+def pack_light(r, g, b, a):
+    """``(r, g, b, a)`` bytes -> the signed int32 Blender's INT attribute holds."""
+    v = ((a & 0xFF) << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF)
+    return v - (1 << 32) if v & 0x80000000 else v
+
+
+def _set_active_color(me, attr):
+    """Make ``attr`` the active colour attribute, which is what a bake targets."""
+    for i, a in enumerate(me.color_attributes):
+        if a.name == attr.name:
+            for prop in ("active_color_index", "render_color_index"):
+                with contextlib.suppress(AttributeError, TypeError):
+                    setattr(me.color_attributes, prop, i)
+            return
+
+
+def white_light_attribute(me, name=LIGHT_COLOR_ATTR):
+    """Ensure ``name`` is a per-vertex BYTE_COLOR, white where it is new, and active.
+
+    Deliberately does **not** set :data:`VTINT_HEADER_PROP`, so this alone does
+    not give the object a ``SHPVTINT``. That is what lets the preview render an
+    unlit mesh the way the engine does -- white diffuse -- without adding a chunk
+    to the file behind the author's back. :func:`enable_lighting` is the call
+    that means "and export it".
+
+    An existing attribute of the wrong shape is replaced rather than written
+    into: its values do not describe this mesh. Returns ``(name, existed)``.
+    """
+    attr = me.color_attributes.get(name)
+    existed = attr is not None
+    if attr is not None and (attr.data_type != "BYTE_COLOR" or attr.domain != "POINT"
+                             or len(attr.data) != len(me.vertices)):
+        me.color_attributes.remove(attr)
+        attr, existed = None, False
+    if attr is None:
+        attr = me.color_attributes.new(name=name, type="BYTE_COLOR", domain="POINT")
+        for item in attr.data:
+            item.color_srgb = (1.0, 1.0, 1.0, 1.0)
+    _set_active_color(me, attr)
+    return attr.name, existed
+
+
+def has_lighting(me):
+    """Does this mesh carry a ``SHPVTINT``? The marker, not the attribute."""
+    return me is not None and VTINT_HEADER_PROP in me
+
+
+def enable_lighting(me):
+    """Start lighting this mesh: a white ``rif_light`` if it has none, plus the marker.
+
+    The attribute is made **active**, which is what makes
+    *Bake > Output > Target > Active Color Attribute* write straight into the
+    stored value -- there is no packing step. Returns ``(name, had_lighting)``.
+    """
+    had = has_lighting(me)
+    name, _existed = white_light_attribute(me)
+    if not had:
+        me[VTINT_HEADER_PROP] = list(VTINT_HEADER)
+    return name, had
+
+
+def adopt_color_attribute(me, name=None):
+    """Fold a colour attribute into ``rif_light``, the one export reads.
+
+    The escape hatch for a bake that landed somewhere else -- Blender's default
+    new colour attribute is **corner**-domain, and a bake targets whatever is
+    active. Reads ``name``, else the active attribute. A corner attribute is
+    averaged per vertex, because the file has one value per vertex and no way to
+    express a per-corner one, and values above 1.0 clamp.
+
+    This is the only place either of those reductions happens. Export refuses a
+    ``rif_light`` it cannot use rather than doing them silently, so a lossy
+    conversion is always something the author asked for.
+
+    Returns ``(source name, None)`` or ``(None, reason)``.
+    """
+    attr = me.color_attributes.get(name) if name else None
+    if attr is None and not name:
+        try:
+            attr = me.color_attributes.active_color
+        except AttributeError:
+            attr = None
+    if attr is None:
+        return None, ("%s has no colour attribute %s"
+                      % (me.name, "called %r" % name if name else "active"))
+
+    # `data` is empty while the mesh is in Edit Mode, and goes short or stale when
+    # the mesh is edited after the attribute was made. Either way the values do
+    # not describe this mesh, so refuse rather than adopt whatever is there --
+    # silently writing a partial SHPVTINT is worse than not writing one.
+    n = len(me.vertices)
+    want = n if attr.domain == "POINT" else len(me.loops)
+    if me.is_editmode:
+        return None, "%s is in Edit Mode; leave it before adopting lighting" % me.name
+    if len(attr.data) != want:
+        return None, ("%s: colour attribute %r holds %d value(s) for %d %s -- the mesh "
+                      "changed since it was made; re-bake before adopting it"
+                      % (me.name, attr.name, len(attr.data), want,
+                         "vertices" if attr.domain == "POINT" else "corners"))
+
+    # Already the stored attribute, and usable as it stands: nothing to convert,
+    # so do not round-trip the bytes through a copy. Only the marker may be
+    # missing, which is exactly the "I painted the preview's attribute and now I
+    # want it exported" case.
+    if attr.name == LIGHT_COLOR_ATTR and attr.domain == "POINT":
+        me[VTINT_HEADER_PROP] = list(me.get(VTINT_HEADER_PROP, VTINT_HEADER))
+        _set_active_color(me, attr)
+        return attr.name, None
+
+    if attr.domain == "POINT":
+        colors = [tuple(attr.data[i].color_srgb) for i in range(n)]
+    else:
+        sums = [[0.0, 0.0, 0.0, 0.0] for _ in range(n)]
+        counts = [0] * n
+        for li, loop in enumerate(me.loops):
+            c = attr.data[li].color_srgb
+            acc = sums[loop.vertex_index]
+            for k in range(4):
+                acc[k] += c[k]
+            counts[loop.vertex_index] += 1
+        colors = [tuple(s[k] / counts[i] for k in range(4)) if counts[i]
+                  else (1.0, 1.0, 1.0, 1.0)      # a loose vertex, unreachable by a bake
+                  for i, s in enumerate(sums)]
+
+    # Quantize through the same clamp export would have applied, so what the
+    # viewport shows from here on is what the file gets.
+    source = attr.name
+    dst_name, _existed = white_light_attribute(me)
+    dst = me.color_attributes[dst_name]
+    for i, c in enumerate(colors[:len(dst.data)]):
+        r, g, b, a = (_byte(x) for x in c)
+        dst.data[i].color_srgb = (r / 255.0, g / 255.0, b / 255.0, a / 255.0)
+    me[VTINT_HEADER_PROP] = list(me.get(VTINT_HEADER_PROP, VTINT_HEADER))
+    return source, None
+
+
+def lighting_refusal(me):
+    """Why export would refuse this mesh's ``rif_light``, or None if it would not.
+
+    Deliberately separate from :func:`lighting_values` and O(1): the panel calls
+    it on every redraw, and packing a 13,000-vertex array to answer "is this
+    usable?" would make selecting a level object crawl.
+    """
+    attr = me.color_attributes.get(LIGHT_COLOR_ATTR)
+    if attr is None:
+        return ("%s is marked as carrying vertex lighting but has no %r attribute"
+                % (me.name, LIGHT_COLOR_ATTR))
+    if attr.domain != "POINT" or attr.data_type != "BYTE_COLOR":
+        return ("%s: %r is a %s %s attribute; vertex lighting is one BYTE_COLOR "
+                "per vertex -- use \"Use Active Color Attribute\" to convert it"
+                % (me.name, LIGHT_COLOR_ATTR, attr.domain.lower(), attr.data_type))
+    if len(attr.data) != len(me.vertices):
+        return ("%s: %r holds %d value(s) for %d vertices -- the mesh changed "
+                "since it was made" % (me.name, LIGHT_COLOR_ATTR,
+                                       len(attr.data), len(me.vertices)))
+    return None
+
+
+def lighting_values(me):
+    """``rif_light`` as the packed int32 array the chunk holds, or a refusal.
+
+    Returns ``(values, None)`` or ``(None, reason)``. The reason is export's, so
+    it names the operator that fixes it rather than describing the shape.
+    """
+    why = lighting_refusal(me)
+    if why is not None:
+        return None, why
+    attr = me.color_attributes[LIGHT_COLOR_ATTR]
+    return [pack_light(*[_byte(c) for c in attr.data[i].color_srgb])
+            for i in range(len(me.vertices))], None
+
+
+def lighting_problems(collection):
+    """Every mesh whose lighting export would refuse, as a list of reasons.
+
+    Export raises rather than writing a file that disagrees with the scene, so
+    this exists to say so *before* anything is written -- the same shape as the
+    shared-shape-id check.
+    """
+    problems = []
+    for obj in collection.objects if collection else ():
+        if obj.get("rif_id") != "RBOBJECT" or obj.data is None:
+            continue
+        if not has_lighting(obj.data):
+            continue
+        if obj.data.color_attributes.get(LIGHT_COLOR_ATTR) is None:
+            continue        # reported as a dropped chunk, not refused -- see _vtint_chunk
+        why = lighting_refusal(obj.data)
+        if why is not None:
+            problems.append(why)
+    return problems
+
+
+def _adopt_light(collection, obj):
+    """A Blender light -> a ``STDLIGHT`` under the file's ``LIGHTSET``."""
+    lightset = lightset_for(collection)
+    if lightset is None:
+        return "%s has no REBENVDT to hold a light set" % collection.name
+
+    lights = _children_of(collection, lightset, "STDLIGHT")
+    obj["rif_id"] = "STDLIGHT"
+    # Index 0 is LTSETHDR's, so lights start at 1.
+    obj["rif_index"] = max((int(o.get("rif_index", 0)) for o in lights), default=0) + 1
+    obj["rif_light_id"] = next_light_id(collection)
+    obj["rif_spread"] = LIGHT_SPREAD
+    obj["rif_flags"] = 3
+    obj["rif_local_flags"] = 1
+    obj["rif_pad"] = [0, 0]
+
+    # Blender's defaults are in photometric watts and metres; the chunk wants a
+    # 16.16 multiplier and rif units. `range` 0 means the light lights nothing,
+    # which is what an untouched Blender light would otherwise export.
+    obj.data.energy = LIGHT_ENERGY
+    if not obj.data.use_custom_distance:
+        obj.data.use_custom_distance = True
+    obj.rotation_mode = "QUATERNION"
+
+    obj.parent = lightset
+    _link_into(collection, obj)
+    _place_ambience_last(collection, lightset)
+    return None
 
 
 def adopt_bone(arm_obj, bone):
@@ -2929,3 +3566,570 @@ def _ensure_mesh_attributes(me):
         has_uv = bool(me.uv_layers)
         for item in attr.data:
             item.value = has_uv
+
+
+# --------------------------------------------------------------------------
+# Navigation mesh preview
+# --------------------------------------------------------------------------
+
+NAV_WALKABLE_ATTR = "rif_walkable"
+NAV_ISLAND_ATTR = "rif_nav_island"
+
+
+def _face_attr(me, name, kind):
+    attr = me.attributes.get(name)
+    if attr is not None and (attr.domain != "FACE" or attr.data_type != kind
+                             or len(attr.data) != len(me.polygons)):
+        me.attributes.remove(attr)
+        attr = None
+    return attr or me.attributes.new(name, kind, "FACE")
+
+
+def navmesh_preview(obj, scale=None, y_down=None):
+    """Classify this mesh's faces the way Gunlok's nav builder does.
+
+    Writes two FACE attributes -- ``rif_walkable`` (BOOLEAN) and
+    ``rif_nav_island`` (INT, -1 where not walkable, else the connected region
+    ordered largest-first) -- and leaves the walkable faces **selected**, which
+    is the part that needs no viewport setup to see.
+
+    Deliberately writes no colour attribute. Export is name-gated on
+    ``rif_light`` so one left here could never *become* the lighting on its own,
+    but :func:`adopt_color_attribute` reads whichever attribute is **active** --
+    so leaving one would put a navmesh preview one click away from being adopted
+    as this object's baked lighting. The INT island id is trivially turned into
+    colour with Geometry Nodes when that is wanted.
+
+    Returns ``(stats dict, reason)`` -- ``reason`` is a string when nothing was
+    done.
+    """
+    me = getattr(obj, "data", None)
+    if me is None or not hasattr(me, "polygons"):
+        return None, "%s is not a mesh" % obj.name
+    if me.is_editmode:
+        return None, "%s is in Edit Mode; leave it before previewing" % obj.name
+    if not len(me.polygons):
+        return None, "%s has no faces" % obj.name
+
+    collection = collection_for(obj)
+    if scale is None:
+        scale = float(collection.get("rif_scale", 1.0)) if collection else 1.0
+    if y_down is None:
+        y_down = bool(collection.get("rif_y_down", True)) if collection else True
+
+    # The engine rotates the stored normal by the object's matrix before testing
+    # it, so a mesh whose object still carries a rotation is classified in the
+    # orientation it will actually load with -- not the one its vertices imply.
+    rot = obj.matrix_world.to_3x3()
+    fl = me.attributes.get("rif_flags")
+
+    normals_rif = []
+    flags = []
+    for i, poly in enumerate(me.polygons):
+        n = rot @ poly.normal
+        if n.length > 0.0:
+            n = n.normalized()
+        normals_rif.append((n.x, -n.z, n.y) if y_down else (n.x, n.y, n.z))
+        flags.append(fl.data[i].value if fl is not None and i < len(fl.data) else 0)
+
+    walk_flags = [shp.is_walkable(normals_rif[i], flags[i]) for i in range(len(me.polygons))]
+
+    # Weld by the *quantized* position, because that is the identity the engine's
+    # vertex records have -- see shapes.weld_map.
+    verts = [to_rif(v.co, scale, y_down) for v in me.vertices]
+    welded = shp.weld_map(verts)
+    faces = {i: tuple(welded[v] for v in p.vertices) for i, p in enumerate(me.polygons)}
+    islands = shp.nav_islands(faces, lambda f: walk_flags[f])
+
+    wa = _face_attr(me, NAV_WALKABLE_ATTR, "BOOLEAN")
+    isl = _face_attr(me, NAV_ISLAND_ATTR, "INT")
+    for i, poly in enumerate(me.polygons):
+        wa.data[i].value = walk_flags[i]
+        isl.data[i].value = islands.get(i, -1)
+        poly.select = walk_flags[i]
+    me.update()
+
+    sizes = {}
+    for isle in islands.values():
+        sizes[isle] = sizes.get(isle, 0) + 1
+    n_walk = sum(walk_flags)
+    steep = sum(1 for i in range(len(me.polygons))
+                if not walk_flags[i] and normals_rif[i][1] < 0
+                and not (flags[i] & shp.NAV_BLOCKED_FLAG))
+    return {
+        "faces": len(me.polygons),
+        "walkable": n_walk,
+        "blocked_flag": sum(1 for f in flags if f & shp.NAV_BLOCKED_FLAG),
+        "faces_down": sum(1 for i in range(len(me.polygons)) if normals_rif[i][1] >= 0),
+        "too_steep": steep,
+        "islands": len(sizes),
+        "largest": max(sizes.values()) if sizes else 0,
+    }, None
+
+
+# --------------------------------------------------------------------------
+# Gunlok preview: seeing the baked lighting the way the engine draws it
+# --------------------------------------------------------------------------
+#
+# The engine's surface shading is two decisions long, and both were read out of
+# the binary rather than guessed:
+#
+# - `BuildShapeVertexBuffers` @ 0x005ab300 fills a 0x24-byte vertex whose +0x18
+#   is the D3DCOLOR diffuse, and assigns `diffuse = shpvtint->values[vert] |
+#   0xFF000000` -- the stored word **undecoded**, with the file's top byte
+#   ignored and alpha forced opaque. A mesh with no SHPVTINT gets 0xFFFFFFFF.
+#   Gunlok does *not* do AvP's `sqrt((r^2+g^2+b^2)/3)` reduction.
+# - `InitBuiltinMaterials` @ 0x005757b2 gives `Mat_Opaque` COLOROP =
+#   D3DTOP_MODULATE with COLORARG1 = D3DTA_TEXTURE and COLORARG2 = D3DTA_DIFFUSE.
+#
+# So an opaque surface is exactly `texel * vertex_colour`, per channel, on the
+# 8-bit numbers -- and because this is D3D8 fixed function, that multiply happens
+# in **gamma space**, on the sRGB-encoded bytes, not in linear light.
+#
+# **That is the whole difficulty, and it is not a rounding detail.** The obvious
+# material -- Color Attribute x Image Texture -> Emission -- multiplies in linear
+# space, which would be equivalent only if sRGB were a pure power law. It is not:
+# it has a linear toe below 0.04045, so `(a^g * b^g)^(1/g) = a*b` fails. Measured
+# against the 8-bit reference, the naive graph is wrong by up to 7.43/255, and it
+# is worst in the dark midrange where Gunlok's lighting actually lives (2.30 LSB
+# at light 0x08, 6.49 at 0x20, 7.43 at 0x40, 0 only at 0xff). A pure 2.2 power
+# law gives exactly 0.0 error, which is what identifies the piecewise toe as the
+# culprit rather than any imprecision.
+#
+# The preview therefore multiplies the *stored* numbers and converts once at the
+# end, which needs three things to line up:
+#
+# - the image texture is set to **Non-Color**, so its output is `byte / 255`
+#   rather than the linearised value sRGB would give;
+# - the colour attribute is *not* raw -- a BYTE_COLOR attribute is sRGB-encoded
+#   storage and Blender linearises it on read -- so it goes through an exact
+#   linear->sRGB encode to recover `byte / 255`;
+# - the product is converted back with an exact sRGB->linear decode before
+#   Emission, because the view transform encodes it again on the way to the
+#   screen.
+#
+# Both conversions are the **exact piecewise** function, built out of Math nodes.
+# Blender's `Gamma` node is a pure power law and would reintroduce the very error
+# being avoided, and there is no colour-space conversion node in the shader node
+# set at all (only in the compositor). Measured end to end by rendering, the
+# graph below reproduces `texel * light / 255` with **0.00 LSB** error on every
+# channel, where the naive linear graph misses by 2.5 to 5.6 on the same inputs.
+#
+# Emission is deliberate: nothing may re-light the result. That also makes the
+# world irrelevant -- verified as identical pixels at world strength 0 and 20 --
+# so this does not touch scene lighting.
+
+#: Bumped when the transfer-function groups change shape, so a ``.blend`` made by
+#: an older addon rebuilds them instead of silently keeping the older graph.
+PREVIEW_GROUP_VERSION = 1
+
+ENCODE_GROUP = "RIF Linear to sRGB"
+DECODE_GROUP = "RIF sRGB to Linear"
+
+#: On a preview material: the material it stands in for. An **ID pointer**, not a
+#: name, so renaming or reordering cannot orphan it; verified to survive a
+#: ``.blend`` save and reload.
+PREVIEW_SOURCE_PROP = "rif_preview_source"
+
+#: On the scene: the colour management and viewport state to put back.
+PREVIEW_STATE_PROP = "rif_preview_restore"
+
+_SRGB_LINEAR_CUT = 0.0031308      # linear side of the toe
+_SRGB_GAMMA_CUT = 0.04045         # encoded side of the toe
+
+
+def _math_node(tree, op, y=None, z=None, clamp=False):
+    """A Math node with its constant inputs set **by index**.
+
+    Never by socket name: a Math node calls all three "Value", and the
+    multi-type nodes elsewhere in Blender's set repeat names across data types.
+    """
+    node = tree.nodes.new("ShaderNodeMath")
+    node.operation = op
+    node.use_clamp = clamp
+    for i, v in ((1, y), (2, z)):
+        if v is not None and i < len(node.inputs):
+            node.inputs[i].default_value = v
+    return node
+
+
+def _srgb_transfer_group(name, decode):
+    """A node group applying the exact piecewise sRGB transfer function.
+
+    ``decode`` selects sRGB -> linear; otherwise linear -> sRGB. One chain per
+    channel, because Math nodes are scalar and Blender has no per-channel
+    conditional on a colour.
+
+    Rebuilt when :data:`PREVIEW_GROUP_VERSION` moves, reused otherwise -- so the
+    two groups exist once per ``.blend`` however many materials reference them.
+    """
+    group = bpy.data.node_groups.get(name)
+    if group is not None:
+        if group.get("rif_transfer_version") == PREVIEW_GROUP_VERSION:
+            return group
+        bpy.data.node_groups.remove(group)
+
+    group = bpy.data.node_groups.new(name, "ShaderNodeTree")
+    group["rif_transfer_version"] = PREVIEW_GROUP_VERSION
+    group.interface.new_socket("Color", in_out="INPUT", socket_type="NodeSocketColor")
+    group.interface.new_socket("Color", in_out="OUTPUT", socket_type="NodeSocketColor")
+
+    gin = group.nodes.new("NodeGroupInput")
+    gin.location = (-1000, 0)
+    gout = group.nodes.new("NodeGroupOutput")
+    gout.location = (700, 0)
+    sep = group.nodes.new("ShaderNodeSeparateColor")
+    sep.location = (-800, 0)
+    comb = group.nodes.new("ShaderNodeCombineColor")
+    comb.location = (500, 0)
+    group.links.new(sep.inputs[0], gin.outputs[0])
+    group.links.new(gout.inputs[0], comb.outputs[0])
+
+    for ch in range(3):
+        row = -300 * ch
+        # A bake can hand back values outside 0..1, and POWER of a negative base
+        # is not the continuation anybody wants, so each channel is clamped once
+        # and every branch reads the clamped value.
+        clamped = _math_node(group, "MULTIPLY", y=1.0, clamp=True)
+        group.links.new(clamped.inputs[0], sep.outputs[ch])
+        src = clamped.outputs[0]
+
+        if decode:
+            lo = _math_node(group, "MULTIPLY", y=1.0 / 12.92)
+            shift = _math_node(group, "MULTIPLY_ADD", y=1.0 / 1.055, z=0.055 / 1.055)
+            hi = _math_node(group, "POWER", y=2.4)
+            cut = _SRGB_GAMMA_CUT
+        else:
+            lo = _math_node(group, "MULTIPLY", y=12.92)
+            shift = _math_node(group, "POWER", y=1.0 / 2.4)
+            hi = _math_node(group, "MULTIPLY_ADD", y=1.055, z=-0.055)
+            cut = _SRGB_LINEAR_CUT
+        group.links.new(shift.inputs[0], src)
+        group.links.new(hi.inputs[0], shift.outputs[0])
+        group.links.new(lo.inputs[0], src)
+
+        below = _math_node(group, "LESS_THAN", y=cut)
+        group.links.new(below.inputs[0], src)
+
+        # out = (lo - hi) * below + hi. Written as arithmetic rather than with a
+        # Mix node because Mix repeats "A"/"B" once per data type and its float
+        # sockets are only reachable by index.
+        delta = _math_node(group, "SUBTRACT")
+        group.links.new(delta.inputs[0], lo.outputs[0])
+        group.links.new(delta.inputs[1], hi.outputs[0])
+        out = _math_node(group, "MULTIPLY_ADD")
+        group.links.new(out.inputs[0], delta.outputs[0])
+        group.links.new(out.inputs[1], below.outputs[0])
+        group.links.new(out.inputs[2], hi.outputs[0])
+        group.links.new(comb.inputs[ch], out.outputs[0])
+
+        for i, node in enumerate((clamped, shift, hi, lo, below, delta, out)):
+            node.location = (-620 + 150 * i, row - (120 if node is lo else 0))
+
+    return group
+
+
+def source_image(mat):
+    """The image a material wears, or None -- the texture the engine samples."""
+    if not (mat and mat.use_nodes and mat.node_tree):
+        return None
+    nodes = [n for n in mat.node_tree.nodes
+             if n.type == "TEX_IMAGE" and n.image is not None]
+    if not nodes:
+        return None
+    # Prefer the one actually feeding base colour, which is what `_wire_texture`
+    # builds; fall back to the first, so a hand-edited material still previews.
+    for node in nodes:
+        for link in mat.node_tree.links:
+            if link.from_node is node and link.to_socket.name in ("Base Color", "Color"):
+                return node.image
+    return nodes[0].image
+
+
+def is_preview_material(mat):
+    return mat is not None and PREVIEW_SOURCE_PROP in mat
+
+
+def preview_material(source):
+    """The Gunlok-shading stand-in for ``source``, made once and reused.
+
+    One preview per source material, so objects sharing a material share its
+    preview and the texture index each material stands for is left untouched.
+    """
+    if is_preview_material(source):
+        return source
+    for mat in bpy.data.materials:
+        if is_preview_material(mat) and mat.get(PREVIEW_SOURCE_PROP) == source:
+            _build_preview_tree(mat, source)
+            return mat
+
+    mat = bpy.data.materials.new(("GK Preview %s" % source.name)[:59])
+    mat[PREVIEW_SOURCE_PROP] = source
+    _build_preview_tree(mat, source)
+    return mat
+
+
+def _build_preview_tree(mat, source):
+    """``texel * light`` in gamma space, decoded once, into Emission."""
+    mat.use_nodes = True
+    tree = mat.node_tree
+    tree.nodes.clear()
+
+    out = tree.nodes.new("ShaderNodeOutputMaterial")
+    out.location = (700, 0)
+    emission = tree.nodes.new("ShaderNodeEmission")
+    emission.location = (400, -60)
+    emission.inputs["Strength"].default_value = 1.0
+
+    light = tree.nodes.new("ShaderNodeAttribute")
+    light.location = (-820, -260)
+    light.attribute_type = "GEOMETRY"
+    light.attribute_name = LIGHT_COLOR_ATTR
+    light.label = "Baked vertex lighting"
+
+    encode = tree.nodes.new("ShaderNodeGroup")
+    encode.location = (-600, -260)
+    encode.node_tree = _srgb_transfer_group(ENCODE_GROUP, decode=False)
+    encode.label = "back to the stored bytes"
+    tree.links.new(encode.inputs[0], light.outputs["Color"])
+
+    product = tree.nodes.new("ShaderNodeVectorMath")
+    product.location = (-160, -60)
+    product.operation = "MULTIPLY"
+    product.label = "D3DTOP_MODULATE"
+
+    image = source_image(source)
+    if image is None:
+        # The 0xfff untextured sentinel, or a material whose `.RIM` is not
+        # installed. COLORARG1 has nothing to sample, so the diffuse stands
+        # alone -- white texel times light, i.e. the light itself.
+        product.inputs[0].default_value = (1.0, 1.0, 1.0)
+        tex = None
+    else:
+        tex = tree.nodes.new("ShaderNodeTexImage")
+        tex.location = (-820, 200)
+        tex.image = image
+        tex.interpolation = "Closest"
+        # The multiply has to see the stored byte. **The image's colour space is
+        # read, never written**: it is a property of a *shared* datablock, so
+        # forcing it to Non-Color here would leave the author's own materials
+        # rendering a linearised texture as though it were raw once the preview
+        # is restored. An sRGB image (which is what `_load_png` produces, and so
+        # every imported `.RIM`) is handed back through the same encode the
+        # colour attribute uses; one already tagged Non-Color is already raw.
+        texel = tex.outputs["Color"]
+        if image.colorspace_settings.name != "Non-Color":
+            to_bytes = tree.nodes.new("ShaderNodeGroup")
+            to_bytes.location = (-600, 200)
+            to_bytes.node_tree = _srgb_transfer_group(ENCODE_GROUP, decode=False)
+            to_bytes.label = "back to the stored bytes"
+            tree.links.new(to_bytes.inputs[0], texel)
+            texel = to_bytes.outputs[0]
+        tree.links.new(product.inputs[0], texel)
+    tree.links.new(product.inputs[1], encode.outputs[0])
+
+    decode = tree.nodes.new("ShaderNodeGroup")
+    decode.location = (60, -60)
+    decode.node_tree = _srgb_transfer_group(DECODE_GROUP, decode=True)
+    decode.label = "to linear for the view transform"
+    tree.links.new(decode.inputs[0], product.outputs[0])
+    tree.links.new(emission.inputs["Color"], decode.outputs[0])
+
+    if tex is not None and _has_alpha(image):
+        # Cut-outs are alpha-tested in the engine, so a previewed fence or sprite
+        # has to keep its holes rather than render as a solid quad.
+        transparent = tree.nodes.new("ShaderNodeBsdfTransparent")
+        transparent.location = (400, 160)
+        mix = tree.nodes.new("ShaderNodeMixShader")
+        mix.location = (560, 60)
+        tree.links.new(mix.inputs[0], tex.outputs["Alpha"])
+        tree.links.new(mix.inputs[1], transparent.outputs[0])
+        tree.links.new(mix.inputs[2], emission.outputs["Emission"])
+        tree.links.new(out.inputs["Surface"], mix.outputs[0])
+        if hasattr(mat, "surface_render_method"):
+            mat.surface_render_method = "DITHERED"
+        elif hasattr(mat, "blend_method"):
+            mat.blend_method = "CLIP"
+    else:
+        tree.links.new(out.inputs["Surface"], emission.outputs["Emission"])
+    return mat
+
+
+def is_shadow_object(obj):
+    """Is this the silhouette caster rather than something the camera sees?
+
+    ``level01_shadow.rif`` and its 24 siblings are a low-polygon stand-in used
+    only to build shadow volumes (``level_loading_notes.md``), so in a preview
+    they should cast and not appear. They are whole separate files, so the
+    collection name is the reliable signal and the object name the fallback.
+    """
+    coll = collection_for(obj)
+    names = [obj.name, rif_object_name(obj) or ""]
+    if coll is not None:
+        names.append(coll.name)
+    return any("_shadow" in n.lower() for n in names)
+
+
+def _preview_meshes(collection):
+    return [o for o in collection.all_objects
+            if o.type == "MESH" and o.data is not None]
+
+
+def preview_setup(collections=None, shadow_casters=True):
+    """Dress every RIF mesh so the viewport shows Gunlok's own shading.
+
+    Returns ``(stats, reason)``. Reversible: each preview material records the
+    material it replaced, and the scene records the colour management it changed.
+    """
+    targets = list(collections) if collections is not None else rif_collections()
+    if not targets:
+        return None, "No RIF collection in the scene"
+
+    stats = {"objects": 0, "materials": 0, "lit": 0, "shadow": 0, "untextured": 0}
+    seen = {}
+    for collection in targets:
+        for obj in _preview_meshes(collection):
+            if shadow_casters and is_shadow_object(obj):
+                # Ray visibility, which is exactly the role the engine gives it.
+                obj.visible_camera = False
+                obj.visible_shadow = True
+                stats["shadow"] += 1
+                continue
+
+            # A mesh with no lighting still has to render: the engine gives an
+            # object with no SHPVTINT a white diffuse, and a ShaderNodeAttribute
+            # naming an attribute that does not exist reads as black. So mint a
+            # white one -- and *only* a white one, never the marker, or looking
+            # at an unlit mesh would give it a chunk. An attribute that is
+            # already there is left exactly as it is: it is the stored lighting,
+            # which is precisely the work this preview exists to show.
+            if obj.data.color_attributes.get(LIGHT_COLOR_ATTR) is None:
+                white_light_attribute(obj.data)
+                stats["lit"] += 1
+
+            for slot in obj.material_slots:
+                source = slot.material
+                if source is None or is_preview_material(source):
+                    continue
+                preview = seen.get(source.name)
+                if preview is None:
+                    preview = preview_material(source)
+                    seen[source.name] = preview
+                    stats["materials"] += 1
+                    if source_image(source) is None:
+                        stats["untextured"] += 1
+                slot.material = preview
+            stats["objects"] += 1
+
+    remember_and_set_display()
+    return stats, None
+
+
+def _viewport_spaces():
+    """Every 3D viewport's active space, keyed so restore can find it again.
+
+    Keyed by screen *and* area index, not by screen: a workspace may hold two
+    viewports set to different shading, and collapsing them onto the screen name
+    would restore one of them to the other's mode.
+    """
+    for screen in bpy.data.screens:
+        for i, area in enumerate(screen.areas):
+            if area.type != "VIEW_3D":
+                continue
+            space = area.spaces.active
+            if space is not None and space.type == "VIEW_3D":
+                yield "%s/%d" % (screen.name, i), area, space
+
+
+def remember_and_set_display(scene=None):
+    """Colour management and viewport shading, recorded so restore is exact.
+
+    ``Standard`` is not a preference: Filmic and AgX are tone mappings, so they
+    would both shift the midtones this is trying to reproduce and roll off the
+    highlights rather than clamping at 1.0 the way the game does. Exposure and
+    gamma are reset for the same reason -- either one silently rescales the
+    result.
+    """
+    scene = scene or bpy.context.scene
+    view = scene.view_settings
+    if PREVIEW_STATE_PROP not in scene:
+        scene[PREVIEW_STATE_PROP] = json.dumps({
+            "view_transform": view.view_transform,
+            "look": view.look,
+            "exposure": view.exposure,
+            "gamma": view.gamma,
+            "shading": [[name, space.shading.type]
+                        for name, _area, space in _viewport_spaces()],
+        })
+
+    view.view_transform = "Standard"
+    with contextlib.suppress(TypeError):
+        view.look = "None"
+    view.exposure = 0.0
+    view.gamma = 1.0
+    # Material Preview, because Solid mode cannot do this at all:
+    # `View3DShading.color_type` is a single choice (VERTEX **or** TEXTURE) and
+    # the struct carries no blend or multiply option to combine them.
+    for _name, _area, space in _viewport_spaces():
+        space.shading.type = "MATERIAL"
+
+
+def preview_restore():
+    """Put the authored materials and the colour management back."""
+    stats = {"objects": 0, "materials": 0, "removed": 0}
+    for obj in bpy.data.objects:
+        touched = False
+        for slot in obj.material_slots:
+            source = slot.material.get(PREVIEW_SOURCE_PROP) if slot.material else None
+            if source is None:
+                continue
+            slot.material = source
+            stats["materials"] += 1
+            touched = True
+        stats["objects"] += touched
+
+    # A preview nothing references any more is rebuilt on demand, so leaving it
+    # would only accumulate. One still in use somewhere is left alone.
+    for mat in list(bpy.data.materials):
+        if is_preview_material(mat) and mat.users == 0:
+            bpy.data.materials.remove(mat)
+            stats["removed"] += 1
+
+    scene = bpy.context.scene
+    saved = scene.get(PREVIEW_STATE_PROP)
+    if saved:
+        state = json.loads(saved)
+        view = scene.view_settings
+        with contextlib.suppress(TypeError):
+            view.view_transform = state.get("view_transform", "Standard")
+        with contextlib.suppress(TypeError):
+            view.look = state.get("look", "None")
+        view.exposure = state.get("exposure", 0.0)
+        view.gamma = state.get("gamma", 1.0)
+        want = dict(state.get("shading", []))
+        for name, _area, space in _viewport_spaces():
+            if name in want:
+                with contextlib.suppress(TypeError):
+                    space.shading.type = want[name]
+        del scene[PREVIEW_STATE_PROP]
+    return stats, None
+
+
+def preview_is_active():
+    """Is anything currently wearing a preview material?
+
+    Asked of the **materials**, not of every object's slots: this is called from
+    a panel's ``draw`` and an operator's ``poll``, both of which run on every
+    redraw, and a level is thousands of objects against a few dozen materials. A
+    preview material with users is one that something is wearing.
+    """
+    return any(is_preview_material(mat) and mat.users for mat in bpy.data.materials)
+
+
+def preview_shade(texel, light):
+    """The engine's own arithmetic for one texel: ``texel * light / 255``.
+
+    The reference the material is measured against, kept beside it so the test
+    and the description cannot drift apart.
+    """
+    return tuple(t * light[i] / 255.0 for i, t in enumerate(texel))

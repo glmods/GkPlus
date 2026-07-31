@@ -23,7 +23,8 @@ blender/
     shapes.py            REBSHAPE geometry decode/encode
     bmpnames.py          the file's texture table
     sounds.py            INDSOUND: the file's indexed sound table
-    rim.py               .RIM textures: IFF container, DXT1/DXT3 decode
+    rim.py               .RIM textures: IFF container, DXT1/DXT3 decode,
+                         palettized CMAP/BODY both ways
   tools/build_zip.py     builds dist/io_scene_rif-<version>.zip
   tests/
     test_roundtrip.py    container format, runs without Blender
@@ -65,7 +66,8 @@ none of those and is silently absent from the file. The operators under *Object 
    smallest shipped file carries them. No texture table until a material asks for one.
 2. Model as usual, then ***Object ▸ Add to Gunlok RIF*** with the objects selected. A mesh becomes
    an `RBOBJECT` with its own `REBSHAPE` and a fresh shape id; an empty becomes an `RBOBJECT` with
-   no geometry; an armature becomes the file's `OBJCHIER` hierarchy.
+   no geometry; an armature becomes the file's `OBJCHIER` hierarchy; a light becomes a `STDLIGHT`
+   in the file's light set. See "Lights" below.
 3. For an animated model, parent each mesh to its bone, then mark each Action with
    ***Object ▸ Add Action to Gunlok RIF***. See "Editing and authoring animation" below.
 4. *File ▸ Export ▸ Gunlok RIF*.
@@ -113,7 +115,7 @@ parent's object.** On top of that, the things with a real Blender equivalent get
 | `OBANSEQC` | an **Action** on that armature, named from `OBASEQHD` (`Seq_Walk`, `Seq_Die`) |
 | `OBASEQFR` | a keyframe in it, plus a sound event on the Action if it triggers one |
 | `SHPMRGDT` | a per-face `rif_merge_group` attribute |
-| `SHPVTINT` | a per-vertex `rif_vertex_intensity` attribute |
+| `SHPVTINT` | a per-vertex `rif_light` **colour** attribute, paintable and bakeable |
 | `BMPNAMES` | the texture table on the collection, plus one material per texture index |
 | `INDSOUND` | a **Speaker** per entry, carrying the path, distances and volume |
 | polygon `engine_type` / `flags` | per-face attributes |
@@ -276,13 +278,40 @@ file-level table, the `BMPNAMES` chunk under `REBENVDT`, whose entries are paths
 | the table | `rif_bmpnames` on the collection, whole and in order | yes, rebuilt on export |
 | the index | `rif_texture_index` on a material | yes, via the table |
 | the name | `rif_bmp_name` on the same material | yes — **this is the retexturing knob** |
-| the image | a packed Blender image, wired to a Principled BSDF | no, `.RIM` files are read-only |
+| the image | a packed Blender image, wired to a Principled BSDF | only if you ask: **Textures** on the export |
 
 **To retexture, edit the texture path** in *Material Properties ▸ Gunlok RIF* and export. Every
 polygon wearing that material moves to the named texture, and if the file never mentioned it the
-table gains an entry at a fresh index. Assigning a different image to the texture node does nothing
-on export — the `.rif` stores the name, and only the name. (The field writes the `rif_bmp_name` ID
-property, which is what it was called when Custom Properties was the only way to reach it.)
+table gains an entry at a fresh index. Assigning a different image to the texture node does not
+change what the `.rif` says — that file stores the name, and only the name. (The field writes the
+`rif_bmp_name` ID property, which is what it was called when Custom Properties was the only way to
+reach it.)
+
+**To change how a texture looks, paint on the image and export with Textures set.** The images are
+a *second* output beside the `.rif`, so the export has its own **Textures** dropdown and
+**Textures folder**:
+
+| Textures | What is written |
+|---|---|
+| **None** (default) | just the `.rif`. The names are in it either way |
+| **Changed only** | the images whose pixels no longer match the `.RIM` they were imported from |
+| **All** | every texture the file names |
+
+Point the folder at a **mod**, not at the install — `<Gunlok>\gkplus\mods\<yours>\graphics` — and a
+name like `Units\baddies3.RIM` lands at `graphics\Units\baddies3.RIM`, which is exactly where
+GkPlus's mod loader looks for it. Pointing it at the install overwrites the real assets, which is
+allowed but is your call to make; nothing here asks twice.
+
+Written textures are **palettized, not DXT** (`CMAP` + `BODY`), which the engine reads first and
+prefers. That is exactly lossless — one palette entry per distinct colour, no quantization, no DXT
+block artifacts — at two to six times the size of a DXT file. **Compress textures** packs them with
+ByteRun1, which 36 of the shipped textures use; turning it off writes the raw form that has been
+verified end to end in the running game.
+
+"Changed only" re-reads the pixels and compares them against a digest taken at import, so it is
+about the *image*, not about whether Blender thinks the file is dirty — paint, save the `.blend`,
+reopen, and the edit is still recognised. An image the addon did not import has no digest and is
+always written.
 
 That panel also shows the **UV scale** the export will use, and warns when it is 1×1 — a material
 naming a texture whose size is unknown writes every UV as a single texel, which looks like nothing
@@ -312,10 +341,200 @@ with it off, the sound table still imports and its speakers are still created, t
 `.wav` loaded. The `Sound` folder is found the same way `Graphics` is, by searching upwards, and
 has no override of its own.
 
-`.RIM` is not a RIF chunk file. It is IFF (big-endian, `LIST`/`FORM`/`PROP` groups) carrying
-DXT1 or DXT3 in an `S3TC` chunk, plus a mip chain the importer discards since Blender makes its
-own. `rim.py` decodes it, and the images are packed rather than pushed in through `pixels` —
-Blender keeps a *generated* image's settings across a `.blend` save but not its pixels.
+`.RIM` is not a RIF chunk file. It is IFF (big-endian, `LIST`/`FORM`/`PROP` groups) carrying the
+image either as DXT1/DXT3 in an `S3TC` chunk or as a palette and planar bitplanes (`CMAP` +
+`BODY`), plus a mip chain the importer discards since Blender makes its own. Both forms are read —
+23 of the 513 shipped textures are palettized, and the game prefers that one where a file has
+both. The images are packed rather than pushed in through `pixels`, because Blender keeps a
+*generated* image's settings across a `.blend` save but not its pixels.
+
+`rim.py` also **writes** the palettized form, which is what the export's Textures option uses. The
+pixels come back out through `image.pixels`: for an 8-bit image that is the stored byte over 255
+with no colour management in the way, so an untouched texture reads back byte for byte identical
+to the `.RIM` it was decoded from — measured on Blender 4.2 and 5.2, across a `.blend` save and
+reload, alpha included.
+
+### Lights
+
+**Gunlok does not read them.** Editing or adding a light produces a correct `.rif` — the chunk is
+written exactly as the shipped ones are — but the shipped engine ignores the whole lighting family
+(`LIGHTSET`, `LTSETHDR`, `STDLIGHT`, `AMBIENCE`, `PLOBJLIT`, `LITSCALE`). Each of those chunk ids
+is referenced only from its own loader and registration in gl.exe, while every chunk the engine
+*does* consume — `SHPVTINT`, `INDSOUND`, `REBENVDT`, `OBJHIERD`, `SHPPOLYS` — shows a consumer
+outside its own translation unit. Runtime lighting comes from `SHPVTINT`, the **baked per-vertex
+intensity** the importer exposes as a `rif_light` colour attribute, plus the sun globals. The
+placed lights are editor-time data that produced those baked values, so to change how a level looks
+you edit the vertex attribute, not the lights. Full evidence in `rif_chunk_format.md`.
+
+They are still worth round-tripping: they are the authored record of how a level was lit, and
+exporting a file that drops them would lose that.
+
+#### Changing how a level actually looks
+
+That is the `rif_light` attribute, which the importer puts on the mesh and the engine does read. On
+the wire it is **one packed `0x00RRGGBB` colour per vertex** — not a scalar and not 16.16; no
+shipped value even falls in 0..65536. The commonest shipped values are `0xFF080808` (a dark grey)
+and `0xFFFFFFFF` (white).
+
+**It is used undecoded.** `BuildShapeVertexBuffers` copies the value straight into the vertex's
+D3DCOLOR `diffuse` and ORs alpha to `0xFF`; a mesh with no `SHPVTINT` gets `0xFFFFFFFF`. So the
+stored RGB *is* the vertex colour, the **top byte is ignored**, and Gunlok does **not** do the
+`sqrt((r² + g² + b²) / 3)` reduction AvP's software renderer uses. The final pixel is
+`texture × diffuse` — `Mat_Opaque` sets `COLOROP = MODULATE`, `ARG1 = TEXTURE`, `ARG2 = DIFFUSE`.
+
+In the scene it is a **`BYTE_COLOR` point attribute** — the form the viewport draws, Vertex Paint
+edits and a Cycles bake writes into. There is no packed mirror and no packing step: what you paint
+*is* what exports.
+
+1. *Object Properties ▸ Gunlok RIF ▸ Vertex lighting ▸* ***Enable Vertex Lighting*** — gives the
+   mesh a white `rif_light` if it has none and makes it the **active** colour attribute. A mesh
+   imported from a file that had a `SHPVTINT` already has one.
+2. Paint it, or bake into it: *Render ▸ Bake*, **Bake Type: Diffuse**, contributions **Direct** and
+   **Indirect** (uncheck Color), **Output ▸ Target: Active Color Attribute**. Light the scene with
+   ordinary Blender lights — the RIF's own lights play no part in this. Because `rif_light` is the
+   active attribute, that bake lands directly in the exported value.
+3. Export.
+
+Storing the paintable form is only safe because it is **lossless**, which took measuring: reading a
+`BYTE_COLOR` through Blender's `color` property converts sRGB↔linear and loses a least-significant
+bit on 157 of 256 values, while `color_srgb` is the stored byte and round-trips 256/256 exactly,
+alpha included. The addon uses `color_srgb` throughout. Checked end to end against the shipped
+files: 1,086 of 1,087 `SHPVTINT` chunks across a 25-file sample come back **byte-identical**, and
+the one that does not is not a loss — `level05_shadow.RIF` ships 13,098 values for a 13,016-vertex
+shape, so the tail no vertex indexes is dropped and `num_vertices` corrected. Only two objects in
+all 563 files are like that (`level15_shadow.RIF` is the other).
+
+Two rules make that storage safe to trust, and both are worth knowing before you fight them:
+
+- **Export reads `rif_light` by name, and nothing else.** Never the *active* colour attribute —
+  that is Blender-wide UI state a bake, a preview or any other feature can repoint, and the file's
+  lighting is not something any of them get to decide. If a bake landed somewhere else, or you
+  built a colour attribute yourself, ***Use Active Color Attribute*** folds it in deliberately.
+  That is the only place a **corner-domain** attribute is averaged per vertex (the file has one
+  value per vertex and cannot express a per-corner one) and the only place values above 1.0 clamp.
+  A bright lamp therefore saturates to white — if a bake comes back flat white, lower the lamp's
+  energy rather than assuming it failed.
+- **Export refuses a `rif_light` it cannot read as one value per vertex**, rather than averaging or
+  padding it into something plausible. That is what a mesh edit outrunning its lighting looks like,
+  and silently writing a partial `SHPVTINT` is worse than not writing one. The panel says so, and
+  the export operator refuses before it writes anything.
+
+Having the attribute is not the same as having lighting: the *marker* is the chunk's own header,
+kept on the mesh, so a `rif_light` minted purely so the preview can render an unlit mesh does not
+put a chunk in the file. Deleting the attribute from a mesh that is marked does not fail — export
+drops the chunk and says so as a **warning**, since a chunk that used to be in the file no longer
+is.
+
+Two more things the addon handles, both of which otherwise silently produce a file the engine
+ignores or misreads:
+
+- **The chunk is selected by name.** An object may carry one `SHPVTINT` per light set and the
+  loader takes the one matching the active set's `LTSETHDR` (`strncmp(..., 8)`). Gunlok ships
+  `NORMALLT` everywhere, so a mesh newly given lighting gets that name rather than zeros — a
+  zero-named chunk is never found. That name lives in the marker, which is why enabling lighting
+  is a deliberate act rather than a side effect of creating the attribute.
+- **`num_vertices` in its header is trusted** — the engine allocates and iterates that many times,
+  so a stale count reads past the chunk. Export regenerates it from the mesh, like `SHPHEAD1`'s
+  counts. (Before this it was carried, so editing a mesh wrote a chunk that disagreed with itself.)
+
+#### Seeing it the way the game will draw it
+
+Painting `rif_light` and *looking* at the result are separate problems, and Blender's Solid mode
+cannot do the second one: `View3DShading.color_type` is a single choice — vertex colour **or**
+texture, never both — and the shading struct carries no blend or multiply option to combine them.
+So *Object Properties ▸ Gunlok RIF ▸ Vertex lighting ▸ **Preview As In Game*** (also *Object ▸ Set
+Up Gunlok Preview*) builds a material that does what the engine does, and puts the viewport in
+Material Preview.
+
+It is reversible. Every preview material records the authored material it replaced — as an ID
+pointer, so renaming cannot orphan it — and the scene records the colour management the setup
+changed. The **↺** button beside it, or *Object ▸ Restore Authored Materials*, puts both back. Your
+own materials are never edited or deleted, and the preview material is regenerated on demand rather
+than being something to maintain.
+
+What it sets up, and why each part is not optional:
+
+- **`texture × rif_light`, multiplied on the stored 8-bit numbers.** This is the part that is easy
+  to get wrong and impossible to eyeball. The obvious material — Color Attribute × Image Texture →
+  Emission — multiplies in **linear** space, which would be equivalent only if sRGB were a pure
+  power law. It is not: it has a linear toe below 0.04045. Measured against the 8-bit reference the
+  naive graph is wrong by up to **7.43/255**, and it is worst exactly where Gunlok's lighting lives
+  (2.30 LSB at light `0x08`, 6.49 at `0x20`, 7.43 at `0x40`, and 0 only at `0xff`). Feeding it a
+  pure 2.2 power law instead gives 0.0 error, which is what identifies the toe as the culprit.
+
+  So the preview multiplies the *stored* values and converts once at the end. Both the texture and
+  the colour attribute reach the multiply through an exact **linear→sRGB encode**, which recovers
+  `byte / 255` from what Blender hands a shader — an sRGB image and a `BYTE_COLOR` attribute are
+  both sRGB storage that gets linearised on read — and the product is decoded back to linear before
+  Emission, since the view transform will encode it again on the way to the screen. Each conversion
+  is the **exact piecewise** function built from Math nodes: Blender's `Gamma` node is a pure power
+  law and would reintroduce the very error being avoided, and the shader node set has no
+  colour-space conversion node at all.
+
+  The image's colour space is **read, never written**. Setting it to Non-Color would get the raw
+  bytes in one step, but an image is a *shared* datablock — so that would leave your own materials
+  rendering a linearised texture as though it were raw once the preview is restored. An image
+  already tagged Non-Color is used directly.
+
+  Measured end to end by rendering, this reproduces `texel × light / 255` with **0.00 LSB** error
+  on every channel, against 2.5–5.6 for the naive graph on the same inputs.
+- **Emission, so nothing re-lights it.** That also makes the world irrelevant — verified as
+  identical pixels at world strength 0 and 20 — so the setup leaves your scene lighting alone.
+- **View transform Standard**, with Look, Exposure and Gamma neutralised. Filmic and AgX are tone
+  mappings: they would shift the midtones and roll off the highlights instead of clamping at 1.0
+  the way the game does.
+- **A `_shadow` object casts and is not drawn.** `level01_shadow.rif` and its 24 siblings are a
+  low-polygon stand-in used only to build shadow volumes, so the preview turns camera visibility
+  off and shadow visibility on for them — which is the role the engine gives them. Untick *Shadow
+  objects cast only* in the operator's redo panel if you want to look at the hull itself.
+
+A material whose `.RIM` is not installed, or which is the `0xfff` untextured sentinel, has nothing
+to sample, so it shows the lighting alone — which is what `COLORARG1` with no texture amounts to.
+A mesh with no `rif_light` yet gets a white one — the engine draws an object with no `SHPVTINT`
+with a white diffuse, and a shader reading an attribute that does not exist would render it black.
+That white attribute is **not** lighting: the preview never sets the marker, so looking at an unlit
+mesh does not give it a chunk. A mesh that already has one is left alone, since its lighting is
+precisely what you are trying to look at.
+
+This is checked numerically rather than visually: `tests/test_authoring.py` renders a known texel
+against a known light and compares against `texel * light / 255`, and renders the naive linear
+graph beside it and asserts that one **fails** the same tolerance — so the check cannot start
+passing again if the node tree is ever simplified back.
+
+#### Authoring a light
+
+A light is a Blender light, and *Add to Gunlok RIF* adopts one like any other object. What makes
+it different from a mesh is where it goes: **every one of the 3,794 `STDLIGHT` chunks in the game
+is a child of a `LIGHTSET`, and every one of the 62 light sets is a direct child of the file-level
+`REBENVDT`.** There is no such thing as a light anywhere else, so adoption puts it there — creating
+the `LIGHTSET` (with the `LTSETHDR` and `AMBIENCE` leaves every shipped one carries) the first time
+a file needs it, and lifting `REBENVDT` from a stored path into a real object to hold it. A second
+light joins the same set. Deleting the object is how a light is removed.
+
+The light datablock carries what it can express, and the panel shows the rest:
+
+| Chunk field | Blender |
+|---|---|
+| `colour` | the light's **Color** |
+| `brightness` | **Power**, as a plain multiplier — see below |
+| `range` | **Custom Distance**, in metres, divided by the file's scale |
+| position, orientation | the object's transform |
+| `spread`, `flags`, `local_flags`, `light_id` | `rif_*` properties |
+
+Two of those need care:
+
+- **Power is not watts here.** The chunk holds a 16.16 multiplier and every shipped light lands
+  between 0.2 and 2.0, so Blender's own 1000 W default would export a brightness a thousand times
+  past anything in the game. Adoption sets it to 1.0 once — that is the only moment it can be told
+  apart from an edit — and after that the number you type is the multiplier the engine gets.
+- **Custom Distance must be on**, or `range` exports as 0 and the light reaches nothing. Adoption
+  turns it on; the panel warns if it is later switched off. Shipped ranges run 3 m to 357 m.
+
+`light_id` is allocated fresh per light because it is **unique within a file in all 38 that have
+lights** — but not `0..n-1`, which only 10 of the 38 are, so it is an id the editor handed out
+rather than a position. Duplicating a light in Blender copies the id along with everything else,
+which no shipped file does; the panel says so and offers a fresh one. Unlike a shared *shape* id
+this is a warning rather than a refusal, because whether the engine minds is not measured.
 
 ## Semantic, not byte-exact
 

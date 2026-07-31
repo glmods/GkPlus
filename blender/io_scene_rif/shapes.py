@@ -249,6 +249,44 @@ def face_normal(verts, tri):
     return _normalize(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx)
 
 
+def weld_map(verts):
+    """Vertex index -> index of the first vertex sharing its exact position.
+
+    The engine welds vertex records by position when it loads a shape, so this is
+    the identity its topology actually runs on -- and because ``SHPRAWVT`` is
+    integer, two vertices closer together than one RIF unit weld even when they
+    are distinct in Blender. Export quantizes, so this can only be computed on
+    the quantized coordinates.
+    """
+    first, out = {}, []
+    for i, v in enumerate(verts):
+        out.append(first.setdefault(tuple(v), i))
+    return out
+
+
+def welds_degenerate(tri, welded):
+    """Does this triangle lose a corner once its vertices are welded?
+
+    Such a polygon carries a *repeated* vertex record, and Gunlok's polygon
+    adjacency predicate (vtable slot 0x50, ``PolygonAdjacencyTest`` @ 0x0048ecf0)
+    collects shared vertices into a fixed three-element buffer without a bound
+    check. Two such polygons meeting in one section-grid cell reach four or more
+    matches, and the fourth write lands exactly on the function's /GS cookie --
+    the game dies during ``LoadOrBuildSectionAdjacency`` with
+    STATUS_STACK_BUFFER_OVERRUN (0xc0000409), nowhere near anything that names
+    the asset.
+
+    **Only level geometry reaches that code**, which is why the shipped set is
+    not evidence that this is fine: 14 files carry such a triangle
+    (``corps building.RIF`` has 22, ``gastowerfrag.RIF`` 14) but every one is
+    under ``RIF\\Objects`` or ``RIF\\Units``, and **no file under ``RIF\\Levels``
+    has a single one**. A prop never goes through section adjacency. Since a
+    triangle that loses a corner has zero area and renders nothing either way,
+    export drops it everywhere rather than guessing which shape will be a map.
+    """
+    return len({welded[i] for i in tri}) < len(tri)
+
+
 def build_bodies(verts, polys, uv_lists):
     """Render mesh data to the five chunk bodies that describe it.
 
@@ -352,3 +390,111 @@ def write_shape(chunk, verts, polys, uv_lists):
 
     chunk.children = kept
     return dropped
+
+
+# --------------------------------------------------------------------------
+# Navigation mesh
+# --------------------------------------------------------------------------
+#
+# Gunlok has no separate navmesh: characters walk on the level's own polygons.
+# ``FUN_004888d0`` turns the map geometry into an array of 0x40-byte nav
+# polygons, storing the object-rotated ``SHPPNORM`` at +0x08 and the masked
+# ``SHPPOLYS`` flags at +0x14, and ``BuildPolygonAdjacencyGrid`` @ 0x0048aa00
+# then links the survivors into the graph the ``.map`` sidecar caches.  Its
+# filter is the definition of "walkable":
+#
+#     if ((flags >> 8 & 1) == 0 && normal.y < 0) ... slot 0x50 ...
+#
+# The builder writes those two fields like this (0x00488c?? region):
+#
+#     flags = SHPPOLYS.flags & 0x3fffc1
+#     if (ny*ny + 1e-5 < nx*nx + nz*nz) flags |= 0x100      # steeper than 45 deg
+#     if (ny == 0.0)                    ny = -1e-5
+#
+# so bit 0x100 means "not walkable", it survives the mask, and level01 sets it
+# on 1,914 polygons by hand -- i.e. it is an authored blocker as well as the
+# loader's slope verdict.
+
+#: ``SHPPOLYS.flags`` bit meaning "a character may not stand here".
+NAV_BLOCKED_FLAG = 0x100
+
+#: The bits of ``SHPPOLYS.flags`` the nav builder keeps.
+NAV_FLAG_MASK = 0x3FFFC1
+
+#: Tie-break epsilon in the slope test. It puts the limit at exactly 45 degrees:
+#: for a unit normal ``ny**2 + eps >= 1 - ny**2`` solves to ``|ny| >= 0.7071``.
+NAV_SLOPE_EPSILON = 1e-5
+
+
+def nav_is_steep(normal):
+    """Is this face steeper than the engine's 45 degree limit?
+
+    Written component for component rather than as an angle threshold, because
+    that is what the engine does and it does not assume a unit normal.
+    """
+    nx, ny, nz = normal
+    return ny * ny + NAV_SLOPE_EPSILON < nx * nx + nz * nz
+
+
+def nav_flags(normal, flags):
+    """The flags word the nav builder stores, given the RIF-space normal."""
+    out = flags & NAV_FLAG_MASK
+    if nav_is_steep(normal):
+        out |= NAV_BLOCKED_FLAG
+    return out
+
+
+def is_walkable(normal, flags):
+    """Can a character stand on this polygon?  ``normal`` is in RIF coordinates.
+
+    Two conditions, both from the adjacency filter: the polygon must not be
+    blocked, and it must face **up** -- which in RIF's Y-down world means a
+    negative Y. A face whose normal is exactly horizontal is nudged to -1e-5 by
+    the loader, reproduced here, though such a face is always steep anyway.
+    """
+    ny = normal[1]
+    if ny == 0.0:
+        ny = -NAV_SLOPE_EPSILON
+    return (nav_flags(normal, flags) & NAV_BLOCKED_FLAG) == 0 and ny < 0.0
+
+
+def nav_islands(faces, walkable):
+    """Group walkable faces into connected regions.
+
+    ``faces`` maps a face index to its tuple of **welded** vertex ids; two
+    walkable faces are linked when they share exactly two of them, which is what
+    ``PolygonAdjacencyTest`` (slot 0x50) accepts -- it collects the shared
+    vertices and returns true only on a count of 2, i.e. a shared edge.
+
+    Returns ``{face index: island id}`` over the walkable faces only, with island
+    ids assigned in ascending order of size (0 is the largest), so the region a
+    unit can actually reach is easy to pick out.
+    """
+    parent = {f: f for f in faces if walkable(f)}
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    by_edge = {}
+    for f in parent:
+        vs = faces[f]
+        for i in range(len(vs)):
+            a, b = vs[i], vs[(i + 1) % len(vs)]
+            by_edge.setdefault((a, b) if a < b else (b, a), []).append(f)
+    for shared in by_edge.values():
+        for other in shared[1:]:
+            union(shared[0], other)
+
+    groups = {}
+    for f in parent:
+        groups.setdefault(find(f), []).append(f)
+    order = sorted(groups.values(), key=len, reverse=True)
+    return {f: i for i, members in enumerate(order) for f in members}
