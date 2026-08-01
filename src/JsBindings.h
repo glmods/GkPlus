@@ -226,6 +226,10 @@ JSValue NewMakeNamespace(JSContext *ctx);
 // provide. Read-only from script apart from mount(); the interception that makes
 // the engine consult it is installed long before any script runs.
 JSValue NewModsNamespace(JSContext *ctx);
+// The renderer (src/D3D8Capture.h). Currently the Phase 0b measurement surface for the
+// Vulkan work - see vulkan_renderer_notes.md. Read-only: the capture layer forwards every
+// D3D8 call unchanged, so nothing here can alter what is drawn.
+JSValue NewRenderNamespace(JSContext *ctx);
 
 // --- per-TU callback teardown --------------------------------------------------
 //

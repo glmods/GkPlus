@@ -208,13 +208,13 @@ does no work on the executor thread (`file_io_notes.md` §1 makes the same obser
 
 | # | Function | Address | Fires | Sees |
 |---|---|---|---|---|
-| 1 | `RenderQueue_Submit` | 0x0059d760 | 102 sites / 31 callers, many times per frame | **every draw the game issues**, before any sorting: the `Renderable`, the `SceneNode`, the `AwMaterial`, the camera, the `LightSet`, the flags, the texture list |
+| 1 | `RenderQueue_Submit` | 0x0059d760 | 102 sites / 31 callers, many times per frame | every *retained* draw, before any sorting: the `Renderable`, the `SceneNode`, the `AwMaterial`, the camera, the `LightSet`, the flags, the texture list. **Not every draw the game issues** — see §4.1 |
 | 2 | `RenderQueue_Flush` | 0x005a90c0 | **not** once per frame — see §5 | the whole queue as it stands, before anything in it is drawn — the place to add or drop draws wholesale |
 | 3 | `DrawItem_RenderGeometry` | 0x0059d390 | once per drawn item | the item post-sort, with its material and lighting already bound |
 | 4 | `ApplyMaterial` | 0x005a3a30 | once per material bucket | material binds only — a cheap "what is this frame made of" probe |
 | 5 | `LightSet_Apply` | 0x0057a8c0 | once per lighting change | every D3D light change; also the publish point for `CurrentLightSet` |
 | 6 | `SceneMesh_Render` | 0x00599230 | once per submesh list | the actual geometry, its textures and the translucent-pass filter |
-| 7 | `Aw_DrawIndexedPrimitive` | 0x005a3c20 | every primitive | the bottom of the funnel — 6 callers, nothing gets past it |
+| 7 | the `Aw_Draw*` quartet | 0x005a3c20/3d30/3e10/3ed0 | every primitive | the bottom of the funnel, and the **only** total seam — see §4.1 |
 | 8 | `RunInGameFrame` | 0x0046e6c0 | once per in-game frame | the seam **between** submit and drain, if you want to inject a producer that behaves like the game's own |
 
 Notes that matter before hooking any of them:
@@ -232,6 +232,61 @@ Notes that matter before hooking any of them:
 - The pre/post `DrawItem+0x2c` pair is a real extension point the engine already uses, but it is
   supplied *by the submitter*, so reaching it means intercepting submits — level 1 again, not a
   cheaper seam.
+
+## 4.1 The render queue is not the only way to D3D
+
+**There are two draw paths, and the queue is the smaller one.** An earlier revision of this file
+called `Aw_DrawIndexedPrimitive` "the bottom of the funnel — 6 callers, nothing gets past it". The
+second half is right and the first half is misleading: there are **four** `Aw_Draw*` wrappers, and
+of the nine functions that call them, only **two** are downstream of `RenderQueue_Flush`.
+
+Anything hooking `RenderQueue_Submit` or `RenderQueue_Flush` therefore never sees text, particles,
+the in-game menus, the shadow renderer or the world-effect overlays.
+
+```
+Aw_DrawIndexedPrimitive   0x005a3c20   VertexBufferSet + IndexBufferSet
+Aw_DrawPrimitive          0x005a3d30   VertexBufferSet
+Aw_DrawPrimitiveUP        0x005a3e10   user pointer + FVF          <- no D3D buffer exists
+Aw_DrawIndexedPrimitiveUP 0x005a3ed0   user pointer + FVF + indices <- no D3D buffer exists
+
+ ├─ RETAINED (the queue)
+ │    SubMesh_DrawIndexed      0x005a1110   ─┐ the only two callers reached
+ │    SubMesh_DrawWireframe    0x005a1160   ─┘ from RenderQueue_Flush
+ │
+ ├─ IMMEDIATE — RenderBatch_Draw 0x005a3970, 8 callers
+ │    0x00582d10  particle renderer
+ │    0x00578180 / 0x00578a00 / 0x005792d0  font + 2D overlay (glyph quads)
+ │    0x005695c0 / 0x00569b10 / 0x00569ed0  in-game menu widgets
+ │    0x00496df0
+ │
+ └─ IMMEDIATE — shadows and world effects
+      ShadowRenderer_Quality23 0x0054fe40  (installed as a fn ptr by ApplyShadowQuality)
+      0x00559680 / 0x00559c80             (under ScenePass_Shadows, via 0x00558550)
+      0x005c3ca0 / 0x005c3cc0 / 0x005c3d50 (UP draws, under ScenePass_Shadows and
+                                            ScenePass_WorldEffects)
+```
+
+Three things this establishes, in order of how much they constrain a replacement renderer:
+
+- **The quartet is total, and that is measured rather than assumed.** Scanning all 662,906 `.text`
+  instructions for a `CALL dword ptr [reg + disp]` whose `disp` matches an `IDirect3DDevice8Vtbl`
+  `Draw*` slot (0x118/0x11c/0x120/0x124) yields 24 candidate functions — but only these four also
+  reference `direct3d_device` @ 0x007c121c. The other 20 are **displacement collisions on unrelated
+  vtables**: an `Actor` vtable has 83-105 slots, so 0x118..0x124 is slots 70-73 and lands squarely
+  inside it. That is why the hit list contains things like `SyncPositionAndBroadcast` and
+  `ApplyUpdateMessage`. A displacement-only scan is not a call-site scan; intersect it with the
+  device global.
+- **Two of the four take a user pointer**, so for the shadow, scanner, level-load-overlay and
+  world-effect draws there is no `IDirect3DVertexBuffer8` in existence at any point. Any scheme that
+  captures geometry by intercepting `CreateVertexBuffer`/`Lock` silently misses all of them.
+- **`ShadowRenderer_Quality23` has no call edge at all.** Its only two references are DATA refs
+  inside `ApplyShadowQuality` (0x0054fc1e, 0x0054fc44), so a caller walk reports it as a root and a
+  reachability query says nothing reaches it. This is CLAUDE.md's function-pointer trap in its
+  purest form.
+
+A `RenderBatch` auto-flushes at 0x800 vertices / 0xc00 indices; `FUN_005792d0`, the glyph quad
+emitter, is the clearest read on the structure (`+0x2c` D3DPRIMITIVETYPE, `+0x50` vertex count,
+`+0x54` index count, and it emits 4 verts / 6 indices per glyph).
 
 ## 5. The producers
 

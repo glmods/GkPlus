@@ -73,6 +73,35 @@ bool PostMessageLoopWork();
 // from the main thread, which owns the window.
 void SetFrameWakeupEnabled(bool enabled);
 
+// GKPLUS_RENDER_UNFOCUSED=1 makes the game keep rendering while its window is
+// inactive, by skipping OnActivateApp @ 0x0046f400 entirely. Measured in level
+// with the app genuinely deactivated: 0 frames over 5 s without it, 7,153 with.
+//
+// It is off by default and only the exact string "1" enables it, because it is
+// sound only in WINDOWED mode - in exclusive fullscreen the device really is lost
+// on Alt-Tab and keeping the gate set just turns skipped Presents into failed
+// ones. It also leaves HasWindowFocus set and the DirectInput devices acquired.
+//
+// Do NOT try to do this by suppressing only ReleaseD3DResources @ 0x00574960, and
+// do not no-op that function globally: the first kills the game (OnActivateApp's
+// gain branch runs restore work with no counterpart on the loss side) and the
+// second breaks resolution changes and multiplayer session setup, which are four
+// of its six callers. vulkan_renderer_notes.md section 4.2 has the full account.
+//
+// This does not replace SetFrameWakeupEnabled above: the WM_TIMER heartbeat is
+// still what drives the REPL at the front-end menus, where the game stops running
+// frames for reasons beyond the D3D gate.
+
+// Is the overlay currently toggled on (F11)? The ImGui *context* and the Win32
+// backend belong to GUISystem whichever renderer is in use; only the rendering
+// backend differs, so src/VkRenderer.cpp asks these two rather than owning any of
+// the overlay's state.
+bool IsOverlayVisible();
+
+// Runs whatever SetOverlayDrawCallback installed, inside the caller's ImGui frame.
+// Valid only between NewFrame and Render.
+void RunOverlayDrawCallback();
+
 // Installs the in-game ImGui/D3D overlay: the 8 D3D/window detours plus the ImGui
 // context. RAII: attaches in the ctor, detaches in the dtor - construct/destroy
 // inside a Detours transaction.

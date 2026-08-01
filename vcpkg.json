@@ -5,11 +5,15 @@
             "name": "imgui",
             "features": [
                 "dx9-binding",
+                "vulkan-binding",
                 "win32-binding"
             ]
         },
         "d3d8to9",
         "detours",
+        "vulkan-headers",
+        "vulkan-memory-allocator",
+        "volk",
         "quickjs-ng",
         "dear-bindings",
         "physfs"

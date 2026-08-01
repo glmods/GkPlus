@@ -11,7 +11,9 @@
 #include <imgui_impl_win32.h>
 
 #include "Core.h"
+#include "D3D8Capture.h"
 #include "GUI.h"
+#include "VkRenderer.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd,
                                                              UINT msg,
@@ -22,8 +24,13 @@ namespace gk {
 namespace {
 WNDPROC WndProc;
 HWND *GameWindow;
-Direct3DDevice8 **DirectXDevice;
+// The game's own `direct3d_device` global. Typed as the *interface*, not d3d8to9's concrete
+// Direct3DDevice8: with the capture layer installed (src/D3D8Capture.h) this holds a
+// CaptureDevice instead, and a static cast to the wrong concrete class would read garbage.
+// d3d8::ResolveD3D9Device unwraps whichever it is.
+IDirect3DDevice8 **DirectXDevice;
 
+FastCall<void, int> OnActivateApp;
 FastCall<int, int> InitDirectSound;
 StdCall<int> CreateDirect3D;
 StdCall<> ReleaseDirect3DDevice;
@@ -50,7 +57,44 @@ FrameCallback Frame = nullptr;
 MessageLoopCallback MessageLoopWork = nullptr;
 
 IDirect3DDevice9 *GetDX9Device() {
-  return (*DirectXDevice)->GetProxyInterface();
+  return d3d8::ResolveD3D9Device(*DirectXDevice);
+}
+
+// --- keeping the game rendering while unfocused (GKPLUS_RENDER_UNFOCUSED) ----------------
+//
+// Gunlok renders and presents NOTHING while its window is inactive: RenderSceneAndPresent
+// @ 0x00574c50 wraps its whole body in `if (DAT_007c1230 != 0)`, and OnActivateApp clears
+// that gate on focus loss by calling ReleaseD3DResources @ 0x00574960.
+//
+// The gate is a "D3D resources are valid" flag, not a "should I draw" flag - it is cleared
+// *because* the textures, vertex buffers and cached state have just been released. So
+// forcing it back to 1 draws through released objects. The only safe patch is to skip the
+// release, which leaves the resources alive and the gate set.
+//
+// Suppressing ONLY the teardown is not enough, and that is the mistake this comment exists
+// to record. OnActivateApp's two branches are not symmetric around ReleaseD3DResources: the
+// focus-GAIN branch also runs restore work with no counterpart on the loss side -
+// FUN_005a1d60(&TexturesObject) against the loss branch's FUN_005a1ca0(&TexturesObject),
+// plus FUN_00468dc0/FUN_00557210/FUN_004b10f0. Skip the release and that restore still runs,
+// against objects that were never released.
+//
+// So the whole handler is skipped instead. Nothing is torn down, nothing is rebuilt, and
+// DAT_007c1230 keeps the value it had - which is what makes RenderSceneAndPresent keep
+// running. The cost is that `HasWindowFocus` @ 0x006a3744 stays set and the DirectInput
+// devices stay acquired while the window is inactive; harmless, because keyboard input
+// arrives as WM_KEYDOWN to a window that is not receiving any (input_notes.md), and the
+// DirectInput keyboard is the vestigial one InputFixSystem already suppresses.
+//
+// Off by default, and deliberately so: this is only sound in WINDOWED mode. In exclusive
+// fullscreen the device really is lost on Alt-Tab, and keeping the gate set just means
+// every Present fails instead of being skipped.
+bool RenderUnfocused = false;
+
+void __fastcall HookedOnActivateApp(int wParam) {
+  if (RenderUnfocused) {
+    return;
+  }
+  OnActivateApp(wParam);
 }
 
 int __fastcall HookedInitDirectSound(int arg) {
@@ -60,8 +104,13 @@ int __fastcall HookedInitDirectSound(int arg) {
 
 int __stdcall HookedCreateDirect3D() {
   if (CreateDirect3D()) {
-    ImGui_ImplDX9_Init(GetDX9Device());
-    ImGui_ImplDX9_CreateDeviceObjects();
+    // Under GKPLUS_RENDERER=vulkan the overlay is drawn by src/VkRenderer.cpp on the
+    // Vulkan backend instead. The ImGui context and the Win32 backend are still ours -
+    // only the rendering half differs - so nothing else here changes.
+    if (!vulkan::RendererRequested()) {
+      ImGui_ImplDX9_Init(GetDX9Device());
+      ImGui_ImplDX9_CreateDeviceObjects();
+    }
     return 1;
   }
 
@@ -69,7 +118,9 @@ int __stdcall HookedCreateDirect3D() {
 }
 
 void __stdcall HookedReleaseDirect3DDevice() {
-  ImGui_ImplDX9_Shutdown();
+  if (!vulkan::RendererRequested()) {
+    ImGui_ImplDX9_Shutdown();
+  }
   ReleaseDirect3DDevice();
 }
 
@@ -82,7 +133,10 @@ void __stdcall HookedPresentScene() {
   // covering the front end. It never has.)
   RunFrameCallback();
 
-  if (!*DirectXDevice || !ShowGUI) {
+  // In Vulkan mode the overlay is built and recorded inside DrawFrame, which runs from
+  // CaptureDevice::Present further down this same call. Doing it here as well would open a
+  // second ImGui frame per frame.
+  if (!*DirectXDevice || !ShowGUI || vulkan::RendererRequested()) {
     return PresentScene();
   }
   ImGui_ImplDX9_NewFrame();
@@ -103,6 +157,9 @@ void __stdcall HookedPresentScene() {
 }
 
 int __stdcall HookedResetD3D1() {
+  if (vulkan::RendererRequested()) {
+    return ResetD3D1();
+  }
   ImGui_ImplDX9_InvalidateDeviceObjects();
   int res = ResetD3D1();
   ImGui_ImplDX9_CreateDeviceObjects();
@@ -110,6 +167,9 @@ int __stdcall HookedResetD3D1() {
 }
 
 int __fastcall HookedResetD3D2(int arg1, int arg2, int arg3, int arg4) {
+  if (vulkan::RendererRequested()) {
+    return ResetD3D2(arg1, arg2, arg3, arg4);
+  }
   ImGui_ImplDX9_InvalidateDeviceObjects();
   int res = ResetD3D2(arg1, arg2, arg3, arg4);
   ImGui_ImplDX9_CreateDeviceObjects();
@@ -189,6 +249,14 @@ bool PostMessageLoopWork() {
   return ::PostMessageW(*GameWindow, WM_GKPLUS_MESSAGE_LOOP_WORK, 0, 0) != 0;
 }
 
+bool IsOverlayVisible() { return ShowGUI; }
+
+void RunOverlayDrawCallback() {
+  if (OverlayDraw) {
+    OverlayDraw();
+  }
+}
+
 void RunFrameCallback() {
   if (Frame) {
     Frame();
@@ -207,6 +275,16 @@ void SetFrameWakeupEnabled(bool enabled) {
 }
 
 GUISystem::GUISystem() {
+  {
+    // Only "1" enables it; anything else (including "0") leaves the game's own behaviour
+    // alone, so a stale variable set to 0 does not silently turn it on.
+    char value[8] = {};
+    const DWORD len =
+        ::GetEnvironmentVariableA("GKPLUS_RENDER_UNFOCUSED", value, sizeof(value));
+    RenderUnfocused = len == 1 && value[0] == '1';
+  }
+
+  GetObjectAtOffset(OnActivateApp, 0x0046f400);
   GetObjectAtOffset(WndProc, 0x0046aad0);
   GetObjectAtOffset(GameWindow, 0x006b02b8);
   GetObjectAtOffset(DirectXDevice, 0x007c121c);
@@ -225,6 +303,7 @@ GUISystem::GUISystem() {
 
   ImGui::StyleColorsDark();
 
+  DetourAttach(&OnActivateApp, HookedOnActivateApp);
   DetourAttach(&WndProc, HookedWndProc);
   DetourAttach(&InitDirectSound, HookedInitDirectSound);
   DetourAttach(&CreateDirect3D, HookedCreateDirect3D);
@@ -235,6 +314,7 @@ GUISystem::GUISystem() {
 }
 
 GUISystem::~GUISystem() {
+  DetourDetach(&OnActivateApp, HookedOnActivateApp);
   DetourDetach(&WndProc, HookedWndProc);
   DetourDetach(&InitDirectSound, HookedInitDirectSound);
   DetourDetach(&CreateDirect3D, HookedCreateDirect3D);

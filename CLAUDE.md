@@ -156,6 +156,7 @@ Four more things that cost time the first time round:
 | quickjs-ng | QuickJS JavaScript engine |
 | dear-bindings | ImGui language bindings |
 | physfs | Archive + search-path filesystem behind the mod loader (`src/Vfs.cpp`) |
+| vulkan-headers, volk, vulkan-memory-allocator | The Vulkan renderer (`src/Vk*`). **volk, not the loader's import library**, so `d3d8.dll` has no load-time dependency on `vulkan-1.dll` and the game still starts on a machine with no Vulkan |
 
 Custom vcpkg ports in `ports/` for: d3d8to9, detours, quickjs-ng, dear-bindings.
 Overlay configuration in `vcpkg-configuration.json`.
@@ -170,11 +171,14 @@ Overlay configuration in `vcpkg-configuration.json`.
    (each member detaches its detours in its dtor), commits.
 
 `Subsystems` holds only the **hook-installing** subsystems — `FileHookSystem`,
-`MusicSystem`, `DebugSystem`, `GUISystem`, `InputFixSystem`, `CustomMenuSystem`,
-`ScriptQueueSystem`, `gls::GlsSystem`, `CustomLevelSystem`, `ScriptSystem`.
+`d3d8::D3D8CaptureSystem`, `MusicSystem`, `DebugSystem`, `GUISystem`, `InputFixSystem`,
+`CustomMenuSystem`, `ScriptQueueSystem`, `gls::GlsSystem`, `CustomLevelSystem`,
+`ScriptSystem`.
 `FileHookSystem` is deliberately **first**: it patches gl.exe's file imports, and assets
 loaded during `WinMain` (before any other hook can fire) have to pass through it for a mod
-to replace them. Destruction is reverse order, so it also unpatches last — and per
+to replace them. `D3D8CaptureSystem` is second, and before `GUISystem` for a reason: it wraps
+the `IDirect3DDevice8` the game creates, and `GUISystem` reads that same global expecting
+whatever `CreateDevice` handed back. Destruction is reverse order, so it also unpatches last — and per
 `game_defects_notes.md` §4 a fault in an earlier destructor can prevent that entirely, so
 nothing there may depend on running.
 Everything else is struct-only
@@ -1404,6 +1408,54 @@ Three modelling decisions that took a round-trip through `tsc` to settle:
   so `actors.count` is `number` while `actors["hark"]` is `Actor | undefined`. `tokens` is the one
   whose index signature is not `readonly`.
 
+### The Vulkan renderer (`src/D3D8Capture`, `src/Vk*`, `src/VertexFormat`)
+
+A bindless Vulkan replacement for Gunlok's renderer, in progress. **`vulkan_renderer_plan.md`
+is where to start** — status and next steps; `vulkan_renderer_notes.md` is the design record
+and every measurement behind it. Read the plan before touching any of this.
+
+The one fact that shapes everything: **the seam is `Direct3DCreate8`, not the AWAPI render
+queue.** The queue looked obvious and is not total — `rendering_notes.md` §4.1 — so
+`src/D3D8Capture.cpp` wraps the D3D8 device instead. It is a **state recorder, not a
+translation layer**: it mirrors the fixed-function state, replays state blocks into that
+mirror, reduces each draw to a material and a pipeline key, and forwards everything to
+d3d8to9 unchanged. `GKPLUS_RENDERER=vulkan` then puts a real swapchain on the game's window.
+
+Three things worth knowing before editing:
+
+- **`src/D3D8Device.gen.inc.h` is generated** by `src/gen-d3d8-forwarders.py` from d3d8to9's
+  `d3d8.hpp`. Re-run it after changing which methods are intercepted. Its
+  `check_wrapped_params()` **fails the build** if a method taking or returning a wrapped
+  interface is left forwarding — that is not a nicety: forwarding a wrapper to d3d8to9 makes
+  it `static_cast` to its own concrete class and read a garbage proxy pointer, which surfaces
+  as an access violation inside `d3d9.dll` with nothing pointing back. `ProcessVertices` was
+  missed twice by reading before the check existed, and adding `IDirect3DSurface8` to
+  `INTERFACES` enumerated all ten surface-carrying device methods — `SetCursorProperties`
+  included, which the hand-written prediction had missed. The check covers **every** wrapped
+  interface including `IDirect3DDevice8`, because a forwarded `GetDevice` on a resource is the
+  same failure without the crash: it hands the game the unwrapped d3d8to9 device, after which
+  every call it makes is invisible.
+- **Vulkan is reached through volk, never the loader's import library**, and the ImGui Vulkan
+  backend is vendored in `third_party/imgui_backends/` for the same reason. GkPlus *is*
+  `d3d8.dll`; a load-time dependency on `vulkan-1.dll` would stop the game launching.
+- **Every "must be 0" counter in `render.report` is a real invariant.** Each one exists
+  because getting it wrong once cost a debugging session.
+- **A counter says the plumbing ran, not that it moved the right bytes.**
+  `render.verify_textures()` reads each texture image back off the GPU and compares it against
+  the D3D texture — and it found four defects with every counter reading clean, two of them in
+  the staging ring and predating textures entirely (notes §4.13). Check `render.validation` in
+  the same breath as any readback: a verifier that is itself invalid reports its own mismatches
+  as the code's, which cost an afternoon.
+
+| File | Purpose |
+|------|---------|
+| `src/D3D8Capture.h/cpp` | The capture device: wraps `IDirect3D8`, `IDirect3DDevice8`, the two buffer types, `IDirect3DTexture8` and `IDirect3DSurface8`; shadow state, state-block replay, per-draw material/pipeline keys, residency, the texture pixel path — `LockRect` on a `SYSTEMMEM` staging texture then `CopyRects` into the `MANAGED` one, so the upload hangs off `CopyRects` (notes §4.12) — and the `AcquireRimTexture` hook that names every image by its `.rim` asset (§4.14) |
+| `src/VkContext.h/cpp` | Instance, physical device, logical device, validation. Lazily initialized — **never from `DllMain`**, since volk calls `LoadLibrary` and that deadlocks under the loader lock |
+| `src/VkRenderer.h/cpp` | Surface, swapchain, frames in flight, the ImGui backend, present |
+| `src/VkResources.h/cpp` | VMA arenas, the staging ring, and the texture images (creation, format mapping, upload, readback verification). Nothing device-local is ever mapped |
+| `src/VertexFormat.h/cpp` | Every FVF the game uses → one canonical 48-byte vertex. Pure CPU, no Vulkan and no D3D headers |
+| `src/JsRender.cpp` | The `render` namespace: all of the above, readable from the REPL |
+
 ### The Blender addon (`blender/`)
 
 Import/export of `.rif` geometry for Blender, in **pure Python** — no compiled extension, and
@@ -1447,6 +1499,9 @@ reference. Test invocations are under "Running the test suites" above.
 - `menu_system_notes.md` - Both menu systems (front-end `Menus[36]` + in-game `InGameMenus[7]`): `Menu`/`MenuListItem` layouts, the four item constructors and the 4 item types, the full 0-35 menu inventory with titles and populators, the (menu, item) -> action transition map, navigation/rendering/input, key bindings, and the localized string table
 - `save_system_notes.md` - `.sav`/`.msv` savegame format: full field-by-field stream layout, the header-only "carry to next level" variant, the team carry-over roster, and why the console `SAVE`/`LOAD` commands are the demo system instead
 - `input_notes.md` - Input subsystem: keyboard runs on Win32 `WM_KEYDOWN` (`MainWindowWndProc` -> `HandleKeyMessage` -> VK->DIK `VkToScanCodeTable` -> the universal `HandleKeyPress4` sink), mouse on Raw Input, and the DirectInput `SysKeyboard` is a vestigial acquired-but-never-read fossil whose `Acquire()` arms the `WH_KEYBOARD_LL` hook that lags system keyboard input under a debugger; the `InputFixSystem` (`src/InputFix.cpp`) detours `AcquireDInputDevice` to suppress it
+- `vulkan_renderer_plan.md` / `vulkan_renderer_notes.md` - the bindless Vulkan renderer that
+  replaces AWAPI's D3D8 usage. **Plan first** (status, next steps, how to test), notes for the
+  design and every measurement behind it. Start here before `src/D3D8Capture` or `src/Vk*`
 - `rendering_notes.md` - the high-level renderer, which is a **separate library, `AWAPI`**
   (`Code\awapi\`, and *not* in the AvP source drop, unlike the RIF layer). The frame is
   "submit everything, then drain once": ~100 producers push into one global `RenderQueue` via

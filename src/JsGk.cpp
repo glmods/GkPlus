@@ -30,6 +30,7 @@ const NamespaceEntry Namespaces[] = {
     {"levels", NewLevelsNamespace},   {"make", NewMakeNamespace},
     {"gls", NewGlsNamespace},         {"game", NewGameNamespace},
     {"world", NewWorldNamespace},     {"mods", NewModsNamespace},
+    {"render", NewRenderNamespace},
     // The broadcast-free command clusters (src/JsCommands.cpp).
     {"fx", NewFxNamespace},           {"light", NewLightNamespace},
     {"objectives", NewObjectivesNamespace},

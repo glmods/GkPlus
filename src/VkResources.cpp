@@ -1,0 +1,1342 @@
+#include "VkResources.h"
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+// VMA reaches Vulkan through the two getters we hand it, which volk has already resolved.
+// STATIC 0 because there are no prototypes to link against (the whole point of volk here);
+// DYNAMIC 1 so VMA loads the rest itself from those two.
+#define VMA_STATIC_VULKAN_FUNCTIONS 0
+#define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
+#define VMA_VULKAN_VERSION 1003000
+// VMA is header-only: exactly one translation unit must define this, and it is this one so
+// the three defines above are guaranteed to apply to the implementation as well as to the
+// declarations. Splitting them would repeat the volk mismatch from section 4.4.
+#define VMA_IMPLEMENTATION
+#include <vk_mem_alloc.h>
+
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <tuple>
+#include <vector>
+
+#include "Core.h"
+#include "VkContext.h"
+#include "VkInternal.h"
+
+namespace gk {
+namespace vulkan {
+namespace {
+
+// Sized from §4.8's measurements with room to spare, because running out is a hard failure
+// and 8 MB is not worth economising on:
+//   peak live vertex 6.2 MB -> 32 MB    peak live index 586 KB -> 8 MB
+//   4.7 MB/frame upload     -> 32 MB staging (about six frames' worth)
+constexpr VkDeviceSize kVertexArenaBytes = 32u << 20;
+constexpr VkDeviceSize kIndexArenaBytes = 8u << 20;
+constexpr VkDeviceSize kStagingBytes = 32u << 20;
+constexpr uint32_t kFramesInFlight = 2; // must match VkRenderer's
+
+bool Ready = false;
+std::string Error;
+ResourceStats TheStats;
+
+VmaAllocator Allocator = VK_NULL_HANDLE;
+
+// A free-list allocator over one arena. First fit, with coalescing on free.
+//
+// Deliberately not a bump allocator - see the note on BufferSlot. The allocation pattern is
+// gentle (about 3,500 live slots, five created and five destroyed per frame), so first-fit
+// over a sorted vector is both fast enough and easy to audit for the fragmentation that
+// actually matters here.
+struct Arena {
+  VkBuffer buffer = VK_NULL_HANDLE;
+  VmaAllocation allocation = VK_NULL_HANDLE;
+  VkDeviceSize capacity = 0;
+  VkDeviceSize tail = 0; // the never-yet-allocated region starts here
+  VkDeviceSize used = 0; // currently allocated
+  std::vector<std::pair<VkDeviceSize, VkDeviceSize>> free_list; // (offset, size), sorted
+};
+
+Arena VertexArena;
+Arena IndexArena;
+
+// Host-visible, permanently mapped, and small. This is the ONLY mapping in the renderer.
+struct Staging {
+  VkBuffer buffer = VK_NULL_HANDLE;
+  VmaAllocation allocation = VK_NULL_HANDLE;
+  uint8_t *mapped = nullptr;
+  VkDeviceSize capacity = 0;
+  VkDeviceSize head = 0;
+  // Bytes staged since the last time anything was recorded into a command buffer. This is
+  // what bounds a wrap: see AllocateStaging.
+  VkDeviceSize batch = 0;
+  // Whether the frame that consumed each slot's staging is still in flight. Written when its
+  // uploads are recorded, cleared when the renderer's fence for that slot has been waited on.
+  //
+  // This used to be a `frame_start[]` that nothing ever read, because ReleaseFrameStaging was
+  // never called - so a wrap could hand a region back while the GPU was still reading it. That
+  // is not theoretical: it is what corrupted exactly one texture during the startup burst,
+  // once per session, in a way that looked like a missing pixel route for an afternoon.
+  bool frame_live[kFramesInFlight] = {};
+};
+
+Staging Ring;
+
+// A command pool and fence of the renderer's own, used only by FlushPendingNow - the frame's
+// command buffer belongs to VkRenderer and is not available mid-batch. Transient because these
+// buffers are allocated, submitted once and freed.
+VkCommandPool UploadPool = VK_NULL_HANDLE;
+VkFence UploadFence = VK_NULL_HANDLE;
+
+struct PendingCopy {
+  VkBuffer dst = VK_NULL_HANDLE;
+  VkDeviceSize src_offset = 0;
+  VkDeviceSize dst_offset = 0;
+  VkDeviceSize bytes = 0;
+};
+
+std::vector<PendingCopy> Pending;
+
+// --- images --------------------------------------------------------------------------------
+//
+// The four formats notes section 4.1 enumerated and section 4.12 confirmed, and nothing else.
+// A format with no entry here gets no image, which makes the texture sample as missing rather
+// than as garbage - the same "refuse, do not guess" rule the FVF converter follows.
+//
+// A4R4G4B4 is deliberately EXPANDED to R8G8B8A8 on the CPU rather than mapped to
+// VK_FORMAT_A4R4G4B4_UNORM_PACK16. That format is optional even in Vulkan 1.3 (it is gated on
+// the `formatA4R4G4B4` feature), so mapping it natively would mean a per-device support matrix
+// and a fallback anyway. There are 58 such textures on level01 and they are small; the
+// expansion costs one pass over rows that are already being copied.
+//
+// A8 keeps its single channel and is fixed up in the image view instead, with a
+// {ONE, ONE, ONE, R} swizzle - which is what D3DFMT_A8 means and costs nothing at sample time.
+enum : uint32_t {
+  kD3DFmtA4R4G4B4 = 26,
+  kD3DFmtA8 = 28,
+  kD3DFmtDXT1 = 0x31545844, // 'DXT1'
+  kD3DFmtDXT3 = 0x33545844, // 'DXT3'
+};
+
+struct FormatMapping {
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  uint32_t block = 1;       // texels per block edge: 1 uncompressed, 4 for BC
+  uint32_t block_bytes = 0; // bytes per block
+  uint32_t src_block_bytes = 0; // ... as D3D stores it, which differs only for A4R4G4B4
+  bool expand_4444 = false;
+  bool alpha_swizzle = false;
+};
+
+bool MapFormat(uint32_t d3d_format, FormatMapping &out) {
+  switch (d3d_format) {
+  case kD3DFmtA4R4G4B4:
+    out = {VK_FORMAT_R8G8B8A8_UNORM, 1, 4, 2, true, false};
+    return true;
+  case kD3DFmtA8:
+    out = {VK_FORMAT_R8_UNORM, 1, 1, 1, false, true};
+    return true;
+  case kD3DFmtDXT1:
+    out = {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 4, 8, 8, false, false};
+    return true;
+  case kD3DFmtDXT3:
+    out = {VK_FORMAT_BC2_UNORM_BLOCK, 4, 16, 16, false, false};
+    return true;
+  default:
+    return false;
+  }
+}
+
+struct Image {
+  VkImage image = VK_NULL_HANDLE;
+  VmaAllocation allocation = VK_NULL_HANDLE;
+  VkImageView view = VK_NULL_HANDLE;
+  VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t levels = 1;
+  uint32_t d3d_format = 0;
+  VkDeviceSize bytes = 0;
+  FormatMapping mapping;
+  // The `.rim` path the engine acquired this texture under, filled in after creation by the
+  // AcquireRimTexture hook. It is what lets a mod or a shader name a texture instead of
+  // pointing at a slot number that changes every run.
+  std::string name;
+  bool live = false;
+};
+
+// Indexed by bindless slot. Entries are never erased, only marked dead and reused, so an index
+// handed out stays meaningful for the life of the image and the vector can back the descriptor
+// array directly.
+std::vector<Image> Images;
+std::vector<uint32_t> FreeImageIndices;
+
+// --- the bindless set ------------------------------------------------------------------------
+//
+// Sized rather than grown: 4096 image slots is ~16x level01's live count and costs one
+// descriptor each, and a set cannot be resized without recreating every pipeline layout built
+// against it. `descriptors_out_of_range` is the counter that would say the guess was wrong.
+constexpr uint32_t kBindlessTextures = 4096;
+constexpr uint32_t kBindlessSamplers = 64;
+
+VkDescriptorSetLayout BindlessLayout = VK_NULL_HANDLE;
+VkDescriptorPool BindlessPool = VK_NULL_HANDLE;
+VkDescriptorSet BindlessSet = VK_NULL_HANDLE;
+
+// The D3D sampler state a VkSampler is built from, kept as the key so identical combinations
+// collapse. These are the six stage states the recorder measured as actually varying
+// (D3DTSS_ADDRESSU/V 13/14, MAG/MIN/MIPFILTER 16/17/18).
+struct SamplerKey {
+  uint32_t mag = 0, min = 0, mip = 0, address_u = 0, address_v = 0;
+  bool operator<(const SamplerKey &o) const {
+    return std::tie(mag, min, mip, address_u, address_v) <
+           std::tie(o.mag, o.min, o.mip, o.address_u, o.address_v);
+  }
+};
+
+std::map<SamplerKey, uint32_t> SamplerIndices;
+std::vector<VkSampler> Samplers;
+
+struct PendingImageCopy {
+  uint32_t index = 0;
+  VkDeviceSize src_offset = 0;
+  uint32_t level = 0;
+  int32_t x = 0;
+  int32_t y = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+};
+
+std::vector<PendingImageCopy> PendingImages;
+
+bool Fail(const std::string &message) {
+  Error = message;
+  DebugWrite("gkplus: vulkan resources: " + message + "\n");
+  return false;
+}
+
+bool CreateArena(Arena &arena, VkDeviceSize bytes, VkBufferUsageFlags usage,
+                 const char *what) {
+  VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  info.size = bytes;
+  // TRANSFER_DST because everything arrives by staged copy, and SHADER_DEVICE_ADDRESS so the
+  // bindless design can pull vertices by pointer rather than binding a vertex buffer (§2).
+  info.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+               VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+  VmaAllocationCreateInfo alloc = {};
+  alloc.usage = VMA_MEMORY_USAGE_AUTO;
+  // No MAPPED bit and no HOST_ACCESS: this must land in device-local memory and stay
+  // unmapped. See the header - on this machine the entire device-local heap is host-visible,
+  // so "it happened to be mappable" is not a reason to map it.
+  alloc.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+
+  if (vmaCreateBuffer(Allocator, &info, &alloc, &arena.buffer, &arena.allocation, nullptr) !=
+      VK_SUCCESS) {
+    return Fail(std::string("could not allocate the ") + what + " arena");
+  }
+  arena.capacity = bytes;
+  arena.used = 0;
+  return true;
+}
+
+// 16-byte aligned, so a slot can hold any vertex layout without a second alignment step.
+VkDeviceSize AlignUp(VkDeviceSize v) { return (v + 15) & ~VkDeviceSize(15); }
+
+bool Suballocate(Arena &arena, VkDeviceSize bytes, VkDeviceSize &offset) {
+  bytes = AlignUp(bytes);
+  for (size_t i = 0; i < arena.free_list.size(); ++i) {
+    if (arena.free_list[i].second >= bytes) {
+      offset = arena.free_list[i].first;
+      if (arena.free_list[i].second == bytes) {
+        arena.free_list.erase(arena.free_list.begin() + i);
+      } else {
+        arena.free_list[i].first += bytes;
+        arena.free_list[i].second -= bytes;
+      }
+      arena.used += bytes;
+      return true;
+    }
+  }
+  if (arena.tail + bytes > arena.capacity) {
+    ++TheStats.arena_exhausted;
+    return false;
+  }
+  offset = arena.tail;
+  arena.tail += bytes;
+  arena.used += bytes;
+  return true;
+}
+
+void Release(Arena &arena, VkDeviceSize offset, VkDeviceSize bytes) {
+  bytes = AlignUp(bytes);
+  arena.used -= bytes;
+  // Insert in address order, then coalesce with either neighbour. Without coalescing the
+  // free list grows without bound under this workload, which is the same leak in different
+  // clothes.
+  size_t i = 0;
+  while (i < arena.free_list.size() && arena.free_list[i].first < offset) {
+    ++i;
+  }
+  arena.free_list.insert(arena.free_list.begin() + i, {offset, bytes});
+  if (i + 1 < arena.free_list.size() &&
+      arena.free_list[i].first + arena.free_list[i].second ==
+          arena.free_list[i + 1].first) {
+    arena.free_list[i].second += arena.free_list[i + 1].second;
+    arena.free_list.erase(arena.free_list.begin() + i + 1);
+  }
+  if (i > 0 && arena.free_list[i - 1].first + arena.free_list[i - 1].second ==
+                   arena.free_list[i].first) {
+    arena.free_list[i - 1].second += arena.free_list[i].second;
+    arena.free_list.erase(arena.free_list.begin() + i);
+  }
+}
+
+void RecordInto(VkCommandBuffer cmd);
+bool FlushPendingNow();
+
+// Blocks until no recorded batch is still being read by the GPU, then marks every slot free.
+// Conservative on purpose: `vkDeviceWaitIdle` rather than per-slot fences, because the ring is
+// only ever handed back at a wrap and the renderer's fences belong to VkRenderer.
+void WaitForLiveFrames() {
+  bool any = false;
+  for (const bool live : Ring.frame_live) {
+    any = any || live;
+  }
+  if (!any) {
+    return;
+  }
+  vkDeviceWaitIdle(GetDevice());
+  for (bool &live : Ring.frame_live) {
+    live = false;
+  }
+  ++TheStats.staging_stalls;
+}
+
+// Reserves staging space. A request that cannot fit even in an empty ring is dropped and
+// counted rather than truncated, because a partial upload is worse than none - it would look
+// like valid geometry.
+//
+// Every region is 16-byte aligned, and that is a requirement rather than tidiness:
+// `vkCmdCopyBufferToImage` demands a `bufferOffset` that is a multiple of the texel block
+// size, which is 16 for BC2 and 8 for BC1. The first version of the image upload inherited
+// whatever offset the preceding buffer copy left behind, and validation rejected essentially
+// every compressed copy. 16 covers all four formats; the waste is at most 15 bytes per
+// allocation out of 32 MB.
+//
+// **The ring may not wrap past data whose copy has not been recorded yet**, and this is the
+// one rule that took a real measurement to find. Staged bytes are only read when
+// `RecordUploads` puts them in a command buffer at the top of a frame, so anything the ring
+// overwrites before then is silently the wrong data. The steady state is ~11 MB between
+// frames and never comes close - but a level load stages **360 MB between two Presents**,
+// because the game stops presenting while it loads. That is eleven wraps inside one batch,
+// every one of them corrupting geometry or texels already queued.
+//
+// So a batch that would exceed the ring is flushed *now*, on its own command buffer, and
+// waited for. It is a stall, and it happens only during a load, which is already a stall.
+bool AllocateStaging(VkDeviceSize bytes, VkDeviceSize &offset) {
+  if (bytes > Ring.capacity) {
+    ++TheStats.dropped_uploads;
+    return false;
+  }
+  if (Ring.batch + bytes > Ring.capacity) {
+    if (!FlushPendingNow()) {
+      // Nothing was reclaimed, so wrapping would still corrupt. Dropping is the honest
+      // outcome and it is counted; a missing texture is diagnosable, a scrambled one is not.
+      ++TheStats.dropped_uploads;
+      return false;
+    }
+  }
+  Ring.head = AlignUp(Ring.head);
+  if (Ring.head + bytes > Ring.capacity) {
+    // Back to the start, which is where a frame that is still in flight may be reading. Only
+    // the wrap can do that - within a pass the head only moves forward - so this is the one
+    // place the check is needed, and in steady state no frame is ever still live this far
+    // back, so the wait almost never fires.
+    WaitForLiveFrames();
+    Ring.head = 0;
+    ++TheStats.staging_wraps;
+  }
+  offset = Ring.head;
+  Ring.head += bytes;
+  Ring.batch += bytes;
+  return true;
+}
+
+// A mip level's dimensions. D3D clamps to 1, and so does Vulkan, so this is the shared rule
+// rather than either API's.
+uint32_t LevelExtent(uint32_t base, uint32_t level) {
+  const uint32_t v = base >> level;
+  return v == 0 ? 1 : v;
+}
+
+// Packs one rectangle of a locked surface into tightly-packed destination rows.
+//
+// Tight rather than strided, so `bufferRowLength` can stay 0 and the copy region needs no
+// stride arithmetic. It is also the single definition of what a texel becomes on the GPU,
+// which is what lets VerifyImageLevel compare a readback against it without duplicating the
+// conversion - a check that re-implemented the expansion would only ever agree with itself.
+void PackLevel(const FormatMapping &map, const void *data, uint32_t pitch,
+               uint32_t blocks_across, uint32_t rows, uint8_t *out) {
+  const auto *src = static_cast<const uint8_t *>(data);
+  const uint32_t dst_row_bytes = blocks_across * map.block_bytes;
+  const uint32_t src_row_bytes = blocks_across * map.src_block_bytes;
+  for (uint32_t row = 0; row < rows; ++row) {
+    const uint8_t *src_row = src + VkDeviceSize(row) * pitch;
+    uint8_t *dst_row = out + VkDeviceSize(row) * dst_row_bytes;
+    if (map.expand_4444) {
+      // ARGB4444 -> RGBA8888. Each nibble is replicated into a byte (0xf -> 0xff), which is
+      // the exact widening for a UNORM: multiplying by 255/15.
+      const auto *texels = reinterpret_cast<const uint16_t *>(src_row);
+      for (uint32_t i = 0; i < blocks_across; ++i) {
+        const uint16_t t = texels[i];
+        const uint8_t a = (t >> 12) & 0xf;
+        const uint8_t r = (t >> 8) & 0xf;
+        const uint8_t g = (t >> 4) & 0xf;
+        const uint8_t b = t & 0xf;
+        dst_row[i * 4 + 0] = static_cast<uint8_t>(r | (r << 4));
+        dst_row[i * 4 + 1] = static_cast<uint8_t>(g | (g << 4));
+        dst_row[i * 4 + 2] = static_cast<uint8_t>(b | (b << 4));
+        dst_row[i * 4 + 3] = static_cast<uint8_t>(a | (a << 4));
+      }
+    } else {
+      std::memcpy(dst_row, src_row, src_row_bytes);
+    }
+  }
+}
+
+// Creates the one descriptor set the renderer uses. Two arrays, both UPDATE_AFTER_BIND so a
+// texture created mid-frame can be written without rebinding, and both PARTIALLY_BOUND so the
+// image array may have holes where textures have been destroyed.
+bool CreateBindlessSet() {
+  const VkDescriptorPoolSize sizes[] = {
+      {VK_DESCRIPTOR_TYPE_SAMPLER, kBindlessSamplers},
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kBindlessTextures},
+  };
+  VkDescriptorPoolCreateInfo pool = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  pool.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+  pool.maxSets = 1;
+  pool.poolSizeCount = 2;
+  pool.pPoolSizes = sizes;
+  if (vkCreateDescriptorPool(GetDevice(), &pool, nullptr, &BindlessPool) != VK_SUCCESS) {
+    return Fail("could not create the bindless descriptor pool");
+  }
+
+  const VkDescriptorBindingFlags binding_flags[] = {
+      VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+          VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT,
+      // VARIABLE_DESCRIPTOR_COUNT is legal only on the LAST binding, which is why the images
+      // are binding 1 and the samplers binding 0 rather than the other way round.
+      VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+          VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+          VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT,
+  };
+  VkDescriptorSetLayoutBindingFlagsCreateInfo flags = {
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+  flags.bindingCount = 2;
+  flags.pBindingFlags = binding_flags;
+
+  const VkDescriptorSetLayoutBinding bindings[] = {
+      {0, VK_DESCRIPTOR_TYPE_SAMPLER, kBindlessSamplers, VK_SHADER_STAGE_ALL, nullptr},
+      {1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kBindlessTextures, VK_SHADER_STAGE_ALL, nullptr},
+  };
+  VkDescriptorSetLayoutCreateInfo layout = {
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  layout.pNext = &flags;
+  layout.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+  layout.bindingCount = 2;
+  layout.pBindings = bindings;
+  if (vkCreateDescriptorSetLayout(GetDevice(), &layout, nullptr, &BindlessLayout) !=
+      VK_SUCCESS) {
+    return Fail("could not create the bindless descriptor set layout");
+  }
+
+  uint32_t variable_count = kBindlessTextures;
+  VkDescriptorSetVariableDescriptorCountAllocateInfo variable = {
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO};
+  variable.descriptorSetCount = 1;
+  variable.pDescriptorCounts = &variable_count;
+
+  VkDescriptorSetAllocateInfo alloc = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  alloc.pNext = &variable;
+  alloc.descriptorPool = BindlessPool;
+  alloc.descriptorSetCount = 1;
+  alloc.pSetLayouts = &BindlessLayout;
+  if (vkAllocateDescriptorSets(GetDevice(), &alloc, &BindlessSet) != VK_SUCCESS) {
+    return Fail("could not allocate the bindless descriptor set");
+  }
+  TheStats.descriptor_capacity = kBindlessTextures;
+  return true;
+}
+
+// Writes one image into its own slot. Called on creation rather than per frame: the index is
+// stable for the image's life, so the descriptor is written once and only rewritten if the slot
+// is reused by a different image.
+void WriteImageDescriptor(uint32_t index) {
+  if (BindlessSet == VK_NULL_HANDLE) {
+    return;
+  }
+  if (index >= kBindlessTextures) {
+    ++TheStats.descriptors_out_of_range;
+    return;
+  }
+  VkDescriptorImageInfo info = {};
+  info.imageView = Images[index].view;
+  info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+  VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  write.dstSet = BindlessSet;
+  write.dstBinding = 1;
+  write.dstArrayElement = index;
+  write.descriptorCount = 1;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  write.pImageInfo = &info;
+  vkUpdateDescriptorSets(GetDevice(), 1, &write, 0, nullptr);
+  ++TheStats.descriptors_written;
+}
+
+// D3DTEXTUREFILTERTYPE: 0 NONE, 1 POINT, 2 LINEAR, and 3/4/5 the anisotropic and gaussian
+// variants the recorder never saw. Anything past LINEAR is treated as LINEAR rather than
+// refused - a slightly wrong filter is a far smaller error than no texture at all, and unlike
+// a format there is no way for it to corrupt anything.
+VkFilter ToVkFilter(uint32_t d3d) { return d3d == 1 ? VK_FILTER_NEAREST : VK_FILTER_LINEAR; }
+
+VkSamplerMipmapMode ToVkMipmapMode(uint32_t d3d) {
+  return d3d == 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+}
+
+// D3DTEXTUREADDRESS: 1 WRAP, 2 MIRROR, 3 CLAMP, 4 BORDER, 5 MIRRORONCE.
+VkSamplerAddressMode ToVkAddressMode(uint32_t d3d) {
+  switch (d3d) {
+  case 2:
+    return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+  case 3:
+    return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  case 4:
+    return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+  case 5:
+    return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+  default:
+    return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+  }
+}
+
+void NoteImageUse() {
+  if (TheStats.image_bytes > TheStats.image_peak_bytes) {
+    TheStats.image_peak_bytes = TheStats.image_bytes;
+  }
+}
+
+void NoteArenaUse() {
+  TheStats.vertex_used = VertexArena.used;
+  TheStats.index_used = IndexArena.used;
+  if (VertexArena.used > TheStats.vertex_peak) {
+    TheStats.vertex_peak = VertexArena.used;
+  }
+  if (IndexArena.used > TheStats.index_peak) {
+    TheStats.index_peak = IndexArena.used;
+  }
+}
+
+} // namespace
+
+bool StartResources() {
+  if (Ready) {
+    return true;
+  }
+  if (Initialize() != InitResult::Ok) {
+    return Fail("no vulkan device");
+  }
+
+  VmaVulkanFunctions functions = {};
+  functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+  functions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+
+  VmaAllocatorCreateInfo info = {};
+  info.instance = GetInstance();
+  info.physicalDevice = GetPhysicalDevice();
+  info.device = GetDevice();
+  info.vulkanApiVersion = VK_API_VERSION_1_3;
+  info.pVulkanFunctions = &functions;
+  // Must match the device feature VkContext enables, or every allocation that could back a
+  // device address is rejected.
+  info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+
+  if (vmaCreateAllocator(&info, &Allocator) != VK_SUCCESS) {
+    return Fail("vmaCreateAllocator failed");
+  }
+
+  if (!CreateArena(VertexArena, kVertexArenaBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                   "vertex") ||
+      !CreateArena(IndexArena, kIndexArenaBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                   "index") ||
+      !CreateBindlessSet()) {
+    return false;
+  }
+
+  VkBufferCreateInfo staging = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  staging.size = kStagingBytes;
+  staging.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  staging.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+  VmaAllocationCreateInfo staging_alloc = {};
+  staging_alloc.usage = VMA_MEMORY_USAGE_AUTO;
+  staging_alloc.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                        VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+  VmaAllocationInfo staging_info = {};
+  if (vmaCreateBuffer(Allocator, &staging, &staging_alloc, &Ring.buffer, &Ring.allocation,
+                      &staging_info) != VK_SUCCESS) {
+    return Fail("could not allocate the staging ring");
+  }
+  Ring.mapped = static_cast<uint8_t *>(staging_info.pMappedData);
+  Ring.capacity = kStagingBytes;
+  if (Ring.mapped == nullptr) {
+    return Fail("staging ring came back unmapped");
+  }
+
+  VkCommandPoolCreateInfo pool = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  pool.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+  pool.queueFamilyIndex = Caps().graphics_queue_family;
+  if (vkCreateCommandPool(GetDevice(), &pool, nullptr, &UploadPool) != VK_SUCCESS) {
+    return Fail("could not create the upload command pool");
+  }
+  VkFenceCreateInfo fence = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  if (vkCreateFence(GetDevice(), &fence, nullptr, &UploadFence) != VK_SUCCESS) {
+    return Fail("could not create the upload fence");
+  }
+
+  Ready = true;
+  Error.clear();
+  TheStats.ready = true;
+  TheStats.vertex_arena_bytes = kVertexArenaBytes;
+  TheStats.index_arena_bytes = kIndexArenaBytes;
+  TheStats.staging_bytes = kStagingBytes;
+  DebugWrite("gkplus: vulkan arenas up: 32 MB vertex, 8 MB index, 32 MB staging\n");
+  return true;
+}
+
+bool ResourcesReady() { return Ready; }
+
+BufferSlot AllocateSlot(uint32_t bytes, bool vertex) {
+  BufferSlot slot;
+  if (!Ready || bytes == 0) {
+    return slot;
+  }
+  VkDeviceSize offset = 0;
+  if (!Suballocate(vertex ? VertexArena : IndexArena, bytes, offset)) {
+    return slot;
+  }
+  slot.offset = static_cast<uint32_t>(offset);
+  slot.bytes = bytes;
+  slot.vertex = vertex;
+  slot.valid = true;
+  ++TheStats.slots_live;
+  NoteArenaUse();
+  return slot;
+}
+
+void FreeSlot(const BufferSlot &slot) {
+  if (!Ready || !slot.valid) {
+    return;
+  }
+  Release(slot.vertex ? VertexArena : IndexArena, slot.offset, slot.bytes);
+  --TheStats.slots_live;
+  NoteArenaUse();
+}
+
+bool UploadIntoSlot(const BufferSlot &slot, uint32_t offset_in_slot, const void *data,
+                    uint32_t bytes) {
+  if (!Ready || !slot.valid || data == nullptr || bytes == 0) {
+    return false;
+  }
+  // Never write past the slot: a larger write would silently corrupt whichever buffer
+  // happens to sit next in the arena, which would show up as unrelated geometry going wrong.
+  if (offset_in_slot >= slot.bytes) {
+    return false;
+  }
+  if (offset_in_slot + bytes > slot.bytes) {
+    bytes = slot.bytes - offset_in_slot;
+  }
+  VkDeviceSize staging_offset = 0;
+  if (!AllocateStaging(bytes, staging_offset)) {
+    return false;
+  }
+  std::memcpy(Ring.mapped + staging_offset, data, bytes);
+  Pending.push_back({slot.vertex ? VertexArena.buffer : IndexArena.buffer, staging_offset,
+                     slot.offset + offset_in_slot, bytes});
+  ++TheStats.uploads;
+  TheStats.uploaded_bytes += bytes;
+  return true;
+}
+
+bool TextureFormatBlock(uint32_t d3d_format, uint32_t &block, uint32_t &block_bytes) {
+  FormatMapping mapping;
+  if (!MapFormat(d3d_format, mapping)) {
+    return false;
+  }
+  block = mapping.block;
+  block_bytes = mapping.src_block_bytes;
+  return true;
+}
+
+bool CreateTextureImage(TextureImage &image, uint32_t width, uint32_t height, uint32_t levels,
+                        uint32_t d3d_format) {
+  image = TextureImage();
+  FormatMapping mapping;
+  if (!Ready || width == 0 || height == 0) {
+    return false;
+  }
+  if (!MapFormat(d3d_format, mapping)) {
+    ++TheStats.unsupported_formats;
+    return false;
+  }
+  if (levels == 0) {
+    levels = 1; // D3D's "make a full chain"; the game always passes an explicit count
+  }
+
+  VkImageCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  info.imageType = VK_IMAGE_TYPE_2D;
+  info.format = mapping.format;
+  info.extent = {width, height, 1};
+  info.mipLevels = levels;
+  info.arrayLayers = 1;
+  info.samples = VK_SAMPLE_COUNT_1_BIT;
+  info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  // TRANSFER_SRC is not for the renderer - nothing copies out of these in a frame. It exists so
+  // VerifyImageLevel can read one back, and leaving it out made every readback an invalid
+  // vkCmdCopyImageToBuffer: the check reported mismatches that were its own. A verifier needs
+  // verifying, and the validation layer is what did it.
+  info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+               VK_IMAGE_USAGE_SAMPLED_BIT;
+  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+  VmaAllocationCreateInfo alloc = {};
+  alloc.usage = VMA_MEMORY_USAGE_AUTO;
+
+  Image entry;
+  VmaAllocationInfo allocated = {};
+  if (vmaCreateImage(Allocator, &info, &alloc, &entry.image, &entry.allocation, &allocated) !=
+      VK_SUCCESS) {
+    return false;
+  }
+
+  VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  view.image = entry.image;
+  view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view.format = mapping.format;
+  // D3DFMT_A8 is alpha-only, and R8_UNORM is red-only. The swizzle is what makes the two the
+  // same thing at sample time, rather than a shader branch per texture.
+  if (mapping.alpha_swizzle) {
+    view.components = {VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_ONE,
+                       VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_R};
+  }
+  view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1};
+  if (vkCreateImageView(GetDevice(), &view, nullptr, &entry.view) != VK_SUCCESS) {
+    vmaDestroyImage(Allocator, entry.image, entry.allocation);
+    return false;
+  }
+
+  entry.width = width;
+  entry.height = height;
+  entry.levels = levels;
+  entry.d3d_format = d3d_format;
+  entry.mapping = mapping;
+  entry.bytes = allocated.size;
+  entry.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  entry.live = true;
+
+  uint32_t index;
+  if (!FreeImageIndices.empty()) {
+    index = FreeImageIndices.back();
+    FreeImageIndices.pop_back();
+    Images[index] = entry;
+  } else {
+    index = static_cast<uint32_t>(Images.size());
+    Images.push_back(entry);
+  }
+
+  image.index = index;
+  image.valid = true;
+  ++TheStats.images_live;
+  ++TheStats.images_created;
+  TheStats.image_bytes += entry.bytes;
+  NoteImageUse();
+  // Written once, here, rather than per frame: the index is stable for the image's life, so
+  // the only thing that can invalidate the descriptor is the slot being reused - which is this
+  // same path, for the next image.
+  WriteImageDescriptor(index);
+  return true;
+}
+
+void DestroyTextureImage(TextureImage &image) {
+  if (!Ready || !image.valid || image.index >= Images.size()) {
+    image = TextureImage();
+    return;
+  }
+  Image &entry = Images[image.index];
+  if (entry.live) {
+    // The image may still be referenced by a copy this frame recorded but has not submitted,
+    // and by the frame in flight before it. Waiting is heavy-handed but this happens at level
+    // teardown, not per frame - level01 destroys 65 images in one burst and then none.
+    vkDeviceWaitIdle(GetDevice());
+    // Anything still queued for this image would now write a destroyed handle.
+    for (size_t i = PendingImages.size(); i-- > 0;) {
+      if (PendingImages[i].index == image.index) {
+        PendingImages.erase(PendingImages.begin() + i);
+      }
+    }
+    vkDestroyImageView(GetDevice(), entry.view, nullptr);
+    vmaDestroyImage(Allocator, entry.image, entry.allocation);
+    TheStats.image_bytes -= entry.bytes;
+    --TheStats.images_live;
+    entry = Image();
+    FreeImageIndices.push_back(image.index);
+    // The descriptor is deliberately NOT cleared, and the reasoning matters for Phase 3.
+    // PARTIALLY_BOUND makes a stale descriptor legal to *have*; what would be undefined is
+    // reading one, and nothing can: a draw only ever names a slot through the texture the
+    // shadow state has bound, which is by definition live. The slot is rewritten when it is
+    // reused. If a draw record is ever built that outlives its texture, this becomes a real
+    // dangling reference and the descriptor must be nulled here instead.
+  }
+  image = TextureImage();
+}
+
+uint32_t AcquireSampler(uint32_t mag_filter, uint32_t min_filter, uint32_t mip_filter,
+                        uint32_t address_u, uint32_t address_v) {
+  const SamplerKey key{mag_filter, min_filter, mip_filter, address_u, address_v};
+  const auto found = SamplerIndices.find(key);
+  if (found != SamplerIndices.end()) {
+    return found->second;
+  }
+  if (!Ready || Samplers.size() >= kBindlessSamplers) {
+    return 0;
+  }
+
+  VkSamplerCreateInfo info = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+  info.magFilter = ToVkFilter(mag_filter);
+  info.minFilter = ToVkFilter(min_filter);
+  info.mipmapMode = ToVkMipmapMode(mip_filter);
+  info.addressModeU = ToVkAddressMode(address_u);
+  info.addressModeV = ToVkAddressMode(address_v);
+  info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+  // The engine's textures carry their own mip chains and it never sets a LOD bias other than
+  // 0 (stage state 19 has exactly one distinct value), so there is nothing to reproduce here.
+  info.maxLod = VK_LOD_CLAMP_NONE;
+  VkSampler sampler = VK_NULL_HANDLE;
+  if (vkCreateSampler(GetDevice(), &info, nullptr, &sampler) != VK_SUCCESS) {
+    return 0;
+  }
+
+  const uint32_t index = static_cast<uint32_t>(Samplers.size());
+  Samplers.push_back(sampler);
+  SamplerIndices[key] = index;
+  TheStats.samplers_live = Samplers.size();
+
+  if (BindlessSet != VK_NULL_HANDLE) {
+    VkDescriptorImageInfo image_info = {};
+    image_info.sampler = sampler;
+    VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = BindlessSet;
+    write.dstBinding = 0;
+    write.dstArrayElement = index;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    write.pImageInfo = &image_info;
+    vkUpdateDescriptorSets(GetDevice(), 1, &write, 0, nullptr);
+    ++TheStats.descriptors_written;
+  }
+  return index;
+}
+
+uint64_t BindlessDescriptorSet() { return reinterpret_cast<uint64_t>(BindlessSet); }
+
+uint64_t BindlessDescriptorSetLayout() {
+  return reinterpret_cast<uint64_t>(BindlessLayout);
+}
+
+void NameTextureImage(const TextureImage &image, const std::string &name) {
+  if (Ready && image.valid && image.index < Images.size() && Images[image.index].live) {
+    Images[image.index].name = name;
+  }
+}
+
+std::vector<TextureImageInfo> TextureImages() {
+  std::vector<TextureImageInfo> out;
+  for (uint32_t i = 0; i < Images.size(); ++i) {
+    const Image &entry = Images[i];
+    if (!entry.live) {
+      continue;
+    }
+    TextureImageInfo info;
+    info.index = i;
+    info.name = entry.name;
+    info.width = entry.width;
+    info.height = entry.height;
+    info.levels = entry.levels;
+    info.d3d_format = entry.d3d_format;
+    info.bytes = entry.bytes;
+    out.push_back(info);
+  }
+  return out;
+}
+
+bool UploadIntoTextureImage(const TextureImage &image, uint32_t level, int32_t x, int32_t y,
+                            uint32_t width, uint32_t height, const void *data,
+                            uint32_t pitch) {
+  if (!Ready || !image.valid || image.index >= Images.size() || data == nullptr ||
+      width == 0 || height == 0) {
+    return false;
+  }
+  Image &entry = Images[image.index];
+  if (!entry.live || level >= entry.levels) {
+    return false;
+  }
+  const FormatMapping &map = entry.mapping;
+
+  // A compressed image is addressed in blocks, and a rectangle that does not land on block
+  // boundaries cannot be expressed as a copy at all. D3D requires the same alignment, so this
+  // should be unreachable - but copying a misaligned rect would silently corrupt the blocks
+  // either side, so it is refused and counted.
+  if (map.block > 1 && ((x % static_cast<int32_t>(map.block)) != 0 ||
+                        (y % static_cast<int32_t>(map.block)) != 0 ||
+                        (width % map.block) != 0 || (height % map.block) != 0)) {
+    ++TheStats.unaligned_rects;
+    return false;
+  }
+  // Except at the edge of a level whose size is not a multiple of the block, where D3D rounds
+  // up and so does Vulkan.
+  const uint32_t level_w = LevelExtent(entry.width, level);
+  const uint32_t level_h = LevelExtent(entry.height, level);
+  if (static_cast<uint32_t>(x) + width > level_w) {
+    width = level_w - static_cast<uint32_t>(x);
+  }
+  if (static_cast<uint32_t>(y) + height > level_h) {
+    height = level_h - static_cast<uint32_t>(y);
+  }
+
+  const uint32_t rows = (height + map.block - 1) / map.block;
+  const uint32_t blocks_across = (width + map.block - 1) / map.block;
+  const uint32_t dst_row_bytes = blocks_across * map.block_bytes;
+  const VkDeviceSize total = VkDeviceSize(dst_row_bytes) * rows;
+
+  VkDeviceSize staging_offset = 0;
+  if (!AllocateStaging(total, staging_offset)) {
+    ++TheStats.image_uploads_dropped;
+    return false;
+  }
+  PackLevel(map, data, pitch, blocks_across, rows, Ring.mapped + staging_offset);
+
+  PendingImages.push_back({image.index, staging_offset, level, x, y, width, height});
+  ++TheStats.image_uploads;
+  TheStats.image_uploaded_bytes += total;
+  return true;
+}
+
+void FlushUploads() {
+  if (Ready) {
+    FlushPendingNow();
+  }
+}
+
+// Reads a whole mip level back off the GPU and compares it against what `data` should have
+// become. This is the only thing that checks the *contents* rather than the plumbing: every
+// counter in ResourceStats can read perfectly while the image holds the wrong bytes, and the
+// whole point of section 4.12 was to avoid building on a texture path nobody had verified.
+//
+// The expected bytes come from PackLevel, the same function the upload uses, so this compares
+// "what the GPU holds" against "what we meant to send" - a swapped channel or a wrong VkFormat
+// would show up as a mismatch, a bad layout transition or a lost copy as a difference too.
+bool VerifyImageLevel(const TextureImage &image, uint32_t level, const void *data,
+                      uint32_t pitch, uint64_t *differing_bytes, uint64_t *first_difference,
+                      uint64_t *total_bytes) {
+  if (!Ready || !image.valid || image.index >= Images.size() || data == nullptr) {
+    return false;
+  }
+  const Image &entry = Images[image.index];
+  if (!entry.live || level >= entry.levels) {
+    return false;
+  }
+  const FormatMapping &map = entry.mapping;
+  const uint32_t level_w = LevelExtent(entry.width, level);
+  const uint32_t level_h = LevelExtent(entry.height, level);
+  const uint32_t blocks_across = (level_w + map.block - 1) / map.block;
+  const uint32_t rows = (level_h + map.block - 1) / map.block;
+  const VkDeviceSize total = VkDeviceSize(blocks_across) * map.block_bytes * rows;
+
+  // Its own buffer rather than the staging ring: that one is HOST_ACCESS_SEQUENTIAL_WRITE and
+  // reading from write-combined memory is correct but pathologically slow.
+  VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  info.size = total;
+  info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  VmaAllocationCreateInfo alloc = {};
+  alloc.usage = VMA_MEMORY_USAGE_AUTO;
+  alloc.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                VMA_ALLOCATION_CREATE_MAPPED_BIT;
+  VkBuffer readback = VK_NULL_HANDLE;
+  VmaAllocation readback_alloc = VK_NULL_HANDLE;
+  VmaAllocationInfo readback_info = {};
+  if (vmaCreateBuffer(Allocator, &info, &alloc, &readback, &readback_alloc,
+                      &readback_info) != VK_SUCCESS ||
+      readback_info.pMappedData == nullptr) {
+    return false;
+  }
+
+  bool equal = false;
+  VkCommandBufferAllocateInfo cmd_alloc = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cmd_alloc.commandPool = UploadPool;
+  cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cmd_alloc.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  if (vkAllocateCommandBuffers(GetDevice(), &cmd_alloc, &cmd) == VK_SUCCESS) {
+    VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &begin);
+
+    // SHADER_READ_ONLY is where every image sits between frames; anything still queued for
+    // this one is irrelevant because we compare against what is already there.
+    auto transition = [&](VkImageLayout from, VkImageLayout to) {
+      VkImageMemoryBarrier2 barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+      barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+      barrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+      barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+      barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+      barrier.oldLayout = from;
+      barrier.newLayout = to;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.image = entry.image;
+      barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, entry.levels, 0, 1};
+      VkDependencyInfo dependency = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+      dependency.imageMemoryBarrierCount = 1;
+      dependency.pImageMemoryBarriers = &barrier;
+      vkCmdPipelineBarrier2(cmd, &dependency);
+    };
+    transition(entry.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+    VkBufferImageCopy region = {};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+    region.imageExtent = {level_w, level_h, 1};
+    vkCmdCopyImageToBuffer(cmd, entry.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1,
+                           &region);
+    transition(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, entry.layout);
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    vkResetFences(GetDevice(), 1, &UploadFence);
+    if (vkQueueSubmit(GetGraphicsQueue(), 1, &submit, UploadFence) == VK_SUCCESS) {
+      vkWaitForFences(GetDevice(), 1, &UploadFence, VK_TRUE, UINT64_MAX);
+      std::vector<uint8_t> expected(static_cast<size_t>(total));
+      PackLevel(map, data, pitch, blocks_across, rows, expected.data());
+      const auto *actual = static_cast<const uint8_t *>(readback_info.pMappedData);
+      uint64_t differing = 0;
+      uint64_t first = total;
+      for (VkDeviceSize i = 0; i < total; ++i) {
+        if (expected[static_cast<size_t>(i)] != actual[i]) {
+          ++differing;
+          if (first == total) {
+            first = i;
+          }
+        }
+      }
+      equal = differing == 0;
+      if (differing_bytes != nullptr) {
+        *differing_bytes = differing;
+      }
+      if (first_difference != nullptr) {
+        *first_difference = first;
+      }
+      if (total_bytes != nullptr) {
+        *total_bytes = total;
+      }
+    }
+    vkFreeCommandBuffers(GetDevice(), UploadPool, 1, &cmd);
+  }
+
+  vmaDestroyBuffer(Allocator, readback, readback_alloc);
+  return equal;
+}
+
+void RecordUploads(void *command_buffer, uint32_t frame_index) {
+  if (!Ready || (Pending.empty() && PendingImages.empty())) {
+    return;
+  }
+  RecordInto(static_cast<VkCommandBuffer>(command_buffer));
+  if (frame_index < kFramesInFlight) {
+    Ring.frame_live[frame_index] = true;
+  }
+}
+
+void ReleaseFrameStaging(uint32_t frame_index) {
+  // Called once the renderer has waited on this slot's fence, so everything it staged has been
+  // read and the ring may hand those bytes back.
+  if (Ready && frame_index < kFramesInFlight) {
+    Ring.frame_live[frame_index] = false;
+  }
+}
+
+namespace {
+
+// Records everything queued, with one barrier pair around the whole batch. Shared by the
+// frame path and by the mid-batch flush, so the two cannot drift.
+void RecordInto(VkCommandBuffer cmd) {
+  for (const PendingCopy &copy : Pending) {
+    VkBufferCopy region = {copy.src_offset, copy.dst_offset, copy.bytes};
+    vkCmdCopyBuffer(cmd, Ring.buffer, copy.dst, 1, &region);
+  }
+
+  // Images need a layout on either side of their copies, which buffers do not. Collected into
+  // two batched barriers rather than one pair per image: several blits usually land on the
+  // same texture in a frame, and a per-copy transition would also force each into
+  // SHADER_READ_ONLY only to pull it straight back out.
+  std::vector<VkImageMemoryBarrier2> to_transfer;
+  std::vector<VkImageMemoryBarrier2> to_read;
+  for (const PendingImageCopy &copy : PendingImages) {
+    Image &entry = Images[copy.index];
+    if (entry.layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+      continue; // already in this batch
+    }
+    VkImageMemoryBarrier2 barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.oldLayout = entry.layout;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = entry.image;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, entry.levels, 0, 1};
+    to_transfer.push_back(barrier);
+
+    VkImageMemoryBarrier2 back = barrier;
+    back.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    back.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    back.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    back.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    back.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_read.push_back(back);
+
+    entry.layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  }
+
+  if (!to_transfer.empty()) {
+    VkDependencyInfo dependency = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.imageMemoryBarrierCount = static_cast<uint32_t>(to_transfer.size());
+    dependency.pImageMemoryBarriers = to_transfer.data();
+    vkCmdPipelineBarrier2(cmd, &dependency);
+  }
+
+  for (const PendingImageCopy &copy : PendingImages) {
+    const Image &entry = Images[copy.index];
+    VkBufferImageCopy region = {};
+    region.bufferOffset = copy.src_offset;
+    // 0/0 mean "tightly packed", which is what UploadIntoTextureImage guarantees.
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, copy.level, 0, 1};
+    region.imageOffset = {copy.x, copy.y, 0};
+    region.imageExtent = {copy.width, copy.height, 1};
+    vkCmdCopyBufferToImage(cmd, Ring.buffer, entry.image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+  }
+
+  // One barrier for the whole buffer batch rather than one per copy: 75 uploads a frame would
+  // otherwise be 75 pipeline barriers for no benefit, since they all target the same two
+  // buffers and are all read at the same stage.
+  VkMemoryBarrier2 barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+  barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+  barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+  barrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                         VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT;
+  barrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT;
+
+  VkDependencyInfo dependency = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  dependency.memoryBarrierCount = 1;
+  dependency.pMemoryBarriers = &barrier;
+  if (!to_read.empty()) {
+    dependency.imageMemoryBarrierCount = static_cast<uint32_t>(to_read.size());
+    dependency.pImageMemoryBarriers = to_read.data();
+  }
+  vkCmdPipelineBarrier2(cmd, &dependency);
+
+  for (const PendingImageCopy &copy : PendingImages) {
+    Images[copy.index].layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  }
+
+  Pending.clear();
+  PendingImages.clear();
+  Ring.batch = 0;
+}
+
+// Records and submits everything queued right now, on a throwaway command buffer, and waits.
+//
+// Only ever called from AllocateStaging, when the un-recorded batch has grown to the size of
+// the whole ring - which in practice means a level load. Once the wait returns, every staged
+// byte has been consumed, so the ring is entirely free again.
+bool FlushPendingNow() {
+  if (Pending.empty() && PendingImages.empty()) {
+    return false; // nothing to reclaim, so wrapping would still corrupt
+  }
+  VkCommandBufferAllocateInfo alloc = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  alloc.commandPool = UploadPool;
+  alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  alloc.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  if (vkAllocateCommandBuffers(GetDevice(), &alloc, &cmd) != VK_SUCCESS) {
+    return false;
+  }
+
+  VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(cmd, &begin);
+  RecordInto(cmd);
+  vkEndCommandBuffer(cmd);
+
+  VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &cmd;
+  vkResetFences(GetDevice(), 1, &UploadFence);
+  const bool ok =
+      vkQueueSubmit(GetGraphicsQueue(), 1, &submit, UploadFence) == VK_SUCCESS;
+  if (ok) {
+    vkWaitForFences(GetDevice(), 1, &UploadFence, VK_TRUE, UINT64_MAX);
+  }
+  vkFreeCommandBuffers(GetDevice(), UploadPool, 1, &cmd);
+  if (ok) {
+    // Rewinding to 0 is the same hazard as a wrap: a frame in flight may still be reading
+    // there. Our own fence only covers what we just submitted.
+    WaitForLiveFrames();
+    Ring.head = 0;
+    ++TheStats.staging_flushes;
+  }
+  return ok;
+}
+
+} // namespace
+
+const ResourceStats &Resources() { return TheStats; }
+
+const std::string &ResourceError() { return Error; }
+
+std::string FormatResourceStats() {
+  std::string out;
+  char line[256];
+  auto add = [&](const char *fmt, auto... args) {
+    std::snprintf(line, sizeof(line), fmt, args...);
+    out += line;
+  };
+  add("arenas: %s\n", Ready ? "up" : "down");
+  if (!Error.empty()) {
+    out += "error: " + Error + "\n";
+  }
+  if (!Ready) {
+    return out;
+  }
+  add("vertex: %llu live / %llu peak / %llu KB   index: %llu / %llu / %llu KB\n",
+      (unsigned long long)(TheStats.vertex_used >> 10),
+      (unsigned long long)(TheStats.vertex_peak >> 10),
+      (unsigned long long)(TheStats.vertex_arena_bytes >> 10),
+      (unsigned long long)(TheStats.index_used >> 10),
+      (unsigned long long)(TheStats.index_peak >> 10),
+      (unsigned long long)(TheStats.index_arena_bytes >> 10));
+  add("slots live: %llu   staging: %llu KB\n", (unsigned long long)TheStats.slots_live,
+      (unsigned long long)(TheStats.staging_bytes >> 10));
+  add("uploads: %llu (%llu KB)   staging wraps: %llu   flushes: %llu   stalls: %llu   "
+      "dropped: %llu   arena full: %llu\n",
+      (unsigned long long)TheStats.uploads,
+      (unsigned long long)(TheStats.uploaded_bytes >> 10),
+      (unsigned long long)TheStats.staging_wraps,
+      (unsigned long long)TheStats.staging_flushes,
+      (unsigned long long)TheStats.staging_stalls,
+      (unsigned long long)TheStats.dropped_uploads,
+      (unsigned long long)TheStats.arena_exhausted);
+  add("images: %llu live / %llu created   %llu KB (peak %llu KB)\n",
+      (unsigned long long)TheStats.images_live,
+      (unsigned long long)TheStats.images_created,
+      (unsigned long long)(TheStats.image_bytes >> 10),
+      (unsigned long long)(TheStats.image_peak_bytes >> 10));
+  add("image uploads: %llu (%llu KB)   unsupported formats: %llu   unaligned rects: %llu"
+      "   dropped: %llu   (last three must be 0)\n",
+      (unsigned long long)TheStats.image_uploads,
+      (unsigned long long)(TheStats.image_uploaded_bytes >> 10),
+      (unsigned long long)TheStats.unsupported_formats,
+      (unsigned long long)TheStats.unaligned_rects,
+      (unsigned long long)TheStats.image_uploads_dropped);
+  add("bindless: %s   %llu image slots   %llu samplers   %llu writes   out of range: %llu"
+      " (must be 0)\n",
+      BindlessSet != VK_NULL_HANDLE ? "up" : "down",
+      (unsigned long long)TheStats.descriptor_capacity,
+      (unsigned long long)TheStats.samplers_live,
+      (unsigned long long)TheStats.descriptors_written,
+      (unsigned long long)TheStats.descriptors_out_of_range);
+  return out;
+}
+
+void ShutdownResources() {
+  if (Allocator == VK_NULL_HANDLE) {
+    return;
+  }
+  vkDeviceWaitIdle(GetDevice());
+  Pending.clear();
+  PendingImages.clear();
+  for (Image &entry : Images) {
+    if (entry.live) {
+      vkDestroyImageView(GetDevice(), entry.view, nullptr);
+      vmaDestroyImage(Allocator, entry.image, entry.allocation);
+      entry = Image();
+    }
+  }
+  Images.clear();
+  FreeImageIndices.clear();
+  TheStats.images_live = 0;
+  TheStats.image_bytes = 0;
+  for (VkSampler sampler : Samplers) {
+    vkDestroySampler(GetDevice(), sampler, nullptr);
+  }
+  Samplers.clear();
+  SamplerIndices.clear();
+  TheStats.samplers_live = 0;
+  // The pool owns the set, so it is freed with it rather than separately.
+  if (BindlessPool != VK_NULL_HANDLE) {
+    vkDestroyDescriptorPool(GetDevice(), BindlessPool, nullptr);
+    BindlessPool = VK_NULL_HANDLE;
+    BindlessSet = VK_NULL_HANDLE;
+  }
+  if (BindlessLayout != VK_NULL_HANDLE) {
+    vkDestroyDescriptorSetLayout(GetDevice(), BindlessLayout, nullptr);
+    BindlessLayout = VK_NULL_HANDLE;
+  }
+  if (UploadFence != VK_NULL_HANDLE) {
+    vkDestroyFence(GetDevice(), UploadFence, nullptr);
+    UploadFence = VK_NULL_HANDLE;
+  }
+  if (UploadPool != VK_NULL_HANDLE) {
+    vkDestroyCommandPool(GetDevice(), UploadPool, nullptr);
+    UploadPool = VK_NULL_HANDLE;
+  }
+  if (Ring.buffer != VK_NULL_HANDLE) {
+    vmaDestroyBuffer(Allocator, Ring.buffer, Ring.allocation);
+    Ring = Staging();
+  }
+  for (Arena *arena : {&VertexArena, &IndexArena}) {
+    if (arena->buffer != VK_NULL_HANDLE) {
+      vmaDestroyBuffer(Allocator, arena->buffer, arena->allocation);
+      *arena = Arena();
+    }
+  }
+  vmaDestroyAllocator(Allocator);
+  Allocator = VK_NULL_HANDLE;
+  Ready = false;
+  TheStats.ready = false;
+}
+
+} // namespace vulkan
+} // namespace gk

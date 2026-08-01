@@ -5,6 +5,7 @@
 
 #include "CustomLevel.h"
 #include "CustomMenu.h"
+#include "D3D8Capture.h"
 #include "Debug.h"
 #include "FileHooks.h"
 #include "GLS.h"
@@ -29,7 +30,10 @@ struct Subsystems {
   // the game subsequently loads - including the assets read during WinMain,
   // before any other subsystem's hook can fire - has to go through it for a mod
   // to be able to replace them.
-  FileHookSystem files;    // mod archives layered over the game's data tree
+  FileHookSystem files; // mod archives layered over the game's data tree
+  // Before GUISystem: it wraps the IDirect3DDevice8 the game creates, and GUISystem's
+  // GetDX9Device reads the game's global expecting whatever CreateDevice handed back.
+  d3d8::D3D8CaptureSystem d3d8;
   MusicSystem music;       // MusicTrack-ctor volume fix
   DebugSystem debug;       // DebugPrint* -> OutputDebugString
   GUISystem gui;           // ImGui/D3D overlay

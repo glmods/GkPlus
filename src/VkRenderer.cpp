@@ -1,0 +1,571 @@
+#include "VkRenderer.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <vector>
+
+#include <imgui.h>
+#include <imgui_impl_vulkan.h>
+#include <imgui_impl_win32.h>
+
+#include "Core.h"
+#include "GUI.h"
+#include "VkContext.h"
+#include "VkInternal.h"
+#include "VkResources.h"
+
+namespace gk {
+namespace vulkan {
+namespace {
+
+// Two frames in flight. Not a tuning choice so much as an address-space one: every frame in
+// flight eventually owns its own staging ring, and on a 32-bit host (section 3 of the notes)
+// three of those buys latency hiding the game does not need at 300 fps.
+constexpr uint32_t kFramesInFlight = 2;
+
+struct Frame {
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  VkSemaphore acquired = VK_NULL_HANDLE;
+  VkFence in_flight = VK_NULL_HANDLE;
+};
+
+bool Requested = false;
+bool RequestedRead = false;
+bool Ready = false;
+bool NeedsRebuild = false;
+std::string Error;
+RendererStats TheStats;
+
+HWND Window = nullptr;
+VkSurfaceKHR Surface = VK_NULL_HANDLE;
+VkSwapchainKHR Swapchain = VK_NULL_HANDLE;
+VkSurfaceFormatKHR Format = {};
+VkPresentModeKHR PresentMode = VK_PRESENT_MODE_FIFO_KHR;
+VkExtent2D Extent = {};
+
+std::vector<VkImage> Images;
+std::vector<VkImageView> Views;
+// One per swapchain image, not per frame in flight: the semaphore a present waits on must
+// not be reused until that image is done being presented, and only the image index tracks
+// that. Using a per-frame semaphore here is the classic way to get a validation error that
+// only appears when the swapchain has more images than frames in flight.
+std::vector<VkSemaphore> RenderFinished;
+
+Frame Frames[kFramesInFlight];
+uint32_t FrameIndex = 0;
+
+bool ImGuiReady = false;
+
+bool Fail(const std::string &message) {
+  Error = message;
+  DebugWrite("gkplus: vulkan renderer: " + message + "\n");
+  return false;
+}
+
+void DestroySwapchainObjects() {
+  VkDevice device = GetDevice();
+  for (VkImageView view : Views) {
+    vkDestroyImageView(device, view, nullptr);
+  }
+  Views.clear();
+  for (VkSemaphore semaphore : RenderFinished) {
+    vkDestroySemaphore(device, semaphore, nullptr);
+  }
+  RenderFinished.clear();
+  Images.clear();
+}
+
+// Prefers a plain 8-bit BGRA UNORM surface. Deliberately NOT an _SRGB one: the engine's
+// colours are already in whatever space D3D8 fixed function produced, and picking an sRGB
+// swapchain silently applies a gamma curve to everything, which reads as "the port looks
+// washed out" much later and is hard to trace back here.
+VkSurfaceFormatKHR ChooseFormat(const std::vector<VkSurfaceFormatKHR> &formats) {
+  for (const VkSurfaceFormatKHR &f : formats) {
+    if ((f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) &&
+        f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+      return f;
+    }
+  }
+  return formats.front();
+}
+
+// FIFO is the only mode guaranteed to exist and the only one that cannot tear. MAILBOX is
+// preferred where present because the game runs far above refresh (measured ~300 fps in
+// level) and FIFO would otherwise throttle the whole engine loop to the monitor - which
+// would change game timing, not just presentation.
+VkPresentModeKHR ChoosePresentMode(const std::vector<VkPresentModeKHR> &modes) {
+  for (VkPresentModeKHR mode : modes) {
+    if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
+      return mode;
+    }
+  }
+  return VK_PRESENT_MODE_FIFO_KHR;
+}
+
+bool CreateSwapchain() {
+  VkDevice device = GetDevice();
+  VkPhysicalDevice physical = GetPhysicalDevice();
+
+  VkSurfaceCapabilitiesKHR caps = {};
+  if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, Surface, &caps) != VK_SUCCESS) {
+    return Fail("vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed");
+  }
+
+  // A zero-area surface is a minimized window, not an error. Leave the old swapchain alone
+  // and report not-ready; DrawFrame retries next frame.
+  if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0) {
+    return false;
+  }
+
+  uint32_t format_count = 0;
+  vkGetPhysicalDeviceSurfaceFormatsKHR(physical, Surface, &format_count, nullptr);
+  if (format_count == 0) {
+    return Fail("surface reports no formats");
+  }
+  std::vector<VkSurfaceFormatKHR> formats(format_count);
+  vkGetPhysicalDeviceSurfaceFormatsKHR(physical, Surface, &format_count, formats.data());
+
+  uint32_t mode_count = 0;
+  vkGetPhysicalDeviceSurfacePresentModesKHR(physical, Surface, &mode_count, nullptr);
+  std::vector<VkPresentModeKHR> modes(mode_count);
+  vkGetPhysicalDeviceSurfacePresentModesKHR(physical, Surface, &mode_count, modes.data());
+
+  Format = ChooseFormat(formats);
+  PresentMode = ChoosePresentMode(modes);
+  Extent = caps.currentExtent;
+
+  uint32_t image_count = caps.minImageCount + 1;
+  if (caps.maxImageCount != 0 && image_count > caps.maxImageCount) {
+    image_count = caps.maxImageCount;
+  }
+
+  VkSwapchainCreateInfoKHR info = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+  info.surface = Surface;
+  info.minImageCount = image_count;
+  info.imageFormat = Format.format;
+  info.imageColorSpace = Format.colorSpace;
+  info.imageExtent = Extent;
+  info.imageArrayLayers = 1;
+  info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  info.preTransform = caps.currentTransform;
+  info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+  info.presentMode = PresentMode;
+  info.clipped = VK_TRUE;
+  info.oldSwapchain = Swapchain;
+
+  VkSwapchainKHR created = VK_NULL_HANDLE;
+  const VkResult result = vkCreateSwapchainKHR(device, &info, nullptr, &created);
+
+  // The old swapchain is retired by the create call whether it succeeded or not, so it is
+  // destroyed either way - and its views and semaphores with it.
+  DestroySwapchainObjects();
+  if (Swapchain != VK_NULL_HANDLE) {
+    vkDestroySwapchainKHR(device, Swapchain, nullptr);
+    Swapchain = VK_NULL_HANDLE;
+  }
+  if (result != VK_SUCCESS) {
+    return Fail("vkCreateSwapchainKHR returned " + std::to_string(result));
+  }
+  Swapchain = created;
+
+  uint32_t actual = 0;
+  vkGetSwapchainImagesKHR(device, Swapchain, &actual, nullptr);
+  Images.resize(actual);
+  vkGetSwapchainImagesKHR(device, Swapchain, &actual, Images.data());
+
+  Views.resize(actual);
+  RenderFinished.resize(actual);
+  for (uint32_t i = 0; i < actual; ++i) {
+    VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view.image = Images[i];
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = Format.format;
+    view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    view.subresourceRange.levelCount = 1;
+    view.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(device, &view, nullptr, &Views[i]) != VK_SUCCESS) {
+      return Fail("vkCreateImageView failed");
+    }
+    VkSemaphoreCreateInfo semaphore = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    if (vkCreateSemaphore(device, &semaphore, nullptr, &RenderFinished[i]) != VK_SUCCESS) {
+      return Fail("vkCreateSemaphore failed");
+    }
+  }
+
+  TheStats.width = Extent.width;
+  TheStats.height = Extent.height;
+  TheStats.image_count = actual;
+  TheStats.format = static_cast<uint32_t>(Format.format);
+  TheStats.present_mode = static_cast<uint32_t>(PresentMode);
+  ++TheStats.swapchain_rebuilds;
+  NeedsRebuild = false;
+  if (ImGuiReady) {
+    ImGui_ImplVulkan_SetMinImageCount(2);
+  }
+  return true;
+}
+
+// The ImGui *context*, the Win32 backend and the F11 toggle all belong to GUISystem
+// (src/GUI.h) whichever renderer is running - only the rendering backend differs. This
+// brings up that half and nothing else.
+bool StartImGui() {
+  if (ImGuiReady) {
+    return true;
+  }
+  // The backend is compiled with IMGUI_IMPL_VULKAN_NO_PROTOTYPES (see
+  // third_party/imgui_backends/README.md), so it has no entry points until this fills them.
+  // Routed through volk's vkGetInstanceProcAddr rather than the loader's exported symbol,
+  // which is the whole point: nothing here needs an import library.
+  if (!ImGui_ImplVulkan_LoadFunctions(
+          VK_API_VERSION_1_3,
+          [](const char *name, void *user) {
+            return vkGetInstanceProcAddr(static_cast<VkInstance>(user), name);
+          },
+          GetInstance())) {
+    return Fail("ImGui_ImplVulkan_LoadFunctions failed");
+  }
+
+  VkPipelineRenderingCreateInfo rendering = {
+      VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+  rendering.colorAttachmentCount = 1;
+  rendering.pColorAttachmentFormats = &Format.format;
+
+  ImGui_ImplVulkan_InitInfo info = {};
+  info.ApiVersion = VK_API_VERSION_1_3;
+  info.Instance = GetInstance();
+  info.PhysicalDevice = GetPhysicalDevice();
+  info.Device = GetDevice();
+  info.QueueFamily = Caps().graphics_queue_family;
+  info.Queue = GetGraphicsQueue();
+  // Non-zero DescriptorPoolSize asks the backend to own its pool. One less object here to
+  // create, size and destroy, and it is the documented convenience path.
+  info.DescriptorPoolSize = 16;
+  info.MinImageCount = 2;
+  info.ImageCount = static_cast<uint32_t>(Images.size());
+  info.UseDynamicRendering = true;
+  info.PipelineInfoMain.PipelineRenderingCreateInfo = rendering;
+
+  if (!ImGui_ImplVulkan_Init(&info)) {
+    return Fail("ImGui_ImplVulkan_Init failed");
+  }
+  ImGuiReady = true;
+  return true;
+}
+
+bool CreateFrames() {
+  VkDevice device = GetDevice();
+  for (Frame &frame : Frames) {
+    VkCommandPoolCreateInfo pool = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pool.queueFamilyIndex = Caps().graphics_queue_family;
+    if (vkCreateCommandPool(device, &pool, nullptr, &frame.pool) != VK_SUCCESS) {
+      return Fail("vkCreateCommandPool failed");
+    }
+
+    VkCommandBufferAllocateInfo alloc = {
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    alloc.commandPool = frame.pool;
+    alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    alloc.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(device, &alloc, &frame.cmd) != VK_SUCCESS) {
+      return Fail("vkAllocateCommandBuffers failed");
+    }
+
+    VkSemaphoreCreateInfo semaphore = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    if (vkCreateSemaphore(device, &semaphore, nullptr, &frame.acquired) != VK_SUCCESS) {
+      return Fail("vkCreateSemaphore failed");
+    }
+
+    // Created signalled so the first frame's wait returns immediately instead of hanging on
+    // a fence nothing has submitted to.
+    VkFenceCreateInfo fence = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    if (vkCreateFence(device, &fence, nullptr, &frame.in_flight) != VK_SUCCESS) {
+      return Fail("vkCreateFence failed");
+    }
+  }
+  return true;
+}
+
+void DestroyFrames() {
+  VkDevice device = GetDevice();
+  for (Frame &frame : Frames) {
+    if (frame.in_flight != VK_NULL_HANDLE) {
+      vkDestroyFence(device, frame.in_flight, nullptr);
+    }
+    if (frame.acquired != VK_NULL_HANDLE) {
+      vkDestroySemaphore(device, frame.acquired, nullptr);
+    }
+    if (frame.pool != VK_NULL_HANDLE) {
+      vkDestroyCommandPool(device, frame.pool, nullptr); // frees its command buffers
+    }
+    frame = Frame();
+  }
+}
+
+// Records one image barrier with synchronization2, which takes both stage masks explicitly
+// rather than inferring them from the layouts.
+void Barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to,
+             VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
+             VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
+  VkImageMemoryBarrier2 barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+  barrier.srcStageMask = src_stage;
+  barrier.srcAccessMask = src_access;
+  barrier.dstStageMask = dst_stage;
+  barrier.dstAccessMask = dst_access;
+  barrier.oldLayout = from;
+  barrier.newLayout = to;
+  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.image = image;
+  barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  barrier.subresourceRange.levelCount = 1;
+  barrier.subresourceRange.layerCount = 1;
+
+  VkDependencyInfo dependency = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  dependency.imageMemoryBarrierCount = 1;
+  dependency.pImageMemoryBarriers = &barrier;
+  vkCmdPipelineBarrier2(cmd, &dependency);
+}
+
+} // namespace
+
+bool RendererRequested() {
+  if (!RequestedRead) {
+    RequestedRead = true;
+    char value[16] = {};
+    const DWORD len = ::GetEnvironmentVariableA("GKPLUS_RENDERER", value, sizeof(value));
+    Requested = len > 0 && std::string(value, len) == "vulkan";
+  }
+  return Requested;
+}
+
+bool StartRenderer(HWND window) {
+  if (Ready) {
+    return true;
+  }
+  if (window == nullptr) {
+    return Fail("no window");
+  }
+  if (Initialize() != InitResult::Ok) {
+    return Fail("no vulkan device: " + LastError());
+  }
+
+  Window = window;
+  VkWin32SurfaceCreateInfoKHR surface = {
+      VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+  surface.hinstance = reinterpret_cast<HINSTANCE>(
+      ::GetWindowLongPtrW(window, GWLP_HINSTANCE));
+  surface.hwnd = window;
+  if (vkCreateWin32SurfaceKHR(GetInstance(), &surface, nullptr, &Surface) != VK_SUCCESS) {
+    return Fail("vkCreateWin32SurfaceKHR failed");
+  }
+
+  // The graphics family was chosen before any surface existed (VkContext has no window at
+  // init time), so this is where "can it actually present" gets checked rather than assumed.
+  VkBool32 supported = VK_FALSE;
+  vkGetPhysicalDeviceSurfaceSupportKHR(GetPhysicalDevice(), Caps().graphics_queue_family,
+                                       Surface, &supported);
+  if (!supported) {
+    return Fail("graphics queue family cannot present to the game window");
+  }
+
+  if (!CreateFrames() || !CreateSwapchain() || !StartImGui() || !StartResources()) {
+    return false;
+  }
+
+  Ready = true;
+  Error.clear();
+  TheStats.ready = true;
+  DebugWrite("gkplus: vulkan renderer up: " + std::to_string(Extent.width) + "x" +
+             std::to_string(Extent.height) + ", " + std::to_string(Images.size()) +
+             " images\n");
+  return true;
+}
+
+bool RendererReady() { return Ready; }
+
+void NotifyResize() { NeedsRebuild = true; }
+
+void DrawFrame() {
+  if (!Ready) {
+    return;
+  }
+  VkDevice device = GetDevice();
+
+  if (NeedsRebuild && !CreateSwapchain()) {
+    return; // minimized, or a genuine failure that CreateSwapchain has already recorded
+  }
+
+  Frame &frame = Frames[FrameIndex];
+  vkWaitForFences(device, 1, &frame.in_flight, VK_TRUE, UINT64_MAX);
+  // The fence is the proof that everything this slot staged last time round has been read, so
+  // the staging ring may hand those bytes back. It must be here rather than after Present:
+  // without it the ring reuses memory a frame in flight is still copying from, which is what
+  // silently corrupted one texture per session during the startup burst.
+  ReleaseFrameStaging(FrameIndex);
+
+  uint32_t image_index = 0;
+  VkResult acquired = vkAcquireNextImageKHR(device, Swapchain, UINT64_MAX, frame.acquired,
+                                            VK_NULL_HANDLE, &image_index);
+  if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
+    // Do NOT reset the fence or advance the frame: nothing was submitted, so the fence is
+    // still signalled from the last time round and the semaphore was never waited on.
+    CreateSwapchain();
+    return;
+  }
+  if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) {
+    ++TheStats.acquire_failures;
+    return;
+  }
+
+  vkResetFences(device, 1, &frame.in_flight);
+  vkResetCommandBuffer(frame.cmd, 0);
+
+  // Built before recording, because ImGui::Render() produces the draw data the command
+  // buffer then consumes. Skipped entirely when the overlay is hidden - NewFrame and Render
+  // must pair, so a half-built frame is worse than none.
+  ImDrawData *draw_data = nullptr;
+  if (ImGuiReady && IsOverlayVisible()) {
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+    RunOverlayDrawCallback();
+    ImGui::Render();
+    draw_data = ImGui::GetDrawData();
+  }
+
+  VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(frame.cmd, &begin);
+
+  RecordUploads(frame.cmd, FrameIndex);
+
+  // UNDEFINED as the source layout on purpose: the previous contents of a swapchain image
+  // are not ours to preserve, and saying so lets the driver skip a decompress.
+  Barrier(frame.cmd, Images[image_index], VK_IMAGE_LAYOUT_UNDEFINED,
+          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+          VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+  // The clear is the attachment's load op rather than a separate vkCmdClearColorImage: one
+  // less barrier, one less layout, and the swapchain no longer needs TRANSFER_DST usage.
+  // Until there is real geometry this colour is still the "is Vulkan on the screen?" test.
+  VkRenderingAttachmentInfo colour = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  colour.imageView = Views[image_index];
+  colour.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  colour.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  colour.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  colour.clearValue.color = {{0.10f, 0.16f, 0.28f, 1.0f}};
+
+  VkRenderingInfo rendering = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+  rendering.renderArea.extent = Extent;
+  rendering.layerCount = 1;
+  rendering.colorAttachmentCount = 1;
+  rendering.pColorAttachments = &colour;
+
+  vkCmdBeginRendering(frame.cmd, &rendering);
+  if (draw_data != nullptr) {
+    ImGui_ImplVulkan_RenderDrawData(draw_data, frame.cmd);
+  }
+  vkCmdEndRendering(frame.cmd);
+
+  Barrier(frame.cmd, Images[image_index], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+          VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+          VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+          VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, 0);
+
+  vkEndCommandBuffer(frame.cmd);
+
+  VkSemaphoreSubmitInfo wait = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+  wait.semaphore = frame.acquired;
+  wait.stageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+
+  VkSemaphoreSubmitInfo signal = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+  signal.semaphore = RenderFinished[image_index];
+  signal.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+  VkCommandBufferSubmitInfo cmd = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+  cmd.commandBuffer = frame.cmd;
+
+  VkSubmitInfo2 submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+  submit.waitSemaphoreInfoCount = 1;
+  submit.pWaitSemaphoreInfos = &wait;
+  submit.commandBufferInfoCount = 1;
+  submit.pCommandBufferInfos = &cmd;
+  submit.signalSemaphoreInfoCount = 1;
+  submit.pSignalSemaphoreInfos = &signal;
+  vkQueueSubmit2(GetGraphicsQueue(), 1, &submit, frame.in_flight);
+
+  VkPresentInfoKHR present = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+  present.waitSemaphoreCount = 1;
+  present.pWaitSemaphores = &RenderFinished[image_index];
+  present.swapchainCount = 1;
+  present.pSwapchains = &Swapchain;
+  present.pImageIndices = &image_index;
+
+  const VkResult presented = vkQueuePresentKHR(GetGraphicsQueue(), &present);
+  if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) {
+    NeedsRebuild = true;
+  }
+
+  ++TheStats.frames_presented;
+  FrameIndex = (FrameIndex + 1) % kFramesInFlight;
+}
+
+void ShutdownRenderer() {
+  if (GetDevice() == VK_NULL_HANDLE) {
+    return;
+  }
+  vkDeviceWaitIdle(GetDevice());
+  ShutdownResources();
+  if (ImGuiReady) {
+    ImGui_ImplVulkan_Shutdown();
+    ImGuiReady = false;
+  }
+  DestroySwapchainObjects();
+  if (Swapchain != VK_NULL_HANDLE) {
+    vkDestroySwapchainKHR(GetDevice(), Swapchain, nullptr);
+    Swapchain = VK_NULL_HANDLE;
+  }
+  DestroyFrames();
+  if (Surface != VK_NULL_HANDLE) {
+    vkDestroySurfaceKHR(GetInstance(), Surface, nullptr);
+    Surface = VK_NULL_HANDLE;
+  }
+  Ready = false;
+  TheStats.ready = false;
+}
+
+const RendererStats &Stats() { return TheStats; }
+
+const std::string &RendererError() { return Error; }
+
+std::string FormatStats() {
+  std::string out;
+  char line[256];
+  auto add = [&](const char *fmt, auto... args) {
+    std::snprintf(line, sizeof(line), fmt, args...);
+    out += line;
+  };
+  add("requested: %s   ready: %s\n", RendererRequested() ? "vulkan" : "d3d9",
+      Ready ? "yes" : "no");
+  if (!Error.empty()) {
+    out += "error: " + Error + "\n";
+  }
+  if (Ready) {
+    add("swapchain: %ux%u, %u images, format %u, present mode %u\n", TheStats.width,
+        TheStats.height, TheStats.image_count, TheStats.format, TheStats.present_mode);
+    add("presented: %llu   rebuilds: %llu   acquire failures: %llu\n",
+        (unsigned long long)TheStats.frames_presented,
+        (unsigned long long)TheStats.swapchain_rebuilds,
+        (unsigned long long)TheStats.acquire_failures);
+  }
+  return out;
+}
+
+} // namespace vulkan
+} // namespace gk
