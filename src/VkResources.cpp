@@ -22,6 +22,8 @@
 #include <vector>
 
 #include "Core.h"
+#include "VertexFormat.h"
+#include "VkCapture.h"
 #include "VkContext.h"
 #include "VkInternal.h"
 
@@ -37,6 +39,34 @@ constexpr VkDeviceSize kVertexArenaBytes = 32u << 20;
 constexpr VkDeviceSize kIndexArenaBytes = 8u << 20;
 constexpr VkDeviceSize kStagingBytes = 32u << 20;
 constexpr uint32_t kFramesInFlight = 2; // must match VkRenderer's
+
+// `GKPLUS_VK_HEAPS=small` - the same totals cut to just above level01's measured peaks, for
+// RenderDoc. A capture is taken *inside* the 32-bit game, where RenderDoc allocates a mapped
+// readback buffer per resource to snapshot its initial state, and gl.exe's 2 GB of address
+// space is already shared with the game, the driver and QuickJS. At full size 15 of those
+// allocations fail in level and those resources are captured uninitialised (§4.17).
+//
+// Deliberately NOT implied by GKPLUS_RENDERDOC. Shrinking the heaps changes what the renderer
+// does - an arena that no longer exhausts, a ring that wraps differently - so a capture taken
+// this way is not a capture of the configuration that runs. Coupling the two would mean the
+// frame being debugged is not the frame that misbehaved, which is the whole problem with
+// debugging tools that alter behaviour. The warning below is the compromise.
+//
+// Level01's peaks are 10.8 MB vertex, 587 KB index, 800 KB + 66 KB scratch. The vertex arena
+// gets 16 MB rather than the 12 that fits, because 12 leaves it at 90% full on the one level
+// that has been measured and a level with more geometry would silently start dropping draws;
+// `arena_full` / `scratch_exhausted` are what say so if one ever does not fit.
+constexpr VkDeviceSize kSmallVertexArenaBytes = 16u << 20;
+constexpr VkDeviceSize kSmallIndexArenaBytes = 2u << 20;
+constexpr VkDeviceSize kSmallStagingBytes = 8u << 20;
+
+bool SmallHeaps = false;
+
+void ReadHeapMode() {
+  char value[16] = {};
+  const DWORD len = ::GetEnvironmentVariableA("GKPLUS_VK_HEAPS", value, sizeof(value));
+  SmallHeaps = std::string(value, len) == "small";
+}
 
 bool Ready = false;
 std::string Error;
@@ -56,6 +86,12 @@ struct Arena {
   VkDeviceSize capacity = 0;
   VkDeviceSize tail = 0; // the never-yet-allocated region starts here
   VkDeviceSize used = 0; // currently allocated
+  // Every slot starts on a multiple of this. For the vertex arena it MUST be the canonical
+  // vertex size, not merely 16: a draw addresses its buffer as `slot.offset / 48`, so a slot
+  // that does not begin on a whole vertex silently pulls the wrong ones. That was the first
+  // thing the renderer put on screen - geometry smeared into long streaks toward a point,
+  // because each triangle got one right vertex and two from somewhere else.
+  VkDeviceSize alignment = 16;
   std::vector<std::pair<VkDeviceSize, VkDeviceSize>> free_list; // (offset, size), sorted
 };
 
@@ -83,6 +119,32 @@ struct Staging {
 };
 
 Staging Ring;
+
+// Per-frame scratch for user-pointer draws. Host-visible and permanently mapped - see the
+// header for why this is the one exception to the unmapped rule.
+//
+// Sized to be generous rather than measured, because nothing existed to measure: the game makes
+// ~115 user-pointer draws a frame and they are text, particles and menu quads, so this is orders
+// of magnitude of headroom. `scratch_exhausted` is what would say otherwise, and the two peaks
+// are the numbers to resize by.
+constexpr VkDeviceSize kScratchVertexBytes = 4u << 20;
+constexpr VkDeviceSize kScratchIndexBytes = 1u << 20;
+constexpr VkDeviceSize kSmallScratchVertexBytes = 1u << 20;
+constexpr VkDeviceSize kSmallScratchIndexBytes = 256u << 10;
+
+struct Scratch {
+  VkBuffer buffer = VK_NULL_HANDLE;
+  VmaAllocation allocation = VK_NULL_HANDLE;
+  uint8_t *mapped = nullptr;
+  VkDeviceAddress address = 0;
+  VkDeviceSize slice = 0; // bytes per frame in flight
+  VkDeviceSize head = 0;  // within the current frame's slice
+  VkDeviceSize base = 0;  // where the current frame's slice starts
+};
+
+Scratch ScratchVertices;
+Scratch ScratchIndices;
+uint32_t ScratchFrame = 0;
 
 // A command pool and fence of the renderer's own, used only by FlushPendingNow - the frame's
 // command buffer belongs to VkRenderer and is not available mid-batch. Transient because these
@@ -217,7 +279,7 @@ bool Fail(const std::string &message) {
 }
 
 bool CreateArena(Arena &arena, VkDeviceSize bytes, VkBufferUsageFlags usage,
-                 const char *what) {
+                 VkDeviceSize alignment, const char *what) {
   VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   info.size = bytes;
   // TRANSFER_DST because everything arrives by staged copy, and SHADER_DEVICE_ADDRESS so the
@@ -239,14 +301,21 @@ bool CreateArena(Arena &arena, VkDeviceSize bytes, VkBufferUsageFlags usage,
   }
   arena.capacity = bytes;
   arena.used = 0;
+  arena.alignment = alignment;
   return true;
 }
 
-// 16-byte aligned, so a slot can hold any vertex layout without a second alignment step.
+// 16-byte aligned, which is what the staging ring needs (see AllocateStaging).
 VkDeviceSize AlignUp(VkDeviceSize v) { return (v + 15) & ~VkDeviceSize(15); }
 
+VkDeviceSize AlignUpTo(VkDeviceSize v, VkDeviceSize alignment) {
+  return ((v + alignment - 1) / alignment) * alignment;
+}
+
 bool Suballocate(Arena &arena, VkDeviceSize bytes, VkDeviceSize &offset) {
-  bytes = AlignUp(bytes);
+  // Both the size and every offset are rounded to the arena's alignment, so that a slot freed
+  // and re-suballocated stays aligned too - rounding only the size would drift.
+  bytes = AlignUpTo(bytes, arena.alignment);
   for (size_t i = 0; i < arena.free_list.size(); ++i) {
     if (arena.free_list[i].second >= bytes) {
       offset = arena.free_list[i].first;
@@ -271,7 +340,7 @@ bool Suballocate(Arena &arena, VkDeviceSize bytes, VkDeviceSize &offset) {
 }
 
 void Release(Arena &arena, VkDeviceSize offset, VkDeviceSize bytes) {
-  bytes = AlignUp(bytes);
+  bytes = AlignUpTo(bytes, arena.alignment);
   arena.used -= bytes;
   // Insert in address order, then coalesce with either neighbour. Without coalescing the
   // free list grows without bound under this workload, which is the same leak in different
@@ -362,6 +431,33 @@ bool AllocateStaging(VkDeviceSize bytes, VkDeviceSize &offset) {
   offset = Ring.head;
   Ring.head += bytes;
   Ring.batch += bytes;
+  return true;
+}
+
+bool CreateScratch(Scratch &scratch, VkDeviceSize slice_bytes, VkBufferUsageFlags usage,
+                   const char *what) {
+  VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  info.size = slice_bytes * kFramesInFlight;
+  info.usage = usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+  VmaAllocationCreateInfo alloc = {};
+  alloc.usage = VMA_MEMORY_USAGE_AUTO;
+  alloc.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+  VmaAllocationInfo allocated = {};
+  if (vmaCreateBuffer(Allocator, &info, &alloc, &scratch.buffer, &scratch.allocation,
+                      &allocated) != VK_SUCCESS ||
+      allocated.pMappedData == nullptr) {
+    return Fail(std::string("could not allocate the ") + what + " scratch");
+  }
+  scratch.mapped = static_cast<uint8_t *>(allocated.pMappedData);
+  scratch.slice = slice_bytes;
+
+  VkBufferDeviceAddressInfo address = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+  address.buffer = scratch.buffer;
+  scratch.address = vkGetBufferDeviceAddress(GetDevice(), &address);
   return true;
 }
 
@@ -549,6 +645,22 @@ bool StartResources() {
   if (Initialize() != InitResult::Ok) {
     return Fail("no vulkan device");
   }
+  ReadHeapMode();
+  // Impossible to miss rather than silently corrected, because the symptom otherwise is a
+  // capture that opens and shows resources with plausible-looking rubbish in them.
+  if (RenderDocLoaded() && !SmallHeaps) {
+    DebugWrite("gkplus: renderdoc is loaded with full-size heaps - an in-level capture will "
+               "be missing some resources' initial state. Set GKPLUS_VK_HEAPS=small for a "
+               "complete one (see vulkan_renderer_notes.md 4.17)\n");
+  }
+
+  const VkDeviceSize vertex_arena = SmallHeaps ? kSmallVertexArenaBytes : kVertexArenaBytes;
+  const VkDeviceSize index_arena = SmallHeaps ? kSmallIndexArenaBytes : kIndexArenaBytes;
+  const VkDeviceSize staging_bytes = SmallHeaps ? kSmallStagingBytes : kStagingBytes;
+  const VkDeviceSize scratch_vertex =
+      SmallHeaps ? kSmallScratchVertexBytes : kScratchVertexBytes;
+  const VkDeviceSize scratch_index =
+      SmallHeaps ? kSmallScratchIndexBytes : kScratchIndexBytes;
 
   VmaVulkanFunctions functions = {};
   functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
@@ -568,16 +680,24 @@ bool StartResources() {
     return Fail("vmaCreateAllocator failed");
   }
 
-  if (!CreateArena(VertexArena, kVertexArenaBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                   "vertex") ||
-      !CreateArena(IndexArena, kIndexArenaBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                   "index") ||
+  // The vertex arena aligns to a whole canonical vertex because a draw addresses its buffer as
+  // a vertex index, not a byte offset. The index arena aligns to 16, which keeps it a multiple
+  // of both index widths.
+  if (!CreateArena(VertexArena, vertex_arena, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                   sizeof(CanonicalVertex), "vertex") ||
+      !CreateArena(IndexArena, index_arena, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, 16, "index") ||
+      !CreateScratch(ScratchVertices, scratch_vertex, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     "vertex") ||
+      !CreateScratch(ScratchIndices, scratch_index, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                     "index") ||
       !CreateBindlessSet()) {
     return false;
   }
+  TheStats.scratch_vertex_bytes = scratch_vertex;
+  TheStats.scratch_index_bytes = scratch_index;
 
   VkBufferCreateInfo staging = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-  staging.size = kStagingBytes;
+  staging.size = staging_bytes;
   staging.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
   staging.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
@@ -592,7 +712,7 @@ bool StartResources() {
     return Fail("could not allocate the staging ring");
   }
   Ring.mapped = static_cast<uint8_t *>(staging_info.pMappedData);
-  Ring.capacity = kStagingBytes;
+  Ring.capacity = staging_bytes;
   if (Ring.mapped == nullptr) {
     return Fail("staging ring came back unmapped");
   }
@@ -611,10 +731,18 @@ bool StartResources() {
   Ready = true;
   Error.clear();
   TheStats.ready = true;
-  TheStats.vertex_arena_bytes = kVertexArenaBytes;
-  TheStats.index_arena_bytes = kIndexArenaBytes;
-  TheStats.staging_bytes = kStagingBytes;
-  DebugWrite("gkplus: vulkan arenas up: 32 MB vertex, 8 MB index, 32 MB staging\n");
+  TheStats.vertex_arena_bytes = vertex_arena;
+  TheStats.index_arena_bytes = index_arena;
+  TheStats.staging_bytes = staging_bytes;
+  TheStats.small_heaps = SmallHeaps;
+  char line[160];
+  std::snprintf(line, sizeof(line),
+                "gkplus: vulkan arenas up (%s): %llu MB vertex, %llu MB index, "
+                "%llu MB staging\n",
+                SmallHeaps ? "small" : "full", (unsigned long long)(vertex_arena >> 20),
+                (unsigned long long)(index_arena >> 20),
+                (unsigned long long)(staging_bytes >> 20));
+  DebugWrite(line);
   return true;
 }
 
@@ -850,6 +978,87 @@ uint32_t AcquireSampler(uint32_t mag_filter, uint32_t min_filter, uint32_t mip_f
     ++TheStats.descriptors_written;
   }
   return index;
+}
+
+void BeginFrameScratch(uint32_t frame_index) {
+  if (!Ready || frame_index >= kFramesInFlight) {
+    return;
+  }
+  ScratchFrame = frame_index;
+  for (Scratch *scratch : {&ScratchVertices, &ScratchIndices}) {
+    scratch->base = scratch->slice * frame_index;
+    scratch->head = 0;
+  }
+}
+
+namespace {
+
+// Bump-allocates within the current frame's slice. `element` is the stride, so the returned
+// offset can be in elements - which is what both a vertex index and a first-index want.
+ScratchAlloc AllocateScratch(Scratch &scratch, uint32_t count, uint32_t element,
+                             uint64_t &peak) {
+  ScratchAlloc out;
+  if (!Ready || scratch.mapped == nullptr || count == 0) {
+    return out;
+  }
+  // Aligned to the element so the returned offset is exact, and to 16 for the vertex case so a
+  // device address stays naturally aligned - element is 48 there, which covers both.
+  const VkDeviceSize head = ((scratch.head + element - 1) / element) * element;
+  const VkDeviceSize bytes = VkDeviceSize(count) * element;
+  if (head + bytes > scratch.slice) {
+    ++TheStats.scratch_exhausted;
+    return out;
+  }
+  out.mapped = scratch.mapped + scratch.base + head;
+  out.offset = static_cast<uint32_t>(head / element);
+  out.valid = true;
+  scratch.head = head + bytes;
+  if (scratch.head > peak) {
+    peak = scratch.head;
+  }
+  return out;
+}
+
+} // namespace
+
+ScratchAlloc AllocateScratchVertices(uint32_t count) {
+  return AllocateScratch(ScratchVertices, count,
+                         static_cast<uint32_t>(sizeof(CanonicalVertex)),
+                         TheStats.scratch_vertices_peak);
+}
+
+ScratchAlloc AllocateScratchIndices(uint32_t count, uint32_t stride) {
+  ScratchAlloc out =
+      AllocateScratch(ScratchIndices, count, stride, TheStats.scratch_indices_peak);
+  // Made absolute from the buffer's start, unlike the vertex case. Vertices are reached through
+  // an address that already has the frame's slice folded in; indices go through
+  // vkCmdBindIndexBuffer, which the renderer binds at offset 0, so the first-index has to carry
+  // the slice itself. The slice size is a power of two, so it divides both index widths.
+  if (out.valid) {
+    out.offset += static_cast<uint32_t>(ScratchIndices.base / stride);
+  }
+  return out;
+}
+
+uint64_t ScratchVertexAddress() {
+  return Ready ? ScratchVertices.address + ScratchVertices.base : 0;
+}
+
+uint64_t ScratchIndexBuffer() {
+  return Ready ? reinterpret_cast<uint64_t>(ScratchIndices.buffer) : 0;
+}
+
+uint64_t VertexArenaAddress() {
+  if (!Ready || VertexArena.buffer == VK_NULL_HANDLE) {
+    return 0;
+  }
+  VkBufferDeviceAddressInfo info = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+  info.buffer = VertexArena.buffer;
+  return vkGetBufferDeviceAddress(GetDevice(), &info);
+}
+
+uint64_t IndexArenaBuffer() {
+  return Ready ? reinterpret_cast<uint64_t>(IndexArena.buffer) : 0;
 }
 
 uint64_t BindlessDescriptorSet() { return reinterpret_cast<uint64_t>(BindlessSet); }
@@ -1233,7 +1442,9 @@ std::string FormatResourceStats() {
     std::snprintf(line, sizeof(line), fmt, args...);
     out += line;
   };
-  add("arenas: %s\n", Ready ? "up" : "down");
+  add("arenas: %s (%s)\n", Ready ? "up" : "down",
+      TheStats.small_heaps ? "SMALL heaps - not the configuration that normally runs"
+                           : "full heaps");
   if (!Error.empty()) {
     out += "error: " + Error + "\n";
   }
@@ -1270,6 +1481,13 @@ std::string FormatResourceStats() {
       (unsigned long long)TheStats.unsupported_formats,
       (unsigned long long)TheStats.unaligned_rects,
       (unsigned long long)TheStats.image_uploads_dropped);
+  add("scratch: %llu KB vtx (peak %llu KB) + %llu KB idx (peak %llu KB) per frame   "
+      "exhausted: %llu (must be 0)\n",
+      (unsigned long long)(TheStats.scratch_vertex_bytes >> 10),
+      (unsigned long long)(TheStats.scratch_vertices_peak >> 10),
+      (unsigned long long)(TheStats.scratch_index_bytes >> 10),
+      (unsigned long long)(TheStats.scratch_indices_peak >> 10),
+      (unsigned long long)TheStats.scratch_exhausted);
   add("bindless: %s   %llu image slots   %llu samplers   %llu writes   out of range: %llu"
       " (must be 0)\n",
       BindlessSet != VK_NULL_HANDLE ? "up" : "down",
@@ -1325,6 +1543,12 @@ void ShutdownResources() {
   if (Ring.buffer != VK_NULL_HANDLE) {
     vmaDestroyBuffer(Allocator, Ring.buffer, Ring.allocation);
     Ring = Staging();
+  }
+  for (Scratch *scratch : {&ScratchVertices, &ScratchIndices}) {
+    if (scratch->buffer != VK_NULL_HANDLE) {
+      vmaDestroyBuffer(Allocator, scratch->buffer, scratch->allocation);
+      *scratch = Scratch();
+    }
   }
   for (Arena *arena : {&VertexArena, &IndexArena}) {
     if (arena->buffer != VK_NULL_HANDLE) {

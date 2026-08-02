@@ -10,7 +10,9 @@
 
 #include "Core.h"
 #include "GUI.h"
+#include "VkCapture.h"
 #include "VkContext.h"
+#include "VkDraw.h"
 #include "VkInternal.h"
 #include "VkResources.h"
 
@@ -309,7 +311,8 @@ void DestroyFrames() {
 // rather than inferring them from the layouts.
 void Barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to,
              VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
-             VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
+             VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access,
+             VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT) {
   VkImageMemoryBarrier2 barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
   barrier.srcStageMask = src_stage;
   barrier.srcAccessMask = src_access;
@@ -320,7 +323,7 @@ void Barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayo
   barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   barrier.image = image;
-  barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  barrier.subresourceRange.aspectMask = aspect;
   barrier.subresourceRange.levelCount = 1;
   barrier.subresourceRange.layerCount = 1;
 
@@ -372,7 +375,10 @@ bool StartRenderer(HWND window) {
     return Fail("graphics queue family cannot present to the game window");
   }
 
-  if (!CreateFrames() || !CreateSwapchain() || !StartImGui() || !StartResources()) {
+  // StartDraw last: it needs the bindless set layout StartResources creates, and the
+  // swapchain's format and extent, so it cannot come before either.
+  if (!CreateFrames() || !CreateSwapchain() || !StartImGui() || !StartResources() ||
+      !StartDraw(Extent.width, Extent.height, Format.format)) {
     return false;
   }
 
@@ -395,8 +401,15 @@ void DrawFrame() {
   }
   VkDevice device = GetDevice();
 
-  if (NeedsRebuild && !CreateSwapchain()) {
-    return; // minimized, or a genuine failure that CreateSwapchain has already recorded
+  if (NeedsRebuild) {
+    if (!CreateSwapchain()) {
+      // Minimized, or a genuine failure CreateSwapchain has already recorded. The frame's
+      // draws are dropped rather than carried over: they were built against the old extent's
+      // projection and would be a frame stale by the time anything rendered.
+      ClearDraws();
+      return;
+    }
+    ResizeDraw(Extent.width, Extent.height);
   }
 
   Frame &frame = Frames[FrameIndex];
@@ -406,6 +419,9 @@ void DrawFrame() {
   // without it the ring reuses memory a frame in flight is still copying from, which is what
   // silently corrupted one texture per session during the startup burst.
   ReleaseFrameStaging(FrameIndex);
+  // Same proof, same moment: this slot's fence has been waited on, so both the staging it held
+  // and the scratch the user-pointer draws wrote into it are free to reuse.
+  BeginFrameScratch(FrameIndex);
 
   uint32_t image_index = 0;
   VkResult acquired = vkAcquireNextImageKHR(device, Swapchain, UINT64_MAX, frame.acquired,
@@ -437,6 +453,10 @@ void DrawFrame() {
     draw_data = ImGui::GetDrawData();
   }
 
+  // Around the whole frame including the uploads, so a capture shows the copies that produced
+  // the geometry as well as the draws that read it.
+  BeginFrameCaptureIfArmed();
+
   VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   vkBeginCommandBuffer(frame.cmd, &begin);
@@ -452,7 +472,6 @@ void DrawFrame() {
 
   // The clear is the attachment's load op rather than a separate vkCmdClearColorImage: one
   // less barrier, one less layout, and the swapchain no longer needs TRANSFER_DST usage.
-  // Until there is real geometry this colour is still the "is Vulkan on the screen?" test.
   VkRenderingAttachmentInfo colour = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
   colour.imageView = Views[image_index];
   colour.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -460,13 +479,44 @@ void DrawFrame() {
   colour.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   colour.clearValue.color = {{0.10f, 0.16f, 0.28f, 1.0f}};
 
+  auto depth_view = reinterpret_cast<VkImageView>(DepthImageView());
+  VkRenderingAttachmentInfo depth = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  depth.imageView = depth_view;
+  depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+  depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  // DONT_CARE: nothing reads the depth buffer after the pass, so storing it is pure bandwidth.
+  depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  depth.clearValue.depthStencil = {1.0f, 0};
+
+  // The depth image is fresh every frame from the renderer's point of view - UNDEFINED as the
+  // old layout, because the clear load op is about to overwrite it anyway.
+  if (depth_view != VK_NULL_HANDLE) {
+    Barrier(frame.cmd, reinterpret_cast<VkImage>(DepthImage()),
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
+            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            VK_IMAGE_ASPECT_DEPTH_BIT);
+  }
+
   VkRenderingInfo rendering = {VK_STRUCTURE_TYPE_RENDERING_INFO};
   rendering.renderArea.extent = Extent;
   rendering.layerCount = 1;
   rendering.colorAttachmentCount = 1;
   rendering.pColorAttachments = &colour;
+  rendering.pDepthAttachment = depth_view != VK_NULL_HANDLE ? &depth : nullptr;
 
   vkCmdBeginRendering(frame.cmd, &rendering);
+
+  // The world first, then the overlay on top of it. Viewport and scissor are dynamic so the
+  // pipeline survives a resize without being rebuilt.
+  VkViewport viewport = {0.0f, 0.0f, static_cast<float>(Extent.width),
+                         static_cast<float>(Extent.height), 0.0f, 1.0f};
+  VkRect2D scissor = {{0, 0}, Extent};
+  vkCmdSetViewport(frame.cmd, 0, 1, &viewport);
+  vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
+  RecordDraws(frame.cmd);
+
   if (draw_data != nullptr) {
     ImGui_ImplVulkan_RenderDrawData(draw_data, frame.cmd);
   }
@@ -508,6 +558,9 @@ void DrawFrame() {
   present.pImageIndices = &image_index;
 
   const VkResult presented = vkQueuePresentKHR(GetGraphicsQueue(), &present);
+  // After present, so the capture contains a complete frame from acquire to present rather
+  // than one that stops short of the thing RenderDoc uses to delimit them.
+  EndFrameCaptureIfArmed();
   if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) {
     NeedsRebuild = true;
   }
@@ -521,6 +574,9 @@ void ShutdownRenderer() {
     return;
   }
   vkDeviceWaitIdle(GetDevice());
+  // Before ShutdownResources: the pipeline layout references the bindless set layout that
+  // owns, and destroying a layout still referenced by a live pipeline is undefined.
+  ShutdownDraw();
   ShutdownResources();
   if (ImGuiReady) {
     ImGui_ImplVulkan_Shutdown();

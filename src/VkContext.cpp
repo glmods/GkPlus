@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "Core.h"
+#include "VkCapture.h"
 #include "VkInternal.h"
 
 namespace gk {
@@ -284,8 +285,16 @@ InitResult DoInitialize() {
   features13.dynamicRendering = VK_TRUE;
   features13.synchronization2 = VK_TRUE;
 
+  // Slang's SV_VertexID carries D3D semantics - the raw index, excluding the base vertex - so
+  // it compiles to `gl_VertexIndex - gl_BaseVertex`, which declares the DrawParameters
+  // capability whether or not a base vertex is ever non-zero. Vulkan 1.1 core and universally
+  // supported; without it the shader module is rejected outright.
+  VkPhysicalDeviceVulkan11Features features11 = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &features13};
+  features11.shaderDrawParameters = VK_TRUE;
+
   VkPhysicalDeviceVulkan12Features features12 = {
-      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &features13};
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &features11};
   features12.descriptorIndexing = VK_TRUE;
   features12.runtimeDescriptorArray = VK_TRUE;
   features12.descriptorBindingPartiallyBound = VK_TRUE;
@@ -358,6 +367,11 @@ InitResult Initialize() {
     return Result;
   }
   Initialized = true;
+  // Before anything Vulkan, and that ordering is the whole contract: RenderDoc captures by
+  // inserting a layer, and a layer cannot be added to an instance that already exists. This is
+  // also safe to do here and NOT in DllMain - it calls LoadLibrary, which deadlocks under the
+  // loader lock, the same reason the whole context is initialized lazily.
+  LoadRenderDoc();
   return DoInitialize();
 }
 

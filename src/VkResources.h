@@ -76,6 +76,9 @@ struct TextureImageInfo {
 
 struct ResourceStats {
   bool ready = false;
+  // GKPLUS_VK_HEAPS=small. Worth reporting rather than inferring from the sizes, because a
+  // capture taken this way is not a capture of the configuration that normally runs.
+  bool small_heaps = false;
   uint64_t vertex_arena_bytes = 0; // capacity
   uint64_t index_arena_bytes = 0;
   uint64_t staging_bytes = 0;
@@ -122,6 +125,15 @@ struct ResourceStats {
   // Images whose slot index is past the set's capacity, so they have no descriptor and would
   // sample as missing. Must be 0; if it ever is not, raise kBindlessTextures.
   uint64_t descriptors_out_of_range = 0;
+
+  // --- per-frame scratch -------------------------------------------------------------------
+  uint64_t scratch_vertex_bytes = 0; // capacity of one frame's slice
+  uint64_t scratch_index_bytes = 0;
+  uint64_t scratch_vertices_peak = 0; // high-water within a single frame
+  uint64_t scratch_indices_peak = 0;
+  // Allocations that did not fit in the frame's slice, so those draws were dropped. Must be 0;
+  // if it ever is not, the slice is too small - the numbers to size it by are the two peaks.
+  uint64_t scratch_exhausted = 0;
 };
 
 // Creates the arenas and the staging ring. Requires vulkan::Initialize() to have succeeded.
@@ -194,6 +206,47 @@ uint32_t AcquireSampler(uint32_t mag_filter, uint32_t min_filter, uint32_t mip_f
 // are not, and typing them as one truncates the handle in half.
 uint64_t BindlessDescriptorSet();
 uint64_t BindlessDescriptorSetLayout();
+
+// --- per-frame scratch, for user-pointer draws ------------------------------------------------
+//
+// `DrawPrimitiveUP` and `DrawIndexedPrimitiveUP` hand D3D their vertices inline: there is no
+// buffer, so there is nothing for a BufferSlot to attach to and nothing whose Release says when
+// the data dies. It is per-frame data by construction, so it gets a per-frame allocator.
+//
+// **Host-visible and mapped, unlike the arenas**, which is the one deliberate exception to the
+// rule in this header. The data is produced on the CPU, is different every frame, and is small;
+// staging it would mean a copy and a barrier per draw to move bytes that the GPU will read once.
+// The arenas stay device-local because they hold a level's worth of geometry that is read every
+// frame and written rarely - exactly the opposite trade.
+//
+// One slice per frame in flight, bump-allocated and reset when that frame comes round again, so
+// a slice is only reused once its fence has been waited on.
+
+struct ScratchAlloc {
+  void *mapped = nullptr; // write the data here
+  uint32_t offset = 0;    // in elements: vertices for the vertex scratch, indices for the index
+  bool valid = false;
+};
+
+// Resets the frame's slice. Called by the renderer once it has waited on that frame's fence.
+void BeginFrameScratch(uint32_t frame_index);
+
+ScratchAlloc AllocateScratchVertices(uint32_t count);
+// `stride` is 2 or 4 bytes; the two index widths are kept apart so a draw can be recorded with
+// the type it actually has rather than everything being widened.
+ScratchAlloc AllocateScratchIndices(uint32_t count, uint32_t stride);
+
+// The scratch vertex buffer's shader-readable address, and the index scratch as a handle. Both
+// are per frame, so they are only valid for the frame BeginFrameScratch last named.
+uint64_t ScratchVertexAddress();
+uint64_t ScratchIndexBuffer();
+
+// The vertex arena as a shader-readable address, and the index arena as a VkBuffer handle.
+// Vertices are *pulled* by address (so a draw binds no vertex buffer at all) while indices
+// still go through vkCmdBindIndexBuffer, which takes a handle - hence the two shapes. Both
+// zero until the resources are up.
+uint64_t VertexArenaAddress();
+uint64_t IndexArenaBuffer();
 
 // Stages one rectangle of one mip level and queues the copy. `data` points at the top-left
 // texel (or block) of the rectangle inside a locked surface of `pitch` bytes per row - which

@@ -8,7 +8,9 @@
 
 #include "D3D8Capture.h"
 #include "JsBindings.h"
+#include "VkCapture.h"
 #include "VkContext.h"
+#include "VkDraw.h"
 #include "VkRenderer.h"
 #include "VkResources.h"
 
@@ -219,6 +221,26 @@ JSValue GetTextures(JSContext *ctx, JSValueConst) {
 
 // The only check that the texture images hold the RIGHT bytes rather than merely holding
 // bytes. Stalls the GPU once per mip level, so it is deliberately a call rather than a getter.
+JSValue GetDrawReport(JSContext *ctx, JSValueConst) {
+  const std::string report = vulkan::FormatDrawStats();
+  return JS_NewStringLen(ctx, report.c_str(), report.size());
+}
+
+// Arms a RenderDoc capture of the next frame. Needs GKPLUS_RENDERDOC set at launch, because
+// RenderDoc has to be loaded before the Vulkan instance exists.
+JSValue Capture(JSContext *ctx, JSValueConst, int, JSValueConst *) {
+  if (!vulkan::TriggerCapture()) {
+    return JS_ThrowTypeError(
+        ctx, "renderdoc is not loaded - relaunch with GKPLUS_RENDERDOC=1");
+  }
+  return JS_UNDEFINED;
+}
+
+JSValue GetCaptureStatus(JSContext *ctx, JSValueConst) {
+  const std::string status = vulkan::FormatCaptureStatus();
+  return JS_NewStringLen(ctx, status.c_str(), status.size());
+}
+
 JSValue VerifyTextures(JSContext *ctx, JSValueConst, int, JSValueConst *) {
   const std::string report = d3d8::VerifyTextureImages();
   return JS_NewStringLen(ctx, report.c_str(), report.size());
@@ -369,9 +391,12 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("vulkan_report", GetVulkanReport, nullptr),
     JS_CGETSET_DEF("validation", GetValidationMessages, nullptr),
     JS_CGETSET_DEF("textures", GetTextures, nullptr),
+    JS_CGETSET_DEF("draws", GetDrawReport, nullptr),
     JS_CFUNC_DEF("reset", 0, Reset),
     JS_CFUNC_DEF("clear_validation", 0, ClearValidation),
     JS_CFUNC_DEF("verify_textures", 0, VerifyTextures),
+    JS_CGETSET_DEF("renderdoc", GetCaptureStatus, nullptr),
+    JS_CFUNC_DEF("capture", 0, Capture),
 };
 
 } // namespace

@@ -17,6 +17,7 @@
 #include "D3D8Device.gen.inc.h"
 #include "DetourUtils.h"
 #include "Render.h"
+#include "VkDraw.h"
 #include "VkRenderer.h"
 #include "VertexFormat.h"
 #include "VkResources.h"
@@ -152,6 +153,19 @@ struct ShadowState {
   uint32_t stage_states[kStages][kMaxStageState] = {};
   IDirect3DBaseTexture8 *textures[kStages] = {};
   uint32_t fvf = 0;
+  // The three transforms the recorder ever sees set - D3DTS_VIEW (2), D3DTS_PROJECTION (3) and
+  // D3DTS_WORLD (256). Kept as raw D3D row-major, because that is the form the shader consumes
+  // (see DrawItem). `have` is per-matrix rather than a single flag: a draw issued before the
+  // projection is set has nothing to transform by and must be skipped, not drawn with identity.
+  D3DMATRIX world = {};
+  D3DMATRIX view = {};
+  D3DMATRIX projection = {};
+  bool have_world = false;
+  bool have_view = false;
+  bool have_projection = false;
+  // The viewport, which the pre-transformed (XYZRHW) path needs to map pixels to clip space.
+  uint32_t viewport_width = 0;
+  uint32_t viewport_height = 0;
 };
 
 ShadowState State;
@@ -523,11 +537,18 @@ struct CaptureVertexBuffer final : BufferWrapper<IDirect3DVertexBuffer8> {
 };
 
 struct CaptureIndexBuffer final : BufferWrapper<IDirect3DIndexBuffer8> {
-  CaptureIndexBuffer(IDirect3DIndexBuffer8 *inner, uint32_t length)
-      : BufferWrapper(inner, length, false, 0) {
+  // D3DFMT_INDEX16 is 101 and D3DFMT_INDEX32 is 102. The stride is kept rather than the format
+  // because it is what the arena offset arithmetic needs, and because a 32-bit index buffer
+  // cannot share the frame's single vkCmdBindIndexBuffer - a draw from one is skipped and
+  // counted instead of being drawn with its indices misread as pairs of 16-bit ones.
+  CaptureIndexBuffer(IDirect3DIndexBuffer8 *inner, uint32_t length, uint32_t format)
+      : BufferWrapper(inner, length, false, 0),
+        index_stride_(format == 102 ? 4 : 2) {
     LiveIndexWrappers.insert(this);
   }
   ~CaptureIndexBuffer() override { LiveIndexWrappers.erase(this); }
+
+  uint32_t index_stride_ = 2;
 
 #define GK_DECL(ret, name, params, args) ret STDMETHODCALLTYPE name params override;
   GK_IDIRECT3DINDEXBUFFER8_METHODS(GK_DECL)
@@ -1054,6 +1075,14 @@ struct CaptureDevice final : Wrapper<IDirect3DDevice8> {
   uint32_t stream0_stride_ = 0;
   IDirect3DIndexBuffer8 *indices_ = nullptr;
   uint32_t base_vertex_ = 0;
+
+  // Not a COM method - a helper that turns one of the game's draws into a vulkan::DrawItem.
+  // A member because it needs the bound stream, indices and base vertex, which are the
+  // device's state and not the shadow's.
+  void EmitDraw(D3DPRIMITIVETYPE type, UINT start_index, UINT primitive_count);
+  void EmitDrawUP(D3DPRIMITIVETYPE type, UINT primitive_count, const void *vertex_data,
+                  UINT vertex_stride, const void *index_data, D3DFORMAT index_format,
+                  UINT vertex_count);
 };
 
 // The one device the game ever creates. Held so a resource's GetDevice can hand back the
@@ -1325,7 +1354,9 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::CreateIndexBuffer(
   if (FAILED(hr) || buffer == nullptr) {
     return hr;
   }
-  *ppIndexBuffer = WrapIndexBuffers ? new CaptureIndexBuffer(buffer, Length) : buffer;
+  *ppIndexBuffer = WrapIndexBuffers ? new CaptureIndexBuffer(buffer, Length,
+                                                             static_cast<uint32_t>(Format))
+                                    : buffer;
   return hr;
 }
 
@@ -1399,11 +1430,34 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::SetTransform(D3DTRANSFORMSTATETYPE Stat
                                                       const D3DMATRIX *pMatrix) {
   NoteBlockState();
   TheStats.transform_states.insert(static_cast<uint32_t>(State));
+  if (pMatrix != nullptr) {
+    switch (static_cast<uint32_t>(State)) {
+    // Qualified because the parameter is also called `State` and shadows the shadow state.
+    case D3DTS_VIEW:
+      gk::d3d8::State.view = *pMatrix;
+      gk::d3d8::State.have_view = true;
+      break;
+    case D3DTS_PROJECTION:
+      gk::d3d8::State.projection = *pMatrix;
+      gk::d3d8::State.have_projection = true;
+      break;
+    case D3DTS_WORLD:
+      gk::d3d8::State.world = *pMatrix;
+      gk::d3d8::State.have_world = true;
+      break;
+    default:
+      break;
+    }
+  }
   return inner_->SetTransform(State, pMatrix);
 }
 
 HRESULT STDMETHODCALLTYPE CaptureDevice::SetViewport(const D3DVIEWPORT8 *pViewport) {
   NoteBlockState();
+  if (pViewport != nullptr) {
+    State.viewport_width = pViewport->Width;
+    State.viewport_height = pViewport->Height;
+  }
   return inner_->SetViewport(pViewport);
 }
 
@@ -1650,6 +1704,206 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::DeleteStateBlock(DWORD Token) {
   return inner_->DeleteStateBlock(Token);
 }
 
+// --- turning one of the game's draws into a DrawItem ---------------------------------------
+//
+// Row-major, row-vector, exactly as D3D composes them, because that is what the shader consumes
+// (see DrawItem). `a * b` here means "apply a, then b", which is D3D's reading order and the
+// opposite of the column-vector one.
+void MultiplyMatrix(const D3DMATRIX &a, const D3DMATRIX &b, float *out) {
+  for (int row = 0; row < 4; ++row) {
+    for (int col = 0; col < 4; ++col) {
+      float sum = 0.0f;
+      for (int k = 0; k < 4; ++k) {
+        sum += a.m[row][k] * b.m[k][col];
+      }
+      out[row * 4 + col] = sum;
+    }
+  }
+}
+
+// The transform for this draw, or false if there is nothing sensible to use.
+//
+// Two families, decided by the FVF rather than guessed at: an ordinary vertex goes through
+// world*view*projection, and a pre-transformed one (D3DFVF_XYZRHW, 0x4) is already in screen
+// pixels and needs only a pixels-to-clip map. Handling both here rather than in the shader is
+// what keeps the vertex path branch-free.
+bool BuildMvp(uint32_t fvf, float *out) {
+  constexpr uint32_t kXyzRhw = 0x004;
+  if ((fvf & kXyzRhw) == kXyzRhw) {
+    const float width = static_cast<float>(State.viewport_width);
+    const float height = static_cast<float>(State.viewport_height);
+    if (width <= 0.0f || height <= 0.0f) {
+      return false;
+    }
+    // Pixels to clip. No Y flip: D3D screen space and Vulkan clip space both have Y growing
+    // downwards, so this one is the same in both - it is the 3D path that needs the flip.
+    const float m[16] = {
+        2.0f / width, 0.0f,           0.0f, 0.0f,
+        0.0f,         2.0f / height,  0.0f, 0.0f,
+        0.0f,         0.0f,           1.0f, 0.0f,
+        -1.0f,        -1.0f,          0.0f, 1.0f,
+    };
+    std::memcpy(out, m, sizeof(m));
+    return true;
+  }
+  if (!State.have_view || !State.have_projection) {
+    return false;
+  }
+  // An unset world transform is identity rather than a reason to skip: the game leaves it
+  // alone for geometry already in world space, which is most of a level.
+  D3DMATRIX identity = {};
+  identity.m[0][0] = identity.m[1][1] = identity.m[2][2] = identity.m[3][3] = 1.0f;
+  const D3DMATRIX &world = State.have_world ? State.world : identity;
+
+  float world_view[16] = {};
+  MultiplyMatrix(world, State.view, world_view);
+  D3DMATRIX wv = {};
+  std::memcpy(&wv, world_view, sizeof(world_view));
+  MultiplyMatrix(wv, State.projection, out);
+
+  // Vulkan's clip space has Y down where D3D's has it up. With a row-vector matrix the y
+  // output is column 1, so negating that column is the whole flip.
+  out[1] = -out[1];
+  out[5] = -out[5];
+  out[9] = -out[9];
+  out[13] = -out[13];
+  return true;
+}
+
+// The bindless slot and sampler for stage 0. Only one stage for now: §4.7 measured at most two
+// active, and the second is a lightmap the übershader will handle - drawing stage 0 alone is
+// the honest first cut rather than silently blending something wrong.
+void ResolveStage0(uint32_t &texture_index, uint32_t &sampler_index) {
+  texture_index = vulkan::kNoTexture;
+  sampler_index = 0;
+  IDirect3DBaseTexture8 *const bound = State.textures[0];
+  if (bound == nullptr || LiveTextureWrappers.count(bound) == 0) {
+    return;
+  }
+  auto &texture = *static_cast<CaptureTexture *>(bound);
+  if (texture.image_.valid) {
+    texture_index = texture.image_.index;
+    sampler_index = StageSampler(0);
+  }
+}
+
+void CaptureDevice::EmitDraw(D3DPRIMITIVETYPE type, UINT start_index,
+                             UINT primitive_count) {
+  if (!vulkan::DrawReady()) {
+    return;
+  }
+  if (type != D3DPT_TRIANGLELIST) {
+    ++vulkan::MutableDrawStats().skipped_topology;
+    return;
+  }
+  // Both buffers must be resident in the arenas, or there is nothing to pull from. This is
+  // where an unconvertible FVF or a buffer created before the renderer came up drops out.
+  if (stream0_ == nullptr || indices_ == nullptr ||
+      LiveVertexWrappers.count(stream0_) == 0 || LiveIndexWrappers.count(indices_) == 0) {
+    ++vulkan::MutableDrawStats().skipped_no_slot;
+    return;
+  }
+  auto &vertex_buffer = *static_cast<CaptureVertexBuffer *>(stream0_);
+  auto &index_buffer = *static_cast<CaptureIndexBuffer *>(indices_);
+  if (!vertex_buffer.slot_.valid || !index_buffer.slot_.valid ||
+      index_buffer.index_stride_ != 2) {
+    ++vulkan::MutableDrawStats().skipped_no_slot;
+    return;
+  }
+
+  vulkan::DrawItem item = {};
+  if (!BuildMvp(State.fvf, item.mvp)) {
+    ++vulkan::MutableDrawStats().skipped_no_transform;
+    return;
+  }
+  // Both offsets are absolute into the one arena, which is what lets the renderer bind the
+  // index buffer once for the whole frame and never bind a vertex buffer at all.
+  //
+  // D3D's rule is `vertex = stream[index + BaseVertexIndex]`, and Slang's SV_VertexID carries
+  // the same D3D semantics - the raw index, with the base excluded. So the base is folded in
+  // here and `vkCmdDrawIndexed` is given a vertexOffset of 0. Passing it to Vulkan instead
+  // would add it twice on any driver where gl_BaseVertex reads back as 0.
+  item.base_vertex =
+      vertex_buffer.slot_.offset / static_cast<uint32_t>(sizeof(vulkan::CanonicalVertex)) +
+      base_vertex_;
+  item.first_index = index_buffer.slot_.offset / 2 + start_index;
+  item.count = primitive_count * 3;
+  item.vertex_offset = 0;
+  ResolveStage0(item.texture_index, item.sampler_index);
+  vulkan::SubmitDraw(item);
+}
+
+// The user-pointer draws: `DrawPrimitiveUP` and `DrawIndexedPrimitiveUP`, which hand D3D their
+// vertices inline. 350,000 of them a session on level01 - the text, the particles and the
+// in-game menus - and none of them has a buffer, so none has an arena slot.
+//
+// They go through the frame's scratch instead, which is host-visible and mapped: the data is
+// produced on the CPU, is different every frame, and is read once. Converting straight into the
+// mapped pointer means no staging copy and no barrier.
+//
+// The stride comes from the CALL, not from the FVF. A user-pointer draw is entitled to pad its
+// vertices, and the two agreeing is an assumption with no reason behind it.
+void CaptureDevice::EmitDrawUP(D3DPRIMITIVETYPE type, UINT primitive_count,
+                               const void *vertex_data, UINT vertex_stride,
+                               const void *index_data, D3DFORMAT index_format,
+                               UINT vertex_count) {
+  if (!vulkan::DrawReady()) {
+    return;
+  }
+  if (type != D3DPT_TRIANGLELIST) {
+    ++vulkan::MutableDrawStats().skipped_topology;
+    return;
+  }
+  if (vertex_data == nullptr || !vulkan::FvfSupported(State.fvf)) {
+    ++vulkan::MutableDrawStats().skipped_unconvertible;
+    return;
+  }
+
+  vulkan::DrawItem item = {};
+  if (!BuildMvp(State.fvf, item.mvp)) {
+    ++vulkan::MutableDrawStats().skipped_no_transform;
+    return;
+  }
+  item.source = vulkan::DrawSource::Scratch;
+
+  const uint32_t indices = primitive_count * 3;
+  // A non-indexed draw names its vertices directly; an indexed one is given a vertex count of
+  // its own, because the indices may reach further than the primitives suggest.
+  const uint32_t vertices = index_data != nullptr ? vertex_count : indices;
+  const vulkan::ScratchAlloc vertex_scratch = vulkan::AllocateScratchVertices(vertices);
+  if (!vertex_scratch.valid) {
+    ++vulkan::MutableDrawStats().skipped_scratch_full;
+    return;
+  }
+  if (!vulkan::ConvertVertices(State.fvf, vertex_data, vertices,
+                               static_cast<vulkan::CanonicalVertex *>(vertex_scratch.mapped),
+                               vertex_stride)) {
+    ++vulkan::MutableDrawStats().skipped_unconvertible;
+    return;
+  }
+  item.base_vertex = vertex_scratch.offset;
+  item.count = indices;
+
+  if (index_data == nullptr) {
+    item.indexed = false;
+    item.count = vertices;
+  } else {
+    const uint32_t stride = index_format == D3DFMT_INDEX32 ? 4u : 2u;
+    const vulkan::ScratchAlloc index_scratch =
+        vulkan::AllocateScratchIndices(indices, stride);
+    if (!index_scratch.valid) {
+      ++vulkan::MutableDrawStats().skipped_scratch_full;
+      return;
+    }
+    std::memcpy(index_scratch.mapped, index_data, size_t(indices) * stride);
+    item.first_index = index_scratch.offset;
+    item.index_stride = static_cast<uint8_t>(stride);
+  }
+
+  ResolveStage0(item.texture_index, item.sampler_index);
+  vulkan::SubmitDraw(item);
+}
+
 void CountDraw(D3DPRIMITIVETYPE type, bool user_pointer) {
   SnapshotDraw();
   ++TheStats.primitive_type_counts[static_cast<uint32_t>(type)];
@@ -1672,6 +1926,7 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::DrawIndexedPrimitive(
     D3DPRIMITIVETYPE PrimitiveType, UINT MinIndex, UINT NumVertices, UINT StartIndex,
     UINT PrimitiveCount) {
   CountDraw(PrimitiveType, false);
+  EmitDraw(PrimitiveType, StartIndex, PrimitiveCount);
   return inner_->DrawIndexedPrimitive(PrimitiveType, MinIndex, NumVertices, StartIndex,
                                       PrimitiveCount);
 }
@@ -1680,6 +1935,8 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::DrawPrimitiveUP(
     D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount,
     const void *pVertexStreamZeroData, UINT VertexStreamZeroStride) {
   CountDraw(PrimitiveType, true);
+  EmitDrawUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride,
+             nullptr, D3DFMT_INDEX16, 0);
   return inner_->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData,
                                  VertexStreamZeroStride);
 }
@@ -1689,6 +1946,11 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::DrawIndexedPrimitiveUP(
     UINT PrimitiveCount, const void *pIndexData, D3DFORMAT IndexDataFormat,
     const void *pVertexStreamZeroData, UINT VertexStreamZeroStride) {
   CountDraw(PrimitiveType, true);
+  // MinVertexIndex + NumVertexIndices is the span the indices reach into, and the vertex
+  // pointer is biased so that index 0 is its first vertex - so the whole span is copied and
+  // the indices need no rebasing.
+  EmitDrawUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride,
+             pIndexData, IndexDataFormat, MinVertexIndex + NumVertexIndices);
   return inner_->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertexIndices,
                                         PrimitiveCount, pIndexData, IndexDataFormat,
                                         pVertexStreamZeroData, VertexStreamZeroStride);

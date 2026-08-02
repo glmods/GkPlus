@@ -964,6 +964,210 @@ Four things that are easy to get wrong here:
   handle in half. `VkCommandBuffer` gets away with it only because it is dispatchable and really
   is a pointer.
 
+## 4.16 Phase 3: the game's geometry, drawn by Vulkan
+
+`src/VkDraw` plus `src/shaders/world.slang`. The capture layer reduces each `DrawIndexedPrimitive`
+to a `DrawItem`; the renderer walks the list once per frame, binding nothing per draw. Measured
+on level01:
+
+```
+world pipeline: up
+draws: 205 this frame / 502 peak / 542021 total
+skipped: 350853 user-pointer, 0 topology, 3785 no arena slot, 0 no transform
+validation errors: 0
+```
+
+The A/B against `GKPLUS_RENDERER=d3d9` is the verification, and it is the same scene: same
+camera, same rock faces, same walkways, same textures. **This is the first thing that reads what
+Phase 2 built** — the arenas, the canonical vertex layout, the images, the samplers and the
+bindless set are all now proven by a picture rather than by a counter.
+
+Remaining differences from the D3D path, all deferred rather than unexplained: no fog (level01 is
+a fogged cavern, which is most of what the two shots differ by), no D3D lighting, and the units
+are missing because they are user-pointer draws.
+
+### Slang, not GLSL
+
+Khronos's own language now, it ships in the SDK, and it earns its place here for two reasons: one
+file holds every entry point of a pass, so a push constant block shared across stages cannot
+drift between two files; and its generics are what the übershader's stage ops want. SPIR-V is
+compiled offline by `src/gen-shaders.py` and the header is checked in, so `d3d8.dll` depends on no
+shader toolchain — the same argument that makes the renderer reach Vulkan through volk.
+
+Two Slang specifics that cost a run each:
+
+- **`SV_VertexID` carries D3D semantics** — the raw index, base vertex excluded — so it compiles
+  to `gl_VertexIndex - gl_BaseVertex` and declares the `DrawParameters` capability whether or not
+  a base vertex is ever non-zero. The device feature must be enabled or the module is rejected
+  outright. It also means the base vertex is folded in on the CPU and `vkCmdDrawIndexed` gets a
+  `vertexOffset` of 0; passing it to Vulkan as well would add it twice.
+- **`mul(v, M)` with `-matrix-layout-row-major`** is D3D's row-vector convention, so the CPU
+  uploads `world*view*projection` exactly as the game composes it, with no transpose anywhere.
+
+### Three bugs, and what actually found each
+
+The first frame drew the level smeared into long streaks converging on a point. Three defects
+were stacked, and the order they came out in is the useful part:
+
+- **The vertex arena aligned slots to 16 bytes while the canonical vertex is 48.** A draw
+  addresses its buffer as `slot.offset / 48`, so any slot not starting on a whole vertex pulled
+  the wrong ones — each triangle getting one right vertex and two from elsewhere, which is
+  exactly what a streak is. The arena now takes a per-arena alignment and the vertex one is
+  `sizeof(CanonicalVertex)`. **This bug was invisible to every counter**: the uploads were
+  correct, the residency was correct, the readback verification passed. Only a picture showed it.
+- **The shader's vertex struct was `{float4, float3, uint, float2, float2}`**, which is the
+  obvious spelling of `CanonicalVertex` and a trap: a `float3` followed by a scalar lays out
+  differently under std140, std430 and scalar rules, and nothing says which one Slang picked for
+  a `ConstBufferPointer`. It is three `float4`s now — 48 bytes with fields at 0/16/32 under every
+  rule there is — so the agreement with the C struct is structural rather than a bet. This was
+  the one that mattered; fixing it turned noise into the level.
+- **The cull winding is `FRONT_FACE_CLOCKWISE`**, which is the opposite of the intuition. The
+  projection negates Y for Vulkan's clip space, so winding "obviously" reverses — but D3D's clip
+  space is left-handed too, and the reasoning that accounts for only one of the two gets it
+  backwards. `COUNTER_CLOCKWISE` culls the ground and most of the level.
+
+**Two wrong guesses preceded the fix, and both were matrix conventions** — the streaks looked like
+a transpose, and testing `mul(M, v)` against `mul(v, M)` cost two full rebuild-and-load cycles to
+eliminate a hypothesis that was never the problem. That is the argument for §4.17.
+
+## 4.17 RenderDoc, driven from the REPL
+
+`src/VkCapture` loads `renderdoc.dll` and calls `StartFrameCapture`/`EndFrameCapture` around the
+renderer's own frame; `render.capture()` arms one from the REPL and the `.rdc` lands beside the
+game. Off unless `GKPLUS_RENDERDOC` is set.
+
+**The in-app API rather than the hotkey, for two reasons specific to this process.** The game has
+a live D3D9 device from d3d8to9 at the same time as our Vulkan one and RenderDoc captures one API
+per frame, so the hotkey may grab the wrong one; and GkPlus is a DLL proxy, so there is no
+"launch this exe" for the UI to hook. Calling it ourselves from inside the Vulkan frame is
+unambiguous on both counts.
+
+It must be loaded **before the Vulkan instance exists** — RenderDoc captures by inserting a layer,
+and a layer cannot be added to an instance already created — so `vulkan::Initialize()` calls
+`LoadRenderDoc()` as its first act. That is also why it cannot go in `DllMain`: it is a
+`LoadLibrary`, which deadlocks under the loader lock.
+
+Two practical notes: the x86 build is at `RenderDoc\x86\renderdoc.dll`, *not* the one beside the
+UI, and loading the x64 one fails with a bare "not a valid Win32 application" that says nothing
+about bitness. And `renderdoccmd` cannot dump a capture's contents without the UI, so a capture
+is something to hand to a person — though `renderdoccmd replay` *does* load one headlessly,
+which is enough to tell a good capture from a bad one without leaving the loop.
+
+### Opening a capture: two separate failures, both reported as out of memory
+
+Both present as `Failed allocating memory, VkResult: VK_ERROR_OUT_OF_DEVICE_MEMORY`, neither is
+about running out of VRAM, and they are independent — the first stops a capture opening at all,
+the second lets it open with silently wrong contents.
+
+**1. The REPLAY process must be 32-bit — the launcher's bitness is irrelevant.** Our captures
+come from `gl.exe`; replaying a buffer-device-address capture means reproducing the exact
+`VkDeviceAddress` values the 32-bit driver handed out, which an x64 replay cannot place. Most
+32-bit applications never touch BDA, which is why this is ours specifically.
+
+**Launching the game from `x86\renderdoccmd.exe` does not fix it**, which is the obvious thing
+to try and the thing that wastes the time: the RenderDoc UI is x64 and replays *in its own
+process*, so where the capture came from changes nothing. Measured on one file, three ways:
+
+| replay | result |
+|---|---|
+| `renderdoccmd.exe` (x64), local | `VK_ERROR_OUT_OF_DEVICE_MEMORY` |
+| `x86\renderdoccmd.exe`, local | loads |
+| `renderdoccmd.exe` (x64) → `--remote-host localhost` against a 32-bit `remoteserver` | loads |
+
+So the fix is RenderDoc's remote-server mechanism, which is what the UI uses too. The full
+procedure, because the middle step is not discoverable and stops the rest working:
+
+1. **Tools → Manage Remote Servers…**, and select `localhost` (it is in the list by default).
+2. **Set its Run Command**, which is empty by default:
+   ```
+   "C:\Program Files\RenderDoc\x86\renderdoccmd.exe" remoteserver
+   ```
+   Without it the dialog reports *"Remote server not running - no start command configured"*
+   and the **Run Server** button does nothing. This is the step that looks optional and is not.
+3. **Run Server** — or run that same command in a terminal, which is all the button does.
+4. Close the dialog and set the status bar's **Replay Context** to `localhost`; it reads
+   `Replay Context: localhost` rather than `Local`.
+5. Open the capture.
+
+Do not hand-edit `%APPDATA%\qrenderdoc\UI.config` while the UI is running — it rewrites the file
+on exit. The host list lives there under `RemoteHostList`, with `runCommand` as the field above,
+which is worth knowing when scripting a machine from scratch.
+
+Headless, the same path is `renderdoccmd.exe replay --remote-host localhost` against a running
+32-bit `remoteserver`, which is the third row of the table and is what was verified end to end.
+
+**2. An in-level capture is incomplete at full heap sizes.** RenderDoc snapshots each resource's
+initial state by allocating a mapped readback buffer **inside the game**, and `gl.exe` has 2 GB
+of address space already shared with the game, the driver and QuickJS. Fifteen of those
+allocations fail in level, and those resources are captured uninitialised — the capture still
+opens, and shows plausible-looking rubbish. The evidence is in the *capture-side* log, which is
+easy to mistake for a replay log because the error text is identical:
+
+```
+%TEMP%\RenderDoc\RenderDoc_app_*.log
+  vk_initstate.cpp(350) - Error - Couldn't allocate readback memory
+```
+
+`GKPLUS_VK_HEAPS=small` cuts the arenas and rings to just above level01's measured peaks — 82 MB
+of buffers down to 24 MB — and takes that count to **0** with `arena_full`, `scratch_exhausted`
+and `dropped` all still 0. A menu capture is clean either way.
+
+**It is deliberately not implied by `GKPLUS_RENDERDOC`.** Shrinking the heaps changes what the
+renderer does: the same level goes from 29 mid-batch staging flushes to 2,540 and from 1,080
+stalls to 2,244, because a smaller ring wraps more often. A debugging tool that quietly alters
+the behaviour under investigation means the frame being captured is not the frame that
+misbehaved. `StartResources` logs a warning instead when RenderDoc is loaded at full size, and
+`render.vulkan_report` says which mode is in force.
+
+This is §3's **"32-bit address space is the real constraint, not GPU capability"** arriving
+exactly where it was predicted to, one layer further out than expected — not in the renderer's
+own allocations but in a tool's.
+
+## 4.18 User-pointer draws
+
+`DrawPrimitiveUP` and `DrawIndexedPrimitiveUP` hand D3D their vertices inline — 350,000 of them a
+session on level01, and they are the text, the particles, the in-game menus and **the units**.
+There is no buffer, so there is nothing for a `BufferSlot` to attach to and nothing whose
+`Release` says when the data dies.
+
+```
+draws: 363 this frame / 660 peak / 809133 total     (542021 before)
+skipped: 6158 topology, 3425 no arena slot, 0 no transform, 0 unconvertible, 0 scratch full
+scratch: 4096 KB vtx (peak 800 KB) + 1024 KB idx (peak 66 KB) per frame   exhausted: 0
+index binds: 19930     validation errors: 0
+```
+
+The characters now appear where the d3d9 reference has them, which is the check that matters.
+
+**The scratch is host-visible and mapped, and that is the one deliberate exception to "nothing
+device-local is ever mapped" (§4.9).** The trade is the opposite of the arenas': this data is
+produced on the CPU, is different every frame and is read once, so staging it would mean a copy
+and a barrier to move bytes the GPU glances at. The arenas hold a level's worth of geometry read
+every frame and written rarely, which is why they are device-local and unmapped. Converting
+straight into the mapped pointer means a user-pointer draw costs one `ConvertVertices` and no
+Vulkan work at all.
+
+One slice per frame in flight, reset from the same place `ReleaseFrameStaging` is called — the
+frame's fence having been waited on is the same proof for both.
+
+Three details that are easy to get wrong:
+
+- **The stride comes from the call, not from the FVF.** A user-pointer draw states
+  `VertexStreamZeroStride` explicitly and is entitled to pad; assuming the two agree is an
+  assumption with nothing behind it. `ConvertVertices` now takes an optional source stride and
+  refuses one *smaller* than the FVF implies, which would mean the promised fields do not fit.
+- **`MinVertexIndex + NumVertexIndices` is the span to copy**, not `PrimitiveCount * 3`. The
+  vertex pointer is biased so that index 0 is its first vertex, so copying the whole span means
+  the indices need no rebasing.
+- **The index binding is tracked, not reissued.** Arena and scratch indices are different
+  buffers, so the bind changes wherever the list crosses between them — 19,930 binds over ~3,000
+  frames, about 6 a frame, which is the alternation and not per-draw churn. Both sources make
+  their first-index absolute from the start of their own buffer, which is what keeps it that low.
+
+`skipped_topology` is 6,158 and non-zero for the first time: those are the line lists and
+triangle strips among the user-pointer draws, which the single triangle-list pipeline cannot take.
+They are the next thing after fog.
+
 ## 5. Fitting the project
 
 GkPlus is a modding framework with a JS layer, a VFS and a REPL; the renderer should join that

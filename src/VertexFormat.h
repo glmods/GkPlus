@@ -54,7 +54,12 @@ bool FvfSupported(uint32_t fvf);
 // Converts `count` vertices from `src` into `dst`. Missing fields take neutral defaults:
 // w = 1, normal = (0,0,0), colour = opaque white, uvs = 0. Returns false without writing
 // anything if the layout is unsupported.
-bool ConvertVertices(uint32_t fvf, const void *src, uint32_t count, CanonicalVertex *dst);
+//
+// `src_stride` of 0 means "whatever the FVF implies", which is the buffered case. A
+// user-pointer draw states its stride explicitly in the call and is entitled to pad, so it
+// passes the value it was given rather than letting the FVF speak for it.
+bool ConvertVertices(uint32_t fvf, const void *src, uint32_t count, CanonicalVertex *dst,
+                     uint32_t src_stride = 0);
 
 } // namespace vulkan
 } // namespace gk

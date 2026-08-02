@@ -1410,18 +1410,22 @@ Three modelling decisions that took a round-trip through `tsc` to settle:
 
 ### The Vulkan renderer (`src/D3D8Capture`, `src/Vk*`, `src/VertexFormat`)
 
-A bindless Vulkan replacement for Gunlok's renderer, in progress. **`vulkan_renderer_plan.md`
-is where to start** — status and next steps; `vulkan_renderer_notes.md` is the design record
-and every measurement behind it. Read the plan before touching any of this.
+A bindless Vulkan replacement for Gunlok's renderer. **`GKPLUS_RENDERER=vulkan` draws the
+game** — level01's world, its textures and its units, with the A/B against `d3d9` showing the
+same scene. Still missing: fog, lighting, blending and the non-triangle-list topologies.
+**`vulkan_renderer_plan.md` is where to start** — status and next steps;
+`vulkan_renderer_notes.md` is the design record and every measurement behind it. Read the plan
+before touching any of this.
 
 The one fact that shapes everything: **the seam is `Direct3DCreate8`, not the AWAPI render
 queue.** The queue looked obvious and is not total — `rendering_notes.md` §4.1 — so
 `src/D3D8Capture.cpp` wraps the D3D8 device instead. It is a **state recorder, not a
 translation layer**: it mirrors the fixed-function state, replays state blocks into that
-mirror, reduces each draw to a material and a pipeline key, and forwards everything to
-d3d8to9 unchanged. `GKPLUS_RENDERER=vulkan` then puts a real swapchain on the game's window.
+mirror, and reduces each draw to a `DrawItem` the Vulkan side consumes. Every call is still
+forwarded to d3d8to9 as well, which is what keeps `GKPLUS_RENDERER=d3d9` available as the A/B —
+the thing that makes "is this our bug or the game's?" answerable.
 
-Three things worth knowing before editing:
+Things worth knowing before editing:
 
 - **`src/D3D8Device.gen.inc.h` is generated** by `src/gen-d3d8-forwarders.py` from d3d8to9's
   `d3d8.hpp`. Re-run it after changing which methods are intercepted. Its
@@ -1440,6 +1444,11 @@ Three things worth knowing before editing:
   `d3d8.dll`; a load-time dependency on `vulkan-1.dll` would stop the game launching.
 - **Every "must be 0" counter in `render.report` is a real invariant.** Each one exists
   because getting it wrong once cost a debugging session.
+- **Some defects only a picture can find.** The arena's 16-byte slot alignment against a 48-byte
+  vertex was invisible to every counter *and* to the texture readback verification, because
+  nothing was wrong with the uploads — only with how a draw addressed them. `render.capture()`
+  (RenderDoc) and a window screenshot are the tools for that class; §4.16 also records two wrong
+  guesses that cost a rebuild each before the picture was consulted.
 - **A counter says the plumbing ran, not that it moved the right bytes.**
   `render.verify_textures()` reads each texture image back off the GPU and compares it against
   the D3D texture — and it found four defects with every counter reading clean, two of them in
@@ -1452,7 +1461,10 @@ Three things worth knowing before editing:
 | `src/D3D8Capture.h/cpp` | The capture device: wraps `IDirect3D8`, `IDirect3DDevice8`, the two buffer types, `IDirect3DTexture8` and `IDirect3DSurface8`; shadow state, state-block replay, per-draw material/pipeline keys, residency, the texture pixel path — `LockRect` on a `SYSTEMMEM` staging texture then `CopyRects` into the `MANAGED` one, so the upload hangs off `CopyRects` (notes §4.12) — and the `AcquireRimTexture` hook that names every image by its `.rim` asset (§4.14) |
 | `src/VkContext.h/cpp` | Instance, physical device, logical device, validation. Lazily initialized — **never from `DllMain`**, since volk calls `LoadLibrary` and that deadlocks under the loader lock |
 | `src/VkRenderer.h/cpp` | Surface, swapchain, frames in flight, the ImGui backend, present |
-| `src/VkResources.h/cpp` | VMA arenas, the staging ring, and the texture images (creation, format mapping, upload, readback verification). Nothing device-local is ever mapped |
+| `src/VkResources.h/cpp` | VMA arenas, the staging ring, the texture images (creation, format mapping, upload, readback verification) and the bindless descriptor set. Nothing device-local is ever mapped. **The vertex arena aligns slots to `sizeof(CanonicalVertex)`, not 16** — a draw addresses its buffer as a vertex index, and a 16-byte-aligned slot silently pulls the wrong vertices (notes §4.16) |
+| `src/VkDraw.h/cpp` | The world pass: the pipeline, the depth buffer, the per-frame draw list. A draw binds nothing — vertices are pulled by device address, from the arena for buffered draws and from a per-frame host-visible scratch for user-pointer ones (notes §4.18) |
+| `src/VkCapture.h/cpp` | RenderDoc via its in-app API, so `render.capture()` grabs one frame from the REPL. Off unless `GKPLUS_RENDERDOC` is set, and loaded before the Vulkan instance because it captures by inserting a layer. **Opening a capture has two traps, both reported as `VK_ERROR_OUT_OF_DEVICE_MEMORY` and neither about VRAM** — the *replayer* must be 32-bit (launching from the x86 tooling does not help; the UI replays in its own x64 process, so it needs `x86\renderdoccmd.exe remoteserver`), and an in-level capture needs `GKPLUS_VK_HEAPS=small` (notes §4.17) |
+| `src/shaders/*.slang`, `src/gen-shaders.py` | The shaders, in **Slang**, compiled offline to `src/Shaders.gen.inc.h` so `d3d8.dll` needs no shader toolchain. Re-run the generator after editing one |
 | `src/VertexFormat.h/cpp` | Every FVF the game uses → one canonical 48-byte vertex. Pure CPU, no Vulkan and no D3D headers |
 | `src/JsRender.cpp` | The `render` namespace: all of the above, readable from the REPL |
 

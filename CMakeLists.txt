@@ -5,6 +5,7 @@ project(GkPlus
     LANGUAGES C CXX)
 
 option(GKPLUS_COPY_DLL "Copy the generated DLL to Gunlok's directory using the `copy` target" ON)
+option(GKPLUS_RENDERDOC_INTEGRATION "Enabled the RenderDoc integration" ON)
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
     message(FATAL_ERROR "Only 32bits builds are supported")
@@ -22,18 +23,19 @@ find_package(detours MODULE REQUIRED)
 
 find_package(d3d8to9 MODULE REQUIRED)
 find_package(volk CONFIG REQUIRED)
+
 # Vulkan::Headers, NOT Vulkan::Vulkan: VMA only needs vulkan/vulkan.h, and linking the
 # loader's import library would give d3d8.dll a load-time dependency on vulkan-1.dll -
 # the thing volk and the vendored imgui backend exist to avoid.
 find_package(VulkanHeaders CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
+
 # volk.c is compiled into GkPlus rather than taken from volk::volk, so that the platform
 # defines below apply to volk's own translation unit as well as to ours. vcpkg's prebuilt
 # volk library is built WITHOUT VK_USE_PLATFORM_WIN32_KHR, so its vkCreateWin32SurfaceKHR
 # pointer does not exist - volk.h still declares it (the header sees our define), so the
 # mismatch surfaces as an undefined symbol at link time rather than anywhere useful.
 find_path(VOLK_SOURCE_DIR NAMES volk.c REQUIRED)
-
 
 find_package(qjs CONFIG REQUIRED)
 
@@ -93,6 +95,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui_backends/imgui_impl_vulkan.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/VertexFormat.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/VkContext.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/VkDraw.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/VkRenderer.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/VkResources.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Vfs.cpp"
@@ -100,6 +103,18 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/exports.def")
 target_link_libraries(GkPlus PRIVATE detours imgui::imgui d3d8to9 d3d9 qjs imgui-quickjs ws2_32 volk::volk_headers GPUOpen::VulkanMemoryAllocator Vulkan::Headers
     $<IF:$<TARGET_EXISTS:PhysFS::PhysFS>,PhysFS::PhysFS,PhysFS::PhysFS-static>)
+
+if(GKPLUS_RENDERDOC_INTEGRATION)
+    find_package(RenderDoc REQUIRED)
+    target_link_libraries(GkPlus PRIVATE RenderDoc::Header)
+
+    target_sources(GkPlus PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/VkCapture.cpp")
+else()
+    target_sources(GkPlus PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/VkCapture_dummy.cpp")
+endif()
+
 # Needed for VK_KHR_win32_surface and vkCreateWin32SurfaceKHR. On the target rather
 # than per-TU so every Vulkan source agrees - a TU that forgot it would still compile
 # and then miss the surface entry points at link time.

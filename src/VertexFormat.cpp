@@ -71,9 +71,16 @@ bool FvfSupported(uint32_t fvf) {
   return ((fvf & kTexCountMask) >> kTexCountShift) <= 2;
 }
 
-bool ConvertVertices(uint32_t fvf, const void *src, uint32_t count, CanonicalVertex *dst) {
-  const uint32_t stride = FvfStride(fvf);
-  if (stride == 0 || src == nullptr || dst == nullptr) {
+bool ConvertVertices(uint32_t fvf, const void *src, uint32_t count, CanonicalVertex *dst,
+                     uint32_t src_stride) {
+  const uint32_t implied = FvfStride(fvf);
+  if (implied == 0 || src == nullptr || dst == nullptr) {
+    return false;
+  }
+  // A caller-supplied stride may be larger than the FVF's - padding is legal - but never
+  // smaller, which would mean the fields the FVF promises do not fit in the vertex.
+  const uint32_t stride = src_stride != 0 ? src_stride : implied;
+  if (stride < implied) {
     return false;
   }
 
