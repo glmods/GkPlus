@@ -165,6 +165,12 @@ constexpr VkDeviceSize kScratchDrawBytes = 8192u * sizeof(GpuDrawRecord);
 constexpr VkDeviceSize kScratchLightBytes = 4096u * sizeof(GpuLight);
 constexpr VkDeviceSize kSmallScratchDrawBytes = 1024u * sizeof(GpuDrawRecord);
 constexpr VkDeviceSize kSmallScratchLightBytes = 512u * sizeof(GpuLight);
+// Materials are interned, so a frame uses far fewer of these than it has draws - but the slice
+// is sized to the same kMaxDrawsPerFrame for the reason the record slice is: a frame in which
+// every draw happened to have its own material must still fit, so the draw limit is the only
+// one that can bite. At 48 bytes that is 384 KB a slice against the record slice's 2304 KB.
+constexpr VkDeviceSize kScratchMaterialBytes = 8192u * sizeof(GpuMaterial);
+constexpr VkDeviceSize kSmallScratchMaterialBytes = 1024u * sizeof(GpuMaterial);
 
 struct Scratch {
   VkBuffer buffer = VK_NULL_HANDLE;
@@ -180,6 +186,7 @@ Scratch ScratchVertices;
 Scratch ScratchIndices;
 Scratch ScratchDraws;
 Scratch ScratchLights;
+Scratch ScratchMaterials;
 // Which slice the scene now being recorded writes into. It belongs to the *scene*, not to a
 // frame in flight - see kScratchSlices.
 uint32_t ScratchSlice = 0;
@@ -783,6 +790,8 @@ bool StartResources() {
       SmallHeaps ? kSmallScratchIndexBytes : kScratchIndexBytes;
   const VkDeviceSize scratch_draw = SmallHeaps ? kSmallScratchDrawBytes : kScratchDrawBytes;
   const VkDeviceSize scratch_light = SmallHeaps ? kSmallScratchLightBytes : kScratchLightBytes;
+  const VkDeviceSize scratch_material =
+      SmallHeaps ? kSmallScratchMaterialBytes : kScratchMaterialBytes;
 
   VmaVulkanFunctions functions = {};
   functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
@@ -816,6 +825,8 @@ bool StartResources() {
                      "draw record") ||
       !CreateScratch(ScratchLights, scratch_light, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                      "light") ||
+      !CreateScratch(ScratchMaterials, scratch_material, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     "material") ||
       !CreateBindlessSet()) {
     return false;
   }
@@ -823,6 +834,7 @@ bool StartResources() {
   TheStats.scratch_index_bytes = scratch_index;
   TheStats.scratch_draw_bytes = scratch_draw;
   TheStats.scratch_light_bytes = scratch_light;
+  TheStats.scratch_material_bytes = scratch_material;
 
   VkBufferCreateInfo staging = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   staging.size = staging_bytes;
@@ -1141,7 +1153,12 @@ uint32_t AcquireSampler(uint32_t mag_filter, uint32_t min_filter, uint32_t mip_f
   info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
   // The engine's textures carry their own mip chains and it never sets a LOD bias other than
   // 0 (stage state 19 has exactly one distinct value), so there is nothing to reproduce here.
-  info.maxLod = VK_LOD_CLAMP_NONE;
+  //
+  // D3DTEXF_NONE as the MIP filter is not "some filter we do not model" - it means **do not
+  // mipmap**, sample level 0 whatever the footprint. Vulkan has no mipmapMode that says so, so
+  // it is a LOD clamp: without this a minified draw walks down the chain and comes out blurred,
+  // which reads as a filtering difference rather than as a missing state (§4.28).
+  info.maxLod = mip_filter == 0 /* D3DTEXF_NONE */ ? 0.25f : VK_LOD_CLAMP_NONE;
   VkSampler sampler = VK_NULL_HANDLE;
   if (vkCreateSampler(GetDevice(), &info, nullptr, &sampler) != VK_SUCCESS) {
     return 0;
@@ -1173,7 +1190,8 @@ void RotateFrameScratch() {
     return;
   }
   ScratchSlice = (ScratchSlice + 1) % kScratchSlices;
-  for (Scratch *scratch : {&ScratchVertices, &ScratchIndices, &ScratchDraws, &ScratchLights}) {
+  for (Scratch *scratch :
+       {&ScratchVertices, &ScratchIndices, &ScratchDraws, &ScratchLights, &ScratchMaterials}) {
     scratch->base = scratch->slice * ScratchSlice;
     scratch->head = 0;
   }
@@ -1183,7 +1201,8 @@ void ResetFrameScratch() {
   if (!Ready) {
     return;
   }
-  for (Scratch *scratch : {&ScratchVertices, &ScratchIndices, &ScratchDraws, &ScratchLights}) {
+  for (Scratch *scratch :
+       {&ScratchVertices, &ScratchIndices, &ScratchDraws, &ScratchLights, &ScratchMaterials}) {
     scratch->head = 0;
   }
 }
@@ -1247,6 +1266,11 @@ ScratchAlloc AllocateScratchLights(uint32_t count) {
                          TheStats.scratch_lights_peak);
 }
 
+ScratchAlloc AllocateScratchMaterials(uint32_t count) {
+  return AllocateScratch(ScratchMaterials, count, static_cast<uint32_t>(sizeof(GpuMaterial)),
+                         TheStats.scratch_materials_peak);
+}
+
 uint64_t ScratchVertexAddress() {
   return Ready ? ScratchVertices.address + ScratchVertices.base : 0;
 }
@@ -1263,6 +1287,20 @@ uint64_t ScratchDrawAddress() {
 
 uint64_t ScratchLightAddress() {
   return Ready ? ScratchLights.address + ScratchLights.base : 0;
+}
+
+uint64_t ScratchMaterialAddress() {
+  return Ready ? ScratchMaterials.address + ScratchMaterials.base : 0;
+}
+
+const void *ScratchVertexMapped() {
+  return Ready && ScratchVertices.mapped != nullptr
+             ? ScratchVertices.mapped + ScratchVertices.base
+             : nullptr;
+}
+
+const void *ScratchIndexMappedBase() {
+  return Ready ? ScratchIndices.mapped : nullptr;
 }
 
 uint64_t VertexArenaAddress() {
@@ -1855,11 +1893,14 @@ std::string FormatResourceStats() {
       (unsigned long long)(TheStats.scratch_index_bytes >> 10),
       (unsigned long long)(TheStats.scratch_indices_peak >> 10),
       (unsigned long long)TheStats.scratch_exhausted);
-  add("  ... plus %llu KB draw records (peak %llu KB) + %llu KB lights (peak %llu KB)\n",
+  add("  ... plus %llu KB draw records (peak %llu KB) + %llu KB lights (peak %llu KB)"
+      " + %llu KB materials (peak %llu KB)\n",
       (unsigned long long)(TheStats.scratch_draw_bytes >> 10),
       (unsigned long long)(TheStats.scratch_draws_peak >> 10),
       (unsigned long long)(TheStats.scratch_light_bytes >> 10),
-      (unsigned long long)(TheStats.scratch_lights_peak >> 10));
+      (unsigned long long)(TheStats.scratch_lights_peak >> 10),
+      (unsigned long long)(TheStats.scratch_material_bytes >> 10),
+      (unsigned long long)(TheStats.scratch_materials_peak >> 10));
   add("bindless: %s   %llu image slots   %llu samplers   %llu writes   out of range: %llu"
       " (must be 0)\n",
       BindlessSet != VK_NULL_HANDLE ? "up" : "down",
@@ -1920,7 +1961,8 @@ void ShutdownResources() {
     vmaDestroyBuffer(Allocator, Ring.buffer, Ring.allocation);
     Ring = Staging();
   }
-  for (Scratch *scratch : {&ScratchVertices, &ScratchIndices, &ScratchDraws, &ScratchLights}) {
+  for (Scratch *scratch :
+       {&ScratchVertices, &ScratchIndices, &ScratchDraws, &ScratchLights, &ScratchMaterials}) {
     if (scratch->buffer != VK_NULL_HANDLE) {
       vmaDestroyBuffer(Allocator, scratch->buffer, scratch->allocation);
       *scratch = Scratch();

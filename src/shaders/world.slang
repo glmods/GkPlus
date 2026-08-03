@@ -52,31 +52,21 @@ struct GpuDrawRecord {
     uint lit_colour;
 };
 
-// The two texture stages, flat rather than an array, for the same layout reason the vertex is
-// three float4s: an array of scalars is padded to a 16-byte stride under std140 and is not
-// under scalar rules, so `uint stage_texture[2]` would be a bet on which one Slang picked.
-// Eight named scalars cannot be laid out two ways.
+// One material: the two texture stages and the alpha test. Must match GpuMaterial in
+// src/VkDraw.h field for field, and 48 bytes is a multiple of 16, so the array stride is the
+// same under std140, std430 and scalar rules alike.
+//
+// The stages are flat rather than an array for the same layout reason the vertex is three
+// float4s: an array of scalars is padded to a 16-byte stride under std140 and is not under
+// scalar rules, so `uint stage_texture[2]` would be a bet on which one Slang picked. Named
+// scalars cannot be laid out two ways.
 //
 // `color` and `alpha` each pack one D3D texture-stage operation:
 //     bits  0..7   D3DTEXTUREOP
 //     bits  8..15  the first argument  (D3DTA_*, complement and alpha-replicate included)
 //     bits 16..23  the second argument
 //     bits 24..31  D3DTSS_TEXCOORDINDEX, meaningful on the colour word only
-//
-// 72 bytes of a guaranteed 128 now that the matrices and the lighting are in the draw record -
-// it used to be 120, which is why a light array could not have gone here (§4.19, §4.26).
-struct Push {
-    ConstBufferPointer<Vertex> vertices;
-    ConstBufferPointer<GpuDrawRecord> draws;
-    ConstBufferPointer<GpuLight> lights;
-    uint record;         // this draw's entry in `draws`
-    uint base_vertex;    // where this draw's buffer starts, in canonical vertices
-    uint stage_count;    // 0, 1 or 2 - stages up to the first D3DTOP_DISABLE
-    // The alpha test: D3DCMPFUNC in bits 0..3, 0 meaning the test is off, and D3DRS_ALPHAREF
-    // in bits 8..15. A `discard` and not pipeline state, because it varies per draw with the
-    // same blend and depth settings - making it part of the pipeline key would multiply the
-    // pipeline count by the number of distinct references for nothing.
-    uint flags;
+struct GpuMaterial {
     uint stage0_texture; // bindless slot, 0xffffffff for untextured
     uint stage0_sampler;
     uint stage0_color;
@@ -85,6 +75,33 @@ struct Push {
     uint stage1_sampler;
     uint stage1_color;
     uint stage1_alpha;
+    uint stage_count;    // 0, 1 or 2 - stages up to the first D3DTOP_DISABLE
+    // The alpha test: D3DCMPFUNC in bits 0..3, 0 meaning the test is off, and D3DRS_ALPHAREF
+    // in bits 8..15. A `discard` and not pipeline state, because it varies per material with the
+    // same blend and depth settings - making it part of the pipeline key would multiply the
+    // pipeline count by the number of distinct references for nothing.
+    uint flags;
+    uint shading;        // D3DRS_SHADEMODE: 1 FLAT, anything else GOURAUD
+    uint pad0;
+};
+
+static const uint kShadeFlat = 1u;
+
+// 44 bytes of a guaranteed 128, where it was 120 before the draw record and 72 before the
+// material table (§4.19, §4.26, §4.30). Four addresses and three indices: nothing here
+// describes a draw, which is the whole of §2's design.
+struct Push {
+    ConstBufferPointer<Vertex> vertices;
+    ConstBufferPointer<GpuDrawRecord> draws;
+    ConstBufferPointer<GpuLight> lights;
+    ConstBufferPointer<GpuMaterial> materials;
+    uint record;         // this draw's entry in `draws`
+    uint material;       // ... and in `materials`, shared with every draw of the same surface
+    uint base_vertex;    // where this draw's buffer starts, in canonical vertices
+    // The LOD probe. Negative samples normally; anything else forces every fetch to that mip
+    // level, which is how "we pick the wrong level" is told apart from "we filter the level
+    // wrongly" (§4.34).
+    float force_lod;
 };
 
 [[vk::push_constant]]
@@ -110,10 +127,24 @@ float4 unpack_colour(uint packed) {
                   float(packed & 0xffu), float((packed >> 24) & 0xffu)) / 255.0;
 }
 
+// D3DRS_SHADEMODE is a *rasteriser* state in D3D and a varying qualifier in Vulkan, so the two
+// colours are carried twice - once interpolated, once flat - and the fragment shader picks. That
+// keeps SHADEMODE off the pipeline key: making it pipeline state would double the pipeline count
+// across every blend/depth/cull combination to serve 2% of the draws (§4.31).
+//
+// **The provoking vertex already agrees.** D3D flat-shades a primitive with the colour of its
+// FIRST vertex, and Vulkan's default convention is first-vertex too - so `nointerpolation` needs
+// no `VK_EXT_provoking_vertex` and no state to go with it. Had the two disagreed, a strip would
+// have taken its colour from the wrong end and looked like an off-by-one in the geometry.
+//
+// Only the two colours: D3D flat shading does not affect texture coordinates, and `uv` stays
+// interpolated.
 struct VertexOut {
     float4 position : SV_Position;
     float4 color : COLOR;
     float4 specular : COLOR1; // D3D's second output colour, added after the texture stages
+    nointerpolation float4 color_flat : COLOR2;
+    nointerpolation float4 specular_flat : COLOR3;
     float4 uv : TEXCOORD0;    // xy = uv0, zw = uv1 - stage 1 is the lightmap set
 };
 
@@ -151,8 +182,9 @@ float4 material_source(uint lighting, uint shift, float4 material, float4 vertex
     return (source == 1u && have_vertex) ? vertex_colour : material;
 }
 
-[shader("vertex")]
-VertexOut vertex_main(uint vertex_id: SV_VertexID) {
+// The body, with the flat copies left to the entry point below. Two exits, and a third would be
+// easy to add - so nothing here writes `color_flat`.
+VertexOut shade_vertex(uint vertex_id) {
     Vertex v = pc.vertices[pc.base_vertex + vertex_id];
     GpuDrawRecord draw = pc.draws[pc.record];
 
@@ -271,6 +303,17 @@ VertexOut vertex_main(uint vertex_id: SV_VertexID) {
     return output;
 }
 
+[shader("vertex")]
+VertexOut vertex_main(uint vertex_id: SV_VertexID) {
+    VertexOut output = shade_vertex(vertex_id);
+    // The same values, differing only in how they are interpolated. Mirrored here, at the one
+    // exit there is, rather than at each exit of the body above - which is the whole reason the
+    // body is a separate function.
+    output.color_flat = output.color;
+    output.specular_flat = output.specular;
+    return output;
+}
+
 // --- the fixed-function texture stages ----------------------------------------------------
 //
 // D3D8's multitexture cascade, reproduced rather than approximated: each stage computes a
@@ -329,18 +372,18 @@ struct Stage {
     uint alpha;
 };
 
-Stage stage_at(uint index) {
+Stage stage_at(GpuMaterial m, uint index) {
     Stage s;
     if (index == 0u) {
-        s.texture = pc.stage0_texture;
-        s.sampler_index = pc.stage0_sampler;
-        s.color = pc.stage0_color;
-        s.alpha = pc.stage0_alpha;
+        s.texture = m.stage0_texture;
+        s.sampler_index = m.stage0_sampler;
+        s.color = m.stage0_color;
+        s.alpha = m.stage0_alpha;
     } else {
-        s.texture = pc.stage1_texture;
-        s.sampler_index = pc.stage1_sampler;
-        s.color = pc.stage1_color;
-        s.alpha = pc.stage1_alpha;
+        s.texture = m.stage1_texture;
+        s.sampler_index = m.stage1_sampler;
+        s.color = m.stage1_color;
+        s.alpha = m.stage1_alpha;
     }
     return s;
 }
@@ -351,20 +394,31 @@ float4 fragment_main(VertexOut input) : SV_Target {
     // of it IS the diffuse the texture stages take as D3DTA_DIFFUSE. That is also D3D's own
     // order - lighting produces a vertex colour, the multitexture cascade consumes it - so
     // nothing here has to know whether the draw was lit.
-    const float4 diffuse = input.color;
+    const GpuMaterial material = pc.materials[pc.material];
+    // D3DSHADE_FLAT takes both output colours from the primitive's first vertex; the texture
+    // coordinates are interpolated either way, which is why only these two have a flat copy.
+    const bool flat_shaded = material.shading == kShadeFlat;
+    const float4 diffuse = flat_shaded ? input.color_flat : input.color;
+    const float3 specular_in = flat_shaded ? input.specular_flat.rgb : input.specular.rgb;
     // With every stage disabled the fixed function outputs the diffuse colour alone. That is
     // 2,160 draws a frame on level01 and used to sample whatever texture happened to still be
     // bound at stage 0, because the old path keyed off the binding rather than off COLOROP.
     float4 current = diffuse;
 
-    for (uint i = 0u; i < pc.stage_count && i < 2u; ++i) {
-        const Stage s = stage_at(i);
+    for (uint i = 0u; i < material.stage_count && i < 2u; ++i) {
+        const Stage s = stage_at(material, i);
         // Texture coordinate set, from D3DTSS_TEXCOORDINDEX. The canonical vertex carries two,
         // which is every set the game's FVFs declare; anything else falls back to the first.
         const float2 uv = ((s.color >> 24) & 0xffu) == 1u ? input.uv.zw : input.uv.xy;
-        const float4 tex = s.texture == kNoTexture
-                               ? float4(1, 1, 1, 1)
-                               : textures[s.texture].Sample(samplers[s.sampler_index], uv);
+        float4 tex = float4(1, 1, 1, 1);
+        if (s.texture != kNoTexture) {
+            // SampleLevel and not Sample with a bias: the probe has to REPLACE the computed LOD,
+            // not nudge it, or it cannot answer which level the hardware would have chosen.
+            tex = pc.force_lod >= 0.0
+                      ? textures[s.texture].SampleLevel(samplers[s.sampler_index], uv,
+                                                        pc.force_lod)
+                      : textures[s.texture].Sample(samplers[s.sampler_index], uv);
+        }
 
         // Colour and alpha both read the state from BEFORE this stage, so `current` is
         // replaced once, at the end - not updated between the two.
@@ -384,10 +438,10 @@ float4 fragment_main(VertexOut input) : SV_Target {
     // D3D's alpha test compares the 0..255 reference against the fragment's alpha, so the
     // comparison is done in those units rather than normalising the reference - `>= 31/255`
     // and `>= 31` differ by a rounding step, and the test is exactly where that shows.
-    const uint alpha_func = pc.flags & 0x0fu;
+    const uint alpha_func = material.flags & 0x0fu;
     if (alpha_func != 0u) {
         const float value = current.a * 255.0;
-        const float reference = float((pc.flags >> 8) & 0xffu);
+        const float reference = float((material.flags >> 8) & 0xffu);
         bool pass;
         switch (alpha_func) {
         case 1u: pass = false; break;                   // D3DCMP_NEVER
@@ -408,5 +462,5 @@ float4 fragment_main(VertexOut input) : SV_Target {
     // it rides its own varying instead of being folded into the diffuse. Zero unless the vertex
     // shader was asked for it, so this costs an add on draws that do not use it - level01 uses
     // none, which is how GKPLUS_NO_SPECULAR ruled it out as a gap (§4.20).
-    return float4(current.rgb + input.specular.rgb, current.a);
+    return float4(current.rgb + specular_in, current.a);
 }

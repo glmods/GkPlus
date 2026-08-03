@@ -94,6 +94,177 @@ JSValue SetLighting(JSContext *ctx, JSValueConst, JSValueConst value) {
   return JS_UNDEFINED;
 }
 
+// `render.half_pixel` - the D3D9 pixel-centre convention as a viewport offset (VkDraw.h).
+// Writable for the same reason as `topologies` and `lighting`: it moves every pixel in the
+// frame by half of one, so the only comparison fine enough to see it is two shots of the same
+// paused frame.
+JSValue GetHalfPixel(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::HalfPixel());
+}
+
+JSValue SetHalfPixelValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetHalfPixel(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+// `render.draw_vertices` - set it to a draw index, let a frame pass, then read it back for the
+// geometry that draw was actually handed. See WatchDrawVertices in VkDraw.h.
+JSValue GetDrawVertices(JSContext *ctx, JSValueConst) {
+  const std::string text = vulkan::DescribeWatchedVertices();
+  return JS_NewStringLen(ctx, text.data(), text.size());
+}
+
+JSValue SetDrawVerticesValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  uint32_t index = 0;
+  if (JS_ToUint32(ctx, &index, value) != 0) {
+    return JS_EXCEPTION;
+  }
+  vulkan::WatchDrawVertices(index);
+  return JS_UNDEFINED;
+}
+
+// `render.force_lod` - the mip probe (VkDraw.h). -1 samples normally; 0 and up force every
+// texture fetch to that level, which is how "we pick the wrong mip" is told apart from "we filter
+// the right one wrongly".
+JSValue GetForceLod(JSContext *ctx, JSValueConst) {
+  return JS_NewFloat64(ctx, vulkan::ForceLod());
+}
+
+JSValue SetForceLodValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  double lod = -1.0;
+  if (JS_ToFloat64(ctx, &lod, value) != 0) {
+    return JS_EXCEPTION;
+  }
+  vulkan::SetForceLod(static_cast<float>(lod));
+  return JS_UNDEFINED;
+}
+
+// `render.probe(name, scale, mipmap)` - arm the synthetic quad (D3D8Capture.h). Drawn through
+// the capture device itself, so d3d8, d3d9 and vulkan all get the same quad and the comparison
+// stops depending on anything about the scene.
+JSValue ProbeQuad(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+  std::string name;
+  if (argc > 0 && !JS_IsNull(argv[0]) && !JS_IsUndefined(argv[0])) {
+    const char *text = JS_ToCString(ctx, argv[0]);
+    if (text == nullptr) {
+      return JS_EXCEPTION;
+    }
+    name = text;
+    JS_FreeCString(ctx, text);
+  }
+  double scale = 1.0;
+  if (argc > 1 && JS_ToFloat64(ctx, &scale, argv[1]) != 0) {
+    return JS_EXCEPTION;
+  }
+  const bool mipmap = argc > 2 && JS_ToBool(ctx, argv[2]) != 0;
+  double offset = 0.0;
+  if (argc > 3 && JS_ToFloat64(ctx, &offset, argv[3]) != 0) {
+    return JS_EXCEPTION;
+  }
+  const bool alpha = argc > 4 && JS_ToBool(ctx, argv[4]) != 0;
+  const std::string result = d3d8::ArmProbeQuad(name, scale, mipmap, offset, alpha);
+  return JS_NewStringLen(ctx, result.data(), result.size());
+}
+
+// `render.shade_mode` - honour D3DRS_SHADEMODE, or interpolate everything (VkDraw.h). Writable
+// for the same reason as the three above: on level02 it touches 2% of the draws and all of them
+// are the stencil shadow, so nothing coarser than two shots of one paused frame can see it.
+JSValue GetShadeMode(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::ShadeMode());
+}
+
+JSValue SetShadeModeValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetShadeMode(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+// `render.draw_range` - [first, last] of the frame's draw list to record, inclusive. The bisect
+// for "which draw painted that pixel"; see SetDrawRange in VkDraw.h. Only meaningful on a paused
+// frame, since an index is a position in a list the game rebuilds every frame.
+JSValue GetDrawRange(JSContext *ctx, JSValueConst) {
+  uint32_t first = 0;
+  uint32_t last = 0;
+  vulkan::GetDrawRange(first, last);
+  JSValue array = JS_NewArray(ctx);
+  if (JS_IsException(array)) {
+    return array;
+  }
+  if (JS_SetPropertyUint32(ctx, array, 0, JS_NewInt64(ctx, first)) < 0 ||
+      JS_SetPropertyUint32(ctx, array, 1, JS_NewInt64(ctx, last)) < 0) {
+    JS_FreeValue(ctx, array);
+    return JS_EXCEPTION;
+  }
+  return array;
+}
+
+JSValue SetDrawRangeValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  // null restores "all of them", so a session can get back without spelling out UINT32_MAX.
+  if (JS_IsNull(value) || JS_IsUndefined(value)) {
+    vulkan::SetDrawRange(0, UINT32_MAX);
+    return JS_UNDEFINED;
+  }
+  uint32_t first = 0;
+  uint32_t last = 0;
+  JSValue a = JS_GetPropertyUint32(ctx, value, 0);
+  JSValue b = JS_GetPropertyUint32(ctx, value, 1);
+  const int ok = JS_ToUint32(ctx, &first, a) == 0 && JS_ToUint32(ctx, &last, b) == 0;
+  JS_FreeValue(ctx, a);
+  JS_FreeValue(ctx, b);
+  if (!ok) {
+    return JS_ThrowTypeError(ctx, "draw_range takes [first, last] or null");
+  }
+  vulkan::SetDrawRange(first, last);
+  return JS_UNDEFINED;
+}
+
+// `render.draw_hide` - [first, last] to leave out, everything else drawn. See SetDrawHide.
+JSValue GetDrawHide(JSContext *ctx, JSValueConst) {
+  uint32_t first = 0;
+  uint32_t last = 0;
+  vulkan::GetDrawHide(first, last);
+  JSValue array = JS_NewArray(ctx);
+  if (JS_IsException(array)) {
+    return array;
+  }
+  if (JS_SetPropertyUint32(ctx, array, 0, JS_NewInt64(ctx, first)) < 0 ||
+      JS_SetPropertyUint32(ctx, array, 1, JS_NewInt64(ctx, last)) < 0) {
+    JS_FreeValue(ctx, array);
+    return JS_EXCEPTION;
+  }
+  return array;
+}
+
+JSValue SetDrawHideValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  if (JS_IsNull(value) || JS_IsUndefined(value)) {
+    vulkan::SetDrawHide(1, 0); // a window no index can fall in
+    return JS_UNDEFINED;
+  }
+  uint32_t first = 0;
+  uint32_t last = 0;
+  JSValue a = JS_GetPropertyUint32(ctx, value, 0);
+  JSValue b = JS_GetPropertyUint32(ctx, value, 1);
+  const int ok = JS_ToUint32(ctx, &first, a) == 0 && JS_ToUint32(ctx, &last, b) == 0;
+  JS_FreeValue(ctx, a);
+  JS_FreeValue(ctx, b);
+  if (!ok) {
+    return JS_ThrowTypeError(ctx, "draw_hide takes [first, last] or null");
+  }
+  vulkan::SetDrawHide(first, last);
+  return JS_UNDEFINED;
+}
+
+JSValue DrawInfo(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+  uint32_t index = 0;
+  if (argc < 1 || JS_ToUint32(ctx, &index, argv[0]) < 0) {
+    return JS_ThrowTypeError(ctx, "draw_info(i) takes a draw index");
+  }
+  const std::string text = vulkan::DescribeDraw(index);
+  if (text.empty()) {
+    return JS_NULL;
+  }
+  return JS_NewStringLen(ctx, text.data(), text.size());
+}
+
 JSValue GetShadowState(JSContext *ctx, JSValueConst) {
   const std::string text = d3d8::FormatShadowState();
   return JS_NewStringLen(ctx, text.data(), text.size());
@@ -454,6 +625,14 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("state", GetShadowState, nullptr),
     JS_CGETSET_DEF("topologies", GetTopologies, SetTopologies),
     JS_CGETSET_DEF("lighting", GetLighting, SetLighting),
+    JS_CGETSET_DEF("half_pixel", GetHalfPixel, SetHalfPixelValue),
+    JS_CGETSET_DEF("shade_mode", GetShadeMode, SetShadeModeValue),
+    JS_CGETSET_DEF("force_lod", GetForceLod, SetForceLodValue),
+    JS_CFUNC_DEF("probe", 5, ProbeQuad),
+    JS_CGETSET_DEF("draw_range", GetDrawRange, SetDrawRangeValue),
+    JS_CGETSET_DEF("draw_hide", GetDrawHide, SetDrawHideValue),
+    JS_CFUNC_DEF("draw_info", 1, DrawInfo),
+    JS_CGETSET_DEF("draw_vertices", GetDrawVertices, SetDrawVerticesValue),
     JS_CGETSET_DEF("vulkan", GetVulkan, nullptr),
     JS_CGETSET_DEF("vulkan_report", GetVulkanReport, nullptr),
     JS_CGETSET_DEF("validation", GetValidationMessages, nullptr),

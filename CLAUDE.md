@@ -131,6 +131,21 @@ Four more things that cost time the first time round:
 
 ### Debugging the running game
 
+- **Automated testing loads `level02`, not `level01`.** `level01.gcs` ends in
+  `PLAY CUTSCENE first contact`, so a scripted run lands in a scripted camera sequence rather
+  than in the level — nothing is where a test expects it, and how far the cutscene has got
+  depends on how fast the machine reached that frame. `level02.gcs` issues no `PLAY CUTSCENE`
+  (of the fifteen campaign levels only `prison`, `level02`, `level03`, `level04` and `level06`
+  are free of one), which makes it the cheapest in-level state to assert against:
+
+  ```
+  levels.start({script: "level02.gls", console: "level02.gcs"})
+  ```
+
+  173 actors / 294 roles, against level01's 158 / 259. Only reach for `level01` when the thing
+  under test *is* level01 — an existing measurement being reproduced, or the cutscene path
+  itself. Every "measured on level01" number in the notes stays as it is; it records what was
+  run, not what to run next.
 - `cmake --build build --target copy` fails while `gl.exe` is running (the DLL is locked). A
   clean exit rewrites `<Gunlok>\scripts\GLkeys.cfg` — a cheap "quit or crashed?" signal.
 - **Prefer no debugger for crash hunting**: launch `gl.exe` directly and read WER's Application
@@ -397,7 +412,7 @@ actors.count                       // 158
 [...actors].filter(a => a.alive).length
 roles["gunlok"].id
 game.simulation_running            // the authority test, false on a joining client
-levels.start("level01.gls")        // into a level from the menu, no keystrokes
+levels.start("level02.gls")        // into a level from the menu, no keystrokes
 console.print("hello")             // goes to the game's own console
 ```
 
@@ -421,6 +436,9 @@ Worth knowing before leaning on it:
   see and mutate live game state, and while it runs the game does not advance. A
   `JS_SetInterruptHandler` deadline throws after 5 s so a runaway loop cannot wedge
   the process — but it **cannot interrupt a native call**, only JavaScript.
+- **Start `level02` when the test does not care which level it is in.** `level01.gcs`
+  opens with `PLAY CUTSCENE first contact`, so anything asserted right after the load
+  is measuring a cutscene; `level02.gcs` plays none. See "Debugging the running game".
 - **`ImGui` is not reachable**, by construction: the frame callback runs outside
   the ImGui frame, so those calls would be invalid. `draw_gui` is where they live.
 - **It shares the runtime with `main.mjs`** but has its own context, so `actors`
@@ -953,7 +971,7 @@ screen. `target` is a `Level` from `levels.add`, a title from `levels.startable`
 
 ```js
 levels.start("Test Arena", { difficulty: "hard" });          // by title
-levels.start({ script: "level01.gls", console: "level01.gcs" });
+levels.start({ script: "level02.gls", console: "level02.gcs" });
 arena.start();                                                // on the Level itself
 ```
 
@@ -1411,25 +1429,83 @@ Three modelling decisions that took a round-trip through `tsc` to settle:
 ### The Vulkan renderer (`src/D3D8Capture`, `src/Vk*`, `src/VertexFormat`)
 
 A bindless Vulkan replacement for Gunlok's renderer. **`GKPLUS_RENDERER=vulkan` draws the
-game** — level01's world, its textures, its lightmaps, its units, its HUD, its
-**fixed-function lighting** and its **stencil shadows**, matching d3d9 to within 0.5/255 on every
-measured region but the HUD, and 4.59/255 over the whole frame (notes §4.26, §4.27). **Every draw
-the game issues now reaches the renderer**: the non-triangle-list topologies were opt-in only
-because the shadow pass had no stencil buffer to mask it, and with `D24_UNORM_S8_UINT` and the
-stencil state in `PipelineState` they are on by default. Two things §4.27 is worth reading for:
-the game never sets `D3DRS_STENCILMASK`, whose default is all-ones, so a mirror that left it at
-zero would have had a working stencil buffer and the same whole-screen darkening; and the shadow
-is worth 5.5/255 over its own region but 0.12 over the frame, which is why **a feature is judged
-on its region and never on a whole-frame MAD**. Fog is measured absent — 0 of 12M draws enable it.
-**The light sum is D3D8's whole per-vertex equation** — ambient, diffuse and specular over
-directional, point and spot lights, with the material colours tracked from
-`D3DRS_*MATERIALSOURCE` — and it needed §2's `GpuDraw` array first, because the 128-byte push
-constant block was full at 120 (it is now 72). §4.19 ruled lighting out on an A/B that does not
-reproduce; §4.20, §4.25 and §4.26 are the corrections. Two of this layer's own counters were
-measuring nothing while reading plausibly — see §4.26 before trusting one.
-**`vulkan_renderer_plan.md` is where to start** — status and next
-steps; `vulkan_renderer_notes.md` is the design record and every measurement behind it. Read the
-plan before touching any of this.
+game** — the world, its textures, its lightmaps, its units, its HUD, its **fixed-function
+lighting** and its **stencil shadows**. **`vulkan_renderer_plan.md` is where to start** — status
+and next steps; `vulkan_renderer_notes.md` is the design record and every measurement behind it.
+Read the plan before touching any of this.
+
+**The ground truth is `GKPLUS_RENDERER=d3d8`** (§4.33). Windows 10 still ships a 32-bit `d3d8.dll`
+in SysWOW64, so the game runs on the *original* runtime with the capture layer and the whole REPL
+harness intact — which matters, because a reference you cannot drive is one you cannot align to
+the same frame. Compare against that. `d3d9` (d3d8to9) is the second opinion that says whether a
+difference lives in the translation layer or in the game: on a settled level02 frame the two agree
+to **0.017/255**, but two HUD columns that belong in the game are drawn by the Vulkan path and
+dropped by d3d8to9. Thirty sections of measurement were taken against d3d9 before anyone checked
+whether the real thing was available.
+
+**The whole-frame residual against the original is 2.59/255, and its cause is known** (§4.37):
+Gunlok renders into a **640x480** backbuffer while the window's client area — and so the swapchain
+— is **628x468**. A pre-transformed draw's pixels-to-clip matrix is built from the D3D viewport,
+so a Vulkan viewport covering the swapchain scales every 2D draw by 628/640 *during
+rasterisation*, resampling the texture. The original rasterises 1:1 and lets its windowed
+`Present` stretch the finished frame. The fix is an offscreen colour target at the backbuffer size
+plus a final scaled blit, and it is the top item in the plan; sizing the viewport alone is *not*
+it — that reproduces the original texel for texel and costs the framing (2.59 → 13.07).
+
+Four measurement rules, each of which cost a wrong conclusion:
+
+- **A feature is judged on its region, never on a whole-frame MAD** (§4.27) — the stencil shadow
+  is worth 5.5/255 over its own region and 0.12 over the frame.
+- **...but mean RGB per region is blind to a real difference** (§4.33). It answers "is this region
+  the right colour" and cancels a per-texel error with zero bias: the reported junk pile matched
+  d3d8 to 0.1 mean RGB while differing by 2.95 MAD against a 0.008 floor. Read both, against a
+  floor — which is what having the real reference supplies.
+- **Count distinct values, not differences, when a texture looks wrong** (§4.37). Sixteen values
+  all multiples of 17 says "one exact 4-bit texel per pixel, no filtering"; 256 says "resampled".
+  That one line settled what three sections of difference images could not.
+- **An amplified difference image cannot tell a sub-pixel offset from filtering** (§4.28) —
+  resample one shot against the other and find where the difference minimises.
+
+**Every draw the game issues now reaches the renderer**, and that is newly true twice over.
+`DrawPrimitive` — one of D3D8's four draw entry points — built no draw at all for the whole life
+of the renderer, with **every "must be 0" counter reading zero**, because they count *reasons a
+draw was rejected* and a draw that is never offered has no reason to be rejected (§4.32). The
+reading that catches that class is `draw calls seen` against `submitted` in `render.draws`, the
+only number that compares against what the **game** did rather than what the renderer chose.
+Separately, the non-triangle-list topologies are on by default now that a stencil buffer exists.
+
+**Gunlok uses six viewport depth slices and none is the default** (§4.32): the world sits in
+`0.1..1.0` and the effect layers in thin slices around `0.02..0.06`, so an overlay is in front of
+the world by construction rather than by switching the depth test off, and `1.0..1.0` pins a
+backdrop to the far plane. `D3DVIEWPORT8::MinZ`/`MaxZ` were recorded nowhere and the viewport was
+hardcoded `0..1`, so the world occluded the layers meant to sit over it — fires rendered as bare
+scenery. It is per-draw dynamic state now.
+
+**The frame is an array of indices** (§4.26, §4.30). A draw's per-draw data lives in a
+`GpuDrawRecord` array and its texture stages in an interned `GpuMaterial` array — 274 draws on
+level02 are 29 materials — so the push constants carry four device addresses and three indices, 48
+bytes, and describe no draw at all. That is what makes a second pass over the frame a walk over
+the draw array rather than a replay of the recording loop.
+
+Fog is measured absent — 0 of 12M draws enable it. **`D3DRS_SHADEMODE` is honoured and has never
+mattered** (§4.31): every flat-shaded draw on level01 and level02 is one of the stencil shadow's
+three passes, two of which write no colour and one of which is a single-colour quad, so
+`render.shade_mode` moves 0 pixels in either. It is also the section on *how* to decide a question
+like that — the pipeline histogram says which draws use a state where a count only says how many,
+and that chose an extra varying over doubling the pipeline table. **The light sum is D3D8's whole
+per-vertex equation** — ambient, diffuse and specular over directional, point and spot lights,
+with the material colours tracked from `D3DRS_*MATERIALSOURCE`. §4.19 ruled lighting out on an A/B
+that does not reproduce; §4.20, §4.25 and §4.26 are the corrections, and two of this layer's own
+counters were measuring nothing while reading plausibly — see §4.26 before trusting one.
+
+Four instruments answer questions no counter can, and each exists because one was needed:
+
+| | |
+|---|---|
+| `render.draw_range` / `draw_hide` / `draw_info(i)` | attribute a pixel to a draw. Bisect by **hiding a window, never truncating a prefix** — a prefix truncates the depth and stencil buffers too (§4.29) |
+| `render.draw_vertices = i` | the converted vertices and indices a draw was actually handed, following its own indices rather than the head of the slice. Answers "wrong shape" vs "something covers it" (§4.32) |
+| `render.force_lod` | force every texture fetch to an explicit mip level. Pair with `GKPLUS_NO_MIPMAP=1` on the reference to pin both sides to level 0 (§4.34) |
+| `render.probe(name, scale, mipmap, offset, alpha)` | one textured quad drawn **through the capture device**, so d3d8, d3d9 and vulkan all get the same draw with the scene's lighting, stages, blending and depth removed (§4.35) |
 
 The one fact that shapes everything: **the seam is `Direct3DCreate8`, not the AWAPI render
 queue.** The queue looked obvious and is not total — `rendering_notes.md` §4.1 — so
@@ -1467,9 +1543,11 @@ Things worth knowing before editing:
   `render.verify_textures()` and `render.verify_buffers()` read each image and each arena slot
   back off the GPU and compare them against the D3D resource they came from — between them they
   have found five defects with every counter reading clean (notes §4.13, §4.24). Both must read
-  `158/158` and `3467/3467` on level01. Check `render.validation` in the same breath as any
-  readback: a verifier that is itself invalid reports its own mismatches as the code's, which
-  cost an afternoon.
+  `158/158` and `3467/3467` on level01. The **ratio** is the invariant, not those two numbers —
+  a run on `level02` (which is what automated testing should load, see "Debugging the running
+  game") has its own totals, and a mismatch is any run where the two halves differ. Check
+  `render.validation` in the same breath as any readback: a verifier that is itself invalid
+  reports its own mismatches as the code's, which cost an afternoon.
 - **Two transfers in a command buffer are not ordered against each other**, and a level load
   hands one arena slot to two buffers inside a single staging batch. Unordered, the loser's
   bytes are what the draw reads — which presents as one object smeared into a black wedge across
@@ -1512,7 +1590,7 @@ Things worth knowing before editing:
 | `src/VkContext.h/cpp` | Instance, physical device, logical device, validation. Lazily initialized — **never from `DllMain`**, since volk calls `LoadLibrary` and that deadlocks under the loader lock |
 | `src/VkRenderer.h/cpp` | Surface, swapchain, frames in flight, the ImGui backend, present |
 | `src/VkResources.h/cpp` | VMA arenas, the staging ring, the texture images (creation, format mapping, upload, readback verification) and the bindless descriptor set. Nothing device-local is ever mapped. **The vertex arena aligns slots to `sizeof(CanonicalVertex)`, not 16** — a draw addresses its buffer as a vertex index, and a 16-byte-aligned slot silently pulls the wrong vertices (notes §4.16) |
-| `src/VkDraw.h/cpp` | The world pass: one `VkPipeline` per distinct blend/depth/cull state (five on level01, built on first sight — notes §4.19), the depth buffer, the per-frame draw list, and the **shader ABI** (`GpuLight`, `GpuDrawRecord` — the two arrays a draw is looked up in, §4.26). A draw binds nothing — vertices, its own record and the lights are all pulled by device address, from the arena for buffered draws and from a per-frame host-visible scratch for user-pointer ones (§4.18). **The list is never sorted**: the game's own order is what makes blending correct |
+| `src/VkDraw.h/cpp` | The world pass: one `VkPipeline` per distinct blend/depth/cull state (five on level01, built on first sight — notes §4.19), the depth buffer, the per-frame draw list, and the **shader ABI** (`GpuLight`, `GpuDrawRecord`, `GpuMaterial` — the three arrays a draw is looked up in, §4.26 and §4.30). A draw binds nothing and its push constants describe nothing: four device addresses and three indices, 48 bytes. Vertices, its own record, its material and the lights are all pulled by address, from the arena for buffered draws and from a per-frame host-visible scratch for user-pointer ones (§4.18). **Materials are interned per frame** — 274 draws on level02 are 29 of them — which is what makes a second pass over the frame a walk over the draw array rather than a replay of the recording loop. **The list is never sorted**: the game's own order is what makes blending correct |
 | `src/VkCapture.h/cpp` | RenderDoc via its in-app API, so `render.capture()` grabs one frame from the REPL. Off unless `GKPLUS_RENDERDOC` is set, and loaded before the Vulkan instance because it captures by inserting a layer. **Opening a capture has two traps, both reported as `VK_ERROR_OUT_OF_DEVICE_MEMORY` and neither about VRAM** — the *replayer* must be 32-bit (launching from the x86 tooling does not help; the UI replays in its own x64 process, so it needs `x86\renderdoccmd.exe remoteserver`), and an in-level capture needs `GKPLUS_VK_HEAPS=small` (notes §4.17) |
 | `src/shaders/*.slang`, `src/gen-shaders.py` | The shaders, in **Slang**, compiled offline to `src/Shaders.gen.inc.h` so `d3d8.dll` needs no shader toolchain. Re-run the generator after editing one |
 | `src/VertexFormat.h/cpp` | Every FVF the game uses → one canonical 48-byte vertex. Pure CPU, no Vulkan and no D3D headers |
@@ -1544,6 +1622,7 @@ reference. Test invocations are under "Running the test suites" above.
 | `types/` | `.d.ts` for the `"gk"` module and the `ImGui` interface, the generator for the latter, and `typecheck.ts`. See "Type definitions" above |
 | `blender/` | The Blender `.rif` import/export addon and its seven test harnesses. Pure Python, unrelated to `d3d8.dll`. Design record in `blender/CLAUDE.md` |
 | `huffman/`, `utils/rifutil` | The C++ REBCRIF1 codec and its CLI. The Python port in `blender/io_scene_rif/rif.py` is decode-only; this is the only compressor |
+| `utils/rendertest` | The PowerShell harness for driving Gunlok through the REPL and capturing frames — launch, dismiss the briefing, wait for the camera to come to rest, screenshot, and bisect `render.draw_hide` for the draw behind a pixel. What every renderer comparison should use; its README is the list of things that waste a run otherwise |
 | `utils/rimutil` | `.RIM` <-> PNG CLI over spng + libsquish, both directions, both image forms. `compress` takes `--format dxt1\|dxt3\|body` (default **dxt3**) and `--raw`; **dxt5 is refused by name**, because `TextureFormatCandidates` @ 0x006ac348 lists only DXT1/DXT3 and `SurfaceDesc_SetCompressedFormat` @ 0x005c6820 drops any other fourcc *silently* — a DXT5 file renders with garbage alpha rather than failing. `body` is exactly lossless and needs no DXT compressor — it picks `masking 2` only when every transparent texel shares one RGB (otherwise an `ALPH` chunk, since the RGB *under* transparency is what bilinear filtering blends into neighbours), and `check_lossless` re-derives every pixel before writing. Format details in `rif_chunk_format.md`; tests in `utils/rimutil/tests` |
 
 ## Reverse Engineering Reference

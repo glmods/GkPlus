@@ -4,13 +4,24 @@ The design record for the Vulkan backend. `rendering_notes.md` is the analysis o
 renderer *does*; this file is what replaces it and why. Read §1 before anything else — it is a
 measurement that overturned the obvious plan, and every other decision here follows from it.
 
-Status: **Phases 0, 1, 2a, 2b, 2c-i and the vertex half of 2c-ii done, all verified on a
-running game.** The D3D8 capture layer
-(`src/D3D8Capture.cpp`) mirrors the fixed-function state, replays state blocks into it, and
-reduces every draw to a material and a pipeline key, and tracks buffer residency — while still
-forwarding every call unchanged. `GKPLUS_RENDERER=vulkan` puts a Vulkan swapchain on the game's
-window, presents a clear colour and draws the ImGui overlay on it, clean under validation. Results and the traps
-they cost are §4.1 through §4.11. Nothing is drawn from game geometry yet — that is Phase 3.
+Status: **the renderer draws the game.** `GKPLUS_RENDERER=vulkan` renders the world, its
+textures and lightmaps, the units, the HUD, the fixed-function light sum and the stencil shadows,
+and every draw the game issues reaches it. The D3D8 capture layer (`src/D3D8Capture.cpp`) mirrors
+the fixed-function state, replays state blocks into it, reduces every draw to a `DrawItem`, and
+tracks buffer and texture residency — while still forwarding every call, which is what keeps the
+A/B available.
+
+**The reference is `GKPLUS_RENDERER=d3d8`** (§4.33), which runs the game on Windows' own 32-bit
+D3D8 with the capture layer and the REPL harness intact. Against it, a settled and paused level02
+frame is **2.59/255** whole-frame — and that residual has a known cause (§4.37): the game
+rasterises into a 640x480 backbuffer while the swapchain is 628x468, so every pre-transformed draw
+is scaled by 628/640 during rasterisation instead of being stretched once at present.
+
+Sections are in the order they were measured, and several correct earlier ones. Where they
+disagree the later number wins — §4.36 is superseded by §4.37, and §4.33 corrects the reading of
+the junk pile in §4.30-§4.32. `vulkan_renderer_plan.md` carries the current state; this file
+carries how each of it was arrived at, including the wrong turns, because most of them were wrong
+in a way worth not repeating.
 
 ## 1. The seam, and the measurement that chose it
 
@@ -346,6 +357,15 @@ Six things worth keeping:
   loop hangs forever. Dismiss it with
   `PostMessage(dlg, WM_COMMAND, IDYES, GetDlgItem(dlg, IDYES))`, and pick **Yes**: windowed is the
   only mode in which the Vulkan path and `GKPLUS_RENDER_UNFOCUSED` are sound.
+- **The FMV is not the only scripted footage in the way — `level01` opens with a cutscene too.**
+  `level01.gcs` ends in `PLAY CUTSCENE first contact`, so the twelve-second settle after
+  dismissing the briefing is partly spent watching a scripted camera, and where it has got to
+  depends on how fast the machine reached that frame. That is a second source of the
+  cross-launch variance §4.21 measures, on top of the frame-rate difference. **Load `level02`
+  for anything automated** — `level02.gcs` issues no `PLAY CUTSCENE` (nor do `prison`,
+  `level03`, `level04` or `level06`; every other campaign level does). The measurements
+  recorded in this file were taken on level01 and stay stated that way: reproducing one means
+  loading level01 deliberately, cutscene included.
 - **`vkCreateSwapchainKHR` retires the old swapchain whether it succeeds or fails**, so the old
   handle and its views and semaphores are destroyed on both paths. Only the success path installs
   the new one.
@@ -2076,6 +2096,1030 @@ had run the two together on a frame where both had something to say.
 With `fx.snow(true)` running, `render.verify_buffers()` reports 3468/3469 with the odd one out a
 buffer the game is refilling every frame. Paused, it reads 3469/3469. The verifier reads a buffer
 while the game writes it; that is a race in the diagnostic, not in the upload path.
+
+## 4.28 The edge fringes were half a pixel, and they were most of the residual
+
+Every section since §4.19 has ended by calling the remaining difference against d3d9 "edge
+fringes - filtering and sub-pixel differences" and moving on, because a fringe on every silhouette
+looks like the price of a different rasteriser. It is not. **D3D8/9 put the centre of pixel
+(i, j) at screen coordinate (i, j); Vulkan and D3D10+ put it at (i + 0.5, j + 0.5)**, so every
+interpolated value - and therefore every texture fetch - was half a pixel out, everywhere, in
+every frame this renderer has ever drawn.
+
+Half a pixel of the whole frame, measured on level02:
+
+| | whole frame vs d3d9 |
+|---|---:|
+| d3d9 against d3d9, two launches | **0.094** |
+| vulkan, before | 4.017 |
+| vulkan, after | **2.680** |
+
+The fix is `VkViewport::x = y = 0.5f` on the world pass (`ViewportOrigin` in VkDraw.h, toggled at
+run time with `render.half_pixel`). The overlay does not take it - ImGui's backend sets its own
+viewport, and the overlay is drawn for the human rather than to match d3d9.
+
+### How to find a sub-pixel offset, since staring at a difference image will not
+
+Amplifying the difference shows outlines and says "filtering". What identifies it is **resampling
+one shot against the other and finding where the difference minimises**: bilinearly sample the
+d3d9 image at `(x + dx, y + dy)`, compare against the Vulkan one at `(x, y)`, and sweep dx and dy
+over a grid. A rasterisation offset puts the minimum somewhere other than the origin, and says
+exactly how far.
+
+| region | before: MAD at (0,0) | before: best | after: MAD at (0,0) | after: best |
+|---|---:|---|---:|---|
+| scene | 4.876 | 3.663 at **(+0.50, +0.50)** | **3.515** | 3.481 at (0.00, -0.25) |
+| HUD | 3.080 | 2.735 at (+1.00, 0.00) | **2.525** | 2.525 at **(0.00, 0.00)** |
+
+The scene's minimum sitting at exactly (+0.50, +0.50) *before* is the whole diagnosis; that it
+moves to the origin *after* is the whole verification. Neither depends on the absolute MAD, which
+is what makes this measurable across two launches.
+
+The HUD's +1.0 is the same offset seen through a small pixel-aligned sprite: shifting a quad by
+half a pixel moves its edges across pixel boundaries, so the *content* appears to jump a whole
+one. Sub-regions of one panel disagreed (+1.0 for the text, +0.5 for the icons) for that reason.
+Sample a large region of ordinary geometry, not a sprite.
+
+### Two launches are reproducible after all, and the old floor was measuring the wrong thing
+
+**d3d9 against d3d9, two separate launches, is 0.094 over the whole frame and 0.00 on every HUD
+region.** §4.21 measured up to 8.06 between two runs of identical Vulkan code and concluded that
+cross-launch comparison was hopeless; §4.20 put the floor at 0.07 only at a twelve-second settle.
+Both were measuring the *game* drifting, not the renderer. Pinning the frame removes it entirely:
+
+- **`level02`**, which plays no cutscene (the reason it is the level to load, and this is what
+  that rule buys);
+- **`screen.toggle_pause()`** before the shot;
+- **the camera set explicitly from the REPL**, from values read back out of the run being
+  compared against.
+
+With those three, level02 is deterministic to 0.094 across launches - so a cross-renderer
+difference above ~0.1 is real, and the per-region-mean workaround is no longer the only thing
+that survives. Keep it for regions anyway; a mean is still what tells a colour error from an edge
+one.
+
+### The five sampler defaults, which were all zero and none of which is zero
+
+`InitialiseShadowState` seeded the render states and, since §4.27, the stencil ones - and never
+the texture-stage sampler states. D3D8's defaults there are `D3DTADDRESS_WRAP` for both address
+modes, `D3DTEXF_POINT` for MAG and MIN, and `D3DTEXF_NONE` for MIP. Zero is none of those: it
+built a **LINEAR/LINEAR sampler with mipmapping enabled** for every stage the game had not
+configured. This is the third instance of the same class of bug, after `D3DRS_COLORWRITEENABLE`
+(§4.20) and the two stencil masks (§4.27), and the rule has earned restating: **adding a state to
+the mirror is a reason to look up its default, because zero is a legal value for most of them.**
+
+`D3DTEXF_NONE` also needed a translation that did not exist. It is not a filter this renderer gets
+to approximate - it means *do not mipmap*, sample level 0 whatever the footprint - and Vulkan has
+no `mipmapMode` that says so. It is a LOD clamp: `maxLod = 0.25` instead of `VK_LOD_CLAMP_NONE`.
+
+Worth 0.04/255 on level02 and no visible change, because Gunlok configures its samplers inside
+**state blocks** and the shadow state was already right nearly everywhere. Landed anyway: it is a
+correctness fix whose absence is a blur, and a blur is invisible to every counter this renderer
+has.
+
+That state-block detail is also why the new `render.state` sampler block reports all seven states
+as "never set" while showing live values that are anything but: `ApplyOp` writes the shadow state
+directly and `TheStats.stage_states` only records direct `SetTextureStageState` calls. **The live
+column is the one to read**, and the stage-configuration histogram now carries `filt` (mag/min/mip)
+and `addr` (u/v) per stage per draw, which is the reading that actually attributes a filter to a
+group of draws. Level02 uses `222` on the world's stage 0, `220` on its lightmap stage, and `111`
+and `110` on parts of the HUD and the on-screen text.
+
+### The HUD, and the first place the reference is the wrong one
+
+The HUD has been "+2.6/+3.4/+0.8 against d3d9, cause unknown" since §4.26. Two things turned out
+to be true of it, and the second is the one that matters.
+
+**It is not a region that fails.** With the half-pixel offset in, the HUD panel differs by 2.478
+where the *rest of the frame* differs by 2.693. It is slightly better than average. Every
+statement since §4.20 calling it "the one region that does not match" was true only while every
+pixel in the frame was half a pixel out, and the HUD - high-contrast art at roughly 1:1 texel to
+pixel - showed that more than anything else did.
+
+**What is left of it is two bright vertical bars, and they are d3d9's fault, not ours.** Scanlines
+through the panels find the palettes identical and the text and portraits matching pixel for
+pixel, and then a 3-pixel column at x=554..556 and another at x≈616..619 reading **134** in Vulkan
+against **35** in d3d9, over a panel background of 26. Those columns **belong in the game**: the
+Vulkan renderer draws them and the d3d9 path does not. d3d9 is not drawing nothing there - 35
+against a 26 background is the panel edge underneath - it is the bright highlight over it that
+goes missing.
+
+So this is the first known case of **the A/B reference being the wrong one**, and it changes what
+the reference is for. `GKPLUS_RENDERER=d3d9` is a second implementation with its own defects, not
+ground truth: it answers "do these two agree", and a disagreement is a reason to find out which is
+right rather than a defect report against this renderer. Everything measured before §4.28 was a
+disagreement large enough that the question did not arise; at 2.68 it does.
+
+What that is worth, so the headline number stays honest: the bars are 2,200 pixels, **0.75% of the
+frame**, and excluding them moves the whole frame from 2.680 to 2.630 and the HUD panel from 2.478
+to **1.497**. They are 40% of the HUD's difference and almost none of the frame's - §4.27's rule
+about judging a feature on its own region, arriving from the other side.
+
+Two things ruled out along the way, both cheap and both worth not repeating:
+
+- **They are not a meter.** Setting `actors["gunlok"].health` to 3 leaves both columns exactly as
+  they were, so they are static panel decoration rather than something whose length is state.
+- **It is not a blur.** Our HUD has *more* gradient energy than d3d9's (|dx| 7.65 against 5.59) and
+  a higher standard deviation, where the scene matches to 1% on both. Binning pixels by the d3d9
+  value and averaging ours suggests a contrast compression and is **not diagnostic** - conditioning
+  on one of two imperfectly-correlated images produces that slope whichever one is sharper. The
+  gradient statistics are the test; the regression is not.
+
+Why d3d8to9 drops them is unexamined. The draws are the green-emissive HUD material
+(`0x80008000`, lighting on with no light enabled, so the sum collapses to the emissive) in a
+pipeline group whose `D3DRS_ALPHABLENDENABLE` is 0 - an opaque green quad, which is exactly the
+134 that appears here. Whatever the mechanism, it is a defect in the measuring instrument, and
+the useful output of chasing it would be knowing where else the instrument lies.
+
+## 4.29 Chasing the columns d3d8to9 drops: five causes ruled out, none found
+
+§4.28 established that the two bright columns in the HUD panels belong in the game, that this
+renderer draws them and the d3d9 path does not. This is the attempt to find out why. **It did not
+find the cause.** What it did produce is the draw named exactly, five candidate causes eliminated
+with instruments rather than argument, and the tooling that made both possible - so this section
+is a record of a search, and the value in it is knowing where not to look again.
+
+### The draw, exactly
+
+Bisected out of the frame with `render.draw_hide` and described with `render.draw_info`:
+
+```
+draw 65 of 273
+  topology 4  indexed  count 36  base_vertex 4407  first_index 298648  vertex_offset 0
+  vertices from arena, indices from arena, index stride 2
+  blend 0 (src 5 dst 2)  depth test 1 write 1 func 4  cull 3  colour write 0xf
+  stencil 0   alpha test func 0 ref 0
+  1 stage(s):  0: tex 50 sampler 3 colour 0x00000204 alpha 0x00000204
+```
+
+36 indices is 12 triangles is **6 quads**, and rendering that draw alone shows what they are: the
+two vertical columns and four small icons, nothing else. Texture 50 is
+`units\plates 2 1024.rim` - DXT1, 1024x1024, 3 mip levels. Stage 0 is
+`MODULATE(D3DTA_TEXTURE, D3DTA_DIFFUSE)` on texture coordinate set 0. Blending is **off**, so the
+result is written opaque.
+
+Those 6 quads light **583 pixels**. Mean green over exactly those pixels:
+
+| | |
+|---|---:|
+| vulkan | **125.92** |
+| d3d9 | 26.44 |
+| d3d9, `GKPLUS_NO_MIPMAP=1` | 26.75 |
+| d3d9, `GKPLUS_NO_CULL=1` | 26.44 |
+| d3d9, `GKPLUS_NO_ZTEST=1` | 26.44 |
+
+26.4 is the panel *behind* them. **d3d9 writes nothing there at all**, and that is a stronger
+statement than "it draws them wrong": an opaque `MODULATE` with a texture that failed to resolve
+would write black, and nothing later covers those pixels - they survive to the final frame in
+Vulkan. So the draw does not rasterise.
+
+### What it is not
+
+Each of these is a switch and a launch, not a reading of the source:
+
+- **Not mip selection.** A quad three pixels wide sampling a 1024-texel texture is as minified as
+  this game gets, so LOD was the first suspect. `GKPLUS_NO_MIPMAP=1` forces `D3DTSS_MIPFILTER` to
+  `D3DTEXF_NONE` in the forwarded call; the columns stay absent (26.44 → 26.75).
+- **Not culling.** `GKPLUS_NO_CULL=1`: 26.44, unchanged to two decimals.
+- **Not the depth test.** `GKPLUS_NO_ZTEST=1`: 26.44, unchanged.
+- **Not an out-of-range draw call.** D3D8's runtime tolerated a `MinIndex`/`NumVertices` reaching
+  past the bound vertex buffer where D3D9's validates it and fails the call - and since
+  d3d8to9 returns `D3D_OK` regardless, such a rejection would be silent on both sides. This
+  renderer pulls by index and would not care, which is exactly the shape of the symptom. The new
+  `draws_out_of_range` counter in `render.state` checks both buffers on every
+  `DrawIndexedPrimitive` and reads **0**.
+- **Not d3d8to9's draw path.** Read rather than measured, and it is a faithful pass-through:
+  `SetIndices` stores the base vertex index that D3D9 moved to the draw call and
+  `DrawIndexedPrimitive` passes it; `ApplyClipPlanes` re-applies only planes
+  `D3DRS_CLIPPLANEENABLE` enables, and the game sets that state to exactly one value.
+
+**Check that a switch did something before believing what it says.** These three were verified
+live by their whole-frame effect against plain d3d9, on a floor of 0.094: `NO_MIPMAP` 1.711 over
+46,204 pixels and `NO_ZTEST` 2.684 over 29,406 are unambiguous. `NO_CULL` is **0.243 over 2,192
+pixels**, which is only just clear of the floor - honest reading of a closed-geometry scene where
+back faces lose the depth test anyway, but it is the weakest of the three and worth redoing on a
+scene with open geometry before treating culling as firmly excluded.
+
+### Which D3D8 states d3d8to9 has to invent, and which Gunlok uses
+
+`render.state` now prints the eight states D3D9 does not have or handles differently, because
+"does the game set this at all" is the first question about each. Live values, and every value
+ever set:
+
+| state | Gunlok | what d3d8to9 does with it |
+|---|---|---|
+| `ZBIAS` | only 0 | scales to `D3DRS_DEPTHBIAS` by -0.000005 |
+| `SOFTWAREVERTEXPROCESSING` | **toggles 0/1** | `SetSoftwareVertexProcessing`, but only on a mixed-VP device |
+| `EDGEANTIALIAS` | only 0 | becomes `D3DRS_ANTIALIASEDLINEENABLE` |
+| `ZVISIBLE` / `LINEPATTERN` | only 0 | dropped on the floor |
+| `CLIPPING` | toggles 0/1 | forwarded |
+| `SHADEMODE` | **1 and 2** | forwarded |
+| `FILLMODE` | only 3 | forwarded |
+
+Two of those are the next things to try, and neither has been. `SOFTWAREVERTEXPROCESSING`
+toggling means the game asks for software vertex processing somewhere and d3d8to9 honours it only
+on a mixed-VP device - so the question is what Gunlok created its device with. And **`SHADEMODE`
+takes `D3DSHADE_FLAT`**, which this renderer ignores entirely: nothing in the shader is
+`nointerpolation`. That is a Vulkan-side gap rather than an explanation for the columns, but it is
+the one state in this table that is definitely unimplemented here.
+
+### The tooling, and the two ways of using it that give wrong answers
+
+`render.draw_range = [a, b]`, `render.draw_hide = [a, b]` and `render.draw_info(i)` were built for
+this and are the first way to attribute a *pixel* to a *draw* - `render.draws` counts what was
+skipped and `render.state` histograms what was configured, and neither could answer it.
+
+- **Bisect by hiding a window, not by truncating a prefix.** A prefix truncates the depth and
+  stencil buffers along with the draw list, so a draw that only becomes visible because the
+  geometry in front of it was never drawn reads as the draw that painted the pixel. The first
+  prefix bisect confidently returned draw 65 of 274 - and then hiding draw 65 alone changed
+  nothing, because the prefix result was an artefact. Hiding a window leaves the rest of the frame
+  intact, so "the pixel went away" means what it says.
+- **Let the frame settle before shooting it.** At 300 ms between setting the range and capturing,
+  the bisect converged neatly on a wrong answer; at 900 ms it is reproducible, and a repeat shot
+  of the same range is bit-identical. A screenshot that lags one change behind produces a
+  *monotone* sequence, which is what makes it convincing.
+
+One more trap, from the same session: **the sampler-state history in `render.state` reads "never
+set" for all seven while the live values are anything but.** Gunlok configures its samplers inside
+state blocks, and `ApplyOp` writes the shadow state without going through the recorder. Read the
+live column, or the per-draw `filt`/`addr` in the stage-configuration histogram.
+
+## 4.30 `GpuMaterial`: the frame is now an array of indices, and 274 draws are 29 surfaces
+
+The other half of §2's design. `GpuDrawRecord` moved the matrices and the lighting inputs into a
+per-frame array (§4.26); this moves the texture stages and the alpha test into a second one, and
+what is left in the push constants describes no draw at all.
+
+**Nothing changes on screen, and that is the claim being tested rather than an aside.** It is
+also the reason this section has a measurement in it: a refactor that "obviously" renders the
+same is exactly the kind that quietly does not.
+
+### What it is
+
+```c
+struct GpuMaterial {            // 48 bytes
+  uint stage0_texture, stage0_sampler, stage0_color, stage0_alpha;
+  uint stage1_texture, stage1_sampler, stage1_color, stage1_alpha;
+  uint stage_count, flags;      // flags: the alpha test, D3DCMPFUNC | ref << 8
+  uint pad0, pad1;
+};
+```
+
+```c
+struct Push {                   // 44 bytes of content, 48 of struct
+  ConstBufferPointer<Vertex>        vertices;
+  ConstBufferPointer<GpuDrawRecord> draws;
+  ConstBufferPointer<GpuLight>      lights;
+  ConstBufferPointer<GpuMaterial>   materials;
+  uint record, material, base_vertex;
+};
+```
+
+120 bytes before the draw record, 72 after it, **48 now**. Four addresses and three indices.
+
+Four decisions, in decreasing order of how much they constrain the rest:
+
+- **Interned in `SubmitDraw`, not in the capture layer**, which is where the `GpuDrawRecord` is
+  written. A record is per draw and only the capture layer knows the matrices; a material is
+  *shared*, and the table it is shared through belongs to the frame's draw list. `SubmitDraw` is
+  also the one place that sees every draw exactly once — the capture layer has three entry points
+  into a `DrawItem` and would have to remember to intern in all of them.
+- **The table lives in the frame's scratch and the intern map dies with it.** A material index is
+  only meaningful against the slice it was allocated from, so carrying one over from the previous
+  scene would name an entry the shader can no longer see. `ClearDraws` clears both, and it is now
+  called everywhere `Items.clear()` used to be — including the two early returns in `RecordDraws`,
+  which is the kind of place a second cleanup step gets forgotten.
+- **The slice holds `kMaxDrawsPerFrame` materials**, so the draw limit is the only one that can
+  bite — the same reasoning that sized the record slice. It makes `dropped_materials`
+  unreachable by capacity, which is what lets it mean "the scratch is unusable" instead of
+  "a busy frame". Measured peak on level02: **1 KB of 384**.
+- **Stages past `stage_count` are zeroed before the key is taken.** The shader never reads them,
+  so two draws differing only there are the same surface — and would not be if the dead words
+  went into the comparison. Zeroed rather than masked out of the comparator, because the table is
+  uploaded exactly as it is compared, which is also what makes `memcmp` a sound `operator<`.
+
+### The number that says it was worth building
+
+Level02, in level, under validation:
+
+```
+draws: 274 this frame / 279 peak
+materials: 29 this frame / 30 peak (0 dropped - must be 0)
+  ... plus 2304 KB draw records (peak 78 KB) + 448 KB lights (peak 18 KB) + 384 KB materials (peak 1 KB)
+```
+
+**274 draws are 29 distinct surfaces** — a 9.5× collapse, which is the whole argument for a table
+rather than a per-draw copy. It is not about bandwidth at these draw counts: it is that a second
+pass over the frame is a walk over the draw array with a different pipeline, and that only works
+if a draw is an *index* into shared state rather than a bundle of push constants only the
+recording loop knows how to rebuild.
+
+`render.draw_info` now prints the index, so §4.29's draw 65 reads `material 15` and is otherwise
+character for character what it was.
+
+### The material key is on the asset name now, and it predicts the table to within 2
+
+`MaterialKey` in the capture layer is the *statistic* that predicted this table's size, and it
+hashed the texture's **wrapper pointer** — an address the allocator happened to return, so the
+same material hashed differently on every launch and identically to a different material that
+reused a freed wrapper. It hashes the `.rim` path instead (§4.14), which is the identity a mod
+has to be able to write down; a texture with no cache record behind it still falls back to the
+pointer rather than collapsing every such texture into one material.
+
+The two counts do not agree exactly and should not: `render.report` peaks at **28 a frame** and
+`render.draws` at **30**, because `GpuMaterial` carries two things the key does not — the sampler
+index and `D3DTSS_TEXCOORDINDEX`, both packed into the stage words. The key is strictly coarser,
+so it is a lower bound, and 28 against 30 is it being a good one.
+
+### How "changes nothing" was checked
+
+`render.lighting` and `render.half_pixel` exist so a feature can be A/B'd inside one paused
+frame; a data-layout change has no such switch, so this is two launches — which §4.21 warns
+costs up to 8.06/255 of drift, and §4.28 answers with "pin the frame". Level02, paused with
+`screen.toggle_pause()`, camera set explicitly to the same five values, the build before and the
+build after:
+
+| region | MAD | pixels |
+|---|---:|---:|
+| above the units and the text | **0.0000** | 138,160 |
+| the HUD panel | **0.0000** | 35,640 |
+| the big rock | **0.0000** | 25,600 |
+| floor right of the units | 0.0044 | 9 of 54,064 differ |
+| whole frame | 2.2020 | |
+
+**Bit-identical**, on a comparison whose floor is 0.094 — better than the floor, because the two
+frames are the *same* frame rather than two settles of it. The whole-frame 2.20 is the objectives
+text at a different point in its fade and the two units at a different animation phase, which the
+amplified difference image shows and nothing else in it does; the nine floor pixels are those
+units' shadow edge. That is the game drifting between launches, which is the thing §4.21 is about,
+and it is why the regions are the reading and the frame number is not.
+
+Also unchanged: `render.verify_textures()` 292/292, `render.verify_buffers()` 2953/2953,
+`render.validation` empty, every "must be 0" counter 0, 9 pipelines.
+
+## 4.31 `D3DRS_SHADEMODE`: implemented, and every flat-shaded draw in the game is a shadow
+
+§4.29 found this while looking for something else and left it as the one state in its table that
+was definitely unimplemented *here* rather than a question about d3d8to9: the game sets
+`D3DSHADE_FLAT` as well as `D3DSHADE_GOURAUD`, and nothing in the shader was `nointerpolation`,
+so every flat-shaded draw was Gouraud-interpolated. How much of the frame that touched was
+unknown.
+
+**It is 2% of the draws, all of it the stencil shadow, and it changes no pixel in any scene
+measured.** The state is honoured now anyway, because "the game sets it and we ignore it" is not
+a defensible place to leave something — but the number is the point of the section, and it was
+worth getting before deciding how to implement.
+
+### Measure first: which draws, not how many
+
+Counting flat-shaded draws would have said 2% and stopped there. `D3DRS_SHADEMODE` went into
+`kPipelineStates` instead, so `render.state`'s pipeline histogram splits on it and says *which*
+draws they are. Level02, whole session (`shade` 1 = FLAT, 2 = GOURAUD):
+
+```
+        fvf atest blend src dst   z zwrite cull cwrite  sten func pass zfail shade
+ 836  0x112     0     1   1   2   1      0    1     15     1    8    5     1     1
+ 836  0x112     0     1   1   2   1      0    1     15     1    8    7     1     1
+ 836  0x1c4     0     1   5   6   0      0    1     15     1    4    2     1     1
+```
+
+Three configurations, in equal counts, and all three are the shadow-volume system §4.27 put the
+stencil buffer in for:
+
+- the first two are the **volume passes** — `INCRSAT` and `DECRSAT` on stencil pass, and
+  `SRCBLEND = ZERO, DESTBLEND = ONE`, which is `dst = dst`. They write no colour at all, so what
+  the fragment shader computes for them is discarded whatever the shade mode.
+- the third is `0x1c4`, pre-transformed, depth off, `LESSEQUAL`/`ZERO` on the stencil — the
+  **50%-black full-screen quad**. Its four vertices carry one colour, and flat and Gouraud agree
+  wherever the inputs agree.
+
+Level01 reproduces it exactly: the same three configurations, the same equal counts (4106 each),
+and no fourth. **No other draw in either level is flat-shaded**, and the front-end menu has none
+at all.
+
+So the prediction was that implementing it correctly would change nothing on screen — which is a
+prediction worth *testing* rather than acting on, because §4.19, §4.20 and §4.25 are each a case
+where the obvious reading of a state was wrong.
+
+### How it is implemented, and why not as pipeline state
+
+`D3DRS_SHADEMODE` is rasteriser state in D3D and an *interpolation qualifier* in Vulkan, so the
+natural translation is a second pipeline per shading mode. That would double the pipeline count
+across every blend/depth/cull/stencil combination — 11 becomes 22 on level01 — to serve 2% of the
+draws.
+
+Instead the vertex shader emits both colours twice, once interpolated and once `nointerpolation`,
+and the fragment shader picks:
+
+```hlsl
+struct VertexOut {
+    float4 position : SV_Position;
+    float4 color : COLOR;
+    float4 specular : COLOR1;
+    nointerpolation float4 color_flat : COLOR2;
+    nointerpolation float4 specular_flat : COLOR3;
+    float4 uv : TEXCOORD0;
+};
+```
+
+Two varyings against a doubled pipeline table. `shading` rides in `GpuMaterial`, in a word that
+was padding — 10 useful words round up to 48 bytes either way — so it costs nothing there either.
+
+Three things that would each have been a defect:
+
+- **The provoking vertex already agrees, and it had to be checked.** D3D flat-shades a primitive
+  with the colour of its **first** vertex; Vulkan's default convention is first-vertex too, so
+  `nointerpolation` needs no `VK_EXT_provoking_vertex` and no state to go with it. Had they
+  disagreed, a triangle strip would have taken its colour from the wrong end and looked like an
+  off-by-one in the geometry rather than like a convention mismatch.
+- **Only the two colours are flattened.** D3D flat shading does not affect texture coordinates,
+  so `uv` stays interpolated. Flattening it as well would have made every flat-shaded draw sample
+  one texel.
+- **The mirroring happens at a wrapper, not at each `return`.** `vertex_main`'s body has two
+  exits, and a third would be easy to add; it is now `shade_vertex`, and the entry point copies
+  `color` into `color_flat` once. A path that forgot would have flat-shaded black.
+
+### The measurement
+
+`render.shade_mode` is the run-time toggle, so this is the sharp comparison the plan prefers:
+pause, shoot, toggle, shoot — same frame, 0.000 floor, and the difference image is exactly the
+pixels the feature moved.
+
+| scene | flat draws | MAD | pixels differing |
+|---|---:|---:|---:|
+| level02, in level, paused | 1,422 | **0.000000** | 0 of 293,904 |
+| level01, in level, paused, past the cutscene | 6,360 | **0.000000** | 0 of 293,904 |
+| the front-end menu | 0 | 0.000000 | 0 (vacuous — nothing to toggle) |
+
+Zero, to the bit, in both scenes that have flat-shaded draws — which is what the histogram
+predicted and is now measured rather than argued. The material table notices the difference even
+though the frame does not: 29 materials with `SHADEMODE` honoured against 28 with it ignored, so
+exactly one surface splits on it, which is the shadow quad.
+
+**This does not generalise past what was measured.** Two levels and the menu are not fifteen
+levels, a cutscene camera, or a multiplayer game; `flat_shaded_draws` in `render.draws` is what
+would show a level using it for something else, and the histogram is what would say what.
+
+### A number in the plan was wrong, and it is not this change
+
+Level01 reads **3468/3469** on `render.verify_buffers()` in level, stably across repeated calls,
+where the plan's steady-state block claims 3469/3469. It is **pre-existing**: the same run on the
+pre-§4.30 build reads the same 3468/3469. The odd buffer is a 96 KB `0x1c4` (pre-transformed)
+vertex buffer with 6,207 unlocks whose bytes print identically to what was wanted — the verifier
+reading a buffer the game is refilling, which the plan already documents for `fx.snow(true)` and
+which turns out not to need snow. Level02 is unaffected at 2953/2953.
+
+The rule that was almost broken here is worth stating: **a number that disagrees with the notes
+is a measurement to repeat on the previous build, not a regression to assume or a note to
+"fix".** Checking cost one rebuild and one launch, and the alternative was either an
+investigation into a defect that is not there or a plan quietly claiming a clean reading it never
+had.
+
+## 4.32 The missing glows: a whole draw entry point, and six viewport depth slices
+
+Reported from play: the sky looks missing, and translucent things - fire especially - look wrong.
+Two real defects, both found, both fixed, and **the second one is not fully closed**. The route to
+them is worth as much as the fixes, because the first one was invisible to every counter in this
+renderer *by construction*.
+
+### Getting a comparison that means anything cost more than the diagnosis
+
+Three scenes were measured before one of them reproduced anything, and two of those three were
+wasted on a methodology error worth recording.
+
+**A fixed settle is not a controlled comparison on any level with a camera sequence.** The two
+renderers run at different frame rates, so the same wall-clock delay lands at a different point in
+the intro sweep. junkyard at 20 s gave a close-up under Vulkan and a wide shot under d3d9 - with
+the camera globals reading *identically* a minute later, because both eventually settle to the
+same place. The frames were from different moments, not from different renderers.
+
+Worse, that scene's world state diverges too: 173 actors against 304. Its pipeline histogram
+showed one configuration present in d3d9 and absent in Vulkan, which looked exactly like a
+renderer defect and was a level that had got further along.
+
+What works is **polling the camera until it stops moving**, which is renderer-independent by
+construction, and then checking the actor count matches. On level03 both renderers settle to the
+same five camera values *and* 301 actors, and that frame reproduced the defect immediately: two
+bright glow sprites in d3d9, nothing at all in Vulkan. `shoot-settled.ps1` is the harness.
+
+**level02's junk piles are not the symptom.** They match d3d9 to 0.1 mean RGB per region, and six
+consecutive unpaused frames show no flicker. What the report describes is the *effect* layers, and
+level02's opening has none in view.
+
+### Defect one: `DrawPrimitive` was never wired up
+
+`CaptureDevice::DrawPrimitive` counted the call, forwarded it to d3d8to9, and returned. It never
+built a `DrawItem`. One of D3D8's four draw entry points did nothing at all.
+
+**Every "must be 0" counter read zero throughout**, and that is the part to keep. They all count
+*reasons a draw was rejected* - a topology we skip, a buffer with no arena slot, an FVF the
+converter refuses. A draw that is never offered has no reason to be rejected, so a whole entry
+point went missing without moving a single number. `render.draws` reported `0 topology, 0 no arena
+slot, 0 no transform, 0 unconvertible, 0 scratch full, 0 no record` on a frame that was missing
+draws.
+
+The guard added with the fix is the one reading that compares against **what the game did** rather
+than against what the renderer chose:
+
+```
+draw calls seen: 718776   submitted: 718776   unaccounted for: 0 (must be 0)
+```
+
+`seen` counts every call reaching either emitter; `submitted` counts every `DrawItem` built; the
+difference has to be the named skips. Nothing had ever reconciled the two.
+
+The fix folds both buffered paths into one `EmitDraw` with an `indexed` flag. Two things it has to
+get right: a non-indexed draw adds `StartVertex` where an indexed one adds D3D's
+`BaseVertexIndex`, and **the index buffer is only required to be resident for an indexed draw** -
+`DrawPrimitive` reads none, and the game legitimately leaves a stale one bound, so requiring it
+would drop every non-indexed draw whose last `SetIndices` named a buffer this layer never wrapped.
+
+### Defect two: Gunlok uses six viewport depth slices and the renderer hardcoded one
+
+`D3DVIEWPORT8::MinZ` and `MaxZ` were recorded nowhere, and `VkViewport` was built with
+`0.0f, 1.0f`. Measured on level03:
+
+```
+viewport: 640x480  depth range 0.0199..0.0399   distinct ranges ever set: 6
+    0.0000 .. 0.0199
+    0.0199 .. 0.0399
+    0.0299 .. 0.0399
+    0.0399 .. 0.0599
+    0.1000 .. 1.0000
+    1.0000 .. 1.0000
+```
+
+**Not one of them is the default.** This is depth-range slicing: the world is confined to
+`0.1..1.0` and the effect layers get thin slices in front of it, so an overlay is in front of the
+world *by construction* rather than by switching the depth test off. `1.0000 .. 1.0000` is a
+backdrop pinned to the far plane, which is what a sky pass looks like.
+
+Collapsing all of that to `0..1` puts world geometry at depths D3D would never have given it, so
+it occludes the layers that were supposed to sit in front. It is now per-`DrawItem` and issued
+with `vkCmdSetViewport` when it changes - dynamic state, so it costs no pipeline. Level03 changes
+slice 16,969 times a session, level02 5,184; a level reading 0 would be one where the engine never
+layers anything.
+
+The instrument that found it is worth naming: **`render.draw_range = [i, i]` renders one draw
+against an empty frame.** Draw 351 painted the three glow blobs perfectly in isolation and
+contributed nothing to the full frame, which converts "the effect is missing" into "the effect is
+drawn and then lost", and the only states that can do that are depth, stencil and blend.
+
+### What is fixed, what is not
+
+Level03, same camera, same 301 actors, against d3d9:
+
+| | whole-frame MAD |
+|---|---:|
+| before | 5.667 |
+| after `DrawPrimitive` | 5.623 |
+| after the depth slices | **5.540** |
+
+A glow now appears where there was nothing. **It is still much dimmer than d3d9's, and the second
+of the three blobs is still missing** - so the depth range was necessary and is not sufficient.
+Whatever is left is in the same neighbourhood: the effect layers are drawn, they are no longer
+wholly occluded, and something still costs them most of their contribution. The next reading to
+take is `render.draw_range` on that draw against `render.draw_hide` of everything after it, which
+separates "blended away" from "still partly occluded".
+
+Level02 is unaffected except for the better: 2.803 to 2.704, with validation clean, 292/292
+textures and the pre-existing 2952/2953 buffers (§4.31).
+
+### `render.draw_vertices`
+
+Built for this and kept. Set it to a draw index, let a frame pass, read it back for the converted
+vertices and indices that draw was actually handed:
+
+```
+draw 351: indexed, 354 indices from scratch, base_vertex 23004 first_index 1093285
+  indices: 0 1 2 0 2 3 4 5 6 4 6 7 ...
+     0  pos    564.0000     37.2500      0.0299  w  33.33333  colour 0xffc6c6c6  uv 0.6855 0.0917
+```
+
+It answers the question no other instrument here could: `render.draws` counts what was skipped,
+`render.state` histograms what was configured, `verify_buffers` proves the arena holds what D3D
+held, and `draw_range` shows what a draw painted - but when a draw paints the wrong *shape*, none
+of them says why. It follows the draw's own indices rather than reading the head of the slice,
+because the first vertex is usually fine and the degenerate ones are further in. User-pointer
+draws only: their vertices are in the host-visible scratch, where a buffered draw's are in an
+arena that is deliberately never mapped.
+
+It is also what showed that the one draw sampling `bitmaps\particles.rim` was the **HUD** rather
+than a particle system - the atlas is shared - which stopped an hour of chasing the wrong draw.
+
+## 4.33 The ground truth was one LoadLibrary away the whole time
+
+Every comparison in this file up to §4.32 was against **d3d8to9**, and §4.28 and §4.29 had each
+already caught that reference being wrong - the HUD's two bright columns belong in the game and
+d3d9 drops them. The plan says in as many words that d3d9 "is not an oracle". What nobody
+checked is whether the *actual* oracle was available.
+
+It is. **Windows 10 still ships a 32-bit `d3d8.dll` in SysWOW64**, 715 KB of the original
+runtime, and the game will run on it.
+
+`GKPLUS_RENDERER=d3d8` now forwards there instead of to d3d8to9. The whole harness survives -
+the capture layer still wraps the device, so the REPL, `levels.start`, the camera and every
+`render.*` counter work exactly as they do in the other two modes. That is the point: a
+reference you cannot drive is a reference you cannot align, and aligning the frame is most of
+the work in any of these comparisons.
+
+Two things it takes to get there, both of which bit on the first launch:
+
+- **Load it by full system path.** GkPlus *is* `d3d8.dll`, sitting next to `gl.exe`, so
+  `LoadLibraryA("d3d8.dll")` resolves to the module already loaded - this one - and
+  `Direct3DCreate8` recurses into itself. `GetSystemDirectoryA` in a 32-bit process returns
+  SysWOW64, which is where the 32-bit copy lives.
+- **There is no D3D9 device behind it, and five call sites assumed there was.**
+  `ResolveD3D9Device` ends in `static_cast<Direct3DDevice8 *>(...)->GetProxyInterface()`, which
+  on a genuine `IDirect3DDevice8` reads a field d3d8to9's class has and the real one does not.
+  It crashed inside `ImGui_ImplDX9_Init` on the first run - `llvm-symbolizer` on the RVA out of
+  the WER log named it in one step. The first fix gated `Init` and missed `NewFrame`; the five
+  sites now share one `Dx9Overlay()` predicate rather than each spelling the test out. The
+  overlay is simply unavailable in this mode, which is correct for something whose only job is
+  to be the reference in an A/B.
+
+### What it says about thirty sections of measurement
+
+Level02, settled and paused, all three renderers at 178 actors and the same camera:
+
+| | whole frame | the junk-pile region |
+|---|---:|---:|
+| **d3d8 vs d3d9** | **0.017** | **0.008** |
+| d3d8 vs vulkan | 2.593 | 2.954 |
+| d3d9 vs vulkan | 2.594 | 2.959 |
+
+**d3d8to9 reproduces the original to 0.017/255 on this frame.** So the d3d9 reference was sound
+for everything measured through it here, and the residual is now a number against the real thing
+rather than against a translation layer: **2.59**, where the plan has been quoting 2.68 against
+d3d9.
+
+That is a good outcome and it is not the same as "d3d9 is fine". It is one frame of one level.
+§4.28's HUD columns are still a case where d3d9 is the one that is wrong, and this mode is how
+that gets settled too - it was never previously possible.
+
+**The rule this replaces**: "compare against d3d9, and treat a disagreement as a question about
+which side is right." The rule now is **compare against d3d8**, and use d3d9 only as the second
+opinion that says whether a difference is in the translation layer or in the game's own
+behaviour. Three-way is cheap - it is one more launch of the same script.
+
+### It did reproduce the report, and "mean RGB per region" is what hid it
+
+The junk-pile decal was called a match here because its **mean RGB agrees to 0.1** across all
+three renderers. That was the wrong reading, and the error is worth more than the section it is
+in: the reported draw is byte-for-byte identical between the two machines (draw 176, same states,
+same textures, same frame), so the report was always about a difference this measurement was
+declaring absent.
+
+The number that says so was on the same line the whole time. In that region Vulkan differs from
+d3d8 by **2.95** where d3d8 and d3d9 differ by **0.008** - a factor of 370. The mean agreed
+because the errors *balance*: 4,039 pixels brighter and 3,735 darker, texel-level speckle spread
+over the whole decal.
+
+**The plan's advice - "compare mean RGB per region, not whole-frame MAD" (§4.25) - is about
+sub-pixel misalignment noise, and applying it to a real difference cancels it out.** Mean RGB
+answers "is this region the right colour"; it cannot see a per-texel difference with zero bias.
+Read both, and read them against a floor: with a real reference the floor is 0.000-0.015, so
+anything above ~0.1 is signal. Against d3d9 there was no such floor to compare with, which is
+part of why this survived.
+
+### The signature: it scales with minification
+
+Same frame, per region, against real d3d8:
+
+| region | d3d8 vs d3d9 | d3d8 vs vulkan |
+|---|---:|---:|
+| junk pile (oblique, minified) | 0.008 | **2.954** |
+| floor (oblique, minified) | 0.015 | 2.723 |
+| big rock (near, large texels) | 0.000 | 2.292 |
+| HUD panel (2D, 1:1) | 0.000 | 1.112 |
+| flat cavern wall | 0.000 | 0.386 |
+
+The error grows with how much texture detail is crammed into a pixel, and is near zero where a
+surface is flat-on and unminified. That is a **texture LOD / filtering** signature, not blending,
+not a missing stage, and not the material: `render.state` confirms the sampler mapping is right
+(no anisotropy, matching D3D8's default of 1; no LOD bias, which the engine never sets; mip mode
+mapped from `D3DTSS_MIPFILTER`), and `verify_textures` says the pixels themselves are correct.
+
+So the junk pile is the worst region of the frame rather than a defect of its own, which is
+exactly why it is the thing a player points at.
+
+**§4.28's half-pixel origin is confirmed correct against the original**, which was never possible
+before: on the pile, 2.90 with it and 5.07 without. So the remaining error is not the pixel-centre
+convention - that fix is right and this is on top of it.
+
+### One caution about the numbers above
+
+The three-way table is one launch per renderer. A second Vulkan launch of the same scene put the
+pile at 2.90 and the *floor* at 4.42 against the same d3d8 shot, where the first read 2.72 - the
+units animate and their shadows move, so region MADs carry a per-launch spread of order 1. The
+ranking is stable and the individual figures are not; `screen.toggle_pause()` pins a frame within
+one launch but nothing pins the animation phase across launches. Compare features with a run-time
+toggle inside one launch (0.000 floor) and use cross-launch numbers only for the shape.
+
+## 4.34 The LOD probe: mip selection is not it
+
+§4.33 left the residual looking like a texture-LOD problem, because it scales with minification.
+`render.force_lod` was built to test that: it replaces the computed LOD with an explicit one in
+every texture fetch, so both sides can be pinned to the same mip level. **The answer is no**, and
+a clean negative is worth having - it removes the hypothesis the plan was about to spend a
+session on.
+
+### The readings
+
+Level02, settled and paused at 178 actors, on the junk-pile region the report named. The four
+Vulkan shots are one launch, so they are mutually at a 0.000 floor; the d3d8 pair is two more.
+
+```
+does forcing mip 0 on BOTH sides make them agree?
+  baseline: vulkan normal vs d3d8 normal      2.918
+  probe:    vulkan LOD0   vs d3d8 NO_MIPMAP   3.341     <- WORSE, not converged
+
+which forced level best matches d3d8's own choice?
+  force_lod = -1 (automatic)   2.918           <- the automatic one wins
+  force_lod = 0                3.456
+  force_lod = 1                3.192
+  force_lod = 2                3.046
+
+what is mipmapping even worth here?
+  d3d8 normal vs d3d8 NO_MIPMAP               0.809
+```
+
+Three things fall out, in order of how much they close off:
+
+- **Pinning both sides to level 0 does not converge them.** If the difference were which mip is
+  chosen, removing the choice would remove the difference. It goes *up*, to 3.34.
+- **No forced level beats the automatic one.** Our LOD selection is already the closest match
+  available, so it is not biased toward blur or sharpness.
+- **Mipmapping is worth 0.809 on that region in the original.** It is arithmetically incapable of
+  explaining a 2.9 difference, which the first two readings show independently.
+
+`GKPLUS_NO_MIPMAP=1` is the reference half of this and it only touches the *forwarded* call, which
+is exactly what makes it usable under `GKPLUS_RENDERER=d3d8`: the real runtime samples level 0
+while our shadow state keeps the true value.
+
+### What it points at instead
+
+Same mip, same texels (`verify_textures` is clean), different result - so the sampling *position*
+or the filter weights. A cheap discriminator separates those from a colour-side error, because
+stage 0 here is `MODULATE(TEXTURE, DIFFUSE)`: an error in DIFFUSE is multiplied by the texture and
+therefore scales with texture **brightness**, while an error in where the texture is sampled
+scales with the local texture **gradient**.
+
+```
+correlation of |difference| with d3d8 brightness        0.254
+correlation of |difference| with d3d8 local gradient    0.389
+```
+
+Both are modest, and the gradient wins - which reads as a **sub-texel sampling offset**, on top of
+a half-pixel viewport origin that §4.33 confirmed is right against the original (2.90 with it,
+5.07 without). That is suggestive rather than settled: 0.39 against 0.25 is a lean, not a proof,
+and the honest next step is a probe that does not depend on scene statistics at all - one textured
+quad at a known scale, with known UVs, rendered by both and compared texel by texel, which removes
+lighting, the lightmap stage and the alpha test from the picture in one move.
+
+Also worth keeping: **the minification correlation from §4.33 does not by itself mean LOD.** The
+regions that minify most in this scene are also the ones with the most texture contrast, and both
+a sampling error and a colour error grow with contrast. That is why the ranking looked like an
+answer and was not one.
+
+## 4.35 The quad probe: not the mips, not the alignment, and the probe itself is degenerate
+
+§4.34 ruled out mip selection and left a lean toward a sub-texel sampling offset. This is the
+probe that does not depend on scene statistics - and it kills that lean too.
+
+### What it is
+
+`render.probe("<texture substring>", scale, mipmap)` draws **one textured quad**, pre-transformed
+to exact screen pixels, at the end of the frame, **through the capture device's own methods**.
+That last part is the whole design: the states and the draw go down both paths at once, so
+`d3d8`, `d3d9` and `vulkan` are each handed the same geometry, the same texture and the same stage
+setup, with nothing of the scene left in the way.
+
+Everything that could explain a difference in a *scene* is removed rather than controlled for:
+
+- no lighting, no fog, no blending, no alpha test, no depth, no stencil;
+- **one stage**, the second explicitly `D3DTOP_DISABLE`, so the lightmap is out of the picture;
+- `SELECTARG1(TEXTURE)` for colour and alpha, so the vertex colour cannot contribute;
+- `units\alpha junk.rim`, which is the reported decal's own texture and has **exactly one mip
+  level** - so mip selection is not merely ruled out, it does not exist.
+
+### The readings
+
+Level02, settled and paused, the quad at three scales:
+
+| scale | quad | minification | d3d8 vs vulkan |
+|---|---:|---:|---:|
+| 0.25 | 256 px | 4x | 13.13 |
+| 0.5 | 512 px | 2x | 7.83 |
+| 1.0 | 1024 px | **none, 1:1** | 3.92 |
+
+**A 1:1 quad of a single-mip texture, with every other input removed, still differs.** That is
+the finding: whatever this is, it is inside texture sampling and nothing else.
+
+Two things about how the difference is distributed, both from the 1:1 case:
+
+- **30.7% of pixels are bit-exact**, and they are the flat regions - black, and solid colour
+  blocks. Every difference sits on a texture *edge*.
+- The histogram falls away fast: 74.7% under 8, 17.3% in 8-15, 5% in 16-23.
+
+### It is not an alignment offset, which corrects §4.34
+
+§4.28's technique - resample one shot against the other and find where the difference minimises -
+applied to the 1:1 quad, over a grid of sub-pixel shifts:
+
+```
+  dy=-0.25   7.217  5.828  4.785  4.349  4.905  6.036  7.468
+  dy=+0.00   6.831  5.384  4.290  3.722  4.421  5.613  7.110
+  dy=+0.25   7.294  5.924  4.898  4.470  5.011  6.139  7.570
+             dx = -0.75 .. +0.75 in 0.25 steps
+```
+
+**The minimum is at (0, 0)** and the surface is convex around it. The two images are already
+aligned; no sub-pixel shift improves them. So §4.34's lean - gradient correlation over brightness
+correlation, read as a sampling offset - was the wrong reading. A gradient-correlated difference
+means "the disagreement is at edges", which an offset produces and so does anything else that
+resolves an edge differently.
+
+The 4-bit-to-8-bit channel expansion was the other candidate the histogram suggested, since
+A4R4G4B4 is CPU-expanded here (§4.13) and an expansion error would cap near 15. It is not that
+either: the code does `r | (r << 4)`, which is the correct replication, and the observed maximum
+is 122.
+
+### The probe is degenerate at 1:1, and that is the next thing to fix
+
+Placed at integer screen coordinates with UV exactly 0..1, a 1:1 quad puts **every sample on a
+texel boundary** - the corner where four texels meet and bilinear weights them equally. That is
+the worst case for the comparison: it is precisely where a hair of floating-point difference
+decides which texels dominate, and it is not where real geometry samples.
+
+So the 3.72 is an upper bound taken at the most adversarial point, and the sweep above is
+measuring alignment of an image built from those coin-flips. The probe should offer a half-pixel
+quad offset so samples land at texel *centres*, where bilinear returns the texel exactly and any
+remaining difference is unambiguous. That is one parameter and it is the next step, before any
+more theorising about filters.
+
+**What the probe has already earned**, whatever that shows: the residual is inside texture
+sampling, it is not the mip level, it is not the alignment, it is not the channel expansion, and
+it is not lighting, the lightmap, the alpha test or the vertex colour - because none of those is
+switched on in the frame that still differs.
+
+## 4.36 It looks like the A4R4G4B4 CPU expansion — SUPERSEDED by §4.37
+
+**Read §4.37 first.** The correlation below is real and reproduces; the conclusion drawn from it
+is wrong. A4R4G4B4 is what made the defect *visible*, not what caused it — a 4-bit channel has 16
+levels, so a 2% resample obviously falls off the ladder where an 8-bit one merely blurs. The
+section is kept because the two negatives in it (the texel-centre offset, and alpha) still stand,
+and because "a variable that correlates perfectly across two samples is not thereby the cause" is
+the lesson it paid for.
+
+The quad probe gained two parameters and answered the question. Both additions came from
+hypotheses that turned out to be wrong, which is the fastest either of them could have been
+settled.
+
+### Two clean negatives first
+
+**The texel-centre offset changes nothing.** §4.35 argued that a 1:1 quad at integer coordinates
+samples texel *corners*, the worst case for bilinear, and that the 3.92 was therefore inflated.
+Sweeping the quad's position across a texel:
+
+| offset | 0 | 0.25 | 0.5 | 0.75 |
+|---|---:|---:|---:|---:|
+| d3d8 vs vulkan | 3.72 | 3.50 | 4.00 | 3.56 |
+
+Flat. Where in the texel the sample lands is not what differs, so §4.35's caveat was real and not
+the cause.
+
+**It is not a per-vertex alpha, and not alpha at all.** Rendering the texture's alpha channel as
+greyscale - `D3DTA_ALPHAREPLICATE` on the colour argument, which is the only way to see alpha in a
+screenshot - gives **100.0% bit-exact, MAD 0.0000**. The two renderers agree on that texture's
+alpha perfectly.
+
+The negative is worth more than it looks, because of *how* it fails to discriminate: that
+texture's alpha is uniformly 255, so any filtering returns 255. What it does prove is that the
+whole path delivers a constant exactly. It also removes blending, the alpha test and vertex alpha
+in one reading.
+
+### The measurement that lands it
+
+Same quad, same states, same offset, same 1:1 scale, same single-level sampling - **only the
+texture's format differs**:
+
+| texture | D3DFORMAT | how it reaches the GPU | d3d8 vs vulkan | bit-exact |
+|---|---|---|---:|---:|
+| `unitslpha junk.rim` | 26 = A4R4G4B4 | **expanded to R8G8B8A8 on the CPU** | **4.00** | 31.6% |
+| `Units\Custom Screen bg 1k 01.RIM` | `DXT1` | uploaded as blocks, decoded by the GPU | **0.60** | 64.0% |
+
+**6.7x, and the only variable is which upload path the texture took.** The one format this
+renderer does not hand to the hardware as-is is the one that differs.
+
+### Why the junk pile
+
+Level02 holds 53 images: **41 DXT1, 6 DXT3, 5 A4R4G4B4** and one other. So the CPU-expanded path
+is under a tenth of the textures - and `unitslpha junk.rim`, stage 0 of draw 176, the decal in
+the report, is one of the five.
+
+That is the whole story of why a player points at that object: it is not that decals are wrong, or
+that translucency is wrong, or that oblique surfaces are wrong. It is that this particular surface
+is drawn from one of the few textures that goes through an expansion the hardware would otherwise
+have done itself. §4.33's "scales with minification" and §4.34's gradient correlation were both
+reading the *texture's* character rather than the renderer's behaviour.
+
+### What to do about it
+
+§4.13 chose the CPU expansion deliberately: `VK_FORMAT_A4R4G4B4_UNORM_PACK16` is optional even in
+Vulkan 1.3, gated on the `formatA4R4G4B4` feature, so mapping it natively means a per-device
+support matrix. That was the right call when the only cost was 112 MB of image memory. There is
+now a correctness cost as well, and the trade changes.
+
+Two routes, and the first is cheaper to try:
+
+- **Find the expansion D3D8 actually performs and match it.** Ours is `v | (v << 4)`, the
+  spec-correct replication. The observed bias is not the shape a naive `v << 4` on either side
+  would give - the renderer comes out *darker* in the midtones (-6.4 at luma 128-159) and slightly
+  brighter at the bottom, with the ends converging - so the difference is more likely to be in
+  where the filtering happens than in the endpoints. A readback of one expanded image against what
+  the reference samples would settle it, and `render.probe` on a flat two-texel gradient is the
+  minimal case.
+- **Map it natively behind a feature check**, falling back to the expansion where the device says
+  no. That is the per-device matrix §4.13 avoided, and it also recovers the memory.
+
+Not yet measured: whether the other four A4R4G4B4 textures are as visible, and what the remaining
+**0.60** on the DXT1 quad is. That floor is small but it is not the 0.008 that d3d8-against-d3d9
+manages, so something else is still there underneath.
+
+## 4.37 It is not the expansion: the game renders 640x480 into a 628x468 window
+
+Going after the A4R4G4B4 expansion found something the expansion is innocent of, and the
+measurement that did it is one line of arithmetic on the probe's output rather than anything
+about formats.
+
+### The reading that reframes it
+
+Count the *distinct values* in the 1:1 quad rather than the difference between the two images:
+
+| | distinct R values | multiples of 17 |
+|---|---:|---:|
+| d3d8 | **16** | **100.0%** |
+| vulkan | 256 | 38.6% |
+
+Sixteen values, every one a multiple of 17, is what a 4-bit channel replicated to 8 bits looks
+like **with no filtering applied at all** - each pixel is one exact texel. That is what the
+original produces. This renderer produces a continuum, so it is blending between texels
+everywhere.
+
+So the expansion arithmetic was never the problem: `v | (v << 4)` is right, and the reference
+lands on exactly the values it produces. What differs is that our samples are not on texel
+centres - and §4.35's offset sweep had already shown no *translation* fixes that, which leaves a
+**scale**.
+
+### The cause
+
+```
+viewport: 640x480          <- what the game set, and what BuildMvp turns pixels into clip with
+swapchain: 628x468         <- the window's client area, and what the Vulkan viewport covered
+```
+
+Gunlok renders into a **640x480** backbuffer. The window's client area is **628x468**. A
+pre-transformed draw's pixels-to-clip matrix is built from the D3D viewport, so a vertex at x=640
+maps to NDC +1 - and the Vulkan viewport then mapped NDC +1 onto pixel 628. **Every 2D draw was
+scaled by 628/640 during rasterisation**, which resamples the texture and is why no sample landed
+on a texel.
+
+`unitslpha junk.rim` being A4R4G4B4 is what made it *visible*: a 4-bit channel has 16 levels,
+so blending two neighbours produces values that are obviously not on the ladder. A DXT1 texture
+resampled by 2% differs too - that is the 0.60 floor §4.36 measured and could not explain - it
+just does not announce itself, because 8-bit channels have no ladder to fall off.
+
+**§4.36's conclusion was wrong**, and the way it was wrong is worth keeping: A4R4G4B4 correlated
+perfectly with the defect across two textures, and the correlation was real. It was not the cause
+but the *contrast agent*.
+
+### Why the obvious fix is not the fix
+
+Sizing the Vulkan viewport from the D3D viewport instead of the swapchain makes the probe exact -
+**16 distinct values, 100% multiples of 17**, matching the original texel for texel. It also makes
+the frame much worse:
+
+| | before | viewport = 640x480 |
+|---|---:|---:|
+| whole frame | 2.593 | **13.066** |
+| junk pile | 2.954 | 13.825 |
+| HUD panel | 1.112 | 7.901 |
+
+Because D3D8's windowed `Present` **stretches** the 640x480 backbuffer into the 628x468 client,
+and a 640x480 Vulkan viewport on a 628x468 swapchain **clips** instead. Right sampling, wrong
+framing. The experiment is reverted.
+
+The faithful shape is what the original does: **rasterise at the D3D backbuffer size into an
+offscreen target, then scale that to the swapchain at present.** Then geometry lands on texels
+exactly as it does in the original, and the downscale happens once, at the end, on finished
+pixels - which is also where the original's 16 distinct values survive a 640→628 blit.
+
+That is a real change to `VkRenderer` - a colour target that is not a swapchain image, the depth
+buffer sized to match, the ImGui pass attached to the right one, and a final blit - so it is the
+next piece of work rather than a patch. It is worth it: it is the difference between every 2D
+pixel in the game being resampled and none of them being.
 
 ## 5. Fitting the project
 

@@ -537,7 +537,13 @@ void DrawFrame() {
 
   // The world first, then the overlay on top of it. Viewport and scissor are dynamic so the
   // pipeline survives a resize without being rebuilt.
-  VkViewport viewport = {0.0f, 0.0f, static_cast<float>(Extent.width),
+  //
+  // The origin is half a pixel, not zero: D3D8/9 sample a pixel at its integer coordinate where
+  // Vulkan samples at the centre, so without it every interpolated value - and therefore every
+  // texture fetch - is half a pixel out. See SetHalfPixel in VkDraw.h. Only the world pass
+  // takes it; ImGui's backend sets its own viewport for the overlay.
+  const float origin = ViewportOrigin();
+  VkViewport viewport = {origin, origin, static_cast<float>(Extent.width),
                          static_cast<float>(Extent.height), 0.0f, 1.0f};
   VkRect2D scissor = {{0, 0}, Extent};
   vkCmdSetViewport(frame.cmd, 0, 1, &viewport);

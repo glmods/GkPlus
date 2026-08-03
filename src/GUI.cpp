@@ -60,6 +60,16 @@ IDirect3DDevice9 *GetDX9Device() {
   return d3d8::ResolveD3D9Device(*DirectXDevice);
 }
 
+// Whether the ImGui DX9 backend is the one drawing the overlay, which is neither of the two
+// modes that do not have a D3D9 device: Vulkan draws its own overlay on its own backend, and the
+// d3d8 passthrough has no D3D9 device at all because it forwards to Windows' own D3D8.
+//
+// One predicate rather than the test spelled out at each of the five sites - which is how the
+// first version of the passthrough crashed, having gated Init and missed NewFrame.
+bool Dx9Overlay() {
+  return !vulkan::RendererRequested() && !d3d8::PassthroughToSystemD3D8();
+}
+
 // --- keeping the game rendering while unfocused (GKPLUS_RENDER_UNFOCUSED) ----------------
 //
 // Gunlok renders and presents NOTHING while its window is inactive: RenderSceneAndPresent
@@ -107,7 +117,10 @@ int __stdcall HookedCreateDirect3D() {
     // Under GKPLUS_RENDERER=vulkan the overlay is drawn by src/VkRenderer.cpp on the
     // Vulkan backend instead. The ImGui context and the Win32 backend are still ours -
     // only the rendering half differs - so nothing else here changes.
-    if (!vulkan::RendererRequested()) {
+    // ... and under GKPLUS_RENDERER=d3d8 there is no D3D9 device at all, because the capture
+    // layer is forwarding to Windows' own D3D8. That mode exists to be the reference in an A/B,
+    // so it renders the game and not the overlay; the REPL is how it is driven anyway.
+    if (Dx9Overlay()) {
       ImGui_ImplDX9_Init(GetDX9Device());
       ImGui_ImplDX9_CreateDeviceObjects();
     }
@@ -118,7 +131,7 @@ int __stdcall HookedCreateDirect3D() {
 }
 
 void __stdcall HookedReleaseDirect3DDevice() {
-  if (!vulkan::RendererRequested()) {
+  if (Dx9Overlay()) {
     ImGui_ImplDX9_Shutdown();
   }
   ReleaseDirect3DDevice();
@@ -136,7 +149,7 @@ void __stdcall HookedPresentScene() {
   // In Vulkan mode the overlay is built and recorded inside DrawFrame, which runs from
   // CaptureDevice::Present further down this same call. Doing it here as well would open a
   // second ImGui frame per frame.
-  if (!*DirectXDevice || !ShowGUI || vulkan::RendererRequested()) {
+  if (!*DirectXDevice || !ShowGUI || !Dx9Overlay()) {
     return PresentScene();
   }
   ImGui_ImplDX9_NewFrame();
@@ -157,7 +170,7 @@ void __stdcall HookedPresentScene() {
 }
 
 int __stdcall HookedResetD3D1() {
-  if (vulkan::RendererRequested()) {
+  if (!Dx9Overlay()) {
     return ResetD3D1();
   }
   ImGui_ImplDX9_InvalidateDeviceObjects();
@@ -167,7 +180,7 @@ int __stdcall HookedResetD3D1() {
 }
 
 int __fastcall HookedResetD3D2(int arg1, int arg2, int arg3, int arg4) {
-  if (vulkan::RendererRequested()) {
+  if (!Dx9Overlay()) {
     return ResetD3D2(arg1, arg2, arg3, arg4);
   }
   ImGui_ImplDX9_InvalidateDeviceObjects();

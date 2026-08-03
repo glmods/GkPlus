@@ -399,14 +399,19 @@ void Close(Connection &connection) {
 
 // Queues one line. Nothing is written here - Flush does that - so a client that
 // has stopped reading can never block a frame.
+//
+// The terminator is CRLF rather than LF so a line-oriented terminal client sees
+// each reply on its own line without a staircase. It costs a reader nothing: a
+// consumer splitting on '\n' is left with a trailing '\r', which JSON counts as
+// whitespace, so JSON.parse takes the line either way.
 void Queue(Connection &connection, const std::string &line) {
-  if (connection.outgoing.size() + line.size() + 1 > kMaxPendingBytes) {
+  if (connection.outgoing.size() + line.size() + 2 > kMaxPendingBytes) {
     js::Log("repl: dropping a client that is not reading its replies");
     Close(connection);
     return;
   }
   connection.outgoing += line;
-  connection.outgoing += '\n';
+  connection.outgoing += "\r\n";
 }
 
 void Flush(Connection &connection) {

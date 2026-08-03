@@ -141,10 +141,12 @@ struct ResourceStats {
   uint64_t scratch_index_bytes = 0;
   uint64_t scratch_draw_bytes = 0;
   uint64_t scratch_light_bytes = 0;
+  uint64_t scratch_material_bytes = 0;
   uint64_t scratch_vertices_peak = 0; // high-water within a single frame
   uint64_t scratch_indices_peak = 0;
   uint64_t scratch_draws_peak = 0;
   uint64_t scratch_lights_peak = 0;
+  uint64_t scratch_materials_peak = 0;
   // Allocations that did not fit in the frame's slice, so those draws were dropped. Must be 0;
   // if it ever is not, the slice is too small - the numbers to size it by are the two peaks.
   uint64_t scratch_exhausted = 0;
@@ -260,16 +262,18 @@ ScratchAlloc AllocateScratchVertices(uint32_t count);
 // the type it actually has rather than everything being widened.
 ScratchAlloc AllocateScratchIndices(uint32_t count, uint32_t stride);
 
-// The same allocator for the two arrays the shader reads per draw: one GpuDrawRecord each, and
-// the enabled lights each draw sees. They are per-frame data written by the capture layer at
-// draw time, exactly like the user-pointer vertices, so they take the same slices and rotate
-// with them - which is also what makes them safe to write while a previous frame is in flight.
+// The same allocator for the three arrays the shader reads per draw: one GpuDrawRecord each,
+// the enabled lights each draw sees, and the interned GpuMaterials. They are per-frame data
+// written at draw time, exactly like the user-pointer vertices, so they take the same slices and
+// rotate with them - which is also what makes them safe to write while a previous frame is in
+// flight.
 //
 // Sized in *records* rather than bytes, so the caller never spells the stride: getting that
 // wrong would address the array past its own elements, which is the failure §4.16 spent a
 // session on.
 ScratchAlloc AllocateScratchDraws(uint32_t count);
 ScratchAlloc AllocateScratchLights(uint32_t count);
+ScratchAlloc AllocateScratchMaterials(uint32_t count);
 
 // The scratch vertex buffer's shader-readable address, and the index scratch as a handle. The
 // address carries the current slice, so it is only valid for the scene now being recorded -
@@ -278,6 +282,19 @@ uint64_t ScratchVertexAddress();
 uint64_t ScratchIndexBuffer();
 uint64_t ScratchDrawAddress();
 uint64_t ScratchLightAddress();
+uint64_t ScratchMaterialAddress();
+
+// The host side of the same two slices, for reading back what a user-pointer draw was actually
+// given. Only the scratch has these: it is host-visible and mapped by design, where the arenas
+// are device-local and deliberately never mapped, so this is a diagnostic for the user-pointer
+// path and nothing else. Valid only for the scene now being recorded, exactly like the
+// addresses above.
+//
+// The vertex pointer already carries the current slice, so a DrawItem's `base_vertex` indexes it
+// directly. The index pointer does NOT - `first_index` is absolute from the buffer's start,
+// because the renderer binds the index buffer at offset 0 - so it is the buffer base.
+const void *ScratchVertexMapped();
+const void *ScratchIndexMappedBase();
 
 // The vertex arena as a shader-readable address, and the index arena as a VkBuffer handle.
 // Vertices are *pulled* by address (so a draw binds no vertex buffer at all) while indices

@@ -13,6 +13,7 @@
 #include "Core.h"
 #include "Shaders.gen.inc.h"
 #include "VkInternal.h"
+#include "VertexFormat.h"
 #include "VkResources.h"
 
 namespace gk {
@@ -21,31 +22,34 @@ namespace {
 
 // The push constant block, matching `Push` in src/shaders/world.slang field for field.
 //
-// 72 bytes of a guaranteed 128, where it used to be 120: the matrix and the lighting inputs
-// moved into the per-draw GpuDrawRecord (§4.26), because a light array could not fit here and
-// the block was already full. What is left is the texture stages - the material half of §2's
-// design, which is what moves next - plus the three addresses and the record index.
+// **48 bytes of a guaranteed 128**, where it was 120 before the draw record (§4.26) and 72
+// before the material table (§4.30). Everything per-draw is now an index into an array reached
+// by address, which is §2's design arrived at in full: four addresses, three indices, nothing
+// that describes a draw. What is left cannot shrink further without giving up the addresses,
+// and there is no reason to.
+//
+// `base_vertex` is the one index that is not into one of those arrays - it is where this draw's
+// buffer starts inside the vertex arena, and it stays here because the vertex shader adds it to
+// SV_VertexID before it has read anything at all.
+//
+// 44 bytes of content and 48 of struct: the four addresses give it 8-byte alignment, so the
+// compiler pads the tail. The pad is spelled out rather than left implicit because the range
+// declared in the pipeline layout is this `sizeof`, and a reader comparing it against the Slang
+// side - which stops at 44 - should not have to work out where the extra four bytes came from.
 struct PushConstants {
   uint64_t vertices;
   uint64_t draws;
   uint64_t lights;
+  uint64_t materials;
   uint32_t record;
+  uint32_t material;
   uint32_t base_vertex;
-  uint32_t stage_count;
-  uint32_t flags;
-  uint32_t stage0_texture;
-  uint32_t stage0_sampler;
-  uint32_t stage0_color;
-  uint32_t stage0_alpha;
-  uint32_t stage1_texture;
-  uint32_t stage1_sampler;
-  uint32_t stage1_color;
-  uint32_t stage1_alpha;
+  // The LOD probe (§4.34). Negative means "sample normally"; anything else makes every texture
+  // fetch an explicit-LOD one at that level. It occupies what was tail padding, so it is free -
+  // see the note above about why the pad exists at all.
+  float force_lod;
 };
-static_assert(sizeof(PushConstants) == 72);
-static_assert(offsetof(PushConstants, stage0_texture) == 40,
-              "the shader reads the stages at fixed offsets, so a field inserted above them "
-              "shifts every one");
+static_assert(sizeof(PushConstants) == 48);
 
 constexpr uint32_t kMaxDrawsPerFrame = 8192;
 
@@ -71,8 +75,22 @@ VkDeviceMemory DepthMemory = VK_NULL_HANDLE;
 VkImageView DepthView = VK_NULL_HANDLE;
 VkFormat DepthFormat = VK_FORMAT_UNDEFINED;
 bool DepthStencil = false;
+// The swapchain's extent, kept because a draw's viewport has to be reissued when its depth
+// slice changes and only the width and height stay constant across that (§4.32).
+uint32_t ViewportWidth = 0;
+uint32_t ViewportHeight = 0;
 
 std::vector<DrawItem> Items;
+// The list as it was last recorded, so a draw can be described after the frame it belongs to.
+// RecordDraws swaps into it rather than copying.
+std::vector<DrawItem> LastItems;
+
+// The bisect windows, inclusive. See SetDrawRange and SetDrawHide in VkDraw.h.
+uint32_t DrawRangeFirst = 0;
+uint32_t DrawRangeLast = UINT32_MAX;
+// Empty by default, expressed as a window that cannot contain an index.
+uint32_t DrawHideFirst = 1;
+uint32_t DrawHideLast = 0;
 
 bool Fail(const std::string &message) {
   Error = message;
@@ -155,6 +173,8 @@ bool CreateDepth(uint32_t width, uint32_t height) {
   if (width == 0 || height == 0) {
     return false;
   }
+  ViewportWidth = width;
+  ViewportHeight = height;
 
   VkImageCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   info.imageType = VK_IMAGE_TYPE_2D;
@@ -453,6 +473,140 @@ bool PipelineState::operator<(const PipelineState &other) const {
   return std::memcmp(this, &other, sizeof(PipelineState)) < 0;
 }
 
+// Byte-comparable for the same reason PipelineState is: every member is a uint32_t and the two
+// explicit pads are always zero, so there is no padding the compiler chose and memcmp cannot
+// call two equal materials unequal. The pads exist for the shader's stride, and being part of
+// the key costs nothing because they never differ.
+bool GpuMaterial::operator<(const GpuMaterial &other) const {
+  return std::memcmp(this, &other, sizeof(GpuMaterial)) < 0;
+}
+
+namespace {
+
+// The frame's material table, and the intern map that deduplicates into it. Both live exactly
+// as long as `Items` does - a scene's worth - because the table is in the scratch slice that
+// scene writes, and RotateFrameScratch takes that slice away at the bottom of the frame.
+//
+// The map is rebuilt every frame rather than persisted, which is not a missed optimisation: a
+// bindless index is only valid against the slice it was allocated from, so a material carried
+// over from the previous scene would name an entry the shader can no longer see.
+std::map<GpuMaterial, uint32_t> InternedMaterials;
+
+// See SetShadeMode in VkDraw.h. Default on: it is a state the game sets, not a feature.
+bool ShadeModeEnabled = true;
+
+// See SetForceLod in VkDraw.h. Off by default and not a state the game has - purely the probe.
+float ForcedLod = -1.0f;
+
+// See WatchDrawVertices in VkDraw.h. Snapshotted at submit time into a fixed buffer, so reading
+// it never races the scratch's rotation.
+constexpr uint32_t kWatchVertices = 16;
+constexpr uint32_t kWatchIndices = 24;
+uint32_t WatchIndex = UINT32_MAX;
+bool WatchValid = false;
+DrawItem WatchItem;
+CanonicalVertex WatchVertexData[kWatchVertices];
+uint32_t WatchVertexCount = 0;
+uint32_t WatchIndexData[kWatchIndices];
+uint32_t WatchIndexCount = 0;
+
+// Copies the head of a watched draw's geometry out of the scratch, while the slice it was
+// written into is still the current one.
+void SnapshotWatched(const DrawItem &item) {
+  WatchValid = false;
+  WatchVertexCount = 0;
+  WatchIndexCount = 0;
+  if (item.vertex_source != DrawSource::Scratch) {
+    // Recorded anyway, so the reader is told "this draw is not a user-pointer draw" rather than
+    // being given an empty answer that looks like "nothing was submitted".
+    WatchItem = item;
+    WatchValid = true;
+    return;
+  }
+  const auto *vertices = static_cast<const CanonicalVertex *>(ScratchVertexMapped());
+  if (vertices == nullptr) {
+    return;
+  }
+  WatchItem = item;
+  WatchVertexCount = (std::min)(kWatchVertices, item.count);
+  std::memcpy(WatchVertexData, vertices + item.base_vertex,
+              sizeof(CanonicalVertex) * WatchVertexCount);
+
+  if (item.indexed && item.index_source == DrawSource::Scratch) {
+    const auto *base = static_cast<const uint8_t *>(ScratchIndexMappedBase());
+    if (base != nullptr) {
+      WatchIndexCount = (std::min)(kWatchIndices, item.count);
+      for (uint32_t i = 0; i < WatchIndexCount; ++i) {
+        const size_t at = size_t(item.first_index + i) * item.index_stride;
+        WatchIndexData[i] = item.index_stride == 4
+                                ? *reinterpret_cast<const uint32_t *>(base + at)
+                                : *reinterpret_cast<const uint16_t *>(base + at);
+      }
+      // The vertices a draw reads are the ones its INDICES name, not the first N in the slice.
+      // Reading the head of the slice instead is how a wrong answer would look right: the first
+      // vertex is usually fine and the degenerate ones are further in.
+      WatchVertexCount = 0;
+      for (uint32_t i = 0; i < WatchIndexCount && WatchVertexCount < kWatchVertices; ++i) {
+        WatchVertexData[WatchVertexCount++] = vertices[item.base_vertex + WatchIndexData[i]];
+      }
+    }
+  }
+  WatchValid = true;
+}
+
+// Interns one material into the frame's table and returns its index. kNoMaterial when the
+// slice is full, which the caller turns into a draw with no stages rather than no draw.
+constexpr uint32_t kNoMaterial = 0xffffffffu;
+
+uint32_t InternMaterial(const DrawItem &item) {
+  GpuMaterial material;
+  material.stage0_texture = item.stages[0].texture_index;
+  material.stage0_sampler = item.stages[0].sampler_index;
+  material.stage0_color = item.stages[0].color;
+  material.stage0_alpha = item.stages[0].alpha;
+  material.stage1_texture = item.stages[1].texture_index;
+  material.stage1_sampler = item.stages[1].sampler_index;
+  material.stage1_color = item.stages[1].color;
+  material.stage1_alpha = item.stages[1].alpha;
+  material.stage_count = item.stage_count;
+  material.flags = item.flags;
+  if (item.shade_mode == kShadeFlat) {
+    ++TheStats.flat_shaded_draws;
+  }
+  // Forced to GOURAUD rather than left alone when the toggle is off, so the whole table collapses
+  // to the pre-§4.31 shape and the A/B is the feature and nothing else.
+  material.shading = ShadeModeEnabled ? item.shade_mode : kShadeGouraud;
+  // A stage past `stage_count` is never read, so two draws differing only there are the same
+  // material - and would not be if the unused words went into the key. Zeroed rather than
+  // masked out of the comparison, because the table is uploaded as it is compared.
+  if (material.stage_count < 2) {
+    material.stage1_texture = kNoTexture;
+    material.stage1_sampler = 0;
+    material.stage1_color = 0;
+    material.stage1_alpha = 0;
+  }
+  if (material.stage_count < 1) {
+    material.stage0_texture = kNoTexture;
+    material.stage0_sampler = 0;
+    material.stage0_color = 0;
+    material.stage0_alpha = 0;
+  }
+
+  const auto found = InternedMaterials.find(material);
+  if (found != InternedMaterials.end()) {
+    return found->second;
+  }
+  const ScratchAlloc alloc = AllocateScratchMaterials(1);
+  if (!alloc.valid) {
+    return kNoMaterial;
+  }
+  *static_cast<GpuMaterial *>(alloc.mapped) = material;
+  InternedMaterials.emplace(material, alloc.offset);
+  return alloc.offset;
+}
+
+} // namespace
+
 bool StartDraw(uint32_t width, uint32_t height, uint32_t colour_format) {
   if (Ready) {
     return true;
@@ -471,6 +625,73 @@ bool StartDraw(uint32_t width, uint32_t height, uint32_t colour_format) {
 
 bool DrawReady() { return Ready; }
 
+// See the note on SetHalfPixel in VkDraw.h. Default on: it is a convention difference between
+// the two APIs, not a feature, so drawing without it is the wrong answer everywhere.
+namespace {
+bool HalfPixelEnabled = true;
+} // namespace
+
+void WatchDrawVertices(uint32_t index) {
+  WatchIndex = index;
+  WatchValid = false;
+}
+
+uint32_t WatchedDrawVertices() { return WatchIndex; }
+
+std::string DescribeWatchedVertices() {
+  if (WatchIndex == UINT32_MAX) {
+    return "no draw is being watched; set render.draw_vertices = <index> and let a frame pass\n";
+  }
+  if (!WatchValid) {
+    return "draw " + std::to_string(WatchIndex) +
+           " has not been submitted since it was watched - let a frame pass, and note that a "
+           "paused frame still submits\n";
+  }
+  std::string out;
+  char line[256];
+  auto add = [&](const char *fmt, auto... args) {
+    std::snprintf(line, sizeof(line), fmt, args...);
+    out += line;
+  };
+  add("draw %u: %s, %u %s from %s, base_vertex %u first_index %u\n", WatchIndex,
+      WatchItem.indexed ? "indexed" : "non-indexed", WatchItem.count,
+      WatchItem.indexed ? "indices" : "vertices",
+      WatchItem.vertex_source == DrawSource::Scratch ? "scratch" : "arena",
+      WatchItem.base_vertex, WatchItem.first_index);
+  if (WatchItem.vertex_source != DrawSource::Scratch) {
+    out += "  vertices are in the arena, which is never mapped - use render.verify_buffers()\n";
+    return out;
+  }
+  if (WatchIndexCount != 0) {
+    out += "  indices:";
+    for (uint32_t i = 0; i < WatchIndexCount; ++i) {
+      add(" %u", WatchIndexData[i]);
+    }
+    out += "\n";
+  }
+  out += "  vertices as the shader pulls them:\n";
+  for (uint32_t i = 0; i < WatchVertexCount; ++i) {
+    const CanonicalVertex &v = WatchVertexData[i];
+    add("    %2u  pos %11.4f %11.4f %11.4f  w %9.5f  colour 0x%08x  uv %8.4f %8.4f\n", i,
+        v.pos[0], v.pos[1], v.pos[2], v.pos[3], v.color, v.uv0[0], v.uv0[1]);
+  }
+  return out;
+}
+
+void SetForceLod(float lod) { ForcedLod = lod; }
+
+float ForceLod() { return ForcedLod; }
+
+void SetShadeMode(bool enabled) { ShadeModeEnabled = enabled; }
+
+bool ShadeMode() { return ShadeModeEnabled; }
+
+void SetHalfPixel(bool enabled) { HalfPixelEnabled = enabled; }
+
+bool HalfPixel() { return HalfPixelEnabled; }
+
+float ViewportOrigin() { return HalfPixelEnabled ? 0.5f : 0.0f; }
+
 bool ResizeDraw(uint32_t width, uint32_t height) {
   return Ready ? CreateDepth(width, height) : false;
 }
@@ -481,17 +702,45 @@ void SubmitDraw(const DrawItem &item) {
     return;
   }
   Items.push_back(item);
+  ++TheStats.submitted;
+  // Interned here rather than in the capture layer, which is where the GpuDrawRecord is written:
+  // a record is per draw and the capture layer is the only place that knows the matrices, but a
+  // material is shared, and the table it is shared through belongs to the frame's draw list.
+  // This is also the only place that sees every draw exactly once - the capture layer has three
+  // entry points into a DrawItem and would have to remember to intern in all of them.
+  const uint32_t material = InternMaterial(item);
+  if (material == kNoMaterial) {
+    --TheStats.submitted;
+    // Structurally unreachable by capacity: at most one new material is interned per draw and
+    // the slice holds kMaxDrawsPerFrame of them, which is the reason it is sized that way. So a
+    // failure here means the scratch itself is not usable, and there is no entry to point at -
+    // dropping the draw is the only option, and the counter is what says it happened.
+    ++TheStats.dropped_materials;
+    Items.pop_back();
+    return;
+  }
+  Items.back().material = material;
+  if (Items.size() - 1 == WatchIndex) {
+    SnapshotWatched(Items.back());
+  }
 }
 
-void ClearDraws() { Items.clear(); }
+void ClearDraws() {
+  Items.clear();
+  InternedMaterials.clear();
+}
 
 void RecordDraws(void *command_buffer) {
   TheStats.items = Items.size();
   if (Items.size() > TheStats.max_items) {
     TheStats.max_items = Items.size();
   }
+  TheStats.materials = InternedMaterials.size();
+  if (InternedMaterials.size() > TheStats.max_materials) {
+    TheStats.max_materials = InternedMaterials.size();
+  }
   if (!Ready || Items.empty()) {
-    Items.clear();
+    ClearDraws();
     return;
   }
   auto cmd = static_cast<VkCommandBuffer>(command_buffer);
@@ -504,8 +753,10 @@ void RecordDraws(void *command_buffer) {
   // the scene now being recorded wrote into, so they are only valid inside this call.
   const uint64_t draw_records = ScratchDrawAddress();
   const uint64_t lights = ScratchLightAddress();
-  if (arena_vertices == 0 || arena_indices == VK_NULL_HANDLE || draw_records == 0) {
-    Items.clear();
+  const uint64_t materials = ScratchMaterialAddress();
+  if (arena_vertices == 0 || arena_indices == VK_NULL_HANDLE || draw_records == 0 ||
+      materials == 0) {
+    ClearDraws();
     return;
   }
 
@@ -529,8 +780,22 @@ void RecordDraws(void *command_buffer) {
   // three: the command buffer is fresh, so nothing carries over from the previous frame.
   uint32_t set_ref = UINT32_MAX, set_mask = 0, set_write_mask = 0;
   bool stencil_state_set = false;
+  // The viewport's depth slice, tracked the same way. VkRenderer has already set a full-range
+  // viewport for the frame; this reissues it whenever a draw wants a different slice, which on
+  // level03 is a handful of times a frame rather than per draw.
+  float set_min_depth = -1.0f, set_max_depth = -1.0f;
+  const float origin = ViewportOrigin();
 
-  for (const DrawItem &item : Items) {
+  for (size_t index = 0; index < Items.size(); ++index) {
+    const DrawItem &item = Items[index];
+    // The bisect window. Skipped before anything else, including the pipeline lookup, so a
+    // narrowed range costs nothing and cannot build a pipeline the full frame would not have.
+    if (index < DrawRangeFirst || index > DrawRangeLast) {
+      continue;
+    }
+    if (index >= DrawHideFirst && index <= DrawHideLast) {
+      continue;
+    }
     const VkPipeline pipeline = PipelineFor(item.pipeline);
     if (pipeline == VK_NULL_HANDLE) {
       continue;
@@ -564,23 +829,29 @@ void RecordDraws(void *command_buffer) {
     }
     stencil_state_set = true;
 
+    if (item.min_depth != set_min_depth || item.max_depth != set_max_depth) {
+      const VkViewport viewport = {origin,
+                                   origin,
+                                   static_cast<float>(ViewportWidth),
+                                   static_cast<float>(ViewportHeight),
+                                   item.min_depth,
+                                   item.max_depth};
+      vkCmdSetViewport(cmd, 0, 1, &viewport);
+      set_min_depth = item.min_depth;
+      set_max_depth = item.max_depth;
+      ++TheStats.viewport_sets;
+    }
+
     PushConstants push = {};
     push.vertices =
         item.vertex_source == DrawSource::Scratch ? scratch_vertices : arena_vertices;
     push.draws = draw_records;
     push.lights = lights;
+    push.materials = materials;
     push.record = item.record;
+    push.material = item.material;
     push.base_vertex = item.base_vertex;
-    push.stage_count = item.stage_count;
-    push.flags = item.flags;
-    push.stage0_texture = item.stages[0].texture_index;
-    push.stage0_sampler = item.stages[0].sampler_index;
-    push.stage0_color = item.stages[0].color;
-    push.stage0_alpha = item.stages[0].alpha;
-    push.stage1_texture = item.stages[1].texture_index;
-    push.stage1_sampler = item.stages[1].sampler_index;
-    push.stage1_color = item.stages[1].color;
-    push.stage1_alpha = item.stages[1].alpha;
+    push.force_lod = ForcedLod;
     if (push.vertices == 0) {
       continue;
     }
@@ -612,7 +883,62 @@ void RecordDraws(void *command_buffer) {
     }
     ++TheStats.drawn;
   }
-  Items.clear();
+  // Kept rather than dropped, so `render.draw_info(i)` can describe the frame that was just
+  // recorded. A swap rather than a copy: the buffers trade places and neither allocates.
+  LastItems.swap(Items);
+  ClearDraws();
+}
+
+void SetDrawRange(uint32_t first, uint32_t last) {
+  DrawRangeFirst = first;
+  DrawRangeLast = last;
+}
+
+void GetDrawRange(uint32_t &first, uint32_t &last) {
+  first = DrawRangeFirst;
+  last = DrawRangeLast;
+}
+
+void SetDrawHide(uint32_t first, uint32_t last) {
+  DrawHideFirst = first;
+  DrawHideLast = last;
+}
+
+void GetDrawHide(uint32_t &first, uint32_t &last) {
+  first = DrawHideFirst;
+  last = DrawHideLast;
+}
+
+std::string DescribeDraw(uint32_t index) {
+  if (index >= LastItems.size()) {
+    return {};
+  }
+  const DrawItem &d = LastItems[index];
+  const PipelineState &p = d.pipeline;
+  char line[1024];
+  std::snprintf(
+      line, sizeof(line),
+      "draw %u of %u\n"
+      "  topology %u  %s  count %u  base_vertex %u  first_index %u  vertex_offset %d\n"
+      "  vertices from %s, indices from %s, index stride %u\n"
+      "  blend %u (src %u dst %u)  depth test %u write %u func %u  cull %u  colour write 0x%x\n"
+      "  stencil %u (func %u fail %u zfail %u pass %u  ref %u mask 0x%x write 0x%x)\n"
+      "  alpha test func %u ref %u   shade %u   material %u\n"
+      "  %u stage(s):  0: tex %d sampler %u colour 0x%08x alpha 0x%08x\n"
+      "                1: tex %d sampler %u colour 0x%08x alpha 0x%08x\n",
+      index, static_cast<unsigned>(LastItems.size()), p.topology,
+      d.indexed ? "indexed" : "non-indexed", d.count, d.base_vertex, d.first_index,
+      d.vertex_offset, d.vertex_source == DrawSource::Scratch ? "scratch" : "arena",
+      d.index_source == DrawSource::Scratch ? "scratch" : "arena", d.index_stride,
+      p.blend_enable, p.src_blend, p.dest_blend, p.depth_test, p.depth_write, p.depth_func,
+      p.cull_mode, p.colour_write, p.stencil_enable, p.stencil_func, p.stencil_fail,
+      p.stencil_zfail, p.stencil_pass, d.stencil_ref, d.stencil_mask, d.stencil_write_mask,
+      d.flags & 0x0fu, (d.flags >> 8) & 0xffu, d.shade_mode, d.material, d.stage_count,
+      d.stages[0].texture_index == kNoTexture ? -1 : (int)d.stages[0].texture_index,
+      d.stages[0].sampler_index, d.stages[0].color, d.stages[0].alpha,
+      d.stages[1].texture_index == kNoTexture ? -1 : (int)d.stages[1].texture_index,
+      d.stages[1].sampler_index, d.stages[1].color, d.stages[1].alpha);
+  return line;
 }
 
 uint64_t DepthImageView() { return reinterpret_cast<uint64_t>(DepthView); }
@@ -639,6 +965,18 @@ std::string FormatDrawStats() {
   add("draws: %llu this frame / %llu peak / %llu total\n",
       (unsigned long long)TheStats.items, (unsigned long long)TheStats.max_items,
       (unsigned long long)TheStats.drawn);
+  // The reconciliation. Everything the capture layer offered has to be either submitted or
+  // skipped for a named reason; anything left over is a path that silently drops draws, which
+  // is what §4.32 was. `skipped_no_slot` is the parent of its own breakdown, so the breakdown
+  // is deliberately not added in again.
+  const uint64_t accounted =
+      TheStats.submitted + TheStats.skipped_topology + TheStats.skipped_no_slot +
+      TheStats.skipped_no_transform + TheStats.skipped_unconvertible +
+      TheStats.skipped_scratch_full + TheStats.skipped_no_record +
+      TheStats.dropped_over_capacity + TheStats.dropped_materials;
+  add("draw calls seen: %llu   submitted: %llu   unaccounted for: %lld (must be 0)\n",
+      (unsigned long long)TheStats.seen, (unsigned long long)TheStats.submitted,
+      (long long)TheStats.seen - (long long)accounted);
   add("skipped: %llu topology, %llu no arena slot, %llu no transform, "
       "%llu unconvertible, %llu scratch full, %llu no draw record\n",
       (unsigned long long)TheStats.skipped_topology,
@@ -670,6 +1008,13 @@ std::string FormatDrawStats() {
       (unsigned)DepthFormat, DepthStencil ? "with stencil" : "DEPTH ONLY",
       (unsigned long long)TheStats.stencil_draws,
       (unsigned long long)TheStats.stencil_draws_without_buffer);
+  add("materials: %llu this frame / %llu peak (%llu dropped - must be 0)   "
+      "%llu flat-shaded draws%s\n",
+      (unsigned long long)TheStats.materials, (unsigned long long)TheStats.max_materials,
+      (unsigned long long)TheStats.dropped_materials,
+      (unsigned long long)TheStats.flat_shaded_draws,
+      ShadeModeEnabled ? "" : " (SHADEMODE ignored)");
+  add("viewport depth-slice changes: %llu\n", (unsigned long long)TheStats.viewport_sets);
   add("index binds: %llu   pipelines: %llu (%llu binds, %llu failures - must be 0)\n",
       (unsigned long long)TheStats.index_binds, (unsigned long long)TheStats.pipelines,
       (unsigned long long)TheStats.pipeline_binds,

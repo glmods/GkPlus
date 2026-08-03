@@ -44,6 +44,11 @@ struct CaptureStats {
   std::map<uint32_t, uint64_t> fvf_counts;
   std::map<uint32_t, uint64_t> primitive_type_counts;
   uint64_t draws_buffered = 0; // DrawPrimitive + DrawIndexedPrimitive
+  // DrawIndexedPrimitive calls whose MinIndex/NumVertices or StartIndex/PrimitiveCount reach
+  // past the bound buffer. D3D8 tolerated it, D3D9 rejects the call outright, and d3d8to9
+  // returns D3D_OK either way - so this is not our defect but the reference renderer's, and
+  // it is the only counter here that is expected to be non-zero (§4.29).
+  uint64_t draws_out_of_range = 0;
   uint64_t draws_user_ptr = 0; // the two *UP variants
 
   // Fixed-function state actually exercised. Keyed by D3D enum; the value set is bounded in
@@ -319,6 +324,26 @@ std::string VerifyBufferSlots();
 // d3d8to9 Direct3DDevice8, so the static cast it used to do would be reading the wrong
 // object. Returns null if the pointer is neither.
 IDirect3DDevice9 *ResolveD3D9Device(IDirect3DDevice8 *device);
+
+// True under `GKPLUS_RENDERER=d3d8`, where the capture layer forwards to Windows' own 32-bit
+// D3D8 instead of to d3d8to9 - the reference this project spent thirty sections not having
+// (§4.33). There is no D3D9 device behind it, so the ImGui DX9 overlay cannot start; that is a
+// deliberate limitation of a mode whose only job is to be the ground truth in an A/B.
+bool PassthroughToSystemD3D8();
+
+// Arm the synthetic quad probe: one textured quad, pre-transformed to exact screen pixels, drawn
+// last through the capture device's own methods so the reference and this renderer are handed
+// the same geometry, texture and stage setup (§4.35). `name` is a case-insensitive substring of
+// a live texture's `.rim` path, or empty to disarm; `scale` is screen pixels per texel, so 1.0
+// is the no-minification case. Returns what it armed, as text.
+// `offset` shifts the quad's top-left by that many pixels, which is what moves the sample points
+// between texel corners and texel centres - at 0 a 1:1 quad samples corners, which is the worst
+// case for bilinear and not where real geometry lands (§4.35).
+// `alpha` renders the texture's alpha channel as greyscale instead of its colour, which is the
+// only way to compare alpha at all - a screenshot has no alpha channel, and a probe with blending
+// off never shows it.
+std::string ArmProbeQuad(const std::string &name, double scale, bool mipmap, double offset,
+                         bool alpha);
 
 // Detours d3d8to9's Direct3DCreate8 in the constructor, undoes it in the destructor. Held by
 // the `Subsystems` aggregate in entry.cpp, and it must be constructed before anything that

@@ -14,10 +14,10 @@
 //     pull from at all - they are text, particles and the in-game menus;
 //   * non-indexed and non-triangle-list primitives.
 //
-// vulkan_renderer_notes.md section 2 is the design this is converging on. Half of it is here
-// now: a draw's per-draw *data* lives in a GpuDrawRecord array and the push constants carry
-// only its index (§4.26). The material half - GpuMaterial, keyed by asset name - is still per
-// draw in the push constants, so the texture stages below are the part still to move.
+// vulkan_renderer_notes.md section 2 is the design this converged on, and both halves are here:
+// a draw's per-draw data lives in a GpuDrawRecord array (§4.26) and its texture stages in a
+// GpuMaterial array (§4.30), each interned once a frame. The push constants carry four
+// addresses and three indices, and nothing else.
 
 #include <cstdint>
 #include <string>
@@ -27,10 +27,10 @@ namespace vulkan {
 
 // --- the shader ABI ---------------------------------------------------------------------------
 //
-// Two arrays a frame, both in host-visible scratch that rotates with the vertex scratch, both
-// reached by device address. They exist because the 128-byte push constant block was full at
-// 120 (§4.19) and the light sum needs a per-draw matrix, five material colours and a variable
-// number of lights - none of which fits.
+// Three arrays a frame - lights, draw records and materials - all in host-visible scratch that
+// rotates with the vertex scratch, all reached by device address. They exist because the
+// 128-byte push constant block was full at 120 (§4.19) and the light sum needs a per-draw
+// matrix, five material colours and a variable number of lights - none of which fits.
 //
 // **Every field is a float4 or an array of them**, for the layout reason the vertex struct
 // already documents: a float4 sits at a 16-byte stride under std140, std430 and scalar rules
@@ -104,16 +104,65 @@ enum class DrawSource : uint8_t { Arena, Scratch };
 
 constexpr uint32_t kNoTexture = 0xffffffffu;
 
-// One D3D8 texture stage, as the shader consumes it. `color` and `alpha` each pack one
-// fixed-function operation - op in bits 0..7, its two D3DTA_* arguments in 8..15 and 16..23,
-// and D3DTSS_TEXCOORDINDEX in 24..31 of the colour word. Packed rather than spelled out
-// because the whole thing is push constants, and 128 bytes is the guaranteed budget.
+// One D3D8 texture stage, as the capture layer resolves it and as GpuMaterial carries it.
+// `color` and `alpha` each pack one fixed-function operation - op in bits 0..7, its two D3DTA_*
+// arguments in 8..15 and 16..23, and D3DTSS_TEXCOORDINDEX in 24..31 of the colour word. Packed
+// because two words per stage is what the shader wants to switch on, and because it was once
+// push constants, where 128 bytes is the whole budget.
 struct DrawStage {
   uint32_t texture_index = kNoTexture; // bindless slot, kNoTexture for untextured
   uint32_t sampler_index = 0;
   uint32_t color = 0;
   uint32_t alpha = 0;
 };
+
+// D3DSHADEMODE, as GpuMaterial::shading carries it.
+constexpr uint32_t kShadeFlat = 1;
+constexpr uint32_t kShadeGouraud = 2;
+
+// The other half of §2's design: everything the fragment shader needs about a draw's *surface*,
+// as one entry of a per-frame array. `GpuDrawRecord` is per draw by construction - it holds a
+// matrix - but a material is shared, and the game draws the same one many times a frame: 273
+// draws on level02 intern to a few dozen materials, and interning is what makes it a table
+// rather than a per-draw copy.
+//
+// It is a table for the reason §2 gives, which is not bandwidth: a second pass over the frame -
+// a shadow map, an ID buffer, a wireframe - is a walk over the draw array with a different
+// pipeline, and that only works if a draw is an *index* into shared state rather than a bundle
+// of push constants only the recording loop knows how to rebuild.
+//
+// **Twelve named uint scalars, and the size is a multiple of 16.** Named scalars sit at 0, 4,
+// 8 ... under std140, std430 and scalar rules alike; what those rules disagree about is an
+// array's *stride*, which std140 rounds up to 16. 48 is already a multiple of 16, so the C++
+// struct and the Slang one agree structurally rather than by betting on which rule Slang picked
+// - the same reasoning GpuLight and GpuDrawRecord document, arrived at from the other side.
+struct GpuMaterial {
+  uint32_t stage0_texture = kNoTexture;
+  uint32_t stage0_sampler = 0;
+  uint32_t stage0_color = 0;
+  uint32_t stage0_alpha = 0;
+  uint32_t stage1_texture = kNoTexture;
+  uint32_t stage1_sampler = 0;
+  uint32_t stage1_color = 0;
+  uint32_t stage1_alpha = 0;
+  uint32_t stage_count = 0;
+  // The alpha test: D3DCMPFUNC in bits 0..3 (0 = off) and D3DRS_ALPHAREF in bits 8..15. It is
+  // here rather than on the draw because it is a property of the surface, and because two draws
+  // that differ only in it would otherwise share a material and get one of the two tests.
+  uint32_t flags = 0;
+  // D3DRS_SHADEMODE, carried as the D3D value - 1 FLAT, 2 GOURAUD, 3 PHONG - for the reason
+  // PipelineState carries its own states that way: the vocabulary stays the game's, so a draw is
+  // comparable with `render.state`'s pipeline histogram with no decoder ring.
+  //
+  // It occupies what was a pad word, so it costs nothing: 10 useful words round up to 48 bytes
+  // either way. Only FLAT and GOURAUD occur (§4.31); PHONG was never implemented by any D3D
+  // driver, and the shader treats anything that is not 1 as GOURAUD.
+  uint32_t shading = kShadeGouraud;
+  uint32_t pad0 = 0;
+
+  bool operator<(const GpuMaterial &other) const;
+};
+static_assert(sizeof(GpuMaterial) == 48, "the scratch stride is part of the shader ABI");
 
 // The fixed-function state that selects a VkPipeline, carried as the D3D values themselves
 // rather than as Vulkan enums: the translation belongs next to the pipeline it builds, and
@@ -160,22 +209,44 @@ struct PipelineState {
 
 struct DrawItem {
   uint32_t record = 0;     // this draw's GpuDrawRecord, in records into the frame's scratch
+  // This draw's GpuMaterial, in materials into the frame's scratch. Assigned by SubmitDraw from
+  // the stages and flags below, which stay on the item because they are what `render.draw_info`
+  // prints - the index alone would only be readable against a table nothing else can see.
+  uint32_t material = 0;
   uint32_t base_vertex;    // this draw's vertices, in canonical vertices into its source
   uint32_t first_index;    // in indices into its source; ignored when `indexed` is false
   uint32_t count;          // indices when indexed, vertices otherwise
   int32_t vertex_offset;   // D3D's BaseVertexIndex, added to every index
+  // The stages and the alpha test. These three are what SubmitDraw interns into `material`, and
+  // they stay on the item so `render.draw_info` can print a draw's surface without a decoder
+  // ring for the table - the shader reads them only through GpuMaterial.
   uint32_t stage_count = 0; // stages up to the first D3DTOP_DISABLE; 0 means diffuse only
   DrawStage stages[2];
   PipelineState pipeline;
   // The alpha test, which is a shader `discard` rather than pipeline state: D3DCMPFUNC in bits
   // 0..3 (0 = the test is off) and D3DRS_ALPHAREF in bits 8..15.
   uint32_t flags = 0;
+  // D3DRS_SHADEMODE. Not pipeline state here, although it is rasteriser state in D3D: the
+  // shader carries the vertex colour twice, once interpolated and once flat, so selecting
+  // between them costs a varying rather than a second pipeline per blend/depth/cull combination
+  // (§4.31).
+  uint32_t shade_mode = kShadeGouraud;
   // The dynamic half of the stencil state. Read only when `pipeline.stencil_enable` is set,
   // but written unconditionally, because a stale reference value is exactly the kind of thing
   // that would only show up on the one frame the game changes it.
   uint32_t stencil_ref = 0;
   uint32_t stencil_mask = 0xffffffffu;
   uint32_t stencil_write_mask = 0xffffffffu;
+  // D3DVIEWPORT8's MinZ and MaxZ, which map a vertex's NDC depth into a slice of the depth
+  // buffer. **Gunlok uses six of them and none is the default 0..1** (§4.32): the world sits in
+  // 0.1..1.0 and the effect layers in thin slices around 0.02..0.06, so an overlay is in front
+  // of the world by construction rather than by switching the depth test off. A backdrop pass
+  // uses 1.0..1.0, which pins it to the far plane.
+  //
+  // Per draw and not per frame, because the game changes it between draws inside one scene -
+  // which is the whole technique. Dynamic state, so it costs no pipeline.
+  float min_depth = 0.0f;
+  float max_depth = 1.0f;
   DrawSource vertex_source = DrawSource::Arena;
   DrawSource index_source = DrawSource::Arena;
   bool indexed = true;     // DrawPrimitiveUP has no indices at all
@@ -187,6 +258,21 @@ struct DrawStats {
   uint64_t items = 0;          // submitted this frame
   uint64_t max_items = 0;
   uint64_t drawn = 0;          // cumulative, actually recorded
+  // Every Draw* call the capture layer received while the renderer was up, and every one that
+  // became a DrawItem. **`seen - submitted - the skips below must be 0`**, and that is the
+  // invariant §4.32 exists because nobody was checking.
+  //
+  // `DrawPrimitive` was never wired up: it was counted, forwarded to d3d8to9, and never turned
+  // into a draw. Every "must be 0" counter here reads zero for it, because they all count
+  // *reasons a draw was rejected* and this one was never offered - so a whole entry point went
+  // missing in a way no existing number could show. Gunlok draws its additive glow sprites that
+  // way, so fires rendered as bare scenery.
+  //
+  // The general lesson is worth more than the fix: a counter that says "of the work that reached
+  // me, none went wrong" cannot see work that never reached it. This pair is the only reading
+  // here that compares against what the GAME did rather than against what the renderer chose.
+  uint64_t seen = 0;
+  uint64_t submitted = 0;
   uint64_t index_binds = 0;    // how often the index source changed within a frame
   uint64_t skipped_user_ptr = 0;
   uint64_t skipped_unconvertible = 0; // a user-pointer FVF the converter does not handle
@@ -247,6 +333,22 @@ struct DrawStats {
   // quad darken the whole screen for two sections was invisible to every other number here.
   uint64_t stencil_draws = 0;
   uint64_t stencil_draws_without_buffer = 0;
+  // Distinct GpuMaterials interned this frame, and the high-water mark. The frame's material
+  // slice holds kMaxDrawsPerFrame of them, so `materials` can never exceed `items`; how far
+  // *below* it runs is the measurement that says whether a table was worth building, and it is
+  // also what a future material-override surface has to address by. `dropped_materials` is a
+  // draw the table could not take - unreachable by capacity, since the two limits agree, so a
+  // non-zero reading means the scratch is unusable. Must be 0.
+  uint64_t materials = 0;
+  uint64_t max_materials = 0;
+  uint64_t dropped_materials = 0;
+  // Draws the game asked for D3DSHADE_FLAT on. Not an invariant either way - it is the size of
+  // the thing §4.31 implemented, and on level02 all of it is the stencil shadow.
+  uint64_t flat_shaded_draws = 0;
+  // How often the viewport had to be reissued because a draw wanted a different depth slice.
+  // Not an invariant - it is the size of the technique in §4.32, and a level where it reads 0
+  // would be one where the engine never layers anything in front of the world.
+  uint64_t viewport_sets = 0;
   uint64_t pipelines = 0;        // distinct pipeline states seen, i.e. VkPipelines created
   uint64_t pipeline_binds = 0;   // how often the bound pipeline changed within a frame
   uint64_t pipeline_failures = 0; // must be 0: a state whose pipeline would not build
@@ -271,6 +373,90 @@ void RecordDraws(void *command_buffer);
 
 // Discards the list without drawing it, for a frame that is not rendered.
 void ClearDraws();
+
+// Record only draws `first .. last` of the frame's list, inclusive; the default (0, UINT32_MAX)
+// is all of them. This is the bisect for "which draw painted that pixel", which nothing else
+// here could answer: `render.draws` counts what was skipped and `render.state` histograms what
+// was configured, but neither attributes a pixel to a draw. Setting a one-draw range renders
+// that draw alone against an empty frame, which is the reading that ends the search (§4.29).
+//
+// Run-time only, and only useful on a paused frame - the list is rebuilt every frame from
+// whatever the game submitted, so an index means nothing across frames unless nothing moves.
+void SetDrawRange(uint32_t first, uint32_t last);
+void GetDrawRange(uint32_t &first, uint32_t &last);
+
+// Hide draws `first .. last` inclusive and record every other one. The **useful** half of the
+// pair, and the reason both exist: a prefix range truncates the depth and stencil buffers along
+// with the draw list, so a draw that only becomes visible because the geometry in front of it
+// was never drawn reads as the draw that painted the pixel. Hiding a window leaves the rest of
+// the frame - and therefore both buffers - almost intact, so "the pixel went away" means that
+// window contains what painted it. Bisect on the window, not on a prefix (§4.29).
+void SetDrawHide(uint32_t first, uint32_t last);
+void GetDrawHide(uint32_t &first, uint32_t &last);
+// Everything the renderer knows about one draw of the last recorded frame, as text. Empty if
+// the index is past the end.
+std::string DescribeDraw(uint32_t index);
+
+// The converted vertices and indices one draw was actually given, which is the question no other
+// instrument here answers: `render.draws` counts what was skipped, `render.state` histograms what
+// was configured, `verify_buffers` proves the arena holds what D3D held, and `draw_range` shows
+// what a draw painted - but when a draw paints the wrong *shape*, none of them says why.
+//
+// Snapshotted at SubmitDraw rather than read back afterwards, because the scratch rotates at the
+// bottom of the frame and reading it later is a race against the next scene. Set the index,
+// let a frame go by, then read.
+//
+// **User-pointer draws only.** Their vertices are in the host-visible scratch by construction;
+// a buffered draw's are in a device-local arena that is deliberately never mapped, and a
+// readback there is `verify_buffers`' job.
+void WatchDrawVertices(uint32_t index);
+uint32_t WatchedDrawVertices();
+std::string DescribeWatchedVertices();
+
+// The LOD probe: force every texture fetch to an explicit mip level, or -1 to sample normally.
+//
+// It exists because the residual against the original D3D8 **scales with minification** (§4.33) -
+// 2.95 on an oblique ground decal against a 0.008 reference floor, and 0.39 on a flat wall - with
+// the sampler mapping, the texture pixels and the half-pixel origin all separately verified
+// correct. That narrows it to which level is sampled, or to the filtering inside a level, and
+// those two need different fixes.
+//
+// Pinning both sides to level 0 is what tells them apart: the reference takes
+// `GKPLUS_NO_MIPMAP=1`, which forces `D3DTSS_MIPFILTER` to `D3DTEXF_NONE` in the forwarded call,
+// and this side takes `render.force_lod = 0`. If they converge, the difference is LOD selection.
+// If they do not, nothing about mip levels is involved and it is the filtering or the
+// coordinates (§4.34).
+//
+// Run-time only, and a diagnostic rather than a feature - the game has no such state.
+void SetForceLod(float lod);
+float ForceLod();
+
+// D3DRS_SHADEMODE: honour it, or interpolate everything the way every build before §4.31 did.
+//
+// On by default, because ignoring a state the game sets is not a defensible default. Off is the
+// A/B - toggle it on a paused frame and the difference image is exactly the pixels flat shading
+// moves, at a 0.000 noise floor, which is the only comparison sharp enough to see something this
+// small (§4.26, §4.28).
+void SetShadeMode(bool enabled);
+bool ShadeMode();
+
+// The D3D9 pixel-centre convention, as a half-pixel viewport offset.
+//
+// D3D8/9 put the centre of pixel (i, j) at screen coordinate (i, j); Vulkan (and D3D10+) put it
+// at (i + 0.5, j + 0.5). Both map the same NDC onto the same rectangle, so nothing about the
+// projection differs - what differs is where inside each pixel the rasteriser samples, which
+// shifts every interpolated value by half a pixel. Measured rather than assumed: aligning a
+// d3d9 shot against a Vulkan one of the same paused frame minimises at exactly (+0.5, +0.5)
+// over the scene, and the residual is the edge fringe on every silhouette (notes §4.28).
+//
+// On by default; `render.half_pixel = false` restores the previous behaviour, which is the only
+// way to A/B it on one paused frame at a 0.00 noise floor rather than across two launches.
+void SetHalfPixel(bool enabled);
+bool HalfPixel();
+// The world pass's viewport origin: 0.5 with the offset on, 0 without. The overlay does not use
+// it - ImGui's Vulkan backend sets its own viewport, and it is drawn for the human rather than
+// to match d3d9.
+float ViewportOrigin();
 
 uint64_t DepthImageView();
 uint64_t DepthImage();
