@@ -17,6 +17,10 @@ bool Attempted = false;
 bool Armed = false;
 bool Capturing = false;
 uint32_t Captures = 0;
+// The staging-batch window, which is separate from the frame one: see VkCapture.h.
+uint32_t WantedBatch = UINT32_MAX;
+bool BatchCapturing = false;
+void *BatchDevice = nullptr;
 std::string Status = "not loaded";
 std::string CapturePath = "(renderdoc's own)";
 
@@ -139,6 +143,33 @@ void EndFrameCaptureIfArmed() {
   Api->EndFrameCapture(nullptr, nullptr);
   Capturing = false;
   Armed = false;
+  ++Captures;
+}
+
+void CaptureStagingBatch(uint32_t batch) { WantedBatch = batch; }
+
+void BeginBatchCaptureIfArmed(uint32_t batch, void *vk_instance) {
+  if (Api == nullptr || batch != WantedBatch || BatchCapturing || Capturing) {
+    return;
+  }
+  // RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE: the dispatch pointer, i.e. the first word of the
+  // instance. Passed explicitly because this is called between frames, where a null device
+  // could resolve to the game's D3D9 one instead. The same pointer has to be handed back to
+  // EndFrameCapture, so it is kept.
+  BatchDevice =
+      vk_instance == nullptr ? nullptr : *static_cast<void **>(vk_instance);
+  Api->StartFrameCapture(BatchDevice, nullptr);
+  BatchCapturing = true;
+  DebugWrite("gkplus: renderdoc: capturing staging batch\n");
+}
+
+void EndBatchCaptureIfArmed(uint32_t batch) {
+  if (Api == nullptr || !BatchCapturing || batch != WantedBatch) {
+    return;
+  }
+  Api->EndFrameCapture(BatchDevice, nullptr);
+  BatchCapturing = false;
+  WantedBatch = UINT32_MAX;
   ++Captures;
 }
 

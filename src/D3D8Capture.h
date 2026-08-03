@@ -204,6 +204,13 @@ struct CaptureStats {
   //               depth test/write, cull mode, alpha test. "Bucket by pipeline only" is only
   //               a good idea if this number stays small, so it is worth counting before
   //               committing to it.
+  // How many draws are issued with fog and with fixed-function lighting on. Both are read
+  // from the shadow state at draw time, so they say what the *renderer* has to reproduce
+  // rather than what the game happened to set once - a state set and never drawn with costs
+  // nothing to ignore.
+  uint64_t draws_fogged = 0;
+  uint64_t draws_lit = 0;
+
   uint64_t distinct_materials = 0;
   uint64_t distinct_pipelines = 0;
   uint64_t max_materials_per_frame = 0;
@@ -218,6 +225,30 @@ struct CaptureStats {
   uint64_t frames = 0;
   uint64_t draws_this_frame = 0;
   uint64_t max_draws_per_frame = 0;
+
+  // A buffer rewritten AFTER a draw in the same frame already read it - the D3D "rename"
+  // pattern, where one dynamic buffer is locked, filled, drawn, and locked again for the next
+  // batch. The arena holds one slot per buffer and the draw list is not recorded until Present,
+  // so every draw off that buffer ends up reading whatever the LAST lock left there. Non-zero
+  // means some draws this session rendered the wrong contents. See §4.23.
+  uint64_t buffer_rewritten_after_draw = 0;
+  // Split by kind, because it decides the shape of the fix: a vertex-only pattern needs the
+  // vertex source versioned and can leave the index arena alone.
+  uint64_t vertex_buffer_rewritten_after_draw = 0;
+  uint64_t index_buffer_rewritten_after_draw = 0;
+  // The draws implicated: how many had already read a buffer that was rewritten afterwards.
+  uint64_t draws_reading_rewritten_buffers = 0;
+  // Of those rewrites, the ones whose new byte range overlaps the range the previous lock
+  // wrote. This is the subset that is genuinely wrong: a D3DLOCK_NOOVERWRITE append writes
+  // somewhere else and leaves the drawn-from bytes alone.
+  uint64_t overlapping_rewrites_after_draw = 0;
+  // Rewrites parked in the frame's scratch so the slot keeps the version the earlier draws
+  // read. This is the fix working; it should track `buffer_rewritten_after_draw`.
+  uint64_t buffer_versions_in_scratch = 0;
+  // Rewrites that could NOT be versioned - a partial refill, whose untouched bytes this layer
+  // does not keep, or a scratch that had no room. These still overwrite the slot, so the
+  // earlier draws read the newer contents. Must be 0.
+  uint64_t unversioned_rewrites = 0;
 };
 
 // The live counters. Valid from the moment the device is created; all zeroes before that.
@@ -226,9 +257,42 @@ const CaptureStats &Stats();
 // A human-readable dump, for the REPL and the ImGui overlay.
 std::string FormatStats();
 
+// What the renderer has to reproduce, as the shadow state has it: the fog, lighting, blend and
+// depth render states, the eight light slots, the material, and a histogram of every texture-
+// stage and pipeline configuration actually drawn with.
+//
+// The histograms are the useful half, and they print VALUES rather than a count - six stage
+// configurations and five pipeline states for a level01 session, which is small enough to
+// implement one by one. `distinct_pipelines` had counted them since Phase 2a and thrown the
+// values away, which is why "6 pipelines" sat in the notes for three sections without anyone
+// being able to act on it.
+//
+// The single-state lines are a sample and are labelled as one: "now" means at Present, which is
+// where the REPL runs, so it is whatever the last draw of the frame left behind. Every value
+// each state has ever been set to is printed beside it for that reason.
+std::string FormatShadowState();
+
 // Discard everything counted so far. Useful for measuring one level load, or one menu
 // screen, without the rest of the session in the sample.
 void ResetStats();
+
+// Which non-triangle-list topologies the Vulkan path draws, switchable at run time.
+//
+// Run time and not just an environment variable, because comparing two launches does not
+// work: the scene is NOT reproducible between them - two Vulkan runs of identical code at the
+// same settle differ by up to 8/255, which is larger than most of what is being measured.
+// Toggling this with the game PAUSED gives two frames of the same scene that differ only by
+// the feature, which is the only exact comparison available (§4.21). Both are ON by default
+// since the stencil buffer landed (§4.27); GKPLUS_VK_TOPOLOGIES now selects a subset rather
+// than opting in.
+void SetTopologies(bool strips, bool lines);
+void GetTopologies(bool &strips, bool &lines);
+
+// Whether the real per-vertex light sum runs, switchable at run time for the same reason and
+// with the same procedure. Off falls back to the §4.20 material collapse - the previous build's
+// behaviour exactly - so the difference image between the two states IS the light sum (§4.26).
+void SetLightSum(bool enabled);
+bool GetLightSum();
 
 // True once the game has created its device through us.
 bool DeviceCreated();
@@ -239,6 +303,15 @@ bool DeviceCreated();
 // The counters say the upload path ran; only this says it put the right bytes there. Stalls
 // the GPU once per level, so it is a REPL diagnostic (`render.verify_textures()`).
 std::string VerifyTextureImages();
+
+// The same, for every live vertex and index buffer that owns an arena slot: reads the arena
+// back and compares it against the buffer's own current contents. Returns
+// "<matched>/<checked> buffers match" plus the first mismatch.
+//
+// A slot holding another buffer's bytes is invisible to every counter, because a draw
+// addresses the arena by offset rather than by binding - it simply draws the wrong thing.
+// `render.verify_buffers()`.
+std::string VerifyBufferSlots();
 
 // The D3D9 device behind whatever IDirect3DDevice8 the game is holding, unwrapping our
 // capture device if it is one. src/GUI.cpp needs this: it reads the game's own

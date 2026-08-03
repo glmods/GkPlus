@@ -40,6 +40,41 @@ bool HaveDevice = false;
 bool WrapVertexBuffers = true;
 bool WrapIndexBuffers = true;
 
+// GKPLUS_NO_LIGHTING=1 / GKPLUS_NO_STAGE1=1, read once at construction. Both are measuring
+// instruments rather than features: each makes the game's OWN renderer draw the scene without
+// one thing the Vulkan path is missing, which is what tells "we are missing X" apart from "we
+// are wrong in some other way that happens to look like missing X". See SetRenderState and
+// SetTextureStageState.
+bool ForceLightingOff = false;
+bool ForceStage1Off = false;
+bool ForceSpecularOff = false;
+
+// GKPLUS_VK_SKIP: which of this renderer's own features to switch OFF, as letters -
+// 't' topologies past triangle lists, 's' seeding a buffer from its own contents, 'l' the
+// material colour for unlit-vertex draws, 'd' the API's initial state defaults. The same
+// bisect knob as GKPLUS_WRAP_BUFFERS and for the same reason: four changes landed together
+// and something in them made the picture worse, which no counter can tell you.
+//
+// The topologies were OFF by default for two sections, and the reason was never the topologies:
+// drawing the strips cost 2.3/255 because one of them is the shadow-volume darkening quad, and
+// with no stencil buffer to mask it, it covered the frame (§4.20, §4.21). Now that the depth
+// format carries a stencil aspect and the pipelines test against it, they are ON, and
+// GKPLUS_VK_TOPOLOGIES=none (or GKPLUS_VK_SKIP=t) is the way back for a bisect.
+bool SkipTopologies = false;
+// GKPLUS_VK_TOPOLOGIES also takes `strip` and `line`, so the two can be told apart - there are
+// only three strip draws and one line-list draw in a frame, and they need not be wrong for the
+// same reason.
+bool DrawStrips = true;
+bool DrawLines = true;
+bool SkipSeeding = false;
+bool SkipLitColour = false;
+bool SkipStateDefaults = false;
+// The real per-vertex light sum (§4.26), on by default and switchable at run time through
+// `render.lighting`. Off falls back to the §4.20 material collapse, which is the previous
+// build's behaviour exactly - so the two can be compared on ONE paused frame instead of across
+// two launches, where the noise floor is 8.06/255 and buries the effect (§4.21).
+bool DrawLightSum = true;
+
 void ReadWrapMode() {
   char value[16] = {};
   const DWORD len =
@@ -147,6 +182,7 @@ void ResolveTextureNames();
 constexpr uint32_t kMaxRenderState = 256;
 constexpr uint32_t kMaxStageState = 32;
 constexpr uint32_t kStages = 8;
+constexpr uint32_t kLights = 8;
 
 struct ShadowState {
   uint32_t render_states[kMaxRenderState] = {};
@@ -166,9 +202,97 @@ struct ShadowState {
   // The viewport, which the pre-transformed (XYZRHW) path needs to map pixels to clip space.
   uint32_t viewport_width = 0;
   uint32_t viewport_height = 0;
+  // The fixed-function lighting state, kept for the same reason as the transforms: the
+  // renderer has to reproduce it, and the only way to find out what the game asks for is to
+  // record what it sets. D3D8 has eight hardware light slots and the recorder has never seen
+  // an index above 0, so eight is the API's bound rather than a guess.
+  D3DLIGHT8 lights[kLights] = {};
+  bool light_set[kLights] = {};
+  bool light_enabled[kLights] = {};
+  D3DMATERIAL8 material = {};
+  bool have_material = false;
 };
 
 ShadowState State;
+
+// D3D8's documented initial state, for the states the renderer reads. The mirror is zeroed
+// otherwise, and zero is a *legal value* for most of these rather than an obviously-missing
+// one - which makes the difference invisible until it is not. D3DRS_COLORWRITEENABLE is the
+// sharp case: its default is all four channels and its zero means write none of them, so a
+// draw issued before the game ever sets it would render nothing at all.
+//
+// Only the states something here consumes are listed. Adding one to a pipeline key or to the
+// shader is a reason to check whether its default is 0, not merely to read it.
+void InitialiseShadowState() {
+  if (SkipStateDefaults) {
+    return;
+  }
+  uint32_t *rs = State.render_states;
+  rs[D3DRS_ZENABLE] = D3DZB_TRUE;
+  rs[D3DRS_ZWRITEENABLE] = TRUE;
+  rs[D3DRS_ZFUNC] = D3DCMP_LESSEQUAL;
+  rs[D3DRS_CULLMODE] = D3DCULL_CCW;
+  rs[D3DRS_SRCBLEND] = D3DBLEND_ONE;
+  rs[D3DRS_DESTBLEND] = D3DBLEND_ZERO;
+  rs[D3DRS_ALPHABLENDENABLE] = FALSE;
+  rs[D3DRS_ALPHATESTENABLE] = FALSE;
+  rs[D3DRS_ALPHAFUNC] = D3DCMP_ALWAYS;
+  rs[D3DRS_ALPHAREF] = 0;
+  rs[D3DRS_COLORWRITEENABLE] = 0xf;
+  rs[D3DRS_LIGHTING] = TRUE;
+  rs[D3DRS_SPECULARENABLE] = FALSE;
+  rs[D3DRS_TEXTUREFACTOR] = 0xffffffff;
+  // The light sum's own states. Three of these have a non-zero default and each one changes
+  // the picture: D3DRS_COLORVERTEX off makes every material source read the material, and the
+  // two COLOR sources decide whether a vertex diffuse is the material diffuse (which it is,
+  // and which is the whole of §4.25) or is ignored. D3DRS_AMBIENT and NORMALIZENORMALS do
+  // default to 0/FALSE and are listed anyway, because "the default happens to be zero" is
+  // exactly the thing that stops being true when a state is added to this list.
+  rs[D3DRS_COLORVERTEX] = TRUE;
+  rs[D3DRS_DIFFUSEMATERIALSOURCE] = D3DMCS_COLOR1;
+  rs[D3DRS_SPECULARMATERIALSOURCE] = D3DMCS_COLOR2;
+  rs[D3DRS_AMBIENTMATERIALSOURCE] = D3DMCS_MATERIAL;
+  rs[D3DRS_EMISSIVEMATERIALSOURCE] = D3DMCS_MATERIAL;
+  rs[D3DRS_AMBIENT] = 0;
+  rs[D3DRS_NORMALIZENORMALS] = FALSE;
+  // The stencil states, and the two masks are the reason this block is not optional for them.
+  // The game switches D3DRS_STENCILENABLE, the func, the ref and the three ops for its shadow
+  // volumes and never touches D3DRS_STENCILMASK or D3DRS_STENCILWRITEMASK, whose default is
+  // all-ones. Left at zero, the shadow passes would write no bits at all - and the test would
+  // still pass, since 0 <= 0 - so the mask would come out empty and the darkening quad would
+  // cover the frame, which is the exact symptom the stencil buffer was added to fix (§4.21).
+  rs[D3DRS_STENCILENABLE] = FALSE;
+  rs[D3DRS_STENCILFAIL] = D3DSTENCILOP_KEEP;
+  rs[D3DRS_STENCILZFAIL] = D3DSTENCILOP_KEEP;
+  rs[D3DRS_STENCILPASS] = D3DSTENCILOP_KEEP;
+  rs[D3DRS_STENCILFUNC] = D3DCMP_ALWAYS;
+  rs[D3DRS_STENCILREF] = 0;
+  rs[D3DRS_STENCILMASK] = 0xffffffff;
+  rs[D3DRS_STENCILWRITEMASK] = 0xffffffff;
+
+  for (uint32_t stage = 0; stage < kStages; ++stage) {
+    uint32_t *ss = State.stage_states[stage];
+    // Stage 0 modulates the texture with the vertex colour and every other stage is off; the
+    // arguments default the same way at every stage whether or not the stage is enabled.
+    ss[D3DTSS_COLOROP] = stage == 0 ? D3DTOP_MODULATE : D3DTOP_DISABLE;
+    ss[D3DTSS_ALPHAOP] = stage == 0 ? D3DTOP_SELECTARG1 : D3DTOP_DISABLE;
+    ss[D3DTSS_COLORARG1] = D3DTA_TEXTURE;
+    ss[D3DTSS_COLORARG2] = D3DTA_CURRENT;
+    ss[D3DTSS_ALPHAARG1] = D3DTA_TEXTURE;
+    ss[D3DTSS_ALPHAARG2] = D3DTA_CURRENT;
+    ss[D3DTSS_TEXCOORDINDEX] = stage;
+  }
+}
+
+// How often the game touches the lighting state at all. Zero for all three would say the
+// fixed-function lighting pipeline is unused and every colour is baked into the vertices.
+uint64_t LightSets = 0;
+uint64_t LightEnables = 0;
+uint64_t MaterialSets = 0;
+
+// Bumped whenever a light slot's contents change, so the per-frame cache that turns an enable
+// mask into a run of GpuLights knows when the mask is no longer enough to identify the run.
+uint64_t LightGeneration = 0;
 
 uint64_t StatesInCurrentBlock = 0;
 bool RecordingBlock = false;
@@ -202,6 +326,10 @@ struct StateBlock {
 std::map<uint32_t, StateBlock> Blocks;
 std::vector<StateOp> RecordingOps;
 
+// Being bound is the definition of "this texture will be sampled", so it is what gives a
+// texture its image - including one that is never blitted into.
+void EnsureTextureImageForBinding(IDirect3DBaseTexture8 *texture);
+
 void ApplyOp(const StateOp &op) {
   switch (op.kind) {
   case OpKind::RenderState:
@@ -217,6 +345,12 @@ void ApplyOp(const StateOp &op) {
   case OpKind::Texture:
     if (op.a < kStages) {
       State.textures[op.a] = op.texture;
+      // Here rather than in SetTexture, because a texture can be bound WITHOUT SetTexture
+      // being called: ApplyStateBlock replays through this function and touches no Set*
+      // method at all. That is how level01's lightmaps arrived - 83,176 draws a session
+      // binding a DXT1 texture at stage 1 that had no image, sampling white, and brightening
+      // the scene through ADDSIGNED instead of darkening it (§4.19).
+      EnsureTextureImageForBinding(op.texture);
     }
     break;
   case OpKind::VertexShader:
@@ -274,6 +408,142 @@ std::set<uint32_t> MaterialKeys;
 std::set<uint32_t> PipelineKeys;
 std::set<uint32_t> MaterialKeysThisFrame;
 
+// Every texture-stage configuration the game draws with, and how often. This is the input to
+// the multitexture shader: it says which fixed-function ops have to exist, rather than which
+// ones D3D8 defines. The key is the configuration itself and not a hash, because unlike the
+// material and pipeline counts - which only had to be *sized* - these values are going to be
+// implemented one by one.
+struct StageConfig {
+  // The FVF is part of the key so the 2D draws can be told from the 3D ones: XYZRHW (0x004) is
+  // the HUD and the text, and "what is the HUD doing differently" is otherwise unanswerable
+  // from a histogram that mixes it with 100,000 world draws.
+  uint32_t fvf = 0;
+  uint32_t stages = 0;
+  // colorop, colorarg1, colorarg2, alphaop, alphaarg1, alphaarg2, texcoordindex.
+  uint32_t stage[2][7] = {};
+  uint32_t textured[2] = {}; // uint32_t and not bool: see the assertion below
+
+  bool operator<(const StageConfig &other) const {
+    return std::memcmp(this, &other, sizeof(StageConfig)) < 0;
+  }
+};
+static_assert(std::has_unique_object_representations_v<StageConfig>,
+              "the ordering is a memcmp, so a padding byte would make equal keys compare "
+              "unequal and the histogram would grow without bound");
+
+std::map<StageConfig, uint64_t> StageConfigs;
+
+// The same idea for the states that select a VkPipeline. `PipelineKey` already counts how many
+// distinct ones there are - six on level01 (§4.7) - but a count cannot be implemented against;
+// this says what the six actually are.
+struct PipelineConfig {
+  uint32_t fvf = 0;
+  uint32_t state[14] = {};
+  bool operator<(const PipelineConfig &other) const {
+    return std::memcmp(this, &other, sizeof(PipelineConfig)) < 0;
+  }
+};
+static_assert(std::has_unique_object_representations_v<PipelineConfig>);
+
+const uint32_t kPipelineStates[14] = {
+    D3DRS_ALPHATESTENABLE, D3DRS_ALPHAREF,     D3DRS_ALPHAFUNC,   D3DRS_ALPHABLENDENABLE,
+    D3DRS_SRCBLEND,        D3DRS_DESTBLEND,    D3DRS_ZENABLE,     D3DRS_ZWRITEENABLE,
+    D3DRS_CULLMODE,        D3DRS_COLORWRITEENABLE,
+    D3DRS_STENCILENABLE,   D3DRS_STENCILFUNC,  D3DRS_STENCILPASS, D3DRS_STENCILZFAIL};
+
+std::map<PipelineConfig, uint64_t> PipelineConfigs;
+
+// Why a bound texture did not reach the shader, split by stage - "the wrapper is not ours" and
+// "the wrapper has no image" have completely different causes, and the second one names the
+// D3DFORMAT and D3DPOOL that produced it.
+uint64_t UnresolvedForeign[2] = {};
+uint64_t UnresolvedNoImage[2] = {};
+std::map<uint64_t, uint64_t> UnresolvedFormats; // pool << 32 | format
+
+// The first converted vertex's colour, per FVF, for the user-pointer draws. Reading the
+// vertices this layer is about to hand the shader is the only way to tell "the game is not
+// sending us the colour" apart from "we are not applying the colour it sends".
+std::map<uint64_t, uint64_t> FirstVertexColours; // fvf << 32 | D3DCOLOR
+
+// Every draw that is not a triangle list, described. There are four a frame, so this can afford
+// to record what they are rather than how many: which primitive type, which vertex format,
+// whether they came from a buffer or a pointer, how many primitives, and what is bound.
+struct OddTopology {
+  uint32_t type = 0;
+  uint32_t fvf = 0;
+  uint32_t user_pointer = 0;
+  uint32_t primitives = 0;
+  uint32_t stages = 0;
+  uint32_t texture_index = 0;
+  uint32_t blend = 0;
+  uint32_t depth_test = 0;
+  uint32_t stencil = 0;      // D3DRS_STENCILENABLE
+  uint32_t stencil_func = 0; // ... and what it tests, if it is on
+  uint32_t stencil_ref = 0;
+  // The screen-space box the draw covers, rounded to whole pixels. Only meaningful for an
+  // XYZRHW draw, where the vertices already ARE screen coordinates - which is every one of
+  // these. It is what says whether a draw paints a corner or the whole frame.
+  int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+  uint32_t first_colour = 0;
+  // z and rhw of the first vertex, as bits so the key stays memcmp-comparable. For an XYZRHW
+  // vertex D3D uses z as the depth value and rhw as 1/w; this renderer ignores rhw, and a z
+  // outside [0,1] is clipped by D3D and by Vulkan alike - so both are worth seeing before
+  // concluding anything about a draw that appears in one renderer and not the other.
+  uint32_t first_z = 0;
+  uint32_t first_rhw = 0;
+
+  bool operator<(const OddTopology &other) const {
+    return std::memcmp(this, &other, sizeof(OddTopology)) < 0;
+  }
+};
+static_assert(std::has_unique_object_representations_v<OddTopology>);
+
+std::map<OddTopology, uint64_t> OddTopologies;
+
+// What the fixed-function lighting pipeline would compute a colour FROM, for the draws that
+// carry no vertex diffuse of their own: the material, and how many lights are switched on.
+// Those draws are the HUD, and with lighting on D3D takes their colour from the material -
+// which is why the panel is green in the game and was not here (§4.20).
+struct LightingInputs {
+  uint32_t fvf = 0;
+  uint32_t lighting = 0;
+  uint32_t enabled_lights = 0;
+  uint32_t diffuse = 0;  // the material, packed ARGB
+  uint32_t ambient = 0;
+  uint32_t emissive = 0;
+
+  bool operator<(const LightingInputs &other) const {
+    return std::memcmp(this, &other, sizeof(LightingInputs)) < 0;
+  }
+};
+static_assert(std::has_unique_object_representations_v<LightingInputs>);
+
+std::map<LightingInputs, uint64_t> LightingByFvf;
+
+uint32_t PackColour(const D3DCOLORVALUE &c) {
+  auto channel = [](float v) {
+    const float clamped = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    return static_cast<uint32_t>(clamped * 255.0f + 0.5f);
+  };
+  return (channel(c.a) << 24) | (channel(c.r) << 16) | (channel(c.g) << 8) | channel(c.b);
+}
+
+// Vertex buffers that are drawn from but hold no arena slot, keyed by fvf << 32 | length. The
+// FVF is the interesting half: a buffer created with none has no stride this layer can derive,
+// so `SlotBytes` is 0 and the allocation quietly does nothing.
+std::map<uint64_t, uint64_t> UnslottedVertexBuffers;
+
+
+// Re-locks of a buffer this frame's draws had already read, keyed by
+// `D3DLOCK_* flags << 1 | the new range overlapping the old one`. The flags say what the game
+// intends and the overlap says what it did; a NOOVERWRITE append is harmless and a DISCARD
+// over the same bytes is not, so the pair is what distinguishes them. See §4.23.
+std::map<uint64_t, uint64_t> RewriteLocks;
+
+void NoteRewrite(uint32_t flags, bool overlaps) {
+  ++RewriteLocks[(uint64_t(flags) << 1) | (overlaps ? 1u : 0u)];
+}
+
 // Exactly the fields GpuMaterial is specified to carry, so the count of distinct values here
 // predicts that table's size instead of merely correlating with it.
 uint32_t MaterialKey(uint32_t stages) {
@@ -319,6 +589,49 @@ void SnapshotDraw() {
     for (uint32_t i = 0; i < stages; ++i) {
       StageSampler(i);
     }
+  }
+  StageConfig config;
+  config.fvf = State.fvf;
+  config.stages = stages;
+  for (uint32_t i = 0; i < 2; ++i) {
+    static const uint32_t kFields[7] = {D3DTSS_COLOROP,    D3DTSS_COLORARG1,
+                                        D3DTSS_COLORARG2,  D3DTSS_ALPHAOP,
+                                        D3DTSS_ALPHAARG1,  D3DTSS_ALPHAARG2,
+                                        D3DTSS_TEXCOORDINDEX};
+    for (uint32_t f = 0; f < 7; ++f) {
+      config.stage[i][f] = State.stage_states[i][kFields[f]];
+    }
+    config.textured[i] = State.textures[i] != nullptr ? 1u : 0u;
+  }
+  ++StageConfigs[config];
+
+  // Only for the layouts with no D3DFVF_DIFFUSE (0x040): those are the ones whose colour the
+  // fixed function has to invent, and the only ones where the material can be seen.
+  if ((State.fvf & 0x040u) == 0) {
+    LightingInputs inputs;
+    inputs.fvf = State.fvf;
+    inputs.lighting = State.render_states[D3DRS_LIGHTING];
+    for (uint32_t i = 0; i < kLights; ++i) {
+      inputs.enabled_lights += State.light_enabled[i] ? 1u : 0u;
+    }
+    inputs.diffuse = PackColour(State.material.Diffuse);
+    inputs.ambient = PackColour(State.material.Ambient);
+    inputs.emissive = PackColour(State.material.Emissive);
+    ++LightingByFvf[inputs];
+  }
+
+  PipelineConfig pipeline;
+  pipeline.fvf = State.fvf;
+  for (uint32_t i = 0; i < 14; ++i) {
+    pipeline.state[i] = State.render_states[kPipelineStates[i]];
+  }
+  ++PipelineConfigs[pipeline];
+
+  if (State.render_states[D3DRS_FOGENABLE] != 0) {
+    ++TheStats.draws_fogged;
+  }
+  if (State.render_states[D3DRS_LIGHTING] != 0) {
+    ++TheStats.draws_lit;
   }
   MaterialKeys.insert(MaterialKey(stages));
   MaterialKeysThisFrame.insert(MaterialKey(stages));
@@ -432,12 +745,13 @@ template <typename Interface> struct BufferWrapper : Wrapper<Interface> {
     }
   }
 
-  void NoteLock(uint32_t offset, uint32_t size, BYTE **data) {
+  void NoteLock(uint32_t offset, uint32_t size, BYTE **data, uint32_t flags) {
     ++TheStats.locks;
     // A zero SizeToLock means "the whole buffer" in D3D8.
     locked_offset_ = offset;
     locked_bytes_ = size == 0 ? length_ - offset : size;
     locked_ = data != nullptr ? *data : nullptr;
+    locked_flags_ = flags;
     TheStats.locked_bytes_this_frame += locked_bytes_;
   }
 
@@ -445,6 +759,28 @@ template <typename Interface> struct BufferWrapper : Wrapper<Interface> {
   // Lock and Unlock, so before Unlock is the only moment the data is both complete and still
   // mapped. Uploading here means the arenas see exactly what D3D9 sees.
   void UploadLocked() {
+    ++unlocks_;
+    // Rewritten after this frame's draws already read it: the slot cannot hold both versions,
+    // and the draw list is not recorded until Present, so those draws would read this one.
+    const bool rewritten_after_draw = drawn_frame_ == TheStats.frames && draws_this_frame_ != 0;
+    if (rewritten_after_draw) {
+      ++TheStats.buffer_rewritten_after_draw;
+      ++(vertex_ ? TheStats.vertex_buffer_rewritten_after_draw
+                 : TheStats.index_buffer_rewritten_after_draw);
+      TheStats.draws_reading_rewritten_buffers += draws_this_frame_;
+      // NOOVERWRITE is the game promising this write lands outside anything already drawn
+      // from, which makes the rewrite harmless; DISCARD is the opposite. Neither is trusted on
+      // its own - the byte ranges say whether the new write actually overlaps the old one.
+      const bool overlaps =
+          locked_offset_ < prev_locked_end_ && prev_locked_offset_ < locked_offset_ + locked_bytes_;
+      NoteRewrite(locked_flags_, overlaps);
+      if (overlaps) {
+        ++TheStats.overlapping_rewrites_after_draw;
+      }
+      draws_this_frame_ = 0;
+    }
+    prev_locked_offset_ = locked_offset_;
+    prev_locked_end_ = locked_offset_ + locked_bytes_;
     if (locked_ == nullptr || locked_bytes_ == 0) {
       locked_ = nullptr;
       return;
@@ -455,6 +791,18 @@ template <typename Interface> struct BufferWrapper : Wrapper<Interface> {
     if (!slot_.valid && vulkan::ResourcesReady() && !unconvertible_) {
       slot_ = vulkan::AllocateSlot(SlotBytes(), vertex_);
     }
+    // The refill case: the slot holds the version an earlier draw this frame already reads, so
+    // this one is parked in the frame's scratch and later draws are pointed at it instead.
+    // Only a whole-buffer rewrite can be versioned this way - a partial one would need the
+    // bytes it did not touch, and this layer keeps no copy of them - so a partial refill falls
+    // through to the old behaviour and is counted rather than silently half-built.
+    if (rewritten_after_draw) {
+      if (locked_offset_ == 0 && locked_bytes_ == length_ && UploadVersionToScratch()) {
+        locked_ = nullptr;
+        return;
+      }
+      ++TheStats.unversioned_rewrites;
+    }
     if (slot_.valid) {
       if (vertex_) {
         UploadConvertedVertices();
@@ -463,6 +811,49 @@ template <typename Interface> struct BufferWrapper : Wrapper<Interface> {
       }
     }
     locked_ = nullptr;
+  }
+
+  // Parks the version just written in the frame's scratch, so the arena slot keeps the version
+  // this frame's earlier draws are recorded against. The whole buffer goes in, not the locked
+  // range: a draw may index anywhere in it, and the offsets stay the buffer's own that way.
+  //
+  // The scratch is the right home rather than a second arena slot because this data has exactly
+  // the lifetime the scratch is built for - one frame, written by the CPU, read once. It is the
+  // same trade as a user-pointer draw, arrived at from the other direction.
+  bool UploadVersionToScratch() {
+    if (unconvertible_) {
+      return false;
+    }
+    if (vertex_) {
+      const uint32_t stride = vulkan::FvfStride(fvf_);
+      const uint32_t count = stride == 0 ? 0 : length_ / stride;
+      if (count == 0) {
+        return false;
+      }
+      const vulkan::ScratchAlloc alloc = vulkan::AllocateScratchVertices(count);
+      if (!alloc.valid ||
+          !vulkan::ConvertVertices(fvf_, locked_, count,
+                                   static_cast<vulkan::CanonicalVertex *>(alloc.mapped))) {
+        return false;
+      }
+      version_offset_ = alloc.offset;
+    } else {
+      // A 32-bit index buffer is refused by EmitDraw anyway, so a version of one would never
+      // be read; refusing here keeps it out of the scratch as well.
+      if (index_stride_ != 2) {
+        return false;
+      }
+      const vulkan::ScratchAlloc alloc =
+          vulkan::AllocateScratchIndices(length_ / index_stride_, index_stride_);
+      if (!alloc.valid) {
+        return false;
+      }
+      std::memcpy(alloc.mapped, locked_, length_);
+      version_offset_ = alloc.offset;
+    }
+    version_frame_ = TheStats.frames;
+    ++TheStats.buffer_versions_in_scratch;
+    return true;
   }
 
   // How much arena this buffer needs. Vertices are widened to the canonical 48-byte layout,
@@ -514,6 +905,78 @@ template <typename Interface> struct BufferWrapper : Wrapper<Interface> {
   BYTE *locked_ = nullptr;
   uint32_t locked_offset_ = 0;
   uint32_t locked_bytes_ = 0;
+  // The D3DLOCK_* flags of the lock now open. DISCARD (0x2000) and NOOVERWRITE (0x1000) are
+  // the two that decide whether re-locking a drawn-from buffer is a hazard or a promise.
+  uint32_t locked_flags_ = 0;
+  // The byte range the previous lock of this frame covered, so an overlap can be told from an
+  // append without trusting the flags alone.
+  uint32_t prev_locked_offset_ = 0;
+  uint32_t prev_locked_end_ = 0;
+  // How many times the game has unlocked this buffer. A slot is claimed on the first one, so
+  // zero here on a buffer that is being DRAWN says the contents arrived some way this layer
+  // cannot see - which is a different problem from an arena that ran out.
+  uint64_t unlocks_ = 0;
+  // Which frame last drew from this buffer, and how many of that frame's draws did. Together
+  // they are the "rewritten after being drawn" test in UploadLocked.
+  uint64_t drawn_frame_ = UINT64_MAX;
+  uint32_t draws_this_frame_ = 0;
+  // The frame whose scratch holds a later version of this buffer, and where in it. A draw uses
+  // the version only while `version_frame_` is the current frame - the scratch slice is recycled
+  // after that, so it expires on its own and there is nothing to clear.
+  uint64_t version_frame_ = UINT64_MAX;
+  uint32_t version_offset_ = 0;
+  // 2 or 4. Lives here rather than on CaptureIndexBuffer because UploadVersionToScratch needs
+  // it, and is left at 2 for a vertex buffer, where nothing reads it.
+  uint32_t index_stride_ = 2;
+  // Set once a read-back of this buffer's own contents has been tried, successfully or not, so
+  // a buffer that cannot be read costs one attempt rather than one per draw.
+  bool seeded_ = false;
+
+  // Gives this buffer an arena slot from its OWN current contents, for a buffer whose only
+  // Unlock happened before the renderer existed. Exactly the same shape, and the same
+  // justification, as EnsureTextureImage: being drawn is the definition of needing to be
+  // resident, and the buffer is the only thing that still knows what is in it.
+  //
+  // The read lock is safe for what it is used on: the buffers reaching this path are
+  // D3DPOOL_MANAGED, which keeps a system-memory copy by definition. `pool_` is recorded so
+  // that stays a checked fact rather than a hope - a DEFAULT-pool buffer is refused.
+  void SeedFromContents() {
+    if (seeded_ || slot_.valid || unconvertible_ || !vulkan::ResourcesReady()) {
+      return;
+    }
+    seeded_ = true;
+    if (pool_ != D3DPOOL_MANAGED && pool_ != D3DPOOL_SYSTEMMEM) {
+      ++vulkan::MutableDrawStats().seed_refused_pool;
+      return;
+    }
+    slot_ = vulkan::AllocateSlot(SlotBytes(), vertex_);
+    if (!slot_.valid) {
+      return;
+    }
+    BYTE *data = nullptr;
+    if (FAILED(LockForRead(&data)) || data == nullptr) {
+      ++vulkan::MutableDrawStats().seed_read_failures;
+      return;
+    }
+    locked_ = data;
+    locked_offset_ = 0;
+    locked_bytes_ = length_;
+    if (vertex_) {
+      UploadConvertedVertices();
+    } else if (!vulkan::UploadIntoSlot(slot_, 0, data, length_)) {
+      ++TheStats.failed_uploads;
+    }
+    locked_ = nullptr;
+    UnlockAfterRead();
+    ++vulkan::MutableDrawStats().buffers_seeded;
+  }
+
+  // The two buffer interfaces have the same Lock signature but no common base that declares
+  // it, so the leaf supplies these.
+  virtual HRESULT LockForRead(BYTE **data) = 0;
+  virtual void UnlockAfterRead() = 0;
+
+  uint32_t pool_ = D3DPOOL_MANAGED;
   // This buffer's own region of the arena, held for its whole lifetime and released in the
   // destructor. See BufferSlot in VkResources.h for why it is per-buffer and not per-upload.
   vulkan::BufferSlot slot_;
@@ -525,11 +988,18 @@ std::set<const void *> LiveVertexWrappers;
 std::set<const void *> LiveIndexWrappers;
 
 struct CaptureVertexBuffer final : BufferWrapper<IDirect3DVertexBuffer8> {
-  CaptureVertexBuffer(IDirect3DVertexBuffer8 *inner, uint32_t length, uint32_t fvf)
+  CaptureVertexBuffer(IDirect3DVertexBuffer8 *inner, uint32_t length, uint32_t fvf,
+                      uint32_t pool)
       : BufferWrapper(inner, length, true, fvf) {
+    pool_ = pool;
     LiveVertexWrappers.insert(this);
   }
   ~CaptureVertexBuffer() override { LiveVertexWrappers.erase(this); }
+
+  HRESULT LockForRead(BYTE **data) override {
+    return inner_->Lock(0, 0, data, D3DLOCK_READONLY);
+  }
+  void UnlockAfterRead() override { inner_->Unlock(); }
 
 #define GK_DECL(ret, name, params, args) ret STDMETHODCALLTYPE name params override;
   GK_IDIRECT3DVERTEXBUFFER8_METHODS(GK_DECL)
@@ -541,14 +1011,19 @@ struct CaptureIndexBuffer final : BufferWrapper<IDirect3DIndexBuffer8> {
   // because it is what the arena offset arithmetic needs, and because a 32-bit index buffer
   // cannot share the frame's single vkCmdBindIndexBuffer - a draw from one is skipped and
   // counted instead of being drawn with its indices misread as pairs of 16-bit ones.
-  CaptureIndexBuffer(IDirect3DIndexBuffer8 *inner, uint32_t length, uint32_t format)
-      : BufferWrapper(inner, length, false, 0),
-        index_stride_(format == 102 ? 4 : 2) {
+  CaptureIndexBuffer(IDirect3DIndexBuffer8 *inner, uint32_t length, uint32_t format,
+                     uint32_t pool)
+      : BufferWrapper(inner, length, false, 0) {
+    index_stride_ = format == 102 ? 4 : 2;
+    pool_ = pool;
     LiveIndexWrappers.insert(this);
   }
   ~CaptureIndexBuffer() override { LiveIndexWrappers.erase(this); }
 
-  uint32_t index_stride_ = 2;
+  HRESULT LockForRead(BYTE **data) override {
+    return inner_->Lock(0, 0, data, D3DLOCK_READONLY);
+  }
+  void UnlockAfterRead() override { inner_->Unlock(); }
 
 #define GK_DECL(ret, name, params, args) ret STDMETHODCALLTYPE name params override;
   GK_IDIRECT3DINDEXBUFFER8_METHODS(GK_DECL)
@@ -583,7 +1058,7 @@ HRESULT STDMETHODCALLTYPE CaptureVertexBuffer::Lock(UINT OffsetToLock, UINT Size
                                                      BYTE **ppbData, DWORD Flags) {
   const HRESULT hr = inner_->Lock(OffsetToLock, SizeToLock, ppbData, Flags);
   if (SUCCEEDED(hr)) {
-    NoteLock(OffsetToLock, SizeToLock, ppbData);
+    NoteLock(OffsetToLock, SizeToLock, ppbData, Flags);
   }
   return hr;
 }
@@ -597,7 +1072,7 @@ HRESULT STDMETHODCALLTYPE CaptureIndexBuffer::Lock(UINT OffsetToLock, UINT SizeT
                                                     BYTE **ppbData, DWORD Flags) {
   const HRESULT hr = inner_->Lock(OffsetToLock, SizeToLock, ppbData, Flags);
   if (SUCCEEDED(hr)) {
-    NoteLock(OffsetToLock, SizeToLock, ppbData);
+    NoteLock(OffsetToLock, SizeToLock, ppbData, Flags);
   }
   return hr;
 }
@@ -953,6 +1428,12 @@ bool EnsureTextureImage(CaptureTexture &texture) {
   return true;
 }
 
+void EnsureTextureImageForBinding(IDirect3DBaseTexture8 *texture) {
+  if (texture != nullptr && LiveTextureWrappers.count(texture) != 0) {
+    EnsureTextureImage(*static_cast<CaptureTexture *>(texture));
+  }
+}
+
 // Walks the cache records and names any texture that has acquired one since the last pass.
 // Driven from Present, because a record is populated at an unpredictable point after the
 // texture is created and there is no event for it.
@@ -1129,6 +1610,9 @@ HRESULT STDMETHODCALLTYPE CaptureD3D8::CreateDevice(
   }
 
   HaveDevice = true;
+  // The shadow state mirrors a device, so it starts when one does - and it must start at the
+  // API's defaults rather than at zero. See InitialiseShadowState.
+  InitialiseShadowState();
   DebugWrite("gkplus: d3d8 capture device created\n");
   auto *const captured = new CaptureDevice(device, this);
   // hDeviceWindow wins where it is set: hFocusWindow is allowed to be null for a windowed
@@ -1340,7 +1824,7 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::CreateVertexBuffer(
     return hr;
   }
   *ppVertexBuffer =
-      WrapVertexBuffers ? new CaptureVertexBuffer(buffer, Length, FVF) : buffer;
+      WrapVertexBuffers ? new CaptureVertexBuffer(buffer, Length, FVF, Pool) : buffer;
   return hr;
 }
 
@@ -1354,9 +1838,10 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::CreateIndexBuffer(
   if (FAILED(hr) || buffer == nullptr) {
     return hr;
   }
-  *ppIndexBuffer = WrapIndexBuffers ? new CaptureIndexBuffer(buffer, Length,
-                                                             static_cast<uint32_t>(Format))
-                                    : buffer;
+  *ppIndexBuffer =
+      WrapIndexBuffers ? new CaptureIndexBuffer(buffer, Length, static_cast<uint32_t>(Format),
+                                                static_cast<uint32_t>(Pool))
+                       : buffer;
   return hr;
 }
 
@@ -1461,8 +1946,19 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::SetViewport(const D3DVIEWPORT8 *pViewpo
   return inner_->SetViewport(pViewport);
 }
 
+// The three lighting setters are recorded straight into the shadow state rather than through
+// `Record`, i.e. they are deliberately NOT replayable from a state block. That is the same
+// narrowness the OpKind list already has, and it holds for the same measured reason: every
+// block is built by AwMaterial_Compile, which issues render states and stage states only. If
+// a light ever appeared inside one, the shadow state would go stale after an Apply with
+// nothing to notice - so `render.state` prints the counts, which is what would show it.
 HRESULT STDMETHODCALLTYPE CaptureDevice::SetMaterial(const D3DMATERIAL8 *pMaterial) {
   NoteBlockState();
+  if (pMaterial != nullptr) {
+    State.material = *pMaterial;
+    State.have_material = true;
+    ++MaterialSets;
+  }
   return inner_->SetMaterial(pMaterial);
 }
 
@@ -1471,6 +1967,12 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::SetLight(DWORD Index, const D3DLIGHT8 *
   if (Index > TheStats.max_light_index) {
     TheStats.max_light_index = Index;
   }
+  if (Index < kLights && pLight != nullptr) {
+    State.lights[Index] = *pLight;
+    State.light_set[Index] = true;
+    ++LightGeneration;
+  }
+  ++LightSets;
   return inner_->SetLight(Index, pLight);
 }
 
@@ -1479,6 +1981,10 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::LightEnable(DWORD Index, BOOL Enable) {
   if (Index > TheStats.max_light_index) {
     TheStats.max_light_index = Index;
   }
+  if (Index < kLights) {
+    State.light_enabled[Index] = Enable != FALSE;
+  }
+  ++LightEnables;
   return inner_->LightEnable(Index, Enable);
 }
 
@@ -1489,6 +1995,18 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::SetRenderState(D3DRENDERSTATETYPE State
       static_cast<uint32_t>(Value));
   Record({OpKind::RenderState, static_cast<uint32_t>(State), 0,
           static_cast<uint32_t>(Value), nullptr});
+  // GKPLUS_NO_LIGHTING=1: hold D3DRS_LIGHTING off in the forwarded call only. This is a
+  // measuring instrument, not a feature - it makes the game's OWN renderer draw the scene
+  // without the one thing the Vulkan path is missing, which is the only way to tell "our
+  // renderer is missing lighting" apart from "our renderer is wrong in some other way that
+  // happens to look flat". The shadow state still records the true value, so `render.state`
+  // does not start lying while it is set.
+  if (ForceLightingOff && State == D3DRS_LIGHTING) {
+    Value = FALSE;
+  }
+  if (ForceSpecularOff && State == D3DRS_SPECULARENABLE) {
+    Value = FALSE;
+  }
   return inner_->SetRenderState(State, Value);
 }
 
@@ -1500,13 +2018,9 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::SetTexture(DWORD Stage,
   }
   // The shadow state keeps the WRAPPER, because the material key hashes pointer identity and
   // the wrapper is what the game consistently hands us. Only the device sees the inner one.
+  // Giving the texture its image happens in ApplyOp, which this reaches through Record - see
+  // there for why it cannot live here.
   Record({OpKind::Texture, Stage, 0, 0, pTexture});
-  // Being bound is the definition of "this texture will be sampled", so it is the right
-  // trigger for giving it an image - and the only one that covers a texture the game never
-  // blits into. `EnsureTextureImage` is a single predictable branch once the image exists.
-  if (pTexture != nullptr && LiveTextureWrappers.count(pTexture) != 0) {
-    EnsureTextureImage(*static_cast<CaptureTexture *>(pTexture));
-  }
   return inner_->SetTexture(Stage, UnwrapTexture(pTexture));
 }
 
@@ -1557,6 +2071,12 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::SetTextureStageState(
       static_cast<uint32_t>(Value));
   Record({OpKind::StageState, Stage, static_cast<uint32_t>(Type),
           static_cast<uint32_t>(Value), nullptr});
+  // GKPLUS_NO_STAGE1=1: disable every stage past the first in the forwarded call. A state
+  // block records what is forwarded, so a block built while this is set carries the disable
+  // too and ApplyStateBlock cannot put the stage back.
+  if (ForceStage1Off && Stage >= 1 && Type == D3DTSS_COLOROP) {
+    Value = D3DTOP_DISABLE;
+  }
   return inner_->SetTextureStageState(Stage, Type, Value);
 }
 
@@ -1770,20 +2290,448 @@ bool BuildMvp(uint32_t fvf, float *out) {
   return true;
 }
 
-// The bindless slot and sampler for stage 0. Only one stage for now: §4.7 measured at most two
-// active, and the second is a lightmap the übershader will handle - drawing stage 0 alone is
-// the honest first cut rather than silently blending something wrong.
-void ResolveStage0(uint32_t &texture_index, uint32_t &sampler_index) {
-  texture_index = vulkan::kNoTexture;
-  sampler_index = 0;
-  IDirect3DBaseTexture8 *const bound = State.textures[0];
-  if (bound == nullptr || LiveTextureWrappers.count(bound) == 0) {
+// The texture stages this draw is configured with, as the shader consumes them.
+//
+// §4.19 is why this exists at all: drawing stage 0 alone left level01 flat and bright, because
+// the darkness of a Gunlok cavern is the SECOND stage - a lightmap blended over the diffuse
+// texture with BLENDTEXTUREALPHA or ADDSIGNED. Neither fog nor D3D lighting was involved, and
+// both were ruled out by making the game's own renderer draw without them.
+//
+// The stage count comes from D3DTSS_COLOROP, not from what is bound: a texture left over at
+// stage 0 with the stage disabled must not be sampled, which is 2,160 draws a frame on
+// level01.
+uint32_t PackStageOp(uint32_t op, uint32_t arg1, uint32_t arg2, uint32_t texcoord) {
+  return (op & 0xffu) | ((arg1 & 0xffu) << 8) | ((arg2 & 0xffu) << 16) |
+         ((texcoord & 0xffu) << 24);
+}
+
+// Every D3DTEXTUREOP world.slang implements. An op outside this set still draws - the shader
+// falls back to its first argument - but the draw is counted, so "the picture is subtly wrong"
+// has a number attached rather than being something to notice by eye.
+bool StageOpImplemented(uint32_t op) {
+  switch (op) {
+  case D3DTOP_SELECTARG1:
+  case D3DTOP_SELECTARG2:
+  case D3DTOP_MODULATE:
+  case D3DTOP_MODULATE2X:
+  case D3DTOP_MODULATE4X:
+  case D3DTOP_ADD:
+  case D3DTOP_ADDSIGNED:
+  case D3DTOP_ADDSIGNED2X:
+  case D3DTOP_SUBTRACT:
+  case D3DTOP_BLENDDIFFUSEALPHA:
+  case D3DTOP_BLENDTEXTUREALPHA:
+  case D3DTOP_BLENDCURRENTALPHA:
+    return true;
+  default:
+    return false;
+  }
+}
+
+// The pipeline state and the alpha test, straight out of the shadow state. Both come from the
+// same place and are filled together because the split between them is an implementation
+// detail of the renderer - D3D has one set of render states, and which of them end up in a
+// VkPipeline rather than in the shader is our decision, not the game's.
+// How many indices - or, for a non-indexed draw, vertices - `primitives` of this topology
+// need. Returns 0 for a primitive type the renderer does not draw, which is how a caller
+// refuses rather than drawing a wrong-length draw.
+bool TopologyEnabled(D3DPRIMITIVETYPE type) {
+  switch (type) {
+  case D3DPT_TRIANGLELIST:  return true;
+  case D3DPT_TRIANGLESTRIP: return DrawStrips;
+  case D3DPT_LINELIST:      return DrawLines;
+  default:                  return false;
+  }
+}
+
+uint32_t ElementCount(D3DPRIMITIVETYPE type, uint32_t primitives) {
+  if (primitives == 0) {
+    return 0;
+  }
+  switch (type) {
+  case D3DPT_POINTLIST:     return primitives;
+  case D3DPT_LINELIST:      return primitives * 2;
+  case D3DPT_LINESTRIP:     return primitives + 1;
+  case D3DPT_TRIANGLELIST:  return primitives * 3;
+  case D3DPT_TRIANGLESTRIP: return primitives + 2;
+  case D3DPT_TRIANGLEFAN:   return primitives + 2;
+  default:                  return 0;
+  }
+}
+
+void ResolvePipeline(vulkan::DrawItem &item, D3DPRIMITIVETYPE type) {
+  item.pipeline.topology = static_cast<uint32_t>(type);
+  item.pipeline.blend_enable = State.render_states[D3DRS_ALPHABLENDENABLE];
+  item.pipeline.src_blend = State.render_states[D3DRS_SRCBLEND];
+  item.pipeline.dest_blend = State.render_states[D3DRS_DESTBLEND];
+  item.pipeline.depth_test = State.render_states[D3DRS_ZENABLE];
+  item.pipeline.depth_write = State.render_states[D3DRS_ZWRITEENABLE];
+  item.pipeline.depth_func = State.render_states[D3DRS_ZFUNC];
+  item.pipeline.cull_mode = State.render_states[D3DRS_CULLMODE];
+  item.pipeline.colour_write = State.render_states[D3DRS_COLORWRITEENABLE];
+  item.pipeline.stencil_enable = State.render_states[D3DRS_STENCILENABLE];
+  item.pipeline.stencil_func = State.render_states[D3DRS_STENCILFUNC];
+  item.pipeline.stencil_fail = State.render_states[D3DRS_STENCILFAIL];
+  item.pipeline.stencil_zfail = State.render_states[D3DRS_STENCILZFAIL];
+  item.pipeline.stencil_pass = State.render_states[D3DRS_STENCILPASS];
+  // Dynamic state on the Vulkan side, so it rides on the item rather than in the pipeline key.
+  item.stencil_ref = State.render_states[D3DRS_STENCILREF];
+  item.stencil_mask = State.render_states[D3DRS_STENCILMASK];
+  item.stencil_write_mask = State.render_states[D3DRS_STENCILWRITEMASK];
+
+  if (State.render_states[D3DRS_ALPHATESTENABLE] != 0) {
+    item.flags = (State.render_states[D3DRS_ALPHAFUNC] & 0xfu) |
+                 ((State.render_states[D3DRS_ALPHAREF] & 0xffu) << 8);
+  }
+}
+
+// What fixed-function lighting turns this draw's vertex colour into, for the ONE case the
+// renderer used to handle: lighting on, a vertex with no colour of its own, and no light
+// enabled. D3D's equation
+//
+//     colour = emissive + ambient_material * global_ambient + SUM over lights(...)
+//
+// collapses there to the material's EMISSIVE, a single colour per draw, with the alpha coming
+// from the diffuse source. It is what makes Gunlok's HUD panels green: they carry no vertex
+// colour at all (FVF 0x112 and 0x212), so the material is the only thing that colours them, and
+// rendering the vertex default of white instead showed the source art in its own colours - a
+// perfectly plausible picture, and not the game's (§4.20).
+//
+// Kept, although the real sum below subsumes it, because it is the *previous build's* answer:
+// `render.lighting = false` selects it, and that is what makes the light sum comparable on one
+// paused frame rather than across two launches (§4.21's noise floor is 8.06/255).
+uint32_t LitVertexColour() {
+  const D3DMATERIAL8 &m = State.material;
+  const uint32_t ambient = State.render_states[D3DRS_AMBIENT];
+  auto channel = [](float value) {
+    const float clamped = value < 0.0f ? 0.0f : (value > 1.0f ? 1.0f : value);
+    return static_cast<uint32_t>(clamped * 255.0f + 0.5f);
+  };
+  const float global_r = static_cast<float>((ambient >> 16) & 0xff) / 255.0f;
+  const float global_g = static_cast<float>((ambient >> 8) & 0xff) / 255.0f;
+  const float global_b = static_cast<float>(ambient & 0xff) / 255.0f;
+  // The alpha of a lit vertex comes from the diffuse source. D3DMCS_COLOR1 would make that the
+  // vertex's own, but this only runs where the vertex has none, so D3D falls back to the
+  // material - and the HUD's alpha is genuinely in there: 0x80, 0x99, 0xcc.
+  const uint32_t alpha = channel(m.Diffuse.a);
+  return (alpha << 24) | (channel(m.Emissive.r + m.Ambient.r * global_r) << 16) |
+         (channel(m.Emissive.g + m.Ambient.g * global_g) << 8) |
+         channel(m.Emissive.b + m.Ambient.b * global_b);
+}
+
+// --- the light sum's inputs ------------------------------------------------------------------
+
+void StoreColour(float *out, const D3DCOLORVALUE &colour) {
+  out[0] = colour.r;
+  out[1] = colour.g;
+  out[2] = colour.b;
+  out[3] = colour.a;
+}
+
+// A D3DCOLOR as four floats, for D3DRS_AMBIENT - which is a packed colour where every other
+// lighting input is a float quad.
+void StorePackedColour(float *out, uint32_t packed) {
+  out[0] = static_cast<float>((packed >> 16) & 0xff) / 255.0f;
+  out[1] = static_cast<float>((packed >> 8) & 0xff) / 255.0f;
+  out[2] = static_cast<float>(packed & 0xff) / 255.0f;
+  out[3] = static_cast<float>((packed >> 24) & 0xff) / 255.0f;
+}
+
+// The inverse transpose of `world`'s upper 3x3, written as three rows of four so it keeps the
+// float4 stride the whole record uses. That is the transform a normal takes: the 3x3 alone is
+// only right when the world matrix has no scale, and a unit's does.
+//
+// A singular 3x3 falls back to the matrix itself rather than producing infinities - it cannot
+// happen for a transform the game draws with, and a NaN normal would take the whole draw's
+// colour with it rather than failing where it was made.
+void StoreNormalTransform(float *out, const D3DMATRIX &world) {
+  const float(&m)[4][4] = world.m;
+  const float c00 = m[1][1] * m[2][2] - m[1][2] * m[2][1];
+  const float c01 = m[1][2] * m[2][0] - m[1][0] * m[2][2];
+  const float c02 = m[1][0] * m[2][1] - m[1][1] * m[2][0];
+  const float determinant = m[0][0] * c00 + m[0][1] * c01 + m[0][2] * c02;
+  if (determinant > -1e-12f && determinant < 1e-12f) {
+    for (int row = 0; row < 3; ++row) {
+      for (int col = 0; col < 3; ++col) {
+        out[row * 4 + col] = m[row][col];
+      }
+      out[row * 4 + 3] = 0.0f;
+    }
     return;
   }
-  auto &texture = *static_cast<CaptureTexture *>(bound);
-  if (texture.image_.valid) {
-    texture_index = texture.image_.index;
-    sampler_index = StageSampler(0);
+  // The cofactor matrix over the determinant IS the inverse transpose: cofactor[r][c] belongs
+  // at [r][c] of adjugate-transpose, so no further transposition is needed here.
+  const float inverse = 1.0f / determinant;
+  const float cofactor[3][3] = {
+      {c00, c01, c02},
+      {m[0][2] * m[2][1] - m[0][1] * m[2][2], m[0][0] * m[2][2] - m[0][2] * m[2][0],
+       m[0][1] * m[2][0] - m[0][0] * m[2][1]},
+      {m[0][1] * m[1][2] - m[0][2] * m[1][1], m[0][2] * m[1][0] - m[0][0] * m[1][2],
+       m[0][0] * m[1][1] - m[0][1] * m[1][0]},
+  };
+  for (int row = 0; row < 3; ++row) {
+    for (int col = 0; col < 3; ++col) {
+      out[row * 4 + col] = cofactor[row][col] * inverse;
+    }
+    out[row * 4 + 3] = 0.0f;
+  }
+}
+
+// The camera in world space, for the specular halfway vector. The view matrix is world->view
+// and rigid, so its rotation inverts by transposition and the eye is the negated translation
+// carried back through it.
+void StoreEye(float *out, const D3DMATRIX &view) {
+  const float(&m)[4][4] = view.m;
+  out[0] = -(m[3][0] * m[0][0] + m[3][1] * m[0][1] + m[3][2] * m[0][2]);
+  out[1] = -(m[3][0] * m[1][0] + m[3][1] * m[1][1] + m[3][2] * m[1][2]);
+  out[2] = -(m[3][0] * m[2][0] + m[3][1] * m[2][1] + m[3][2] * m[2][2]);
+  out[3] = 1.0f;
+}
+
+// The frame's light array, deduplicated by enable mask.
+//
+// Worth doing rather than appending per draw: `LightEnable` is called 118 million times a
+// session (§4.25), lights are switched on and off around individual draws, and the same handful
+// of masks recur - so this turns "up to eight records per draw" into a handful per frame. The
+// generation is what keeps it honest when a light's *contents* change under an unchanged mask.
+struct LightRun {
+  uint32_t offset = 0;
+  uint32_t count = 0;
+};
+
+std::map<uint32_t, LightRun> LightRunByMask;
+uint64_t LightRunFrame = UINT64_MAX;
+uint64_t LightRunGeneration = UINT64_MAX;
+
+void StoreLight(vulkan::GpuLight &out, const D3DLIGHT8 &light) {
+  out.position[0] = light.Position.x;
+  out.position[1] = light.Position.y;
+  out.position[2] = light.Position.z;
+  out.position[3] = 1.0f;
+  // Normalised here rather than in the shader: it is per draw rather than per vertex, and D3D
+  // does not require the game to hand it a unit vector.
+  const float length = std::sqrt(light.Direction.x * light.Direction.x +
+                                 light.Direction.y * light.Direction.y +
+                                 light.Direction.z * light.Direction.z);
+  const float scale = length > 1e-8f ? 1.0f / length : 0.0f;
+  out.direction[0] = light.Direction.x * scale;
+  out.direction[1] = light.Direction.y * scale;
+  out.direction[2] = light.Direction.z * scale;
+  out.direction[3] = 0.0f;
+  StoreColour(out.diffuse, light.Diffuse);
+  StoreColour(out.specular, light.Specular);
+  StoreColour(out.ambient, light.Ambient);
+  out.attenuation[0] = light.Attenuation0;
+  out.attenuation[1] = light.Attenuation1;
+  out.attenuation[2] = light.Attenuation2;
+  // A directional light has no range, and D3D ignores the field for one. Left as the light's
+  // own value anyway, because the shader never reads it on that path.
+  out.attenuation[3] = light.Range;
+  out.spot[0] = std::cos(light.Theta * 0.5f);
+  out.spot[1] = std::cos(light.Phi * 0.5f);
+  out.spot[2] = light.Falloff;
+  out.spot[3] = static_cast<float>(light.Type);
+}
+
+// Writes this draw's enabled lights into the frame's array and returns where they landed.
+// `count` comes back 0 when nothing is enabled, which is a legitimate and common state - the
+// draw is then lit by the emissive and global ambient terms alone.
+void ResolveLightRun(uint64_t frame, uint32_t &offset, uint32_t &count) {
+  offset = 0;
+  count = 0;
+  uint32_t mask = 0;
+  for (uint32_t i = 0; i < kLights; ++i) {
+    if (State.light_enabled[i] && State.light_set[i]) {
+      mask |= 1u << i;
+    }
+  }
+  if (mask == 0) {
+    return;
+  }
+  // The cache lives inside one frame and one light generation, because the scratch it indexes
+  // into is emptied every frame and its contents are only right for the lights as they stood.
+  if (frame != LightRunFrame || LightGeneration != LightRunGeneration) {
+    LightRunByMask.clear();
+    LightRunFrame = frame;
+    LightRunGeneration = LightGeneration;
+  }
+  const auto found = LightRunByMask.find(mask);
+  if (found != LightRunByMask.end()) {
+    offset = found->second.offset;
+    count = found->second.count;
+    return;
+  }
+
+  uint32_t enabled = 0;
+  for (uint32_t i = 0; i < kLights; ++i) {
+    enabled += (mask & (1u << i)) != 0 ? 1u : 0u;
+  }
+  const vulkan::ScratchAlloc alloc = vulkan::AllocateScratchLights(enabled);
+  if (!alloc.valid) {
+    vulkan::MutableDrawStats().dropped_lights += enabled;
+    return;
+  }
+  auto *lights = static_cast<vulkan::GpuLight *>(alloc.mapped);
+  uint32_t written = 0;
+  for (uint32_t i = 0; i < kLights; ++i) {
+    if ((mask & (1u << i)) != 0) {
+      StoreLight(lights[written++], State.lights[i]);
+    }
+  }
+  offset = alloc.offset;
+  count = written;
+  LightRunByMask[mask] = LightRun{offset, written};
+}
+
+// Builds this draw's GpuDrawRecord and points the item at it. False means the frame's record
+// scratch is full, which is a reason to skip the draw rather than to draw it against whatever
+// record happens to be at index 0.
+//
+// This is where the fixed-function lighting state is SNAPSHOT, and per draw is the only place
+// it can be: `render.state` samples between frames and sees every light off, which is what made
+// the original A/B read as null and cost §4.19 its second headline claim. The state a per-draw
+// quantity has between frames is not the state it has at any draw.
+bool BuildDrawRecord(vulkan::DrawItem &item, const float *mvp, uint64_t frame) {
+  const vulkan::ScratchAlloc alloc = vulkan::AllocateScratchDraws(1);
+  if (!alloc.valid) {
+    return false;
+  }
+  auto &record = *static_cast<vulkan::GpuDrawRecord *>(alloc.mapped);
+  record = vulkan::GpuDrawRecord{};
+  item.record = alloc.offset;
+  std::memcpy(record.mvp, mvp, sizeof(record.mvp));
+
+  // A pre-transformed vertex is never lit: it is already in screen space, and D3D takes its
+  // colour straight from the vertex. Everything below would be meaningless for it.
+  constexpr uint32_t kXyzRhw = 0x004;
+  const bool pre_transformed = (State.fvf & kXyzRhw) == kXyzRhw;
+  if (pre_transformed || State.render_states[D3DRS_LIGHTING] == 0) {
+    return true;
+  }
+
+  // D3D8 documents no default material, and every colour in the equation comes from one - so a
+  // draw issued before the game's first SetMaterial would light to black rather than to
+  // anything defensible. Those keep the vertex colour, which is what the renderer did for every
+  // draw until now and therefore cannot be a regression. The counter says whether it ever
+  // happens after the first material, which would mean this guard is hiding something.
+  if (!State.have_material) {
+    ++vulkan::MutableDrawStats().lit_draws_without_material;
+    return true;
+  }
+
+  if (!DrawLightSum) {
+    // The previous build's behaviour, for the run-time A/B: the material collapse, and only
+    // where the vertex has no colour of its own.
+    if (!SkipLitColour && (State.fvf & D3DFVF_DIFFUSE) == 0) {
+      bool any_light = false;
+      for (uint32_t i = 0; i < kLights; ++i) {
+        any_light = any_light || State.light_enabled[i];
+      }
+      if (!any_light) {
+        record.lighting |= vulkan::kLitCollapse;
+        record.lit_colour = LitVertexColour();
+      }
+    }
+    return true;
+  }
+
+  const D3DMATRIX identity = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  const D3DMATRIX &world = State.have_world ? State.world : identity;
+  std::memcpy(record.world, &world, sizeof(record.world));
+  StoreNormalTransform(record.normal_transform, world);
+  StoreEye(record.eye, State.have_view ? State.view : identity);
+
+  StoreColour(record.material_ambient, State.material.Ambient);
+  StoreColour(record.material_diffuse, State.material.Diffuse);
+  StoreColour(record.material_specular, State.material.Specular);
+  record.material_specular[3] = State.material.Power;
+  StoreColour(record.material_emissive, State.material.Emissive);
+  StorePackedColour(record.global_ambient, State.render_states[D3DRS_AMBIENT]);
+
+  uint32_t lighting = vulkan::kLightSum;
+  if (State.render_states[D3DRS_NORMALIZENORMALS] != 0) {
+    lighting |= vulkan::kNormaliseNormals;
+  }
+  if (State.render_states[D3DRS_SPECULARENABLE] != 0) {
+    lighting |= vulkan::kSpecularEnable;
+  }
+  if (State.render_states[D3DRS_COLORVERTEX] != 0) {
+    lighting |= vulkan::kColourVertex;
+  }
+  if ((State.fvf & D3DFVF_DIFFUSE) != 0) {
+    lighting |= vulkan::kVertexColour;
+  }
+  const uint32_t sources[4] = {
+      State.render_states[D3DRS_DIFFUSEMATERIALSOURCE] & 3u,
+      State.render_states[D3DRS_AMBIENTMATERIALSOURCE] & 3u,
+      State.render_states[D3DRS_SPECULARMATERIALSOURCE] & 3u,
+      State.render_states[D3DRS_EMISSIVEMATERIALSOURCE] & 3u,
+  };
+  lighting |= sources[0] << vulkan::kDiffuseSourceShift;
+  lighting |= sources[1] << vulkan::kAmbientSourceShift;
+  lighting |= sources[2] << vulkan::kSpecularSourceShift;
+  lighting |= sources[3] << vulkan::kEmissiveSourceShift;
+  // D3DMCS_COLOR2 asks for the specular vertex colour, which the canonical vertex drops - but
+  // only a draw whose FVF actually declares one loses anything, because D3D itself falls back
+  // to the material where the vertex has no such colour. Gunlok sets SPECULARMATERIALSOURCE to
+  // COLOR2 (the API default) on every draw, so testing the state alone counted all 1.35M of
+  // them and said nothing; the FVF test is what makes this a defect counter.
+  //
+  // It reads 0, and that is a *structural* result rather than luck: the only FVF the game emits
+  // with D3DFVF_SPECULAR is 0x1c4, which is D3DFVF_XYZRHW - pre-transformed, and therefore
+  // never lit at all. The fallback is exact for every draw that is actually lit.
+  if ((State.fvf & D3DFVF_SPECULAR) != 0) {
+    for (const uint32_t source : sources) {
+      if (source == D3DMCS_COLOR2) {
+        ++vulkan::MutableDrawStats().lit_draws_wanting_colour2;
+        break;
+      }
+    }
+  }
+  record.lighting = lighting;
+
+  ResolveLightRun(frame, record.light_offset, record.light_count);
+  ++vulkan::MutableDrawStats().lit_draws;
+  if (record.light_count != 0) {
+    ++vulkan::MutableDrawStats().lit_draws_with_lights;
+  }
+  return true;
+}
+
+void ResolveStages(vulkan::DrawItem &item) {
+  const uint32_t active = ActiveStages();
+  item.stage_count = (std::min)(active, 2u);
+  if (active > 2) {
+    ++vulkan::MutableDrawStats().truncated_stages;
+  }
+  for (uint32_t i = 0; i < item.stage_count; ++i) {
+    const uint32_t *s = State.stage_states[i];
+    vulkan::DrawStage &stage = item.stages[i];
+    stage.color = PackStageOp(s[D3DTSS_COLOROP], s[D3DTSS_COLORARG1], s[D3DTSS_COLORARG2],
+                              s[D3DTSS_TEXCOORDINDEX]);
+    stage.alpha = PackStageOp(s[D3DTSS_ALPHAOP], s[D3DTSS_ALPHAARG1], s[D3DTSS_ALPHAARG2], 0);
+    if (!StageOpImplemented(s[D3DTSS_COLOROP]) || !StageOpImplemented(s[D3DTSS_ALPHAOP])) {
+      ++vulkan::MutableDrawStats().unsupported_stage_op;
+    }
+
+    IDirect3DBaseTexture8 *const bound = State.textures[i];
+    if (bound == nullptr) {
+      continue;
+    }
+    if (LiveTextureWrappers.count(bound) == 0) {
+      ++vulkan::MutableDrawStats().stage_texture_unresolved;
+      ++UnresolvedForeign[i];
+      continue;
+    }
+    auto &texture = *static_cast<CaptureTexture *>(bound);
+    if (texture.image_.valid) {
+      stage.texture_index = texture.image_.index;
+      stage.sampler_index = StageSampler(i);
+    } else {
+      ++vulkan::MutableDrawStats().stage_texture_unresolved;
+      ++UnresolvedNoImage[i];
+      ++UnresolvedFormats[(uint64_t(texture.pool_) << 32) | texture.format_];
+    }
   }
 }
 
@@ -1792,7 +2740,8 @@ void CaptureDevice::EmitDraw(D3DPRIMITIVETYPE type, UINT start_index,
   if (!vulkan::DrawReady()) {
     return;
   }
-  if (type != D3DPT_TRIANGLELIST) {
+  const uint32_t elements = TopologyEnabled(type) ? ElementCount(type, primitive_count) : 0;
+  if (elements == 0) {
     ++vulkan::MutableDrawStats().skipped_topology;
     return;
   }
@@ -1801,21 +2750,57 @@ void CaptureDevice::EmitDraw(D3DPRIMITIVETYPE type, UINT start_index,
   if (stream0_ == nullptr || indices_ == nullptr ||
       LiveVertexWrappers.count(stream0_) == 0 || LiveIndexWrappers.count(indices_) == 0) {
     ++vulkan::MutableDrawStats().skipped_no_slot;
+    ++vulkan::MutableDrawStats().skipped_foreign_stream;
     return;
   }
   auto &vertex_buffer = *static_cast<CaptureVertexBuffer *>(stream0_);
   auto &index_buffer = *static_cast<CaptureIndexBuffer *>(indices_);
-  if (!vertex_buffer.slot_.valid || !index_buffer.slot_.valid ||
-      index_buffer.index_stride_ != 2) {
+  // A buffer whose only Unlock happened before the renderer existed has no slot and will never
+  // be unlocked again. Being drawn is the definition of needing to be resident, so it seeds
+  // itself from its own contents here - once, whether or not that works.
+  if (!SkipSeeding) {
+    vertex_buffer.SeedFromContents();
+    index_buffer.SeedFromContents();
+  }
+  // A live scratch version stands in for the slot: it is where this draw's contents actually
+  // are, so a buffer that has one is resident whatever the arena did.
+  const bool vertices_resident =
+      vertex_buffer.slot_.valid || vertex_buffer.version_frame_ == TheStats.frames;
+  const bool indices_resident =
+      index_buffer.slot_.valid || index_buffer.version_frame_ == TheStats.frames;
+  if (!vertices_resident || !indices_resident || index_buffer.index_stride_ != 2) {
     ++vulkan::MutableDrawStats().skipped_no_slot;
+    if (!vertex_buffer.slot_.valid) {
+      ++vulkan::MutableDrawStats().skipped_unslotted_vertices;
+      if (vertex_buffer.unlocks_ == 0) {
+        ++vulkan::MutableDrawStats().skipped_never_unlocked;
+      }
+      ++UnslottedVertexBuffers[(uint64_t(vertex_buffer.fvf_) << 32) | vertex_buffer.length_];
+    } else if (!index_buffer.slot_.valid) {
+      ++vulkan::MutableDrawStats().skipped_unslotted_indices;
+    } else {
+      ++vulkan::MutableDrawStats().skipped_index_stride;
+    }
     return;
   }
 
   vulkan::DrawItem item = {};
-  if (!BuildMvp(State.fvf, item.mvp)) {
+  float mvp[16] = {};
+  if (!BuildMvp(State.fvf, mvp)) {
     ++vulkan::MutableDrawStats().skipped_no_transform;
     return;
   }
+  // Noted for the rewrite test in UploadLocked: this draw reads whatever the slot holds at
+  // Present, so a lock arriving after it is an aliasing hazard rather than an ordinary update.
+  auto note_drawn = [](auto &buffer) {
+    if (buffer.drawn_frame_ != TheStats.frames) {
+      buffer.drawn_frame_ = TheStats.frames;
+      buffer.draws_this_frame_ = 0;
+    }
+    ++buffer.draws_this_frame_;
+  };
+  note_drawn(vertex_buffer);
+  note_drawn(index_buffer);
   // Both offsets are absolute into the one arena, which is what lets the renderer bind the
   // index buffer once for the whole frame and never bind a vertex buffer at all.
   //
@@ -1823,13 +2808,33 @@ void CaptureDevice::EmitDraw(D3DPRIMITIVETYPE type, UINT start_index,
   // the same D3D semantics - the raw index, with the base excluded. So the base is folded in
   // here and `vkCmdDrawIndexed` is given a vertexOffset of 0. Passing it to Vulkan instead
   // would add it twice on any driver where gl_BaseVertex reads back as 0.
-  item.base_vertex =
-      vertex_buffer.slot_.offset / static_cast<uint32_t>(sizeof(vulkan::CanonicalVertex)) +
-      base_vertex_;
-  item.first_index = index_buffer.slot_.offset / 2 + start_index;
-  item.count = primitive_count * 3;
+  //
+  // A buffer refilled after an earlier draw this frame has its later version in the frame's
+  // scratch instead of the slot (§4.23), and this draw is one of the later ones - so it reads
+  // from there. Both offsets are already absolute within whichever buffer they name.
+  if (vertex_buffer.version_frame_ == TheStats.frames) {
+    item.vertex_source = vulkan::DrawSource::Scratch;
+    item.base_vertex = vertex_buffer.version_offset_ + base_vertex_;
+  } else {
+    item.base_vertex =
+        vertex_buffer.slot_.offset / static_cast<uint32_t>(sizeof(vulkan::CanonicalVertex)) +
+        base_vertex_;
+  }
+  if (index_buffer.version_frame_ == TheStats.frames) {
+    item.index_source = vulkan::DrawSource::Scratch;
+    item.first_index = index_buffer.version_offset_ + start_index;
+  } else {
+    item.first_index = index_buffer.slot_.offset / 2 + start_index;
+  }
+  item.count = elements;
   item.vertex_offset = 0;
-  ResolveStage0(item.texture_index, item.sampler_index);
+  ResolveStages(item);
+  ResolvePipeline(item, type);
+  // Last, so a draw that is going to be skipped for any other reason does not consume a record.
+  if (!BuildDrawRecord(item, mvp, TheStats.frames)) {
+    ++vulkan::MutableDrawStats().skipped_no_record;
+    return;
+  }
   vulkan::SubmitDraw(item);
 }
 
@@ -1850,7 +2855,8 @@ void CaptureDevice::EmitDrawUP(D3DPRIMITIVETYPE type, UINT primitive_count,
   if (!vulkan::DrawReady()) {
     return;
   }
-  if (type != D3DPT_TRIANGLELIST) {
+  const uint32_t elements = TopologyEnabled(type) ? ElementCount(type, primitive_count) : 0;
+  if (elements == 0) {
     ++vulkan::MutableDrawStats().skipped_topology;
     return;
   }
@@ -1860,15 +2866,17 @@ void CaptureDevice::EmitDrawUP(D3DPRIMITIVETYPE type, UINT primitive_count,
   }
 
   vulkan::DrawItem item = {};
-  if (!BuildMvp(State.fvf, item.mvp)) {
+  float mvp[16] = {};
+  if (!BuildMvp(State.fvf, mvp)) {
     ++vulkan::MutableDrawStats().skipped_no_transform;
     return;
   }
-  item.source = vulkan::DrawSource::Scratch;
+  item.vertex_source = vulkan::DrawSource::Scratch;
+  item.index_source = vulkan::DrawSource::Scratch;
 
-  const uint32_t indices = primitive_count * 3;
   // A non-indexed draw names its vertices directly; an indexed one is given a vertex count of
   // its own, because the indices may reach further than the primitives suggest.
+  const uint32_t indices = elements;
   const uint32_t vertices = index_data != nullptr ? vertex_count : indices;
   const vulkan::ScratchAlloc vertex_scratch = vulkan::AllocateScratchVertices(vertices);
   if (!vertex_scratch.valid) {
@@ -1881,6 +2889,9 @@ void CaptureDevice::EmitDrawUP(D3DPRIMITIVETYPE type, UINT primitive_count,
     ++vulkan::MutableDrawStats().skipped_unconvertible;
     return;
   }
+  ++FirstVertexColours[(uint64_t(State.fvf) << 32) |
+                       static_cast<const vulkan::CanonicalVertex *>(vertex_scratch.mapped)
+                           ->color];
   item.base_vertex = vertex_scratch.offset;
   item.count = indices;
 
@@ -1900,12 +2911,76 @@ void CaptureDevice::EmitDrawUP(D3DPRIMITIVETYPE type, UINT primitive_count,
     item.index_stride = static_cast<uint8_t>(stride);
   }
 
-  ResolveStage0(item.texture_index, item.sampler_index);
+  ResolveStages(item);
+  ResolvePipeline(item, type);
+  if (!BuildDrawRecord(item, mvp, TheStats.frames)) {
+    ++vulkan::MutableDrawStats().skipped_no_record;
+    return;
+  }
   vulkan::SubmitDraw(item);
 }
 
-void CountDraw(D3DPRIMITIVETYPE type, bool user_pointer) {
+// Recorded whether or not the draw is drawn, so the description is available while the
+// topologies are switched off - which is the state they are shipped in.
+void NoteOddTopology(D3DPRIMITIVETYPE type, bool user_pointer, uint32_t primitives,
+                     const void *vertex_data, uint32_t vertex_stride, uint32_t vertex_count) {
+  if (type == D3DPT_TRIANGLELIST) {
+    return;
+  }
+  OddTopology odd;
+  odd.type = static_cast<uint32_t>(type);
+  odd.fvf = State.fvf;
+  odd.user_pointer = user_pointer ? 1u : 0u;
+  odd.primitives = primitives;
+  odd.stages = ActiveStages();
+  odd.texture_index = vulkan::kNoTexture;
+  IDirect3DBaseTexture8 *const bound = State.textures[0];
+  if (bound != nullptr && LiveTextureWrappers.count(bound) != 0) {
+    auto &texture = *static_cast<CaptureTexture *>(bound);
+    if (texture.image_.valid) {
+      odd.texture_index = texture.image_.index;
+    }
+  }
+  odd.blend = State.render_states[D3DRS_ALPHABLENDENABLE];
+  odd.depth_test = State.render_states[D3DRS_ZENABLE];
+  odd.stencil = State.render_states[D3DRS_STENCILENABLE];
+  odd.stencil_func = State.render_states[D3DRS_STENCILFUNC];
+  odd.stencil_ref = State.render_states[D3DRS_STENCILREF];
+  if (vertex_data != nullptr && vertex_count > 0 && (State.fvf & 0x004u) != 0) {
+    const uint32_t stride =
+        vertex_stride != 0 ? vertex_stride : vulkan::FvfStride(State.fvf);
+    float min_x = 1e30f, min_y = 1e30f, max_x = -1e30f, max_y = -1e30f;
+    for (uint32_t i = 0; i < vertex_count && stride != 0; ++i) {
+      const auto *p = static_cast<const uint8_t *>(vertex_data) + size_t(i) * stride;
+      float x = 0.0f;
+      float y = 0.0f;
+      std::memcpy(&x, p, sizeof(x));
+      std::memcpy(&y, p + 4, sizeof(y));
+      min_x = (std::min)(min_x, x);
+      min_y = (std::min)(min_y, y);
+      max_x = (std::max)(max_x, x);
+      max_y = (std::max)(max_y, y);
+    }
+    odd.x0 = static_cast<int32_t>(min_x);
+    odd.y0 = static_cast<int32_t>(min_y);
+    odd.x1 = static_cast<int32_t>(max_x);
+    odd.y1 = static_cast<int32_t>(max_y);
+    const auto *first = static_cast<const uint8_t *>(vertex_data);
+    std::memcpy(&odd.first_z, first + 8, sizeof(odd.first_z));
+    std::memcpy(&odd.first_rhw, first + 12, sizeof(odd.first_rhw));
+    // The first vertex's D3DCOLOR, which for an untextured draw IS the colour it paints.
+    if ((State.fvf & 0x040u) != 0) {
+      std::memcpy(&odd.first_colour, first + 16, sizeof(odd.first_colour));
+    }
+  }
+  ++OddTopologies[odd];
+}
+
+void CountDraw(D3DPRIMITIVETYPE type, bool user_pointer, uint32_t primitives,
+               const void *vertex_data = nullptr, uint32_t vertex_stride = 0,
+               uint32_t vertex_count = 0) {
   SnapshotDraw();
+  NoteOddTopology(type, user_pointer, primitives, vertex_data, vertex_stride, vertex_count);
   ++TheStats.primitive_type_counts[static_cast<uint32_t>(type)];
   ++TheStats.draws_this_frame;
   if (user_pointer) {
@@ -1918,14 +2993,14 @@ void CountDraw(D3DPRIMITIVETYPE type, bool user_pointer) {
 HRESULT STDMETHODCALLTYPE CaptureDevice::DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType,
                                                         UINT StartVertex,
                                                         UINT PrimitiveCount) {
-  CountDraw(PrimitiveType, false);
+  CountDraw(PrimitiveType, false, PrimitiveCount);
   return inner_->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
 }
 
 HRESULT STDMETHODCALLTYPE CaptureDevice::DrawIndexedPrimitive(
     D3DPRIMITIVETYPE PrimitiveType, UINT MinIndex, UINT NumVertices, UINT StartIndex,
     UINT PrimitiveCount) {
-  CountDraw(PrimitiveType, false);
+  CountDraw(PrimitiveType, false, PrimitiveCount);
   EmitDraw(PrimitiveType, StartIndex, PrimitiveCount);
   return inner_->DrawIndexedPrimitive(PrimitiveType, MinIndex, NumVertices, StartIndex,
                                       PrimitiveCount);
@@ -1934,7 +3009,8 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::DrawIndexedPrimitive(
 HRESULT STDMETHODCALLTYPE CaptureDevice::DrawPrimitiveUP(
     D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount,
     const void *pVertexStreamZeroData, UINT VertexStreamZeroStride) {
-  CountDraw(PrimitiveType, true);
+  CountDraw(PrimitiveType, true, PrimitiveCount, pVertexStreamZeroData,
+            VertexStreamZeroStride, ElementCount(PrimitiveType, PrimitiveCount));
   EmitDrawUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride,
              nullptr, D3DFMT_INDEX16, 0);
   return inner_->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData,
@@ -1945,7 +3021,8 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::DrawIndexedPrimitiveUP(
     D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertexIndices,
     UINT PrimitiveCount, const void *pIndexData, D3DFORMAT IndexDataFormat,
     const void *pVertexStreamZeroData, UINT VertexStreamZeroStride) {
-  CountDraw(PrimitiveType, true);
+  CountDraw(PrimitiveType, true, PrimitiveCount, pVertexStreamZeroData,
+            VertexStreamZeroStride, MinVertexIndex + NumVertexIndices);
   // MinVertexIndex + NumVertexIndices is the span the indices reach into, and the vertex
   // pointer is biased so that index 0 is its first vertex - so the whole span is copied and
   // the indices need no rebasing.
@@ -1973,6 +3050,21 @@ IDirect3D8 *WINAPI HookedDirect3DCreate8(UINT SDKVersion) {
 
 const CaptureStats &Stats() { return TheStats; }
 
+void SetTopologies(bool strips, bool lines) {
+  DrawStrips = strips;
+  DrawLines = lines;
+  SkipTopologies = !strips && !lines;
+}
+
+void GetTopologies(bool &strips, bool &lines) {
+  strips = DrawStrips;
+  lines = DrawLines;
+}
+
+void SetLightSum(bool enabled) { DrawLightSum = enabled; }
+
+bool GetLightSum() { return DrawLightSum; }
+
 bool DeviceCreated() { return HaveDevice; }
 
 void ResetStats() {
@@ -1997,6 +3089,12 @@ void ResetStats() {
   MaterialKeys.clear();
   PipelineKeys.clear();
   MaterialKeysThisFrame.clear();
+  StageConfigs.clear();
+  PipelineConfigs.clear();
+  UnslottedVertexBuffers.clear();
+  FirstVertexColours.clear();
+  LightingByFvf.clear();
+  OddTopologies.clear();
   // Blocks are deliberately NOT cleared: they belong to the device, not to the sample, and
   // dropping them would make every later ApplyStateBlock look opaque.
 }
@@ -2091,6 +3189,140 @@ std::string VerifyTextureImages() {
   return std::string(out) + (first_mismatch.empty() ? "" : "\n" + first_mismatch);
 }
 
+// The buffer half of VerifyTextureImages: every live buffer that owns an arena slot is read
+// back off the GPU and compared against its own current contents.
+//
+// It is worth the code for the same reason the texture check was. A draw addresses the arenas
+// by offset, so a slot holding the wrong bytes does not fail anywhere a counter can see - the
+// vertices are somewhere, the indices are somewhere, and the picture is merely wrong. A bad
+// index is the loudest form of it: one triangle reaching a vertex from an unrelated mesh
+// megabytes away, which draws as a wedge across half the screen.
+std::string VerifyBufferSlots() {
+  vulkan::FlushUploads();
+  uint32_t checked = 0;
+  uint32_t matched = 0;
+  std::string first_mismatch;
+
+  uint32_t reported = 0;
+  auto report = [&](const char *what, uint32_t index, uint32_t bytes, uint64_t differing,
+                    uint64_t first, uint32_t offset, uint32_t fvf, uint64_t unlocks) {
+    if (++reported > 8) {
+      return;
+    }
+    char line[256];
+    std::snprintf(line, sizeof(line),
+                  "\n   %s %u, %u bytes at arena offset %u, fvf 0x%03x, "
+                  "%llu unlocks; %llu bytes differ from %llu",
+                  what, index, bytes, offset, fvf, (unsigned long long)unlocks,
+                  (unsigned long long)differing, (unsigned long long)first);
+    first_mismatch += line;
+  };
+
+  // Do the live slots overlap each other? An arena that hands the same bytes to two buffers
+  // corrupts both, and it would look exactly like a lost upload from the outside.
+  std::vector<std::pair<uint64_t, uint64_t>> spans[2];
+  auto note_span = [&](const vulkan::BufferSlot &slot) {
+    if (slot.valid) {
+      spans[slot.vertex ? 0 : 1].push_back({slot.offset, uint64_t(slot.offset) + slot.bytes});
+    }
+  };
+  for (const void *p : LiveVertexWrappers) {
+    note_span(static_cast<const CaptureVertexBuffer *>(p)->slot_);
+  }
+  for (const void *p : LiveIndexWrappers) {
+    note_span(static_cast<const CaptureIndexBuffer *>(p)->slot_);
+  }
+  uint32_t overlaps = 0;
+  for (auto &list : spans) {
+    std::sort(list.begin(), list.end());
+    for (size_t i = 1; i < list.size(); ++i) {
+      if (list[i].first < list[i - 1].second) {
+        ++overlaps;
+      }
+    }
+  }
+
+  uint32_t which = 0;
+  for (const void *pointer : LiveVertexWrappers) {
+    auto &buffer = *static_cast<CaptureVertexBuffer *>(const_cast<void *>(pointer));
+    ++which;
+    const uint32_t stride = vulkan::FvfStride(buffer.fvf_);
+    if (!buffer.slot_.valid || stride == 0) {
+      continue;
+    }
+    const uint32_t count = buffer.length_ / stride;
+    BYTE *data = nullptr;
+    if (count == 0 || FAILED(buffer.LockForRead(&data)) || data == nullptr) {
+      continue;
+    }
+    std::vector<vulkan::CanonicalVertex> expected(count);
+    if (vulkan::ConvertVertices(buffer.fvf_, data, count, expected.data())) {
+      ++checked;
+      uint64_t differing = 0;
+      uint64_t first = 0;
+      uint8_t got[32] = {};
+      const uint32_t bytes = count * static_cast<uint32_t>(sizeof(vulkan::CanonicalVertex));
+      if (vulkan::VerifySlot(buffer.slot_, expected.data(), bytes, &differing, &first, got)) {
+        ++matched;
+      } else {
+        report("vertex buffer", which, bytes, differing, first, buffer.slot_.offset,
+               buffer.fvf_, buffer.unlocks_);
+        {
+          const auto *want = reinterpret_cast<const float *>(
+              reinterpret_cast<const uint8_t *>(expected.data()) + first);
+          const auto *have = reinterpret_cast<const float *>(got);
+          char line[192];
+          std::snprintf(line, sizeof(line),
+                        "\n      want %.3f %.3f %.3f %.3f   arena holds %.3f %.3f %.3f %.3f",
+                        want[0], want[1], want[2], want[3], have[0], have[1], have[2],
+                        have[3]);
+          first_mismatch += line;
+        }
+        // The same one-bit experiment VerifyTextureImages uses: send this very data again and
+        // look once more. Fixed by a re-upload means the conversion and the copy are right and
+        // something overwrote the slot afterwards; still wrong means the path itself is.
+        if (reported == 1) {
+          vulkan::UploadIntoSlot(buffer.slot_, 0, expected.data(), bytes);
+          vulkan::FlushUploads();
+          first_mismatch +=
+              vulkan::VerifySlot(buffer.slot_, expected.data(), bytes)
+                  ? "   (a re-upload fixes it: something overwrote the slot)"
+                  : "   (a re-upload does NOT fix it: the upload path itself is wrong)";
+        }
+      }
+    }
+    buffer.UnlockAfterRead();
+  }
+
+  which = 0;
+  for (const void *pointer : LiveIndexWrappers) {
+    auto &buffer = *static_cast<CaptureIndexBuffer *>(const_cast<void *>(pointer));
+    ++which;
+    if (!buffer.slot_.valid || buffer.length_ == 0) {
+      continue;
+    }
+    BYTE *data = nullptr;
+    if (FAILED(buffer.LockForRead(&data)) || data == nullptr) {
+      continue;
+    }
+    ++checked;
+    uint64_t differing = 0;
+    uint64_t first = 0;
+    if (vulkan::VerifySlot(buffer.slot_, data, buffer.length_, &differing, &first)) {
+      ++matched;
+    } else {
+      report("index buffer", which, buffer.length_, differing, first, buffer.slot_.offset, 0,
+             buffer.unlocks_);
+    }
+    buffer.UnlockAfterRead();
+  }
+
+  char out[96];
+  std::snprintf(out, sizeof(out), "%u/%u buffers match, %u overlapping live slots (must be 0)",
+                matched, checked, overlaps);
+  return std::string(out) + first_mismatch;
+}
+
 IDirect3DDevice9 *ResolveD3D9Device(IDirect3DDevice8 *device) {
   if (!device) {
     return nullptr;
@@ -2174,6 +3406,21 @@ std::string FormatStats() {
       (unsigned long long)s.foreign_buffers,
       (unsigned long long)s.unconvertible_buffers,
       (unsigned long long)s.failed_uploads);
+  add("buffers rewritten after being drawn this frame: %llu (%llu vertex, %llu index;"
+      " %llu draws affected)\n",
+      (unsigned long long)s.buffer_rewritten_after_draw,
+      (unsigned long long)s.vertex_buffer_rewritten_after_draw,
+      (unsigned long long)s.index_buffer_rewritten_after_draw,
+      (unsigned long long)s.draws_reading_rewritten_buffers);
+  add("  ... overlapping the drawn-from range: %llu   versioned into the scratch: %llu"
+      "   NOT versioned: %llu (must be 0)\n",
+      (unsigned long long)s.overlapping_rewrites_after_draw,
+      (unsigned long long)s.buffer_versions_in_scratch,
+      (unsigned long long)s.unversioned_rewrites);
+  for (const auto &entry : RewriteLocks) {
+    add("  lock flags 0x%04x %-10s %llu\n", (unsigned)(entry.first >> 1),
+        (entry.first & 1) ? "overlapping" : "disjoint", (unsigned long long)entry.second);
+  }
 
   out += "FVF / vertex shader handles:\n";
   for (const auto &[fvf, count] : s.fvf_counts) {
@@ -2215,6 +3462,254 @@ std::string FormatStats() {
   return out;
 }
 
+std::string FormatShadowState() {
+  std::string out;
+  char line[256];
+  auto add = [&](const char *fmt, auto... args) {
+    std::snprintf(line, sizeof(line), fmt, args...);
+    out += line;
+  };
+
+  // A float render state is a float's bits in a DWORD, so it has to be bit-cast rather than
+  // converted - reading D3DRS_FOGSTART as an integer gives 1065353216 for 1.0.
+  auto as_float = [](uint32_t bits) {
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+  };
+
+  // Every state printed below, with the name it is printed under and whether it is a float.
+  // The history is taken from the same table, so the two halves cannot drift apart.
+  struct Entry {
+    uint32_t state;
+    const char *name;
+    bool is_float;
+  };
+  static const Entry kEntries[] = {
+      {D3DRS_FOGENABLE, "FOGENABLE", false},
+      {D3DRS_FOGCOLOR, "FOGCOLOR", false},
+      {D3DRS_FOGTABLEMODE, "FOGTABLEMODE", false},
+      {D3DRS_FOGVERTEXMODE, "FOGVERTEXMODE", false},
+      {D3DRS_FOGSTART, "FOGSTART", true},
+      {D3DRS_FOGEND, "FOGEND", true},
+      {D3DRS_FOGDENSITY, "FOGDENSITY", true},
+      {D3DRS_RANGEFOGENABLE, "RANGEFOGENABLE", false},
+      {D3DRS_LIGHTING, "LIGHTING", false},
+      {D3DRS_AMBIENT, "AMBIENT", false},
+      {D3DRS_SPECULARENABLE, "SPECULARENABLE", false},
+      {D3DRS_COLORVERTEX, "COLORVERTEX", false},
+      {D3DRS_NORMALIZENORMALS, "NORMALIZENORMALS", false},
+      {D3DRS_LOCALVIEWER, "LOCALVIEWER", false},
+      {D3DRS_DIFFUSEMATERIALSOURCE, "DIFFUSEMATERIALSOURCE", false},
+      {D3DRS_SPECULARMATERIALSOURCE, "SPECULARMATERIALSOURCE", false},
+      {D3DRS_AMBIENTMATERIALSOURCE, "AMBIENTMATERIALSOURCE", false},
+      {D3DRS_EMISSIVEMATERIALSOURCE, "EMISSIVEMATERIALSOURCE", false},
+      // The two colours a draw can carry that the canonical vertex and the shader do not: the
+      // per-vertex specular, added after texturing whenever SPECULARENABLE is on, and the
+      // texture factor, which a stage names as D3DTA_TFACTOR.
+      {D3DRS_TEXTUREFACTOR, "TEXTUREFACTOR", false},
+      {D3DRS_COLORWRITEENABLE, "COLORWRITEENABLE", false},
+      // The pipeline half - what a VkPipeline would have to be bucketed by.
+      {D3DRS_ALPHATESTENABLE, "ALPHATESTENABLE", false},
+      {D3DRS_ALPHAREF, "ALPHAREF", false},
+      {D3DRS_ALPHAFUNC, "ALPHAFUNC", false},
+      {D3DRS_ALPHABLENDENABLE, "ALPHABLENDENABLE", false},
+      {D3DRS_SRCBLEND, "SRCBLEND", false},
+      {D3DRS_DESTBLEND, "DESTBLEND", false},
+      {D3DRS_ZENABLE, "ZENABLE", false},
+      {D3DRS_ZWRITEENABLE, "ZWRITEENABLE", false},
+      {D3DRS_ZFUNC, "ZFUNC", false},
+      {D3DRS_CULLMODE, "CULLMODE", false},
+      // Stencil. This renderer has no stencil buffer at all, so if the game uses one, every
+      // draw it masks is drawn here unmasked - which is a whole-screen effect for anything
+      // shaped like a stencil shadow.
+      {D3DRS_STENCILENABLE, "STENCILENABLE", false},
+      {D3DRS_STENCILFAIL, "STENCILFAIL", false},
+      {D3DRS_STENCILZFAIL, "STENCILZFAIL", false},
+      {D3DRS_STENCILPASS, "STENCILPASS", false},
+      {D3DRS_STENCILFUNC, "STENCILFUNC", false},
+      {D3DRS_STENCILREF, "STENCILREF", false},
+      {D3DRS_STENCILMASK, "STENCILMASK", false},
+      {D3DRS_STENCILWRITEMASK, "STENCILWRITEMASK", false},
+  };
+
+  out += "render states the renderer has to reproduce (now / every value ever set):\n";
+  for (const Entry &entry : kEntries) {
+    const uint32_t current = State.render_states[entry.state];
+    if (entry.is_float) {
+      add("  %-22s %10.3f  |", entry.name, as_float(current));
+    } else {
+      add("  %-22s 0x%08x  |", entry.name, current);
+    }
+    const auto found = TheStats.render_states.find(entry.state);
+    if (found == TheStats.render_states.end()) {
+      out += " never set";
+    } else {
+      for (const uint32_t value : found->second) {
+        if (entry.is_float) {
+          add(" %.3f", as_float(value));
+        } else {
+          add(" 0x%x", value);
+        }
+      }
+    }
+    out += "\n";
+  }
+
+  add("draws with fog on: %llu   with lighting on: %llu   of %llu\n",
+      (unsigned long long)TheStats.draws_fogged, (unsigned long long)TheStats.draws_lit,
+      (unsigned long long)(TheStats.draws_buffered + TheStats.draws_user_ptr));
+  add("SetLight: %llu   LightEnable: %llu   SetMaterial: %llu\n",
+      (unsigned long long)LightSets, (unsigned long long)LightEnables,
+      (unsigned long long)MaterialSets);
+
+  for (uint32_t i = 0; i < kLights; ++i) {
+    if (!State.light_set[i] && !State.light_enabled[i]) {
+      continue;
+    }
+    const D3DLIGHT8 &light = State.lights[i];
+    add("  light %u: %s type %u  diffuse %.2f %.2f %.2f  ambient %.2f %.2f %.2f  "
+        "specular %.2f %.2f %.2f\n",
+        i, State.light_enabled[i] ? "ON " : "off", (unsigned)light.Type, light.Diffuse.r,
+        light.Diffuse.g, light.Diffuse.b, light.Ambient.r, light.Ambient.g, light.Ambient.b,
+        light.Specular.r, light.Specular.g, light.Specular.b);
+    add("           direction %.3f %.3f %.3f  position %.1f %.1f %.1f  range %.1f  "
+        "atten %.4f %.4f %.4f  theta %.2f phi %.2f falloff %.2f\n",
+        light.Direction.x, light.Direction.y, light.Direction.z, light.Position.x,
+        light.Position.y, light.Position.z, light.Range, light.Attenuation0,
+        light.Attenuation1, light.Attenuation2, light.Theta, light.Phi, light.Falloff);
+  }
+
+  // The texture stages as the last draw of the frame left them. `ActiveStages` stops at the
+  // first disabled COLOROP, so a stage printed past that one is configured but not in use.
+  add("texture stages (%u active), FVF 0x%03x:\n", ActiveStages(), State.fvf);
+  for (uint32_t i = 0; i < 3; ++i) {
+    const uint32_t *s = State.stage_states[i];
+    add("  %u: colorop %2u(%2u,%2u)  alphaop %2u(%2u,%2u)  texcoord %u  texture %p\n", i,
+        s[D3DTSS_COLOROP], s[D3DTSS_COLORARG1], s[D3DTSS_COLORARG2], s[D3DTSS_ALPHAOP],
+        s[D3DTSS_ALPHAARG1], s[D3DTSS_ALPHAARG2], s[D3DTSS_TEXCOORDINDEX],
+        (void *)State.textures[i]);
+  }
+
+  // Every configuration actually drawn with, most used first. Ops are D3DTEXTUREOP (1
+  // DISABLE, 2 SELECTARG1, 3 SELECTARG2, 4 MODULATE, 5 MODULATE2X, 7 ADD, ...); args are
+  // D3DTA (0 DIFFUSE, 1 CURRENT, 2 TEXTURE, 3 TFACTOR, 4 SPECULAR, |0x10 COMPLEMENT,
+  // |0x20 ALPHAREPLICATE).
+  {
+    std::vector<std::pair<uint64_t, const StageConfig *>> ordered;
+    ordered.reserve(StageConfigs.size());
+    for (const auto &[config, count] : StageConfigs) {
+      ordered.emplace_back(count, &config);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const auto &a, const auto &b) { return a.first > b.first; });
+    add("stage configurations drawn with: %u\n", (unsigned)ordered.size());
+    for (const auto &[count, config] : ordered) {
+      add("  %10llu draws  fvf 0x%03x  %u stage%s", (unsigned long long)count, config->fvf,
+          config->stages, config->stages == 1 ? " " : "s");
+      for (uint32_t i = 0; i < config->stages && i < 2; ++i) {
+        const uint32_t *s = config->stage[i];
+        add("  | %u: c %2u(%2u,%2u) a %2u(%2u,%2u) uv%u %s", i, s[0], s[1], s[2], s[3], s[4],
+            s[5], s[6], config->textured[i] != 0 ? "tex" : "---");
+      }
+      out += "\n";
+    }
+  }
+
+  // Blend factors are D3DBLEND (1 ZERO, 2 ONE, 5 SRCALPHA, 6 INVSRCALPHA, ...); the compare
+  // functions are D3DCMPFUNC (1 NEVER, 2 LESS, ... 8 ALWAYS); cull is D3DCULL (1 NONE, 2 CW,
+  // 3 CCW).
+  {
+    std::vector<std::pair<uint64_t, const PipelineConfig *>> ordered;
+    ordered.reserve(PipelineConfigs.size());
+    for (const auto &[config, count] : PipelineConfigs) {
+      ordered.emplace_back(count, &config);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const auto &a, const auto &b) { return a.first > b.first; });
+    add("pipeline configurations drawn with: %u\n", (unsigned)ordered.size());
+    out += "                          fvf atest ref func  blend src dst   z zwrite cull cwrite"
+           "   sten func pass zfail\n";
+    for (const auto &[count, config] : ordered) {
+      add("  %10llu draws  0x%03x %5u %3u %4u %6u %3u %3u %3u %6u %4u %5u %6u %4u %4u %5u\n",
+          (unsigned long long)count, config->fvf, config->state[0], config->state[1],
+          config->state[2], config->state[3], config->state[4], config->state[5],
+          config->state[6], config->state[7], config->state[8], config->state[9],
+          config->state[10], config->state[11], config->state[12], config->state[13]);
+    }
+  }
+
+  add("bound textures that did not reach the shader: stage 0 %llu foreign + %llu imageless, "
+      "stage 1 %llu + %llu\n",
+      (unsigned long long)UnresolvedForeign[0], (unsigned long long)UnresolvedNoImage[0],
+      (unsigned long long)UnresolvedForeign[1], (unsigned long long)UnresolvedNoImage[1]);
+  for (const auto &[key, count] : UnresolvedFormats) {
+    add("  pool %u format %u: %llu draws\n", (unsigned)(key >> 32), (unsigned)(key & 0xffffffff),
+        (unsigned long long)count);
+  }
+
+  {
+    std::vector<std::pair<uint64_t, const LightingInputs *>> ordered;
+    ordered.reserve(LightingByFvf.size());
+    for (const auto &[inputs, count] : LightingByFvf) {
+      ordered.emplace_back(count, &inputs);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const auto &a, const auto &b) { return a.first > b.first; });
+    add("draws with NO vertex diffuse - what the fixed function colours them from: %u\n",
+        (unsigned)ordered.size());
+    out += "                          fvf  lit  lights  material diffuse   ambient  emissive\n";
+    for (const auto &[count, in] : ordered) {
+      add("  %10llu draws  0x%03x %4u %6u   0x%08x 0x%08x 0x%08x\n", (unsigned long long)count,
+          in->fvf, in->lighting, in->enabled_lights, in->diffuse, in->ambient, in->emissive);
+    }
+  }
+
+  // D3DPRIMITIVETYPE: 1 point list, 2 line list, 3 line strip, 4 triangle list, 5 strip, 6 fan.
+  add("draws that are not triangle lists: %u distinct\n", (unsigned)OddTopologies.size());
+  out += "                         type   fvf  from  prims  stages  texture  blend  ztest"
+         "   screen box            colour        z      rhw  stencil(func,ref)\n";
+  for (const auto &[odd, count] : OddTopologies) {
+    float z = 0.0f;
+    float rhw = 0.0f;
+    std::memcpy(&z, &odd.first_z, sizeof(z));
+    std::memcpy(&rhw, &odd.first_rhw, sizeof(rhw));
+    add("  %10llu draws %5u 0x%03x %5s %6u %7u %8d %6u %6u   %5d,%-4d %5d,%-4d  0x%08x %8.3f "
+        "%8.3f   %u(%u,%u)\n",
+        (unsigned long long)count, odd.type, odd.fvf, odd.user_pointer != 0 ? "ptr" : "buf",
+        odd.primitives, odd.stages,
+        odd.texture_index == vulkan::kNoTexture ? -1 : (int)odd.texture_index, odd.blend,
+        odd.depth_test, odd.x0, odd.y0, odd.x1, odd.y1, odd.first_colour, z, rhw, odd.stencil,
+        odd.stencil_func, odd.stencil_ref);
+  }
+
+  add("first converted vertex colour of a user-pointer draw, by FVF: %u distinct\n",
+      (unsigned)FirstVertexColours.size());
+  for (const auto &[key, count] : FirstVertexColours) {
+    add("  fvf 0x%03x  0x%08x: %llu draws\n", (unsigned)(key >> 32),
+        (unsigned)(key & 0xffffffff), (unsigned long long)count);
+  }
+
+  add("vertex buffers drawn from with no arena slot: %u distinct\n",
+      (unsigned)UnslottedVertexBuffers.size());
+  for (const auto &[key, count] : UnslottedVertexBuffers) {
+    add("  fvf 0x%03x, %u bytes: %llu draws\n", (unsigned)(key >> 32),
+        (unsigned)(key & 0xffffffff), (unsigned long long)count);
+  }
+
+  if (State.have_material) {
+    const D3DMATERIAL8 &m = State.material;
+    add("material: diffuse %.2f %.2f %.2f %.2f  ambient %.2f %.2f %.2f\n", m.Diffuse.r,
+        m.Diffuse.g, m.Diffuse.b, m.Diffuse.a, m.Ambient.r, m.Ambient.g, m.Ambient.b);
+    add("          specular %.2f %.2f %.2f power %.1f  emissive %.2f %.2f %.2f\n",
+        m.Specular.r, m.Specular.g, m.Specular.b, m.Power, m.Emissive.r, m.Emissive.g,
+        m.Emissive.b);
+  } else {
+    out += "material: never set\n";
+  }
+  return out;
+}
+
 // Qualified: gk::DetourAttach in src/DetourUtils.h is a member-function-pointer overload,
 // and unqualified lookup from inside namespace gk would find it first.
 D3D8CaptureSystem::D3D8CaptureSystem() {
@@ -2224,6 +3719,46 @@ D3D8CaptureSystem::D3D8CaptureSystem() {
   // they were still causing. Read the plan's env table as a claim to check, not a fact.
   ReadWrapMode();
   ReadTextureUploadMode();
+  auto env_is_one = [](const char *name) {
+    char value[8] = {};
+    return ::GetEnvironmentVariableA(name, value, sizeof(value)) > 0 && value[0] == '1';
+  };
+  ForceLightingOff = env_is_one("GKPLUS_NO_LIGHTING");
+  ForceStage1Off = env_is_one("GKPLUS_NO_STAGE1");
+  ForceSpecularOff = env_is_one("GKPLUS_NO_SPECULAR");
+  {
+    char skip[16] = {};
+    const DWORD len = ::GetEnvironmentVariableA("GKPLUS_VK_SKIP", skip, sizeof(skip));
+    const std::string letters(skip, len);
+    char topologies[16] = {};
+    const DWORD topologies_len =
+        ::GetEnvironmentVariableA("GKPLUS_VK_TOPOLOGIES", topologies, sizeof(topologies));
+    const std::string want(topologies, topologies_len);
+    // Unset means all of them now, so the variable selects a SUBSET rather than opting in.
+    const bool none = want == "0" || want == "none";
+    const bool all = want.empty() || want == "1" || want == "all";
+    DrawStrips = !none && (all || want == "strip");
+    DrawLines = !none && (all || want == "line");
+    SkipTopologies = (!DrawStrips && !DrawLines) || letters.find('t') != std::string::npos;
+    if (SkipTopologies) {
+      DrawStrips = DrawLines = false;
+    }
+    SkipSeeding = letters.find('s') != std::string::npos;
+    SkipLitColour = letters.find('l') != std::string::npos;
+    SkipStateDefaults = letters.find('d') != std::string::npos;
+    if (!letters.empty()) {
+      DebugWrite("gkplus: vulkan features skipped: " + letters + "\n");
+    }
+  }
+  if (ForceLightingOff) {
+    DebugWrite("gkplus: D3DRS_LIGHTING forced off (GKPLUS_NO_LIGHTING)\n");
+  }
+  if (ForceStage1Off) {
+    DebugWrite("gkplus: texture stages past 0 forced off (GKPLUS_NO_STAGE1)\n");
+  }
+  if (ForceSpecularOff) {
+    DebugWrite("gkplus: D3DRS_SPECULARENABLE forced off (GKPLUS_NO_SPECULAR)\n");
+  }
   ::DetourAttach(reinterpret_cast<void **>(&OriginalDirect3DCreate8),
                  reinterpret_cast<void *>(HookedDirect3DCreate8));
   GetObjectAtOffset(AcquireRimTexture, 0x005a15b0);

@@ -229,10 +229,16 @@ bool StartImGui() {
     return Fail("ImGui_ImplVulkan_LoadFunctions failed");
   }
 
+  // The overlay draws into the same pass as the world, so its pipeline has to name the same
+  // attachments - a pipeline whose depth or stencil format disagrees with the one attached is
+  // not render-pass compatible, and the overlay is the last thing recorded before the pass ends.
   VkPipelineRenderingCreateInfo rendering = {
       VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
   rendering.colorAttachmentCount = 1;
   rendering.pColorAttachmentFormats = &Format.format;
+  rendering.depthAttachmentFormat = static_cast<VkFormat>(DepthFormatValue());
+  rendering.stencilAttachmentFormat =
+      DepthHasStencil() ? static_cast<VkFormat>(DepthFormatValue()) : VK_FORMAT_UNDEFINED;
 
   ImGui_ImplVulkan_InitInfo info = {};
   info.ApiVersion = VK_API_VERSION_1_3;
@@ -375,10 +381,12 @@ bool StartRenderer(HWND window) {
     return Fail("graphics queue family cannot present to the game window");
   }
 
-  // StartDraw last: it needs the bindless set layout StartResources creates, and the
-  // swapchain's format and extent, so it cannot come before either.
-  if (!CreateFrames() || !CreateSwapchain() || !StartImGui() || !StartResources() ||
-      !StartDraw(Extent.width, Extent.height, Format.format)) {
+  // StartDraw needs the bindless set layout StartResources creates, and the swapchain's format
+  // and extent, so it cannot come before either. **StartImGui comes after it** rather than
+  // before, because the overlay's pipeline has to declare the same depth and stencil formats
+  // the pass will attach - and which those are is StartDraw's decision (§4.21).
+  if (!CreateFrames() || !CreateSwapchain() || !StartResources() ||
+      !StartDraw(Extent.width, Extent.height, Format.format) || !StartImGui()) {
     return false;
   }
 
@@ -407,6 +415,9 @@ void DrawFrame() {
       // draws are dropped rather than carried over: they were built against the old extent's
       // projection and would be a frame stale by the time anything rendered.
       ClearDraws();
+      // Their scratch goes with them, and it is emptied rather than rotated: nothing was
+      // submitted from this slice, so it stays the one the next scene writes into.
+      ResetFrameScratch();
       return;
     }
     ResizeDraw(Extent.width, Extent.height);
@@ -419,9 +430,12 @@ void DrawFrame() {
   // without it the ring reuses memory a frame in flight is still copying from, which is what
   // silently corrupted one texture per session during the startup burst.
   ReleaseFrameStaging(FrameIndex);
-  // Same proof, same moment: this slot's fence has been waited on, so both the staging it held
-  // and the scratch the user-pointer draws wrote into it are free to reuse.
-  BeginFrameScratch(FrameIndex);
+  // The scratch is NOT reset here, and that is the point of the fix in §4.22: the user-pointer
+  // vertices this frame is about to draw were written by the game before Present was called, so
+  // the slice they went into is the one that must still be current while RecordDraws reads it.
+  // Resetting here read the previous scene's slice and let the next scene overwrite a live one.
+  // It rotates at the bottom of this function instead - where this same fence wait, one frame
+  // on, is what proves the incoming slice is free.
 
   uint32_t image_index = 0;
   VkResult acquired = vkAcquireNextImageKHR(device, Swapchain, UINT64_MAX, frame.acquired,
@@ -480,23 +494,34 @@ void DrawFrame() {
   colour.clearValue.color = {{0.10f, 0.16f, 0.28f, 1.0f}};
 
   auto depth_view = reinterpret_cast<VkImageView>(DepthImageView());
+  // The stencil aspect rides on the same image and the same view (§4.21): the game's shadow
+  // volumes count into it, so it is cleared with the depth and discarded with it. Its layout,
+  // aspect mask and attachment all have to acknowledge both aspects, which is why every one of
+  // them asks DepthHasStencil() rather than assuming.
+  const bool has_stencil = DepthHasStencil();
+  const VkImageLayout depth_layout = has_stencil
+                                         ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                                         : VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
   VkRenderingAttachmentInfo depth = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
   depth.imageView = depth_view;
-  depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+  depth.imageLayout = depth_layout;
   depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
   // DONT_CARE: nothing reads the depth buffer after the pass, so storing it is pure bandwidth.
   depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
   depth.clearValue.depthStencil = {1.0f, 0};
+  // Cleared to 0 every frame, which is what the shadow-volume algorithm counts up from.
+  VkRenderingAttachmentInfo stencil = depth;
 
   // The depth image is fresh every frame from the renderer's point of view - UNDEFINED as the
   // old layout, because the clear load op is about to overwrite it anyway.
   if (depth_view != VK_NULL_HANDLE) {
     Barrier(frame.cmd, reinterpret_cast<VkImage>(DepthImage()),
-            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_UNDEFINED, depth_layout,
             VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
             VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
             VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-            VK_IMAGE_ASPECT_DEPTH_BIT);
+            VK_IMAGE_ASPECT_DEPTH_BIT |
+                (has_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VkImageAspectFlags(0)));
   }
 
   VkRenderingInfo rendering = {VK_STRUCTURE_TYPE_RENDERING_INFO};
@@ -505,6 +530,8 @@ void DrawFrame() {
   rendering.colorAttachmentCount = 1;
   rendering.pColorAttachments = &colour;
   rendering.pDepthAttachment = depth_view != VK_NULL_HANDLE ? &depth : nullptr;
+  rendering.pStencilAttachment =
+      (depth_view != VK_NULL_HANDLE && has_stencil) ? &stencil : nullptr;
 
   vkCmdBeginRendering(frame.cmd, &rendering);
 
@@ -567,6 +594,11 @@ void DrawFrame() {
 
   ++TheStats.frames_presented;
   FrameIndex = (FrameIndex + 1) % kFramesInFlight;
+  // After the submit that reads the outgoing slice, so the scene the game is about to draw
+  // writes somewhere else. What makes the incoming slice safe is the fence waited at the top of
+  // this function: with one more slice than frames in flight, the slice coming round now was
+  // last read by the frame that fence retired.
+  RotateFrameScratch();
 }
 
 void ShutdownRenderer() {

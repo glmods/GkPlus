@@ -97,6 +97,16 @@ struct ResourceStats {
   // Times the ring had to block because the region it was about to reuse was still being read
   // by a frame in flight. See WaitForLiveFrames.
   uint64_t staging_stalls = 0;
+  // Ring bytes the head skipped without handing them out - alignment padding, and the tail
+  // abandoned at a wrap. They count against the batch like any other byte; the figure is here
+  // because it used to not, which let the head lap its own un-recorded batch (see
+  // AllocateStaging). It is the size of that former hazard, so it is worth being able to read.
+  uint64_t staging_skipped_bytes = 0;
+  // Copies that overwrite bytes an earlier copy in the same batch also wrote, and so had a
+  // barrier put in front of them. Non-zero is normal on a level load - a freed arena slot is
+  // handed to a new buffer while the old one's upload is still queued - and each one is a
+  // buffer that used to reach the GPU as whichever copy the driver happened to retire last.
+  uint64_t ordered_overlapping_copies = 0;
   uint64_t dropped_uploads = 0; // did not fit; see AllocateStaging
   uint64_t arena_exhausted = 0;
 
@@ -129,8 +139,12 @@ struct ResourceStats {
   // --- per-frame scratch -------------------------------------------------------------------
   uint64_t scratch_vertex_bytes = 0; // capacity of one frame's slice
   uint64_t scratch_index_bytes = 0;
+  uint64_t scratch_draw_bytes = 0;
+  uint64_t scratch_light_bytes = 0;
   uint64_t scratch_vertices_peak = 0; // high-water within a single frame
   uint64_t scratch_indices_peak = 0;
+  uint64_t scratch_draws_peak = 0;
+  uint64_t scratch_lights_peak = 0;
   // Allocations that did not fit in the frame's slice, so those draws were dropped. Must be 0;
   // if it ever is not, the slice is too small - the numbers to size it by are the two peaks.
   uint64_t scratch_exhausted = 0;
@@ -219,8 +233,12 @@ uint64_t BindlessDescriptorSetLayout();
 // The arenas stay device-local because they hold a level's worth of geometry that is read every
 // frame and written rarely - exactly the opposite trade.
 //
-// One slice per frame in flight, bump-allocated and reset when that frame comes round again, so
-// a slice is only reused once its fence has been waited on.
+// **A slice belongs to a scene, not to a frame in flight**, and the difference is the whole
+// reason there is one more slice than there are frames. The game writes here while it draws,
+// which is before the Present that renders what it wrote; rotating on the renderer's own frame
+// index instead made every user-pointer draw read the slice the *previous* scene had written,
+// and made the next scene overwrite a slice the GPU was still reading. See kScratchSlices in
+// the .cpp for why the count is what it is.
 
 struct ScratchAlloc {
   void *mapped = nullptr; // write the data here
@@ -228,18 +246,38 @@ struct ScratchAlloc {
   bool valid = false;
 };
 
-// Resets the frame's slice. Called by the renderer once it has waited on that frame's fence.
-void BeginFrameScratch(uint32_t frame_index);
+// Moves to the next slice and empties it, for the scene that is about to be recorded. Called by
+// the renderer at the END of a frame - after the draws that read the outgoing slice have been
+// submitted, and while the fence waited at the top of that frame is the proof that the incoming
+// one is no longer being read.
+void RotateFrameScratch();
+// Empties the current slice without moving off it, for a frame whose draws were dropped. Safe
+// wherever RotateFrameScratch is not, because nothing in flight is reading this slice.
+void ResetFrameScratch();
 
 ScratchAlloc AllocateScratchVertices(uint32_t count);
 // `stride` is 2 or 4 bytes; the two index widths are kept apart so a draw can be recorded with
 // the type it actually has rather than everything being widened.
 ScratchAlloc AllocateScratchIndices(uint32_t count, uint32_t stride);
 
-// The scratch vertex buffer's shader-readable address, and the index scratch as a handle. Both
-// are per frame, so they are only valid for the frame BeginFrameScratch last named.
+// The same allocator for the two arrays the shader reads per draw: one GpuDrawRecord each, and
+// the enabled lights each draw sees. They are per-frame data written by the capture layer at
+// draw time, exactly like the user-pointer vertices, so they take the same slices and rotate
+// with them - which is also what makes them safe to write while a previous frame is in flight.
+//
+// Sized in *records* rather than bytes, so the caller never spells the stride: getting that
+// wrong would address the array past its own elements, which is the failure §4.16 spent a
+// session on.
+ScratchAlloc AllocateScratchDraws(uint32_t count);
+ScratchAlloc AllocateScratchLights(uint32_t count);
+
+// The scratch vertex buffer's shader-readable address, and the index scratch as a handle. The
+// address carries the current slice, so it is only valid for the scene now being recorded -
+// read it while recording that scene's draws, never after RotateFrameScratch.
 uint64_t ScratchVertexAddress();
 uint64_t ScratchIndexBuffer();
+uint64_t ScratchDrawAddress();
+uint64_t ScratchLightAddress();
 
 // The vertex arena as a shader-readable address, and the index arena as a VkBuffer handle.
 // Vertices are *pulled* by address (so a draw binds no vertex buffer at all) while indices
@@ -279,6 +317,19 @@ void FlushUploads();
 bool VerifyImageLevel(const TextureImage &image, uint32_t level, const void *data,
                       uint32_t pitch, uint64_t *differing_bytes = nullptr,
                       uint64_t *first_difference = nullptr, uint64_t *total_bytes = nullptr);
+
+// The same check for a buffer slot: read the arena back and compare it against what the slot
+// should hold - converted vertices, or indices verbatim. A slot that took another buffer's
+// bytes cannot fail visibly on its own, because a draw addresses the arena by offset: it draws
+// the wrong geometry, or, through a corrupt index, one triangle stretched across the screen.
+// Every upload GKPLUS_VK_WATCH_DST named, with the staging batch that carried it. One run
+// says which batch to capture; see CaptureStagingBatch in VkCapture.h.
+const std::string &StagingWatchLog();
+
+bool VerifySlot(const BufferSlot &slot, const void *expected, uint32_t bytes,
+                uint64_t *differing_bytes = nullptr, uint64_t *first_difference = nullptr,
+                uint8_t *got_prefix = nullptr);
+
 
 // Whether a D3DFORMAT has an image mapping at all, and how it is addressed. `block` is texels
 // per block edge (1 for uncompressed, 4 for DXT) and `block_bytes` is what D3D stores per

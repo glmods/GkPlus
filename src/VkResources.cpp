@@ -16,13 +16,20 @@
 #include <vk_mem_alloc.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <tuple>
 #include <vector>
 
 #include "Core.h"
 #include "VertexFormat.h"
+// For the two shader-ABI records the scratch is sized and strided by. The dependency goes this
+// way round - VkDraw.cpp already reads this header - because the ABI belongs beside the draw
+// list that defines it, and a scratch allocator that took the stride as an argument would put
+// the one number that must not be wrong at every call site.
+#include "VkDraw.h"
 #include "VkCapture.h"
 #include "VkContext.h"
 #include "VkInternal.h"
@@ -39,6 +46,18 @@ constexpr VkDeviceSize kVertexArenaBytes = 32u << 20;
 constexpr VkDeviceSize kIndexArenaBytes = 8u << 20;
 constexpr VkDeviceSize kStagingBytes = 32u << 20;
 constexpr uint32_t kFramesInFlight = 2; // must match VkRenderer's
+
+// One MORE scratch slice than there are frames in flight, and the extra one is not slack - it
+// is what makes the allocator correct at all.
+//
+// The scratch is written by the *game*, during the scene, and read by the frame that Present
+// then produces: the write window for scene k+1 is [end of DrawFrame(k), start of
+// DrawFrame(k+1)]. The only completion the renderer has proof of during that window is the
+// fence waited at the top of DrawFrame(k), which retires frame k-N. So a slice the CPU is
+// about to write must not have been read more recently than that, i.e. slices must outnumber
+// frames in flight. With N slices the next one round belongs to frame k+1-N, which is still in
+// flight, and the CPU would be overwriting vertices the GPU is reading.
+constexpr uint32_t kScratchSlices = kFramesInFlight + 1;
 
 // `GKPLUS_VK_HEAPS=small` - the same totals cut to just above level01's measured peaks, for
 // RenderDoc. A capture is taken *inside* the 32-bit game, where RenderDoc allocates a mapped
@@ -108,6 +127,12 @@ struct Staging {
   // Bytes staged since the last time anything was recorded into a command buffer. This is
   // what bounds a wrap: see AllocateStaging.
   VkDeviceSize batch = 0;
+  // Bytes that HAVE been recorded but whose copies the GPU has not run yet, per frame slot.
+  // Recording does not release a region - executing does - so these have to keep counting
+  // against the ring until the frame's fence retires them. `in_flight` is their sum, kept
+  // beside them so the hot path adds one number rather than looping.
+  VkDeviceSize frame_bytes[kFramesInFlight] = {};
+  VkDeviceSize in_flight = 0;
   // Whether the frame that consumed each slot's staging is still in flight. Written when its
   // uploads are recorded, cleared when the renderer's fence for that slot has been waited on.
   //
@@ -132,19 +157,32 @@ constexpr VkDeviceSize kScratchIndexBytes = 1u << 20;
 constexpr VkDeviceSize kSmallScratchVertexBytes = 1u << 20;
 constexpr VkDeviceSize kSmallScratchIndexBytes = 256u << 10;
 
+// The per-draw record array and the lights it points at (§4.26). The record slice holds exactly
+// as many as VkDraw's kMaxDrawsPerFrame will submit, so the two limits agree rather than one
+// silently biting first; level01's peak is 660 of them. Lights are deduplicated by enable mask
+// within a frame, so 4096 is several hundred times what a level01 frame uses.
+constexpr VkDeviceSize kScratchDrawBytes = 8192u * sizeof(GpuDrawRecord);
+constexpr VkDeviceSize kScratchLightBytes = 4096u * sizeof(GpuLight);
+constexpr VkDeviceSize kSmallScratchDrawBytes = 1024u * sizeof(GpuDrawRecord);
+constexpr VkDeviceSize kSmallScratchLightBytes = 512u * sizeof(GpuLight);
+
 struct Scratch {
   VkBuffer buffer = VK_NULL_HANDLE;
   VmaAllocation allocation = VK_NULL_HANDLE;
   uint8_t *mapped = nullptr;
   VkDeviceAddress address = 0;
-  VkDeviceSize slice = 0; // bytes per frame in flight
-  VkDeviceSize head = 0;  // within the current frame's slice
-  VkDeviceSize base = 0;  // where the current frame's slice starts
+  VkDeviceSize slice = 0; // bytes per slice
+  VkDeviceSize head = 0;  // within the current scene's slice
+  VkDeviceSize base = 0;  // where the current scene's slice starts
 };
 
 Scratch ScratchVertices;
 Scratch ScratchIndices;
-uint32_t ScratchFrame = 0;
+Scratch ScratchDraws;
+Scratch ScratchLights;
+// Which slice the scene now being recorded writes into. It belongs to the *scene*, not to a
+// frame in flight - see kScratchSlices.
+uint32_t ScratchSlice = 0;
 
 // A command pool and fence of the renderer's own, used only by FlushPendingNow - the frame's
 // command buffer belongs to VkRenderer and is not available mid-batch. Transient because these
@@ -157,9 +195,38 @@ struct PendingCopy {
   VkDeviceSize src_offset = 0;
   VkDeviceSize dst_offset = 0;
   VkDeviceSize bytes = 0;
+  // Whether this copy writes bytes an earlier copy in the same batch also wrote, and therefore
+  // needs a barrier before it. See NoteDestination.
+  bool barrier_before = false;
 };
 
 std::vector<PendingCopy> Pending;
+
+// The destination ranges already queued in this batch, per arena, as start -> end.
+//
+// **Two copies in one command buffer are not ordered against each other.** Vulkan orders the
+// stages of a pipeline, not two transfers writing the same memory: without a barrier between
+// them the result of overlapping writes is whichever the GPU happens to retire last. That is
+// not a theoretical hazard here - a level load frees a buffer's arena slot and hands it to a
+// new buffer within the same batch, so both buffers' uploads sit in `Pending` targeting the
+// same bytes, and the older one wins often enough to leave a handful of meshes per load drawing
+// somebody else's geometry. It presents as one object smeared across the screen, because a
+// vertex read through a stale index lands anywhere.
+//
+// A range that overlaps anything already queued therefore gets a barrier before it, and the map
+// is cleared at that point - the barrier orders every earlier copy, so nothing before it can
+// collide again.
+std::map<VkDeviceSize, VkDeviceSize> PendingDstRanges[2];
+
+// Which staging batch is being filled. A batch is everything between two records, so this is
+// the unit CaptureStagingBatch works in - and it is reproducible across runs, because a level
+// load stages the same bytes in the same order every time.
+uint32_t StagingBatch = 0;
+
+// GKPLUS_VK_WATCH_DST: a vertex-arena slot offset whose uploads are logged with the batch that
+// carried them, so a capture can be aimed at the right batch on the next run. -1 is off.
+uint32_t WatchDst = 0xffffffffu;
+std::string WatchLog;
 
 // --- images --------------------------------------------------------------------------------
 //
@@ -268,9 +335,15 @@ struct PendingImageCopy {
   int32_t y = 0;
   uint32_t width = 0;
   uint32_t height = 0;
+  // The same ordering problem the buffer copies have - two blits into one mip level in a batch
+  // are not ordered against each other - and the game does re-blit a texture within a batch.
+  // Conservative about what counts as a collision: the same image and level, whatever the
+  // rectangles, because a per-rect test would buy nothing at these counts.
+  bool barrier_before = false;
 };
 
 std::vector<PendingImageCopy> PendingImages;
+std::set<uint64_t> PendingImageLevels; // index << 32 | level, for this batch
 
 bool Fail(const std::string &message) {
   Error = message;
@@ -284,7 +357,13 @@ bool CreateArena(Arena &arena, VkDeviceSize bytes, VkBufferUsageFlags usage,
   info.size = bytes;
   // TRANSFER_DST because everything arrives by staged copy, and SHADER_DEVICE_ADDRESS so the
   // bindless design can pull vertices by pointer rather than binding a vertex buffer (§2).
-  info.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+  //
+  // TRANSFER_SRC is not for the renderer either - nothing copies out of an arena in a frame.
+  // It is `render.verify_buffers()`, for the same reason the texture images carry it: without
+  // it, the readback's own vkCmdCopyBuffer is an invalid call, so the verifier that exists to
+  // check the bytes is itself the thing validation is complaining about. It read clean here
+  // only because this driver tolerates it.
+  info.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
   info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
@@ -366,6 +445,10 @@ void Release(Arena &arena, VkDeviceSize offset, VkDeviceSize bytes) {
 void RecordInto(VkCommandBuffer cmd);
 bool FlushPendingNow();
 
+// How much of the ring the batch RecordInto just recorded occupied. Read by its two callers,
+// which differ in when those bytes become free again.
+VkDeviceSize LastRecordedBytes = 0;
+
 // Blocks until no recorded batch is still being read by the GPU, then marks every slot free.
 // Conservative on purpose: `vkDeviceWaitIdle` rather than per-slot fences, because the ring is
 // only ever handed back at a wrap and the renderer's fences belong to VkRenderer.
@@ -381,6 +464,10 @@ void WaitForLiveFrames() {
   for (bool &live : Ring.frame_live) {
     live = false;
   }
+  for (VkDeviceSize &bytes : Ring.frame_bytes) {
+    bytes = 0;
+  }
+  Ring.in_flight = 0;
   ++TheStats.staging_stalls;
 }
 
@@ -395,22 +482,66 @@ void WaitForLiveFrames() {
 // every compressed copy. 16 covers all four formats; the waste is at most 15 bytes per
 // allocation out of 32 MB.
 //
-// **The ring may not wrap past data whose copy has not been recorded yet**, and this is the
-// one rule that took a real measurement to find. Staged bytes are only read when
-// `RecordUploads` puts them in a command buffer at the top of a frame, so anything the ring
-// overwrites before then is silently the wrong data. The steady state is ~11 MB between
-// frames and never comes close - but a level load stages **360 MB between two Presents**,
-// because the game stops presenting while it loads. That is eleven wraps inside one batch,
-// every one of them corrupting geometry or texels already queued.
+// **A region is free again only once the GPU has RUN its copy** - not when the copy is staged,
+// and not when it is recorded. Three things follow, and each of them was a real corruption
+// before it was a rule.
 //
-// So a batch that would exceed the ring is flushed *now*, on its own command buffer, and
-// waited for. It is a stall, and it happens only during a load, which is already a stall.
+// - Staged bytes are read when `RecordUploads` puts them in a command buffer, so the ring may
+//   not overwrite a batch that has not been recorded yet. The steady state is ~11 MB between
+//   frames and never comes close; a level load stages **360 MB between two Presents**, because
+//   the game stops presenting while it loads, which is eleven laps of the ring inside one
+//   batch. So a batch that would exceed the ring is recorded and waited for on the spot.
+//
+// - Recorded bytes are read when that command buffer EXECUTES, which is later still. Releasing
+//   them at record time let the head lap the ring and overwrite the source of a copy the GPU
+//   had not run - measured at 87,222 copies in one level01 session, each of them moving
+//   whatever the ring held by then. That is why `frame_bytes`/`in_flight` exist: recorded
+//   bytes keep counting until the frame's fence retires them.
+//
+// - `batch` is what the head has TRAVELLED, not the sum of the payloads. The head also skips
+//   bytes it never hands out - up to 15 for alignment on every allocation, and the whole tail
+//   at a wrap - and counting only the payloads let it drift ahead by the accumulated skip and
+//   lap its own batch. One load skips ~140 MB that way.
+//
+// With all three counted, "the head may not travel further than the ring holds" is exactly the
+// invariant, and lapping live data is unrepresentable rather than merely unlikely.
 bool AllocateStaging(VkDeviceSize bytes, VkDeviceSize &offset) {
   if (bytes > Ring.capacity) {
     ++TheStats.dropped_uploads;
     return false;
   }
-  if (Ring.batch + bytes > Ring.capacity) {
+  for (uint32_t attempt = 0; attempt < 3; ++attempt) {
+    VkDeviceSize head = AlignUp(Ring.head);
+    VkDeviceSize skipped = head - Ring.head;
+    bool wrapping = false;
+    if (head + bytes > Ring.capacity) {
+      skipped += Ring.capacity - head;
+      head = 0;
+      wrapping = true;
+    }
+    if (Ring.batch + Ring.in_flight + skipped + bytes <= Ring.capacity) {
+      if (wrapping) {
+        ++TheStats.staging_wraps;
+      }
+      if (Ring.batch == 0) {
+        // The first allocation of a batch: everything this batch stages has to be inside the
+        // capture window, and the staging writes happen here rather than at record time.
+        BeginBatchCaptureIfArmed(StagingBatch, GetInstance());
+      }
+      offset = head;
+      Ring.head = head + bytes;
+      Ring.batch += skipped + bytes;
+      TheStats.staging_skipped_bytes += skipped;
+      return true;
+    }
+    // Retire what the GPU has already been given before recording anything more: a frame whose
+    // copies have run is holding the ring for nothing.
+    if (Ring.in_flight != 0) {
+      WaitForLiveFrames();
+      continue;
+    }
+    // The un-recorded batch has grown to the size of the ring. Record and wait for it, which
+    // hands the whole ring back, then place the allocation at 0 on the second pass.
     if (!FlushPendingNow()) {
       // Nothing was reclaimed, so wrapping would still corrupt. Dropping is the honest
       // outcome and it is counted; a missing texture is diagnosable, a scrambled one is not.
@@ -418,26 +549,15 @@ bool AllocateStaging(VkDeviceSize bytes, VkDeviceSize &offset) {
       return false;
     }
   }
-  Ring.head = AlignUp(Ring.head);
-  if (Ring.head + bytes > Ring.capacity) {
-    // Back to the start, which is where a frame that is still in flight may be reading. Only
-    // the wrap can do that - within a pass the head only moves forward - so this is the one
-    // place the check is needed, and in steady state no frame is ever still live this far
-    // back, so the wait almost never fires.
-    WaitForLiveFrames();
-    Ring.head = 0;
-    ++TheStats.staging_wraps;
-  }
-  offset = Ring.head;
-  Ring.head += bytes;
-  Ring.batch += bytes;
-  return true;
+  // Unreachable: a successful flush leaves head and batch at 0, and `bytes` fits the ring.
+  ++TheStats.dropped_uploads;
+  return false;
 }
 
 bool CreateScratch(Scratch &scratch, VkDeviceSize slice_bytes, VkBufferUsageFlags usage,
                    const char *what) {
   VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-  info.size = slice_bytes * kFramesInFlight;
+  info.size = slice_bytes * kScratchSlices;
   info.usage = usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
   info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
@@ -661,6 +781,8 @@ bool StartResources() {
       SmallHeaps ? kSmallScratchVertexBytes : kScratchVertexBytes;
   const VkDeviceSize scratch_index =
       SmallHeaps ? kSmallScratchIndexBytes : kScratchIndexBytes;
+  const VkDeviceSize scratch_draw = SmallHeaps ? kSmallScratchDrawBytes : kScratchDrawBytes;
+  const VkDeviceSize scratch_light = SmallHeaps ? kSmallScratchLightBytes : kScratchLightBytes;
 
   VmaVulkanFunctions functions = {};
   functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
@@ -690,11 +812,17 @@ bool StartResources() {
                      "vertex") ||
       !CreateScratch(ScratchIndices, scratch_index, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                      "index") ||
+      !CreateScratch(ScratchDraws, scratch_draw, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     "draw record") ||
+      !CreateScratch(ScratchLights, scratch_light, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     "light") ||
       !CreateBindlessSet()) {
     return false;
   }
   TheStats.scratch_vertex_bytes = scratch_vertex;
   TheStats.scratch_index_bytes = scratch_index;
+  TheStats.scratch_draw_bytes = scratch_draw;
+  TheStats.scratch_light_bytes = scratch_light;
 
   VkBufferCreateInfo staging = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   staging.size = staging_bytes;
@@ -733,6 +861,12 @@ bool StartResources() {
   TheStats.ready = true;
   TheStats.vertex_arena_bytes = vertex_arena;
   TheStats.index_arena_bytes = index_arena;
+  {
+    char watch[32] = {};
+    if (::GetEnvironmentVariableA("GKPLUS_VK_WATCH_DST", watch, sizeof(watch)) != 0) {
+      WatchDst = static_cast<uint32_t>(std::strtoul(watch, nullptr, 0));
+    }
+  }
   TheStats.staging_bytes = staging_bytes;
   TheStats.small_heaps = SmallHeaps;
   char line[160];
@@ -775,6 +909,43 @@ void FreeSlot(const BufferSlot &slot) {
   NoteArenaUse();
 }
 
+// Records a destination range in this batch and says whether it collides with one already
+// queued - i.e. whether the copy about to be pushed needs a barrier before it. See
+// PendingDstRanges for why an unordered overlap is a real corruption rather than a nicety.
+//
+// On a collision the map is cleared rather than pruned: the barrier orders EVERY earlier copy
+// in the batch, so none of them can collide with anything that follows.
+bool NoteDestination(bool vertex, VkDeviceSize offset, VkDeviceSize bytes) {
+  auto &ranges = PendingDstRanges[vertex ? 0 : 1];
+  const VkDeviceSize end = offset + bytes;
+  bool overlaps = false;
+  // The first range starting at or after this one, and the one before it - between them they
+  // are the only two that can overlap a range in a map of disjoint... they are not disjoint,
+  // since ranges accumulate, so both neighbours are checked and that is enough for the shapes
+  // this produces: a slot is written either whole or as one sub-range.
+  auto after = ranges.lower_bound(offset);
+  if (after != ranges.end() && after->first < end) {
+    overlaps = true;
+  }
+  if (!overlaps && after != ranges.begin()) {
+    auto before = std::prev(after);
+    if (before->second > offset) {
+      overlaps = true;
+    }
+  }
+  if (overlaps) {
+    ++TheStats.ordered_overlapping_copies;
+    ranges.clear();
+    ranges.emplace(offset, end);
+    return true;
+  }
+  auto [it, inserted] = ranges.emplace(offset, end);
+  if (!inserted && it->second < end) {
+    it->second = end;
+  }
+  return false;
+}
+
 bool UploadIntoSlot(const BufferSlot &slot, uint32_t offset_in_slot, const void *data,
                     uint32_t bytes) {
   if (!Ready || !slot.valid || data == nullptr || bytes == 0) {
@@ -793,8 +964,18 @@ bool UploadIntoSlot(const BufferSlot &slot, uint32_t offset_in_slot, const void 
     return false;
   }
   std::memcpy(Ring.mapped + staging_offset, data, bytes);
+  const bool needs_barrier =
+      NoteDestination(slot.vertex, slot.offset + offset_in_slot, bytes);
+  if (slot.vertex && slot.offset == WatchDst) {
+    char line[160];
+    std::snprintf(line, sizeof(line),
+                  "  batch %u: slot %u + %u, %u bytes, staged at %llu\n", StagingBatch,
+                  slot.offset, offset_in_slot, bytes,
+                  (unsigned long long)staging_offset);
+    WatchLog += line;
+  }
   Pending.push_back({slot.vertex ? VertexArena.buffer : IndexArena.buffer, staging_offset,
-                     slot.offset + offset_in_slot, bytes});
+                     slot.offset + offset_in_slot, bytes, needs_barrier});
   ++TheStats.uploads;
   TheStats.uploaded_bytes += bytes;
   return true;
@@ -858,9 +1039,16 @@ bool CreateTextureImage(TextureImage &image, uint32_t width, uint32_t height, ui
   view.format = mapping.format;
   // D3DFMT_A8 is alpha-only, and R8_UNORM is red-only. The swizzle is what makes the two the
   // same thing at sample time, rather than a shader branch per texture.
+  //
+  // **RGB is ZERO, not ONE.** D3D reads a channel a format does not carry as 0, except alpha,
+  // which reads as 1 - so an alpha-only texture samples as (0, 0, 0, a). The ONE this replaces
+  // was invisible while only stage 0 was drawn (§4.16 modulated by a white RGB, which is the
+  // identity) and inverted the whole scene the moment stage 1 arrived: level01's second stage
+  // blends toward the fog with BLENDTEXTUREALPHA, so the distance faded to white instead of to
+  // black (§4.19).
   if (mapping.alpha_swizzle) {
-    view.components = {VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_ONE,
-                       VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_R};
+    view.components = {VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO,
+                       VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R};
   }
   view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1};
   if (vkCreateImageView(GetDevice(), &view, nullptr, &entry.view) != VK_SUCCESS) {
@@ -980,13 +1168,22 @@ uint32_t AcquireSampler(uint32_t mag_filter, uint32_t min_filter, uint32_t mip_f
   return index;
 }
 
-void BeginFrameScratch(uint32_t frame_index) {
-  if (!Ready || frame_index >= kFramesInFlight) {
+void RotateFrameScratch() {
+  if (!Ready) {
     return;
   }
-  ScratchFrame = frame_index;
-  for (Scratch *scratch : {&ScratchVertices, &ScratchIndices}) {
-    scratch->base = scratch->slice * frame_index;
+  ScratchSlice = (ScratchSlice + 1) % kScratchSlices;
+  for (Scratch *scratch : {&ScratchVertices, &ScratchIndices, &ScratchDraws, &ScratchLights}) {
+    scratch->base = scratch->slice * ScratchSlice;
+    scratch->head = 0;
+  }
+}
+
+void ResetFrameScratch() {
+  if (!Ready) {
+    return;
+  }
+  for (Scratch *scratch : {&ScratchVertices, &ScratchIndices, &ScratchDraws, &ScratchLights}) {
     scratch->head = 0;
   }
 }
@@ -1040,12 +1237,32 @@ ScratchAlloc AllocateScratchIndices(uint32_t count, uint32_t stride) {
   return out;
 }
 
+ScratchAlloc AllocateScratchDraws(uint32_t count) {
+  return AllocateScratch(ScratchDraws, count, static_cast<uint32_t>(sizeof(GpuDrawRecord)),
+                         TheStats.scratch_draws_peak);
+}
+
+ScratchAlloc AllocateScratchLights(uint32_t count) {
+  return AllocateScratch(ScratchLights, count, static_cast<uint32_t>(sizeof(GpuLight)),
+                         TheStats.scratch_lights_peak);
+}
+
 uint64_t ScratchVertexAddress() {
   return Ready ? ScratchVertices.address + ScratchVertices.base : 0;
 }
 
 uint64_t ScratchIndexBuffer() {
   return Ready ? reinterpret_cast<uint64_t>(ScratchIndices.buffer) : 0;
+}
+
+// Both carry the current slice, like the vertex address and unlike the index one: they are read
+// by device address rather than bound, so the offsets in a DrawItem stay slice-relative.
+uint64_t ScratchDrawAddress() {
+  return Ready ? ScratchDraws.address + ScratchDraws.base : 0;
+}
+
+uint64_t ScratchLightAddress() {
+  return Ready ? ScratchLights.address + ScratchLights.base : 0;
 }
 
 uint64_t VertexArenaAddress() {
@@ -1139,7 +1356,15 @@ bool UploadIntoTextureImage(const TextureImage &image, uint32_t level, int32_t x
   }
   PackLevel(map, data, pitch, blocks_across, rows, Ring.mapped + staging_offset);
 
-  PendingImages.push_back({image.index, staging_offset, level, x, y, width, height});
+  const uint64_t key = (uint64_t(image.index) << 32) | level;
+  const bool repeat = !PendingImageLevels.insert(key).second;
+  if (repeat) {
+    ++TheStats.ordered_overlapping_copies;
+    PendingImageLevels.clear();
+    PendingImageLevels.insert(key);
+  }
+  PendingImages.push_back(
+      {image.index, staging_offset, level, x, y, width, height, repeat});
   ++TheStats.image_uploads;
   TheStats.image_uploaded_bytes += total;
   return true;
@@ -1272,6 +1497,97 @@ bool VerifyImageLevel(const TextureImage &image, uint32_t level, const void *dat
   return equal;
 }
 
+// Reads a slot back off the GPU and compares it against what the arena should hold. The buffer
+// half of VerifyImageLevel, and it exists for the same reason: every counter in ResourceStats
+// can read perfectly while a slot holds another buffer's bytes. A draw reads its vertices and
+// indices by offset into one big arena, so a slot that took the wrong data does not fail - it
+// draws somebody else's geometry, or, through a corrupt index, a triangle stretched across the
+// screen.
+bool VerifySlot(const BufferSlot &slot, const void *expected, uint32_t bytes,
+                uint64_t *differing_bytes, uint64_t *first_difference, uint8_t *got_prefix) {
+  if (!Ready || !slot.valid || expected == nullptr || bytes == 0 || bytes > slot.bytes) {
+    return false;
+  }
+  const Arena &arena = slot.vertex ? VertexArena : IndexArena;
+  if (arena.buffer == VK_NULL_HANDLE) {
+    return false;
+  }
+
+  VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  info.size = bytes;
+  info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  VmaAllocationCreateInfo alloc = {};
+  alloc.usage = VMA_MEMORY_USAGE_AUTO;
+  alloc.flags =
+      VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+  VkBuffer readback = VK_NULL_HANDLE;
+  VmaAllocation readback_alloc = VK_NULL_HANDLE;
+  VmaAllocationInfo readback_info = {};
+  if (vmaCreateBuffer(Allocator, &info, &alloc, &readback, &readback_alloc, &readback_info) !=
+          VK_SUCCESS ||
+      readback_info.pMappedData == nullptr) {
+    return false;
+  }
+
+  bool equal = false;
+  VkCommandBufferAllocateInfo cmd_alloc = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cmd_alloc.commandPool = UploadPool;
+  cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cmd_alloc.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  if (vkAllocateCommandBuffers(GetDevice(), &cmd_alloc, &cmd) == VK_SUCCESS) {
+    VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &begin);
+    VkBufferCopy region = {slot.offset, 0, bytes};
+    vkCmdCopyBuffer(cmd, arena.buffer, readback, 1, &region);
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    vkResetFences(GetDevice(), 1, &UploadFence);
+    if (vkQueueSubmit(GetGraphicsQueue(), 1, &submit, UploadFence) == VK_SUCCESS) {
+      vkWaitForFences(GetDevice(), 1, &UploadFence, VK_TRUE, UINT64_MAX);
+      const auto *got = static_cast<const uint8_t *>(readback_info.pMappedData);
+      const auto *want = static_cast<const uint8_t *>(expected);
+      uint64_t differing = 0;
+      uint64_t first = bytes;
+      for (uint32_t i = 0; i < bytes; ++i) {
+        if (got[i] != want[i]) {
+          if (differing == 0) {
+            first = i;
+          }
+          ++differing;
+        }
+      }
+      equal = differing == 0;
+      if (differing_bytes != nullptr) {
+        *differing_bytes = differing;
+      }
+      if (first_difference != nullptr) {
+        *first_difference = first;
+      }
+      // What the arena actually holds at the first difference, which separates two very
+      // different failures: plausible geometry says another buffer's bytes landed here, zeros
+      // or noise says the copy never happened at all.
+      if (got_prefix != nullptr && first < bytes) {
+        const uint32_t n = bytes - static_cast<uint32_t>(first) < 32u
+                               ? bytes - static_cast<uint32_t>(first)
+                               : 32u;
+        std::memcpy(got_prefix, got + first, n);
+      }
+    }
+    vkFreeCommandBuffers(GetDevice(), UploadPool, 1, &cmd);
+  }
+
+  vmaDestroyBuffer(Allocator, readback, readback_alloc);
+  return equal;
+}
+
+const std::string &StagingWatchLog() { return WatchLog; }
+
 void RecordUploads(void *command_buffer, uint32_t frame_index) {
   if (!Ready || (Pending.empty() && PendingImages.empty())) {
     return;
@@ -1279,6 +1595,8 @@ void RecordUploads(void *command_buffer, uint32_t frame_index) {
   RecordInto(static_cast<VkCommandBuffer>(command_buffer));
   if (frame_index < kFramesInFlight) {
     Ring.frame_live[frame_index] = true;
+    Ring.frame_bytes[frame_index] += LastRecordedBytes;
+    Ring.in_flight += LastRecordedBytes;
   }
 }
 
@@ -1287,6 +1605,8 @@ void ReleaseFrameStaging(uint32_t frame_index) {
   // read and the ring may hand those bytes back.
   if (Ready && frame_index < kFramesInFlight) {
     Ring.frame_live[frame_index] = false;
+    Ring.in_flight -= Ring.frame_bytes[frame_index];
+    Ring.frame_bytes[frame_index] = 0;
   }
 }
 
@@ -1295,7 +1615,26 @@ namespace {
 // Records everything queued, with one barrier pair around the whole batch. Shared by the
 // frame path and by the mid-batch flush, so the two cannot drift.
 void RecordInto(VkCommandBuffer cmd) {
+  // The ring is host-written and GPU-read, and nothing else makes those writes visible: on a
+  // memory type that is not HOST_COHERENT the CPU's stores sit in its cache and the copy reads
+  // whatever was there before. VMA turns this into a no-op when the type is coherent, so it
+  // costs nothing to be right about it.
+  vmaFlushAllocation(Allocator, Ring.allocation, 0, VK_WHOLE_SIZE);
   for (const PendingCopy &copy : Pending) {
+    if (copy.barrier_before) {
+      // This copy overwrites bytes an earlier one in this batch also wrote, and two transfers
+      // in a command buffer are not ordered against each other. Without this the later upload
+      // does not reliably win, which is the whole defect - see PendingDstRanges.
+      VkMemoryBarrier2 barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+      barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+      barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+      barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+      barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
+      VkDependencyInfo dependency = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+      dependency.memoryBarrierCount = 1;
+      dependency.pMemoryBarriers = &barrier;
+      vkCmdPipelineBarrier2(cmd, &dependency);
+    }
     VkBufferCopy region = {copy.src_offset, copy.dst_offset, copy.bytes};
     vkCmdCopyBuffer(cmd, Ring.buffer, copy.dst, 1, &region);
   }
@@ -1345,6 +1684,17 @@ void RecordInto(VkCommandBuffer cmd) {
 
   for (const PendingImageCopy &copy : PendingImages) {
     const Image &entry = Images[copy.index];
+    if (copy.barrier_before) {
+      VkMemoryBarrier2 barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+      barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+      barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+      barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+      barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
+      VkDependencyInfo dependency = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+      dependency.memoryBarrierCount = 1;
+      dependency.pMemoryBarriers = &barrier;
+      vkCmdPipelineBarrier2(cmd, &dependency);
+    }
     VkBufferImageCopy region = {};
     region.bufferOffset = copy.src_offset;
     // 0/0 mean "tightly packed", which is what UploadIntoTextureImage guarantees.
@@ -1382,7 +1732,16 @@ void RecordInto(VkCommandBuffer cmd) {
 
   Pending.clear();
   PendingImages.clear();
+  PendingImageLevels.clear();
+  for (auto &ranges : PendingDstRanges) {
+    ranges.clear();
+  }
+  // The batch is not released here: its bytes are only free once the GPU has run these copies.
+  // The caller moves them into `frame_bytes` (the frame path, retired by that frame's fence) or
+  // waits for them itself (FlushPendingNow).
+  LastRecordedBytes = Ring.batch;
   Ring.batch = 0;
+  ++StagingBatch;
 }
 
 // Records and submits everything queued right now, on a throwaway command buffer, and waits.
@@ -1406,6 +1765,7 @@ bool FlushPendingNow() {
   VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   vkBeginCommandBuffer(cmd, &begin);
+  const uint32_t recorded_batch = StagingBatch;
   RecordInto(cmd);
   vkEndCommandBuffer(cmd);
 
@@ -1418,10 +1778,13 @@ bool FlushPendingNow() {
   if (ok) {
     vkWaitForFences(GetDevice(), 1, &UploadFence, VK_TRUE, UINT64_MAX);
   }
+  // After the wait, so the capture contains the copies AND their completion.
+  EndBatchCaptureIfArmed(recorded_batch);
   vkFreeCommandBuffers(GetDevice(), UploadPool, 1, &cmd);
   if (ok) {
-    // Rewinding to 0 is the same hazard as a wrap: a frame in flight may still be reading
-    // there. Our own fence only covers what we just submitted.
+    // The wait above covers only what this call submitted, so anything a frame still holds has
+    // to be waited for separately before the head may rewind over it.
+    LastRecordedBytes = 0;
     WaitForLiveFrames();
     Ring.head = 0;
     ++TheStats.staging_flushes;
@@ -1469,6 +1832,10 @@ std::string FormatResourceStats() {
       (unsigned long long)TheStats.staging_stalls,
       (unsigned long long)TheStats.dropped_uploads,
       (unsigned long long)TheStats.arena_exhausted);
+  add("   ... ring bytes skipped for alignment and wraps: %llu KB (they count against the "
+      "batch)   overlapping copies ordered: %llu\n",
+      (unsigned long long)(TheStats.staging_skipped_bytes >> 10),
+      (unsigned long long)TheStats.ordered_overlapping_copies);
   add("images: %llu live / %llu created   %llu KB (peak %llu KB)\n",
       (unsigned long long)TheStats.images_live,
       (unsigned long long)TheStats.images_created,
@@ -1488,6 +1855,11 @@ std::string FormatResourceStats() {
       (unsigned long long)(TheStats.scratch_index_bytes >> 10),
       (unsigned long long)(TheStats.scratch_indices_peak >> 10),
       (unsigned long long)TheStats.scratch_exhausted);
+  add("  ... plus %llu KB draw records (peak %llu KB) + %llu KB lights (peak %llu KB)\n",
+      (unsigned long long)(TheStats.scratch_draw_bytes >> 10),
+      (unsigned long long)(TheStats.scratch_draws_peak >> 10),
+      (unsigned long long)(TheStats.scratch_light_bytes >> 10),
+      (unsigned long long)(TheStats.scratch_lights_peak >> 10));
   add("bindless: %s   %llu image slots   %llu samplers   %llu writes   out of range: %llu"
       " (must be 0)\n",
       BindlessSet != VK_NULL_HANDLE ? "up" : "down",
@@ -1505,6 +1877,10 @@ void ShutdownResources() {
   vkDeviceWaitIdle(GetDevice());
   Pending.clear();
   PendingImages.clear();
+  PendingImageLevels.clear();
+  for (auto &ranges : PendingDstRanges) {
+    ranges.clear();
+  }
   for (Image &entry : Images) {
     if (entry.live) {
       vkDestroyImageView(GetDevice(), entry.view, nullptr);
@@ -1544,7 +1920,7 @@ void ShutdownResources() {
     vmaDestroyBuffer(Allocator, Ring.buffer, Ring.allocation);
     Ring = Staging();
   }
-  for (Scratch *scratch : {&ScratchVertices, &ScratchIndices}) {
+  for (Scratch *scratch : {&ScratchVertices, &ScratchIndices, &ScratchDraws, &ScratchLights}) {
     if (scratch->buffer != VK_NULL_HANDLE) {
       vmaDestroyBuffer(Allocator, scratch->buffer, scratch->allocation);
       *scratch = Scratch();

@@ -57,6 +57,48 @@ JSValue GetReport(JSContext *ctx, JSValueConst) {
   return JS_NewStringLen(ctx, text.data(), text.size());
 }
 
+// `render.topologies` - "", "strip", "line" or "all". A setter as well as a getter, because
+// the only exact way to measure what these draws paint is to toggle them inside one paused
+// frame; comparing two launches measures the scene drifting between them (§4.21).
+JSValue GetTopologies(JSContext *ctx, JSValueConst) {
+  bool strips = false;
+  bool lines = false;
+  d3d8::GetTopologies(strips, lines);
+  const char *value = strips && lines ? "all" : strips ? "strip" : lines ? "line" : "";
+  return JS_NewString(ctx, value);
+}
+
+JSValue SetTopologies(JSContext *ctx, JSValueConst, JSValueConst value) {
+  const char *text = JS_ToCString(ctx, value);
+  if (text == nullptr) {
+    return JS_EXCEPTION;
+  }
+  const std::string want(text);
+  JS_FreeCString(ctx, text);
+  if (want != "" && want != "strip" && want != "line" && want != "all") {
+    return JS_ThrowTypeError(ctx, "topologies must be \"\", \"strip\", \"line\" or \"all\"");
+  }
+  d3d8::SetTopologies(want == "strip" || want == "all", want == "line" || want == "all");
+  return JS_UNDEFINED;
+}
+
+// `render.lighting` - the real per-vertex light sum, on or off. Same reason as `topologies`
+// for being writable: false restores the previous build's material collapse, so the two states
+// are one frame apart and the difference image is exactly what lighting paints (§4.26).
+JSValue GetLighting(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, d3d8::GetLightSum());
+}
+
+JSValue SetLighting(JSContext *ctx, JSValueConst, JSValueConst value) {
+  d3d8::SetLightSum(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+JSValue GetShadowState(JSContext *ctx, JSValueConst) {
+  const std::string text = d3d8::FormatShadowState();
+  return JS_NewStringLen(ctx, text.data(), text.size());
+}
+
 // Structured form, so a REPL session can do arithmetic on it rather than reading prose -
 // e.g. `Object.keys(render.stats.fvfs).length` to size the vertex-format work.
 JSValue GetStats(JSContext *ctx, JSValueConst) {
@@ -246,6 +288,28 @@ JSValue VerifyTextures(JSContext *ctx, JSValueConst, int, JSValueConst *) {
   return JS_NewStringLen(ctx, report.c_str(), report.size());
 }
 
+// `render.capture_batch(n)` - see CaptureStagingBatch in VkCapture.h. The unit is a staging
+// batch rather than a frame because the uploads worth capturing happen during a level load,
+// which presents nothing.
+JSValue CaptureBatch(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+  uint32_t batch = 0;
+  if (argc < 1 || JS_ToUint32(ctx, &batch, argv[0]) < 0) {
+    return JS_ThrowTypeError(ctx, "capture_batch(n) takes a batch index");
+  }
+  vulkan::CaptureStagingBatch(batch);
+  return JS_UNDEFINED;
+}
+
+JSValue GetStagingWatch(JSContext *ctx, JSValueConst) {
+  const std::string &log = vulkan::StagingWatchLog();
+  return JS_NewStringLen(ctx, log.c_str(), log.size());
+}
+
+JSValue VerifyBuffers(JSContext *ctx, JSValueConst, int, JSValueConst *) {
+  const std::string report = d3d8::VerifyBufferSlots();
+  return JS_NewStringLen(ctx, report.c_str(), report.size());
+}
+
 // The layer's own words, not just a count. See the note on ValidationMessages in VkContext.h:
 // DebugWrite is OutputDebugString, and a debugger makes Gunlok unusable, so the REPL is the
 // only practical way to read these.
@@ -387,6 +451,9 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("captured", GetCaptured, nullptr),
     JS_CGETSET_DEF("report", GetReport, nullptr),
     JS_CGETSET_DEF("stats", GetStats, nullptr),
+    JS_CGETSET_DEF("state", GetShadowState, nullptr),
+    JS_CGETSET_DEF("topologies", GetTopologies, SetTopologies),
+    JS_CGETSET_DEF("lighting", GetLighting, SetLighting),
     JS_CGETSET_DEF("vulkan", GetVulkan, nullptr),
     JS_CGETSET_DEF("vulkan_report", GetVulkanReport, nullptr),
     JS_CGETSET_DEF("validation", GetValidationMessages, nullptr),
@@ -395,6 +462,9 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CFUNC_DEF("reset", 0, Reset),
     JS_CFUNC_DEF("clear_validation", 0, ClearValidation),
     JS_CFUNC_DEF("verify_textures", 0, VerifyTextures),
+    JS_CFUNC_DEF("verify_buffers", 0, VerifyBuffers),
+    JS_CFUNC_DEF("capture_batch", 1, CaptureBatch),
+    JS_CGETSET_DEF("staging_watch", GetStagingWatch, nullptr),
     JS_CGETSET_DEF("renderdoc", GetCaptureStatus, nullptr),
     JS_CFUNC_DEF("capture", 0, Capture),
 };

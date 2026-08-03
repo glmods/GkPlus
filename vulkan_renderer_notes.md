@@ -1147,8 +1147,10 @@ every frame and written rarely, which is why they are device-local and unmapped.
 straight into the mapped pointer means a user-pointer draw costs one `ConvertVertices` and no
 Vulkan work at all.
 
-One slice per frame in flight, reset from the same place `ReleaseFrameStaging` is called — the
-frame's fence having been waited on is the same proof for both.
+One slice per scene, rotated at the *end* of a frame. It was originally reset from the same place
+`ReleaseFrameStaging` is called, on the reasoning that the frame's fence is the same proof for
+both — and it is not, because the staging is written by the renderer and the scratch by the game.
+**§4.22 is that defect**; read it before touching the allocator.
 
 Three details that are easy to get wrong:
 
@@ -1166,7 +1168,914 @@ Three details that are easy to get wrong:
 
 `skipped_topology` is 6,158 and non-zero for the first time: those are the line lists and
 triangle strips among the user-pointer draws, which the single triangle-list pipeline cannot take.
-They are the next thing after fog.
+
+## 4.19 The second texture stage, and the pipeline states
+
+The scene was flat and bright against the d3d9 reference, and the plan said the gap was **fog and
+lighting**. It was neither. It was the **second texture stage** and the **alpha test and blend**,
+and getting that wrong for three sessions is the argument for the method below rather than for
+reading more of the renderer.
+
+### Ruling things out with the game's own renderer
+
+The instrument is two environment variables that make gl.exe draw the scene *without* one thing
+the Vulkan path is missing, and nothing else — `GKPLUS_NO_LIGHTING=1` forces `D3DRS_LIGHTING`
+off in the forwarded call, `GKPLUS_NO_STAGE1=1` forces `D3DTSS_COLOROP` to `DISABLE` on every
+stage past the first. Both modify only what is forwarded; the shadow state still records the
+truth, so `render.state` does not start lying while one is set. A block records what is
+forwarded, so a block built while `NO_STAGE1` is set carries the disable and `ApplyStateBlock`
+cannot put the stage back.
+
+Same camera, same frame, mean absolute difference against the unmodified d3d9 render:
+
+| | mean/255 | pixels differing by >32 |
+|---|---:|---:|
+| d3d9 vs d3d9 with **lighting off** | **0.08** | **0.1%** |
+| d3d9 vs d3d9 with **stage 1 off** | 6.48 | 11.6% |
+| d3d9 vs Vulkan, stage 0 only (before) | 15.85 | 24.2% |
+| d3d9 vs Vulkan, + stage 1 | 9.08 | 10.5% |
+| d3d9 vs Vulkan, + pipeline states | **7.77** | **10.3%** |
+
+The first row is the whole argument. It is also the *noise floor* of the comparison — two
+separate launches, level loaded from the REPL, briefing dismissed, twelve seconds to let the
+intro camera settle — so the procedure is reproducible to 0.08/255 and every other number in the
+table is signal.
+
+Three measurements, in the order they were taken:
+
+- **Fog is never enabled.** `D3DRS_FOGENABLE` is 0 for every draw of a session and
+  `D3DRS_FOGCOLOR`, `FOGTABLEMODE` and `FOGVERTEXMODE` are never set to anything else. The
+  cavern's fog is *content*, not D3D fog: `world.fog` reports enabled with a black colour, and
+  the engine renders it as a texture stage.
+- **Fixed-function lighting is enabled for 97.6% of draws and changes nothing.** 432,331 of
+  442,745, with `SetLight` 86,424 times and `LightEnable` 3.7 million — and the picture with it
+  forced off is identical to 0.08/255. `DIFFUSEMATERIALSOURCE` is `D3DMCS_COLOR1`, the global
+  ambient is 0 and the lights are disabled again by the time anything draws, so the result is
+  the vertex diffuse either way. Implementing D3D lighting would have been a week of work for
+  no pixels.
+
+  **This is wrong, twice over — see §4.20 for the HUD and §4.25 for the rest.** The same A/B
+  re-run measures 6.54/255, not 0.08. "The lights are disabled again by the time anything draws"
+  is the error: `LightEnable` runs 118 million times a session, around individual draws, and
+  `render.state` samples *between* frames. The snapshot is real and says nothing about the state
+  at a draw.
+- **Stage 1 is the whole gap**, and `NO_STAGE1` on the game's own renderer reproduces our
+  picture: bright, washed out, with the ceiling structure that should be hidden clearly visible.
+
+### What the stages actually are
+
+`render.state` now prints every texture-stage configuration drawn with, and how often. Six for a
+level01 session, and the two-stage ones are what matters:
+
+```
+53576 draws  2 stages | 0: c  4( 2, 0) a  4( 2, 0) uv0 tex | 1: c 13( 2, 1) a  3( 2, 1) uv1 tex
+32461 draws  1 stage  | 0: c  4( 2, 0) a  4( 2, 0) uv0 tex
+21904 draws  2 stages | 0: c  4( 2, 0) a  4( 2, 0) uv0 tex | 1: c  8( 2, 1) a  3( 2, 1) uv1 tex
+  888 draws  0 stages
+  296 draws  1 stage  | 0: c  3( 2, 0) a  3( 2, 0) uv0 ---
+```
+
+Stage 0 is always `MODULATE(TEXTURE, DIFFUSE)`. Stage 1 is `BLENDTEXTUREALPHA(TEXTURE, CURRENT)`
+(op 13, 49% of draws) or `ADDSIGNED(TEXTURE, CURRENT)` (op 8, 20%), on the second UV set, with
+its alpha `SELECTARG2` — i.e. the lightmap keeps the diffuse texture's alpha. `bitmaps\LEVEL01.rim`
+is the lightmap; the second UV set §4.1 measured on FVF `0x252` is its coordinates.
+
+The shader implements twelve `D3DTEXTUREOP`s rather than all twenty-six, and the CPU counts a
+draw naming one it does not — `unsupported_stage_op`, 0 on level01. Two stages, not eight:
+§4.7's "at most 2 active" is what sizes the push constants, and a third would not fit in 128
+bytes.
+
+**The stage count comes from `D3DTSS_COLOROP`, not from what is bound.** 2,160 draws a frame
+have every stage disabled and a texture still bound at stage 0; the old code keyed off the
+binding and sampled it. Fixed by construction here.
+
+### Three defects the second stage exposed, each invisible before it
+
+- **`D3DFMT_A8` was swizzled to `{ONE, ONE, ONE, R}` and must be `{ZERO, ZERO, ZERO, R}`.** D3D
+  reads a channel a format does not carry as 0 — alpha is the exception, reading as 1 — so an
+  alpha-only texture samples as `(0, 0, 0, a)`. White RGB is the *identity* under stage 0's
+  `MODULATE`, which is why §4.16 could not see it; under `BLENDTEXTUREALPHA` it inverted the
+  scene, fading the distance to white instead of to black. The texture readback (§4.13) cannot
+  catch this either: it compares stored bytes, and the swizzle is in the view.
+- **A texture bound only by `ApplyStateBlock` never got an image.** `EnsureTextureImage` hung
+  off `SetTexture`, and a block replay sets the shadow state through `ApplyOp` while touching no
+  `Set*` method at all — which is the whole reason blocks are replayed (§4.7). 83,176 draws a
+  session bound a DXT1 lightmap at stage 1 that had no image and sampled white, which under
+  `ADDSIGNED` *brightens* by 0.5. The fix is to give the texture its image in `ApplyOp`, so
+  "bound, however it was bound" is one code path. `stage_texture_unresolved` is the counter, and
+  it must be 0.
+- **A stage whose texture does not resolve samples white, and white is not neutral.** It is the
+  identity for `MODULATE` and nothing else. That is why the counter above is a must-be-0 rather
+  than a diagnostic.
+
+### The pipeline states, and the alpha test
+
+`PipelineKey()` had counted six distinct pipeline states for a level since §4.7 and thrown the
+values away. A count cannot be implemented against, so `render.state` now prints them:
+
+```
+       atest ref func  blend src dst   z zwrite zfunc cull
+80709      1  31    7      1   5   6   1      1     4    3
+27232      0  31    7      0   5   6   1      1     4    3
+ 1184      0  31    7      1   1   2   1      0     4    1
+  592      0  31    7      1   5   6   0      0     4    1
+  296      0  31    7      0   5   2   1      1     4    3
+```
+
+**73% of draws have both the alpha test and alpha blending on**, `SRCALPHA`/`INVSRCALPHA` with
+`GREATEREQUAL 31`. A single always-opaque pipeline draws three draws in four with the wrong
+coverage, which is what made the units white blobs with halos. Five `VkPipeline`s, built on
+first sight of a state and cached; `pipeline_failures` must be 0.
+
+Three decisions:
+
+- **The alpha test is a `discard`, not pipeline state.** It varies per draw under the same blend
+  and depth settings, so putting the reference in the pipeline key would multiply the pipeline
+  count by the number of distinct references for nothing. It rides in `flags` — `D3DCMPFUNC` in
+  bits 0..3, `D3DRS_ALPHAREF` in 8..15 — and compares in 0..255 units, because `>= 31/255` and
+  `>= 31` differ by a rounding step and the test is exactly where that shows.
+- **The draw list is not sorted by pipeline.** It is recorded in the order the game issued it,
+  which is what makes blending come out right with no work here: `RenderQueue_Flush` has already
+  state-sorted the opaque draws and put the back-to-front list last (`rendering_notes.md` §4).
+  Sorting to save binds would undo that. 12,207 binds against 595,119 draws is what the game's
+  own ordering already gives.
+- **`D3DCMPFUNC` and `VkCompareOp` are the same eight comparisons in the same order, one apart.**
+  Written as the subtraction it is, with the range checked, rather than an eight-case switch that
+  would only restate it. `D3DCULL_CW` is the existing `D3DCULL_CCW` rule with the front face the
+  other way round — the winding convention itself was measured in §4.16 and is not re-derived.
+
+### What is left, precisely
+
+7.77/255 against a noise floor of 0.08, and it is **not** uniform: the near rock matches to
+within 1.5/255, the mid-distance walkway is uniformly ~+8 on every channel, and the far rock is
++8 red / +13 green / +23 blue. Amplifying the difference shows texture detail on every lit
+surface rather than a flat offset. So the residual grows with distance and desaturates toward
+grey — the shape of a fog or lightmap term that is not attenuating enough — and it is the next
+thing to chase. Ruled out already: mip drift (`render.verify_textures()` is 155/158, all three
+8x8 level-1 mips), the swapchain being sRGB (format 37 is `R8G8B8A8_UNORM`), and D3D lighting.
+
+**It is D3D lighting** — §4.25. The description above is accurate and the attribution is not:
+lit-against-unlit reproduces this residual's shape and magnitude region for region. It was ruled
+out on the null A/B corrected in the bullet above.
+
+Validation is clean with the five pipelines and the alpha test: 0 errors, 0 warnings.
+
+## 4.20 The HUD is green, and it is fixed-function lighting after all
+
+Reported from playing, not from a counter: **the character portraits render greyscale where the
+game shows them monochrome green.** Chasing it corrected §4.19's headline claim, so read this
+next to it rather than instead of it.
+
+### The screenshot was missing a third of the frame
+
+`GetClientRect` reported 418x312 while the swapchain was the real 628x468, because gl.exe is not
+DPI aware and Windows hands *it* virtualized coordinates. `PrintWindow` renders at the window's
+own resolution, so a bitmap sized from that rect keeps only the top-left two thirds — and the HUD
+is in the upper right. **Every screenshot in §4.19 was cropped, and nothing about them looked
+wrong.** One `SetProcessDPIAware()` in the capturing process fixes it: a DPI-aware caller asking
+about a non-aware window gets the physical rect.
+
+The §4.19 numbers stand as comparisons — both sides were cropped identically — but they were
+never the whole frame, and the 7.77 there is 9.62 measured over all of it.
+
+### §4.19 said lighting contributes nothing. That was true of the frame it measured.
+
+`GKPLUS_NO_LIGHTING=1` changed the picture by 0.08/255 — on a frame **with no HUD up**. Re-run
+with the HUD visible, the same switch turns the panel from green (2.1, 23.2, 0.2) to grey
+(47.8, 46.3, 45.9), which is exactly what this renderer was drawing. So fixed-function lighting
+does contribute, and the earlier conclusion was an over-generalisation from a sound measurement:
+**an A/B is only evidence about the pixels that were on screen when it ran.**
+
+What it does is narrower than "lighting", though, and the narrowness is the whole implementation:
+
+- The HUD's geometry carries **no vertex colour at all** — FVF `0x112` and `0x212`, position,
+  normal and texture coordinates. `ConvertVertices` gives those a neutral opaque white, which is
+  the identity under `MODULATE` and therefore renders the source art in its own colours: a
+  perfectly plausible picture that is not the game's.
+- With lighting on, D3D does not use the vertex colour there. It computes
+  `emissive + ambient_material * global_ambient + SUM over lights(...)`.
+- **Gunlok enables no light for those draws** — measured per draw, 0 enabled on every one — and
+  its global ambient is 0. The sum is empty and the whole expression collapses to the material's
+  **emissive**, which for the HUD is `0x008000` and `0x00ff00`. Green.
+
+So the implementation is one packed colour per draw in the push constants, not a lighting loop:
+computing an empty sum would be elaborate machinery around a term that is always zero. Alpha
+comes from the material's diffuse, which is where the panel's 0x80/0x99/0xcc translucency lives.
+
+**It applies only where the vertex has no colour of its own**, and that boundary is measured
+rather than cautious. Applying the same collapse to geometry that *does* carry a vertex colour
+rendered the terrain very nearly black — the world is lit by real lights (94% of draws have one
+enabled), so its sum is not empty. For that geometry §4.19's A/B already showed the lit result
+and the vertex colour to be the same picture to 0.08/255, so keeping the vertex colour is a
+measurement too, not a shortcut.
+
+`lit_draws_with_lights` counts what falls through both tests: lighting on, no vertex colour, and
+a light enabled after all — 845 in a session against ~2M draws. Note where it sits, because the
+number means nothing without it: the vertex-colour test comes *first*, so this is not "94% of
+draws are unlit by us". It is the narrow remainder where the collapse would have been wrong and
+the vertex default is used instead, and a level on which it is large is a level that needs the
+real light sum.
+
+### Two things that were never drawn at all
+
+Both found by asking why a draw was skipped rather than by looking:
+
+- **A buffer whose only `Unlock` happened before the renderer existed never got an arena slot**,
+  and is never unlocked again — 9 buffers, ~4.5 draws a frame. A slot was claimed on first
+  Unlock, and `vulkan::ResourcesReady()` is false until the first `Present`. They now seed
+  themselves from their own contents at draw time (`SeedFromContents`), the same shape and the
+  same justification as `EnsureTextureImage`: being drawn is the definition of needing to be
+  resident, and the buffer is the only thing that still knows what is in it. The read lock is
+  safe for what it is used on and `pool_` is checked rather than assumed.
+- **Non-triangle-list topologies** — 3 strips and 1 line list a frame.
+
+`skipped_no_slot` is 0 now, and its breakdown (foreign stream / unslotted vertices / unslotted
+indices / 32-bit index buffer) is what turned "14,644 draws skipped" into a single named cause.
+
+### The topologies are OFF by default, and that is the interesting result
+
+Drawing them **made the picture worse**. Measured against d3d9 on the same frame, mean absolute
+difference over the whole frame:
+
+| | |
+|---|---:|
+| d3d9 vs d3d9 (noise floor) | **0.07** |
+| neither seeding nor the lit colour nor topologies | 9.62 |
+| seeding + lit colour | **8.34** |
+| + topologies | 10.64 |
+
+So seeding and the lit colour are worth 1.28 together, and the topologies cost 2.30. Something
+about how a strip or a line list is drawn is wrong — winding, or geometry that should not be
+visible at all — and shipping them would have been a regression dressed up as completeness
+("every primitive type now draws"). They are opt-in through `GKPLUS_VK_TOPOLOGIES=1`, and
+finding out why is the next thing.
+
+**That bisect only worked at the 12-second settle.** At 90 seconds the two renderers run at
+different frame rates, so the game is in a *different state* by the time the shot is taken and
+the frames are not comparable — the first attempt at this bisect produced five numbers with no
+pattern, and a rock that appeared and vanished between runs of identical code. Check the
+d3d9-vs-d3d9 noise floor at whatever settle you use before trusting any difference: 0.07 at
+twelve seconds, and not reproducible at ninety.
+
+### The shadow state now starts at the API's defaults
+
+`D3DRS_COLORWRITEENABLE` is what forced it: its default is all four channels and its zero means
+write *none* of them, so the moment it joined the pipeline key, every draw before the game first
+set it would have rendered nothing. It never sets it, so that is every draw. Zero is a legal
+value for most of these states rather than an obviously-missing one, which is what makes the
+whole class dangerous — `InitialiseShadowState` sets the documented initial value for every
+state the renderer reads, and adding one to a pipeline key is a reason to check its default.
+
+### What it cost, and what it is now
+
+| | whole frame | HUD panel |
+|---|---:|---:|
+| d3d9 vs d3d9 | 0.07 | 0.00 |
+| before | 9.62 | 38.96 |
+| after | **8.30** | **4.62** |
+
+Ruled out along the way, each with a switch or a dump rather than an argument: vertex specular
+(`GKPLUS_NO_SPECULAR` changes nothing), `D3DTA_TFACTOR` (set, but no stage names it),
+`D3DRS_COLORWRITEENABLE` (never set), and a wrong texture (the shapes matched all along; only
+the channels differed). The green channel matching d3d9 to within 2/255 while red and blue did
+not was the measurement that made "a colour multiplies this" the only remaining explanation.
+
+## 4.21 Why the topologies made it worse: Gunlok has stencil shadows
+
+§4.20 shipped the line lists and triangle strips switched off because turning them on cost
+2.30/255. The topologies are not the problem. **The game draws stencil shadows, and this
+renderer has no stencil buffer**, so one of those draws lands over the whole screen instead of
+over the shadows.
+
+### Getting a comparison that means anything
+
+The first attempt at this bisect was worthless, and finding out why is the more useful half.
+
+**Two launches are not comparable.** The two renderers run at different frame rates, so at a
+fixed wall-clock delay the *game* is in a different state. Measured: three Vulkan runs of
+identical code at the same 12-second settle differ from each other by up to **8.06/255**, which
+is larger than nearly everything worth measuring. Two of them agreed to 0.03 and a third did
+not — so a single agreeing pair proves nothing either. The d3d9-vs-d3d9 floor of 0.07 says the
+*capture* is reproducible; it says nothing about the game's state.
+
+Three things together make a frame comparable, and all three are needed:
+
+- **`screen.toggle_pause()`** (`PAUSE GAME`), so the simulation stops and nothing animates;
+- **set the camera explicitly** — `camera.position`, `yaw`, `pitch`, `roll`, `distance` — so the
+  framing does not depend on where the intro move happened to get to. Read the values back from
+  a session and reuse them *within* it: the same literals replayed in a later session framed
+  something else entirely, and `render.draws` dropping to 73 a frame is what said so. Check that
+  count before trusting a controlled shot;
+- **wait out the mission-objectives overlay**, which dims the entire screen while it is up and
+  is itself one of these full-screen quads.
+
+`controlled.ps1` in the session scratchpad is that procedure.
+
+**Better still, do not compare two processes at all.** `render.topologies` is settable at run
+time, so with the game paused the feature can be toggled between two shots of the *same frame*.
+That reduces the noise floor to **0.03** and makes the difference image exactly the pixels the
+feature touched. That is what turned this from an argument into a measurement, and it is the
+technique to reach for whenever a renderer feature needs judging.
+
+### What the three draws are
+
+There are four non-triangle-list draws a frame, and `render.state` now prints what each one is,
+including the screen box its vertices cover:
+
+```
+   type   fvf  from  prims  stages  texture  blend  ztest   screen box          colour      sten
+      2 0x1c4   ptr      2       1       -1      0      1   512,384  640,480  0xff00c700   0
+      5 0x1c4   ptr      1       1        7      1      1   576,418  639,440  0x8f3fff3f   0
+      5 0x1c4   ptr      2       0       -1      1      0     0,0    628,468  0x7f000000   1
+```
+
+The first two are HUD corner decorations and cost nothing — toggling the line lists alone moves
+the picture by 0.04/255. The third is a **full-screen quad, 50% black** (`0x7f000000` blended
+`SRCALPHA`/`INVSRCALPHA`), drawn twice a frame, and it has `D3DRS_STENCILENABLE` on where
+nothing else in the frame does.
+
+### It is the classic shadow-volume algorithm
+
+The pipeline histogram, now keyed by the stencil states too, shows all three passes:
+
+```
+ 42 draws 0x112  blend ZERO/ONE  z 1 zwrite 0 cull NONE   sten 1 func ALWAYS    pass INCRSAT
+ 42 draws 0x112  blend ZERO/ONE  z 1 zwrite 0 cull NONE   sten 1 func ALWAYS    pass INCR
+ 42 draws 0x1c4  blend SRC/INV   z 0 zwrite 0 cull NONE   sten 1 func LESSEQUAL pass REPLACE  ref 1
+```
+
+Two passes over the shadow geometry with **colour writes neutralised by the blend itself** —
+`SRCBLEND ZERO`, `DESTBLEND ONE` is `result = dst`, so they are invisible by construction rather
+than by a colour mask — incrementing the stencil counter, and then the darkening quad tested
+against it with `LESSEQUAL 1`.
+
+So this renderer already draws the volume passes, correctly and invisibly. What it does not do
+is *count* anything, because **`ChooseDepthFormat` puts `VK_FORMAT_D32_SFLOAT` first** and that
+format has no stencil aspect. With no mask, the third pass darkens everything.
+
+That also explains the shape of the earlier symptom exactly: the difference image showed the
+terrain darkened and the **units left alone**, because the quad is submitted mid-frame, after
+the world and before the characters.
+
+### What the fix is
+
+Not large, and now fully specified by the table above:
+
+1. Pick a depth format **with a stencil aspect** — `D24_UNORM_S8_UINT` or `D32_SFLOAT_S8_UINT`,
+   both already in the candidate list, just after the one that wins — and clear stencil with
+   depth.
+2. Put the stencil state in `PipelineState`: enable, func, ref, read/write masks and the three
+   ops. `D3DSTENCILOP` and `VkStencilOp` do **not** correspond one-to-one — D3D's `INCRSAT`(5)
+   saturates and `INCR`(7) wraps, which is `VK_STENCIL_OP_INCREMENT_AND_CLAMP` and
+   `..._AND_WRAP` — so write them out rather than subtracting.
+3. `D3DRS_STENCILREF` and the masks are dynamic state in Vulkan, so they need not multiply the
+   pipeline count.
+
+Until then the topologies stay off, which is the smaller error: shadows missing rather than the
+whole screen darkened.
+
+## 4.22 The scratch belonged to the wrong end of the frame
+
+Actors and text glitched wildly and at random: units and HUD characters landing at arbitrary
+positions, particles drawn as huge screen-filling quads, HUD numbers vanishing for a frame.
+Only the user-pointer draws — §4.18's text, particles, menus and **units** — and never the
+world, which is the shape that names the culprit before any measurement does. Buffered geometry
+lives in the arena; only the UP path goes through the per-frame scratch.
+
+### The defect
+
+`DrawFrame` called `BeginFrameScratch(FrameIndex)` at the **top**, right after the fence wait,
+on the reasoning that the fence proves the slice is free to reuse. The fence proof was right and
+the placement was wrong, because **the scratch is not written by the renderer — it is written by
+the game, during the scene, before Present is ever called**.
+
+So for scene *k*:
+
+- the game bump-allocates and converts into the slice whose base the *previous* `DrawFrame` had
+  installed, and records `base_vertex` relative to it;
+- `DrawFrame(k)` then rotates the base and `RecordDraws` reads `ScratchVertexAddress()` — the
+  *new* base — for every `push.vertices`.
+
+With two slices that is a full slice of skew: every user-pointer draw pulled its vertices from
+the slice the **previous scene** had filled, at the **current scene's** offsets. It looks fine
+whenever consecutive frames allocate the same way, which is exactly why it survived §4.18's
+"the characters appear where d3d9 has them" check and every counter: a static scene re-allocates
+identically frame after frame, so the stale slice happens to hold equivalent bytes. It falls
+apart the moment the pattern moves — a particle appearing, a HUD number changing width, a unit
+entering the frame — and then a draw addresses unrelated vertices.
+
+Two independent bugs, one cause. The second is a plain data race: after the rotation, the slice
+the CPU wrote next was the very one the frame just submitted was reading.
+
+**The indices were unaffected and that asymmetry is diagnostic.** `AllocateScratchIndices`
+already makes its offset absolute from the start of the buffer (the index buffer is bound at
+offset 0), so an index offset carries its own slice and stayed correct. Only the vertex address
+was recomputed at record time. Structure right, positions wrong — which is precisely what a
+"vertices glitching" report describes.
+
+### The fix, and why it needs a third slice
+
+The slice belongs to the **scene**, not to a frame in flight. `RotateFrameScratch` is called at
+the *bottom* of `DrawFrame`, after the submit that reads the outgoing slice, so the scene the
+game is about to draw writes somewhere else and `RecordDraws` still sees what that scene wrote.
+
+The count then has to grow, and the argument is worth keeping because "one per frame in flight"
+is the reflex:
+
+- scene *k+1*'s write window is `[end of DrawFrame(k), start of DrawFrame(k+1)]`;
+- the only completion proven inside that window is the fence waited at the top of
+  `DrawFrame(k)`, which retires frame *k−N*;
+- with *N* slices the one coming round belongs to frame *k+1−N*, still in flight.
+
+So `kScratchSlices = kFramesInFlight + 1`, and the incoming slice was last read by the frame that
+fence retired. The buffers grow by half — 12 MB vertex, 3 MB index at full heaps, against
+measured peaks of 800 KB and 66 KB, so this is untouched headroom either way.
+
+A dropped frame (the `CreateSwapchain`-failed path) empties the current slice instead of
+rotating: nothing was submitted from it, so it stays the one the next scene writes into, and
+rotating there would be the unproven move all over again.
+
+### What the A/B says
+
+The check is a *dynamic* scene, and picking one is the whole difficulty — a paused frame cannot
+show this. `fx.snow(true)` is the cheap generator: particle counts differ every frame, so the
+allocation pattern never repeats.
+
+| | pre-fix | fixed |
+|---|---|---|
+| snow on, level01 | screen-sized grey quads where flakes belong; both HUD health numbers gone | flakes correct, HUD complete |
+| paused, camera set explicitly | — | **0.106/255** against pre-fix — the noise floor |
+
+That second row is the one that keeps the first honest: with the simulation stopped the two
+builds are the same picture, because a static scene is exactly the case the defect could not
+reach. Both still sit 11.2/255 from d3d9 at that camera, unchanged by this — that residual is
+§4.19's plus the §4.21 shadow wedge, and **both builds draw the wedge identically**, which is
+what rules this change out as its cause. A screenshot showing a new artifact next to a fixed one
+is worth nothing until the old build has been put at the same camera; that cost one extra
+build cycle here and was the only way to tell the two apart.
+
+## 4.23 One slot per buffer is wrong: the game refills within a frame
+
+The main menu's text glitched occasionally after §4.22, and the first thing measured ruled the
+scratch out entirely: **at the front end there are no user-pointer draws at all.** All 8,000-odd
+draws of a menu session are buffered. Whatever was wrong lived on the arena side, and §4.22's
+fix could not have touched it.
+
+The number that named it was **6,171 locks against 8,117 draws over 395 frames** — about 15
+locks a frame for 21 draws. A static menu does not re-upload its geometry fifteen times a frame
+unless it is reusing the same buffer, which is what a batching text renderer does.
+
+### The defect
+
+`BufferSlot` is one arena region per D3D buffer, written on every `Unlock` (§4.8, and the
+reasoning there is still right for what it was measured on). The draw list, meanwhile, is not
+recorded until Present. So for a buffer filled twice in one frame:
+
+```
+lock/fill A -> unlock (A into the slot) -> draw1 -> lock/fill B -> unlock (B into the slot) -> draw2
+                                                                                    ... Present
+```
+
+both draws read the slot, and the slot holds B. `draw1` renders `draw2`'s contents.
+
+A counter was added rather than inferred — `buffer_rewritten_after_draw`, set when an `Unlock`
+follows a draw off the same buffer in the same frame — and it reported **774 over 395 frames:
+387 vertex and 387 index, one pair per frame, two draws affected.** Two of the menu's 21 draws
+were rendering the wrong geometry every frame.
+
+**The lock flags are what turn that from a suspicion into a defect**, and they are why the
+counter records them. A `D3DLOCK_NOOVERWRITE` refill is the game *promising* it will not touch
+bytes already drawn from, which would make all of this harmless; `D3DLOCK_DISCARD` is the
+opposite. Neither is trusted on its own, so the byte ranges are compared too. The measurement:
+
+```
+lock flags 0x0800 overlapping 774
+```
+
+`0x0800` is `D3DLOCK_NOSYSLOCK` and nothing else — **no NOOVERWRITE, no DISCARD** — and all 774
+overlap the range the earlier draw read. The game simply refills the same bytes of one
+vertex/index pair, twice a frame, with no promise attached.
+
+### The fix: version the refill into the frame's scratch
+
+The slot must keep the version the already-recorded draws reference, so the *new* version is
+what moves. It goes into the per-frame scratch — which is exactly the right home, because this
+data has precisely the lifetime the scratch exists for: one frame, written by the CPU, read
+once. It is a user-pointer draw arrived at from the other direction.
+
+- On an `Unlock` that follows a draw off the same buffer this frame, the whole buffer is
+  converted into the scratch and the wrapper records `(version_frame_, version_offset_)`; the
+  slot is left alone.
+- `EmitDraw` prefers a version whose frame is the current one. The version expires by itself
+  when the frame number moves on — the scratch slice is recycled anyway, so there is nothing to
+  clear and no way to reference a stale one.
+- **The whole buffer is copied, not the locked range.** A draw may index anywhere in it, and
+  copying all of it keeps the offsets the buffer's own. A *partial* refill therefore cannot be
+  versioned at all — the untouched bytes are not kept anywhere on this side — so it falls
+  through to the old behaviour and increments `unversioned_rewrites`, which is a must-be-0.
+  Level01 and the menu produce none.
+
+`DrawItem` grew a **separate source for each stream** for this. Vertices and indices are
+refilled independently in general, so one `DrawSource` for both would force a draw with one
+versioned buffer to fake the other.
+
+### What it cost and what it fixed
+
+```
+menu:     774 rewritten, 774 versioned, 0 not versioned   scratch peak 96 KB vtx + 6 KB idx
+level01:  598 rewritten, 598 versioned, 0 not versioned   scratch peak 991 KB (was 800 KB)
+```
+
+The picture is the proof, and it is legible rather than statistical: the console overlay at the
+menu prints four lines, and before the fix the **third was absent and the fourth truncated to
+its tail** — the two draws the counter had already identified. After it, all four render exactly
+as d3d9 does. The console-text band goes from 9.95/255 against d3d9 to 6.64, and the whole frame
+from 5.66 to 5.15; the rest is the pre-existing menu residual.
+
+Two things worth carrying forward:
+
+- **The static-frame trap from §4.22 has a mirror image here.** That defect needed a changing
+  scene and hid on a still one; this one is perfectly stable — 60 consecutive menu captures were
+  *bit-identical*, wrong text and all. A stability check is evidence about which defect you have,
+  not about whether you have one.
+- **A HUD element disappearing is not automatically a renderer bug.** The health bars and unit
+  numbers vanished between two in-level shots and looked like a regression; the d3d9 reference
+  shows them absent in the same states. They follow game state, and a toggle with a five-second
+  wait either side spans one.
+
+## 4.24 Two copies to one arena slot, and nothing ordering them
+
+**Two transfers in a command buffer are not ordered against each other.** Vulkan orders the
+stages of a pipeline; it does not order two `vkCmdCopyBuffer`s that write the same bytes. Without
+a barrier between them the result is whichever the driver retires last, and on this AMD card that
+is often the *earlier* one.
+
+`RecordInto` emitted every pending copy back to back. That is correct for a batch of copies to
+distinct destinations, which is what a frame's uploads are — and wrong for a **level load**, which
+frees a buffer's arena slot and hands it straight to a new buffer inside the same batch. Both
+uploads then sit in `Pending` naming the same arena offset, and the loser's contents are what the
+draw reads.
+
+The symptom is not subtle and does not look like a synchronisation bug: **one object smeared into
+a hard-edged black wedge across a third of the screen**, because a mesh drawn through another
+mesh's vertices reaches wherever those indices point. On level01 it was the fraggable boulder,
+identical in every session, and it swept over the world as the camera scrolled — which reads as
+the visibility mask glitching rather than as one object being wrong.
+
+The same hazard applies to the image blits, which were also emitted back to back between one
+barrier pair, and it was costing 1-3 mip levels a session — the residual §4.13 left open.
+
+### What it took to find, which is the part worth keeping
+
+Every cheap check said the upload path was correct, and each was true:
+
+- `render.verify_buffers()` — added for this, the buffer half of §4.13's texture check — pinned it
+  to **9 of 3,467 buffers**, deterministically, with `1 unlocks` each and a re-upload fixing every
+  one. That is what turned "the picture is wrong" into "these nine slots hold the wrong bytes".
+- The staged bytes were right when the copy was **recorded** and still right when its fence
+  **retired**, so the ring was exonerated as a source.
+- No two *live* slots overlapped, the buffer's own D3D contents matched what was uploaded byte for
+  byte, and the uploads covered `[0, len)` of each slot.
+
+Three of those measurements were built to catch this and could not, which is the lesson:
+
+- **A per-block "who wrote this" table keyed on the copy's destination offset cannot see it.**
+  Both copies name the same offset, so the table reported one writer and looked clean. It was
+  blind to the very thing it was written for.
+- **Forcing the frame path synchronous proved nothing**, because a level load never runs a frame —
+  `RecordUploads` is not called, and every batch already goes through `FlushPendingNow`.
+- **`GKPLUS_VK_HEAPS=small` "fixes" it** — 8 of 9 buffers come right — for the uninteresting
+  reason that an 8 MB ring flushes 3,218 times instead of 30, so two copies to one slot rarely
+  share a batch. A configuration that makes a bug go away is not thereby a diagnosis.
+
+What actually named it was **logging every upload to one watched arena offset along with its batch
+number** (`GKPLUS_VK_WATCH_DST`, `render.staging_watch`):
+
+```
+  batch 862: slot 6106272 + 0,  9408 bytes, staged at 15808176
+  batch 862: slot 6106272 + 0, 10752 bytes, staged at 15991696
+```
+
+Two buffers, one slot, one batch. Nothing else needed to be measured.
+
+### RenderDoc could not have shown this, and that is worth writing down
+
+The capture route is closed for load-time uploads, in both directions at once:
+
+- A load presents nothing, so there is no frame to capture. `CaptureStagingBatch(n)` exists for
+  that — the unit is a staging batch, and it is reproducible because a load stages the same bytes
+  in the same order every run, so one run says which batch and the next captures it.
+- At full heaps the capture **dies**: `Allocating readback window of 67108864 bytes` then
+  `common.cpp(214) - Fatal - Allocation for 67108992 bytes failed`. That is §4.17's 32-bit
+  address-space limit again, hit by RenderDoc's persistent-map flush rather than by initial state.
+- At the small heaps that would fit, the defect is 8/9 gone (above), so the capture would show a
+  correct frame.
+
+The instrumentation is kept anyway: it is the only way to look at a load, and the next upload bug
+will want it.
+
+### The fix, and the counter that keeps it honest
+
+A copy whose destination overlaps one already queued in the batch gets a
+`TRANSFER_WRITE -> TRANSFER_WRITE|TRANSFER_READ` barrier in front of it, and the range map is
+cleared at that point — the barrier orders *every* earlier copy, so nothing before it can collide
+again. Image blits use the same mechanism, conservatively keyed on image+level rather than on
+rectangles. `ordered_overlapping_copies` reports it: **166,375** on a level01 session, which is
+how much unordered overlap was there all along.
+
+Both content checks come back clean afterwards, which neither had ever done:
+
+```
+  render.verify_buffers()   3467/3467 buffers match, 0 overlapping live slots
+  render.verify_textures()  158/158 levels match
+```
+
+and the frames the wedge covered go from 11.23/255 against d3d9 to 7.41 (cross-session, so a
+5.2/255 noise floor — the wedge is gone, and what is left is §4.19's residual).
+
+### Two ring defects found on the way, neither of them this
+
+Both were real and both are fixed; both are also a reminder that a plausible bug found while
+hunting another one is not evidence you have found the one you are hunting.
+
+- **`batch` counted payload bytes, not distance travelled.** Alignment padding and the tail
+  abandoned at a wrap — 145 MB a session — let the head drift ahead of its own un-recorded batch
+  and lap it.
+- **Recorded bytes were released at record time.** A copy is only free once the GPU has *run* it,
+  which is later than recording; `frame_bytes`/`in_flight` now hold them until the frame's fence.
+
+## 4.25 The light sum is not optional, and it is most of the residual
+
+Reported from playing, like §4.20: **crates, the boulder and some health bars are not fogged** —
+they sit at full brightness against a scene that darkens with distance. Chasing it overturns
+§4.19's second headline claim and reassigns the residual §4.19 left open, so this supersedes both
+rather than sitting beside them.
+
+**It is not fog, and that part of §4.19 was right.** `draws with fog on: 0` over a 12,045,221-draw
+session, with `FOGENABLE`, `FOGCOLOR`, `FOGTABLEMODE` and `FOGVERTEXMODE` never set to anything
+but zero. What reads as fog is fixed-function **lighting**, and this renderer implements none of
+it for geometry that carries a vertex colour — which is nearly all of it.
+
+### The measurement
+
+`GKPLUS_NO_LIGHTING=1` on the game's own d3d9 renderer, level01, same camera set explicitly from
+the REPL on a paused game (§4.21's procedure). Mean RGB per region, which is what to compare
+across separate launches — a whole-frame MAD is dominated by inter-run misalignment and says
+13.04 for two d3d9 runs of *identical* code:
+
+| region | vulkan | d3d9 **lit** | d3d9 **lighting off** |
+|---|---|---|---|
+| boulder | 85, 59, 52 | 79, 49, 32 | **85, 59, 52** |
+| ground mid | 81, 27, 17 | 75, 23, 11 | **81, 27, 17** |
+| ground far | 68, 35, 28 | 59, 26, 15 | **68, 35, 28** |
+| left rock wall | 24, 9, 7 | 26, 10, 7 | **24, 9, 7** |
+
+Vulkan reproduces *lighting-disabled* d3d9 to within 0.5/255 on every static region. The renderer
+draws the whole scene as though `D3DRS_LIGHTING` were off, because that is exactly what it does.
+
+### Why it presents as "some objects are unfogged" rather than "everything is bright"
+
+`DIFFUSEMATERIALSOURCE` is `D3DMCS_COLOR1`, so a vertex diffuse is the **material diffuse**, not
+the final colour: D3D computes `emissive + ambient * global_ambient + SUM over lights(material
+diffuse x light)`. The shader uses it *as* the final colour, which is D3D's lighting-off result.
+
+On the lightmapped world — the two-stage draws on `uv1` — the lightmap supplies most of the
+darkening, so it looks approximately right. The **single-stage** draws have nothing else
+attenuating them and land at full unlit albedo: 428,414 at FVF `0x152` and 2,468,778 at `0x252`,
+which is the crates, the boulder, the units and the health bars. That is the whole of the
+reported symptom.
+
+### The counter that should have caught this is blind by construction
+
+`lit_draws_with_lights` is documented as the number that would say "this level needs the real
+light sum". It cannot, because in `ResolveLighting` the FVF test precedes the light test:
+
+```cpp
+if ((State.fvf & D3DFVF_DIFFUSE) != 0) return;   // <- first
+for (...) if (State.light_enabled[i]) { ++lit_draws_with_lights; return; }
+```
+
+so every draw with a vertex colour returns before the lights are ever looked at. It read exactly
+**845 across 340,000 further draws** while the level rendered — a frozen counter, not a small
+one, and the two are indistinguishable without watching it move. It only ever counts HUD
+geometry.
+
+### It is also the residual §4.19 could not name
+
+§4.19 described the leftover as growing with distance and desaturating toward grey — near rock
+within 1.5/255, walkway ~+8 on every channel, far rock +8/+13/+23 — and ruled out D3D lighting.
+Measured here, lit against unlit: ground far +9/+9/+13, boulder +6/+10/+20, units +18/+16/+22.
+Same shape, same magnitude. Whole-frame d3d9 lit vs d3d9 unlit is **6.54**, against the 0.08
+§4.19 recorded for that same A/B.
+
+**Why the original A/B read as null is worth keeping**, because it is a general trap:
+`LightEnable` is called **118,077,962** times a session — lights are switched on and off around
+individual draws — so `render.state`, which samples between frames, shows all five lights `off`
+and the global ambient 0. From that snapshot the equation genuinely does collapse to the vertex
+colour. **The state a per-draw quantity has between frames is not the state it has at any draw.**
+
+Level01's lights, for whoever implements this: one directional (type 3, diffuse 1.29/1.00/0.69,
+direction 0.382/0.644/-0.664) and four point (type 1, diffuse 1.00/0.39/0.09, range 10,
+attenuation 0.9599/0.0199/0.0599).
+
+### What the fix needs
+
+The real per-vertex sum, in the vertex shader: directional, point and spot, with range and the
+three attenuation coefficients, and the material tracked from `COLOR1`. The 128-byte push
+constant block is full (§4.19), so the lights have to be a per-frame buffer with a per-draw
+enable mask — i.e. this wants the `GpuDraw`/`GpuMaterial` design in §2 rather than another push
+constant. Not implemented.
+
+## 4.26 The light sum, and the per-draw record it needed first
+
+§4.25 named the gap and measured it; this implements it. D3D8's per-vertex equation now runs in
+the vertex shader - ambient, diffuse and specular over directional, point and spot lights, with
+range, the three attenuation coefficients, the spot cone, and each of the four material colours
+tracked from whichever source `D3DRS_*MATERIALSOURCE` names.
+
+**It reproduces d3d9 to within 1/255 on four of the six regions §4.25 measured.** Same procedure -
+level01, paused, camera set explicitly from the REPL (§4.21) - and mean RGB per region, which is
+what survives comparing two launches:
+
+| region | d3d9 | vulkan **lit** | vulkan **unlit** (the previous build) |
+|---|---|---|---|
+| boulder | 72, 48, 31 | **73, 48, 32** | 78, 58, 52 |
+| ground mid | 80, 24, 11 | **80, 24, 11** | 85, 28, 17 |
+| ground far | 68, 19, 9 | **68, 20, 9** | 74, 24, 15 |
+| left rock wall | 35, 12, 8 | **35, 12, 8** | 35, 13, 10 |
+| units | 71, 37, 25 | **76, 38, 26** | 87, 51, 45 |
+| HUD | 0, 27, 0 | 6, 33, 2 | 6, 34, 2 |
+
+Whole frame against d3d9: **4.66 lit, 6.97 unlit**. And because `render.lighting` toggles it at
+run time, the sharper measurement is available - on one paused frame, two captures of identical
+code are **bit-identical (0.00)** and lighting-on against lighting-off is **3.88**, so the
+difference image is exactly what the light sum paints and nothing else.
+
+### The counter said 845 and the truth was 796,297
+
+`lit_draws_with_lights` is fixed and it is worth recording how far off it was. It read **845
+across a whole session** because its FVF test preceded its light test (§4.25). Counting properly:
+**819,653 lit draws, 796,297 of them with a light switched on** - so a light is enabled on 97% of
+lit draws, not on a rounding error's worth. `render.state` shows all five lights `off` because it
+samples between frames, and `LightEnable` is called 16.4 million times in this session alone.
+
+### What the state turned out to be, which is not what the defaults suggest
+
+Read off `render.state` rather than assumed, and two of these are the reason the equation cannot
+be shortened:
+
+| state | level01 | why it matters |
+|---|---|---|
+| `LIGHTING` | on for 1,650,311 of 1,688,802 draws | nearly everything is lit |
+| `DIFFUSEMATERIALSOURCE` | `D3DMCS_COLOR1` | a vertex diffuse is the **material** diffuse - the whole of §4.25 |
+| `AMBIENTMATERIALSOURCE` | never set, so `D3DMCS_MATERIAL` | the API default is load-bearing and had to be added to `InitialiseShadowState` |
+| `SPECULARENABLE` | **on** | §4.20 ruled specular out by A/B, not by this state - see below |
+| `SPECULARMATERIALSOURCE` | `D3DMCS_COLOR2` | on every draw, which broke the first version of the COLOR2 counter |
+| `COLORVERTEX` / `LOCALVIEWER` | on | both are the API defaults, and both are read |
+| `NORMALIZENORMALS` / `AMBIENT` | off / 0 | listed anyway: "the default is zero" is what stops being true later |
+
+**The COLOR2 fallback is exact, and that is structural rather than luck.** The canonical vertex
+drops the specular colour (§4.10), so a draw naming `D3DMCS_COLOR2` gets the material instead -
+which is also what D3D itself does when the vertex has no such colour. The only FVF Gunlok emits
+with `D3DFVF_SPECULAR` is **0x1c4, which is `D3DFVF_XYZRHW`** - pre-transformed, and therefore
+never lit at all. So no lit draw can lose anything to it, and `lit_draws_wanting_colour2` reads 0.
+Its first version tested the render state alone and counted all 1,351,426 lit draws while
+reporting nothing; a counter that fires on every draw is as useless as one that fires on none.
+
+### The push constant block was full, so this needed §2's GpuDraw first
+
+A light array cannot go in 8 spare bytes, so the per-draw *data* moved out: `GpuDrawRecord` (288
+bytes - both matrices, the normal transform, five material colours, the global ambient, the eye,
+and a range into the frame's `GpuLight` array) lives in host-visible scratch reached by device
+address, and the push constants carry its index. **The block went from 120 bytes to 72**, which
+is also the room a third texture stage or a `GpuMaterial` pointer will need.
+
+Both arrays are per-frame data written by the capture layer at draw time, which is exactly what
+the user-pointer vertex scratch already is - so they are two more `Scratch` slices and rotate
+with it. That inherits §4.22's correctness argument rather than restating it: the scene writes
+them before the Present that reads them, so they rotate at the *bottom* of `DrawFrame`. Peaks on
+level01 are **185 KB of 2304 KB** for the records and **18 KB of 448 KB** for the lights.
+
+**The lights are deduplicated by enable mask within a frame**, keyed additionally on a generation
+counter bumped by `SetLight` - because the mask alone stops identifying a run the moment a light's
+contents change under it. Without the dedup, 16.4 million `LightEnable` calls a session would mean
+appending up to eight records per draw.
+
+### Two things that would have rendered black, and are guarded
+
+- **A draw before the game's first `SetMaterial`.** D3D8 documents no default material and every
+  term of the equation comes from one, so a zeroed material lights to black. Those draws keep
+  their vertex colour - the previous build's behaviour, so it cannot be a regression - and
+  `lit_draws_without_material` says whether it ever happens after a level is up. It reads 0.
+- **A singular world matrix**, where the inverse transpose the normal needs does not exist. It
+  falls back to the 3x3 itself rather than producing infinities, because a NaN normal takes the
+  whole draw's colour with it and fails nowhere near where it was made.
+
+### What is left, and it is now three named things
+
+The amplified difference against d3d9 is no longer distance-shaped. What remains is:
+
+- **the units' stencil shadow**, a dark blob under them that d3d9 draws and this renderer cannot
+  (§4.21) - the largest single feature left in the frame;
+- **edge fringes** on the walkway grating and the rock silhouettes, which are filtering and
+  sub-pixel differences and dominate any whole-frame MAD;
+- **the HUD, +6/+6/+2**, which is unchanged between lighting on and off - so it is neither caused
+  nor fixed by this, and is a separate item that this measurement isolated for the first time.
+
+## 4.27 The stencil buffer, and the shadows it lets through
+
+§4.21 diagnosed this completely and left it: `ChooseDepthFormat` preferred `VK_FORMAT_D32_SFLOAT`,
+which has no stencil aspect, so the game's two shadow-volume passes counted nothing and the
+50%-black quad meant to be masked to the shadows covered the frame. That is the whole reason the
+non-triangle-list topologies were opt-in.
+
+Implementing the table in §4.21's "what the fix is" turned out to be exactly what it said, plus one
+thing that section could not have known about.
+
+### The masks, which the game never sets
+
+`InitialiseShadowState` did not seed the stencil states, and D3D8's defaults for
+`D3DRS_STENCILMASK` and `D3DRS_STENCILWRITEMASK` are **all ones**. The game sets the enable, the
+func, the ref and the three ops for its shadow volumes and never touches either mask - so the
+mirror would have handed Vulkan a compare mask and a write mask of **zero**.
+
+That fails in the way that is hardest to attribute: a write mask of 0 means the two volume passes
+increment nothing, and a compare mask of 0 means the `LESSEQUAL 1` test compares 0 against 0 and
+**passes everywhere**. The stencil buffer would have been present, correct, enabled, validated -
+and the quad would still have darkened the whole screen, which is the exact symptom the buffer was
+added to remove. Seeding the eight stencil defaults is what makes the feature work, and it is a
+state-mirror bug rather than a renderer one.
+
+### What was implemented
+
+- **The candidate order is the fix.** `D24_UNORM_S8_UINT` and `D32_SFLOAT_S8_UINT` come first now;
+  the depth-only formats stay as a fallback, with a log line, because a renderer that will not
+  start is worse than one without shadows. The chosen format reports in `render.draws` -
+  `depth format: 130 (with stencil)` - so the failure mode is visible rather than inferred.
+- **One image, one view, both aspects.** Dynamic rendering's depth and stencil attachments may
+  name the same view, and a view restricted to one aspect could serve only one of them. The
+  aspect mask, the layout (`DEPTH_STENCIL_ATTACHMENT_OPTIMAL` rather than `DEPTH_ATTACHMENT_OPTIMAL`)
+  and the barrier all ask `DepthHasStencil()`.
+- **The pipeline key grew five fields** - enable, func, and the fail/zfail/pass ops - and level01
+  goes from 6 pipelines to 11. The reference and the two masks are **dynamic** state, set in
+  `RecordDraws` on change, so a draw that differs only in its reference value does not build a
+  second pipeline.
+- **`D3DSTENCILOP` and `VkStencilOp` do not correspond**, and this is where §4.21's own table has a
+  slip worth keeping: it calls `INCRSAT` 5, and `INCRSAT` is **4** (`DECRSAT` is 5). D3D orders the
+  saturating pair before `INVERT` and the wrapping pair after it; Vulkan interleaves them
+  differently. Subtracting a constant - which `ToCompareOp` legitimately does, because the compare
+  functions really are the same eight in the same order - would have turned `INCRSAT` into
+  `INVERT` here.
+- **Both faces take the same state.** D3D8 has no two-sided stencil, and this is load-bearing
+  rather than a formality: the volume passes draw with `D3DCULL_NONE`, so back faces are genuinely
+  rasterised and must count the same way.
+- **`StartImGui` now runs after `StartDraw`.** The overlay draws into the same pass, so its
+  pipeline has to declare the same depth and stencil formats - and which those are is `StartDraw`'s
+  decision. It used to be initialised first, when there was no format to declare.
+
+### What it is worth, measured on one paused frame
+
+The topologies toggle at run time, so this is the §4.21 technique rather than two launches: same
+frame, `render.topologies` off and on, noise floor **0.000** across a repeat shot.
+
+| region | d3d9 | vulkan, shadows | vulkan, no topologies |
+|---|---|---|---|
+| under the units | 70.7, 36.7, 24.9 | **70.7, 36.3, 24.4** | 76.2, 38.2, 25.5 |
+| floor | 57.8, 17.4, 7.6 | 57.7, 17.5, 7.6 | 57.7, 17.2, 7.6 |
+| pillar | 58.6, 35.1, 22.4 | 58.7, 35.1, 22.4 | 58.7, 35.1, 22.4 |
+| HUD | 25.7, 32.3, 17.3 | 28.3, 35.7, 18.1 | 28.3, 35.7, 18.1 |
+
+The shadow was worth **5.5/255 of red over the region it covers**, and that region now matches
+d3d9 to within 0.5. Everything else moves by less than 0.3, which is what says the topologies were
+never the problem.
+
+**The whole-frame number barely moves: 4.71 without, 4.59 with.** That is the useful correction to
+§4.26, which called the shadow "the largest single feature left in the difference image". It is the
+largest *feature* - a thing that is drawn in one renderer and not the other - and it is nearly
+invisible in a whole-frame MAD, because a few hundred pixels of shadow cannot compete with edge
+fringes spread over every silhouette in the frame. Judge a feature on its own region; the
+whole-frame number is dominated by filtering and always was.
+
+The difference image amplified 4x is now edge outlines everywhere plus the HUD, with no blob.
+
+### A validation error that belonged to the verifier
+
+`render.verify_buffers()` was emitting `VUID-vkCmdCopyBuffer-srcBuffer-00118` on every run: the
+arenas were created without `TRANSFER_SRC`, so the readback that exists to check the bytes was
+itself an invalid call. It read 3469/3469 anyway, because the driver tolerates it. The texture
+images already carried `TRANSFER_SRC` for exactly this reason and the arenas were simply missed.
+
+This is the plan's own warning arriving from the other direction: it says to check
+`render.validation` in the same breath as a readback because *a broken verifier reports its own
+mismatches as the code's*. Here the verifier was reporting its own **errors** while its results
+were fine, which is the same trap with the outcome reversed - and it went unnoticed because nobody
+had run the two together on a frame where both had something to say.
+
+### One thing that reads as a defect and is not
+
+With `fx.snow(true)` running, `render.verify_buffers()` reports 3468/3469 with the odd one out a
+buffer the game is refilling every frame. Paused, it reads 3469/3469. The verifier reads a buffer
+while the game writes it; that is a race in the diagnostic, not in the upload path.
 
 ## 5. Fitting the project
 

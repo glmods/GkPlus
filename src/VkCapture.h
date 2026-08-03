@@ -41,6 +41,25 @@ bool TriggerCapture();
 void BeginFrameCaptureIfArmed();
 void EndFrameCaptureIfArmed();
 
+// A capture window that is NOT a frame, for the staging path.
+//
+// The upload corruption happens during a level load, and a load presents nothing at all - the
+// copies go through FlushPendingNow on its own command buffer, so there is no frame to hang a
+// capture on. Capturing the whole load is not an option either: it stages 360 MB through
+// persistently mapped memory, all of which RenderDoc must serialise, inside a 32-bit process
+// that is already short of address space.
+//
+// So the unit is one staging BATCH - everything between two records, at most a ring's worth.
+// `CaptureStagingBatch(n)` captures the nth, which is reproducible because a load stages the
+// same bytes in the same order every time: one run says which batch carries the copy of
+// interest, the next captures it.
+//
+// The device pointer has to be given explicitly here, unlike the frame path: outside a frame
+// "whatever is active" can resolve to the game's D3D9 device.
+void CaptureStagingBatch(uint32_t batch);
+void BeginBatchCaptureIfArmed(uint32_t batch, void *vk_instance);
+void EndBatchCaptureIfArmed(uint32_t batch);
+
 std::string FormatCaptureStatus();
 
 } // namespace vulkan
