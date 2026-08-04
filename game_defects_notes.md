@@ -311,6 +311,65 @@ arity were not re-derived — the calling convention comes from the call site at
 
 ---
 
+## 6. `Role::interface_beam_script` is shared by pointer to every actor, and freed per actor
+
+**Latent in the shipped game — and GkPlus is what makes it reachable.** Two failures, in this
+order: a use-after-free when a second interface beam completes, and a **pool double-free** when a
+second actor of the role is destroyed. The second needs no beam completion at all.
+
+`AddInterfaceBeamVulnerability` @ **0x00510fe0** (`__fastcall void(Actor * /*ECX*/)`) runs from
+`SpawnRole` @ 0x00503785 and `ServerSpawnActorForTeam` @ 0x005036d0 — i.e. **on every actor
+spawn**, gated only on `role->interface_beam_delay` (`Role+0x80`) `>= 0`. It copies the role's
+string **by pointer** and marks the vulnerability actor-scoped:
+
+```
+0051106e  MOV ECX,dword ptr [EAX + 0x88]   ; EAX = actor->role, +0x88 = interface_beam_script
+00511074  MOV dword ptr [EDI + 0x10],ECX   ; EDI = the fresh 0x1c Vulnerability
+00511080  MOV byte ptr [EDI + 0x18],1      ; actor_scoped = 1
+```
+
+So every actor of that role holds the *same* `char *`, and two things then free it:
+
+- **`Actor::Destructor` @ 0x0052da98** tests `actor_scoped` and, when set, pool-frees
+  `vuln->script` before freeing the 0x1c record. Two live actors is therefore enough.
+- **The `VulnerabilityType::SCRIPT` (4) arm of `CharacterActor::Update`** — jump table
+  @ 0x005409c4, arm at 0x0053f7de, falling into 0x0053f892 — queues the script and then frees it,
+  **nulling only the `Vulnerability`'s copy** at `+0x10`:
+
+  ```
+  0053f8a8  CALL 0x00505080          ; QueueScriptExecution(vuln->script)
+  0053f8b3  CALL 0x005e3f7b          ; free -- a bare JMP to pool_free @ 0x005715b0
+  0053f8be  MOV dword ptr [EAX+0x10],0   ; only Vulnerability::script is cleared
+  ```
+
+**Nothing ever resets `Role+0x88`.** Its only two writers are `CreateRole` @ 0x004adee7 (zero) and
+`ToRole` @ 0x0047d4c7 (a fresh allocation), and `RoleDtor` @ 0x004ada50 never touches it — so the
+field also *leaks* at level teardown whenever nothing else freed it, and the dangling window lasts
+the whole level.
+
+**Why it never fires in the retail game.** `ToRole` allocates `+0x88` only when
+`interface_beam_effect` (`Role+0x84`) is `4` (SCRIPT). Across all **226** shipped `.gls`/`.gsh`,
+`interface beam effect` appears 6 times and is **always `destroy`** (`level07.gls` ×5,
+`technocrate.gsh`), and `interface beam script` appears **zero** times. The field is NULL in every
+shipped role, so both frees are guarded by a `TEST`/`JZ` and nothing happens. The 94 `.gcs`
+`vulnerability … interface_beam` lines go through `CommandVulnerability`, which is **correct**: it
+`strdup`s (malloc thunk @ 0x0044a870, stored at 0x0044a892) and sets `actor_scoped = 0` on its
+role fan-out path (0x0044a8cb) so only `RoleDtor` frees it. `AddInterfaceBeamVulnerability` is the
+**only** site in the binary that pairs `actor_scoped = 1` with a string it does not own.
+
+**What makes it reachable is entirely GkPlus**: `make.role({interface_beam_script})`, a
+`gls`-authored role, or a mod `.gsh` that sets `interface beam effect script`. Any of those puts a
+non-NULL pointer in `Role+0x88` and arms both frees. GkPlus's `ScriptQueueSystem` hook on `ToRole`
+is *not* the cause — it replaces the string's contents with an envelope using the same allocator
+(`GameStrdup` / `pool_free`), leaving ownership exactly as `ToRole` left it — but that hook is why
+the field is worth caring about here.
+
+The fix, if one is wanted, is the engine's own correct pattern: give each actor its own copy, the
+way `CommandVulnerability` does. Setting `actor_scoped = 0` instead would stop the destructor
+double-free but not the completion free, which is unconditional on a non-NULL pointer.
+
+---
+
 ## Debugging Gunlok: what actually works
 
 - **cdb is at** `C:\Program Files\WindowsApps\Microsoft.WinDbg_*\x86\cdb.exe`. It

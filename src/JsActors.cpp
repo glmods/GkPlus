@@ -298,17 +298,17 @@ JSValue GetSize(JSContext *ctx, JSValueConst self) {
   return a ? JS_NewInt32(ctx, a->GetSize()) : JS_EXCEPTION; // slot 35
 }
 
-JSValue GetMine(JSContext *ctx, JSValueConst self) {
+JSValue GetConcealed(JSContext *ctx, JSValueConst self) {
   Actor *a = Resolve(ctx, self);
-  return a ? JS_NewBool(ctx, a->IsMine()) : JS_EXCEPTION; // slot 8
+  return a ? JS_NewBool(ctx, a->IsConcealed()) : JS_EXCEPTION; // slot 8
 }
 
-JSValue SetMine(JSContext *ctx, JSValueConst self, JSValueConst v) {
+JSValue SetConcealed(JSContext *ctx, JSValueConst self, JSValueConst v) {
   Actor *a = Resolve(ctx, self);
   if (!a) {
     return JS_EXCEPTION;
   }
-  a->SetIsMine(JS_ToBool(ctx, v) != 0); // slot 9
+  a->SetConcealed(JS_ToBool(ctx, v) != 0); // slot 9
   return JS_UNDEFINED;
 }
 
@@ -336,7 +336,7 @@ enum ActorFlag {
   FlagVisible,        // slot 61
   FlagTargetable,     // slot 60
   FlagInteractable,   // slot 62
-  FlagCanBePickedUp,  // slot 63
+  FlagCrouched,  // slot 63
   FlagPendingOrders,  // slot 32
 };
 
@@ -368,8 +368,8 @@ JSValue GetActorFlag(JSContext *ctx, JSValueConst self, int magic) {
   case FlagInteractable:
     value = a->IsInteractable();
     break;
-  case FlagCanBePickedUp:
-    value = a->CanBePickedUp();
+  case FlagCrouched:
+    value = a->IsCrouched();
     break;
   case FlagPendingOrders:
     value = a->HasPendingOrders();
@@ -830,7 +830,7 @@ const JSCFunctionListEntry ActorProto[] = {
     JS_CGETSET_DEF("hotspot", GetHotspotName, nullptr),
     JS_CGETSET_DEF("ammo", GetAmmo, nullptr),
     JS_CGETSET_DEF("size", GetSize, nullptr),
-    JS_CGETSET_DEF("mine", GetMine, SetMine),
+    JS_CGETSET_DEF("concealed", GetConcealed, SetConcealed),
     JS_CGETSET_MAGIC_DEF("alive", GetActorFlag, nullptr, FlagAlive),
     JS_CGETSET_MAGIC_DEF("attacking", GetActorFlag, nullptr, FlagAttacking),
     JS_CGETSET_MAGIC_DEF("enabled", GetActorFlag, nullptr, FlagEnabled),
@@ -839,8 +839,7 @@ const JSCFunctionListEntry ActorProto[] = {
     JS_CGETSET_MAGIC_DEF("targetable", GetActorFlag, nullptr, FlagTargetable),
     JS_CGETSET_MAGIC_DEF("interactable", GetActorFlag, nullptr,
                          FlagInteractable),
-    JS_CGETSET_MAGIC_DEF("can_be_picked_up", GetActorFlag, nullptr,
-                         FlagCanBePickedUp),
+    JS_CGETSET_MAGIC_DEF("crouched", GetActorFlag, nullptr, FlagCrouched),
     JS_CGETSET_MAGIC_DEF("has_pending_orders", GetActorFlag, nullptr,
                          FlagPendingOrders),
     JS_CGETSET_MAGIC_DEF("health", GetActorStat, SetActorStat, StatHealth),

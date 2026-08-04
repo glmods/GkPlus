@@ -365,5 +365,8 @@ float DegreesToBamMulFirst(double degrees); // (d * 4096) / 360
 float RevolutionsToBam(double revolutions);
 // Animation cycles per second as the 16.16 fixed point the animator reads,
 // rounded to nearest-even (the game uses FISTP with the default control word).
-float ToFixed16(double cycles_per_second);
+// Returns an **int**, because that is what Character::walking_speed is - every
+// reader in the binary FILDs it. Returning a float here stored the IEEE bit
+// pattern instead of the value, which the game read as a nine-digit integer.
+int ToFixed16(double cycles_per_second);
 } // namespace gk

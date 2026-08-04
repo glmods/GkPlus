@@ -222,9 +222,34 @@ formula), and copies the `vulnerabilities` list. It also special-cases roles nam
 has no character. `Character.aggression` is overloaded to carry the pickup type for
 pickup roles. Observed:
 
-- `4` -> weapon pickup (`GetWeaponPickupRole` matches this + `character->weapon`)
-- `6` -> ammo pickup (`GetAmmoPickupRole` matches this + `character->weapon`)
-- `2` -> default / non-pickup
+The full table, **named by the developers themselves** in comments in the shipped GLS headers
+(`<Gunlok>\scripts\*.gsh`, chiefly `defaults.gsh` and `body_slot_upgrades.gsh`):
+
+| `aggression` | type | meaning |
+|---|---|---|
+| 0 | 0 | health bonus |
+| 0.21 | 2 | **the "nothing" pickup** (`Chr_Nothing_Pickup`) |
+| 0.31 | 3 | shield |
+| 0.41 | 4 | weapon (`GetWeaponPickupRole` matches this + `character->weapon`) |
+| 0.51 | 5 | minelayer |
+| 0.6 / 0.61 | 6 | PC chip / ammo (`GetAmmoPickupRole` matches this + `character->weapon`) |
+| 0.71 | 7 | body slot |
+| 0.91 | 9 | armour |
+| 1.00 / 1.01 | 10 | "other" (a mission item with no other use) |
+
+**Type 2 is the *nothing* pickup, not "default / non-pickup"** — which this section used to say,
+and which reads as "the fallback for roles that are not pickups". It is a real, authored pickup
+whose whole purpose is to be empty: it is the one category `Inventory_AddItemFromRole` @ 0x004e4790
+refuses, which is what produces the manual's "nothing" message (`"Junkpile Empty"`, resource 7343).
+That the no-character fallback also yields 2 is a coincidence of the same number, not the meaning.
+
+Note the deliberate `.x1` fractional nudge in the authored values — they write 0.61 rather than
+0.6 — which is insurance against the float `* 10` landing a hair low. It is harmless either way
+here because the conversion **rounds**, but it is why the shipped data looks odd.
+
+`aggression` is triple-purposed: a 0..1 combat aggression on a real character, this class code on
+a pickup, and on spawner roles the shipped comments read "actually baddies produced per second".
+Never read an `aggression` value without knowing which kind of role it is on.
 
 ## 8. Known defects in `ToRole` (relevant to the `gk::gls` builder)
 

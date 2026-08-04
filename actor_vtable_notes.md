@@ -85,8 +85,8 @@ recorded as a plate comment on each function.
 | Old name | New name | Why |
 |---|---|---|
 | `IsSpecialType_0` (7) | `IsAttacking` | CharacterActor's override is `MOV AL,[ECX+0x2d4]` = `is_attacking` |
-| `IsSpecialType_1` (8) | `IsMine` | MobileActor's override is `MOV AL,[ECX+0x186]` = `is_mine` |
-| `OnUpdate` (9) | `SetIsMine` | base is `RET 0x4` - it *takes* an argument; MobileActor's stores the byte into `+0x186`. It is the setter paired with slot 8, not a tick callback |
+| `IsSpecialType_1` (8) | `IsConcealed` | MobileActor's override is `MOV AL,[ECX+0x186]` = `is_concealed` - camouflage in water or a scrap pile, which every AI acquisition loop skips on. Was `IsMine`, which described nothing: a mine is an `ai mine` role, not this flag |
+| `OnUpdate` (9) | `SetConcealed` | base is `RET 0x4` - it *takes* an argument; MobileActor's stores the byte into `+0x186`. It is the setter paired with slot 8, not a tick callback |
 | `GetSecondaryWeapon` (15) | `GetAttackTarget` | CharacterActor's override returns `+0x2d8` = `attack_target`, not a weapon |
 | `OnPostUpdate` (54) | `SetField0x188` | base is `RET 0x4`; MobileActor's stores the byte into `+0x188`, pairing with slot 30's getter |
 | `GetMovementState` (16) | `GetInventory` | returns MobileActor `+0x194`, which the ctor null-inits, `SetTeamId` `malloc(0x44)`s into, `EquipObject`/`ReceiveObject` read and the destructor frees - a container pointer, not a state enum |
@@ -104,8 +104,8 @@ recorded as a plate comment on each function.
 | 5 | 0x0054ec10 | `GetStrengthRatio` | current / max strength |
 | 6 | 0x0054f100 | `IsAlive` | `!is_dead` (`+0x115`) |
 | 7 | 0x0054f130 | `IsAttacking` | false |
-| 8 | 0x0054f170 | `IsMine` | false |
-| 9 | 0x0054e890 | `SetIsMine(bool)` | `RET 4`, discards |
+| 8 | 0x0054f170 | `IsConcealed` | false |
+| 9 | 0x0054e890 | `SetConcealed(bool)` | `RET 4`, discards |
 | 10 | 0x0054ea30 | `GetCharacterData` | `entity->character` |
 | 11 | 0x0054ef80 | `GetWeapon` | NULL |
 | 12 | 0x0054eb30 | `GetField0x118` | `+0x118` |
@@ -175,7 +175,7 @@ Only the class that *introduces* the override appears here; its descendants inhe
 | 60 | 0x0054f1a0 | `IsTargetable` | false |
 | 61 | 0x0054f250 | `IsVisible` | `+0x10d` |
 | 62 | 0x0054f200 | `IsInteractable` | false |
-| 63 | 0x0054f150 | `CanBePickedUp` | false |
+| 63 | 0x0054f150 | `IsCrouched` | false. Was `CanBePickedUp`, refuted by the override column: `PickupActor` carries *this* base (`XOR AL,AL`), so the one class that can be picked up always answered false. Only MobileActor and below override it, returning `+0x187` |
 | 64 | 0x0052e220 | `Frag` | scoring, splash, debris |
 | 65 | 0x0052f0d0 | `Delete` | sets `is_dead`, cleanup, broadcast 0x49 |
 | 66 | 0x0054e640 | `Associate` | no-op |
@@ -433,7 +433,7 @@ and when the victim's role name is one of `hark`, `gunlok`, `maskelyn`, `frend`,
    concrete class.
 2. **Slot 35 `GetSize`** returns each class's `sizeof`, which is how the engine does polymorphic
    allocation without RTTI - and how the sizes above were confirmed.
-3. **Getter/setter pairs:** armor 18/28, shield 19/29, `+0x18c` 25/26, `is_mine` 8/9, `+0x188`
+3. **Getter/setter pairs:** armor 18/28, shield 19/29, `+0x18c` 25/26, `is_concealed` 8/9, `+0x188`
    30/54, `+0x304` 23/95. Two of those pairs were only discovered by noticing that the "callback"
    slots 9 and 54 are `RET 0x4`.
 4. **Damage pipeline:** slot 68 -> slots 20/21 (armor/shield absorption) -> slot 69 -> at zero

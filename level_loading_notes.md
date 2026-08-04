@@ -710,9 +710,24 @@ walkable subset of *those* is the navmesh.
 |-----|-------|--------|
 | 0x00 | vptr | 0x00663e60; slot 0x50 is `PolygonAdjacencyTest` |
 | 0x08 | `Vec3 normal` | `ObjectRotation * SHPPNORM[normal_index]`, via `Mat3Transform` @ 0x0058e8c0 |
-| 0x14 | `int flags` | `SHPPOLYS.flags & 0x3fffc1`, plus 0x100 if too steep |
-| 0x20 | `Vertex *v[3]` | the three world-space vertex records |
+| 0x14 | `uint flags` | `SHPPOLYS.flags & 0x3fffc1`, plus 0x100 if too steep |
+| 0x18 | `NavPolygon **neighbours` | `NavPoly_AddNeighbour` @ 0x0048e300 writes `[+0x18][ [+0x24]++ ]` |
+| 0x1c | `NavPolygon *came_from` | **A\* scratch**, written by `FindNavPath` — see `navigation_notes.md` §3.4 |
+| 0x20 | unidentified | the ctor does not zero it |
+| 0x24 | `uint num_neighbours` | loop bound in every neighbour walk |
+| 0x28, 0x2c, 0x30 | `float *v0, *v1, *v2` | the three world-space vertex records |
 | 0x34 | `Vec3` | centroid, written through vtable slot 0x14 |
+
+**The vertex offset was wrong here until it was measured against the consumers.** This table
+used to place `Vertex *v[3]` at 0x20 and omit the adjacency array entirely. It cannot be 0x20:
+`NavPoly_ContainsPointXZ` @ 0x004902a0 walks the edge pairs (0x30,0x28), (0x28,0x2c),
+(0x2c,0x30), and 0x18/0x24 are provably the neighbour array and its count. `navigation_notes.md`
+§2.2 has the evidence per field, and §2 the rest of the graph — **`Map::sections` *is* this
+array**, so there is no separate section-level pathfinding graph.
+
+There is also a **sibling class**: a second 27-slot vtable at 0x00663ecc parallels every slot,
+with slot 4 returning `+0x38` rather than `+0x34`, so its object is 4 bytes larger in the vertex
+region. A quad nav polygon is the obvious reading, but that is inferred, not measured.
 
 Positions go through the affine `AffineTransform` @ 0x0058e7f0 (translation at
 `this[3]/[7]/[0xb]`); normals through the **rotation-only** `Mat3Transform`. So an object

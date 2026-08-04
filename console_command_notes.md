@@ -571,7 +571,7 @@ Measured by forward reachability to `BroadcastToPlayers` @ 0x00504bf0 or `SendTo
 | `actor.shield` | `Actor::SetShieldValue` @ 0x0054f440 | **no** |
 | `actor.set_position()` | `Actor::SetPositionAndOrientation` @ 0x0052ded0 | **no** |
 | `actor.set_team()` | was `SetTeamId`, now `ChangeOwnerAndTeam` @ 0x00530470 | **yes**, since d11995b |
-| `actor.mine` | `Actor::SetIsMine` @ 0x0054e890 | **no** |
+| `actor.concealed` (was `actor.mine`) | `Actor::SetConcealed` @ 0x0054e890 | **no** |
 | `actor.goto()` | `MobileActor::Goto` @ 0x00539450 | **no** |
 | `turret.turret_enabled` | `TurretActor::SetTurretEnabled` @ 0x0054e8b0 | **no** |
 | `pickup.set_required_item()` | `PickupActor::SetRequiredItem` @ 0x00546b20 | **no** |

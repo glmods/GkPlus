@@ -44,7 +44,16 @@ enum class AIType : int {
 };
 
 struct Character {
-  float walking_speed;
+  // 16.16 fixed point, and an **int** - not a float. ToCharacter @ 0x0047db80
+  // stores it with FISTP and re-reads its own stored integer with FILD; every
+  // reader in the binary does FILD then multiplies by 1/65536 (DAT_00652190):
+  // MobileActor::Ctor @ 0x005325e1 (raw dword copy to MobileActor+0x178),
+  // Inventory::AddItemFromRole @ 0x004e47b9, MobileActor::DropItem @ 0x00538452,
+  // MobileActor::ReceiveObject @ 0x00539256, AiThink_Scavenger @ 0x00455c53.
+  // There are no float readers. Typing it `float` here silently made MakeRole
+  // write the IEEE bit pattern of the fixed-point value, which the game FILDs as
+  // a nine-digit integer - see the note in MakeRole.cpp.
+  int walking_speed;
   float turning_speed;
   float aim;
   float angular_scan_rate;

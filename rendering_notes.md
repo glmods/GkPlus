@@ -484,3 +484,54 @@ Also open:
   clearly the `vertbuff.cpp` half of AWAPI, but their pooling policy is unexamined.
 - Whether any of this is reachable from a `.gls` or a console command. Nothing in
   `console_command_notes.md` currently maps to the queue.
+
+---
+
+### The renderer's struct mirror (`src/Render.h/cpp`)
+
+`rendering_notes.md` is the analysis; `src/Render` is the mirror, and it is pure struct +
+native-API — no `*System`, because the renderer installs no detour of GkPlus's own (the
+D3D-side hooks live in `src/GUI.cpp`).
+
+Three things about it that are not obvious from the header alone:
+
+- **It is the second place in the codebase to use real multiple inheritance**, after
+  `Map : MapBase, RefCountedBase`. `AwNode : AwFrame, AwRefCounted` puts the refcounted
+  subobject's vptr at +0x9c and its `refcount` at +0xa0 purely because `AwFrame` is 0x9c bytes —
+  and +0xa0 is exactly the word `RenderQueue_Add` increments. The `static_assert`s on
+  `offsetof(AwNode, refcount)` and `sizeof(AwFrame)` are what prove the split reproduces the
+  original.
+- **`AwRefCounted` and `Map.h`'s `RefCountedBase` are the same 8 bytes and are deliberately not
+  merged.** They model different points on the same chain: the root vtable 0x006522e8 has one
+  slot, which is what `AwRefCounted` declares, while Map's second base sits two levels above it
+  (0x006522e8 <- 0x0065281c <- 0x00652828) and `Map.h` folds the middle base's extra slot into its
+  own declaration. Merging them would make one of the two wrong about its slot count; the size is
+  identical either way, which is all either `static_assert` pins.
+- **`AwFrame` has no virtual destructor and `SceneNode` adds one as slot 2.** That ordering is
+  load-bearing: `AwFrame`'s vtable (0x0066da08) is exactly `{EnsureMatrix, EnsureInverseMatrix}`,
+  and `SceneNode`'s (0x0066da34) is those two *then* the deleting destructor. Declaring the
+  destructor first — the reflex — would put it in slot 0 and silently mis-model every class in
+  the tree. `AwNode` and `Renderable` add nothing to the primary table at all; their destructor
+  lives on the secondary vtable at +0x9c.
+
+Four field-level findings shape the rest of the header, and `rendering_notes.md` §6 has the
+evidence:
+
+- **`AwFrame`'s two virtual slots return the matrix**, they are not `void` — each early-outs on
+  its cache bit and hands back a pointer, and *which* matrix comes back is the entire point of
+  `AwNode`'s override (`&matrix` vs `&world`). That return value is what reaches `SetTransform`.
+- **`LightSet`'s 0x44-byte tail is a `D3DMATERIAL8`** — `SetD3DMaterial` passes `this + 0x18` to
+  `IDirect3DDevice8::SetMaterial`, and `0x08 + 0x10 + 0x44` is 0x5c exactly. The engine's "ambient
+  light" is this object's Emissive term.
+- **`AwMaterial` ends in `AwTextureStage stages[8]`** — `AwMaterial_Compile` walks
+  `this + 0x3c + num_stages * 0x30` downwards, and `0x3c + 8 * 0x30 == 0x1bc` is the object.
+- **`DrawItem+0x0c` is a timestamp and `+0x24` a LOD index**, neither of which looks like it at
+  the call sites; the first drives the animation controllers at `Renderable+0x1e0`.
+
+`SubmitDrawItem` wraps `RenderQueue_Submit`, whose nine stack arguments (`RET 0x24`) are **not**
+in the order their fields land in — the mapping was read off the prologue, and swapping the
+camera and the light set would not fault, it would just render with the wrong one. `AwTexture`
+deliberately carries no `sizeof` assert — its size is not established, and the 0x34-byte record
+`AcquireRimTexture` caches is a different, earlier object. It is also **not** one of the
+`AwRefCounted` family, which an earlier revision had it as: `AwMaterial_ApplyStage` takes the D3D
+texture as `**stage`, straight off offset 0, so there is no vptr and no refcount at +0x04.

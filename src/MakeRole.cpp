@@ -68,9 +68,8 @@ float RevolutionsToBam(double revolutions) {
   return static_cast<float>(revolutions * BamPerTurn);
 }
 
-float ToFixed16(double cycles_per_second) {
-  return static_cast<float>(
-      RoundToNearest(static_cast<float>(cycles_per_second) * FixedScale));
+int ToFixed16(double cycles_per_second) {
+  return RoundToNearest(static_cast<float>(cycles_per_second) * FixedScale);
 }
 
 Character *MakeCharacter(const CharacterDesc &d) {
@@ -138,10 +137,8 @@ Character *MakeCharacter(const CharacterDesc &d) {
   // - reproducing that is the difference between matching the game and being
   // half an ulp out on every turning character.
   if (c->turning_speed > 0.0f && c->size > 0.0f) {
-    float cycles = static_cast<float>(static_cast<int>(c->walking_speed)) /
-                   FixedScale;
-    c->walking_speed =
-        static_cast<float>(RoundToNearest((cycles / c->size) * FixedScale));
+    float cycles = static_cast<float>(c->walking_speed) / FixedScale;
+    c->walking_speed = RoundToNearest((cycles / c->size) * FixedScale);
   }
   // A max below the initial is clamped up, not down.
   if (c->maximum_first_person_range <= c->initial_first_person_range &&

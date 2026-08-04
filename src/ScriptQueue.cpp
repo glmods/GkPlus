@@ -48,6 +48,9 @@ FastCall<ReplaceDestructibility *, void *> ToReplaceDestructibility;
 // The game's own strdup @ 0x0044e1a0, so a rewritten field is allocated exactly
 // where the converter allocated the one it replaces.
 FastCall<char *, const char *> GameStrdup;
+// AddInterfaceBeamVulnerability @ 0x00510fe0, __fastcall with only ECX. Hooked
+// to repair an engine defect rather than to encode anything - see the hook.
+FastCall<void, Actor *> AddInterfaceBeamVulnerability;
 // The two console commands whose script name never reaches a field, and the
 // respawn that builds one on the stack. All three are *replaced* rather than
 // wrapped, except CommandVulnerability, whose trampoline the sweep calls.
@@ -204,12 +207,69 @@ Role *__fastcall HookedToRole(void *parsed) {
   }
   std::string envelope = FileEnvelopeFromGameText(role->interface_beam_script);
   if (char *fresh_string = RepoolString(envelope.c_str())) {
-    // Safe to release: Roles.h records this field as leaked - RoleDtor does not
-    // free it - so nothing else will touch the old allocation.
+    // Safe to release *here*, which is narrower than it looks. RoleDtor does not
+    // free this field, and we run inside ToRole - before any actor has spawned,
+    // so no Vulnerability holds the pointer yet. Same allocator in and out
+    // (GameStrdup is the game's own strdup over the pool), so ownership is
+    // exactly as ToRole left it.
+    //
+    // What is NOT true is the old comment here, that "nothing else will touch
+    // the old allocation". AddInterfaceBeamVulnerability @ 0x00510fe0 shares
+    // this pointer by value into *every* spawned actor's Vulnerability with
+    // actor_scoped = 1, and both Actor::Destructor and the SCRIPT completion arm
+    // pool-free it - so from the first spawn onwards the field is shared and
+    // double-freed. That is Gunlok's defect, not ours (game_defects_notes.md
+    // section 6), but writing an envelope here is one of the few things that
+    // makes it reachable at all, since no shipped role sets the field.
     pool_free(role->interface_beam_script);
     role->interface_beam_script = fresh_string;
   }
   return role;
+}
+
+// AddInterfaceBeamVulnerability @ 0x00510fe0 - give each actor its own copy of
+// the role's script string.
+//
+// This one repairs Gunlok rather than encoding anything, and it exists because
+// GkPlus is what makes the defect reachable (game_defects_notes.md section 6).
+// The original shares `Role::interface_beam_script` **by pointer** into every
+// spawned actor's Vulnerability and sets `actor_scoped = 1`, which is the flag
+// that tells ~Actor to pool-free it. Two live actors of one role therefore
+// double-free, and the SCRIPT completion arm frees it a third way while nulling
+// only its own copy, leaving Role::interface_beam_script dangling for the rest
+// of the level. Nothing in the shipped game sets that field - `interface beam
+// effect` is `destroy` in all six shipped uses - so the retail game never
+// triggers it; `make.role({interface_beam_script})` and a gls-authored role do.
+//
+// Giving each actor its own copy is the engine's own correct pattern:
+// CommandVulnerability strdups for exactly this reason. It makes actor_scoped
+// sound, so ~Actor frees a string it really does own. Setting actor_scoped = 0
+// instead would fix the destructor but not the completion free, which is
+// unconditional on a non-NULL pointer.
+//
+// Matching by pointer identity, not by content: only the aliased entry is
+// replaced, so a vulnerability CommandVulnerability already gave its own copy is
+// left alone.
+void __fastcall HookedAddInterfaceBeamVulnerability(Actor *actor) {
+  AddInterfaceBeamVulnerability(actor);
+  if (!actor || !actor->role) {
+    return;
+  }
+  // Raw char * on the Role (the field nothing owns), a pool_string on the
+  // Vulnerability - which is the ownership mismatch this hook exists to fix.
+  char *shared = actor->role->interface_beam_script;
+  if (!shared) {
+    return;
+  }
+  for (Vulnerability *v : actor->vulnerabilities) {
+    if (!v || !v->actor_scoped || v->script.get() != shared) {
+      continue;
+    }
+    if (char *owned = GameStrdup(shared)) {
+      v->script.release();
+      v->script.reset(owned);
+    }
+  }
 }
 
 // ToReplaceDestructibility @ 0x0047eaa0 - GLS field 0x00, whose keyword is `name`
@@ -845,6 +905,7 @@ ScriptQueueSystem::ScriptQueueSystem() {
   GetObjectAtOffset(ToReplaceDestructibility, 0x0047eaa0);
   GetObjectAtOffset(Associate, 0x005469f0);
   GetObjectAtOffset(GameStrdup, 0x0044e1a0);
+  GetObjectAtOffset(AddInterfaceBeamVulnerability, 0x00510fe0);
   GetObjectAtOffset(CommandBatchAndBroadcast, 0x00448400);
   GetObjectAtOffset(CommandVulnerability, 0x0044a600);
   GetObjectAtOffset(MultiplayerRespawnRole, 0x0050c8b0);
@@ -856,6 +917,8 @@ ScriptQueueSystem::ScriptQueueSystem() {
   ::DetourAttach(&PumpQueuedConsoleCommand, HookedPumpQueuedConsoleCommand);
   ::DetourAttach(&AddTriggerToGlobalList, HookedRegisterTriggers);
   ::DetourAttach(&ToRole, HookedToRole);
+  ::DetourAttach(&AddInterfaceBeamVulnerability,
+                 HookedAddInterfaceBeamVulnerability);
   ::DetourAttach(&ToReplaceDestructibility, HookedToReplaceDestructibility);
   ::DetourAttach(&CommandBatchAndBroadcast, HookedCommandBatchAndBroadcast);
   ::DetourAttach(&CommandVulnerability, HookedCommandVulnerability);
@@ -871,6 +934,8 @@ ScriptQueueSystem::~ScriptQueueSystem() {
   ::DetourDetach(&PumpQueuedConsoleCommand, HookedPumpQueuedConsoleCommand);
   ::DetourDetach(&AddTriggerToGlobalList, HookedRegisterTriggers);
   ::DetourDetach(&ToRole, HookedToRole);
+  ::DetourDetach(&AddInterfaceBeamVulnerability,
+                 HookedAddInterfaceBeamVulnerability);
   ::DetourDetach(&ToReplaceDestructibility, HookedToReplaceDestructibility);
   ::DetourDetach(&CommandBatchAndBroadcast, HookedCommandBatchAndBroadcast);
   ::DetourDetach(&CommandVulnerability, HookedCommandVulnerability);

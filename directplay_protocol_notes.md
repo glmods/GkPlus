@@ -232,17 +232,31 @@ gameplay method; several re-`BroadcastToPlayers` a resulting update. `size` is t
 | `0x13` | 12 | `FUN_004c0cf0` | `FUN_00538240(arg1)` |
 | `0x15` | 12 | `FUN_004c0dc0` | use/remove inventory item -> re-broadcasts update `0x80` |
 | `0x17` | 24 | `FUN_004c0d50` | board / attach (escort) - actor id + carrier + slot |
-| `0x19` | 12 | `FUN_004c0c30` | set movement state |
-| `0x1a` | - | (in-switch) | set health (`SetHealth` vcall), arg1=`f32` |
-| `0x1b` | 12 | `FUN_004bdd60` | `FUN_00538690(arg1)` |
-| `0x1c` | 8 | `FUN_004c09d0` | destroy actor |
-| `0x1d`/`0x1f` | 24 | `FUN_004c3e90` | query health into buffer |
-| `0x1e`/`0x20` | 16 | `FUN_004c3fc0` | query center coords into buffer |
+| `0x19` | 12 | `Unit_SendSetAmmoType` | select ammo type, **immediate** |
+| `0x1a` | - | (in-switch) | select ammo type, **queued** -> slot 85 |
+| `0x1b` | 12 | `Unit_SendStandingOrder` | `MobileActor::SetStandingOrder(arg1)` |
+| `0x1c` | 8 | `Unit_SendCrouchToggle` | crouch toggle |
+| `0x1d`/`0x1f` | 24 | `Unit_SendAttackPosition` | attack ground -> slot 86 |
+| `0x1e`/`0x20` | 16 | `Unit_SendAttackTarget` | attack target -> slot 87 |
 | `0x21` | - | (in-switch) | inventory/pickup spawn batch (variant of `0x08`) |
-| `0x23` | 8 | `FUN_004be6f0` | `FUN_00539030` (mobile) |
+| `0x23` | 8 | `Unit_SendCancelLastOrder` | `MobileActor::CancelLastOrder` (DELETE key) |
 | `0x24` | 8 | `FUN_004c9d70` | delete actor (`vtbl->Delete`) |
-| `0x25`/`0x26` | 8 | `FUN_0046ef50` | team command -> re-broadcasts `0x65` |
+| `0x25`/`0x26` | 8 | `ActivateUnitAndResume` | hold-marker release / team push -> re-broadcasts `0x65` |
 | `0x27` | 16 | `FUN_004a4660` | Gunlok super-ability -> broadcasts `0x37`, projectiles |
+<!-- rows above corrected against the order system; see orders_notes.md -->
+
+**Six of these rows described something the code does not do**, and the pattern is worth knowing
+before trusting a neighbour: the *sender* column was right throughout, and only the *meaning*
+column was invented. `0x19`/`0x1a`, `0x1c`, `0x1d`/`0x1f` and `0x1e`/`0x20` are the player order
+commands, not health/coordinate queries — `orders_notes.md` has the dispatch. Ids in this range
+come in **immediate/queued pairs**, which is why so many rows carry two: the sender picks between
+them with a literal, e.g. `Unit_SendInteract` does `CMP byte [EBP+0x10],0` then
+`MOV [EBP-0x14],0x10` (queued) or `0xf` (immediate). The odd member is immediate, the even one
+queues a `PendingOrder`.
+
+**Still unmapped in this direction**: `0x10`, `0x12`, `0x14`, `0x16`, `0x18`, `0x22` — which is
+exactly the set of even twins for the odd ids already listed, so they are almost certainly the
+queued forms of `0x0f`, `0x11`, `0x13`, `0x15`, `0x17` and `0x21`.
 | `0x28` | 259 | `FUN_004fcd00` | **set player name / chat text** (255-byte string) -> re-broadcast `0x8d`; in lobby (GameState 8) sets local name |
 | `0x29` | 16 | `FUN_004fcdf0` | (world command) |
 | `0x2a` | 16 | `FUN_004fce30` | score-matrix write (`DAT_007b70e4[arg0*5+arg1]=arg2`) |
@@ -501,10 +515,20 @@ Related: `PresidentActor::ApplyDamage` also emits the death-effect `0x8b`
 ```
 +0x00 u32     id = 0x46
 +0x04 u32     attacker actorId
-+0x08 u32     team
++0x08 i32     TARGET actorId        (-1 for a position shot)
 +0x0c u32     projectile roleId
-+0x10 ...     position + direction/velocity vectors + damage/params (to 0x40)
++0x10 u8      team                  (a byte, not the dword at +0x08)
++0x18 f32[3]  position
++0x24 f32[4]  direction, as a QUATERNION
+              ... remaining params to 0x40
 ```
+
+**`+0x08` is the target, not the team**, and the team is the byte at `+0x10`. The earlier reading
+of this packet had the team at `+0x08` and described `+0x10` onwards as an undifferentiated blob
+of "position + direction/velocity + damage". The corrected layout was recovered from the sender's
+stack slots, which sum to exactly 0x40 — that total is the check that the field list is complete.
+Note the direction is a **quaternion at `+0x24`**, not a direction vector; `combat_notes.md` has
+the fire path that fills it.
 
 ### 8.7 Movement / waypoint order - command `0x3b`/`0x3d` (server) & update `0x3b`/`0x3c`, 56 bytes
 

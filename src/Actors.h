@@ -135,10 +135,12 @@ struct Actor {
   virtual bool IsAlive() = 0;
   // 7  base false; CharacterActor returns is_attacking (+0x2d4).
   virtual bool IsAttacking() = 0;
-  // 8  base false; MobileActor returns is_mine (+0x186). Getter paired with slot 9.
-  virtual bool IsMine() = 0;
-  // 9  base RET 4 (discards arg); MobileActor stores it to is_mine. Setter for slot 8.
-  virtual void SetIsMine(bool) = 0;
+  // 8  base false; MobileActor returns is_concealed (+0x186). Getter paired with slot 9.
+  //    Was IsMine, which described nothing: an actual mine is an ai-mine role, and this
+  //    is the camouflage flag the AI skips on. See stealth_and_fog_notes.md.
+  virtual bool IsConcealed() = 0;
+  // 9  base RET 4 (discards arg); MobileActor stores it to is_concealed. Setter for slot 8.
+  virtual void SetConcealed(bool) = 0;
   // 10  role->character.
   virtual Character *GetCharacter() = 0;
   // 11  base NULL; CharacterActor returns its 0x28-byte weapon (+0x2b8).
@@ -236,8 +238,11 @@ struct Actor {
   virtual bool IsVisible() = 0;
   // 62  base false; MobileActor: move_state (+0x1bc) is neither 0 nor 1.
   virtual bool IsInteractable() = 0;
-  // 63  base false; MobileActor returns can_be_picked_up (+0x187).
-  virtual bool CanBePickedUp() = 0;
+  // 63  base false; MobileActor returns is_crouched (+0x187). Was CanBePickedUp, which is
+  //     refuted by the override column: PickupActor carries the *base* (XOR AL,AL), so the
+  //     one class that can be picked up always answered false. Only MobileActor and its
+  //     descendants override it.
+  virtual bool IsCrouched() = 0;
   // 64  Frag: scoring, splash, debris; broadcast 0x6b/0xba (0x37/0x38 for projectiles).
   virtual void Frag() = 0;
   // 65  set is_dead, run cleanup, and - **only if the argument is true** -
@@ -350,8 +355,8 @@ struct MobileActor : Actor {
   char pad0x180[4];
   bool is_moving;              // 0x184 slot 14
   char field0x185;
-  bool is_mine;                // 0x186 slots 8/9
-  bool can_be_picked_up;       // 0x187 slot 63
+  bool is_concealed;           // 0x186 slots 8/9  (was is_mine)
+  bool is_crouched;            // 0x187 slot 63    (was can_be_picked_up)
   bool field0x188;             // 0x188 slots 30/54
   char pad0x189[3];
   int field0x18c;              // 0x18c slots 25/26; used as a team-slot index
@@ -391,9 +396,15 @@ struct MobileActor : Actor {
   virtual void EquipToFirstOpenSlot(int, int) = 0;
   // 85  append a tag-10 order record (0x28 bytes) to the order queue (+0x1f0).
   virtual void QueueOrderKind10(int) = 0;
-  // 86  append a tag-1 order record carrying a Vec3.
-  // RET 0x10: four arguments, one more than was declared.
-  virtual void QueueOrderPosition(Vec3 *, int, char, int) = 0;
+  // 86  append a tag-1 order record carrying a Vec3 (kind at +0x00, the Vec3 at
+  // +0x10, the flag at +0x20). The Vec3 is passed **by value**, which RET 0x10
+  // cannot tell you - a Vec3* plus three dwords is the same 16 bytes. What
+  // settles it is the callee: MobileActor's own stub @ 0x0054e5f0 consists of a
+  // single `_eh_vector_destructor_iterator_(&[EBP+8], 4, 3, ...)`, which MSVC
+  // emits only to destroy a by-value class parameter. CharacterActor's override
+  // @ 0x00541ac0 then reads x,y from [EBP+8], z from [EBP+0x10] and the flag
+  // from [EBP+0x14]. Declared here as (Vec3*, int, char, int) until measured.
+  virtual void QueueOrderPosition(Vec3, bool) = 0;
   // 87  append a tag-0 order record.
   virtual void QueueOrderTarget(int, char) = 0;
   // 88  issue a move order, gated on can_turn, strength and priority.
@@ -401,7 +412,14 @@ struct MobileActor : Actor {
   // 89  death: broadcast 0x3d (destructible) or 0x48, then slots 82 and 64.
   virtual void Die() = 0;
   // 90  push a 0x18-byte waypoint record onto the waypoint list (+0x204).
-  virtual void AddWaypoint(Vec3 *, int, char, int) = 0;
+  // Despite also being RET 0x10, this is *not* slot 86's signature: the body
+  // dereferences its first argument (`MOV ECX,[EBP+8]` then `MOVQ XMM0,[ECX]`)
+  // and has no vector destructor, and MobileActor::PathToTarget @ 0x00539930
+  // pushes the pointer a position getter just returned. The last argument is a
+  // float, not an int - the one in-binary caller pushes 0.0f. Arguments 2 and 4
+  // land at record+0x0c and +0x10; that caller passes 0 for both, so what they
+  // mean is not established.
+  virtual void AddWaypoint(Vec3 *, int, char, float) = 0;
   // 91  fill a 0x24-byte navigation-target descriptor.
   virtual void GetNavigationTarget(int *) = 0;
   // 92  return the Hierarchy* override at +0x198.
@@ -414,7 +432,7 @@ struct MobileActor : Actor {
 };
 static_assert(sizeof(MobileActor) == 0x230);
 static_assert(offsetof(MobileActor, character) == 0x160);
-static_assert(offsetof(MobileActor, is_mine) == 0x186);
+static_assert(offsetof(MobileActor, is_concealed) == 0x186);
 static_assert(offsetof(MobileActor, inventory) == 0x194);
 static_assert(offsetof(MobileActor, nav_agent) == 0x200);
 

@@ -657,3 +657,218 @@ the crashed process that makes the harness lie; kill `WerFault.exe` first.
   automated runs should be loading anyway (see "Working on this"), so widening these is a matter
   of reading `render.state` on a run that is happening regardless.
 - **The overlay is tiny at 4K** (§4.5) — cosmetic, ImGui is drawing 1:1 into the swapchain.
+
+---
+
+### The Vulkan renderer (`src/D3D8Capture`, `src/Vk*`, `src/VertexFormat`)
+
+A bindless Vulkan replacement for Gunlok's renderer. **`GKPLUS_RENDERER=vulkan` draws the
+game** — the world, its textures, its lightmaps, its units, its HUD, its **fixed-function
+lighting** and its **stencil shadows**. **`vulkan_renderer_plan.md` is where to start** — status
+and next steps; `vulkan_renderer_notes.md` is the design record and every measurement behind it.
+Read the plan before touching any of this.
+
+**The ground truth is `GKPLUS_RENDERER=d3d8`** (§4.33). Windows 10 still ships a 32-bit `d3d8.dll`
+in SysWOW64, so the game runs on the *original* runtime with the capture layer and the whole REPL
+harness intact — which matters, because a reference you cannot drive is one you cannot align to
+the same frame. Compare against that. `d3d9` (d3d8to9) is the second opinion that says whether a
+difference lives in the translation layer or in the game: on a settled level02 frame the two agree
+to **0.017/255**, but two HUD columns that belong in the game are drawn by the Vulkan path and
+dropped by d3d8to9. Thirty sections of measurement were taken against d3d9 before anyone checked
+whether the real thing was available.
+
+**The whole-frame residual against the original is 0.13/255 and 93% of the frame is bit-identical**
+(§4.38), against a **cross-launch d3d8-vs-d3d8 floor of 0.034**. It was 2.59 for six sections, and
+it was one defect: Gunlok renders into a **640x480** backbuffer while the window's client area —
+and so the swapchain — is **628x468**. A pre-transformed draw's pixels-to-clip matrix is built
+from the D3D viewport, so a Vulkan viewport covering the swapchain scaled every 2D draw by 628/640
+*during rasterisation*, resampling the texture (§4.37). The renderer now rasterises into an
+offscreen colour target at the backbuffer size and blits onto the swapchain at the end — the order
+the original does it in. Sizing the viewport alone is *not* the fix: it reproduces the original
+texel for texel and costs the framing (2.59 → 13.07), because a larger viewport on a smaller
+swapchain clips where D3D stretches.
+
+Three things that follow, and are the reason to trust the number: `render.offscreen` toggles it on
+one paused frame — worth **2.55/255 over 65% of the frame**, and on→off→on is bit-identical; the
+A4R4G4B4 probe quad went from 4.00 MAD / 31.6% bit-exact to **0.0000 / 100%**, which takes the CPU
+expansion off the correctness list for good and leaves it a memory question; and of the 6.8% of
+pixels still differing, **93% also differ between two d3d8 launches** — the characters idle-animate,
+so that part is the game, not the renderer. The blit filter is **NEAREST**, deduced rather than
+chosen: the original's own stretch preserves a 4-bit texture's sixteen distinct values, which a
+filtered downscale could not.
+
+Four measurement rules, each of which cost a wrong conclusion:
+
+- **A feature is judged on its region, never on a whole-frame MAD** (§4.27) — the stencil shadow
+  is worth 5.5/255 over its own region and 0.12 over the frame.
+- **...but mean RGB per region is blind to a real difference** (§4.33). It answers "is this region
+  the right colour" and cancels a per-texel error with zero bias: the reported junk pile matched
+  d3d8 to 0.1 mean RGB while differing by 2.95 MAD against a 0.008 floor. Read both, against a
+  floor — which is what having the real reference supplies.
+- **Count distinct values, not differences, when a texture looks wrong** (§4.37). Sixteen values
+  all multiples of 17 says "one exact 4-bit texel per pixel, no filtering"; 256 says "resampled".
+  That one line settled what three sections of difference images could not.
+- **An amplified difference image cannot tell a sub-pixel offset from filtering** (§4.28) —
+  resample one shot against the other and find where the difference minimises.
+
+**Every draw the game issues now reaches the renderer**, and that is newly true twice over.
+`DrawPrimitive` — one of D3D8's four draw entry points — built no draw at all for the whole life
+of the renderer, with **every "must be 0" counter reading zero**, because they count *reasons a
+draw was rejected* and a draw that is never offered has no reason to be rejected (§4.32). The
+reading that catches that class is `draw calls seen` against `submitted` in `render.draws`, the
+only number that compares against what the **game** did rather than what the renderer chose.
+Separately, the non-triangle-list topologies are on by default now that a stencil buffer exists.
+
+**Gunlok uses six viewport depth slices and none is the default** (§4.32): the world sits in
+`0.1..1.0` and the effect layers in thin slices around `0.02..0.06`, so an overlay is in front of
+the world by construction rather than by switching the depth test off, and `1.0..1.0` pins a
+backdrop to the far plane. `D3DVIEWPORT8::MinZ`/`MaxZ` were recorded nowhere and the viewport was
+hardcoded `0..1`, so the world occluded the layers meant to sit over it — fires rendered as bare
+scenery. It is per-draw dynamic state now.
+
+**The frame is an array of indices** (§4.26, §4.30). A draw's per-draw data lives in a
+`GpuDrawRecord` array and its texture stages in an interned `GpuMaterial` array — 274 draws on
+level02 are 29 materials — so the push constants carry four device addresses and three indices, 48
+bytes, and describe no draw at all. That is what makes a second pass over the frame a walk over
+the draw array rather than a replay of the recording loop.
+
+**That table is what the material override rewrites** (§4.44), and it is the first thing this
+renderer does that the game never could: `render.material_override("<.rim substring>", {texture,
+tint, hide})` retextures, tints or hides every draw sampling one asset, as one entry rather than a
+per-draw interception. **The key is the `.rim` name because a bindless index is load-order
+dependent** — the same key re-resolved image 34 → 35 across a level reload, which is the
+measurement that argues for it — and resolution is name → index once, gated on
+`TextureRegistryGeneration()`. Removing an override restores the frame **bit-identically**: an
+un-overridden material carries `tint = 0xffffffff`, which multiplies by exactly 1.0. `hidden_draws`
+counts into the `seen == submitted + skips` reconciliation, or the one feature that drops draws on
+purpose would read as §4.32's regression. Two traps: an override that resolves and paints nothing
+looks exactly like a broken one (its asset may be out of view — read `draws overridden`, and pick a
+target off `render.frame_draws()`), and a paused frame drifts over a long session, so re-shoot the
+baseline before believing a difference.
+
+Fog is measured absent — 0 of 12M draws enable it. **`D3DRS_SHADEMODE` is honoured and has never
+mattered** (§4.31): every flat-shaded draw on level01 and level02 is one of the stencil shadow's
+three passes, two of which write no colour and one of which is a single-colour quad, so
+`render.shade_mode` moves 0 pixels in either. It is also the section on *how* to decide a question
+like that — the pipeline histogram says which draws use a state where a count only says how many,
+and that chose an extra varying over doubling the pipeline table. **The light sum is D3D8's whole
+per-vertex equation** — ambient, diffuse and specular over directional, point and spot lights,
+with the material colours tracked from `D3DRS_*MATERIALSOURCE`. §4.19 ruled lighting out on an A/B
+that does not reproduce; §4.20, §4.25 and §4.26 are the corrections, and two of this layer's own
+counters were measuring nothing while reading plausibly — see §4.26 before trusting one.
+
+Six instruments answer questions no counter can, and each exists because one was needed:
+
+| | |
+|---|---|
+| `render.draw_range` / `draw_hide` / `draw_info(i)` | attribute a pixel to a draw. Bisect by **hiding a window, never truncating a prefix** — a prefix truncates the depth and stencil buffers too (§4.29) |
+| `render.ref_range` / `ref_hide` / `frame_draws()` | the same, pointed at the runtime the capture layer **forwards** to, so the *original* can be bisected — and it works in `d3d8` mode, where there is no Vulkan draw list (§4.42). `frame_draws` is the mirror-side draw list it has to be aimed with: an index does not carry between runs |
+| `render.draw_vertices = i` | the converted vertices and indices a draw was actually handed, following its own indices rather than the head of the slice. Answers "wrong shape" vs "something covers it" (§4.32) |
+| `render.draw_geometry` | what a **buffered** draw pulled, in four columns — and only two of them are read **at the draw** (§4.42). A deferred readback proves consistency, not correctness: the game refills a dynamic buffer several times a frame, so the arena and the buffer can agree perfectly on a version neither held when the draw was issued |
+| `render.force_lod` | force every texture fetch to an explicit mip level. Pair with `GKPLUS_NO_MIPMAP=1` on the reference to pin both sides to level 0 (§4.34) |
+| `render.probe(name, scale, mipmap, offset, alpha)` | one textured quad drawn **through the capture device**, so d3d8, d3d9 and vulkan all get the same draw with the scene's lighting, stages, blending and depth removed (§4.35) |
+
+The one fact that shapes everything: **the seam is `Direct3DCreate8`, not the AWAPI render
+queue.** The queue looked obvious and is not total — `rendering_notes.md` §4.1 — so
+`src/D3D8Capture.cpp` wraps the D3D8 device instead. It is a **state recorder, not a
+translation layer**: it mirrors the fixed-function state, replays state blocks into that
+mirror, and reduces each draw to a `DrawItem` the Vulkan side consumes. Every call is still
+forwarded to d3d8to9 as well, which is what keeps `GKPLUS_RENDERER=d3d9` available as the A/B —
+the thing that makes "is this our bug or the game's?" answerable.
+
+Things worth knowing before editing:
+
+- **The capture layer is two translation units, and the split is along a real line.** The
+  recorder (`D3D8Capture.cpp`) is everything on the path a frame takes; the evidence
+  (`D3D8CaptureReport.cpp`) only ever reads what the recorder wrote, plus the `Note*`/`Log*`
+  collectors it exports for the draw path to call. Roughly a third of the original file was the
+  second thing. Keep the direction one-way — a diagnostic that mutates state the renderer then
+  reads is not a diagnostic — and put new counters, histograms and verifiers in the report TU.
+- **`src/D3D8Device.gen.inc.h` is generated** by `src/gen-d3d8-forwarders.py` from d3d8to9's
+  `d3d8.hpp`. Re-run it after changing which methods are intercepted. Its
+  `check_wrapped_params()` **fails the build** if a method taking or returning a wrapped
+  interface is left forwarding — that is not a nicety: forwarding a wrapper to d3d8to9 makes
+  it `static_cast` to its own concrete class and read a garbage proxy pointer, which surfaces
+  as an access violation inside `d3d9.dll` with nothing pointing back. `ProcessVertices` was
+  missed twice by reading before the check existed, and adding `IDirect3DSurface8` to
+  `INTERFACES` enumerated all ten surface-carrying device methods — `SetCursorProperties`
+  included, which the hand-written prediction had missed. The check covers **every** wrapped
+  interface including `IDirect3DDevice8`, because a forwarded `GetDevice` on a resource is the
+  same failure without the crash: it hands the game the unwrapped d3d8to9 device, after which
+  every call it makes is invisible.
+- **Vulkan is reached through volk, never the loader's import library**, and the ImGui Vulkan
+  backend is vendored in `third_party/imgui_backends/` for the same reason. GkPlus *is*
+  `d3d8.dll`; a load-time dependency on `vulkan-1.dll` would stop the game launching.
+- **Every "must be 0" counter in `render.report` is a real invariant.** Each one exists
+  because getting it wrong once cost a debugging session.
+- **Some defects only a picture can find.** The arena's 16-byte slot alignment against a 48-byte
+  vertex was invisible to every counter *and* to the texture readback verification, because
+  nothing was wrong with the uploads — only with how a draw addressed them. `render.capture()`
+  (RenderDoc) and a window screenshot are the tools for that class; §4.16 also records two wrong
+  guesses that cost a rebuild each before the picture was consulted.
+- **A counter says the plumbing ran, not that it moved the right bytes.**
+  `render.verify_textures()` and `render.verify_buffers()` read each image and each arena slot
+  back off the GPU and compare them against the D3D resource they came from — between them they
+  have found five defects with every counter reading clean (notes §4.13, §4.24). Both must read
+  `158/158` and `3467/3467` on level01. The **ratio** is the invariant, not those two numbers —
+  a run on `level02` (which is what automated testing should load, see "Debugging the running
+  game") has its own totals, and a mismatch is any run where the two halves differ. Check
+  `render.validation` in the same breath as any readback: a verifier that is itself invalid
+  reports its own mismatches as the code's, which cost an afternoon.
+- **...but a readback taken later proves consistency, not correctness** (§4.42). Both verifiers
+  read *now* and compare against what the game holds *now*, and now is a frame or more after any
+  draw they are being used to vouch for. Textures do not move, so that half is safe; a dynamic
+  vertex buffer is refilled several times a frame, so the arena and the buffer can agree perfectly
+  on a version neither held at the draw. That is how a HUD draw rendering the fire's glow quad
+  survived "0 of 12 vertices differ" through three sections. `verify_buffers` reading one short on
+  both levels is this, and expected: the slot is deliberately frozen mid-frame.
+- **Two transfers in a command buffer are not ordered against each other**, and a level load
+  hands one arena slot to two buffers inside a single staging batch. Unordered, the loser's
+  bytes are what the draw reads — which presents as one object smeared into a black wedge across
+  a third of the screen, not as anything synchronisation-shaped. `ordered_overlapping_copies`
+  counts the barriers that now prevent it (166,375 a session, so this is the common case, not an
+  edge). Notes §4.24, which is also the record of three diagnostics that were built to catch it
+  and could not.
+- **RenderDoc cannot see a level load.** A load presents nothing, so `CaptureStagingBatch(n)`
+  captures a staging *batch* instead — reproducible across runs, so one run says which batch and
+  the next captures it. But at full heaps the capture dies on RenderDoc's own readback window
+  (§4.17's 32-bit limit again), and at `GKPLUS_VK_HEAPS=small` the upload defects mostly stop
+  happening, because a smaller ring flushes 100x more often. `GKPLUS_VK_WATCH_DST` +
+  `render.staging_watch` is what works: log every upload to one arena offset with its batch.
+- **To find out what the renderer is missing, make the GAME render without it.** Three env vars
+  force `D3DRS_LIGHTING`, `D3DRS_SPECULARENABLE` and the texture stages past the first off, in
+  the *forwarded* call only. That is what proved fog was not the gap and the lightmap stage was —
+  after three sections of the plan said the opposite. A hypothesis costs one such switch and one
+  screenshot diff; reading more of the renderer costs a session and settles nothing (§4.19).
+- **An A/B is only evidence about the pixels that were on screen when it ran.** "Lighting
+  contributes nothing, 0.08/255" was measured on a frame whose HUD had not appeared yet; with
+  the HUD up the same switch turns the panel from green to grey. Check what is actually in the
+  frame before generalising from it (§4.20).
+- **Two launches are not a comparison.** The renderers run at different frame rates, so at a
+  fixed delay the *game* is in a different state — three Vulkan runs of identical code differ by
+  up to 8/255, which is bigger than most of what is worth measuring. Toggle the feature at run
+  time with the game paused instead (`screen.toggle_pause()`, then `render.topologies`): same
+  frame, noise floor 0.03, and the difference image is exactly what the feature painted. For a
+  cross-renderer shot, pause *and* set the camera explicitly (§4.21).
+- **A screenshot of gl.exe needs `SetProcessDPIAware()` in the capturing process**, or
+  `GetClientRect` reports virtualized coordinates, `PrintWindow` renders at the window's real
+  resolution, and the bitmap keeps only the top-left two thirds. The HUD is in the upper right
+  and went missing from a whole session's shots, all of which looked complete (§4.20).
+- **A stage whose texture fails to resolve samples white, and white is not neutral** — it is the
+  identity for `MODULATE` and for nothing else. The same texture under `ADDSIGNED` brightens by
+  0.5, which is how 83,176 draws a session went unnoticed while only stage 0 was drawn.
+
+| File | Purpose |
+|------|---------|
+| `src/D3D8Capture.h` | The **public** surface: what `entry.cpp`, `JsRender.cpp` and the Vulkan side may use. `CaptureStats`, the `render.*` readings, the run-time knobs, `D3D8CaptureSystem` |
+| `src/D3D8Capture.cpp` | The **recorder**: wraps `IDirect3D8`, `IDirect3DDevice8`, the two buffer types, `IDirect3DTexture8` and `IDirect3DSurface8`; shadow state, state-block replay, per-draw material/pipeline keys, residency, the texture pixel path — `LockRect` on a `SYSTEMMEM` staging texture then `CopyRects` into the `MANAGED` one, so the upload hangs off `CopyRects` (notes §4.12) — and the `AcquireRimTexture` hook that names every image by its `.rim` asset (§4.14) |
+| `src/D3D8CaptureReport.cpp` | The **evidence**: the histograms, the verifiers, the frame draw log and every `render.*` reading built on them. Split out because it was a third of one 5,000-line file and none of it is on the path a frame takes — it only reads what the recorder wrote, through the `Note*`/`Log*` collectors. **That direction is the invariant**: a diagnostic that mutates state the renderer then reads is not a diagnostic, and this is the file where that mistake would be made |
+| `src/D3D8CaptureInternal.h` | The seam between those two — the wrappers, the shadow state, the shared containers. Deliberately **not** `D3D8Capture.h`: nothing outside those two `.cpp` files should include it |
+| `src/VkContext.h/cpp` | Instance, physical device, logical device, validation. Lazily initialized — **never from `DllMain`**, since volk calls `LoadLibrary` and that deadlocks under the loader lock |
+| `src/VkRenderer.h/cpp` | Surface, swapchain, frames in flight, the ImGui backend, present — and the **offscreen colour target** the world is rasterised into at the game's own backbuffer size, blitted onto the swapchain at the end (§4.38). The extent comes from `d3d8::BackBufferExtent`, i.e. from the present parameters, not from the D3D viewport: the swapchain shows the whole backbuffer, so that is what the blit's source has to be. The overlay has its **own pass on the swapchain image**, after the blit, so it stays 1:1 with the window instead of going through the scale |
+| `src/VkResources.h/cpp` | VMA arenas, the staging ring, the texture images (creation, format mapping, upload, readback verification) and the bindless descriptor set. Nothing device-local is ever mapped. **The vertex arena aligns slots to `sizeof(CanonicalVertex)`, not 16** — a draw addresses its buffer as a vertex index, and a 16-byte-aligned slot silently pulls the wrong vertices (notes §4.16) |
+| `src/VkDraw.h/cpp` | The world pass: one `VkPipeline` per distinct blend/depth/cull state (five on level01, built on first sight — notes §4.19), the depth buffer, the per-frame draw list, and the **shader ABI** (`GpuLight`, `GpuDrawRecord`, `GpuMaterial` — the three arrays a draw is looked up in, §4.26 and §4.30). A draw binds nothing and its push constants describe nothing: four device addresses and three indices, 48 bytes. Vertices, its own record, its material and the lights are all pulled by address, from the arena for buffered draws and from a per-frame host-visible scratch for user-pointer ones (§4.18). **Materials are interned per frame** — 274 draws on level02 are 29 of them — which is what makes a second pass over the frame a walk over the draw array rather than a replay of the recording loop. **The list is never sorted**: the game's own order is what makes blending correct |
+| `src/VkCapture.h/cpp` | RenderDoc via its in-app API, so `render.capture()` grabs one frame from the REPL. Off unless `GKPLUS_RENDERDOC` is set, and loaded before the Vulkan instance because it captures by inserting a layer. **Opening a capture has two traps, both reported as `VK_ERROR_OUT_OF_DEVICE_MEMORY` and neither about VRAM** — the *replayer* must be 32-bit (launching from the x86 tooling does not help; the UI replays in its own x64 process, so it needs `x86\renderdoccmd.exe remoteserver`), and an in-level capture needs `GKPLUS_VK_HEAPS=small` (notes §4.17) |
+| `src/shaders/*.slang`, `src/gen-shaders.py` | The shaders, in **Slang**, compiled offline to `src/Shaders.gen.inc.h` so `d3d8.dll` needs no shader toolchain. Re-run the generator after editing one |
+| `src/VertexFormat.h/cpp` | Every FVF the game uses → one canonical 48-byte vertex. Pure CPU, no Vulkan and no D3D headers |
+| `src/JsRender.cpp` | The `render` namespace: all of the above, readable from the REPL — plus `material_override`, the one member of it that is a **feature** rather than a measurement. Only that part is in `types/gk.d.ts`; the diagnostics move with whatever is being investigated, so `Render` carries an index signature and says so |

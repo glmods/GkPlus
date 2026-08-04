@@ -361,6 +361,10 @@ JSValue GetCharacterSnapshot(JSContext *ctx, JSValueConst self) {
   if (JS_IsException(obj)) {
     return obj;
   }
+  // Raw stored values throughout, like turning_speed and the angles below, which
+  // are BAM rather than revolutions and degrees. walking_speed is therefore the
+  // 16.16 fixed point, so divide by 65536 for the cycles/sec `make.role` takes.
+  // It is an int in the game; reading it as a float reported a denormal.
   SetFloat(ctx, obj, "walking_speed", c->walking_speed);
   SetFloat(ctx, obj, "turning_speed", c->turning_speed);
   SetFloat(ctx, obj, "aim", c->aim);

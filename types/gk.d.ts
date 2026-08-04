@@ -279,7 +279,9 @@ declare module "gk" {
     readonly visible: boolean;
     readonly targetable: boolean;
     readonly interactable: boolean;
-    readonly can_be_picked_up: boolean;
+    /** Crouched. Slot 63, and it is `MobileActor`-only: `PickupActor` carries
+     *  the base implementation, which always answers false. */
+    readonly crouched: boolean;
     readonly has_pending_orders: boolean;
 
     /** Replicates: `Actor::SetHealth` broadcasts on its way through. */
@@ -292,9 +294,12 @@ declare module "gk" {
     shield: number;
     /** health / the role's strength, so 1 is untouched and 0 is dead. */
     readonly strength_ratio: number;
-    /** Whether this actor belongs to the local player.
-     *  **Local only** - `SetIsMine` reaches no broadcast. */
-    mine: boolean;
+    /** Camouflaged - hidden in water or a scrap pile, which the AI treats as a
+     *  hard skip in every target-acquisition loop. Set by crouching next to
+     *  cover, not directly by the player; see `stealth_and_fog_notes.md`.
+     *  **Local only** - the setter (slot 9) reaches no broadcast, while the
+     *  game's own crouch toggle broadcasts 0x4c/0x4e carrying this flag. */
+    concealed: boolean;
 
     /** Applies damage, returning whether it landed. A negative amount heals.
      *
