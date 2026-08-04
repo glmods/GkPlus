@@ -49,6 +49,12 @@ struct CaptureStats {
   // returns D3D_OK either way - so this is not our defect but the reference renderer's, and
   // it is the only counter here that is expected to be non-zero (§4.29).
   uint64_t draws_out_of_range = 0;
+  // Draw calls the FORWARDED runtime refused - a failing HRESULT out of `inner_`. Nothing had
+  // ever read one, so "the reference does not draw this" had no explanation that did not
+  // require the reference's state to differ from ours. A refused call draws nothing while
+  // every state, every vertex and every counter on this side reads perfectly correct, which is
+  // exactly the shape of §4.29's HUD columns and §4.40's plate quad.
+  uint64_t draws_refused = 0;
   uint64_t draws_user_ptr = 0; // the two *UP variants
 
   // Fixed-function state actually exercised. Keyed by D3D enum; the value set is bounded in
@@ -302,6 +308,38 @@ bool GetLightSum();
 // True once the game has created its device through us.
 bool DeviceCreated();
 
+// The size of the D3D backbuffer the game rasterises into, which is **not** the window's client
+// area: Gunlok asks for 640x480 and the client is 628x468, so D3D's windowed Present stretches
+// one onto the other (§4.37). A Vulkan viewport covering the swapchain instead scales every
+// pre-transformed draw by 628/640 *during* rasterisation, which resamples the texture - so the
+// renderer draws into an offscreen target this size and blits afterwards, the way the original
+// does.
+//
+// False before CreateDevice, and false when the game left the size at 0 - which windowed D3D8
+// reads as "match the client area", the case where there is nothing to correct for.
+bool BackBufferExtent(uint32_t &width, uint32_t &height);
+
+// What the game last cleared its whole backbuffer to.
+//
+// The Vulkan path clears its own attachments through a load op, so it has to use these rather
+// than values of its own - and it used a hardcoded debug blue-grey for the colour until that was
+// spotted on screen. The difference is not confined to the background: an alpha-blended or
+// additive draw over an uncovered background **blends against it**, so a translucent beam against
+// a black sky comes out lighter and hazier over a blue-grey one.
+struct ClearValues {
+  uint32_t colour = 0xff000000; // D3DCOLOR, ARGB
+  float z = 1.0f;
+  uint32_t stencil = 0;
+  // False until the game has cleared the target at all. Black is the right assumption then: a
+  // D3D8 backbuffer's contents after a Present are undefined, so nothing is being preserved.
+  bool clears_target = false;
+  uint64_t clears = 0;
+  // Clears with a rectangle list, which a load op cannot express. Expected to be 0; a non-zero
+  // reading means part of the frame is cleared separately and the load op is not the whole story.
+  uint64_t partial_clears = 0;
+};
+const ClearValues &Clears();
+
 // Reads every live texture's every mip level back off the GPU and compares it against the D3D
 // texture it came from. Returns "<matched>/<checked> levels match" plus the first mismatch.
 //
@@ -317,6 +355,42 @@ std::string VerifyTextureImages();
 // addresses the arena by offset rather than by binding - it simply draws the wrong thing.
 // `render.verify_buffers()`.
 std::string VerifyBufferSlots();
+
+// Reads the fixed-function state back off the device and diffs it against the shadow mirror.
+// Returns "<matched>/<checked> states match the device" plus a line per mismatch.
+//
+// The mirror is the whole basis of the Vulkan renderer - every draw is described by what the
+// shadow says was set - and nothing checked it against D3D until §4.39 found a state-block bug
+// that let the two diverge silently for a whole scene. This is `VerifyTextureImages` and
+// `VerifyBufferSlots` pointed at state instead of at bytes.
+//
+// Only the states the shadow tracks and the game has actually set are compared: walking the
+// whole render-state space would ask D3D about indices that are not states and report its
+// refusals as mismatches. The device compared against is whatever this layer forwards to -
+// d3d8to9 under `GKPLUS_RENDERER=vulkan`, Windows' own D3D8 under `d3d8` - which is exactly the
+// mirror's contract. A `GKPLUS_NO_*` switch makes the two differ deliberately, so the report
+// says when one is set.
+std::string VerifyShadowState();
+
+// The same comparison taken **at the moment one draw is issued**, which is the form that can see
+// a divergence that only exists mid-scene. Set the draw index, let a frame pass, then read the
+// report - the same set-and-read-back shape as `render.draw_vertices`, and for the same reason.
+//
+// Needs `GKPLUS_RENDERER=vulkan`: the index is a position in the Vulkan draw list, which the
+// other renderer modes do not build. -1 disarms.
+void WatchDrawState(int64_t index);
+int64_t WatchedDrawState();
+std::string DescribeWatchedDrawState();
+
+// What the same watched draw actually **pulled**: the indices and vertices the shader reads out
+// of the arena, beside the ones D3D reads out of the game's own buffer for that draw.
+//
+// The one reading nothing else here gives. `VerifyBufferSlots` proves a slot holds what its
+// buffer holds and `render.draw_info` prints the offsets a draw was given, but neither says the
+// draw addressed the right place - and the arena is one buffer every slot shares, so addressing
+// it wrongly yields *other geometry* rather than garbage. That looks like a draw in the wrong
+// position and nothing like a bug, which is §4.16's lesson and the gap it left open.
+std::string DescribeWatchedDrawGeometry();
 
 // The D3D9 device behind whatever IDirect3DDevice8 the game is holding, unwrapping our
 // capture device if it is one. src/GUI.cpp needs this: it reads the game's own
@@ -344,6 +418,34 @@ bool PassthroughToSystemD3D8();
 // off never shows it.
 std::string ArmProbeQuad(const std::string &name, double scale, bool mipmap, double offset,
                          bool alpha);
+
+// `render.ref_range` / `render.ref_hide` - `vulkan::SetDrawRange` and `SetDrawHide` pointed at
+// the runtime this layer FORWARDS to, so the reference can be bisected the way the Vulkan list
+// already could. A draw outside the range, or inside the hide window, is simply not forwarded.
+//
+// This is the reading that was missing on the reference side, and its absence is why §4.39 and
+// §4.40 could establish "this renderer paints a quad the original does not" and then have
+// nowhere to go: every follow-up question - what does the original paint for THAT draw, is it
+// painted and then covered, is it painted somewhere else - is a `draw_range` question, and
+// `draw_range` only existed for us. Works in `d3d8` and `d3d9` mode, which is the point.
+//
+// The index is the draw's position in the frame in call order, which is what `PendingDrawIndex`
+// counts while every draw reaches the renderer - so a draw located in `vulkan` mode carries its
+// number over to `d3d8`. `seen == submitted` in `render.draws` is the check that they are the
+// same list; nothing else guarantees it.
+//
+// Run-time only, and only meaningful on a paused frame: the list is rebuilt every frame.
+// `render.frame_draws([first, last])` - one line per draw of the last complete frame, built from
+// the shadow state and the call's arguments, so it exists in **every** renderer mode. It is what
+// `ref_range` is aimed with: an index is a position in a list the game rebuilds every frame, and
+// two runs of one camera do not have the same number of draws, so a number carried over from a
+// `vulkan` session lands on a different draw. This is how to find the same draw again.
+std::string FormatFrameDraws(uint32_t first, uint32_t last);
+
+void SetRefRange(uint32_t first, uint32_t last);
+void GetRefRange(uint32_t &first, uint32_t &last);
+void SetRefHide(uint32_t first, uint32_t last);
+void GetRefHide(uint32_t &first, uint32_t &last);
 
 // Detours d3d8to9's Direct3DCreate8 in the constructor, undoes it in the destructor. Held by
 // the `Subsystems` aggregate in entry.cpp, and it must be constructed before anything that

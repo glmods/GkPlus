@@ -9,6 +9,7 @@
 #include <imgui_impl_win32.h>
 
 #include "Core.h"
+#include "D3D8Capture.h"
 #include "GUI.h"
 #include "VkCapture.h"
 #include "VkContext.h"
@@ -58,6 +59,40 @@ Frame Frames[kFramesInFlight];
 uint32_t FrameIndex = 0;
 
 bool ImGuiReady = false;
+
+// --- the offscreen colour target (§4.37) ------------------------------------------------------
+//
+// The world is rasterised at the size the GAME rasterises at - its D3D backbuffer, 640x480 - and
+// scaled onto the swapchain afterwards. Not a quality choice: a pre-transformed draw's
+// pixels-to-clip matrix is built from the D3D viewport, so a Vulkan viewport covering a 628x468
+// swapchain scales every 2D draw by 628/640 *during rasterisation*, which resamples the texture
+// and puts no sample on a texel. The original does exactly this - it rasterises 1:1 and lets its
+// windowed Present stretch the finished frame - and reproducing the order is the whole fix.
+//
+// Sizing the Vulkan viewport from the D3D viewport instead makes the sampling exact and costs the
+// framing (2.59 -> 13.07 whole-frame), because a larger viewport on a smaller swapchain clips
+// where D3D stretches. That is the experiment §4.37 reverted; this is what it concluded.
+VkImage OffscreenImage = VK_NULL_HANDLE;
+VkDeviceMemory OffscreenMemory = VK_NULL_HANDLE;
+VkImageView OffscreenView = VK_NULL_HANDLE;
+// What the world pass rasterises into: the backbuffer size when the offscreen target is up, the
+// swapchain extent when it is not. The depth buffer and every viewport follow it.
+VkExtent2D RenderExtent = {};
+// GKPLUS_VK_OFFSCREEN=0 / `render.offscreen`. On by default - drawing at the wrong size is not a
+// defensible default - and off is the pre-§4.37 behaviour exactly, which is what makes it
+// A/B-able on one paused frame the way `render.half_pixel` is.
+bool OffscreenWanted = true;
+bool OffscreenWantedRead = false;
+// Whether the target actually exists this frame. False when the swapchain will not take
+// TRANSFER_DST, or before the game has told us a backbuffer size.
+bool OffscreenActive = false;
+bool SwapchainTransferDst = false;
+// The filter for the final scale, and NEAREST is not the lazy default: the original's 640->628
+// windowed stretch preserves the probe quad's **16 distinct values, 100% multiples of 17**
+// (§4.37), which a filtered downscale could not - a blend of two 4-bit levels is not on that
+// ladder. So D3D's stretch drops columns rather than mixing them, and matching it means NEAREST.
+// `render.present_linear` is the A/B, because that deduction is about one measurement.
+bool PresentLinearFilter = false;
 
 bool Fail(const std::string &message) {
   Error = message;
@@ -142,6 +177,18 @@ bool CreateSwapchain() {
     image_count = caps.maxImageCount;
   }
 
+  // TRANSFER_DST is what the offscreen target is blitted through, and it is asked for rather
+  // than assumed: every surface in practice supports it, but a swapchain created without a usage
+  // bit it does not support fails outright, and this renderer has a working path without it.
+  // `SwapchainTransferDst` is what the render-target reconcile reads.
+  SwapchainTransferDst =
+      (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0;
+  if (!SwapchainTransferDst) {
+    DebugWrite("gkplus: vulkan renderer: the surface will not take TRANSFER_DST; drawing "
+               "straight into the swapchain, so 2D draws are rasterised at the window's size "
+               "rather than the game's\n");
+  }
+
   VkSwapchainCreateInfoKHR info = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
   info.surface = Surface;
   info.minImageCount = image_count;
@@ -149,7 +196,9 @@ bool CreateSwapchain() {
   info.imageColorSpace = Format.colorSpace;
   info.imageExtent = Extent;
   info.imageArrayLayers = 1;
-  info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                    (SwapchainTransferDst ? VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                                          : VkImageUsageFlags(0));
   info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
   info.preTransform = caps.currentTransform;
   info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -209,6 +258,139 @@ bool CreateSwapchain() {
   return true;
 }
 
+void DestroyOffscreen() {
+  VkDevice device = GetDevice();
+  if (OffscreenView != VK_NULL_HANDLE) {
+    vkDestroyImageView(device, OffscreenView, nullptr);
+    OffscreenView = VK_NULL_HANDLE;
+  }
+  if (OffscreenImage != VK_NULL_HANDLE) {
+    vkDestroyImage(device, OffscreenImage, nullptr);
+    OffscreenImage = VK_NULL_HANDLE;
+  }
+  if (OffscreenMemory != VK_NULL_HANDLE) {
+    vkFreeMemory(device, OffscreenMemory, nullptr);
+    OffscreenMemory = VK_NULL_HANDLE;
+  }
+  OffscreenActive = false;
+}
+
+// Allocated directly rather than through VMA, for the reason CreateDepth in VkDraw.cpp gives for
+// the depth image: one image that lives as long as the swapchain, and pulling the allocator in
+// for it would export a handle nothing else needs.
+bool CreateOffscreen(VkExtent2D extent) {
+  DestroyOffscreen();
+  VkDevice device = GetDevice();
+
+  VkImageCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  info.imageType = VK_IMAGE_TYPE_2D;
+  info.format = Format.format;
+  info.extent = {extent.width, extent.height, 1};
+  info.mipLevels = 1;
+  info.arrayLayers = 1;
+  info.samples = VK_SAMPLE_COUNT_1_BIT;
+  info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (vkCreateImage(device, &info, nullptr, &OffscreenImage) != VK_SUCCESS) {
+    return Fail("could not create the offscreen colour target");
+  }
+
+  VkMemoryRequirements requirements = {};
+  vkGetImageMemoryRequirements(device, OffscreenImage, &requirements);
+  VkPhysicalDeviceMemoryProperties memory = {};
+  vkGetPhysicalDeviceMemoryProperties(GetPhysicalDevice(), &memory);
+  uint32_t type = UINT32_MAX;
+  for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+    if ((requirements.memoryTypeBits & (1u << i)) != 0 &&
+        (memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+      type = i;
+      break;
+    }
+  }
+  if (type == UINT32_MAX) {
+    return Fail("no device-local memory type for the offscreen colour target");
+  }
+
+  VkMemoryAllocateInfo allocate = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  allocate.allocationSize = requirements.size;
+  allocate.memoryTypeIndex = type;
+  if (vkAllocateMemory(device, &allocate, nullptr, &OffscreenMemory) != VK_SUCCESS ||
+      vkBindImageMemory(device, OffscreenImage, OffscreenMemory, 0) != VK_SUCCESS) {
+    return Fail("could not back the offscreen colour target");
+  }
+
+  VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  view.image = OffscreenImage;
+  view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view.format = Format.format;
+  view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  if (vkCreateImageView(device, &view, nullptr, &OffscreenView) != VK_SUCCESS) {
+    return Fail("could not create the offscreen colour target's view");
+  }
+  OffscreenActive = true;
+  return true;
+}
+
+bool OffscreenEnvEnabled() {
+  if (!OffscreenWantedRead) {
+    OffscreenWantedRead = true;
+    char value[16] = {};
+    const DWORD len = ::GetEnvironmentVariableA("GKPLUS_VK_OFFSCREEN", value, sizeof(value));
+    if (len > 0) {
+      const std::string text(value, len);
+      OffscreenWanted = !(text == "0" || text == "off" || text == "no");
+    }
+  }
+  return OffscreenWanted;
+}
+
+// The size the world pass should rasterise at, and whether that needs a target of its own.
+// The game's backbuffer when it has told us one, the swapchain otherwise - which is also what
+// windowed D3D8 does with a zero BackBufferWidth, so the two agree in that case rather than the
+// fallback being a guess.
+VkExtent2D DesiredRenderExtent(bool &offscreen) {
+  uint32_t width = 0, height = 0;
+  if (OffscreenEnvEnabled() && SwapchainTransferDst &&
+      d3d8::BackBufferExtent(width, height)) {
+    offscreen = true;
+    return {width, height};
+  }
+  offscreen = false;
+  return Extent;
+}
+
+// Brings the render target and the depth buffer in line with what the game is drawing at.
+// Called once a frame and a no-op unless something moved - a resize, a Reset, or the toggle -
+// because it waits for the device to go idle before it destroys anything the last frame read.
+bool ReconcileRenderTarget() {
+  bool want_offscreen = false;
+  const VkExtent2D want = DesiredRenderExtent(want_offscreen);
+  if (want_offscreen == OffscreenActive && want.width == RenderExtent.width &&
+      want.height == RenderExtent.height) {
+    return true;
+  }
+  vkDeviceWaitIdle(GetDevice());
+  RenderExtent = want;
+  if (want_offscreen) {
+    if (!CreateOffscreen(want)) {
+      // Fall back rather than stop: rasterising at the window's size is what every build before
+      // §4.37 did, and a renderer that draws slightly wrong beats one that draws nothing.
+      DestroyOffscreen();
+      RenderExtent = Extent;
+    }
+  } else {
+    DestroyOffscreen();
+  }
+  // DrawReady() is false during bring-up, where StartDraw creates the depth buffer at this same
+  // extent immediately afterwards.
+  if (DrawReady() && !ResizeDraw(RenderExtent.width, RenderExtent.height)) {
+    return Fail("could not resize the depth buffer to the render extent");
+  }
+  return true;
+}
+
 // The ImGui *context*, the Win32 backend and the F11 toggle all belong to GUISystem
 // (src/GUI.h) whichever renderer is running - only the rendering backend differs. This
 // brings up that half and nothing else.
@@ -229,16 +411,17 @@ bool StartImGui() {
     return Fail("ImGui_ImplVulkan_LoadFunctions failed");
   }
 
-  // The overlay draws into the same pass as the world, so its pipeline has to name the same
-  // attachments - a pipeline whose depth or stencil format disagrees with the one attached is
-  // not render-pass compatible, and the overlay is the last thing recorded before the pass ends.
+  // The overlay has its own pass on the swapchain image, with no depth attachment, so its
+  // pipeline declares colour only. It used to share the world's pass and therefore had to name
+  // the world's depth and stencil formats; moving it out is what keeps it 1:1 with the window
+  // now that the world is rasterised at the game's size and scaled (§4.37). The overlay is drawn
+  // for a human, not to match d3d9, so it is the one thing that should NOT go through the scale.
   VkPipelineRenderingCreateInfo rendering = {
       VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
   rendering.colorAttachmentCount = 1;
   rendering.pColorAttachmentFormats = &Format.format;
-  rendering.depthAttachmentFormat = static_cast<VkFormat>(DepthFormatValue());
-  rendering.stencilAttachmentFormat =
-      DepthHasStencil() ? static_cast<VkFormat>(DepthFormatValue()) : VK_FORMAT_UNDEFINED;
+  rendering.depthAttachmentFormat = VK_FORMAT_UNDEFINED;
+  rendering.stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
 
   ImGui_ImplVulkan_InitInfo info = {};
   info.ApiVersion = VK_API_VERSION_1_3;
@@ -381,21 +564,25 @@ bool StartRenderer(HWND window) {
     return Fail("graphics queue family cannot present to the game window");
   }
 
-  // StartDraw needs the bindless set layout StartResources creates, and the swapchain's format
-  // and extent, so it cannot come before either. **StartImGui comes after it** rather than
-  // before, because the overlay's pipeline has to declare the same depth and stencil formats
-  // the pass will attach - and which those are is StartDraw's decision (§4.21).
+  // StartDraw needs the bindless set layout StartResources creates, and the swapchain's format,
+  // so it cannot come before either. **ReconcileRenderTarget comes before it**, because the size
+  // StartDraw builds the depth buffer at is the render extent rather than the swapchain's - the
+  // game is already up by the time Present first reaches us, so its backbuffer size is known
+  // here (§4.37).
   if (!CreateFrames() || !CreateSwapchain() || !StartResources() ||
-      !StartDraw(Extent.width, Extent.height, Format.format) || !StartImGui()) {
+      !ReconcileRenderTarget() ||
+      !StartDraw(RenderExtent.width, RenderExtent.height, Format.format) || !StartImGui()) {
     return false;
   }
 
   Ready = true;
   Error.clear();
   TheStats.ready = true;
-  DebugWrite("gkplus: vulkan renderer up: " + std::to_string(Extent.width) + "x" +
+  DebugWrite("gkplus: vulkan renderer up: swapchain " + std::to_string(Extent.width) + "x" +
              std::to_string(Extent.height) + ", " + std::to_string(Images.size()) +
-             " images\n");
+             " images, rendering at " + std::to_string(RenderExtent.width) + "x" +
+             std::to_string(RenderExtent.height) +
+             (OffscreenActive ? " offscreen\n" : " direct\n"));
   return true;
 }
 
@@ -420,7 +607,14 @@ void DrawFrame() {
       ResetFrameScratch();
       return;
     }
-    ResizeDraw(Extent.width, Extent.height);
+  }
+  // Every frame, not only after a rebuild: the game can change its backbuffer size through Reset
+  // without the swapchain going out of date, and the toggle can move under a paused frame. Cheap
+  // and does nothing unless one of the three actually moved.
+  if (!ReconcileRenderTarget()) {
+    ClearDraws();
+    ResetFrameScratch();
+    return;
   }
 
   Frame &frame = Frames[FrameIndex];
@@ -477,21 +671,35 @@ void DrawFrame() {
 
   RecordUploads(frame.cmd, FrameIndex);
 
-  // UNDEFINED as the source layout on purpose: the previous contents of a swapchain image
-  // are not ours to preserve, and saying so lets the driver skip a decompress.
-  Barrier(frame.cmd, Images[image_index], VK_IMAGE_LAYOUT_UNDEFINED,
+  // Where the world pass draws: the offscreen target when it is up, the swapchain image when it
+  // is not. UNDEFINED as the source layout in either case, on purpose - neither image's previous
+  // contents are ours to preserve, and saying so lets the driver skip a decompress.
+  const VkImage world_image = OffscreenActive ? OffscreenImage : Images[image_index];
+  const VkImageView world_view = OffscreenActive ? OffscreenView : Views[image_index];
+  Barrier(frame.cmd, world_image, VK_IMAGE_LAYOUT_UNDEFINED,
           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 
   // The clear is the attachment's load op rather than a separate vkCmdClearColorImage: one
-  // less barrier, one less layout, and the swapchain no longer needs TRANSFER_DST usage.
+  // less barrier and one less layout.
+  //
+  // **The colour is the game's own**, taken from its last whole-surface `Clear`. It used to be a
+  // hardcoded blue-grey, which is visible wherever the world does not cover the frame and - the
+  // part that actually matters - is what every alpha-blended and additive draw over an uncovered
+  // background blends *against*. A translucent beam against a black sky comes out lighter and
+  // hazier over a blue-grey one, which reads as "this renderer gets translucency wrong".
+  const d3d8::ClearValues &clears = d3d8::Clears();
+  const auto channel = [](uint32_t argb, int shift) {
+    return static_cast<float>((argb >> shift) & 0xff) / 255.0f;
+  };
   VkRenderingAttachmentInfo colour = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-  colour.imageView = Views[image_index];
+  colour.imageView = world_view;
   colour.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
   colour.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
   colour.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-  colour.clearValue.color = {{0.10f, 0.16f, 0.28f, 1.0f}};
+  colour.clearValue.color = {{channel(clears.colour, 16), channel(clears.colour, 8),
+                              channel(clears.colour, 0), channel(clears.colour, 24)}};
 
   auto depth_view = reinterpret_cast<VkImageView>(DepthImageView());
   // The stencil aspect rides on the same image and the same view (§4.21): the game's shadow
@@ -508,8 +716,9 @@ void DrawFrame() {
   depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
   // DONT_CARE: nothing reads the depth buffer after the pass, so storing it is pure bandwidth.
   depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  depth.clearValue.depthStencil = {1.0f, 0};
-  // Cleared to 0 every frame, which is what the shadow-volume algorithm counts up from.
+  // The game's own values, for the same reason as the colour above - and the stencil one is what
+  // the shadow-volume algorithm counts up from, so it is not a free choice either.
+  depth.clearValue.depthStencil = {clears.z, clears.stencil};
   VkRenderingAttachmentInfo stencil = depth;
 
   // The depth image is fresh every frame from the renderer's point of view - UNDEFINED as the
@@ -525,7 +734,7 @@ void DrawFrame() {
   }
 
   VkRenderingInfo rendering = {VK_STRUCTURE_TYPE_RENDERING_INFO};
-  rendering.renderArea.extent = Extent;
+  rendering.renderArea.extent = RenderExtent;
   rendering.layerCount = 1;
   rendering.colorAttachmentCount = 1;
   rendering.pColorAttachments = &colour;
@@ -535,37 +744,103 @@ void DrawFrame() {
 
   vkCmdBeginRendering(frame.cmd, &rendering);
 
-  // The world first, then the overlay on top of it. Viewport and scissor are dynamic so the
-  // pipeline survives a resize without being rebuilt.
+  // Viewport and scissor are dynamic so the pipeline survives a resize without being rebuilt.
+  // Both cover the RENDER extent rather than the swapchain's: that is the size the game's own
+  // pixels-to-clip matrix was built from, so a vertex at x=640 lands on pixel 640 exactly and
+  // every 2D draw rasterises 1:1 (§4.37). Scaling to the window happens once, afterwards, on
+  // finished pixels - which is the order the original does it in.
   //
   // The origin is half a pixel, not zero: D3D8/9 sample a pixel at its integer coordinate where
   // Vulkan samples at the centre, so without it every interpolated value - and therefore every
-  // texture fetch - is half a pixel out. See SetHalfPixel in VkDraw.h. Only the world pass
-  // takes it; ImGui's backend sets its own viewport for the overlay.
+  // texture fetch - is half a pixel out. See SetHalfPixel in VkDraw.h.
   const float origin = ViewportOrigin();
-  VkViewport viewport = {origin, origin, static_cast<float>(Extent.width),
-                         static_cast<float>(Extent.height), 0.0f, 1.0f};
-  VkRect2D scissor = {{0, 0}, Extent};
+  VkViewport viewport = {origin, origin, static_cast<float>(RenderExtent.width),
+                         static_cast<float>(RenderExtent.height), 0.0f, 1.0f};
+  VkRect2D scissor = {{0, 0}, RenderExtent};
   vkCmdSetViewport(frame.cmd, 0, 1, &viewport);
   vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
   RecordDraws(frame.cmd);
-
-  if (draw_data != nullptr) {
-    ImGui_ImplVulkan_RenderDrawData(draw_data, frame.cmd);
-  }
   vkCmdEndRendering(frame.cmd);
 
-  Barrier(frame.cmd, Images[image_index], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+  // The scale, which is what makes the two sizes agree. NEAREST rather than LINEAR by default:
+  // the original's own stretch preserves a 4-bit texture's sixteen distinct values (§4.37), which
+  // only a point sample can, so D3D drops columns rather than mixing them.
+  if (OffscreenActive) {
+    Barrier(frame.cmd, OffscreenImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT,
+            VK_ACCESS_2_TRANSFER_READ_BIT);
+    Barrier(frame.cmd, Images[image_index], VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+            VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+
+    VkImageBlit blit = {};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[1] = {static_cast<int32_t>(RenderExtent.width),
+                          static_cast<int32_t>(RenderExtent.height), 1};
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.dstOffsets[1] = {static_cast<int32_t>(Extent.width),
+                          static_cast<int32_t>(Extent.height), 1};
+    vkCmdBlitImage(frame.cmd, OffscreenImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   Images[image_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                   PresentLinearFilter ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+  }
+
+  // The overlay, in its own pass on the swapchain image, so it is 1:1 with the window instead of
+  // going through the scale above. It loads rather than clears - the world is already there,
+  // whether by blit or because it was drawn straight into this image.
+  if (draw_data != nullptr) {
+    Barrier(frame.cmd, Images[image_index],
+            OffscreenActive ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                            : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            OffscreenActive ? VK_PIPELINE_STAGE_2_BLIT_BIT
+                            : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            OffscreenActive ? VK_ACCESS_2_TRANSFER_WRITE_BIT
+                            : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT);
+
+    VkRenderingAttachmentInfo overlay = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    overlay.imageView = Views[image_index];
+    overlay.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    overlay.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    overlay.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+    VkRenderingInfo overlay_pass = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+    overlay_pass.renderArea.extent = Extent;
+    overlay_pass.layerCount = 1;
+    overlay_pass.colorAttachmentCount = 1;
+    overlay_pass.pColorAttachments = &overlay;
+    vkCmdBeginRendering(frame.cmd, &overlay_pass);
+    // ImGui's backend sets its own viewport and scissor from the draw data's display size, which
+    // is the window's - so nothing here has to.
+    ImGui_ImplVulkan_RenderDrawData(draw_data, frame.cmd);
+    vkCmdEndRendering(frame.cmd);
+  }
+
+  // Whichever of the three wrote the swapchain image last is what this barrier comes from.
+  const bool ended_as_attachment = draw_data != nullptr || !OffscreenActive;
+  Barrier(frame.cmd, Images[image_index],
+          ended_as_attachment ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                              : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
           VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-          VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+          ended_as_attachment ? VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT
+                              : VK_PIPELINE_STAGE_2_BLIT_BIT,
+          ended_as_attachment ? VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
+                              : VK_ACCESS_2_TRANSFER_WRITE_BIT,
           VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, 0);
 
   vkEndCommandBuffer(frame.cmd);
 
   VkSemaphoreSubmitInfo wait = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
   wait.semaphore = frame.acquired;
-  wait.stageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+  // Both stages the swapchain image is first touched at: the attachment write when the world
+  // draws straight into it, and the blit when it does not. Naming only one of the two would let
+  // the other run before the image had been acquired.
+  wait.stageMask =
+      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT;
 
   VkSemaphoreSubmitInfo signal = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
   signal.semaphore = RenderFinished[image_index];
@@ -620,6 +895,8 @@ void ShutdownRenderer() {
     ImGui_ImplVulkan_Shutdown();
     ImGuiReady = false;
   }
+  DestroyOffscreen();
+  RenderExtent = {};
   DestroySwapchainObjects();
   if (Swapchain != VK_NULL_HANDLE) {
     vkDestroySwapchainKHR(GetDevice(), Swapchain, nullptr);
@@ -635,6 +912,26 @@ void ShutdownRenderer() {
 }
 
 const RendererStats &Stats() { return TheStats; }
+
+void SetOffscreen(bool enabled) {
+  // The env read is marked done as well, so a run-time write is not undone the first time
+  // something else asks what GKPLUS_VK_OFFSCREEN said.
+  OffscreenWantedRead = true;
+  OffscreenWanted = enabled;
+}
+
+bool Offscreen() { return OffscreenEnvEnabled(); }
+
+bool OffscreenRunning() { return OffscreenActive; }
+
+void SetPresentLinear(bool enabled) { PresentLinearFilter = enabled; }
+
+bool PresentLinear() { return PresentLinearFilter; }
+
+void RenderSize(uint32_t &width, uint32_t &height) {
+  width = RenderExtent.width;
+  height = RenderExtent.height;
+}
 
 const std::string &RendererError() { return Error; }
 
@@ -653,6 +950,12 @@ std::string FormatStats() {
   if (Ready) {
     add("swapchain: %ux%u, %u images, format %u, present mode %u\n", TheStats.width,
         TheStats.height, TheStats.image_count, TheStats.format, TheStats.present_mode);
+    // The two sizes and what closes the gap. They differ by design - the game rasterises into a
+    // 640x480 backbuffer and the window's client area is 628x468 - and the whole of §4.37 is
+    // that rasterising at the second resamples every 2D draw.
+    add("rendering at: %ux%u %s%s\n", RenderExtent.width, RenderExtent.height,
+        OffscreenActive ? "offscreen, scaled to the swapchain at present" : "direct",
+        OffscreenActive ? (PresentLinearFilter ? " (linear)" : " (nearest)") : "");
     add("presented: %llu   rebuilds: %llu   acquire failures: %llu\n",
         (unsigned long long)TheStats.frames_presented,
         (unsigned long long)TheStats.swapchain_rebuilds,

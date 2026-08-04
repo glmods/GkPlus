@@ -51,6 +51,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/CustomLevel.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/CustomMenu.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/D3D8Capture.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/D3D8CaptureReport.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Debug.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Encoding.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/entry.cpp"

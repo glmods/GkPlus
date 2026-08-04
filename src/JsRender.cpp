@@ -107,6 +107,64 @@ JSValue SetHalfPixelValue(JSContext *ctx, JSValueConst, JSValueConst value) {
   return JS_UNDEFINED;
 }
 
+// `render.offscreen` - rasterise the world at the game's backbuffer size and scale it onto the
+// swapchain, rather than drawing straight into the swapchain (VkRenderer.h, §4.37). Writable for
+// the same reason as `half_pixel`: it moves every pre-transformed pixel in the frame, so the only
+// comparison fine enough to judge it is two shots of one paused frame.
+JSValue GetOffscreen(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::Offscreen());
+}
+
+JSValue SetOffscreenValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetOffscreen(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+// `render.present_linear` - the filter for that final scale. False (nearest) is what the original
+// appears to do, deduced from the probe quad keeping exactly sixteen distinct values through a
+// 640->628 stretch; true is the A/B for that deduction.
+JSValue GetPresentLinear(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::PresentLinear());
+}
+
+JSValue SetPresentLinearValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetPresentLinear(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+// `render.draw_state` - set it to a draw index, let a frame pass, then read back what D3D held
+// at the moment that draw was issued, diffed against the shadow mirror (D3D8Capture.h). The
+// per-draw half of `render.verify_state()`, and the half that can see a divergence which only
+// exists mid-scene.
+JSValue GetDrawState(JSContext *ctx, JSValueConst) {
+  const std::string text = d3d8::DescribeWatchedDrawState();
+  return JS_NewStringLen(ctx, text.data(), text.size());
+}
+
+JSValue SetDrawStateValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  int64_t index = -1;
+  if (JS_ToInt64(ctx, &index, value) != 0) {
+    return JS_EXCEPTION;
+  }
+  d3d8::WatchDrawState(index);
+  return JS_UNDEFINED;
+}
+
+// `render.draw_geometry` - what the same watched draw actually pulled out of the arena, beside
+// what D3D holds in the game's own buffer for it (D3D8Capture.h). Set `render.draw_state` first;
+// this reads back the geometry half of the same snapshot.
+JSValue GetDrawGeometry(JSContext *ctx, JSValueConst) {
+  const std::string text = d3d8::DescribeWatchedDrawGeometry();
+  return JS_NewStringLen(ctx, text.data(), text.size());
+}
+
+// `render.verify_state()` - the immediate form: read the fixed-function state back off the device
+// and diff it against the mirror, now. Works in every renderer mode.
+JSValue VerifyState(JSContext *ctx, JSValueConst, int, JSValueConst *) {
+  const std::string text = d3d8::VerifyShadowState();
+  return JS_NewStringLen(ctx, text.data(), text.size());
+}
+
 // `render.draw_vertices` - set it to a draw index, let a frame pass, then read it back for the
 // geometry that draw was actually handed. See WatchDrawVertices in VkDraw.h.
 JSValue GetDrawVertices(JSContext *ctx, JSValueConst) {
@@ -251,6 +309,91 @@ JSValue SetDrawHideValue(JSContext *ctx, JSValueConst, JSValueConst value) {
   }
   vulkan::SetDrawHide(first, last);
   return JS_UNDEFINED;
+}
+
+// `render.ref_range` / `render.ref_hide` - the same pair pointed at the runtime the capture
+// layer forwards to, so the ORIGINAL can be bisected. See SetRefRange in D3D8Capture.h; the
+// whole value is that these work in `d3d8` mode, where the Vulkan draw list does not exist.
+JSValue MakePair(JSContext *ctx, uint32_t first, uint32_t last) {
+  JSValue array = JS_NewArray(ctx);
+  if (JS_IsException(array)) {
+    return array;
+  }
+  if (JS_SetPropertyUint32(ctx, array, 0, JS_NewInt64(ctx, first)) < 0 ||
+      JS_SetPropertyUint32(ctx, array, 1, JS_NewInt64(ctx, last)) < 0) {
+    JS_FreeValue(ctx, array);
+    return JS_EXCEPTION;
+  }
+  return array;
+}
+
+// Reads [first, last] out of `value`, or reports that it is not a pair. `null` is the caller's
+// to interpret, because "all of them" and "none of them" are different defaults.
+bool ReadPair(JSContext *ctx, JSValueConst value, uint32_t &first, uint32_t &last) {
+  JSValue a = JS_GetPropertyUint32(ctx, value, 0);
+  JSValue b = JS_GetPropertyUint32(ctx, value, 1);
+  const bool ok = JS_ToUint32(ctx, &first, a) == 0 && JS_ToUint32(ctx, &last, b) == 0;
+  JS_FreeValue(ctx, a);
+  JS_FreeValue(ctx, b);
+  return ok;
+}
+
+JSValue GetRefRange(JSContext *ctx, JSValueConst) {
+  uint32_t first = 0;
+  uint32_t last = 0;
+  d3d8::GetRefRange(first, last);
+  return MakePair(ctx, first, last);
+}
+
+JSValue SetRefRangeValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  if (JS_IsNull(value) || JS_IsUndefined(value)) {
+    d3d8::SetRefRange(0, UINT32_MAX);
+    return JS_UNDEFINED;
+  }
+  uint32_t first = 0;
+  uint32_t last = 0;
+  if (!ReadPair(ctx, value, first, last)) {
+    return JS_ThrowTypeError(ctx, "ref_range takes [first, last] or null");
+  }
+  d3d8::SetRefRange(first, last);
+  return JS_UNDEFINED;
+}
+
+JSValue GetRefHide(JSContext *ctx, JSValueConst) {
+  uint32_t first = 0;
+  uint32_t last = 0;
+  d3d8::GetRefHide(first, last);
+  return MakePair(ctx, first, last);
+}
+
+JSValue SetRefHideValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  if (JS_IsNull(value) || JS_IsUndefined(value)) {
+    d3d8::SetRefHide(1, 0); // a window no index can fall in
+    return JS_UNDEFINED;
+  }
+  uint32_t first = 0;
+  uint32_t last = 0;
+  if (!ReadPair(ctx, value, first, last)) {
+    return JS_ThrowTypeError(ctx, "ref_hide takes [first, last] or null");
+  }
+  d3d8::SetRefHide(first, last);
+  return JS_UNDEFINED;
+}
+
+// `render.frame_draws()` or `render.frame_draws(first, last)` - the capture layer's own list of
+// the last complete frame's draws. Mirror-side, so it works in `d3d8` mode where there is no
+// Vulkan draw list; see FormatFrameDraws in D3D8Capture.h.
+JSValue FrameDraws(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+  uint32_t first = 0;
+  uint32_t last = UINT32_MAX;
+  if (argc >= 1 && JS_ToUint32(ctx, &first, argv[0]) != 0) {
+    return JS_EXCEPTION;
+  }
+  if (argc >= 2 && JS_ToUint32(ctx, &last, argv[1]) != 0) {
+    return JS_EXCEPTION;
+  }
+  const std::string text = d3d8::FormatFrameDraws(first, last);
+  return JS_NewStringLen(ctx, text.data(), text.size());
 }
 
 JSValue DrawInfo(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
@@ -626,13 +769,21 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("topologies", GetTopologies, SetTopologies),
     JS_CGETSET_DEF("lighting", GetLighting, SetLighting),
     JS_CGETSET_DEF("half_pixel", GetHalfPixel, SetHalfPixelValue),
+    JS_CGETSET_DEF("offscreen", GetOffscreen, SetOffscreenValue),
+    JS_CGETSET_DEF("present_linear", GetPresentLinear, SetPresentLinearValue),
     JS_CGETSET_DEF("shade_mode", GetShadeMode, SetShadeModeValue),
     JS_CGETSET_DEF("force_lod", GetForceLod, SetForceLodValue),
     JS_CFUNC_DEF("probe", 5, ProbeQuad),
     JS_CGETSET_DEF("draw_range", GetDrawRange, SetDrawRangeValue),
     JS_CGETSET_DEF("draw_hide", GetDrawHide, SetDrawHideValue),
+    JS_CGETSET_DEF("ref_range", GetRefRange, SetRefRangeValue),
+    JS_CGETSET_DEF("ref_hide", GetRefHide, SetRefHideValue),
     JS_CFUNC_DEF("draw_info", 1, DrawInfo),
+    JS_CFUNC_DEF("frame_draws", 2, FrameDraws),
     JS_CGETSET_DEF("draw_vertices", GetDrawVertices, SetDrawVerticesValue),
+    JS_CGETSET_DEF("draw_state", GetDrawState, SetDrawStateValue),
+    JS_CGETSET_DEF("draw_geometry", GetDrawGeometry, nullptr),
+    JS_CFUNC_DEF("verify_state", 0, VerifyState),
     JS_CGETSET_DEF("vulkan", GetVulkan, nullptr),
     JS_CGETSET_DEF("vulkan_report", GetVulkanReport, nullptr),
     JS_CGETSET_DEF("validation", GetValidationMessages, nullptr),

@@ -1541,6 +1541,70 @@ bool VerifyImageLevel(const TextureImage &image, uint32_t level, const void *dat
 // indices by offset into one big arena, so a slot that took the wrong data does not fail - it
 // draws somebody else's geometry, or, through a corrupt index, a triangle stretched across the
 // screen.
+// Copies `bytes` out of one arena at an ABSOLUTE offset. The unit both VerifySlot and ReadArena
+// are built on, and the reason it takes an offset rather than a slot: a draw addresses the arena
+// by absolute offset, so "what does this draw actually read" is a question about the arena and
+// not about any particular slot - which is exactly the question VerifySlot cannot answer.
+bool CopyOutOfArena(bool vertex, uint64_t offset, uint32_t bytes, void *out) {
+  if (!Ready || out == nullptr || bytes == 0) {
+    return false;
+  }
+  const Arena &arena = vertex ? VertexArena : IndexArena;
+  if (arena.buffer == VK_NULL_HANDLE || offset + bytes > arena.capacity) {
+    return false;
+  }
+
+  VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  info.size = bytes;
+  info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  VmaAllocationCreateInfo alloc = {};
+  alloc.usage = VMA_MEMORY_USAGE_AUTO;
+  alloc.flags =
+      VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+  VkBuffer readback = VK_NULL_HANDLE;
+  VmaAllocation readback_alloc = VK_NULL_HANDLE;
+  VmaAllocationInfo readback_info = {};
+  if (vmaCreateBuffer(Allocator, &info, &alloc, &readback, &readback_alloc, &readback_info) !=
+          VK_SUCCESS ||
+      readback_info.pMappedData == nullptr) {
+    return false;
+  }
+
+  bool ok = false;
+  VkCommandBufferAllocateInfo cmd_alloc = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cmd_alloc.commandPool = UploadPool;
+  cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cmd_alloc.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  if (vkAllocateCommandBuffers(GetDevice(), &cmd_alloc, &cmd) == VK_SUCCESS) {
+    VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &begin);
+    VkBufferCopy region = {offset, 0, bytes};
+    vkCmdCopyBuffer(cmd, arena.buffer, readback, 1, &region);
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    vkResetFences(GetDevice(), 1, &UploadFence);
+    if (vkQueueSubmit(GetGraphicsQueue(), 1, &submit, UploadFence) == VK_SUCCESS) {
+      vkWaitForFences(GetDevice(), 1, &UploadFence, VK_TRUE, UINT64_MAX);
+      std::memcpy(out, readback_info.pMappedData, bytes);
+      ok = true;
+    }
+    vkFreeCommandBuffers(GetDevice(), UploadPool, 1, &cmd);
+  }
+  vmaDestroyBuffer(Allocator, readback, readback_alloc);
+  return ok;
+}
+
+bool ReadArena(bool vertex, uint64_t offset, uint32_t bytes, void *out) {
+  FlushUploads();
+  return CopyOutOfArena(vertex, offset, bytes, out);
+}
+
 bool VerifySlot(const BufferSlot &slot, const void *expected, uint32_t bytes,
                 uint64_t *differing_bytes, uint64_t *first_difference, uint8_t *got_prefix) {
   if (!Ready || !slot.valid || expected == nullptr || bytes == 0 || bytes > slot.bytes) {

@@ -696,6 +696,8 @@ bool ResizeDraw(uint32_t width, uint32_t height) {
   return Ready ? CreateDepth(width, height) : false;
 }
 
+uint32_t PendingDrawIndex() { return static_cast<uint32_t>(Items.size()); }
+
 void SubmitDraw(const DrawItem &item) {
   if (Items.size() >= kMaxDrawsPerFrame) {
     ++TheStats.dropped_over_capacity;
@@ -923,7 +925,11 @@ std::string DescribeDraw(uint32_t index) {
       "  vertices from %s, indices from %s, index stride %u\n"
       "  blend %u (src %u dst %u)  depth test %u write %u func %u  cull %u  colour write 0x%x\n"
       "  stencil %u (func %u fail %u zfail %u pass %u  ref %u mask 0x%x write 0x%x)\n"
-      "  alpha test func %u ref %u   shade %u   material %u\n"
+      // The viewport depth slice belongs here with the rest of the state that decides whether a
+      // draw is visible: it is per draw, the game uses six of them and never the default (§4.32),
+      // and a draw in the wrong slice is drawn in front of things it should be behind - which
+      // looks like a depth-test defect and is not one.
+      "  alpha test func %u ref %u   shade %u   material %u   depth slice %.4f..%.4f\n"
       "  %u stage(s):  0: tex %d sampler %u colour 0x%08x alpha 0x%08x\n"
       "                1: tex %d sampler %u colour 0x%08x alpha 0x%08x\n",
       index, static_cast<unsigned>(LastItems.size()), p.topology,
@@ -933,7 +939,8 @@ std::string DescribeDraw(uint32_t index) {
       p.blend_enable, p.src_blend, p.dest_blend, p.depth_test, p.depth_write, p.depth_func,
       p.cull_mode, p.colour_write, p.stencil_enable, p.stencil_func, p.stencil_fail,
       p.stencil_zfail, p.stencil_pass, d.stencil_ref, d.stencil_mask, d.stencil_write_mask,
-      d.flags & 0x0fu, (d.flags >> 8) & 0xffu, d.shade_mode, d.material, d.stage_count,
+      d.flags & 0x0fu, (d.flags >> 8) & 0xffu, d.shade_mode, d.material, d.min_depth,
+      d.max_depth, d.stage_count,
       d.stages[0].texture_index == kNoTexture ? -1 : (int)d.stages[0].texture_index,
       d.stages[0].sampler_index, d.stages[0].color, d.stages[0].alpha,
       d.stages[1].texture_index == kNoTexture ? -1 : (int)d.stages[1].texture_index,

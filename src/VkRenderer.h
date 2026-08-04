@@ -69,6 +69,29 @@ struct RendererStats {
 };
 
 const RendererStats &Stats();
+
+// Whether the world is rasterised into an offscreen target at the GAME's backbuffer size and
+// scaled onto the swapchain afterwards, rather than straight into the swapchain (§4.37).
+//
+// On by default, and off is the pre-§4.37 behaviour exactly, which is what makes it A/B-able on
+// one paused frame the way `render.half_pixel` is - and it is worth A/B-ing, because it moves
+// every pre-transformed pixel in the frame. `GKPLUS_VK_OFFSCREEN=0` sets the same thing at
+// launch. `OffscreenRunning` is the separate question of whether it is actually up: it needs a
+// swapchain that takes TRANSFER_DST and a backbuffer size from the game.
+void SetOffscreen(bool enabled);
+bool Offscreen();
+bool OffscreenRunning();
+
+// The filter for the final scale. NEAREST by default, and that is a measurement rather than a
+// default: the original's own windowed stretch preserves a 4-bit texture's sixteen distinct
+// values (§4.37), which a filtered downscale could not - so D3D drops columns rather than mixing
+// them. `render.present_linear` is the A/B for that deduction.
+void SetPresentLinear(bool enabled);
+bool PresentLinear();
+
+// What the world pass rasterises at, which is the game's backbuffer size when the offscreen
+// target is up and the swapchain extent when it is not.
+void RenderSize(uint32_t &width, uint32_t &height);
 // Named apart from vulkan::LastError() in VkContext.h on purpose: that one is why the
 // DEVICE failed to come up, this one is why presentation did. Same namespace, and the
 // two failures have different fixes.

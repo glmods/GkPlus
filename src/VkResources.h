@@ -347,6 +347,14 @@ bool VerifySlot(const BufferSlot &slot, const void *expected, uint32_t bytes,
                 uint64_t *differing_bytes = nullptr, uint64_t *first_difference = nullptr,
                 uint8_t *got_prefix = nullptr);
 
+// Copies `bytes` out of the vertex or index arena at an ABSOLUTE offset.
+//
+// Deliberately not expressed in terms of a slot, because the question it exists to answer is not
+// about one: a draw addresses the arena by absolute offset, and `VerifySlot` proves a slot holds
+// the right bytes without proving any draw *reads* that slot. This is what lets a caller ask
+// "what did draw N actually pull", which is the gap §4.16 named and nothing here could answer.
+bool ReadArena(bool vertex, uint64_t offset, uint32_t bytes, void *out);
+
 
 // Whether a D3DFORMAT has an image mapping at all, and how it is addressed. `block` is texels
 // per block edge (1 for uncompressed, 4 for DXT) and `block_bytes` is what D3D stores per

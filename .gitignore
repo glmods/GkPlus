@@ -15,3 +15,5 @@ vcpkg/
 /blender/.venv/
 /blender/dist/
 CMakeUserPresets.json
+# find-draw.ps1 writes its bisect screenshots beside itself
+/utils/rendertest/_probe*.png

@@ -3121,6 +3121,511 @@ buffer sized to match, the ImGui pass attached to the right one, and a final bli
 next piece of work rather than a patch. It is worth it: it is the difference between every 2D
 pixel in the game being resampled and none of them being.
 
+## 4.38 The offscreen target: 2.593 → 0.13, and 93% of the frame is bit-identical
+
+§4.37's fix, implemented. The world is rasterised into a colour target at the **game's** backbuffer
+size and blitted onto the swapchain at the end, which is the order the original does it in.
+
+### The numbers
+
+Level02, settled, paused, three launches. **The cross-launch floor is measured in the same
+session rather than assumed** - two d3d8 runs of the same procedure - because everything below is
+close enough to it to need one:
+
+| | whole frame | pixels differing |
+|---|---:|---:|
+| d3d8 vs d3d8, two launches (**the floor**) | **0.034** | 1.45% |
+| d3d8 vs d3d9, the second opinion | 0.051 | — |
+| d3d8 vs vulkan, before | 2.593 | 67.5% |
+| d3d8 vs vulkan, after | **0.107 - 0.192** | 6.1 - 6.8% |
+| d3d9 vs vulkan, after | 0.122 | — |
+
+The three-way still holds and now says something it could not before: d3d8-vs-d3d9 at 0.051 is
+the same order as the d3d8-vs-d3d8 floor, so the two references agree to within launch noise, and
+vulkan sits the same distance from both.
+
+And on one paused frame, toggling `render.offscreen`, which is the comparison with no launch
+noise in it at all:
+
+| | |
+|---|---:|
+| the feature, on against off | **2.547** over 65.0% of the frame |
+| off, against d3d8 | **2.593** - §4.37's headline number, reproduced on a fresh launch |
+| on → off → on | **0.000**, bit-identical, so the run-time rebuild is exact |
+
+**The probe quad is now bit-exact.** Same `render.probe("junk", 1.0)` §4.36 measured at 4.00 MAD
+and 31.6% bit-exact on the A4R4G4B4 decal:
+
+| | d3d8 | vulkan |
+|---|---:|---:|
+| distinct R values in the crop | 61 | 61 |
+| multiples of 17 | 46.2% | 46.2% |
+| **MAD** | **0.0000, 100.0% bit-exact** ||
+
+So the CPU expansion was never wrong, exactly as §4.37 concluded, and the two "route not taken"
+items §4.36 proposed - matching D3D's own expansion arithmetic, or mapping A4R4G4B4 natively
+behind a feature check - are **not correctness work any more**. Native mapping is still worth
+having for the memory (§4.13), and nothing else.
+
+**The HUD panel is 0.000 against the original**, from 1.260 - the open item §4.28 left. The
+objectives text reads 0.198 against a same-region cross-launch floor of 0.167, which is not a
+difference.
+
+### What is left, and most of it is not ours
+
+93% of the frame is bit-identical. Of the 6.8% that is not, **93% of the pixels that differ
+between d3d8 and vulkan also differ between two d3d8 launches**, in the same bounding box: the
+two character models, which idle-animate, so the two shots are of slightly different world state.
+At 8x amplification the whole difference image is black apart from a thin outline on each
+character, a faint gradient on the rock in the upper right, and one small bright spot.
+
+That mask overlap is the reading to take, not the MAD: it says the loud part of the residual is
+the *game*, and no amount of renderer work moves it.
+
+### How it is built
+
+- **The render extent comes from `D3DPRESENT_PARAMETERS8::BackBufferWidth/Height`**, recorded at
+  `CreateDevice` and at `Reset` (`d3d8::BackBufferExtent`). Not from the D3D *viewport*, although
+  that is what `BuildMvp` maps against and although the two are equal here: the swapchain shows
+  the whole backbuffer, so the backbuffer is what the blit's source rectangle has to be. Zero is a
+  legitimate value - windowed D3D8 reads it as "match the client area" - and then there is nothing
+  to correct for and the swapchain extent is used directly.
+- **`render.state` now reports the backbuffer and every distinct viewport rectangle.** One
+  rectangle covering the whole backbuffer is what makes "one viewport for the world pass" correct;
+  level02 reads exactly that, `0,0 640x480`. A sub-viewport would have to move onto the `DrawItem`
+  beside `min_depth`/`max_depth`, and this is what would say so - it prints a marker rather than
+  leaving it to be noticed in a screenshot, because a wrongly-scaled sub-viewport looks exactly
+  like the defect §4.37 just fixed.
+- **The blit filter is NEAREST, and that is a deduction rather than a default.** The original's
+  own 640→628 stretch preserves a 4-bit texture's sixteen distinct values (§4.37) - a filtered
+  downscale could not, because a blend of two 4-bit levels is not on that ladder - so D3D drops
+  columns rather than mixing them. `render.present_linear` is the A/B for it, kept because the
+  deduction rests on one measurement.
+- **ImGui moved into its own pass on the swapchain image**, loading rather than clearing, after
+  the blit. It is drawn for a human and not to match d3d9, so it is the one thing that should not
+  go through the scale - and it stays 1:1 with the window. Its pipeline therefore declares colour
+  only; it used to have to name the world's depth and stencil formats because it shared that pass.
+- **`TRANSFER_DST` on the swapchain is asked for, not assumed.** A swapchain created with a usage
+  bit the surface does not support fails outright, and there is a working path without it, so
+  `CreateSwapchain` checks `supportedUsageFlags` and the whole thing degrades to drawing straight
+  into the swapchain - pre-§4.37 behaviour - with a line in the log.
+- **The reconcile runs every frame and waits for idle only when something moved.** A `Reset` can
+  change the backbuffer size without the swapchain going out of date, and the toggle can move
+  under a paused frame; the on→off→on being bit-identical is what says the rebuild is clean.
+
+### One thing that would have caught it earlier
+
+`render.state` printed the viewport as `640x480` for thirty sections, and `render.vulkan_report`
+printed the swapchain as `628x468`, and nothing printed them **next to each other**. The report
+does now, on one line, with what closes the gap: `rendering at: 640x480 offscreen, scaled to the
+swapchain at present (nearest)`. Two numbers that must agree, in two different reports, agree by
+nobody's decision.
+
+## 4.39 Two defects from a play report: the clear colour, and a quad that was not the defect
+
+Reported as "translucent things render differently with the DLL present, in every renderer mode".
+Two real defects came out of it - the clear colour and a state-block bug, both fixed - plus a
+third thing that looked like a defect for most of a session and **was not one**. §4.40 is how
+that was settled; the short version is that the quad is a backdrop the fire effect is supposed to
+paint over, so it is §4.32's effect-layer gap seen from underneath. **Read this section for the
+two fixes and for the eliminations; do not read the quad as an open defect.**
+
+### The clear colour, and why it is a translucency defect
+
+`CaptureDevice::Clear` intercepted the call and **recorded none of its arguments**, and
+`VkRenderer` cleared its colour attachment to a hardcoded `0.10, 0.16, 0.28` - a debug blue-grey
+left over from the phase where the Vulkan path only cleared the screen. The game clears to
+**`0xff000000`, z 1.0, stencil 0**, measured: 3669 calls on a level02 session, **0 of them with a
+rectangle list**, so a load op expresses all of it.
+
+It is easy to file this as "the background is the wrong colour", and that is the small half. The
+large half is that an alpha-blended or additive draw over an uncovered background **blends against
+it** - so a translucent beam against a black sky comes out lighter and hazier over a blue-grey
+one, which is exactly what a player reads as "this renderer gets translucency wrong". The game's
+values are used for the depth and stencil clears too, for the same reason: neither is a free
+choice, and the stencil one is what the shadow-volume algorithm counts up from.
+
+Visible only where the world does not cover the frame, which is why thirty sections of settled,
+world-filling level02 frames never showed it. `render.state` prints the recorded values now.
+
+### The plate quad: reproduced and isolated — and it WAS the defect (see §4.42)
+
+Level02, the two fires on the ledge north of the start. Camera pinned at
+`roll 45, distance 45, pitch -30, position (-9.9, -4, 2.48)`.
+
+**Vulkan draws an opaque lattice rectangle over the right-hand flame. d3d8 and d3d9 do not.**
+Hiding that one draw restores the flame exactly, so it is a spurious draw and not the fire's own
+quad with the wrong texture:
+
+```
+draw 222 of 348   topology 4  indexed  count 36  base_vertex 4407  first_index 298648
+  vertices from arena, indices from arena
+  blend 0 (src 5 dst 2)   depth test 1 write 1 func 4   cull 3   colour write 0xf
+  alpha test func 0 ref 0   depth slice 0.1000..1.0000
+  stage 0: tex 50 = units\plates 2 1024.rim
+```
+
+Eliminated, each by one measurement against the **real D3D8**:
+
+| hypothesis | test | result |
+|---|---|---|
+| the original culls it | `GKPLUS_NO_CULL=1` | still absent |
+| the original's alpha test discards it | `GKPLUS_NO_ATEST=1` (new) | still absent |
+| we put it in the wrong viewport depth slice | `render.draw_info` | `0.1..1.0`, the world slice, same as its neighbour |
+| its vertices come from a seeded buffer | `GKPLUS_VK_SKIP=s` | still drawn |
+
+**`units\plates 2 1024.rim` is the same texture as §4.29's two bright HUD columns** - the ones
+that section concluded "belong in the game: this renderer draws them and d3d8to9 does not". Same
+asset, same "we rasterise pixels the reference does not", and §4.40 resolves both the same way:
+neither is spurious geometry. They are *uncovered background* - surfaces the original paints over
+and this renderer does not.
+
+**Its geometry is sane.** `render.draw_range = [222, 222]` paints one clean, correctly UV-mapped
+plate quad, slightly tilted - not garbage, not a degenerate fan. So the vertices, the indices and
+the texture coordinates are all fine, and what is wrong is either where the transform puts it or
+what state it is drawn with.
+
+### A real state-block bug, found on the way, that is not the whole cause
+
+`Record()` did `ApplyOp(op)` **and** appended to the block being recorded, with a comment
+asserting that "the state a block sets is genuinely set on the device at record time too". That
+is the opposite of what D3D does: between `BeginStateBlock` and `EndStateBlock` a state-setting
+call is captured into the block and **does not change the device**. So from the moment the game
+recorded a block, the shadow held the block's values and the device held the old ones, until
+something set that state explicitly again - and every draw issued in that window was described
+with the wrong state.
+
+Fixed (record *or* apply, never both). It is worth 2.481 → 2.257 whole-frame at the fire camera
+and it visibly changes draw 222 - the quad blends now where it was flatly opaque - but **it does
+not remove it**. Two lessons: a comment asserting an API behaves opposite to its documentation is
+worth checking rather than trusting, and a fix that moves the number is not thereby the fix for
+the thing you were chasing.
+
+What had not been read at this point was **where those 36 indices actually put the quad**. §4.40
+reads it, and the answer moves the whole thing somewhere else.
+
+## 4.40 Making the draw verifiable — and drawing the wrong conclusion from it (see §4.42)
+
+> The instruments in this section are sound and are still the right ones to reach for. Its
+> **conclusion** is not: "draws 223 and 224 sit in front of 222 and in the original they cover it"
+> was never measured — those two are the HUD portraits in the top-right corner. And its central
+> reading, "0 of 12 vertices differ", compares two values both read back a frame or more *after*
+> the draw, which cannot see the defect §4.42 found. Read it for the method, not the verdict.
+
+The mirror is the whole basis of this renderer - every draw is described by what the shadow says
+was set - and until now **nothing checked it against D3D**. §4.39's state-block bug is what made
+that intolerable: the two diverged silently for a whole scene and no counter could see it, because
+every counter is computed *from* the mirror.
+
+`render.verify_state()` reads the fixed-function state back off the device and diffs it against
+the shadow; `render.draw_state = <index>` does the same **at the moment one draw is issued**, which
+is the form that can see a divergence existing only mid-scene. Same instrument as
+`verify_textures` and `verify_buffers`, pointed at state instead of at bytes, and the same
+set-and-read-back shape as `render.draw_vertices`.
+
+**It is self-testing, and that was checked before any result was believed.** `GKPLUS_NO_CULL=1`
+makes the forwarded state differ from the mirror on purpose, so it is a divergence with a known
+answer:
+
+```
+188/189 states match the device
+NOTE: a GKPLUS_NO_* switch is set, so the device is MEANT to differ from the mirror
+  CULLMODE                   mirror 0x00000003  device 0x00000001
+```
+
+Exactly the injected difference and nothing else. A verifier that cannot fail proves nothing;
+this one fails where it should.
+
+Compared: every render state and texture-stage state the game has ever set, the bound texture at
+each of the eight stages (unwrapped - the mirror holds our wrapper and the device holds the inner
+object, and a raw pointer compare would report every textured stage as a mismatch), the FVF, the
+world/view/projection transforms, the viewport, the material, the lights, **and the stream
+bindings** - stream 0 with its stride, the index buffer and `BaseVertexIndex`. Those last three
+are state exactly as much as a render state is, and they are the only part of a draw the mirror
+can get wrong *without* getting a single `D3DRS_` wrong.
+
+Two limits, both honest rather than incidental: it compares against `inner_`, which is d3d8to9
+under `vulkan` and Windows' own D3D8 under `d3d8` - "does the mirror match the device we forward
+to", which is the mirror's contract - and the per-draw form indexes the Vulkan draw list, so it
+needs `vulkan` mode. The immediate form works anywhere.
+
+### The result, which is a clean negative
+
+```
+draw 222, device state at the moment it was issued:
+193/193 states match the device
+```
+
+Also 193/193 at draws 221 and 223, and 191/191 at frame end. **The mirror is exact.** So the plate
+quad is drawn with precisely the state D3D has - and D3D, given that state, rasterises nothing
+there. That eliminates the entire "our state is wrong" family in one reading, including the blend
+factors, the texture binding and the transform, none of which the §4.39 switches could have
+isolated individually.
+
+That left the geometry, so the second instrument got built.
+
+### `render.draw_geometry`: what a buffered draw actually pulled
+
+`verify_buffers` proves a slot holds what its buffer holds; `draw_info` prints the offsets a draw
+was given. Neither says the draw addressed the right place - and **the arena is one buffer every
+slot shares**, so addressing it wrongly yields *other geometry* rather than garbage, which looks
+like a draw in the wrong position and nothing like a bug. That is §4.16's lesson and the gap it
+left open.
+
+`vulkan::ReadArena` copies from an arena at an absolute offset, which is how a draw addresses it -
+deliberately not expressed in terms of a slot, because the question is not about one; `VerifySlot`
+is refactored onto the same primitive. `render.draw_geometry` reports, for the draw
+`render.draw_state` is watching, the indices and vertices the shader reads out of the arena beside
+the ones D3D holds in the game's own buffer. The buffers are snapshotted when the draw is issued
+rather than looked up later - `stream0_` is whatever is bound *now* - and the readback is
+deferred, because it submits and waits and doing that mid-scene would stall the frame being
+measured.
+
+### The answer, and it is not a defect in that draw at all
+
+```
+draw 222: indexed, 36 indices, base_vertex 4407 first_index 298648, D3D bias 0
+  stage 0: game bound "units\plates 2 1024.rim" -> samples image 50 "units\plates 2 1024.rim"
+  idx  arena (what the shader reads)        D3D buffer (what the game holds)
+  0      185.728  273.300  0.987  0.01912 84ff6519    185.728  273.300  0.987  0.01912 84ff6519
+  4      179.717  262.687  0.987  0.01918 7bff6519    179.717  262.687  0.987  0.01918 7bff6519
+  0 of the 12 vertices shown differ
+```
+
+Three things at once. The arena matches D3D **vertex for vertex including colour**, so the upload
+path and the offsets are exonerated. The bound texture and the sampled image are the same asset,
+so the second mapping - object to bindless index, which `verify_state` does *not* cover and which
+nothing had ever checked - is right too. And the vertices are **screen-space with `rhw`**: six
+concentric quads, orange, alpha falling 0x84 → 0x7b, at 172..262 x 257..350.
+
+So nothing about draw 222 is wrong. What is wrong is what should be **on top of it**: draws 223
+and 224 sit in the `0.0299..0.0399` effect slice, in front of 222's `0.1..1.0` world slice, and in
+the original they cover it. This renderer draws them dimmer and smaller, so the backdrop shows
+through.
+
+**That is §4.32's open item seen from underneath**, and it collapses two entries of the plan into
+one: the plate quad and §4.29's two bright HUD columns are both *uncovered background*, not
+spurious geometry. §4.29 spent a section eliminating mip selection, culling, the depth test and an
+out-of-range draw call on the columns and found nothing, because it was looking at the wrong draw
+- the defect is in whatever was supposed to paint over them.
+
+### Two process notes
+
+- **The reported symptom named the wrong layer, and so did the diagnosis.** "In every renderer
+  mode" was wrong - measured, the fire is correct in `d3d8` and `d3d9` and wrong only in `vulkan`
+  - but the clear-colour half of the report was real, so reproduce before believing the scope in a
+  report *and* before disbelieving it. Then the diagnosis named the wrong layer twice more: "a
+  spurious quad we draw and the original does not" survived four eliminations and was false both
+  ways round. The original does draw it, and it is not spurious.
+- **"The original draws nothing there" was an inference from a black background**, and a black
+  quad on black is indistinguishable from no quad. That inference is what sent four measurements
+  at the wrong question. When the evidence for a draw's absence is that a *region* is empty, say
+  so out loud - it is a much weaker claim than it reads as.
+- **A clean negative from a good instrument is worth more than it feels like.** Three readings in
+  a row said "this is not it" - 193/193 on state, 0 of 12 on geometry, matching texture names -
+  and each felt like no progress. Together they left exactly one place for the defect to be, which
+  is how it got found.
+- **`GKPLUS_NO_ATEST=1` joins `NO_CULL` and `NO_ZTEST`** as the third "why did this draw vanish"
+  switch. A draw whose fragments are all discarded is indistinguishable from a draw that was never
+  issued until you switch the test off in the *reference* and watch it appear.
+
+## 4.41 Where this session got to
+
+Four commits, in order: the offscreen render target; the clear colour and the state-block
+recording bug; the state verifier; the arena readback and the texture-mapping check. Then
+`GKPLUS_NO_BLEND`.
+
+**Landed and measured:**
+
+- **The 2.59 residual is gone** (§4.38). Whole frame against the real D3D8 is **0.13** on a
+  settled, paused level02 frame, against a cross-launch d3d8-vs-d3d8 floor of **0.034**, with
+  **93% bit-identical**, the HUD panel at 0.000 and the A4R4G4B4 probe quad at 0.0000/100%.
+- **Two defects from a play report** (§4.39): the clear colour, which was a hardcoded debug
+  blue-grey and is what every blended draw over an uncovered background blends *against*; and
+  `Record()` applying state-block writes to the mirror while a block was being recorded, which D3D
+  does not do.
+- **Three instruments**, each self-tested before its results were believed: `render.verify_state`
+  / `render.draw_state` (§4.40), `render.draw_geometry` (§4.40), and `GKPLUS_NO_ATEST` /
+  `GKPLUS_NO_BLEND` beside the two switches §4.29 already had.
+
+**Open, and it is one item rather than three:** the effect layers (§4.32). The plate quad and
+§4.29's HUD columns are both *uncovered background*, not geometry this renderer invents — the
+plan's item 1 has the repro, what is already verified and must not be re-investigated, and the
+next measurement.
+
+> **That last paragraph is wrong, and §4.42 is what it turned out to be.** Nothing was supposed
+> to cover the quad: the draw was issued for a HUD panel and rendered the fire's glow quad,
+> because the arena slot it reads was overwritten later in the same frame. "What is already
+> verified and must not be re-investigated" was the costly part — every one of those readings was
+> taken a frame or more after the draw, and each was true of a version the draw never saw.
+
+**The methodological residue, which is the part worth re-reading:** every instrument built this
+session returned a **clean negative**, and each felt like no progress at the time. 193/193 on
+state, 0 of 12 on geometry, matching texture names, four switches that changed nothing on the
+reference. Together they left exactly one place for the defect to be, and that is how it was
+found — after a wrong diagnosis ("a spurious quad we draw and the original does not") survived
+four eliminations while being false in both directions. The inference that started it was that a
+*region* was empty, which is a much weaker claim than "the original draws nothing there" and does
+not survive the background being black.
+
+## 4.42 The plate quad, found: a slot frozen one rewrite too early
+
+The quad §4.39 and §4.40 chased is a **buffer-versioning defect**, and both of those sections'
+conclusions about it were wrong. It is not uncovered background, nothing was supposed to cover it,
+and the draw was never issued for that geometry at all: **draw 222 is a HUD panel, and it rendered
+the fire's screen-space glow quad** because the arena slot it reads had been overwritten later in
+the same frame.
+
+### The mechanism
+
+Gunlok refills one shared 64 KB dynamic vertex buffer (fvf `0x1c4`) about **five times a frame** -
+8,639 unlocks over 1,603 frames - and draws the HUD panels, the objectives text and the effect
+layers' screen-space quads out of it. §4.23 already established that a slot holds one version and
+the later ones are parked in the frame's scratch. The test for "park this one" was:
+
+```cpp
+const bool rewritten_after_draw = drawn_frame_ == TheStats.frames && draws_this_frame_ != 0;
+```
+
+`draws_this_frame_` counts draws **since the last rewrite**, not since the frame began - it is
+zeroed each time a rewrite is versioned, so that `draws_reading_rewritten_buffers` attributes each
+rewrite to the draws it endangered. That makes it exactly the wrong thing to gate the freeze on.
+Two rewrites in a row with no draw between them, which is the common case in a five-refill frame:
+
+```
+unlock A  -> the slot            (no draw yet this frame)
+draw 222  -> reads the slot      draws_this_frame_ = 1
+unlock B  -> the scratch         versioned, draws_this_frame_ := 0
+unlock C  -> the SLOT            draws_this_frame_ == 0, so not versioned  <== over draw 222's data
+```
+
+The draw list is not recorded until Present, so draw 222 renders whatever unlock C left there. The
+fix is one clause: once **any** draw this frame has read the slot, the slot belongs to it for the
+rest of the frame - `drawn_frame_ == TheStats.frames` alone.
+
+`unversioned_rewrites` stayed 0 throughout, and correctly: unlock C was never *classified* as a
+rewrite-after-draw, so it never reached the counter that would have said it could not be versioned.
+
+### Why every instrument said the draw was fine
+
+`verify_state` reported 193/193, `draw_geometry` reported 0 of 12 vertices differing, the bound
+texture and the sampled image matched, `seen == submitted`, and `GKPLUS_NO_CULL`, `NO_ATEST`,
+`NO_ZTEST` and `NO_BLEND` each changed nothing on the reference. All true, and all beside the point.
+
+**Both of `draw_geometry`'s columns were read back a frame or more later**, and by then the game
+had refilled the buffer - so the arena and the game's buffer agreed *with each other* on a version
+neither of them held when the draw was issued. A deferred read cannot tell "the draw pulled the
+wrong bytes" from "the bytes moved on afterwards", which is the entire question. Two columns were
+added, both read **at the moment the draw is issued**: the game's buffer under a mid-frame
+read-only lock, and the arena under a synchronous `ReadArena`. The first said 12 of 12 STALE, the
+second said the arena was *correct* at that instant - which located the defect between the draw and
+Present rather than in the upload.
+
+That is a general lesson about this project's readback instruments, and it now has a name: **a
+deferred readback proves consistency, not correctness.** `verify_buffers` and `verify_textures` are
+built the same way; textures do not move, so they are safe, but anything the game rewrites within a
+frame needs the reading taken at the draw.
+
+### The reference was not bisectable, and that is why this took three sections
+
+`render.draw_range` narrows the **Vulkan** list. Every follow-up question §4.39 and §4.40 wanted to
+ask - what does the original paint for *that* draw, is it painted and then covered, is it painted
+somewhere else - is a `draw_range` question, and there was no such switch for the runtime the layer
+forwards to. So "this renderer draws a quad the original does not" could be established four
+separate times and never followed.
+
+Two instruments close that, and both work in `d3d8` and `d3d9` mode:
+
+- **`render.ref_range` / `render.ref_hide`** simply do not forward a draw outside the window.
+  Self-tested before anything was read off them: `[0, 100]` renders a partial scene, the full range
+  renders 91,063 lit pixels against the partial's 10,881.
+- **`render.frame_draws([first, last])`** is the capture layer's own list of the last complete
+  frame - index, topology, primitive count, FVF, buffered or user-pointer, blend/src/dst, depth,
+  cull, alpha test, viewport depth slice, stage-0 `.rim` name - built from the shadow state, so it
+  needs no Vulkan draw list. It exists because **an index cannot be carried between runs**: aiming
+  `ref_range` at 222 because a `vulkan` session called the quad 222 landed on the HUD portraits.
+  With the list, the same draw is found by its signature in whichever mode is running.
+
+Aimed correctly, the reference rendering draw 222 alone paints the two HUD panels at (564, 37) -
+which is what the game's buffer held at that moment, and nothing like the corona.
+
+### One clean negative worth keeping
+
+`draws_refused` counts draw calls the forwarded runtime returns a failing HRESULT for, with the
+first eight spelled out. Nothing had ever read a draw call's return value, and a refused call is
+the one way the reference can render fewer pixels than this renderer while agreeing about every
+state, every vertex and every texture. It reads **0**, so that is not what was happening - but the
+hypothesis was worth a counter rather than an assumption, and `indexed draws reaching past their
+bound buffer` sits beside it claiming D3D8 tolerates what D3D9 rejects, which is now measured
+rather than believed.
+
+### What it fixes
+
+The lattice rectangle over the fire is gone, and so is the objectives text rendering as garbage -
+same buffer, same defect. **§4.29's two bright HUD columns are the same defect seen from the other
+side**: the reference painted the HUD columns where this renderer painted a corona, so "we
+rasterise pixels the reference does not" and "the reference draws columns we do not" were one
+event. Neither was about d3d8to9, mip selection, culling or the depth test, all of which §4.29 had
+eliminated while looking at the wrong draw.
+
+Invariants after the fix, level02 at the fire camera: `seen == submitted`, 0 skips of every kind,
+`NOT versioned: 0`, scratch peak 1301 KB against 4096 KB (up from 1087 KB - every post-draw refill
+is versioned now, which is the point), 292/292 textures, validation clean.
+
+`verify_buffers` still reads **2952/2953**, and this is the section that explains it. The odd buffer
+is *this* buffer, and it must differ: the verifier compares a slot deliberately frozen mid-frame
+against a game buffer that has moved on. It now says so, and it no longer runs its re-upload
+experiment on a frozen slot - which would have overwritten the version that frame's draws point at.
+"A pre-transformed buffer the game refills while the verifier reads it" was the right shape and the
+wrong reason.
+
+### Three process notes
+
+- **A wrong conclusion outlived four correct measurements.** §4.40's "draws 223 and 224 sit in the
+  effect slice in front of 222, and in the original they cover it" was never checked: rendering
+  them alone puts them in the **top-right corner** - they are the HUD portraits, 2 primitives each,
+  fvf `0x112`, nowhere near draw 222. The neighbouring index was taken for a neighbouring object.
+- **The reported symptom was right and every diagnosis of it was wrong**, three times: "a spurious
+  quad we draw and the original does not" (false both ways), "uncovered background the fire fails
+  to cover" (nothing was meant to cover it), and "the effect layers are dimmer and smaller"
+  (they were being drawn *instead of* something else). The measurement that ended it asked about
+  the **instrument** rather than the renderer.
+- **A counter that never fires may be measuring a case that never reaches it.** This is §4.32's
+  lesson - "every must-be-0 counter reads zero for a draw that was never offered" - repeated one
+  level down. `unversioned_rewrites` is a real invariant and it was 0 for the whole life of the
+  defect, because the misclassification happened before the counter.
+
+## 4.43 Where this session got to
+
+One defect, one line of code, and three instruments that made it findable.
+
+**Landed and measured:**
+
+- **The plate quad is fixed** (§4.42). A shared dynamic vertex buffer's arena slot was being
+  overwritten by the second of two consecutive refills, because the freeze test asked "have there
+  been draws since the last rewrite" instead of "has any draw this frame read the slot". The
+  lattice rectangle over the fire is gone, the objectives text renders, and §4.29's two bright HUD
+  columns were the same event seen from the other side.
+- **The reference is bisectable** — `render.ref_range` / `render.ref_hide` and
+  `render.frame_draws`, all three working in `d3d8` mode. Self-tested: `ref_range = [0, 100]`
+  renders a partial scene against the full frame's 91,063 lit pixels.
+- **`draw_geometry` reads at the draw**, not only afterwards: the game's buffer under a mid-frame
+  read-only lock and the arena under a synchronous `ReadArena`, beside the deferred columns that
+  were all this had. That pair is what located the defect.
+- **`draws_refused`**, a clean negative: the forwarded runtime refuses nothing.
+
+**Invariants**, level02 at the fire camera: `seen == submitted` with 0 skips of every kind,
+`NOT versioned: 0`, 292/292 textures, validation clean, scratch peak 1301 KB against 4096 KB.
+`verify_buffers` reads 2952/2953 and now explains itself — the odd buffer is the frozen slot, by
+design.
+
+**The methodological residue.** §4.41 said the previous session's clean negatives "left exactly one
+place for the defect to be". They did not: they left one place *given* an assumption nobody had
+tested, which was that a readback taken a frame later describes the frame that mattered. Three
+sections were spent inside that assumption. The two questions that broke out of it were **"when is
+this instrument reading?"** and **"can I ask the reference the same question?"** — and the second
+had a one-word answer for three sections, which is that nobody had built the switch.
+
 ## 5. Fitting the project
 
 GkPlus is a modding framework with a JS layer, a VFS and a REPL; the renderer should join that

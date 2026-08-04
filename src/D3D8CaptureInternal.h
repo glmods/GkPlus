@@ -1,0 +1,961 @@
+#pragma once
+
+// The capture layer's own internals, shared between the two translation units that make it up.
+//
+// `D3D8Capture.cpp` is the **recorder**: the wrappers, the shadow state, the setters that keep it,
+// and the reduction of each draw to a `vulkan::DrawItem`. `D3D8CaptureReport.cpp` is the
+// **evidence**: the histograms, the verifiers, the frame draw log and every `render.*` reading
+// built on them. They were one 5,000-line file, and roughly a third of it was the second thing.
+//
+// The split is along a real line rather than a size one. Nothing in the report TU is on the path
+// a frame takes - it only reads what the recorder wrote, and its counters are collected through
+// the `Note*` / `Log*` entry points declared at the bottom of this file. Getting that backwards
+// is the hazard the split exists to make visible: a diagnostic that mutates state the renderer
+// then reads is not a diagnostic.
+//
+// This header is deliberately NOT `D3D8Capture.h`. That one is the public surface - what
+// `entry.cpp`, `JsRender.cpp` and the Vulkan side may use. Nothing outside these two `.cpp`
+// files should include this one.
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#include <d3d8to9.hpp>
+
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+
+#include "D3D8Capture.h"
+#include "D3D8Device.gen.inc.h"
+#include "Render.h"
+#include "VkDraw.h"
+#include "VkResources.h"
+#include "VertexFormat.h"
+
+namespace gk {
+namespace d3d8 {
+
+// The live counters, and whether there is a device at all. Defined in D3D8Capture.cpp: the
+// recorder owns them and the report TU only reads them.
+extern CaptureStats TheStats;
+extern bool HaveDevice;
+
+// The bisect and instrument switches, all read once at construction from the environment. They
+// are measuring instruments rather than features - each makes the game's OWN renderer draw the
+// scene without one thing the Vulkan path is missing, which is what tells "we are missing X"
+// apart from "we are wrong in some other way that looks like missing X". D3D8Capture.cpp holds
+// the definitions and the reasoning for each.
+extern bool WrapVertexBuffers;
+extern bool WrapIndexBuffers;
+extern bool ForceLightingOff;
+extern bool ForceStage1Off;
+extern bool ForceSpecularOff;
+extern bool ForceNoMipmap;
+extern bool ForceNoCull;
+extern bool ForceNoZTest;
+extern bool ForceNoAlphaTest;
+extern bool ForceNoBlend;
+extern bool SkipTopologies;
+extern bool DrawStrips;
+extern bool DrawLines;
+extern bool SkipSeeding;
+extern bool SkipLitColour;
+extern bool SkipStateDefaults;
+extern bool DrawLightSum;
+extern bool SeedTextures;
+extern bool ApplyTextureBlits;
+
+// Counters the reports print and the recorder increments. Not on CaptureStats because they
+// measure the SETTERS rather than the draws, and the public struct is the renderer's contract.
+extern uint64_t LightSets;
+extern uint64_t LightEnables;
+extern uint64_t MaterialSets;
+
+// Recorder helpers the reports also need. Defined in D3D8Capture.cpp.
+//
+// `NoteRewrite` is declared up here rather than beside the rest because `BufferWrapper` calls it
+// from a member of a template, where a later declaration is not found.
+void NoteRewrite(uint32_t flags, bool overlaps);
+uint32_t ActiveStages();
+uint32_t ElementCount(D3DPRIMITIVETYPE type, uint32_t primitives);
+
+// The one device the game ever creates, borrowed rather than owned. Null before CreateDevice.
+// Declared here, defined below - the wrappers all reach for it and it reads better beside the
+// rest of the shared state than buried among them.
+struct CaptureDevice;
+extern CaptureDevice *TheCaptureDevice;
+
+// Every `.rim` cache record the engine has minted, which is how a D3D texture gets a NAME - the
+// only identity a mod can write down (§4.14). Swept per frame rather than resolved once,
+// because the record is minted with its D3D pointer null and filled in much later.
+extern std::set<AwTexture *> RimRecords;
+
+// What the game has been observed to set, kept so the report can print values rather than
+// counts. §4.31 is the case for values: a *count* of flat-shaded draws says 2% and stops, where
+// the histogram says all three configurations using it are the stencil shadow - which is the
+// fact that decided how to implement it.
+extern std::set<uint64_t> ViewportDepthRanges;
+extern std::set<uint64_t> ViewportRects;
+extern uint32_t BackBufferWidth;
+extern uint32_t BackBufferHeight;
+extern ClearValues ClearState;
+extern std::set<uint32_t> MaterialKeys;
+extern std::set<uint32_t> PipelineKeys;
+extern std::set<uint32_t> MaterialKeysThisFrame;
+extern uint64_t UnresolvedForeign[2];
+extern uint64_t UnresolvedNoImage[2];
+extern std::map<uint64_t, uint64_t> UnresolvedFormats;
+extern std::map<uint64_t, uint64_t> FirstVertexColours;
+extern std::vector<std::string> OutOfRangeDraws;
+extern std::vector<std::string> RefusedDraws;
+extern std::map<uint64_t, uint64_t> UnslottedVertexBuffers;
+extern std::map<uint64_t, uint64_t> RewriteLocks;
+
+// `render.ref_range` / `render.ref_hide`: the bisect windows for the runtime this layer
+// FORWARDS to, which is what makes the ORIGINAL bisectable (§4.42).
+extern uint32_t RefRangeFirst;
+extern uint32_t RefRangeLast;
+extern uint32_t RefHideFirst;
+extern uint32_t RefHideLast;
+
+// --- the shadow state -------------------------------------------------------------------
+//
+// A flat mirror of the D3D8 fixed-function state, updated by the intercepted setters. Flat
+// arrays indexed by the D3D enum rather than a map: the whole thing is about 2 KB, lookup is
+// a load, and the API bounds the index space (render states stop below 210, stage states
+// below 32). A map would cost more than the memory it saved.
+//
+// This is the "recorder, not a translation layer" half of vulkan_renderer_notes.md section 1.
+// Nothing here reproduces D3D semantics; it remembers what was set so that each draw can be
+// reduced to the two keys the Vulkan renderer actually needs.
+
+constexpr uint32_t kMaxRenderState = 256;
+constexpr uint32_t kMaxStageState = 32;
+constexpr uint32_t kStages = 8;
+constexpr uint32_t kLights = 8;
+
+struct ShadowState {
+  uint32_t render_states[kMaxRenderState] = {};
+  uint32_t stage_states[kStages][kMaxStageState] = {};
+  IDirect3DBaseTexture8 *textures[kStages] = {};
+  uint32_t fvf = 0;
+  // The three transforms the recorder ever sees set - D3DTS_VIEW (2), D3DTS_PROJECTION (3) and
+  // D3DTS_WORLD (256). Kept as raw D3D row-major, because that is the form the shader consumes
+  // (see DrawItem). `have` is per-matrix rather than a single flag: a draw issued before the
+  // projection is set has nothing to transform by and must be skipped, not drawn with identity.
+  D3DMATRIX world = {};
+  D3DMATRIX view = {};
+  D3DMATRIX projection = {};
+  bool have_world = false;
+  bool have_view = false;
+  bool have_projection = false;
+  // The viewport, which the pre-transformed (XYZRHW) path needs to map pixels to clip space.
+  // D3DVIEWPORT8's depth range. Recorded because the renderer hardcodes 0..1 and nothing said
+  // whether the game agrees - and a viewport depth range is exactly how a 2000-era engine pins
+  // an overlay pass to the near plane (§4.32).
+  float viewport_min_z = 0.0f;
+  float viewport_max_z = 1.0f;
+  uint32_t viewport_width = 0;
+  uint32_t viewport_height = 0;
+  // The fixed-function lighting state, kept for the same reason as the transforms: the
+  // renderer has to reproduce it, and the only way to find out what the game asks for is to
+  // record what it sets. D3D8 has eight hardware light slots and the recorder has never seen
+  // an index above 0, so eight is the API's bound rather than a guess.
+  D3DLIGHT8 lights[kLights] = {};
+  bool light_set[kLights] = {};
+  bool light_enabled[kLights] = {};
+  D3DMATERIAL8 material = {};
+  bool have_material = false;
+};
+
+inline ShadowState State;
+
+
+// Every texture-stage configuration the game draws with, and how often. This is the input to
+// the multitexture shader: it says which fixed-function ops have to exist, rather than which
+// ones D3D8 defines. The key is the configuration itself and not a hash, because unlike the
+// material and pipeline counts - which only had to be *sized* - these values are going to be
+// implemented one by one.
+struct StageConfig {
+  // The FVF is part of the key so the 2D draws can be told from the 3D ones: XYZRHW (0x004) is
+  // the HUD and the text, and "what is the HUD doing differently" is otherwise unanswerable
+  // from a histogram that mixes it with 100,000 world draws.
+  uint32_t fvf = 0;
+  uint32_t stages = 0;
+  // colorop, colorarg1, colorarg2, alphaop, alphaarg1, alphaarg2, texcoordindex, and then the
+  // five that pick the sampler: magfilter, minfilter, mipfilter, addressu, addressv. The
+  // sampler states are in the key because a blur has no counter - the only way to find out that
+  // the HUD was being minified through a mip chain the game had switched off was to see which
+  // filter combination each group of draws actually ran with (§4.28).
+  uint32_t stage[2][12] = {};
+  uint32_t textured[2] = {}; // uint32_t and not bool: see the assertion below
+
+  bool operator<(const StageConfig &other) const {
+    return std::memcmp(this, &other, sizeof(StageConfig)) < 0;
+  }
+};
+static_assert(std::has_unique_object_representations_v<StageConfig>,
+              "the ordering is a memcmp, so a padding byte would make equal keys compare "
+              "unequal and the histogram would grow without bound");
+
+inline std::map<StageConfig, uint64_t> StageConfigs;
+
+// The same idea for the states that select a VkPipeline. `PipelineKey` already counts how many
+// distinct ones there are - six on level01 (§4.7) - but a count cannot be implemented against;
+// this says what the six actually are.
+struct PipelineConfig {
+  uint32_t fvf = 0;
+  uint32_t state[15] = {};
+  bool operator<(const PipelineConfig &other) const {
+    return std::memcmp(this, &other, sizeof(PipelineConfig)) < 0;
+  }
+};
+static_assert(std::has_unique_object_representations_v<PipelineConfig>);
+
+// SHADEMODE is here rather than with the states this renderer merely records, because the
+// histogram is what says which draws are flat-shaded - and a per-draw count alone cannot say
+// whether they are the world, the HUD or the four non-triangle-list draws (§4.31).
+inline constexpr uint32_t kPipelineStates[15] = {
+    D3DRS_ALPHATESTENABLE, D3DRS_ALPHAREF,     D3DRS_ALPHAFUNC,   D3DRS_ALPHABLENDENABLE,
+    D3DRS_SRCBLEND,        D3DRS_DESTBLEND,    D3DRS_ZENABLE,     D3DRS_ZWRITEENABLE,
+    D3DRS_CULLMODE,        D3DRS_COLORWRITEENABLE,
+    D3DRS_STENCILENABLE,   D3DRS_STENCILFUNC,  D3DRS_STENCILPASS, D3DRS_STENCILZFAIL,
+    D3DRS_SHADEMODE};
+
+inline std::map<PipelineConfig, uint64_t> PipelineConfigs;
+
+// Every draw that is not a triangle list, described. There are four a frame, so this can afford
+// to record what they are rather than how many: which primitive type, which vertex format,
+// whether they came from a buffer or a pointer, how many primitives, and what is bound.
+struct OddTopology {
+  uint32_t type = 0;
+  uint32_t fvf = 0;
+  uint32_t user_pointer = 0;
+  uint32_t primitives = 0;
+  uint32_t stages = 0;
+  uint32_t texture_index = 0;
+  uint32_t blend = 0;
+  uint32_t depth_test = 0;
+  uint32_t stencil = 0;      // D3DRS_STENCILENABLE
+  uint32_t stencil_func = 0; // ... and what it tests, if it is on
+  uint32_t stencil_ref = 0;
+  // The screen-space box the draw covers, rounded to whole pixels. Only meaningful for an
+  // XYZRHW draw, where the vertices already ARE screen coordinates - which is every one of
+  // these. It is what says whether a draw paints a corner or the whole frame.
+  int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+  uint32_t first_colour = 0;
+  // z and rhw of the first vertex, as bits so the key stays memcmp-comparable. For an XYZRHW
+  // vertex D3D uses z as the depth value and rhw as 1/w; this renderer ignores rhw, and a z
+  // outside [0,1] is clipped by D3D and by Vulkan alike - so both are worth seeing before
+  // concluding anything about a draw that appears in one renderer and not the other.
+  uint32_t first_z = 0;
+  uint32_t first_rhw = 0;
+
+  bool operator<(const OddTopology &other) const {
+    return std::memcmp(this, &other, sizeof(OddTopology)) < 0;
+  }
+};
+static_assert(std::has_unique_object_representations_v<OddTopology>);
+
+inline std::map<OddTopology, uint64_t> OddTopologies;
+
+
+// One line per draw of the frame just gone. See LogDraw, which fills it.
+struct LoggedDraw {
+  uint32_t index = 0;
+  uint32_t type = 0;
+  uint32_t primitives = 0;
+  uint32_t fvf = 0;
+  uint32_t blend = 0, src_blend = 0, dest_blend = 0;
+  uint32_t z_test = 0, z_write = 0, cull = 0, alpha_test = 0;
+  float min_z = 0.0f, max_z = 0.0f;
+  bool user_pointer = false;
+  std::string texture;
+};
+
+inline std::vector<LoggedDraw> DrawLog;
+inline std::vector<LoggedDraw> DrawLogLastFrame;
+
+// What the fixed-function lighting pipeline would compute a colour FROM, for the draws that
+// carry no vertex diffuse of their own: the material, and how many lights are switched on.
+// Those draws are the HUD, and with lighting on D3D takes their colour from the material -
+// which is why the panel is green in the game and was not here (§4.20).
+struct LightingInputs {
+  uint32_t fvf = 0;
+  uint32_t lighting = 0;
+  uint32_t enabled_lights = 0;
+  uint32_t diffuse = 0;  // the material, packed ARGB
+  uint32_t ambient = 0;
+  uint32_t emissive = 0;
+
+  bool operator<(const LightingInputs &other) const {
+    return std::memcmp(this, &other, sizeof(LightingInputs)) < 0;
+  }
+};
+static_assert(std::has_unique_object_representations_v<LightingInputs>);
+
+inline std::map<LightingInputs, uint64_t> LightingByFvf;
+
+
+// Ours is the only reference the game gets; `inner` is released when ours reaches zero.
+// Kept deliberately simple: Gunlok creates one device and never queries for another
+// interface off it, so there is no aggregation or tear-off to model.
+template <typename Interface> struct Wrapper : Interface {
+  explicit Wrapper(Interface *inner) : inner_(inner) {}
+
+  // A COM interface has no virtual destructor, and declaring one here introduces a NEW
+  // virtual rather than overriding a slot - so MSVC appends it after all of `Interface`'s
+  // own slots and the game's vtable indices are unaffected. It is needed because Release
+  // does `delete this` through a Wrapper<Interface> *, which is undefined without it.
+  virtual ~Wrapper() = default;
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObj) override {
+    if (!ppvObj) {
+      return E_POINTER;
+    }
+    if (riid == __uuidof(Interface) || riid == __uuidof(IUnknown)) {
+      AddRef();
+      *ppvObj = static_cast<Interface *>(this);
+      return S_OK;
+    }
+    // Deliberately NOT forwarded to `inner_`. Forwarding would hand the caller the
+    // unwrapped d3d8to9 object, and every draw made through it would be invisible here -
+    // which is the one thing this layer exists to prevent.
+    *ppvObj = nullptr;
+    return E_NOINTERFACE;
+  }
+
+  ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+
+  ULONG STDMETHODCALLTYPE Release() override {
+    const ULONG remaining = --refs_;
+    if (remaining == 0) {
+      inner_->Release();
+      delete this;
+    }
+    return remaining;
+  }
+
+  Interface *inner_ = nullptr;
+
+private:
+  ULONG refs_ = 1;
+};
+
+struct CaptureDevice;
+
+// --- buffer wrappers ---------------------------------------------------------------------
+//
+// Wrapped so that Release reaching zero is observable. `Wrapper<T>` already owns exactly one
+// reference to `inner_` and destroys it at that point, which is the hook.
+//
+// A subtlety worth stating: the *device* also holds references, but on `inner_`, not on the
+// wrapper - SetStreamSource is given `inner_`. So the game releasing its last reference
+// destroys our wrapper while the device may still hold the inner buffer, and that is
+// correct: what is being measured is what the game considers live.
+
+template <typename Interface> struct BufferWrapper : Wrapper<Interface> {
+  BufferWrapper(Interface *inner, uint32_t length, bool vertex, uint32_t fvf)
+      : Wrapper<Interface>(inner), length_(length), vertex_(vertex), fvf_(fvf) {
+    if (vertex && !vulkan::FvfSupported(fvf)) {
+      unconvertible_ = true;
+      ++TheStats.unconvertible_buffers;
+    }
+    if (vertex_) {
+      ++TheStats.live_vertex_buffers;
+      TheStats.live_vertex_bytes += length_;
+      if (TheStats.live_vertex_bytes > TheStats.peak_live_vertex_bytes) {
+        TheStats.peak_live_vertex_bytes = TheStats.live_vertex_bytes;
+      }
+    } else {
+      ++TheStats.live_index_buffers;
+      TheStats.live_index_bytes += length_;
+      if (TheStats.live_index_bytes > TheStats.peak_live_index_bytes) {
+        TheStats.peak_live_index_bytes = TheStats.live_index_bytes;
+      }
+    }
+    const uint64_t total = TheStats.live_vertex_buffers + TheStats.live_index_buffers;
+    if (total > TheStats.peak_live_buffers) {
+      TheStats.peak_live_buffers = total;
+    }
+  }
+
+  ~BufferWrapper() override {
+    vulkan::FreeSlot(slot_);
+    if (vertex_) {
+      --TheStats.live_vertex_buffers;
+      TheStats.live_vertex_bytes -= length_;
+    } else {
+      --TheStats.live_index_buffers;
+      TheStats.live_index_bytes -= length_;
+    }
+  }
+
+  void NoteLock(uint32_t offset, uint32_t size, BYTE **data, uint32_t flags) {
+    ++TheStats.locks;
+    // A zero SizeToLock means "the whole buffer" in D3D8.
+    locked_offset_ = offset;
+    locked_bytes_ = size == 0 ? length_ - offset : size;
+    locked_ = data != nullptr ? *data : nullptr;
+    locked_flags_ = flags;
+    TheStats.locked_bytes_this_frame += locked_bytes_;
+  }
+
+  // Read on the way OUT of the lock, not on the way in: the game writes its geometry between
+  // Lock and Unlock, so before Unlock is the only moment the data is both complete and still
+  // mapped. Uploading here means the arenas see exactly what D3D9 sees.
+  void UploadLocked() {
+    ++unlocks_;
+    // Rewritten after this frame's draws already read it: the slot cannot hold both versions,
+    // and the draw list is not recorded until Present, so those draws would read this one.
+    //
+    // The test is "has ANY draw this frame read this buffer", not "have there been draws since
+    // the last rewrite". Those differ exactly when the game refills the buffer twice with no
+    // draw in between, and the difference is not academic: `draws_this_frame_` is zeroed by the
+    // first rewrite, so the second read 0, took this branch's `else`, and wrote the slot -
+    // *over* the version an earlier draw of the same frame was still pointing at. Gunlok
+    // refills one shared 64 KB dynamic buffer about five times a frame, so this happened every
+    // frame, and it is what drew the fire's screen-space glow quad in place of the HUD panel
+    // that draw was issued for (§4.42). Once a draw has read the slot, the slot belongs to it
+    // for the rest of the frame.
+    const bool rewritten_after_draw = drawn_frame_ == TheStats.frames;
+    if (rewritten_after_draw) {
+      ++TheStats.buffer_rewritten_after_draw;
+      ++(vertex_ ? TheStats.vertex_buffer_rewritten_after_draw
+                 : TheStats.index_buffer_rewritten_after_draw);
+      TheStats.draws_reading_rewritten_buffers += draws_this_frame_;
+      // NOOVERWRITE is the game promising this write lands outside anything already drawn
+      // from, which makes the rewrite harmless; DISCARD is the opposite. Neither is trusted on
+      // its own - the byte ranges say whether the new write actually overlaps the old one.
+      const bool overlaps =
+          locked_offset_ < prev_locked_end_ && prev_locked_offset_ < locked_offset_ + locked_bytes_;
+      NoteRewrite(locked_flags_, overlaps);
+      if (overlaps) {
+        ++TheStats.overlapping_rewrites_after_draw;
+      }
+      draws_this_frame_ = 0;
+    }
+    prev_locked_offset_ = locked_offset_;
+    prev_locked_end_ = locked_offset_ + locked_bytes_;
+    if (locked_ == nullptr || locked_bytes_ == 0) {
+      locked_ = nullptr;
+      return;
+    }
+    // The slot is claimed on first use rather than in the constructor, because the Vulkan
+    // arenas may not exist yet when the game creates its earliest buffers - the renderer
+    // comes up on the first Present, which is after the menu has built its geometry.
+    if (!slot_.valid && vulkan::ResourcesReady() && !unconvertible_) {
+      slot_ = vulkan::AllocateSlot(SlotBytes(), vertex_);
+    }
+    // The refill case: the slot holds the version an earlier draw this frame already reads, so
+    // this one is parked in the frame's scratch and later draws are pointed at it instead.
+    // Only a whole-buffer rewrite can be versioned this way - a partial one would need the
+    // bytes it did not touch, and this layer keeps no copy of them - so a partial refill falls
+    // through to the old behaviour and is counted rather than silently half-built.
+    if (rewritten_after_draw) {
+      if (locked_offset_ == 0 && locked_bytes_ == length_ && UploadVersionToScratch()) {
+        locked_ = nullptr;
+        return;
+      }
+      ++TheStats.unversioned_rewrites;
+    }
+    if (slot_.valid) {
+      if (vertex_) {
+        UploadConvertedVertices();
+      } else if (!vulkan::UploadIntoSlot(slot_, locked_offset_, locked_, locked_bytes_)) {
+        ++TheStats.failed_uploads;
+      }
+    }
+    locked_ = nullptr;
+  }
+
+  // Parks the version just written in the frame's scratch, so the arena slot keeps the version
+  // this frame's earlier draws are recorded against. The whole buffer goes in, not the locked
+  // range: a draw may index anywhere in it, and the offsets stay the buffer's own that way.
+  //
+  // The scratch is the right home rather than a second arena slot because this data has exactly
+  // the lifetime the scratch is built for - one frame, written by the CPU, read once. It is the
+  // same trade as a user-pointer draw, arrived at from the other direction.
+  bool UploadVersionToScratch() {
+    if (unconvertible_) {
+      return false;
+    }
+    if (vertex_) {
+      const uint32_t stride = vulkan::FvfStride(fvf_);
+      const uint32_t count = stride == 0 ? 0 : length_ / stride;
+      if (count == 0) {
+        return false;
+      }
+      const vulkan::ScratchAlloc alloc = vulkan::AllocateScratchVertices(count);
+      if (!alloc.valid ||
+          !vulkan::ConvertVertices(fvf_, locked_, count,
+                                   static_cast<vulkan::CanonicalVertex *>(alloc.mapped))) {
+        return false;
+      }
+      version_offset_ = alloc.offset;
+    } else {
+      // A 32-bit index buffer is refused by EmitDraw anyway, so a version of one would never
+      // be read; refusing here keeps it out of the scratch as well.
+      if (index_stride_ != 2) {
+        return false;
+      }
+      const vulkan::ScratchAlloc alloc =
+          vulkan::AllocateScratchIndices(length_ / index_stride_, index_stride_);
+      if (!alloc.valid) {
+        return false;
+      }
+      std::memcpy(alloc.mapped, locked_, length_);
+      version_offset_ = alloc.offset;
+    }
+    version_frame_ = TheStats.frames;
+    ++TheStats.buffer_versions_in_scratch;
+    return true;
+  }
+
+  // How much arena this buffer needs. Vertices are widened to the canonical 48-byte layout,
+  // so the slot is sized in *vertices*, not in source bytes; indices are copied verbatim.
+  uint32_t SlotBytes() const {
+    if (!vertex_) {
+      return length_;
+    }
+    const uint32_t stride = vulkan::FvfStride(fvf_);
+    return stride == 0 ? 0 : (length_ / stride) * sizeof(vulkan::CanonicalVertex);
+  }
+
+  void UploadConvertedVertices() {
+    const uint32_t stride = vulkan::FvfStride(fvf_);
+    // A lock that does not start on a vertex boundary cannot be mapped onto canonical
+    // vertices at all. Never observed; counted rather than guessed at.
+    if (stride == 0 || locked_offset_ % stride != 0) {
+      ++TheStats.failed_uploads;
+      return;
+    }
+    const uint32_t count = locked_bytes_ / stride;
+    if (count == 0) {
+      return;
+    }
+    // One scratch buffer for the process: conversion is main-thread and immediately
+    // consumed by the staging copy, so there is nothing to keep per buffer.
+    static std::vector<vulkan::CanonicalVertex> scratch;
+    scratch.resize(count);
+    if (!vulkan::ConvertVertices(fvf_, locked_, count, scratch.data())) {
+      ++TheStats.failed_uploads;
+      return;
+    }
+    const uint32_t dst_offset =
+        (locked_offset_ / stride) * sizeof(vulkan::CanonicalVertex);
+    const uint32_t bytes =
+        count * static_cast<uint32_t>(sizeof(vulkan::CanonicalVertex));
+    if (!vulkan::UploadIntoSlot(slot_, dst_offset, scratch.data(), bytes)) {
+      ++TheStats.failed_uploads;
+    }
+  }
+
+  uint32_t length_ = 0;
+  bool vertex_ = false;
+  // The FVF CreateVertexBuffer was given. Zero for index buffers, and zero for a vertex
+  // buffer the game declared without one - which would leave its layout unknowable here, so
+  // `unconvertible_` drops it from the arena rather than uploading bytes of unknown shape.
+  uint32_t fvf_ = 0;
+  bool unconvertible_ = false;
+  BYTE *locked_ = nullptr;
+  uint32_t locked_offset_ = 0;
+  uint32_t locked_bytes_ = 0;
+  // The D3DLOCK_* flags of the lock now open. DISCARD (0x2000) and NOOVERWRITE (0x1000) are
+  // the two that decide whether re-locking a drawn-from buffer is a hazard or a promise.
+  uint32_t locked_flags_ = 0;
+  // The byte range the previous lock of this frame covered, so an overlap can be told from an
+  // append without trusting the flags alone.
+  uint32_t prev_locked_offset_ = 0;
+  uint32_t prev_locked_end_ = 0;
+  // How many times the game has unlocked this buffer. A slot is claimed on the first one, so
+  // zero here on a buffer that is being DRAWN says the contents arrived some way this layer
+  // cannot see - which is a different problem from an arena that ran out.
+  uint64_t unlocks_ = 0;
+  // Which frame last drew from this buffer, and how many of that frame's draws did. Together
+  // they are the "rewritten after being drawn" test in UploadLocked.
+  //
+  // `draws_this_frame_` counts draws since the LAST rewrite, not since the frame began - it is
+  // zeroed each time a rewrite is versioned, so `draws_reading_rewritten_buffers` attributes
+  // each rewrite to the draws it endangered. That makes it the wrong thing to gate the freeze
+  // on, which is why `drawn_frame_` alone decides it now: two rewrites in a row with no draw
+  // between them left the second reading 0 and writing the SLOT, on top of the version an
+  // earlier draw of the same frame was still pointing at. See UploadLocked.
+  uint64_t drawn_frame_ = UINT64_MAX;
+  uint32_t draws_this_frame_ = 0;
+  // The frame whose scratch holds a later version of this buffer, and where in it. A draw uses
+  // the version only while `version_frame_` is the current frame - the scratch slice is recycled
+  // after that, so it expires on its own and there is nothing to clear.
+  uint64_t version_frame_ = UINT64_MAX;
+  uint32_t version_offset_ = 0;
+  // 2 or 4. Lives here rather than on CaptureIndexBuffer because UploadVersionToScratch needs
+  // it, and is left at 2 for a vertex buffer, where nothing reads it.
+  uint32_t index_stride_ = 2;
+  // Set once a read-back of this buffer's own contents has been tried, successfully or not, so
+  // a buffer that cannot be read costs one attempt rather than one per draw.
+  bool seeded_ = false;
+
+  // Gives this buffer an arena slot from its OWN current contents, for a buffer whose only
+  // Unlock happened before the renderer existed. Exactly the same shape, and the same
+  // justification, as EnsureTextureImage: being drawn is the definition of needing to be
+  // resident, and the buffer is the only thing that still knows what is in it.
+  //
+  // The read lock is safe for what it is used on: the buffers reaching this path are
+  // D3DPOOL_MANAGED, which keeps a system-memory copy by definition. `pool_` is recorded so
+  // that stays a checked fact rather than a hope - a DEFAULT-pool buffer is refused.
+  void SeedFromContents() {
+    if (seeded_ || slot_.valid || unconvertible_ || !vulkan::ResourcesReady()) {
+      return;
+    }
+    seeded_ = true;
+    if (pool_ != D3DPOOL_MANAGED && pool_ != D3DPOOL_SYSTEMMEM) {
+      ++vulkan::MutableDrawStats().seed_refused_pool;
+      return;
+    }
+    slot_ = vulkan::AllocateSlot(SlotBytes(), vertex_);
+    if (!slot_.valid) {
+      return;
+    }
+    BYTE *data = nullptr;
+    if (FAILED(LockForRead(&data)) || data == nullptr) {
+      ++vulkan::MutableDrawStats().seed_read_failures;
+      return;
+    }
+    locked_ = data;
+    locked_offset_ = 0;
+    locked_bytes_ = length_;
+    if (vertex_) {
+      UploadConvertedVertices();
+    } else if (!vulkan::UploadIntoSlot(slot_, 0, data, length_)) {
+      ++TheStats.failed_uploads;
+    }
+    locked_ = nullptr;
+    UnlockAfterRead();
+    ++vulkan::MutableDrawStats().buffers_seeded;
+  }
+
+  // The two buffer interfaces have the same Lock signature but no common base that declares
+  // it, so the leaf supplies these.
+  virtual HRESULT LockForRead(BYTE **data) = 0;
+  virtual void UnlockAfterRead() = 0;
+
+  uint32_t pool_ = D3DPOOL_MANAGED;
+  // This buffer's own region of the arena, held for its whole lifetime and released in the
+  // destructor. See BufferSlot in VkResources.h for why it is per-buffer and not per-upload.
+  vulkan::BufferSlot slot_;
+};
+
+// Declared before the wrappers so their constructors can register themselves; defined with
+// Unwrap, which is where the reason they exist is written up.
+inline std::set<const void *> LiveVertexWrappers;
+inline std::set<const void *> LiveIndexWrappers;
+
+struct CaptureVertexBuffer final : BufferWrapper<IDirect3DVertexBuffer8> {
+  CaptureVertexBuffer(IDirect3DVertexBuffer8 *inner, uint32_t length, uint32_t fvf,
+                      uint32_t pool)
+      : BufferWrapper(inner, length, true, fvf) {
+    pool_ = pool;
+    LiveVertexWrappers.insert(this);
+  }
+  ~CaptureVertexBuffer() override { LiveVertexWrappers.erase(this); }
+
+  HRESULT LockForRead(BYTE **data) override {
+    return inner_->Lock(0, 0, data, D3DLOCK_READONLY);
+  }
+  void UnlockAfterRead() override { inner_->Unlock(); }
+
+#define GK_DECL(ret, name, params, args) ret STDMETHODCALLTYPE name params override;
+  GK_IDIRECT3DVERTEXBUFFER8_METHODS(GK_DECL)
+#undef GK_DECL
+};
+
+struct CaptureIndexBuffer final : BufferWrapper<IDirect3DIndexBuffer8> {
+  // D3DFMT_INDEX16 is 101 and D3DFMT_INDEX32 is 102. The stride is kept rather than the format
+  // because it is what the arena offset arithmetic needs, and because a 32-bit index buffer
+  // cannot share the frame's single vkCmdBindIndexBuffer - a draw from one is skipped and
+  // counted instead of being drawn with its indices misread as pairs of 16-bit ones.
+  CaptureIndexBuffer(IDirect3DIndexBuffer8 *inner, uint32_t length, uint32_t format,
+                     uint32_t pool)
+      : BufferWrapper(inner, length, false, 0) {
+    index_stride_ = format == 102 ? 4 : 2;
+    pool_ = pool;
+    LiveIndexWrappers.insert(this);
+  }
+  ~CaptureIndexBuffer() override { LiveIndexWrappers.erase(this); }
+
+  HRESULT LockForRead(BYTE **data) override {
+    return inner_->Lock(0, 0, data, D3DLOCK_READONLY);
+  }
+  void UnlockAfterRead() override { inner_->Unlock(); }
+
+#define GK_DECL(ret, name, params, args) ret STDMETHODCALLTYPE name params override;
+  GK_IDIRECT3DINDEXBUFFER8_METHODS(GK_DECL)
+#undef GK_DECL
+};
+
+// --- textures and surfaces -----------------------------------------------------------------
+//
+// Textures are wrapped for one reason: LockRect is the only place a texture's pixels exist in
+// a form this layer can read. The engine loads .rim files itself and hands the decoded bits to
+// D3D, so there is no file to intercept and no D3D-side copy to read back.
+//
+// Whether that is *enough* is a measurement, not an assumption. D3D8 has three more ways into
+// a texture's bits, none of which touches IDirect3DTexture8::LockRect:
+//
+//   GetSurfaceLevel then IDirect3DSurface8::LockRect
+//   CopyRects into a texture's surface
+//   SetRenderTarget onto a texture's surface, and let the GPU write it
+//
+// All three go through IDirect3DSurface8, which is why it is wrapped: with it, each route has
+// its own counter and "are the pixels all visible here?" is a number rather than a hope. See
+// vulkan_renderer_notes.md section 4.11.
+struct CaptureTexture;
+
+inline std::set<const void *> LiveTextureWrappers;
+inline std::set<const void *> LiveSurfaceWrappers;
+
+struct CaptureSurface final : Wrapper<IDirect3DSurface8> {
+  // `owner` is the texture this surface is a level of, or null for a backbuffer, a render
+  // target or a standalone image surface. It is what makes the counters answer the question
+  // that matters: a lock on a texture level is a pixel write the texture path missed, a lock
+  // on the backbuffer is not.
+  CaptureSurface(IDirect3DSurface8 *inner, CaptureTexture *owner, uint32_t level);
+  ~CaptureSurface() override;
+
+#define GK_DECL(ret, name, params, args) ret STDMETHODCALLTYPE name params override;
+  GK_IDIRECT3DSURFACE8_METHODS(GK_DECL)
+#undef GK_DECL
+
+  CaptureTexture *owner_ = nullptr;
+  uint32_t level_ = 0; // mip level within `owner_`; meaningless when it is null
+
+  // Inner surface -> the wrapper that owns it. Two things make this a cache rather than a
+  // bump-allocation per call. Identity: GetSurfaceLevel runs ~39,000 times per level load
+  // and D3D8 callers do compare surface pointers, so handing out a fresh wrapper per call
+  // would make the same surface look like a different one. And lifetime: the wrapper holds a
+  // reference on `inner_` for as long as it is in this map, so an entry can never be stale -
+  // d3d8to9 cannot destroy a surface we are still pointing at and reuse the address.
+  static std::map<IDirect3DSurface8 *, CaptureSurface *> SurfaceWrappers;
+};
+
+struct CaptureTexture final : Wrapper<IDirect3DTexture8> {
+  CaptureTexture(IDirect3DTexture8 *inner, uint32_t width, uint32_t height, uint32_t levels,
+                 uint32_t format, uint32_t pool)
+      : Wrapper(inner), width_(width), height_(height), levels_(levels), format_(format),
+        pool_(pool) {
+    // A `Levels` of 0 means "make the whole chain", so the count has to come from the object
+    // rather than from the argument. Asked rather than derived from the dimensions, because
+    // D3D is entitled to stop early.
+    if (levels_ == 0) {
+      levels_ = inner->GetLevelCount();
+    }
+    LiveTextureWrappers.insert(this);
+    ++TheStats.live_textures;
+  }
+
+  ~CaptureTexture() override {
+    vulkan::DestroyTextureImage(image_);
+    LiveTextureWrappers.erase(this);
+    --TheStats.live_textures;
+  }
+
+#define GK_DECL(ret, name, params, args) ret STDMETHODCALLTYPE name params override;
+  GK_IDIRECT3DTEXTURE8_METHODS(GK_DECL)
+#undef GK_DECL
+
+  uint32_t width_ = 0;
+  uint32_t height_ = 0;
+  uint32_t levels_ = 0;
+  uint32_t format_ = 0;
+  uint32_t pool_ = 0;  // D3DPOOL: SYSTEMMEM is a staging copy, DEFAULT/MANAGED is drawn with
+  uint32_t usage_ = 0; // D3DUSAGE, for AUTOGENMIPMAP (0x400) - see MirrorBlitDestination
+  // Claimed the first time this texture is bound or blitted into, not at creation: a texture
+  // may exist long before the renderer comes up, and a SYSTEMMEM staging copy never needs one
+  // at all. `image_failed_` stops a texture whose format has no VkFormat from being retried on
+  // every SetTexture, which would turn one unsupported texture into millions of counts.
+  vulkan::TextureImage image_;
+  bool image_failed_ = false;
+  // Per-texture provenance, so a content mismatch can say which route wrote it. The global
+  // counters cannot: they show 1:1 locks-to-blits across all textures, which is consistent
+  // with one texture being written directly and another only ever blitted.
+  uint64_t own_locks_ = 0; // the GAME locking this texture, not our read-backs
+  uint64_t blits_in_ = 0;  // CopyRects with this texture as the destination
+  uint32_t levels_blitted_ = 0; // bitmask: which mip levels a blit ever landed on
+  // The `.rim` path this texture was acquired under, empty if it has no cache record. This is
+  // the only stable, writable-down identity a texture has - the wrapper pointer differs every
+  // run and means nothing to a mod.
+  std::string rim_path_;
+};
+
+struct CaptureD3D8 final : Wrapper<IDirect3D8> {
+  using Wrapper::Wrapper;
+
+#define GK_DECL(ret, name, params, args) ret STDMETHODCALLTYPE name params override;
+  GK_IDIRECT3D8_METHODS(GK_DECL)
+#undef GK_DECL
+};
+
+struct CaptureDevice final : Wrapper<IDirect3DDevice8> {
+  CaptureDevice(IDirect3DDevice8 *inner, CaptureD3D8 *parent)
+      : Wrapper(inner), parent_(parent) {}
+
+#define GK_DECL(ret, name, params, args) ret STDMETHODCALLTYPE name params override;
+  GK_IDIRECT3DDEVICE8_METHODS(GK_DECL)
+#undef GK_DECL
+
+  CaptureD3D8 *parent_ = nullptr;
+  // The window CreateDevice was given. Captured here rather than read from the game's own
+  // HWND global because this is the one place it is known for certain to be the window the
+  // backbuffer belongs to.
+  HWND window_ = nullptr;
+
+  // The wrappers the game last bound, so the getters can return the same objects rather than
+  // the inner buffers. Borrowed, not owned: the game holds its own reference for as long as
+  // it cares, and the device's reference is on the inner object.
+  IDirect3DVertexBuffer8 *stream0_ = nullptr;
+  uint32_t stream0_stride_ = 0;
+  IDirect3DIndexBuffer8 *indices_ = nullptr;
+  uint32_t base_vertex_ = 0;
+
+  // Not a COM method - a helper that turns one of the game's draws into a vulkan::DrawItem.
+  // A member because it needs the bound stream, indices and base vertex, which are the
+  // device's state and not the shadow's.
+  // Does this DrawIndexedPrimitive address vertices or indices its bound buffers do not have?
+  // D3D8's runtime tolerated an out-of-range MinIndex/NumVertices; D3D9's validates it and
+  // fails the call - and d3d8to9 returns D3D_OK regardless, so a rejected draw is silent on
+  // both sides of the wrapper. This renderer pulls by index and does not care, which is exactly
+  // the shape of "drawn here, missing in the reference" (§4.29).
+  void NoteIndexedRange(D3DPRIMITIVETYPE type, UINT min_index, UINT num_vertices,
+                        UINT start_index, UINT primitive_count);
+  // Both buffered draw entry points. `indexed` false is DrawPrimitive, which reads no index
+  // buffer at all and counts its vertices from `start_vertex`.
+  void EmitDraw(D3DPRIMITIVETYPE type, UINT start_index, UINT primitive_count, bool indexed,
+                UINT start_vertex);
+  // The synthetic quad probe (§4.35). Issued through this device's OWN methods rather than
+  // through `inner_`, which is the entire point: the states and the draw go down both paths at
+  // once, so the reference and this renderer are handed the same geometry, the same texture and
+  // the same stage setup with nothing of the scene left in the way.
+  void DrawProbeQuad();
+
+  void EmitDrawUP(D3DPRIMITIVETYPE type, UINT primitive_count, const void *vertex_data,
+                  UINT vertex_stride, const void *index_data, D3DFORMAT index_format,
+                  UINT vertex_count);
+};
+
+
+inline CaptureTexture *ProbeTexture = nullptr;
+inline float ProbeScale = 1.0f;
+inline uint32_t ProbeMipFilter = 0; // D3DTEXF_NONE, so a 1:1 quad cannot silently walk the chain
+// Where the quad's top-left sits, in pixels from (16, 16). It exists because **a 1:1 quad at
+// integer coordinates samples texel BOUNDARIES, not texel centres** (§4.35).
+//
+// The arithmetic: a vertex at x0 with u=0 and one at x0+W with u=1 makes the coordinate under
+// screen sample position `sx` equal to `(sx - x0) / W`, and texel j's centre is at `(j+0.5)/W`.
+// The renderer samples at the pixel centre and then shifts the whole viewport by half a pixel to
+// match D3D (§4.28), so `sx` comes out at an integer - which lands on `j/W`, the corner where
+// four texels meet and bilinear weights them equally. An offset of +0.5 puts it back on the
+// centre, where bilinear returns the texel exactly and a difference means something.
+inline float ProbeOffset = 0.0f;
+// Render the texture's ALPHA as greyscale instead of its colour, via D3DTA_ALPHAREPLICATE on the
+// colour argument. The screenshot has no alpha channel, so this is the only way to compare the
+// two renderers' idea of a texture's alpha at all - and alpha is the one input a probe with
+// blending off still cannot see (§4.36).
+inline bool ProbeAlpha = false;
+inline RECT ProbeRect = {};
+
+
+inline int64_t VerifyDrawIndex = -1;
+inline std::string VerifyDrawReport;
+inline bool VerifyDrawValid = false;
+
+// What the watched draw was made of, snapshotted when it is issued. The buffers have to be
+// remembered here rather than looked up later: `stream0_` and `indices_` are whatever is bound
+// *now*, and by the time anyone reads a report the frame has moved on.
+//
+// The readback itself is NOT done here. It submits and waits on the GPU, and doing that in the
+// middle of the scene the draw belongs to would stall the frame being measured.
+// How many vertices from the draw's own base the at-draw arena read covers. Twelve is what the
+// report prints, and the read stalls the frame, so there is no reason to take more.
+constexpr uint32_t kWatchedVertices = 12;
+
+struct WatchedGeometry {
+  bool valid = false;
+  vulkan::DrawItem item;
+  CaptureVertexBuffer *vertices = nullptr;
+  CaptureIndexBuffer *indices = nullptr;
+  uint32_t vertex_bias = 0; // D3D's BaseVertexIndex (or StartVertex), which base_vertex folds in
+  // The bound texture at each stage, by the name the game knows it under, beside the name of the
+  // bindless image the draw actually samples. The state verifier proves the same texture OBJECT
+  // is bound as the device has; it says nothing about whether our image index names that
+  // object's pixels, which is a second mapping and a second chance to be wrong.
+  std::string bound_name[2];
+  std::string image_name[2];
+  uint32_t image_index[2] = {0xffffffffu, 0xffffffffu};
+  // The game's vertex buffer read AT THE MOMENT THE DRAW IS ISSUED, converted. The report's
+  // other D3D column is read back later, which is a different question and quietly a weaker
+  // one: a dynamic buffer refilled after the draw holds the newer version by then, so the
+  // arena and the late read can agree perfectly while the runtime drew from bytes neither of
+  // them ever saw. That is the one way "same state, same vertices, different picture" can be
+  // true, and nothing here could see it.
+  std::vector<vulkan::CanonicalVertex> at_draw;
+  bool at_draw_read = false;
+  // The ARENA, read at the same instant. Both deferred columns answer "what does this hold
+  // now", and now is a frame or more after the draw - long enough for the game to refill the
+  // buffer, and long enough for the wrapper to have been destroyed and its slot handed to
+  // another buffer (8,539 vertex buffers created against 333 live). So neither can tell "the
+  // draw pulled the wrong bytes" from "the bytes moved on afterwards", which is the whole
+  // question. This one can.
+  std::vector<vulkan::CanonicalVertex> arena_at_draw;
+  bool arena_at_draw_read = false;
+  // The buffer's own bookkeeping at that instant, which is what decides whether a draw reads
+  // the slot or a scratch version (§4.23).
+  std::string book;
+};
+inline WatchedGeometry VerifyDrawGeometry;
+
+// The inner object a wrapper holds, or the argument unchanged when it is not one of ours. The
+// membership check against the Live*Wrappers sets is what makes the downcast sound.
+IDirect3DBaseTexture8 *UnwrapTexture(IDirect3DBaseTexture8 *texture);
+IDirect3DVertexBuffer8 *Unwrap(IDirect3DVertexBuffer8 *buffer);
+IDirect3DIndexBuffer8 *Unwrap(IDirect3DIndexBuffer8 *buffer);
+
+// One mip level's pixels, from whichever of the two copies has them (§4.12).
+bool ReadTextureLevel(CaptureTexture &texture, uint32_t level, D3DLOCKED_RECT &locked);
+
+// --- the seam between the recorder and the evidence ---------------------------------------
+//
+// Everything below is defined in D3D8CaptureReport.cpp. The recorder calls the `Note*`/`Log*`
+// half from the draw path and never reads any of it back; the `render.*` readings in
+// D3D8Capture.h are the other direction.
+
+// The `.rim` path a D3D texture was acquired under, or null. A linear scan on purpose: it runs
+// once per texture at image creation, so an index would cost more upkeep than it saves.
+void ResolveTextureNames();
+const std::string *TextureAssetName(IDirect3DBaseTexture8 *texture);
+
+// A D3D enum's name, or null. Used only by the reports.
+const char *RenderStateName(uint32_t state);
+const char *StageStateName(uint32_t type);
+
+// Reads the fixed-function state back off the device and diffs it against the shadow mirror.
+// Every counter in this layer is computed FROM the mirror, so this is the only reading that can
+// say the mirror itself is right (§4.40).
+std::string CompareShadowToDevice(CaptureDevice *capture);
+
+// Collectors, called from the recorder's draw path. Each is a measurement that costs a little
+// per draw and has paid for itself at least once.
+void NoteOddTopology(D3DPRIMITIVETYPE type, bool user_pointer, uint32_t primitives,
+                     const void *vertex_data, uint32_t vertex_stride, uint32_t vertex_count);
+void LogDraw(D3DPRIMITIVETYPE type, bool user_pointer, uint32_t primitives);
+void NoteDrawResult(HRESULT hr, const char *which, D3DPRIMITIVETYPE type,
+                    uint32_t primitive_count);
+// Snapshots the device state, the game's own vertices and the arena AT THE MOMENT one draw is
+// issued. The at-draw reads are the point: a deferred readback proves consistency, not
+// correctness, which is how §4.42's defect survived three sections of instruments (§4.42).
+void MaybeVerifyStateForDraw(CaptureDevice *capture, const vulkan::DrawItem &item,
+                             uint32_t vertex_bias);
+
+} // namespace d3d8
+} // namespace gk

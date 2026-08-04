@@ -367,6 +367,11 @@ bool ResizeDraw(uint32_t width, uint32_t height);
 // Appends one item to the frame's list. Cheap and does no Vulkan work.
 void SubmitDraw(const DrawItem &item);
 
+// The index the next SubmitDraw will occupy, which is what `render.draw_info` and
+// `render.draw_hide` index by. The capture layer needs it to answer "is the draw I am about to
+// build the one someone armed a diagnostic on".
+uint32_t PendingDrawIndex();
+
 // Records the whole list into `cmd`, inside a rendering pass the caller has begun, then clears
 // it. The depth image view is the caller's to attach - see DepthImageView.
 void RecordDraws(void *command_buffer);
