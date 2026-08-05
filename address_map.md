@@ -200,6 +200,20 @@ CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84
 | 0x007b6dd0 | char* | ConsoleFileName (level `.gcs`) |
 | 0x007b68e4 | int* | client actor id counter |
 
+**Window and video mode:** (see `src/WindowPlacement.h`)
+
+| Offset | Type | Name |
+|--------|------|------|
+| 0x006b02b8 | HWND* | GameWindow — the main window; the only handle any of the six `ShowWindow` sites and the one `SetWindowPos` ever pass |
+| 0x007c1244 | int* | ViewFlags — bit 0 set = **windowed**, bit 31 set by `-r`. Selects which of `WinMain`'s two `CreateWindowExA` sites runs |
+| 0x007c1250 / 0x007c1254 | int* | ResolutionWidth / ResolutionHeight — what the window is actually sized from, and what `ResetD3D2` writes into the present parameters |
+| 0x006a7d78 / 0x006a7d7c / 0x006a7d80 | int* | WindowedWidth / WindowedHeight / WindowedViewFlags — the persisted pair, copied into `Resolution*` by `ReadGLKeys` when `ViewFlags & 1` |
+| 0x006a7d84 / 0x006a7d88 / 0x007b80a8 | int* | FullscreenWidth / FullscreenHeight / FullscreenViewFlags — the same, for the other branch |
+| 0x007c1268 / 0x007c126c | int* | GameWindowX / GameWindowY — the client area's **origin** in screen space, filled by `WinMain` from `ClientToScreen(GameWindow, {0,0})` and maintained by the `WM_MOVE` bookkeeper. Nothing repositions the window from them: the one reader passes them to a `SWP_NOMOVE` `SetWindowPos`, which discards them |
+| 0x007c1270 / 0x007c1274 | int* | ClientRight / ClientBottom — the client rect's **far corner**, `GameWindowX + width` / `GameWindowY + height`. Named `OrigX`/`OrigY` in the DB until the arithmetic was read; every consumer subtracts the origin back off to recover the size |
+| 0x007c1278 | RECT | DesktopRect — `GetClientRect(GetDesktopWindow())` when windowed, `{0, 0, width, height}` otherwise. Its one reader takes only the width and height from it |
+| 0x007c1288 / 0x007c128c | int* | ClientWidth / ClientHeight (18 readers, all pixel comparisons — `DrawHud`, `DrawInventoryItemPanel`, `ApplyShadowQuality`) |
+
 ### Key Function Addresses (offsets from base)
 
 **Console:**
@@ -283,6 +297,22 @@ CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84
 | 0x0056a120 | FastCall<void, const char*, void*, void*> | OpenInGameConfirmDialog |
 | 0x005691f0 | FastCall<void, int> | CloseInGameMenu (kind 0/1/2/3/0x41/0x42/0x43) |
 | 0x00569550 | FastCall<char> | IsAnyInGameMenuOpen |
+
+**Window and video mode:** (see `src/WindowPlacement.h`)
+
+| Offset | Signature | Name |
+|--------|-----------|------|
+| 0x0046aef0 | StdCall (RET 0x10) | WinMain — registers the one window class (`"GLClass"`, resource id 0x2f07) and holds the binary's **only two** `CreateWindowExA` sites: windowed @ 0x0046b585 (`WS_EX_APPWINDOW`, style 0x90CF0000) and fullscreen @ 0x0046b5cf (`WS_EX_TOPMOST`, style 0x90080000). Both pass **X = 0, Y = 0** as literals; the game never asks Windows where a window may go |
+| 0x004f6f10 | - | ReadGLKeys — the only thing that fills `Resolution*` before creation, from the `Windowed*`/`Fullscreen*` pair per `ViewFlags & 1` |
+| 0x0046a0b0 | FastCall<int, int, int, int, int> (RET 0x8) | SetVideoMode(width ECX, height EDX, bpp, view_flags) — the single entry point for a mode change and the binary's **only** `SetWindowPos` caller (0x0046a183), which passes `SWP_NOMOVE\|SWP_NOZORDER`, so it resizes in place and its X/Y arguments are discarded |
+| 0x0046a560 | FastCall<void, int, int> | OnClientSizeChanged(width ECX, height EDX) — the `WM_SIZE` bookkeeper (`lParam`'s packed LOWORD/HIWORD). **Resizes no window**: it recomputes `ClientRight`/`ClientBottom`/`Client*`/`DesktopRect` and a pair of 640x480-relative UI scale factors at 0x007c1290/0x007c1294. Was `WindowResize` in the DB, which cost real time to rule out |
+| 0x00470dd0 | FastCall<void, int, int> | OnWindowMoved(x ECX, y EDX) — the `WM_MOVE` bookkeeper. **Moves no window**: it is the only writer of `GameWindowX/Y`, and keeps `ClientRight`/`ClientBottom` correct by the same delta. `WinMain` @ 0x0046b91b re-derives the origin from the live window via `ClientToScreen`, which is what keeps the mouse mapping correct wherever the window ends up. Was `WindowMove` |
+
+gl.exe's user32 import set contains **no** `MoveWindow`, `SetWindowLongA/W`, `AdjustWindowRect(Ex)`,
+`SystemParametersInfo`, `GetMonitorInfo`, `MonitorFromWindow` or `SetWindowPlacement` — so nothing
+in the game can reposition or restyle the window after creation, and the non-client margin is
+hand-rolled (`SM_CXFRAME`x2 horizontally, `SM_CXFRAME`x2 + `SM_CYCAPTION` vertically, missing
+`SM_CXPADDEDBORDER`, which is where the undersized client area comes from).
 
 **Particles:** (see `role_subobjects_notes.md` §3)
 

@@ -14,6 +14,7 @@
 #include "Music.h"
 #include "Script.h"
 #include "ScriptQueue.h"
+#include "WindowPlacement.h"
 
 #include <cassert>
 #include <memory>
@@ -38,6 +39,10 @@ struct Subsystems {
   DebugSystem debug;       // DebugPrint* -> OutputDebugString
   GUISystem gui;           // ImGui/D3D overlay
   InputFixSystem inputfix; // suppress the vestigial DirectInput keyboard acquire
+  // Also patches an import gl.exe uses during WinMain, but unlike FileHookSystem
+  // it needs no particular position here: everything in this aggregate is built
+  // from DllMain, which runs before WinMain does.
+  WindowPlacementSystem window; // keep the game window clear of the taskbar
   CustomMenuSystem menus;   // front-end menu items owned by GkPlus
   ScriptQueueSystem queue;  // the script queue carries JSON, not bare .gcs names
   gls::GlsSystem gls;       // lets the GLS parser take a source text, not a file

@@ -100,6 +100,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/VkRenderer.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/VkResources.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Vfs.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/WindowPlacement.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/World.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/exports.def")
 target_link_libraries(GkPlus PRIVATE detours imgui::imgui d3d8to9 d3d9 qjs imgui-quickjs ws2_32 volk::volk_headers GPUOpen::VulkanMemoryAllocator Vulkan::Headers

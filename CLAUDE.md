@@ -140,8 +140,8 @@ Overlay configuration in `vcpkg-configuration.json`.
 
 `Subsystems` holds only the **hook-installing** subsystems — `FileHookSystem`,
 `d3d8::D3D8CaptureSystem`, `MusicSystem`, `DebugSystem`, `GUISystem`, `InputFixSystem`,
-`CustomMenuSystem`, `ScriptQueueSystem`, `gls::GlsSystem`, `CustomLevelSystem`,
-`ScriptSystem`.
+`CustomMenuSystem`, `WindowPlacementSystem`, `ScriptQueueSystem`, `gls::GlsSystem`,
+`CustomLevelSystem`, `ScriptSystem`.
 `FileHookSystem` is deliberately **first**: it patches gl.exe's file imports, and assets
 loaded during `WinMain` (before any other hook can fire) have to pass through it for a mod
 to replace them. `D3D8CaptureSystem` is second, and before `GUISystem` for a reason: it wraps
@@ -217,16 +217,20 @@ Each pair is a header of decompiled structs/enums plus native free-function decl
 `src/World` (sun angle/brightness/direction, ambient light and the fog state behind `FogSystem`,
 whose null-ness is the "is a level loaded" test),
 `src/Triggers`, `src/Console`, `src/Misc`, `src/Camera`, `src/Debug`, `src/GUI`, `src/InputFix`,
-`src/CustomMenu`, `src/ScriptQueue`, `src/CustomLevel`, `src/Script`, `src/Session` (starting a
+`src/CustomMenu`, `src/ScriptQueue`, `src/CustomLevel`, `src/Script`, `src/WindowPlacement`
+(the game window clear of the taskbar, see below), `src/Session` (starting a
 level without the menus, see below), `src/MakeRole` (native constructors, see below),
 `src/FileHooks` (mod loading, see below), `src/Render` (the AWAPI renderer, see below).
 `src/GLS.h/cpp` is the model the rest now follow. The behavioral-hook subsystems (`Music`, `Debug`,
-`GUI`, `InputFix`, `CustomMenu`, `ScriptQueue`, `GLS`, `CustomLevel`, `Script`, `FileHooks`) expose a
-`*System` RAII class constructed by `entry.cpp`; the others are pure struct + native-API.
+`GUI`, `InputFix`, `CustomMenu`, `WindowPlacement`, `ScriptQueue`, `GLS`, `CustomLevel`, `Script`,
+`FileHooks`) expose a `*System` RAII class constructed by `entry.cpp`; the others are pure struct +
+native-API.
 
-`FileHookSystem` is the one that does not resolve *offsets* at all: it patches gl.exe's import table
+`FileHookSystem` and `WindowPlacementSystem` are the two that do not resolve *offsets* at all.
+`FileHookSystem` patches gl.exe's import table
 and detours two functions in the exe's private CRT copy, and its lookup half (`src/Vfs`) touches no
-game memory whatsoever.
+game memory whatsoever. `WindowPlacementSystem` patches one more slot in the same table and reads
+nothing out of the game at all.
 
 `GlsSystem` is the odd one there: `src/GLS` is otherwise pure struct + native-API, and its single
 detour (`PushFileToParserStack`) exists only so `gls::ParseSource` can hand the parser a **source
@@ -297,6 +301,18 @@ later name wins. The interception is **gl.exe's import table**, not Detours on k
 what makes it non-recursive. `mod_loading_notes.md` has the five decisions that shape it and the
 three that are easy to get wrong later; `file_io_notes.md` sections 1 and 5 are the measurement -
 read those before touching either file.
+### The game window and the taskbar (`src/WindowPlacement.h/cpp`)
+
+`WinMain` @ 0x0046aef0 passes **literal 0, 0** as X/Y to both of the binary's `CreateWindowExA`
+sites — not `CW_USEDEFAULT`, not a centering computation — so a windowed-mode game sits under a
+taskbar docked to the left or top edge. The fix is one more IAT slot in the same table
+`FileHookSystem` patches: the windowed creation (the captioned, non-topmost one, still at 0,0) is
+redirected to the monitor's work-area origin, the fullscreen one is left alone, and the size is
+untouched. Nothing in the game undoes it — user32's import set has no `MoveWindow`,
+`SetWindowLongA`, `AdjustWindowRect` or `SetWindowPlacement` at all, and the single `SetWindowPos`
+passes `SWP_NOMOVE`. The addresses are in `address_map.md` under "Window and video mode"; the
+header carries the reasoning.
+
 ### The renderer's struct mirror (`src/Render.h/cpp`)
 
 Pure struct + native-API over AWAPI's own classes - no detours of GkPlus's own. It is the second
@@ -340,6 +356,7 @@ reference. Test invocations are under "Running the test suites" above.
 | `src/Repl.h/cpp` | The loopback JavaScript REPL: `StartRepl` / `PumpRepl` / `StopRepl`, owned by `BootScriptHost` rather than by `Subsystems` (it installs no detour). Off unless `GKPLUS_REPL_PORT` is set. See "The REPL channel" above |
 | `src/Session.h/cpp` | `StartLevel` / `QueueLevelStart` / `QueueReturnToMainMenu` — a level start with no menus and no briefing, deferred to the message loop. Installs no detour and has no `*System`: it registers `SetMessageLoopCallback` on first use. See "Starting a level programmatically" above |
 | `src/InputFix.h/cpp` | `InputFixSystem` - hook-only. Detours `AcquireDInputDevice` to suppress the vestigial DirectInput keyboard acquire and its `WH_KEYBOARD_LL` hook (see `input_notes.md`) |
+| `src/WindowPlacement.h/cpp` | `WindowPlacementSystem` - hook-only. Patches one IAT slot (`user32!CreateWindowExA`) so the windowed-mode window is created at the monitor's **work area** origin instead of the hardcoded 0,0 it would otherwise sit at, under a left- or top-docked taskbar. `GKPLUS_WINDOW_PLACEMENT=raw` restores the stock behaviour. See "The game window and the taskbar" below |
 | `src/ActorClasses.inc.h` | X-macro listing the 15 Actor subclasses: `GK_ACTOR_CLASS(Name, Parent, Predicate, Kind)`. Drives the JS class table, `kind`, the RTTI ladder and the prototype chain. **Must list every class before its own base** |
 | `src/Menus.inc.h` | X-macro listing all 36 Gunlok menus: `GUNLOK_MENU(Name, Id, TitleResourceId, "English title")`. There are no gaps - ids 11 and 14-20 are identified in `menu_system_notes.md`. Also counted into `gk::MenuCount` |
 | `imgui-quickjs/` | Static library: the ImGui bindings, linked into `d3d8.dll`. **Not a QuickJS module** — `js_imgui_new_namespace(ctx)` builds a plain object the host passes to `draw_gui`, since an ImGui call outside that frame does not work. `JS_SetPropertyFunctionList` handles the whole export list, `JS_DEF_CGETSET` included (see the QuickJS conventions) |
