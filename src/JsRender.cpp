@@ -1,10 +1,12 @@
-// The `render` namespace. Today it is the Phase 0b measurement surface for the Vulkan
-// renderer (vulkan_renderer_notes.md section 4) and nothing else - it reads the counters
-// src/D3D8Capture.cpp accumulates and can clear them. The eventual shape (post-process pass
-// registration, material override, draw-list introspection) is section 5 of that file.
+// The `render` namespace: the measurement surface for the Vulkan renderer
+// (vulkan_renderer_notes.md section 4), plus `material_override`, which is the first piece of
+// section 5's eventual shape (post-process pass registration, material override, draw-list
+// introspection) to exist.
 //
-// Everything here is read-only against the game: the capture layer forwards every call
-// unchanged, so nothing in this namespace can alter what is drawn.
+// Everything here reads or reconfigures **this renderer**, never the game: the capture layer
+// forwards every call to the original runtime unchanged, so nothing in this namespace can alter
+// what the game itself draws - `render.material_override` repaints the Vulkan frame and leaves
+// `GKPLUS_RENDERER=d3d8` and `d3d9` exactly as they were. That is what keeps the A/B honest.
 
 #include "D3D8Capture.h"
 #include "JsBindings.h"
@@ -222,6 +224,107 @@ JSValue ProbeQuad(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
   const bool alpha = argc > 4 && JS_ToBool(ctx, argv[4]) != 0;
   const std::string result = d3d8::ArmProbeQuad(name, scale, mipmap, offset, alpha);
   return JS_NewStringLen(ctx, result.data(), result.size());
+}
+
+// `render.material_override(name, spec)` - see SetMaterialOverride in VkDraw.h.
+//
+// `spec` null or absent removes the registration; anything else is
+// `{texture, tint: [r, g, b, a?], hide}`. It **returns the readback** rather than undefined,
+// because the one thing that can go wrong here is silent: a substring key that matches no live
+// image, or matches more than the author meant, is not an error and cannot be detected from the
+// call site. The answer says what it matched, now.
+JSValue MaterialOverrideFn(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+  if (argc < 1) {
+    return JS_ThrowTypeError(ctx, "material_override(name, spec) needs a texture name");
+  }
+  const char *text = JS_ToCString(ctx, argv[0]);
+  if (text == nullptr) {
+    return JS_EXCEPTION;
+  }
+  const std::string name = text;
+  JS_FreeCString(ctx, text);
+
+  if (argc < 2 || JS_IsNull(argv[1]) || JS_IsUndefined(argv[1])) {
+    vulkan::RemoveMaterialOverride(name);
+    const std::string result = vulkan::DescribeMaterialOverrides();
+    return JS_NewStringLen(ctx, result.data(), result.size());
+  }
+  if (!JS_IsObject(argv[1])) {
+    return JS_ThrowTypeError(ctx,
+                             "material_override(name, spec): spec is {texture, tint, hide} "
+                             "or null to remove");
+  }
+
+  vulkan::MaterialOverride over;
+  JSValue texture = JS_GetPropertyStr(ctx, argv[1], "texture");
+  if (JS_IsException(texture)) {
+    return JS_EXCEPTION;
+  }
+  if (!JS_IsUndefined(texture) && !JS_IsNull(texture)) {
+    const char *replacement = JS_ToCString(ctx, texture);
+    if (replacement == nullptr) {
+      JS_FreeValue(ctx, texture);
+      return JS_EXCEPTION;
+    }
+    over.texture = replacement;
+    JS_FreeCString(ctx, replacement);
+  }
+  JS_FreeValue(ctx, texture);
+
+  JSValue tint = JS_GetPropertyStr(ctx, argv[1], "tint");
+  if (JS_IsException(tint)) {
+    return JS_EXCEPTION;
+  }
+  if (!JS_IsUndefined(tint) && !JS_IsNull(tint)) {
+    // Three components or four; alpha defaults to opaque, since a tint given as a colour should
+    // not silently make a surface transparent.
+    for (int i = 0; i < 4; ++i) {
+      JSValue component = JS_GetPropertyUint32(ctx, tint, uint32_t(i));
+      if (JS_IsException(component)) {
+        JS_FreeValue(ctx, tint);
+        return JS_EXCEPTION;
+      }
+      if (JS_IsUndefined(component)) {
+        JS_FreeValue(ctx, component);
+        if (i < 3) {
+          JS_FreeValue(ctx, tint);
+          return JS_ThrowTypeError(ctx, "material_override: tint is [r, g, b] or [r, g, b, a]");
+        }
+        break;
+      }
+      double value = 1.0;
+      const int failed = JS_ToFloat64(ctx, &value, component);
+      JS_FreeValue(ctx, component);
+      if (failed != 0) {
+        JS_FreeValue(ctx, tint);
+        return JS_EXCEPTION;
+      }
+      over.tint[i] = static_cast<float>(value);
+    }
+  }
+  JS_FreeValue(ctx, tint);
+
+  JSValue hide = JS_GetPropertyStr(ctx, argv[1], "hide");
+  if (JS_IsException(hide)) {
+    return JS_EXCEPTION;
+  }
+  over.hide = JS_ToBool(ctx, hide) != 0;
+  JS_FreeValue(ctx, hide);
+
+  vulkan::SetMaterialOverride(name, over);
+  const std::string result = vulkan::DescribeMaterialOverrides();
+  return JS_NewStringLen(ctx, result.data(), result.size());
+}
+
+// `render.material_overrides` - every registration, with the live images each key matches.
+JSValue GetMaterialOverrides(JSContext *ctx, JSValueConst) {
+  const std::string text = vulkan::DescribeMaterialOverrides();
+  return JS_NewStringLen(ctx, text.data(), text.size());
+}
+
+JSValue ClearMaterialOverridesFn(JSContext *ctx, JSValueConst, int, JSValueConst *) {
+  vulkan::ClearMaterialOverrides();
+  return JS_UNDEFINED;
 }
 
 // `render.shade_mode` - honour D3DRS_SHADEMODE, or interpolate everything (VkDraw.h). Writable
@@ -774,6 +877,9 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("shade_mode", GetShadeMode, SetShadeModeValue),
     JS_CGETSET_DEF("force_lod", GetForceLod, SetForceLodValue),
     JS_CFUNC_DEF("probe", 5, ProbeQuad),
+    JS_CFUNC_DEF("material_override", 2, MaterialOverrideFn),
+    JS_CGETSET_DEF("material_overrides", GetMaterialOverrides, nullptr),
+    JS_CFUNC_DEF("clear_material_overrides", 0, ClearMaterialOverridesFn),
     JS_CGETSET_DEF("draw_range", GetDrawRange, SetDrawRangeValue),
     JS_CGETSET_DEF("draw_hide", GetDrawHide, SetDrawHideValue),
     JS_CGETSET_DEF("ref_range", GetRefRange, SetRefRangeValue),

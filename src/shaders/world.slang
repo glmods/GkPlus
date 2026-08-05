@@ -82,7 +82,10 @@ struct GpuMaterial {
     // pipeline count by the number of distinct references for nothing.
     uint flags;
     uint shading;        // D3DRS_SHADEMODE: 1 FLAT, anything else GOURAUD
-    uint pad0;
+    // The material override's tint, RGBA8 with R in bits 0..7. 0xffffffff for every material the
+    // game itself produces, which is the identity, so nothing here branches on whether an
+    // override exists.
+    uint tint;
 };
 
 static const uint kShadeFlat = 1u;
@@ -462,5 +465,14 @@ float4 fragment_main(VertexOut input) : SV_Target {
     // it rides its own varying instead of being folded into the diffuse. Zero unless the vertex
     // shader was asked for it, so this costs an add on draws that do not use it - level01 uses
     // none, which is how GKPLUS_NO_SPECULAR ruled it out as a gap (§4.20).
-    return float4(current.rgb + specular_in, current.a);
+    const float4 lit = float4(current.rgb + specular_in, current.a);
+
+    // The material override's tint, last: after the stages, after the alpha test and after the
+    // specular add. It is the only thing in this shader the game did not ask for, and it is
+    // deliberately not part of the fixed-function cascade - a mod tinting a surface should not
+    // have to know which stage its colour would have survived. Multiplying by an unpacked
+    // 0xffffffff is exactly 1.0 per channel, so the un-overridden path is bit-identical.
+    const float4 tint = float4(uint4(material.tint, material.tint >> 8, material.tint >> 16,
+                                     material.tint >> 24) & 0xffu) * (1.0 / 255.0);
+    return lit * tint;
 }

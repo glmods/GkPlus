@@ -158,7 +158,14 @@ struct GpuMaterial {
   // either way. Only FLAT and GOURAUD occur (§4.31); PHONG was never implemented by any D3D
   // driver, and the shader treats anything that is not 1 as GOURAUD.
   uint32_t shading = kShadeGouraud;
-  uint32_t pad0 = 0;
+  // The material override's tint, as RGBA8 - R in bits 0..7 through A in 24..31, so 0xffffffff
+  // is the identity and is what every material the game itself produces carries. Multiplied into
+  // the fragment's final colour, after the texture stages, the alpha test and the specular add
+  // (see SetMaterialOverride below).
+  //
+  // It occupies what was `pad0`, so it costs nothing: eleven useful words round up to 48 bytes
+  // either way, and the two structs stay byte-comparable.
+  uint32_t tint = 0xffffffffu;
 
   bool operator<(const GpuMaterial &other) const;
 };
@@ -336,7 +343,7 @@ struct DrawStats {
   // Distinct GpuMaterials interned this frame, and the high-water mark. The frame's material
   // slice holds kMaxDrawsPerFrame of them, so `materials` can never exceed `items`; how far
   // *below* it runs is the measurement that says whether a table was worth building, and it is
-  // also what a future material-override surface has to address by. `dropped_materials` is a
+  // also what the material-override surface addresses by. `dropped_materials` is a
   // draw the table could not take - unreachable by capacity, since the two limits agree, so a
   // non-zero reading means the scratch is unusable. Must be 0.
   uint64_t materials = 0;
@@ -345,6 +352,13 @@ struct DrawStats {
   // Draws the game asked for D3DSHADE_FLAT on. Not an invariant either way - it is the size of
   // the thing §4.31 implemented, and on level02 all of it is the stencil shadow.
   uint64_t flat_shaded_draws = 0;
+  // Draws a material override touched, and draws it removed. Neither is an invariant - both are
+  // 0 until a mod registers something - but they are the only way to tell "the override is
+  // registered and resolved" from "the frame actually draws with it". A key that matches an
+  // asset the camera cannot see resolves, reports its image and paints nothing, which is
+  // indistinguishable from a broken override without this (§4.44).
+  uint64_t overridden_draws = 0;
+  uint64_t hidden_draws = 0;
   // How often the viewport had to be reissued because a draw wanted a different depth slice.
   // Not an invariant - it is the size of the technique in §4.32, and a level where it reads 0
   // would be one where the engine never layers anything in front of the world.
@@ -462,6 +476,57 @@ bool HalfPixel();
 // it - ImGui's Vulkan backend sets its own viewport, and it is drawn for the human rather than
 // to match d3d9.
 float ViewportOrigin();
+
+// --- the material override --------------------------------------------------------------------
+//
+// What a mod says about every draw that samples one texture, and the first thing here that adds
+// something the game never had rather than reproducing something it does.
+//
+// **Keyed by the `.rim` asset name, because that is the identity a mod can write down.** A
+// bindless index is assigned at image creation and depends on load order; a wrapper pointer is
+// not even stable within a session. The name is what a mod author can see in `render.textures`
+// and put in a file, so it is what the table is addressed by - a case-insensitive *substring*
+// of the path the engine acquired the texture under, which is the same rule `render.probe` takes
+// (§4.35).
+//
+// **It is a rewrite of a material-table entry, not a per-draw interception**, which is what §2's
+// design was for. `GpuMaterial` is interned per frame from the D3D state (§4.30), so an override
+// applies where the material is built: 274 draws on level02 are 29 materials, and a texture
+// swapped here is swapped for every draw that shares one. The per-draw cost is one array lookup
+// by bindless index, and none at all while no override is registered.
+//
+// Three things one override can do, all resolved from the same key:
+//   - `texture` names another loaded image to sample *instead*, at whichever stage the original
+//     is bound to. The stage keeps its own sampler and its own colour/alpha ops: those are the
+//     game's choices about how the surface is shaded, and only the picture is being replaced.
+//   - `tint` multiplies the fragment's final colour, after the stages, the alpha test and the
+//     specular add. Applying it *after* the alpha test is deliberate - a tint that could change
+//     which fragments are discarded would move silhouettes, and cutting holes in geometry is not
+//     what a colour is for.
+//   - `hide` drops every draw whose stage-0 texture matches, before it reaches the frame's list.
+//
+// `tint` and `hide` key on the draw's **stage 0** texture, which is the surface's own identity;
+// `texture` applies at any stage, so replacing a lightmap works too. This is a Vulkan-renderer
+// feature and does nothing under `GKPLUS_RENDERER=d3d8` or `d3d9` - those forward to a runtime
+// that has never heard of it.
+struct MaterialOverride {
+  // A `.rim` substring naming the image to sample instead. Empty keeps the original.
+  std::string texture;
+  float tint[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+  bool hide = false;
+};
+
+// Registers or replaces the override for `name`. Insertion order is preserved and the first
+// matching key wins, so a later, broader key cannot silently take over from an earlier one.
+void SetMaterialOverride(const std::string &name, const MaterialOverride &over);
+// Removes one by its key, matched exactly (case-insensitively) rather than as a substring - the
+// key is a string the caller chose, so removing it should not depend on what it matched.
+bool RemoveMaterialOverride(const std::string &name);
+void ClearMaterialOverrides();
+// Every registered override, with the live images its key currently resolves to and what each
+// resolves *to*. The readback matters more here than for a diagnostic: a substring key can match
+// nothing, or match more than the author meant, and neither shows up as an error.
+std::string DescribeMaterialOverrides();
 
 uint64_t DepthImageView();
 uint64_t DepthImage();

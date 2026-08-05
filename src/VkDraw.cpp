@@ -5,6 +5,7 @@
 
 #include <volk.h>
 
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -473,10 +474,11 @@ bool PipelineState::operator<(const PipelineState &other) const {
   return std::memcmp(this, &other, sizeof(PipelineState)) < 0;
 }
 
-// Byte-comparable for the same reason PipelineState is: every member is a uint32_t and the two
-// explicit pads are always zero, so there is no padding the compiler chose and memcmp cannot
-// call two equal materials unequal. The pads exist for the shader's stride, and being part of
-// the key costs nothing because they never differ.
+// Byte-comparable for the same reason PipelineState is: every member is a uint32_t, so there is
+// no padding the compiler chose and memcmp cannot call two equal materials unequal. That holds
+// for `tint` too, which is why the override can key on a material rather than on a draw: two
+// draws of the same surface with the same tint intern to one entry, as they did before it
+// existed.
 bool GpuMaterial::operator<(const GpuMaterial &other) const {
   return std::memcmp(this, &other, sizeof(GpuMaterial)) < 0;
 }
@@ -554,6 +556,125 @@ void SnapshotWatched(const DrawItem &item) {
   WatchValid = true;
 }
 
+// --- the material override ----------------------------------------------------------------
+//
+// See SetMaterialOverride in VkDraw.h for what this is and why it is keyed by asset name. The
+// table here is the registration; `Resolved` is that table projected onto bindless indices, which
+// is the form the draw path can afford to consult.
+struct OverrideEntry {
+  std::string key;      // as given, for the readback
+  std::string lowered;  // ... and folded, for matching
+  MaterialOverride over;
+  std::string lowered_texture;
+};
+
+// A vector rather than a map: insertion order decides which of two matching keys wins, and
+// "first one registered" is the only rule a mod author can predict.
+std::vector<OverrideEntry> Overrides;
+
+struct ResolvedOverride {
+  uint32_t texture = kNoTexture; // the image to sample instead, kNoTexture to keep the original
+  uint32_t tint = 0xffffffffu;
+  bool hide = false;
+  bool any = false;
+  size_t owner = 0; // which registration claimed this image, for the readback
+};
+
+// Indexed by bindless slot. Empty whenever no override is registered, which is what makes the
+// whole feature free when nobody is using it.
+std::vector<ResolvedOverride> Resolved;
+uint64_t ResolvedGeneration = 0; // the TextureRegistryGeneration this was built against
+// Live images the keys matched. NOT Resolved.size(), which is the highest matching slot plus one:
+// the difference is invisible while one image matches and misleading as soon as two do.
+size_t ResolvedMatches = 0;
+
+std::string Lowered(const std::string &text) {
+  std::string out = text;
+  for (char &c : out) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return out;
+}
+
+uint32_t PackTint(const float (&rgba)[4]) {
+  uint32_t packed = 0;
+  for (int i = 0; i < 4; ++i) {
+    const float clamped = rgba[i] < 0.0f ? 0.0f : (rgba[i] > 1.0f ? 1.0f : rgba[i]);
+    // +0.5 and not truncation: 1.0 has to land on 255 exactly, or an identity tint would darken
+    // every surface it touched by one step and read as a shading defect.
+    packed |= static_cast<uint32_t>(clamped * 255.0f + 0.5f) << (8 * i);
+  }
+  return packed;
+}
+
+// The first image whose name contains `needle`, or kNoTexture. Substring and case-insensitive,
+// which is `render.probe`'s rule (§4.35) and is what makes `"water"` a usable key against
+// `bitmaps\water.rim`.
+uint32_t FindImageByName(const std::vector<TextureImageInfo> &images, const std::string &needle) {
+  if (needle.empty()) {
+    return kNoTexture;
+  }
+  for (const TextureImageInfo &image : images) {
+    if (Lowered(image.name).find(needle) != std::string::npos) {
+      return image.index;
+    }
+  }
+  return kNoTexture;
+}
+
+// Rebuilds `Resolved` from `Overrides` and the live image set. Called when either changes, never
+// per draw and never per frame while both are unchanged - which is what TextureRegistryGeneration
+// is for: an image created or named mid-level changes what a key matches, and nothing else does.
+void ResolveMaterialOverrides() {
+  Resolved.clear();
+  ResolvedMatches = 0;
+  ResolvedGeneration = TextureRegistryGeneration();
+  if (Overrides.empty()) {
+    return;
+  }
+  const std::vector<TextureImageInfo> images = TextureImages();
+  for (const TextureImageInfo &image : images) {
+    const std::string name = Lowered(image.name);
+    if (name.empty()) {
+      continue; // an image with no cache record behind it has no identity to key on
+    }
+    for (size_t i = 0; i < Overrides.size(); ++i) {
+      const OverrideEntry &entry = Overrides[i];
+      if (name.find(entry.lowered) == std::string::npos) {
+        continue;
+      }
+      if (Resolved.size() <= image.index) {
+        Resolved.resize(size_t(image.index) + 1);
+      }
+      ResolvedOverride &slot = Resolved[image.index];
+      if (!slot.any) {
+        ++ResolvedMatches;
+      }
+      slot.any = true;
+      slot.owner = i;
+      slot.tint = PackTint(entry.over.tint);
+      slot.hide = entry.over.hide;
+      slot.texture = FindImageByName(images, entry.lowered_texture);
+      break; // first registration wins; see the note on Overrides
+    }
+  }
+}
+
+const ResolvedOverride *OverrideFor(uint32_t texture_index) {
+  if (Resolved.empty() || texture_index >= Resolved.size() || !Resolved[texture_index].any) {
+    return nullptr;
+  }
+  return &Resolved[texture_index];
+}
+
+// Cheap enough to call per draw: a comparison against a counter, and a rebuild only when the
+// game has created, destroyed or named an image since the last one.
+void EnsureOverridesResolved() {
+  if (!Overrides.empty() && ResolvedGeneration != TextureRegistryGeneration()) {
+    ResolveMaterialOverrides();
+  }
+}
+
 // Interns one material into the frame's table and returns its index. kNoMaterial when the
 // slice is full, which the caller turns into a draw with no stages rather than no draw.
 constexpr uint32_t kNoMaterial = 0xffffffffu;
@@ -590,6 +711,33 @@ uint32_t InternMaterial(const DrawItem &item) {
     material.stage0_sampler = 0;
     material.stage0_color = 0;
     material.stage0_alpha = 0;
+  }
+
+  // The override, applied here because this is where a material becomes a table entry - one
+  // rewrite per distinct surface rather than one per draw. Keyed on the ORIGINAL stage-0 index,
+  // read before either stage is remapped, or an override naming its own replacement would key on
+  // whatever it had just swapped in.
+  if (!Resolved.empty()) {
+    bool touched = false;
+    if (const ResolvedOverride *over = OverrideFor(material.stage0_texture)) {
+      material.tint = over->tint;
+      touched = true;
+    }
+    for (uint32_t *stage : {&material.stage0_texture, &material.stage1_texture}) {
+      if (const ResolvedOverride *over = OverrideFor(*stage)) {
+        if (over->texture != kNoTexture) {
+          *stage = over->texture;
+          touched = true;
+        }
+      }
+    }
+    // Counted per draw and not per interned material, because the question it answers is "did
+    // the frame draw anything with this" - a key that matches an asset the camera cannot see
+    // resolves and reports its image exactly like one that is on screen, which cost most of a
+    // session's confusion the first time (see the tint measured at 0.000 in §4.44).
+    if (touched) {
+      ++TheStats.overridden_draws;
+    }
   }
 
   const auto found = InternedMaterials.find(material);
@@ -686,6 +834,102 @@ void SetShadeMode(bool enabled) { ShadeModeEnabled = enabled; }
 
 bool ShadeMode() { return ShadeModeEnabled; }
 
+// --- the material override, from the outside --------------------------------------------------
+//
+// All four resolve immediately rather than marking the table dirty, so an override registered on
+// a *paused* frame takes effect on the next one - which is where it will be judged, since a
+// paused frame is the only comparison sharp enough to see a small change (§4.28).
+
+void SetMaterialOverride(const std::string &name, const MaterialOverride &over) {
+  const std::string lowered = Lowered(name);
+  OverrideEntry entry;
+  entry.key = name;
+  entry.lowered = lowered;
+  entry.over = over;
+  entry.lowered_texture = Lowered(over.texture);
+  for (OverrideEntry &existing : Overrides) {
+    if (existing.lowered == lowered) {
+      // Replaced in place, so re-registering a key does not move it to the back of the
+      // first-match-wins order.
+      existing = entry;
+      ResolveMaterialOverrides();
+      return;
+    }
+  }
+  Overrides.push_back(entry);
+  ResolveMaterialOverrides();
+}
+
+bool RemoveMaterialOverride(const std::string &name) {
+  const std::string lowered = Lowered(name);
+  for (size_t i = 0; i < Overrides.size(); ++i) {
+    if (Overrides[i].lowered == lowered) {
+      Overrides.erase(Overrides.begin() + i);
+      ResolveMaterialOverrides();
+      return true;
+    }
+  }
+  return false;
+}
+
+void ClearMaterialOverrides() {
+  Overrides.clear();
+  ResolveMaterialOverrides();
+}
+
+std::string DescribeMaterialOverrides() {
+  EnsureOverridesResolved();
+  if (Overrides.empty()) {
+    return "no material overrides registered\n"
+           "  render.material_override(\"<.rim substring>\", {texture, tint, hide})\n";
+  }
+  std::string out;
+  char line[512];
+  auto add = [&](const char *fmt, auto... args) {
+    std::snprintf(line, sizeof(line), fmt, args...);
+    out += line;
+  };
+  const std::vector<TextureImageInfo> images = TextureImages();
+  for (size_t index = 0; index < Overrides.size(); ++index) {
+    const OverrideEntry &entry = Overrides[index];
+    const uint32_t tint = PackTint(entry.over.tint);
+    add("\"%s\"%s  tint %.3f %.3f %.3f %.3f%s\n", entry.key.c_str(),
+        entry.over.hide ? "  HIDDEN" : "", entry.over.tint[0], entry.over.tint[1],
+        entry.over.tint[2], entry.over.tint[3],
+        tint == 0xffffffffu ? " (identity)" : "");
+    if (!entry.over.texture.empty()) {
+      const uint32_t replacement = FindImageByName(images, entry.lowered_texture);
+      if (replacement == kNoTexture) {
+        add("  -> texture \"%s\": NO LIVE IMAGE MATCHES - the original is drawn\n",
+            entry.over.texture.c_str());
+      } else {
+        add("  -> texture \"%s\" = image %u\n", entry.over.texture.c_str(),
+            (unsigned)replacement);
+      }
+    }
+    // Every image the key matches, because a substring key matching nothing and one matching
+    // half the level look identical from the call site.
+    size_t matched = 0;
+    for (const TextureImageInfo &image : images) {
+      if (image.name.empty() || Lowered(image.name).find(entry.lowered) == std::string::npos) {
+        continue;
+      }
+      const bool mine = image.index < Resolved.size() && Resolved[image.index].any &&
+                        Resolved[image.index].owner == index;
+      add("     image %-4u %s%s\n", (unsigned)image.index, image.name.c_str(),
+          mine ? "" : "   (taken by an earlier key)");
+      ++matched;
+    }
+    if (matched == 0) {
+      out += "     MATCHES NOTHING - no live image's .rim path contains this\n";
+    }
+  }
+  add("%llu draws overridden, %llu hidden since the last render.reset()\n",
+      (unsigned long long)TheStats.overridden_draws,
+      (unsigned long long)TheStats.hidden_draws);
+  return out;
+}
+
 void SetHalfPixel(bool enabled) { HalfPixelEnabled = enabled; }
 
 bool HalfPixel() { return HalfPixelEnabled; }
@@ -702,6 +946,19 @@ void SubmitDraw(const DrawItem &item) {
   if (Items.size() >= kMaxDrawsPerFrame) {
     ++TheStats.dropped_over_capacity;
     return;
+  }
+  // Before the draw joins the list, and before its material is interned: a hidden draw should
+  // cost nothing and should leave no entry in a table that is read back as "what this frame
+  // draws". `PendingDrawIndex` still advances the same way, because the index a diagnostic was
+  // armed on is a position in the list, and skipping one shifts the rest either way.
+  EnsureOverridesResolved();
+  if (!Resolved.empty() && item.stage_count > 0) {
+    if (const ResolvedOverride *over = OverrideFor(item.stages[0].texture_index)) {
+      if (over->hide) {
+        ++TheStats.hidden_draws;
+        return;
+      }
+    }
   }
   Items.push_back(item);
   ++TheStats.submitted;
@@ -976,11 +1233,16 @@ std::string FormatDrawStats() {
   // skipped for a named reason; anything left over is a path that silently drops draws, which
   // is what §4.32 was. `skipped_no_slot` is the parent of its own breakdown, so the breakdown
   // is deliberately not added in again.
+  //
+  // `hidden_draws` is in the sum because a material override asking for a draw to be dropped is
+  // a named reason like any other - leaving it out would make the invariant read as broken by
+  // the one feature that drops draws on purpose, which is exactly how a real regression would
+  // stop being noticed.
   const uint64_t accounted =
       TheStats.submitted + TheStats.skipped_topology + TheStats.skipped_no_slot +
       TheStats.skipped_no_transform + TheStats.skipped_unconvertible +
       TheStats.skipped_scratch_full + TheStats.skipped_no_record +
-      TheStats.dropped_over_capacity + TheStats.dropped_materials;
+      TheStats.dropped_over_capacity + TheStats.dropped_materials + TheStats.hidden_draws;
   add("draw calls seen: %llu   submitted: %llu   unaccounted for: %lld (must be 0)\n",
       (unsigned long long)TheStats.seen, (unsigned long long)TheStats.submitted,
       (long long)TheStats.seen - (long long)accounted);
@@ -1033,6 +1295,16 @@ std::string FormatDrawStats() {
       (unsigned long long)TheStats.stage_texture_unresolved);
   add("dropped over capacity: %llu (must be 0)\n",
       (unsigned long long)TheStats.dropped_over_capacity);
+  // Printed only once something is registered, because 0/0/0 on every report would read as an
+  // invariant rather than as "nobody asked for anything". `render.material_overrides` is the
+  // reading that says what the keys matched; this one says whether the frame drew with them.
+  if (!Overrides.empty()) {
+    add("material overrides: %llu registered, %llu images matched, %llu draws overridden, "
+        "%llu hidden\n",
+        (unsigned long long)Overrides.size(), (unsigned long long)ResolvedMatches,
+        (unsigned long long)TheStats.overridden_draws,
+        (unsigned long long)TheStats.hidden_draws);
+  }
   return out;
 }
 

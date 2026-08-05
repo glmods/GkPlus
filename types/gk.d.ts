@@ -2095,8 +2095,69 @@ declare module "gk" {
     readonly [name: string]: Mod | undefined;
   };
 
+  // --- the Vulkan renderer ---------------------------------------------------
+
+  /** What a material override says about every draw that samples one texture.
+   *
+   *  Every field is optional; an override with none of them registers a key
+   *  that matches images and changes nothing, which is a legitimate way to ask
+   *  `render.material_overrides` what a key would match. */
+  export interface MaterialOverrideSpec {
+    /** A case-insensitive substring of another loaded texture's `.rim` path.
+     *  Draws sampling the overridden texture sample this one instead, at
+     *  whichever stage it was bound to; the stage keeps its own sampler and its
+     *  own colour and alpha operations. */
+    texture?: string;
+    /** `[r, g, b]` or `[r, g, b, a]` in 0..1, multiplied into the fragment's
+     *  final colour - after the texture stages, after the alpha test and after
+     *  specular. Applying it after the alpha test is deliberate: a tint that
+     *  could change which fragments are discarded would move silhouettes. */
+    tint?: [number, number, number] | [number, number, number, number];
+    /** Drop every draw whose *stage 0* texture matches. The draw never reaches
+     *  the frame's list, so nothing it would have painted appears - but a
+     *  stencil shadow cast by the same object is a separate draw with its own
+     *  texture and survives. */
+    hide?: boolean;
+  }
+
+  /** The Vulkan renderer, under `GKPLUS_RENDERER=vulkan`.
+   *
+   *  Only the material override is declared here. The rest of the namespace is
+   *  the measurement surface `vulkan_renderer_plan.md` documents - counters,
+   *  histograms, verifiers and bisect knobs - which moves with the
+   *  investigation in progress and would be stale in a `.d.ts` more often than
+   *  it was right; the index signature is what keeps it reachable and says
+   *  plainly that it is not typed.
+   *
+   *  Nothing here alters what the *game* draws: the capture layer forwards
+   *  every call to the original runtime unchanged, so an override repaints the
+   *  Vulkan frame and leaves `GKPLUS_RENDERER=d3d8` and `d3d9` untouched. */
+  export interface Render {
+    /** Register, replace or (with a null spec) remove the override for `name`,
+     *  a case-insensitive substring of a texture's `.rim` path.
+     *
+     *  Returns the readback rather than nothing, because the one thing that can
+     *  go wrong is silent: a substring matching no live image, or matching more
+     *  than was meant, is not an error and cannot be seen from the call.
+     *
+     *      render.material_override("gunlok_mk2", {tint: [1, 0, 1]});
+     *      render.material_override("gunlok_mk2", {texture: "hark_512"});
+     *      render.material_override("gunlok_mk2", null);
+     */
+    material_override(name: string, spec?: MaterialOverrideSpec | null): string;
+    /** Every registration, the live images each key matches, and how many draws
+     *  they have touched. A key that matches an asset the camera cannot see
+     *  resolves and reports exactly like one that is on screen - the draw
+     *  counts are what tell them apart. */
+    readonly material_overrides: string;
+    clear_material_overrides(): void;
+
+    [key: string]: any;
+  }
+
   // --- the module ------------------------------------------------------------
 
+  export const render: Render;
   export const camera: Camera;
   export const console: Console;
   export const actors: Actors;
@@ -2126,6 +2187,7 @@ declare module "gk" {
 
   /** The default export carries the same twenty-one objects: `gk.actors === actors`. */
   const gk: {
+    render: Render;
     camera: Camera;
     console: Console;
     actors: Actors;

@@ -196,6 +196,13 @@ void NameTextureImage(const TextureImage &image, const std::string &name);
 // what `render.textures` reports.
 std::vector<TextureImageInfo> TextureImages();
 
+// Bumped whenever an image is created, destroyed or named, i.e. whenever `TextureImages()` would
+// answer differently. It exists so a name-keyed table can be resolved to bindless indices once
+// and reused - the material override resolves ~300 names against a handful of keys, which is
+// nothing once, and is per-frame string work if the only way to know it is stale is to rebuild
+// it (see ResolveMaterialOverrides in VkDraw.cpp).
+uint64_t TextureRegistryGeneration();
+
 // --- the bindless descriptor set -------------------------------------------------------------
 //
 // One set for the whole renderer: a sampler array at binding 0 and a sampled-image array at

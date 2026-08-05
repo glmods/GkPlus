@@ -307,6 +307,9 @@ struct Image {
 // array directly.
 std::vector<Image> Images;
 std::vector<uint32_t> FreeImageIndices;
+// See TextureRegistryGeneration in VkResources.h: bumped by create, destroy and name, which are
+// the three things that change what a name-keyed lookup would resolve to.
+uint64_t ImageRegistryGeneration = 1;
 
 // --- the bindless set ------------------------------------------------------------------------
 //
@@ -1089,6 +1092,7 @@ bool CreateTextureImage(TextureImage &image, uint32_t width, uint32_t height, ui
 
   image.index = index;
   image.valid = true;
+  ++ImageRegistryGeneration;
   ++TheStats.images_live;
   ++TheStats.images_created;
   TheStats.image_bytes += entry.bytes;
@@ -1123,6 +1127,7 @@ void DestroyTextureImage(TextureImage &image) {
     --TheStats.images_live;
     entry = Image();
     FreeImageIndices.push_back(image.index);
+    ++ImageRegistryGeneration;
     // The descriptor is deliberately NOT cleared, and the reasoning matters for Phase 3.
     // PARTIALLY_BOUND makes a stale descriptor legal to *have*; what would be undefined is
     // reading one, and nothing can: a draw only ever names a slot through the texture the
@@ -1325,8 +1330,11 @@ uint64_t BindlessDescriptorSetLayout() {
 void NameTextureImage(const TextureImage &image, const std::string &name) {
   if (Ready && image.valid && image.index < Images.size() && Images[image.index].live) {
     Images[image.index].name = name;
+    ++ImageRegistryGeneration;
   }
 }
+
+uint64_t TextureRegistryGeneration() { return ImageRegistryGeneration; }
 
 std::vector<TextureImageInfo> TextureImages() {
   std::vector<TextureImageInfo> out;

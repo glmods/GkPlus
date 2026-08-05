@@ -3626,6 +3626,95 @@ sections were spent inside that assumption. The two questions that broke out of 
 this instrument reading?"** and **"can I ask the reference the same question?"** — and the second
 had a one-word answer for three sections, which is that nobody had built the switch.
 
+## 4.44 The material override: the first thing the bindless shape was for
+
+Everything up to here reproduces what Gunlok already drew. This is the first piece that draws
+something it never could: a mod names a `.rim` asset and says what should happen to every draw
+that samples it.
+
+**It is a rewrite of a material-table entry, not a per-draw interception**, which is the whole
+reason §4.30 built the table. `GpuMaterial` is interned per frame from the D3D state, and 274
+draws on level02 are 29 materials — so an override applies once where a material is built, and
+every draw sharing that surface follows. The per-draw cost is one array lookup by bindless index,
+and none at all while nothing is registered.
+
+### The key is the asset name, and a level reload is why
+
+A bindless index is assigned at image creation and depends on load order; a texture wrapper
+pointer is not stable even within a session. The name is the only identity a mod author can see
+(`render.textures`) and write in a file, so `render.material_override` takes a **case-insensitive
+substring of the `.rim` path** — `render.probe`'s rule (§4.35).
+
+That is not a convenience, and the measurement says so. With one override registered on
+`gunlok_mk2`, quitting level02 and loading it again re-resolved the same key from **image 34 to
+image 35**, and the tint reapplied to the same pixels (0.444 MAD over the same bounding box against
+0.445 before). An override written against a slot number would have silently moved onto whatever
+asset took slot 34.
+
+Resolution is name → index once, not per draw: `TextureRegistryGeneration()` (VkResources) is
+bumped by image create, destroy and name — the three things that change what a key matches — and
+the table is rebuilt only when it moves. That is what makes the reload case work with no hook of
+its own.
+
+### What one override can do, and what each is worth
+
+level02, settled, **paused**, `GKPLUS_RENDERER=vulkan`, against a baseline of 275 draws and 29
+materials a frame with `unaccounted for: 0`. The paused-frame floor is 0.000, so every number here
+is the feature and nothing else:
+
+| `render.material_override("gunlok_mk2", …)` | frame | MAD | bounding box |
+|---|---|---|---|
+| `{tint: [1, 0, 1]}` | 2.04% | 0.445 | (310,240)-(385,404) |
+| `{texture: "hark_512"}` | 2.19% | 0.781 | the same |
+| `{hide: true}` | 2.25% | 0.995 | the same |
+| `clear_material_overrides()` | **0.00%** | **0.000** | **none** |
+
+The bounding box is the player character and nothing else — the Elint unit beside him, the ground
+under him and the HUD are bit-identical in all three. The last row is the invariant that matters
+most: with no override registered the frame is bit-identical to the build before this existed,
+because an un-overridden material carries `tint = 0xffffffff` and multiplying by that is exactly
+1.0 per channel.
+
+Three properties fell out of the implementation rather than being designed, and each is worth
+knowing before using it:
+
+- **`texture` applies at any stage; `tint` and `hide` key on stage 0.** The replacement keeps the
+  original stage's sampler and its colour/alpha ops — only the picture changes — so swapping a
+  lightmap works the same way as swapping a skin. Tint and hide are properties of a *surface*, and
+  stage 0 is what identifies one.
+- **`tint` multiplies after the alpha test**, deliberately. A tint that could change which
+  fragments are discarded would move silhouettes, and cutting holes in geometry is not what a
+  colour is for. The cost is that `tint: […, 0]` does not make a surface vanish; `hide` does.
+- **`hide` drops the draw, not the object.** Hiding `gunlok_mk2` leaves the character's *head*
+  (a different asset, `gunloktestface_blue`) and its **stencil shadow**, which is three passes of
+  its own with no texture. The picture is honest about what a material is.
+
+`hidden_draws` is in the `seen == submitted + skips` reconciliation (§4.32). Leaving it out would
+make that invariant read as broken by the one feature that drops draws on purpose, which is
+exactly how a real regression stops being noticed.
+
+Invariants with an override active: `unaccounted for: 0`, validation clean, `verify_textures()`
+292/292, `verify_buffers()` 2952/2952, `dropped_materials` 0 and the same 29 materials a frame —
+an override rewrites an entry rather than adding one.
+
+### Two ways to think it is broken when it is not
+
+Both cost time in this session, and neither is about the renderer.
+
+- **An override that resolves, counts and paints nothing looks exactly like one that does not
+  work.** `render.material_override("city ruins ground 1_a", {tint: […]})` reported image 21
+  matched, `overridden_draws` climbed, and the frame was **0.000 different** — because those ~12
+  draws a frame are ground sections outside the view. Two readings separate the cases: the draw
+  counters say the frame drew *with* the material at all, and a key matching every named image
+  (`".rim"`) is the smoke test — it moved 86% of the frame, which proved the shader path before
+  any single asset was interrogated. `render.frame_draws()` names each draw's stage-0 asset, and
+  is the way to pick one that is actually on screen.
+- **Check the baseline is still the baseline before believing a difference.** After a long REPL
+  session the "paused" frame had drifted — camera z from 2.48 to 38.99, the scene black — and a
+  screenshot taken with `hide` registered was very nearly read as "hide removed the whole world".
+  It was the game, and re-shooting with every override cleared is what said so. §4.21's rule
+  ("pin the frame") is about two launches; this is the same rule inside one.
+
 ## 5. Fitting the project
 
 GkPlus is a modding framework with a JS layer, a VFS and a REPL; the renderer should join that

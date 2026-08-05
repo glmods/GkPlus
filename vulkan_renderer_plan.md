@@ -13,6 +13,12 @@ Vulkan, and **every draw the game issues reaches the renderer**. Against the **r
 settled, paused level02 frame the whole frame is **0.13/255**, against a cross-launch d3d8-vs-d3d8
 floor of **0.034** — and **93% of the frame is bit-identical** (§4.38).
 
+**And it now draws something the game never could.** `render.material_override(name, spec)` names a
+`.rim` asset and retextures, tints or hides every draw that samples it — a rewrite of one entry in
+the per-frame material table rather than a per-draw interception, which is what §4.30's table was
+built for (§4.44). Verified on level02 paused: each of the three confined to the player character's
+bounding box, and **removing the override restores the frame bit-identically**.
+
 **Compare against `GKPLUS_RENDERER=d3d8`, not d3d9** (§4.33). Windows 10 still ships a 32-bit
 `d3d8.dll` in SysWOW64, so that mode runs the game on the original runtime with the capture layer
 and the whole REPL harness intact — which is what makes the frame alignable, and a reference you
@@ -149,6 +155,7 @@ and still forwards every call to d3d8to9 so the A/B stays available.
 | **The last residual against the original** — 2.9 on an oblique decal, and what a player sees as "the junk pile looks wrong" | ✅ **found**: the game renders 640x480 into a 628x468 swapchain, so every 2D draw was rasterised 2% small and resampled (§4.37). Not mips (§4.34), not alignment or alpha (§4.35), and A4R4G4B4 was the contrast agent rather than the cause (§4.36) |
 | **An offscreen colour target at the backbuffer size, blitted to the swapchain** — the fix for it | ✅ §4.38 — whole frame 2.593 → **0.13** against a 0.034 cross-launch floor, **93% of it bit-identical**, the HUD panel 0.000 and the A4R4G4B4 probe quad **100% bit-exact** |
 | **The overlay in its own pass on the swapchain**, so it stays 1:1 with the window | ✅ §4.38 |
+| **The material override** — retexture, tint or hide by `.rim` name | ✅ §4.44 — the first feature the game never had; a key survives a level reload by re-resolving image 34 → 35, and clearing one restores the frame bit-identically |
 
 Steady state on level01, in level, under validation:
 
@@ -204,6 +211,10 @@ its re-upload experiment for that case. Earlier revisions of this block called i
 artefact and read the alternation as the evidence for that, which was the right shape and the wrong
 reason.
 
+There is no `material overrides:` line in either block, and that is the reading: `render.draws`
+prints it only once something is registered, so `0 registered, 0 matched, 0 overridden, 0 hidden`
+on every report would read as an invariant rather than as "nobody asked for anything" (§4.44).
+
 The cumulative figures scale with how long the run sat there; the **ratios and the zeros** are the
 invariant. `seen == submitted` and `unaccounted for: 0` are the two that say the frame is whole —
 they are what §4.32 added, and no other counter here can see a draw that was never offered.
@@ -240,14 +251,16 @@ Read these before changing the draw path; each cost real time to establish.
 
 In order, most visible first.
 
-1. **The material *override*, now that there is a table to override** (§5). `GpuMaterial` is
-   interned per frame from the D3D state (§4.30), so a mod hook is a rewrite of one entry rather
-   than a per-draw interception — and the key is the `.rim` name, which is the identity a mod can
-   write down. This is the first thing the bindless shape was for, and the first item here that
-   adds something the game never had.
-
-   **This is now the top item because nothing visible is known to be wrong.** §4.42 closed the
-   last one; if a new one is reported, the repro below is the shape to reach for.
+1. **Where a material override comes FROM** (§5). The override exists and is verified (§4.44), but
+   the only way to register one is `render.material_override` from a script or the REPL — so it is
+   a session-scoped experiment rather than something a mod ships. The rest of §5's shape is what
+   closes that: a manifest in `gkplus/mods/*.zip` read through `src/Vfs`, so an override arrives
+   with the assets it refers to, and — the bigger half — **a replacement texture loaded from the
+   mod rather than picked out of what the game already loaded**. Today `texture:` can only name
+   another live image, which is enough to prove the mechanism and not enough to reskin anything.
+   `utils/rimutil` already converts PNG → `.RIM` in both directions, and the VFS already serves a
+   `.rim` by name, so the missing piece is a texture the *capture layer* never saw: an image
+   created and uploaded by this side, holding a bindless slot of its own.
 
 2. **Re-audit what else a deferred readback has been vouching for** (§4.42). `verify_buffers` and
    `verify_textures` both read *now* and compare against what the game holds *now*, which is a
@@ -341,6 +354,7 @@ level02 when starting fresh.
 | `render.half_pixel` | run-time only, on by default: the D3D9 pixel-centre convention as a half-pixel viewport origin (§4.28). Off is the pre-§4.28 behaviour, and worth 1.34/255 over the whole frame |
 | `GKPLUS_VK_OFFSCREEN=0` / `render.offscreen` | on by default: rasterise the world at the **game's** backbuffer size into an offscreen target and blit it onto the swapchain, rather than drawing straight into the swapchain and letting the viewport scale every 2D draw (§4.37, §4.38). Off is the pre-§4.38 behaviour exactly, and worth **2.55/255 over 65% of the frame**. `render.vulkan_report` says which is running |
 | `render.present_linear` | run-time only, **off** by default: the filter for that final scale. NEAREST is a deduction, not a default — the original's own stretch preserves a 4-bit texture's sixteen distinct values, which a filtered downscale could not (§4.37) — and this is the A/B for it |
+| `render.material_override(name, spec)` | **not a diagnostic — the first mod-facing feature** (§4.44). `name` is a case-insensitive substring of a live texture's `.rim` path; `spec` is `{texture, tint: [r,g,b,a?], hide}` or null to remove. Returns the readback, because a substring key that matches nothing — or matches more than was meant — is not an error and cannot be seen from the call. `render.material_overrides` re-reads it, `render.clear_material_overrides()` empties it. **An override that resolves and paints nothing looks exactly like a broken one**: check `draws overridden` in `render.draws`, and pick a target off `render.frame_draws()` so it is one the camera can see |
 | `render.probe(name, scale, mipmap, offset, alpha)` | draw one textured quad through the capture device, so d3d8, d3d9 and vulkan all get the same draw with the scene's lighting, stages, blending and depth removed (§4.35). `name` is a substring of a live texture's `.rim` path, `scale` is screen pixels per texel; `render.probe(null)` disarms |
 | `render.ref_range` / `render.ref_hide` | **`draw_range`/`draw_hide` for the REFERENCE** (§4.42): a draw outside the range, or inside the hide window, is simply not forwarded. Works in `d3d8` and `d3d9` mode, which is the whole point — for three sections "this renderer draws a quad the original does not" could be established and not followed, because every follow-up question is a `draw_range` question and `draw_range` only existed for us |
 | `render.frame_draws([first, last])` | the capture layer's **own** draw list for the last complete frame — index, topology, primitives, FVF, buffered/user-pointer, blend, depth, cull, alpha test, depth slice, stage-0 `.rim` name. Mirror-side, so it works in every mode. It is what `ref_range` is aimed with: **an index does not carry between runs** (aiming at 222 because a `vulkan` session called the quad 222 landed on the HUD portraits), so find the draw by its signature in the mode you are in |
@@ -485,6 +499,12 @@ pixel.
 moving scene and vanished on a still one; §4.23 was perfectly stable — 60 consecutive menu
 captures were bit-identical with two draws rendering the wrong geometry throughout. Judge the
 picture against d3d9, not against the previous frame.
+
+**A paused frame stays pinned for a while, not forever — re-shoot the baseline before believing a
+difference.** After a long REPL session the level02 pause had drifted (camera z 2.48 → 38.99, the
+scene black), and a shot taken with a feature switched on was very nearly read as that feature
+blanking the world. Clearing it and re-shooting is one command and is what said otherwise (§4.44).
+The rule is §4.21's "pin the frame", applied inside a single launch rather than across two.
 
 **A paused frame cannot find a per-frame-data defect.** Pausing is what makes a comparison
 reproducible, and it is also what hides anything whose failure needs the allocation pattern to

@@ -29,6 +29,7 @@ import gk, {
   triggers,
   units,
   mods,
+  render,
   world,
 } from "gk";
 // @ts-expect-error - `menus` is not an export: it is only setup_menus'
@@ -715,3 +716,20 @@ if (mods["20-tweaks.zip"] !== undefined) {
 mods[0] = { name: "x", path: "y", archive: true, priority: 0 };
 // @ts-expect-error - `served` is a count the host owns
 mods.served = 0;
+
+// --- the Vulkan renderer's material override ---------------------------------
+
+const overrideReadback: string = render.material_override("gunlok_mk2", {
+  texture: "hark_512",
+  tint: [1, 0.25, 0.25],
+  hide: false,
+});
+render.material_override("bitmaps\water.rim", { tint: [0.2, 0.4, 1, 0.5] });
+render.material_override("gunlok_mk2", null);
+render.material_override("gunlok_mk2");
+const overrides: string = render.material_overrides;
+render.clear_material_overrides();
+// @ts-expect-error - a tint is [r, g, b] or [r, g, b, a], not a packed number
+render.material_override("gunlok_mk2", { tint: 0xff00ff });
+// @ts-expect-error - the readback is the host's
+render.material_overrides = "";
