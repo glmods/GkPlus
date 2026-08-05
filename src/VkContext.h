@@ -67,6 +67,12 @@ struct DeviceCaps {
   bool dynamic_rendering = false;
   bool synchronization2 = false;
 
+  // Vulkan 1.0 core and optional. Used only by the pre-transformed pipelines, which need D3D's
+  // clamp of an out-of-slice z rather than Vulkan's clip (notes §4.45). Not required: without
+  // it those draws clip where D3D clamps, which is one draw's worth of difference rather than
+  // a renderer that will not start.
+  bool depth_clamp = false;
+
   // Limits that size the design rather than merely describing the device.
   uint32_t max_bindless_textures = 0; // maxDescriptorSetUpdateAfterBindSampledImages
   uint32_t max_push_constants = 0;    // must fit FrameAddrs; 128 is the guaranteed minimum

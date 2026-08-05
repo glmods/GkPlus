@@ -308,6 +308,13 @@ block artifacts — at two to six times the size of a DXT file. **Compress textu
 ByteRun1, which 36 of the shipped textures use; turning it off writes the raw form that has been
 verified end to end in the running game.
 
+**One exception, and it is silent: a texture with graded (partial) alpha comes out opaque
+in-game.** The palettized form can only carry that alpha in an `ALPH` chunk, and Gunlok ignores
+the chunk — the file is correct, the engine drops it. Cut-outs are fine when every fully
+transparent texel sits on the same RGB, which is the usual case. If you need a soft alpha edge,
+convert that one texture with `utils\rimutil compress --format dxt3` instead; the addon cannot
+write DXT.
+
 "Changed only" re-reads the pixels and compares them against a digest taken at import, so it is
 about the *image*, not about whether Blender thinks the file is dirty — paint, save the `.blend`,
 reopen, and the edit is still recognised. An image the addon did not import has no digest and is

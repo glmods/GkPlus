@@ -305,6 +305,12 @@ void GetTopologies(bool &strips, bool &lines);
 void SetLightSum(bool enabled);
 bool GetLightSum();
 
+// The specular term of that sum on its own, which is the mirror image of `GKPLUS_NO_SPECULAR` -
+// that switch reaches only the forwarded call, so it removes the term from the reference and
+// this one removes it from us. Both are needed to compare bases (§4.46).
+void SetSpecular(bool enabled);
+bool GetSpecular();
+
 // True once the game has created its device through us.
 bool DeviceCreated();
 
@@ -418,6 +424,19 @@ bool PassthroughToSystemD3D8();
 // off never shows it.
 std::string ArmProbeQuad(const std::string &name, double scale, bool mipmap, double offset,
                          bool alpha);
+
+// Arm the depth probe: one opaque magenta XYZRHW quad drawn last, against a depth buffer cleared
+// to a known value under a known viewport slice. It settles whether D3D runs the viewport's
+// MinZ/MaxZ over a pre-transformed vertex - see the note on DepthProbeArmed in
+// D3D8CaptureInternal.h for the arithmetic and for why the answer decides `render.rhw_depth_raw`.
+// Returns what it armed and what each answer predicts, as text.
+std::string ArmDepthProbe(bool armed, double quad_z, double clear_z, double min_z, double max_z);
+
+// Arm the viewport-rectangle probe: one opaque magenta XYZRHW quad drawn last under a viewport
+// whose X/Y are not zero. It settles whether D3D adds those to a pre-transformed vertex - see the
+// note on ViewportProbeArmed in D3D8CaptureInternal.h. Returns what it armed and where each
+// answer puts the quad, as text.
+std::string ArmViewportProbe(bool armed, int32_t x, int32_t y, uint32_t width, uint32_t height);
 
 // `render.ref_range` / `render.ref_hide` - `vulkan::SetDrawRange` and `SetDrawHide` pointed at
 // the runtime this layer FORWARDS to, so the reference can be bisected the way the Vulkan list

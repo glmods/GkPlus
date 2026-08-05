@@ -100,6 +100,13 @@ extern std::set<uint64_t> ViewportDepthRanges;
 extern std::set<uint64_t> ViewportRects;
 extern uint32_t BackBufferWidth;
 extern uint32_t BackBufferHeight;
+extern uint32_t AutoDepthStencilFormat;
+extern bool AutoDepthStencilEnabled;
+
+// The camera in world space, from the view matrix. Declared here rather than left file-local
+// because the report reads it back off the device for a watched draw, and two copies of a
+// matrix inversion is exactly how the report and the shader would come to disagree.
+void StoreEye(float *out, const D3DMATRIX &view);
 extern ClearValues ClearState;
 extern std::set<uint32_t> MaterialKeys;
 extern std::set<uint32_t> PipelineKeys;
@@ -159,6 +166,11 @@ struct ShadowState {
   float viewport_max_z = 1.0f;
   uint32_t viewport_width = 0;
   uint32_t viewport_height = 0;
+  // ...and its rectangle. Zero for every draw of the world, which is why this went unrecorded
+  // for the whole of §4.1-§4.46 - but the upgrade screen sets 32,24 575x431, and a renderer that
+  // ignores it stretches that screen over the whole window (§4.47).
+  int32_t viewport_x = 0;
+  int32_t viewport_y = 0;
   // The fixed-function lighting state, kept for the same reason as the transforms: the
   // renderer has to reproduce it, and the only way to find out what the game asks for is to
   // record what it sets. D3D8 has eight hardware light slots and the recorder has never seen
@@ -271,6 +283,11 @@ struct LoggedDraw {
   uint32_t blend = 0, src_blend = 0, dest_blend = 0;
   uint32_t z_test = 0, z_write = 0, cull = 0, alpha_test = 0;
   float min_z = 0.0f, max_z = 0.0f;
+  // The viewport rectangle this draw was issued under. A column of its own because the frame
+  // list is what a wrongly-placed draw is chased through, and until §4.47 it could not show the
+  // one state that decides where a draw lands at all.
+  int32_t viewport_x = 0, viewport_y = 0;
+  uint32_t viewport_width = 0, viewport_height = 0;
   bool user_pointer = false;
   std::string texture;
 };
@@ -838,6 +855,8 @@ struct CaptureDevice final : Wrapper<IDirect3DDevice8> {
   // once, so the reference and this renderer are handed the same geometry, the same texture and
   // the same stage setup with nothing of the scene left in the way.
   void DrawProbeQuad();
+  void DrawDepthProbe();
+  void DrawViewportProbe();
 
   void EmitDrawUP(D3DPRIMITIVETYPE type, UINT primitive_count, const void *vertex_data,
                   UINT vertex_stride, const void *index_data, D3DFORMAT index_format,
@@ -865,9 +884,61 @@ inline float ProbeOffset = 0.0f;
 inline bool ProbeAlpha = false;
 inline RECT ProbeRect = {};
 
+// The depth probe (§4.45). It answers one question the API documentation does not settle and no
+// reading of Gunlok's own draws can: **does D3D run the viewport's MinZ/MaxZ over a
+// pre-transformed vertex, or is its z already the depth value?** Vulkan has no choice - the
+// viewport transform applies to every vertex - so if D3D skips it, every screen-space draw in
+// the frame is at the wrong depth here, and the two readings differ by `MinZ * (1 - z)`, which
+// is small enough to hide everywhere except where the game puts a layer just in front of a wall.
+//
+// It clears the depth buffer to `clear_z`, sets a viewport of `min_z..max_z`, and draws one
+// opaque XYZRHW quad at `quad_z` with ZFUNC LESS and no depth write. The two answers are a quad
+// that appears and a quad that does not, so the reading needs no precision at all:
+//
+//     clear 0.5, viewport 0.0..0.5, quad z 0.8
+//       viewport applied -> depth 0.40, passes LESS against 0.5 -> the quad is drawn
+//       viewport skipped -> depth 0.80, fails                   -> the quad is absent
+//
+// Armed with `render.depth_probe(...)` and drawn from Present alongside the texture probe, so it
+// goes down both paths at once and d3d8, d3d9 and vulkan all answer the same question.
+inline bool DepthProbeArmed = false;
+inline float DepthProbeQuadZ = 0.8f;
+inline float DepthProbeClearZ = 0.5f;
+inline float DepthProbeMinZ = 0.0f;
+inline float DepthProbeMaxZ = 0.5f;
+
+// The viewport-rectangle probe (§4.47), the depth probe's sibling and for the same reason: the
+// API documentation does not settle **whether D3D adds the viewport's X/Y to a pre-transformed
+// vertex**, and no reading of Gunlok's own draws can, because every viewport it set for the whole
+// life of this renderer was at 0,0 - where the two answers coincide.
+//
+// The upgrade screen is the first thing that sets a sub-rectangle (32,24 575x431), so the answer
+// now decides where every 2D draw on it lands. It draws one opaque magenta XYZRHW quad at fixed
+// screen pixels under a viewport of `x,y w*h`, and the reading is where the quad appears:
+//
+//     viewport 100,60 200x150, quad at (120,80)-(184,112)
+//       X/Y added   -> the quad is at (220,140)-(284,172)
+//       X/Y ignored -> the quad is at (120, 80)-(184,112)
+//
+// Both land inside the rectangle, so viewport *clipping* cannot turn one answer into the other -
+// which is the trap the depth probe's "keep the quad inside the slice" rule warns about.
+inline bool ViewportProbeArmed = false;
+inline int32_t ViewportProbeX = 100;
+inline int32_t ViewportProbeY = 60;
+inline uint32_t ViewportProbeWidth = 200;
+inline uint32_t ViewportProbeHeight = 150;
+
 
 inline int64_t VerifyDrawIndex = -1;
 inline std::string VerifyDrawReport;
+// The lighting inputs read **off the device** at the moment the watched draw was issued: the
+// material, the enabled lights, and the states that decide where each material colour comes
+// from. Separate from `VerifyDrawReport`, which only says whether the mirror *agrees* with the
+// device - a mirror can agree perfectly and the shader still be handed the wrong equation, and
+// until §4.46 there was no way to read the numbers a draw was actually lit with. `render.state`
+// prints the same things for the *last* draw of the frame, which for a level02 frame is the
+// text, not the geometry anyone is looking at.
+inline std::string VerifyDrawLighting;
 inline bool VerifyDrawValid = false;
 
 // What the watched draw was made of, snapshotted when it is issued. The buffers have to be

@@ -16,7 +16,7 @@ Shoot-Settled -Renderer vulkan -Level level02 -Out vk.png
 | script | what it is for |
 |---|---|
 | `launch-gunlok.ps1` | `Start-Gunlok`, `Focus-Gunlok`, `Repl`. Answers the modal `-skipfmv` dialog that blocks *before* the REPL listener opens, waits for the port, and takes the window foreground — a level load sticks at `game.state 18` otherwise |
-| `shot-gunlok.ps1` | `Get-GunlokShot`. `PrintWindow` with `PW_RENDERFULLCONTENT`, and `SetProcessDPIAware()` in the capturing process |
+| `shot-gunlok.ps1` | `Get-GunlokShot`. `PrintWindow` with flag **3**, and `SetProcessDPIAware()` in the capturing process |
 | `shoot-settled.ps1` | `Dismiss-Briefing`, `Wait-CameraRest`, `Shoot-Settled`. The whole procedure |
 | `find-draw.ps1` | `Find-Draw -X -Y -Count`: binary-searches `render.draw_hide` for the draw that painted a pixel |
 
@@ -33,8 +33,13 @@ Four things they encode, each of which produced a wrong answer first:
   keypress (`render.draws` sits at ~4 draws a frame). `Dismiss-Briefing` presses space *until
   `actors.count` is non-zero*, because when the briefing appears depends on how long the load took
   and a single press at a fixed delay lands before it exists about half the time.
-- **`PrintWindow` needs `PW_RENDERFULLCONTENT`,** or a swapchain window prints solid black — which
-  looks exactly like a renderer that is not drawing. And the capturing process must call
+- **`PrintWindow` needs flag 3, and both bits of it.** Without `PW_RENDERFULLCONTENT` (2) a
+  swapchain window prints solid black, which looks exactly like a renderer that is not drawing.
+  Without `PW_CLIENTONLY` (1) the whole window is rendered — title bar and border — into a bitmap
+  sized from `GetClientRect`, so the picture is pushed down and right and the bottom and right
+  edges of the frame fall off it. The script passed 2 alone until §4.47 and nobody noticed,
+  because the result still looks like a screenshot of a game in a window.
+  And the capturing process must call
   `SetProcessDPIAware()`: gl.exe is not DPI aware, so `GetClientRect` reports 418x312 against a
   real 628x468 swapchain and the bitmap silently keeps the top-left two thirds. The HUD is in the
   upper right and went missing from an entire session's screenshots.
@@ -49,3 +54,22 @@ camera values and the same 178 actors. Use `level01` only to reproduce a level01
 
 Kill `WerFault.exe` as well as `gl.exe` before rebuilding — WER holds the crashed process's handle
 to `d3d8.dll`, so `--target copy` fails with "Permission denied" long after the game is gone.
+
+## Reaching a screen that is not the world
+
+Some things worth comparing are behind a key press rather than behind the REPL, and the upgrade
+screen — the one §4.47 is about — is the awkward case. There is no `screen.*` command for it, so
+it is `keybd_event` into the focused window, and three things have to be right:
+
+- **Send the scancode as well as the virtual key.** Input arrives on `WM_KEYDOWN` and is mapped
+  VK → DIK (`input_notes.md`), and the bindings are in `<Gunlok>\scripts\GLkeys.cfg` as
+  name/scancode/modifier triples — DIK values, so 22 is `U` and 2 is `1`.
+- **Select a character first.** `U` alone does nothing; the screen is per unit. `1` is
+  "Select Gunlok" (scancode 2), then `U` is "Upgrade Screen" (scancode 22).
+- **Do not pause.** `screen.toggle_pause()` blocks the screen from opening at all, so this is the
+  one comparison that cannot use the pin-the-frame procedure. Take consecutive shots inside one
+  session and use a run-time toggle for the A/B instead; two shots of that screen with nothing
+  changed differ by 0.043 MAD, which is a good enough floor.
+
+`Escape` (VK 0x1B, scancode 1) opening the in-game menu is the cheap check that key input is
+reaching the game at all, before concluding that a particular binding is wrong.

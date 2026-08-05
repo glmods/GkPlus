@@ -5,7 +5,9 @@
 
 #include <volk.h>
 
+#include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -13,6 +15,7 @@
 
 #include "Core.h"
 #include "Shaders.gen.inc.h"
+#include "VkContext.h"
 #include "VkInternal.h"
 #include "VertexFormat.h"
 #include "VkResources.h"
@@ -335,6 +338,11 @@ VkPipeline CreatePipelineFor(const PipelineState &state) {
                                                            : VK_FRONT_FACE_CLOCKWISE;
   raster.polygonMode = VK_POLYGON_MODE_FILL;
   raster.lineWidth = 1.0f;
+  // See PipelineState::depth_clamp. Requested at device creation and near-universal on desktop,
+  // but not required: without it a pre-transformed draw whose z leaves its slice is clipped
+  // where D3D would have clamped it, which is the pre-§4.45 behaviour for that draw alone.
+  raster.depthClampEnable =
+      (state.depth_clamp != 0 && Caps().depth_clamp) ? VK_TRUE : VK_FALSE;
 
   VkPipelineMultisampleStateCreateInfo multisample = {
       VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
@@ -777,6 +785,14 @@ bool DrawReady() { return Ready; }
 // the two APIs, not a feature, so drawing without it is the wrong answer everywhere.
 namespace {
 bool HalfPixelEnabled = true;
+// See the note on SetRhwDepthRaw in VkDraw.h. Default on for the same reason `half_pixel` is:
+// D3D clamping a pre-transformed vertex's z instead of scaling it is a measured rule of the API
+// being reproduced, not a choice. Read from the capture layer at record time, not here.
+bool RhwDepthRawEnabled = true;
+// See the note on SetViewportRect in VkDraw.h. Default on for the same reason, and read from the
+// capture layer at record time for the same reason - the rectangle reaches both the DrawItem and
+// BuildMvp's origin term from there, and a toggle read here would move only one of them.
+bool ViewportRectEnabled = true;
 } // namespace
 
 void WatchDrawVertices(uint32_t index) {
@@ -936,6 +952,14 @@ bool HalfPixel() { return HalfPixelEnabled; }
 
 float ViewportOrigin() { return HalfPixelEnabled ? 0.5f : 0.0f; }
 
+void SetRhwDepthRaw(bool enabled) { RhwDepthRawEnabled = enabled; }
+
+bool RhwDepthRaw() { return RhwDepthRawEnabled; }
+
+void SetViewportRect(bool enabled) { ViewportRectEnabled = enabled; }
+
+bool ViewportRect() { return ViewportRectEnabled; }
+
 bool ResizeDraw(uint32_t width, uint32_t height) {
   return Ready ? CreateDepth(width, height) : false;
 }
@@ -1039,10 +1063,13 @@ void RecordDraws(void *command_buffer) {
   // three: the command buffer is fresh, so nothing carries over from the previous frame.
   uint32_t set_ref = UINT32_MAX, set_mask = 0, set_write_mask = 0;
   bool stencil_state_set = false;
-  // The viewport's depth slice, tracked the same way. VkRenderer has already set a full-range
-  // viewport for the frame; this reissues it whenever a draw wants a different slice, which on
-  // level03 is a handful of times a frame rather than per draw.
+  // The viewport, tracked the same way. VkRenderer has already set a full-target one for the
+  // frame; this reissues it whenever a draw wants a different depth slice - a handful of times a
+  // frame on level03 rather than per draw - or a different rectangle, which on the upgrade screen
+  // is once (§4.47). Started at values no draw can ask for, so the first draw always sets it.
   float set_min_depth = -1.0f, set_max_depth = -1.0f;
+  int32_t set_x = INT32_MIN, set_y = INT32_MIN;
+  uint32_t set_width = 0, set_height = 0;
   const float origin = ViewportOrigin();
 
   for (size_t index = 0; index < Items.size(); ++index) {
@@ -1088,16 +1115,48 @@ void RecordDraws(void *command_buffer) {
     }
     stencil_state_set = true;
 
-    if (item.min_depth != set_min_depth || item.max_depth != set_max_depth) {
-      const VkViewport viewport = {origin,
-                                   origin,
-                                   static_cast<float>(ViewportWidth),
-                                   static_cast<float>(ViewportHeight),
+    // A draw recorded before the game ever set a viewport has no rectangle; the render target is
+    // what every draw got before the rectangle was tracked at all, so it stays the fallback.
+    const int32_t item_x = item.viewport_width != 0 ? item.viewport_x : 0;
+    const int32_t item_y = item.viewport_width != 0 ? item.viewport_y : 0;
+    const uint32_t item_width = item.viewport_width != 0 ? item.viewport_width : ViewportWidth;
+    const uint32_t item_height = item.viewport_height != 0 ? item.viewport_height : ViewportHeight;
+    if (item.min_depth != set_min_depth || item.max_depth != set_max_depth ||
+        item_x != set_x || item_y != set_y || item_width != set_width ||
+        item_height != set_height) {
+      const VkViewport viewport = {static_cast<float>(item_x) + origin,
+                                   static_cast<float>(item_y) + origin,
+                                   static_cast<float>(item_width),
+                                   static_cast<float>(item_height),
                                    item.min_depth,
                                    item.max_depth};
       vkCmdSetViewport(cmd, 0, 1, &viewport);
+      // D3D clips to the rectangle and a Vulkan viewport does not, so the scissor is the other
+      // half of the same state - measured, not assumed (§4.47). Clamped to the render target
+      // because Vulkan rejects a scissor reaching past the framebuffer, where D3D's own
+      // validation would simply have refused the SetViewport.
+      // Written out rather than with std::min/max: <windows.h> is included here and defines both
+      // as macros, so the qualified calls do not even parse.
+      const auto clamp_span = [](int64_t origin, int64_t extent, int64_t limit) -> uint32_t {
+        const int64_t low = origin < 0 ? 0 : origin;
+        int64_t high = origin + extent;
+        if (high > limit) {
+          high = limit;
+        }
+        return high > low ? static_cast<uint32_t>(high - low) : 0u;
+      };
+      const int32_t sx = item_x < 0 ? 0 : item_x;
+      const int32_t sy = item_y < 0 ? 0 : item_y;
+      const uint32_t sw = clamp_span(item_x, item_width, ViewportWidth);
+      const uint32_t sh = clamp_span(item_y, item_height, ViewportHeight);
+      const VkRect2D scissor = {{sx, sy}, {sw, sh}};
+      vkCmdSetScissor(cmd, 0, 1, &scissor);
       set_min_depth = item.min_depth;
       set_max_depth = item.max_depth;
+      set_x = item_x;
+      set_y = item_y;
+      set_width = item_width;
+      set_height = item_height;
       ++TheStats.viewport_sets;
     }
 
@@ -1187,6 +1246,9 @@ std::string DescribeDraw(uint32_t index) {
       // and a draw in the wrong slice is drawn in front of things it should be behind - which
       // looks like a depth-test defect and is not one.
       "  alpha test func %u ref %u   shade %u   material %u   depth slice %.4f..%.4f\n"
+      // ...and the rectangle, which is the other half of the same viewport and decides WHERE the
+      // draw lands rather than how deep it is (§4.47).
+      "  viewport rect %d,%d %ux%u\n"
       "  %u stage(s):  0: tex %d sampler %u colour 0x%08x alpha 0x%08x\n"
       "                1: tex %d sampler %u colour 0x%08x alpha 0x%08x\n",
       index, static_cast<unsigned>(LastItems.size()), p.topology,
@@ -1197,7 +1259,8 @@ std::string DescribeDraw(uint32_t index) {
       p.cull_mode, p.colour_write, p.stencil_enable, p.stencil_func, p.stencil_fail,
       p.stencil_zfail, p.stencil_pass, d.stencil_ref, d.stencil_mask, d.stencil_write_mask,
       d.flags & 0x0fu, (d.flags >> 8) & 0xffu, d.shade_mode, d.material, d.min_depth,
-      d.max_depth, d.stage_count,
+      d.max_depth, d.viewport_x, d.viewport_y, d.viewport_width, d.viewport_height,
+      d.stage_count,
       d.stages[0].texture_index == kNoTexture ? -1 : (int)d.stages[0].texture_index,
       d.stages[0].sampler_index, d.stages[0].color, d.stages[0].alpha,
       d.stages[1].texture_index == kNoTexture ? -1 : (int)d.stages[1].texture_index,

@@ -142,6 +142,183 @@ void CaptureDevice::DrawProbeQuad() {
   EndScene();
 }
 
+// See the note on DepthProbeArmed in D3D8CaptureInternal.h. A quad that appears and a quad that
+// does not, which is the whole reading.
+void CaptureDevice::DrawDepthProbe() {
+  if (!DepthProbeArmed) {
+    return;
+  }
+  // The viewport rectangle has to be the one the scene uses, or the quad lands somewhere else -
+  // only the depth slice is under test here.
+  D3DVIEWPORT8 saved = {};
+  if (FAILED(GetViewport(&saved))) {
+    return;
+  }
+  D3DVIEWPORT8 probe = saved;
+  probe.MinZ = DepthProbeMinZ;
+  probe.MaxZ = DepthProbeMaxZ;
+
+  BeginScene();
+  SetViewport(&probe);
+  // Only the depth buffer, and **straight at the forwarded runtime**: the shadow's `Clear`
+  // records the frame's clear values for the Vulkan path's load ops, and a mid-frame clear
+  // recorded there would become the whole frame's depth clear. That also makes this a
+  // d3d8/d3d9 instrument by construction - under `vulkan` the quad still draws, but against
+  // whatever depth the scene left rather than against a known value, so read it in a
+  // reference mode. Which is the point: the question is what D3D does.
+  inner_->Clear(0, nullptr, D3DCLEAR_ZBUFFER, 0, DepthProbeClearZ, 0);
+  SetRenderState(D3DRS_LIGHTING, FALSE);
+  SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+  SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+  SetRenderState(D3DRS_STENCILENABLE, FALSE);
+  SetRenderState(D3DRS_FOGENABLE, FALSE);
+  SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+  SetRenderState(D3DRS_COLORWRITEENABLE, 0xf);
+  SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+  // No write, so the probe cannot change what the test it is measuring compares against.
+  SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+  SetRenderState(D3DRS_ZFUNC, D3DCMP_LESS);
+  SetTexture(0, nullptr);
+  SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+  SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+  SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+  SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+  SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+  SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+
+  struct ProbeVertex {
+    float x, y, z, rhw;
+    DWORD diffuse, specular;
+    float u, v;
+  };
+  static_assert(sizeof(ProbeVertex) == 32);
+  SetVertexShader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_SPECULAR | D3DFVF_TEX1);
+  // Bottom-left, clear of the texture probe at (16, 16) and of Gunlok's own HUD.
+  const float x0 = 16.0f, y0 = 340.0f, x1 = 144.0f, y1 = 436.0f;
+  const float z = DepthProbeQuadZ;
+  const ProbeVertex quad[4] = {
+      {x0, y0, z, 1.0f, 0xffff00ff, 0, 0.0f, 0.0f},
+      {x1, y0, z, 1.0f, 0xffff00ff, 0, 1.0f, 0.0f},
+      {x0, y1, z, 1.0f, 0xffff00ff, 0, 0.0f, 1.0f},
+      {x1, y1, z, 1.0f, 0xffff00ff, 0, 1.0f, 1.0f},
+  };
+  DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(ProbeVertex));
+  SetViewport(&saved);
+  EndScene();
+}
+
+// See the note on ViewportProbeArmed in D3D8CaptureInternal.h. Where the quad appears is the
+// whole reading, and both answers put it inside the rectangle so clipping cannot fake either.
+void CaptureDevice::DrawViewportProbe() {
+  if (!ViewportProbeArmed) {
+    return;
+  }
+  D3DVIEWPORT8 saved = {};
+  if (FAILED(GetViewport(&saved))) {
+    return;
+  }
+  D3DVIEWPORT8 probe = saved;
+  probe.X = static_cast<DWORD>(ViewportProbeX);
+  probe.Y = static_cast<DWORD>(ViewportProbeY);
+  probe.Width = ViewportProbeWidth;
+  probe.Height = ViewportProbeHeight;
+  probe.MinZ = 0.0f;
+  probe.MaxZ = 1.0f;
+
+  BeginScene();
+  SetViewport(&probe);
+  SetRenderState(D3DRS_LIGHTING, FALSE);
+  SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+  SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+  SetRenderState(D3DRS_ZENABLE, FALSE);
+  SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+  SetRenderState(D3DRS_STENCILENABLE, FALSE);
+  SetRenderState(D3DRS_FOGENABLE, FALSE);
+  SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+  SetRenderState(D3DRS_COLORWRITEENABLE, 0xf);
+  SetTexture(0, nullptr);
+  SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+  SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+  SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+  SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+  SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+  SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+
+  struct ProbeVertex {
+    float x, y, z, rhw;
+    DWORD diffuse, specular;
+    float u, v;
+  };
+  static_assert(sizeof(ProbeVertex) == 32);
+  SetVertexShader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_SPECULAR | D3DFVF_TEX1);
+  // 20 px in from the rectangle's own origin, so the quad sits well inside it under either
+  // answer and a whole rectangle's width apart between them.
+  const float x0 = static_cast<float>(ViewportProbeX) + 20.0f;
+  const float y0 = static_cast<float>(ViewportProbeY) + 20.0f;
+  const float x1 = x0 + 64.0f, y1 = y0 + 32.0f;
+  const ProbeVertex quad[4] = {
+      {x0, y0, 0.5f, 1.0f, 0xffff00ff, 0, 0.0f, 0.0f},
+      {x1, y0, 0.5f, 1.0f, 0xffff00ff, 0, 1.0f, 0.0f},
+      {x0, y1, 0.5f, 1.0f, 0xffff00ff, 0, 0.0f, 1.0f},
+      {x1, y1, 0.5f, 1.0f, 0xffff00ff, 0, 1.0f, 1.0f},
+  };
+  DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(ProbeVertex));
+  SetViewport(&saved);
+  EndScene();
+}
+
+std::string ArmViewportProbe(bool armed, int32_t x, int32_t y, uint32_t width,
+                             uint32_t height) {
+  ViewportProbeArmed = armed;
+  if (width > 0 && height > 0) {
+    ViewportProbeX = x;
+    ViewportProbeY = y;
+    ViewportProbeWidth = width;
+    ViewportProbeHeight = height;
+  }
+  if (!armed) {
+    return "viewport probe off";
+  }
+  const float qx = static_cast<float>(ViewportProbeX) + 20.0f;
+  const float qy = static_cast<float>(ViewportProbeY) + 20.0f;
+  char line[320];
+  std::snprintf(line, sizeof(line),
+                "viewport probe: rect %d,%d %ux%u, magenta XYZRHW quad at (%.0f,%.0f)-(%.0f,%.0f)\n"
+                "  X/Y added   -> the quad is at (%.0f,%.0f)-(%.0f,%.0f)\n"
+                "  X/Y ignored -> the quad is at (%.0f,%.0f)-(%.0f,%.0f)\n"
+                "read it in d3d8, not vulkan: the question is what D3D does",
+                ViewportProbeX, ViewportProbeY, ViewportProbeWidth, ViewportProbeHeight, qx, qy,
+                qx + 64.0f, qy + 32.0f, qx + ViewportProbeX, qy + ViewportProbeY,
+                qx + ViewportProbeX + 64.0f, qy + ViewportProbeY + 32.0f, qx, qy, qx + 64.0f,
+                qy + 32.0f);
+  return line;
+}
+
+std::string ArmDepthProbe(bool armed, double quad_z, double clear_z, double min_z,
+                          double max_z) {
+  DepthProbeArmed = armed;
+  DepthProbeQuadZ = static_cast<float>(quad_z);
+  DepthProbeClearZ = static_cast<float>(clear_z);
+  DepthProbeMinZ = static_cast<float>(min_z);
+  DepthProbeMaxZ = static_cast<float>(max_z);
+  if (!armed) {
+    return "depth probe off";
+  }
+  const float scaled = DepthProbeMinZ + (DepthProbeMaxZ - DepthProbeMinZ) * DepthProbeQuadZ;
+  char text[512];
+  std::snprintf(text, sizeof(text),
+                "depth probe armed: magenta quad at 16,340..144,436  z %.4f  viewport "
+                "%.4f..%.4f  depth cleared to %.4f, ZFUNC LESS\n"
+                "  if the viewport transform APPLIES to a pre-transformed vertex: depth %.4f "
+                "-> quad %s\n"
+                "  if the vertex z IS the depth value:                             depth %.4f "
+                "-> quad %s\n",
+                DepthProbeQuadZ, DepthProbeMinZ, DepthProbeMaxZ, DepthProbeClearZ, scaled,
+                scaled < DepthProbeClearZ ? "DRAWN" : "absent", DepthProbeQuadZ,
+                DepthProbeQuadZ < DepthProbeClearZ ? "DRAWN" : "absent");
+  return text;
+}
+
 // --- verifying the shadow against the device --------------------------------------------------
 //
 // The mirror is the whole basis of this renderer - every draw is described by what the shadow
@@ -349,12 +526,16 @@ std::string CompareShadowToDevice(CaptureDevice *capture) {
   D3DVIEWPORT8 viewport = {};
   if (SUCCEEDED(device->GetViewport(&viewport))) {
     ++checked;
-    if (viewport.Width != State.viewport_width || viewport.Height != State.viewport_height ||
+    if (static_cast<int32_t>(viewport.X) != State.viewport_x ||
+        static_cast<int32_t>(viewport.Y) != State.viewport_y ||
+        viewport.Width != State.viewport_width || viewport.Height != State.viewport_height ||
         viewport.MinZ != State.viewport_min_z || viewport.MaxZ != State.viewport_max_z) {
       ++bad;
-      add("  viewport                   mirror %ux%u %.4f..%.4f  device %ux%u %.4f..%.4f\n",
-          State.viewport_width, State.viewport_height, State.viewport_min_z,
-          State.viewport_max_z, viewport.Width, viewport.Height, viewport.MinZ, viewport.MaxZ);
+      add("  viewport                   mirror %d,%d %ux%u %.4f..%.4f  "
+          "device %u,%u %ux%u %.4f..%.4f\n",
+          State.viewport_x, State.viewport_y, State.viewport_width, State.viewport_height,
+          State.viewport_min_z, State.viewport_max_z, viewport.X, viewport.Y, viewport.Width,
+          viewport.Height, viewport.MinZ, viewport.MaxZ);
     }
   }
 
@@ -440,6 +621,85 @@ std::string CompareShadowToDevice(CaptureDevice *capture) {
   return std::string(header) + out;
 }
 
+// The lighting equation's inputs, read off the device at the moment a draw is issued. See the
+// note on VerifyDrawLighting in D3D8CaptureInternal.h for why this is not the same question as
+// "does the mirror match".
+std::string DescribeDeviceLighting(CaptureDevice *capture) {
+  IDirect3DDevice8 *device = capture->inner_;
+  std::string out;
+  char line[320];
+  auto add = [&](const char *fmt, auto... args) {
+    std::snprintf(line, sizeof(line), fmt, args...);
+    out += line;
+  };
+  auto state_of = [&](D3DRENDERSTATETYPE which) {
+    DWORD value = 0;
+    return SUCCEEDED(device->GetRenderState(which, &value)) ? static_cast<uint32_t>(value) : 0u;
+  };
+
+  // The four *MATERIALSOURCE states decide whether each C* below is the material's colour or a
+  // vertex's, and D3D falls back to the material when the FVF does not carry the one named -
+  // which for D3DMCS_COLOR2 (the default for specular) it usually does not.
+  add("  SPECULARENABLE %u  LOCALVIEWER %u  COLORVERTEX %u  NORMALIZENORMALS %u  LIGHTING %u\n",
+      state_of(D3DRS_SPECULARENABLE), state_of(D3DRS_LOCALVIEWER), state_of(D3DRS_COLORVERTEX),
+      state_of(D3DRS_NORMALIZENORMALS), state_of(D3DRS_LIGHTING));
+  add("  material sources: diffuse %u  specular %u  ambient %u  emissive %u   (0 material, 1 "
+      "COLOR1, 2 COLOR2)\n",
+      state_of(D3DRS_DIFFUSEMATERIALSOURCE), state_of(D3DRS_SPECULARMATERIALSOURCE),
+      state_of(D3DRS_AMBIENTMATERIALSOURCE), state_of(D3DRS_EMISSIVEMATERIALSOURCE));
+  add("  FVF 0x%03x   global ambient 0x%08x\n", State.fvf, state_of(D3DRS_AMBIENT));
+
+  D3DMATERIAL8 material = {};
+  if (SUCCEEDED(device->GetMaterial(&material))) {
+    // **Power is the field to read first.** It is the exponent on N.H, so it is the one input
+    // whose effect over a broad surface is a multiplier rather than a tint, and the report in
+    // `render.state` shows only whatever the frame's last SetMaterial left behind.
+    add("  material: diffuse %.2f %.2f %.2f %.2f  ambient %.2f %.2f %.2f\n", material.Diffuse.r,
+        material.Diffuse.g, material.Diffuse.b, material.Diffuse.a, material.Ambient.r,
+        material.Ambient.g, material.Ambient.b);
+    add("            specular %.2f %.2f %.2f  POWER %.3f  emissive %.2f %.2f %.2f\n",
+        material.Specular.r, material.Specular.g, material.Specular.b, material.Power,
+        material.Emissive.r, material.Emissive.g, material.Emissive.b);
+  }
+
+  D3DMATRIX view = {};
+  if (SUCCEEDED(device->GetTransform(D3DTS_VIEW, &view))) {
+    float eye[4] = {};
+    StoreEye(eye, view);
+    add("  eye (world) %.3f %.3f %.3f\n", eye[0], eye[1], eye[2]);
+    // The matrix it came from. StoreEye assumes the view is RIGID - rotation plus translation -
+    // and inverts it by transposing the 3x3 and carrying the translation back through it. That
+    // assumption is worth printing rather than trusting: a scale or a shear in the view makes
+    // the transpose not the inverse, and the resulting eye is wrong by an amount too small to
+    // see in anything except a grazing specular term.
+    for (int row = 0; row < 4; ++row) {
+      add("    view[%d] %9.5f %9.5f %9.5f %9.5f\n", row, view.m[row][0], view.m[row][1],
+          view.m[row][2], view.m[row][3]);
+    }
+  }
+
+  uint32_t enabled_count = 0;
+  for (uint32_t i = 0; i < kLights; ++i) {
+    BOOL enabled = FALSE;
+    if (FAILED(device->GetLightEnable(i, &enabled)) || !enabled) {
+      continue;
+    }
+    D3DLIGHT8 light = {};
+    if (FAILED(device->GetLight(i, &light))) {
+      continue;
+    }
+    ++enabled_count;
+    add("  light %u ON type %u  diffuse %.2f %.2f %.2f  specular %.2f %.2f %.2f\n", i,
+        (unsigned)light.Type, light.Diffuse.r, light.Diffuse.g, light.Diffuse.b,
+        light.Specular.r, light.Specular.g, light.Specular.b);
+    add("          position %.2f %.2f %.2f  range %.2f  atten %.4f %.4f %.4f\n",
+        light.Position.x, light.Position.y, light.Position.z, light.Range, light.Attenuation0,
+        light.Attenuation1, light.Attenuation2);
+  }
+  add("  %u lights enabled at this draw\n", enabled_count);
+  return out;
+}
+
 // The armed per-draw form. Rewritten every frame the index comes round, so the report is always
 // the most recent one - which is what makes it usable on a frame that is not paused.
 
@@ -452,6 +712,7 @@ void MaybeVerifyStateForDraw(CaptureDevice *capture, const vulkan::DrawItem &ite
     return;
   }
   VerifyDrawReport = CompareShadowToDevice(capture);
+  VerifyDrawLighting = DescribeDeviceLighting(capture);
   VerifyDrawValid = true;
   VerifyDrawGeometry.valid = true;
   VerifyDrawGeometry.item = item;
@@ -651,6 +912,10 @@ void LogDraw(D3DPRIMITIVETYPE type, bool user_pointer, uint32_t primitives) {
   entry.alpha_test = State.render_states[D3DRS_ALPHATESTENABLE];
   entry.min_z = State.viewport_min_z;
   entry.max_z = State.viewport_max_z;
+  entry.viewport_x = State.viewport_x;
+  entry.viewport_y = State.viewport_y;
+  entry.viewport_width = State.viewport_width;
+  entry.viewport_height = State.viewport_height;
   entry.user_pointer = user_pointer;
   IDirect3DBaseTexture8 *const bound = State.textures[0];
   if (bound != nullptr && LiveTextureWrappers.count(bound) != 0) {
@@ -706,7 +971,8 @@ std::string DescribeWatchedDrawState() {
            "GKPLUS_RENDERER=vulkan, since it indexes the Vulkan draw list\n";
   }
   return "draw " + std::to_string(VerifyDrawIndex) +
-         ", device state at the moment it was issued:\n" + VerifyDrawReport;
+         ", device state at the moment it was issued:\n" + VerifyDrawReport +
+         "lighting inputs at that draw, read off the device:\n" + VerifyDrawLighting;
 }
 
 // What the watched draw actually pulled, both sides: the indices and vertices the shader reads
@@ -939,15 +1205,18 @@ std::string FormatFrameDraws(uint32_t first, uint32_t last) {
   add("%u draws in the last complete frame%s\n", (unsigned)DrawLogLastFrame.size(),
       DrawLogLastFrame.size() >= 8192 ? "  (LOG FULL - the tail is missing)" : "");
   out += "  idx  type prims  fvf   from  blend src dst   z zw cull atest  depth slice   "
-         "stage 0 texture\n";
+         "viewport rect     stage 0 texture\n";
   for (const LoggedDraw &draw : DrawLogLastFrame) {
     if (draw.index < first || draw.index > last) {
       continue;
     }
-    add("  %4u  %4u %5u  0x%03x  %s  %5u %3u %3u  %2u %2u %4u %5u  %.4f..%.4f  %s\n",
+    char rect[32];
+    std::snprintf(rect, sizeof(rect), "%d,%d %ux%u", draw.viewport_x, draw.viewport_y,
+                  draw.viewport_width, draw.viewport_height);
+    add("  %4u  %4u %5u  0x%03x  %s  %5u %3u %3u  %2u %2u %4u %5u  %.4f..%.4f  %-16s  %s\n",
         draw.index, draw.type, draw.primitives, draw.fvf, draw.user_pointer ? "ptr" : "buf",
         draw.blend, draw.src_blend, draw.dest_blend, draw.z_test, draw.z_write, draw.cull,
-        draw.alpha_test, draw.min_z, draw.max_z, draw.texture.c_str());
+        draw.alpha_test, draw.min_z, draw.max_z, rect, draw.texture.c_str());
   }
   return out;
 }
@@ -1440,13 +1709,12 @@ std::string FormatShadowState() {
     out += "\n";
   }
 
-  add("viewport: %ux%u  depth range %.4f..%.4f   distinct ranges ever set: %u%s\n",
-      State.viewport_width, State.viewport_height, State.viewport_min_z, State.viewport_max_z,
-      (unsigned)ViewportDepthRanges.size(),
-      ViewportDepthRanges.size() > 1 || State.viewport_min_z != 0.0f ||
-              State.viewport_max_z != 1.0f
-          ? "   <== the renderer hardcodes 0..1"
-          : "");
+  // Both halves of the live viewport. The depth slice rides on the DrawItem since §4.32 and the
+  // rectangle since §4.47, so neither carries a "the renderer ignores this" marker any more -
+  // what is worth seeing is the values, and the per-rectangle marker below.
+  add("viewport: %d,%d %ux%u  depth range %.4f..%.4f   distinct ranges ever set: %u\n",
+      State.viewport_x, State.viewport_y, State.viewport_width, State.viewport_height,
+      State.viewport_min_z, State.viewport_max_z, (unsigned)ViewportDepthRanges.size());
   for (const uint64_t range : ViewportDepthRanges) {
     float min_z = 0.0f, max_z = 0.0f;
     const uint32_t min_bits = uint32_t(range >> 32), max_bits = uint32_t(range);
@@ -1454,16 +1722,35 @@ std::string FormatShadowState() {
     std::memcpy(&max_z, &max_bits, sizeof(max_z));
     add("    %.4f .. %.4f\n", min_z, max_z);
   }
-  // The rectangle, separately from the depth slice, because they answer different questions and
-  // only one of them is per draw. The render target is sized from the backbuffer and the world
-  // pass sets one viewport over all of it, which is right exactly while this reads one rectangle
-  // covering the whole backbuffer (§4.37/§4.38).
+  // The rectangle, separately from the depth slice, because they answer different questions.
+  // Both are per draw now (§4.47): the render target is sized from the backbuffer, and a draw's
+  // own rectangle becomes the Vulkan viewport and scissor. A rectangle that is not the whole
+  // backbuffer is still worth marking - the offscreen target's SIZE assumes the backbuffer
+  // (§4.37/§4.38), so the marker says which draws are the ones to check a scaling defect against
+  // rather than announcing something unimplemented.
   {
     uint32_t bb_width = 0, bb_height = 0;
     const bool known = BackBufferExtent(bb_width, bb_height);
     add("backbuffer: %ux%u%s   distinct viewport rects ever set: %u\n", bb_width, bb_height,
         known ? "" : " (unset - windowed D3D takes the client area)",
         (unsigned)ViewportRects.size());
+    // The depth buffer the game asked D3D for. It belongs next to the size because it is the
+    // other property of the target this renderer has to match rather than choose: the depth
+    // test compares quantised values, so a layer authored a hair in front of a wall can pass
+    // in 16 bits and fail in 32 (§4.45).
+    const char *depth_name = "?";
+    switch (AutoDepthStencilFormat) {
+    case 80: depth_name = "D3DFMT_D16"; break;
+    case 79: depth_name = "D3DFMT_D24X4S4"; break;
+    case 77: depth_name = "D3DFMT_D24X8"; break;
+    case 75: depth_name = "D3DFMT_D24S8"; break;
+    case 73: depth_name = "D3DFMT_D15S1"; break;
+    case 71: depth_name = "D3DFMT_D32"; break;
+    case 0:  depth_name = "none"; break;
+    default: break;
+    }
+    add("depth buffer the game asked for: %s (%u)%s\n", depth_name, AutoDepthStencilFormat,
+        AutoDepthStencilEnabled ? "" : "   <== EnableAutoDepthStencil is FALSE");
     // What the Vulkan path has to clear its own attachments to. Printed because getting it wrong
     // is invisible where the world covers the frame and looks like a translucency defect where it
     // does not - a blended draw over the background blends against this.
@@ -1477,7 +1764,7 @@ std::string FormatShadowState() {
       const uint32_t w = uint32_t(rect >> 16) & 0xffff, h = uint32_t(rect) & 0xffff;
       add("    %u,%u %ux%u%s\n", x, y, w, h,
           (x != 0 || y != 0 || (known && (w != bb_width || h != bb_height)))
-              ? "   <== not the whole backbuffer; the world pass assumes it is"
+              ? "   <== a sub-rectangle; honoured per draw since §4.47"
               : "");
     }
   }

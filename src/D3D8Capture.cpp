@@ -95,6 +95,12 @@ bool SkipStateDefaults = false;
 // build's behaviour exactly - so the two can be compared on ONE paused frame instead of across
 // two launches, where the noise floor is 8.06/255 and buries the effect (§4.21).
 bool DrawLightSum = true;
+// The specular half of that sum, separately, through `render.specular`. It exists because
+// GKPLUS_NO_SPECULAR only reaches the FORWARDED call, so until now the term could be removed
+// from the reference or from this renderer but never from one frame of each - and "we add
+// specular the original does not" reads identically to "we add three times as much of it"
+// unless both bases can be compared (§4.46).
+bool SpecularEnabled = true;
 
 void ReadWrapMode() {
   char value[16] = {};
@@ -425,6 +431,15 @@ std::set<uint64_t> ViewportRects;
 // which case there is nothing to correct for and the swapchain extent is already right.
 uint32_t BackBufferWidth = 0;
 uint32_t BackBufferHeight = 0;
+
+// The depth/stencil format CreateDevice (or the last Reset) asked for, and whether it asked for
+// one at all. **A precision figure, not a bookkeeping one**: the depth test compares quantised
+// values, so a scene the game authors to be a hair in front of a wall resolves differently in a
+// 16-bit buffer than in a 32-bit float one, and an effect layer can pass in the original and
+// fail here for no reason visible in any state (notes §4.45). D3DFMT_D16 is 80, D24S8 75,
+// D24X8 77, D32 71, D15S1 73, D24X4S4 79.
+uint32_t AutoDepthStencilFormat = 0;
+bool AutoDepthStencilEnabled = false;
 
 // What the game last cleared the whole backbuffer to. See CaptureDevice::Clear.
 ClearValues ClearState;
@@ -1064,9 +1079,13 @@ HRESULT STDMETHODCALLTYPE CaptureD3D8::CreateDevice(
   if (pPresentationParameters != nullptr) {
     BackBufferWidth = pPresentationParameters->BackBufferWidth;
     BackBufferHeight = pPresentationParameters->BackBufferHeight;
+    AutoDepthStencilEnabled = pPresentationParameters->EnableAutoDepthStencil != FALSE;
+    AutoDepthStencilFormat =
+        static_cast<uint32_t>(pPresentationParameters->AutoDepthStencilFormat);
   }
   DebugWrite("gkplus: d3d8 capture device created, backbuffer " +
-             std::to_string(BackBufferWidth) + "x" + std::to_string(BackBufferHeight) + "\n");
+             std::to_string(BackBufferWidth) + "x" + std::to_string(BackBufferHeight) +
+             ", depth format " + std::to_string(AutoDepthStencilFormat) + "\n");
   auto *const captured = new CaptureDevice(device, this);
   // hDeviceWindow wins where it is set: hFocusWindow is allowed to be null for a windowed
   // device, and D3D uses hDeviceWindow as the presentation target.
@@ -1342,6 +1361,8 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::Present(const RECT *pSourceRect,
   // scene d3d8/d3d9 present. It is the last draw either way, which is what makes it unoccluded
   // without needing the depth buffer disabled for anything but itself.
   DrawProbeQuad();
+  DrawDepthProbe();
+  DrawViewportProbe();
 
   if (vulkan::RendererRequested()) {
     if (!vulkan::RendererReady()) {
@@ -1437,6 +1458,8 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::SetTransform(D3DTRANSFORMSTATETYPE Stat
 HRESULT STDMETHODCALLTYPE CaptureDevice::SetViewport(const D3DVIEWPORT8 *pViewport) {
   NoteBlockState();
   if (pViewport != nullptr) {
+    State.viewport_x = static_cast<int32_t>(pViewport->X);
+    State.viewport_y = static_cast<int32_t>(pViewport->Y);
     State.viewport_width = pViewport->Width;
     State.viewport_height = pViewport->Height;
     State.viewport_min_z = pViewport->MinZ;
@@ -1782,13 +1805,61 @@ bool BuildMvp(uint32_t fvf, float *out) {
     if (width <= 0.0f || height <= 0.0f) {
       return false;
     }
+    // The depth row undoes the viewport transform Vulkan is about to apply, because D3D does
+    // not apply one here at all: a pre-transformed vertex's z **is** the depth value, clamped
+    // to the viewport's MinZ..MaxZ, with no scale and no bias. Measured with `render.depth_probe`
+    // against the real D3D8 runtime, in both directions, with z inside the slice and outside it
+    // (notes §4.45) - the API documentation does not settle it and every reading of Gunlok's own
+    // draws is consistent with either answer.
+    //
+    // Vulkan has no bypass: `minDepth + z_ndc * (maxDepth - minDepth)` runs over every vertex a
+    // pipeline rasterises. Feeding it `(z - MinZ) / (MaxZ - MinZ)` makes it hand back `z`, and
+    // carries the clamp for free - a z outside the slice leaves [0,1] in NDC, which is exactly
+    // the case `depthClampEnable` turns into D3D's clamp instead of a clip. See
+    // PipelineState::depth_clamp.
+    //
+    // A degenerate slice (MaxZ == MinZ, which level03's backdrop pass uses) needs no
+    // compensation and cannot have one: Vulkan collapses every depth onto the single value,
+    // which is what clamping to it would have produced anyway.
+    float depth_scale = 1.0f;
+    float depth_bias = 0.0f;
+    const float span = State.viewport_max_z - State.viewport_min_z;
+    if (vulkan::RhwDepthRaw() && span > 0.0f) {
+      depth_scale = 1.0f / span;
+      depth_bias = -State.viewport_min_z / span;
+    }
     // Pixels to clip. No Y flip: D3D screen space and Vulkan clip space both have Y growing
     // downwards, so this one is the same in both - it is the 3D path that needs the flip.
+    //
+    // The viewport's origin is SUBTRACTED, because D3D does not add it: a pre-transformed
+    // vertex's x and y are absolute screen pixels and the rectangle only clips them. Measured
+    // with `render.viewport_probe` against the real D3D8 runtime - the same quad drawn under
+    // 0,0 200x150 and under 100,60 200x150 moves by exactly the 100,60 its own coordinates
+    // moved by, not by twice that (notes §4.47). Vulkan has no bypass here either: its viewport
+    // transform will add the rectangle's origin back, and these two terms are what cancel it, so
+    // a vertex at pixel p lands on pixel p whatever rectangle is set. The 3D path needs no such
+    // compensation - there the origin genuinely applies, and Vulkan applies it the same way.
+    const float origin_x =
+        vulkan::ViewportRect() ? static_cast<float>(State.viewport_x) : 0.0f;
+    const float origin_y =
+        vulkan::ViewportRect() ? static_cast<float>(State.viewport_y) : 0.0f;
     const float m[16] = {
-        2.0f / width, 0.0f,           0.0f, 0.0f,
-        0.0f,         2.0f / height,  0.0f, 0.0f,
-        0.0f,         0.0f,           1.0f, 0.0f,
-        -1.0f,        -1.0f,          0.0f, 1.0f,
+        2.0f / width,
+        0.0f,
+        0.0f,
+        0.0f,
+        0.0f,
+        2.0f / height,
+        0.0f,
+        0.0f,
+        0.0f,
+        0.0f,
+        depth_scale,
+        0.0f,
+        -1.0f - 2.0f * origin_x / width,
+        -1.0f - 2.0f * origin_y / height,
+        depth_bias,
+        1.0f,
     };
     std::memcpy(out, m, sizeof(m));
     return true;
@@ -1917,6 +1988,23 @@ void ResolvePipeline(vulkan::DrawItem &item, D3DPRIMITIVETYPE type) {
   // front of the world (§4.32). Dynamic state on the Vulkan side, like the stencil reference.
   item.min_depth = State.viewport_min_z;
   item.max_depth = State.viewport_max_z;
+  // ...and its rectangle, for the same reason and from the same call (§4.47). Left at zero when
+  // `render.viewport_rect` is off, which is what RecordDraws reads as "no rectangle" and answers
+  // with the whole render target - the pre-§4.47 behaviour exactly.
+  if (vulkan::ViewportRect()) {
+    item.viewport_x = State.viewport_x;
+    item.viewport_y = State.viewport_y;
+    item.viewport_width = State.viewport_width;
+    item.viewport_height = State.viewport_height;
+  }
+  // ...and whether the slice applies to this draw the way Vulkan would apply it. It does not
+  // for a pre-transformed one: D3D skips the viewport transform for D3DFVF_XYZRHW and clamps
+  // instead, so BuildMvp compensates for the scale and this asks for the clamp. The two are
+  // one decision read off `State.fvf` twice, and they have to agree - a compensated matrix
+  // without the clamp turns D3D's clamp into a clip, which is what §4.45's first cut did to
+  // the HUD.
+  const bool pre_transformed = (State.fvf & 0x004u) == 0x004u;
+  item.pipeline.depth_clamp = (pre_transformed && vulkan::RhwDepthRaw()) ? 1u : 0u;
 }
 
 // What fixed-function lighting turns this draw's vertex colour into, for the ONE case the
@@ -2186,7 +2274,12 @@ bool BuildDrawRecord(vulkan::DrawItem &item, const float *mvp, uint64_t frame) {
   if (State.render_states[D3DRS_NORMALIZENORMALS] != 0) {
     lighting |= vulkan::kNormaliseNormals;
   }
-  if (State.render_states[D3DRS_SPECULARENABLE] != 0) {
+  // `render.specular` is the mirror image of GKPLUS_NO_SPECULAR, which forces the state off in
+  // the FORWARDED call only. Without both, the specular term can be removed from the reference
+  // or from this renderer but never from the same frame of each, so "we add specular the
+  // original does not" and "we add more of it than the original does" cannot be told apart
+  // (§4.46).
+  if (State.render_states[D3DRS_SPECULARENABLE] != 0 && SpecularEnabled) {
     lighting |= vulkan::kSpecularEnable;
   }
   if (State.render_states[D3DRS_COLORVERTEX] != 0) {
@@ -2669,6 +2762,10 @@ void GetTopologies(bool &strips, bool &lines) {
   lines = DrawLines;
 }
 
+
+void SetSpecular(bool enabled) { SpecularEnabled = enabled; }
+
+bool GetSpecular() { return SpecularEnabled; }
 
 void SetLightSum(bool enabled) { DrawLightSum = enabled; }
 

@@ -1184,6 +1184,13 @@ their own `engine_type`/`flags` (see `SHPPOLYS` above), which is where transluce
 the expectation is that DXT3-vs-DXT1 is a storage decision only. The load path is traced; the
 draw path is not.
 
+**This rule has teeth on the uncompressed path, and it is where a `BODY` + `ALPH` texture loses
+its alpha.** `Use32BitTextures` is 0 by default and its only toggle is menu 19, which
+`menu_system_notes.md` lists as unreachable - so `A8R8G8B8` is never available in a retail
+build, and an uncompressed image declaring `alpha_bits = 8` has nowhere to land. The measured
+consequence is under "The engine does not honour an `ALPH` you write" below: such a texture
+loads fully opaque rather than failing. A compressed `DXT3` surface is unaffected.
+
 ### `BMHD` - the header
 
 The standard 20-byte ILBM BitMapHeader, unmodified. Offsets are into the chunk body; the
@@ -1245,7 +1252,12 @@ earlier revision of this file attributed the 19 planes to `tree_alpha`, which co
 `ceil(log2(entries))` rule two paragraphs down; the rule is right and holds for all 65
 base-level `BODY` variants.)
 
-Two things make this a fallback rather than the obvious choice:
+Three things make this a fallback rather than the obvious choice:
+
+- **It cannot carry graded alpha at all.** The `ALPH` chunk that would hold it is ignored by the
+  engine, measured - see "The engine does not honour an `ALPH` you write" below. `masking = 2`
+  is the only palettized alpha that survives, and it covers a cut-out whose transparent texels
+  all share one RGB and nothing else.
 
 - **The cost scales with distinct colours, and the worst case beats raw RGBA.** A 1024x1024
   image with a unique colour per pixel needs 20 planes: 2.5 MB of indices plus 3 MB of palette,
@@ -1258,8 +1270,8 @@ Two things make this a fallback rather than the obvious choice:
   landing in R5G6B5 is still 16-bit output. The 32-bit candidates are gated on
   `Use32BitTextures`, which is a user setting the file cannot influence.
 
-So `BODY` is the right tool for *losslessness* (and for avoiding a DXT compressor entirely),
-not for cheap photographic fidelity.
+So `BODY` is the right tool for *losslessness* of an opaque image (and for avoiding a DXT
+compressor entirely), not for cheap photographic fidelity and not for alpha.
 - **`BODY` is planar, MSB-first** (`IffBodyDecodeScanline` @ 0x005e0a30). One scanline is
   `nPlanes` consecutive plane-rows; plane row *p* contributes bit *p* of each pixel's palette
   index, most significant pixel first within each byte:
@@ -1305,21 +1317,50 @@ Its presence is what routes `RimConvertRows` to the two alpha-aware converters, 
 `RimImage+0x50` = `ALPH.bits`. On the `S3TC` path that field is set from the fourcc instead
 (`DXT1` -> 0, otherwise 8).
 
-**Open question: whether an `ALPH` inside a `PROP:ILBM` is found at all.** The only shipped
-`ALPH` is in the `PROP` of `Ground\tree_alpha.RIM`, but `RimOpenAndScan` looks it up with
-`IffChunk_FindChild` against the `ILBM`. Whether IFF `PROP` properties are merged into that
-lookup scope has not been read out of the binary. It does not affect writing a file - put
-`ALPH` in the `FORM` and the question is moot - but it does decide whether that one texture
-gets its alpha. The same doubt applies to `TRAN`, and there it is academic: every shipped
-`TRAN` body is eight zero bytes, and `RimBindImageChunks` gates the colour key on the first
-byte being non-zero, so no shipped file applies one either way.
+#### The engine does not honour an `ALPH` you write - measured
+
+**A `BODY` + `ALPH` texture loads fully opaque, and an `ALPH` in the `FORM` does not fix it.**
+This is measured in the running game, and it contradicts what this section used to say:
+
+- `Units\alpha junk.RIM` re-encoded with `rimutil compress --format body` decodes back
+  byte-identically (md5-equal PNGs) and renders **wrong**: the front end's menu-selection
+  lozenge, a soft blob in that atlas drawn `SRCALPHA`/`INVSRCALPHA`, comes out as its own
+  opaque bounding rectangle.
+- Re-encoding the *same pixels* with the alpha channel flattened to a uniform 128 produces a
+  **pixel-identical frame**. The `ALPH` never reaches the surface at all - this is not
+  quantisation to 1 bit.
+- The same PNG through `--format dxt3` matches stock exactly, so it is the chunk and not the
+  missing mip chain (`rimutil` writes an empty `LIST:MIPM` either way).
+- `rimutil` puts its `ALPH` in the `FORM`, not the `PROP`.
+
+The likely mechanism is the alpha-depth rule above: an *uncompressed* image with
+`alpha_bits >= 2` admits only `A8R8G8B8`, which is gated on `Use32BitTextures` - 0 by default,
+and its only toggle is menu 19, which `menu_system_notes.md` lists as unreachable. DXT3 escapes
+it by being a *compressed* surface. **Not verified**; what is verified is the outcome.
+
+So the `PROP`-vs-`FORM` question is still open and is no longer the interesting one: `ALPH` in
+the `FORM` is found or not, but either way the alpha does not survive. The only shipped `ALPH`
+is in the `PROP` of `Ground\tree_alpha.RIM`, and `RimOpenAndScan` looks it up with
+`IffChunk_FindChild` against the `ILBM`; whether IFF `PROP` properties are merged into that
+lookup scope has not been read out of the binary. The same doubt applies to `TRAN`, and there it
+is academic: every shipped `TRAN` body is eight zero bytes, and `RimBindImageChunks` gates the
+colour key on the first byte being non-zero, so no shipped file applies one either way.
+
+**What this means for a writer:** graded alpha has to go through `S3TC`/`DXT3`. `masking = 2` is
+the only palettized alpha that works, and it only covers a cut-out whose transparent texels all
+share one RGB. `utils/rimutil` enforces exactly that - `--format body` refuses graded alpha
+outright and warns on a cut-out that would need an `ALPH` (the same construct, presumed equally
+broken, not measured).
 
 `blender/io_scene_rif/rim.py` reads **both** paths and writes the palettized one, exercised over
 all 513 by `blender/tests/test_rim.py`. Writing needs no DXT compressor - which the addon could
 not carry, being dependency-free - because a `BMHD` + `CMAP` + planar `BODY` with `CONT = 0` is a
 configuration the shipped files already use, and one palette entry per distinct colour makes it
 exactly lossless. It emits the same bytes `utils/rimutil` does for the same image, raw and
-ByteRun1 alike, so the two writers can be diffed rather than each trusted alone.
+ByteRun1 alike, so the two writers can be diffed rather than each trusted alone. **It carries no
+equivalent of `rimutil`'s refusal**, so a graded-alpha texture written by the addon and served to
+the game has the defect above; the round-trip test cannot see it, because the file is correct and
+the engine is what drops the alpha.
 
 ### Confirmed in the running game
 
@@ -1342,9 +1383,19 @@ The set exercised the interesting paths as well as the ordinary one: `Units\alph
 graded alpha and therefore round-tripped through an `ALPH` chunk, and the palettes ranged from
 1,851 to 59,746 entries (11 to 16 bitplanes).
 
-One thing this did *not* cover: a `masking = 2` transparent index, which none of level01's
-textures needed. That path is covered by the synthetic cases in `utils/rimutil/tests` but has
-not been seen by the engine.
+**That `ALPH` claim was wrong, and this measurement is why it survived.** It compared static
+*geometry* against a baseline camera and never looked at an alpha blend. `alpha junk`'s alpha is
+1-bit almost everywhere, and the quads that use it in a level are additive (`SRCALPHA`/`ONE`)
+over black RGB, so forcing every texel opaque adds nothing visible - the mean-absolute-error
+number is identical either way. The one graded element in that atlas is the front end's
+menu-selection lozenge, which is not on screen during a level. See "The engine does not honour an
+`ALPH` you write" above: the alpha was being dropped throughout this test. What the 0.9-1.9 MAE
+result does still establish is the palettized `BODY` path itself - plane count, row padding,
+palette binding, `CONT = 0` - for **opaque** textures.
+
+Two things this did *not* cover: a `masking = 2` transparent index, which none of level01's
+textures needed (that path is covered by the synthetic cases in `utils/rimutil/tests` but has not
+been seen by the engine); and any alpha blend at all, which is the gap that hid the `ALPH` defect.
 
 ---
 

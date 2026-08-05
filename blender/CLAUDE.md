@@ -178,7 +178,13 @@ These pin the design, in roughly decreasing order of how much everything else re
   `nPlanes` follows from the count (up to 31, since the scanline decoder accumulates into a
   uint32), and alpha goes to a transparent palette index when every transparent texel shares one
   RGB and to an `ALPH` chunk otherwise — **that choice is not cosmetic**, because the RGB under a
-  transparent texel is what bilinear filtering blends into its opaque neighbours. DXT stays in
+  transparent texel is what bilinear filtering blends into its opaque neighbours. **And the `ALPH`
+  branch does not work in the game**: Gunlok ignores the chunk, so a texture written down it loads
+  fully opaque — measured, see `rif_chunk_format.md`, "The engine does not honour an `ALPH` you
+  write". `utils/rimutil` refuses `--format body` for graded alpha on that basis; `rim.encode` has
+  no equivalent guard and no DXT fallback to offer, so **a graded-alpha texture exported by the
+  addon will render opaque**. The round-trip test cannot see it: the file is correct and the engine
+  is what drops the alpha. DXT stays in
   `utils/rimutil`, where libsquish is. The two writers emit **identical bytes** for the same
   image, raw and ByteRun1 alike, which is what makes them cross-checkable rather than separately
   believed. Cost: 2–6× a DXT payload, and about a second per 1024² image in pure Python.
@@ -216,7 +222,11 @@ These pin the design, in roughly decreasing order of how much everything else re
   actors, and the scene rendered correctly — the difference against the stock DXT1 build is
   0.9–1.9 mean absolute error per channel on static geometry, confined to edges, which is DXT1's
   block artifacts being *absent* from the lossless copy rather than any fault in it. So the format
-  description above is confirmed end to end, not just self-consistent.
+  description above is confirmed end to end, not just self-consistent — **for opaque textures**.
+  This measurement looked at static geometry and never at an alpha blend, which is exactly why it
+  missed the `ALPH` defect above: `Units\alpha junk.RIM` was in the set, its alpha was being
+  dropped throughout, and the MAE number is identical either way because the quads that use it in
+  a level are additive over black RGB.
 - **Files are written uncompressed.** 150 of the 563 shipped files already are, and the game reads
   them, so the Huffman *compressor* is never needed. `huffman/huffman_compress.cpp` still exists for
   byte-parity work.

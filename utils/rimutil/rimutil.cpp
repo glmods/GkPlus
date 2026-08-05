@@ -21,7 +21,10 @@
 // - **`BODY` is exactly lossless**: the palette is built from the distinct colours
 //   actually present and `nPlanes` from its size, with no cap worth caring about
 //   (the engine passes "no limit" on any true-colour destination and the decoder
-//   accumulates into a uint32, so nPlanes up to 31 works).
+//   accumulates into a uint32, so nPlanes up to 31 works). **Lossless on disk is
+//   not lossless in the engine**, though: Gunlok ignores the `ALPH` chunk a
+//   palettized image has to carry alpha in, so `compress --format body` refuses
+//   graded alpha. See `AlphaShape` for the measurement.
 
 #include <algorithm>
 #include <bit>
@@ -762,13 +765,87 @@ static Chunk make_tran() {
   return {'TRAN', std::vector<char>(8, 0)};
 }
 
+// How an image's alpha channel has to be carried on the BODY path - which is
+// also whether the engine will honour it at all.
+//
+// **Gunlok ignores `ALPH`.** Measured in the running game: `Units\alpha junk.RIM`
+// re-encoded as BODY loses its graded alpha - the front-end menu's selection
+// lozenge comes out as its own opaque bounding rectangle instead of a soft blob -
+// and re-encoding the *same pixels* with the alpha channel flattened to a uniform
+// 128 produces a pixel-identical frame. The chunk never reaches the surface. The
+// same PNG encoded `--format dxt3` matches stock exactly, so it is the chunk and
+// not the missing mip chain.
+//
+// The likely mechanism is `ChooseSurfaceFormatForImage` (rif_chunk_format.md,
+// "The fourcc picks the surface format"): an *uncompressed* image with alpha bits
+// >= 2 admits only A8R8G8B8, which is gated on `Use32BitTextures` - 0 by default,
+// and its only toggle is on menu 19, which nothing can reach. DXT3 escapes that
+// by being a compressed surface. Not measured, so it is a working theory.
+//
+// So a BODY encode is exactly lossless *on disk* and wrong *in the engine*
+// whenever it has to emit an `ALPH`. Graded alpha is therefore refused outright.
+// A cut-out needing an `ALPH` (several distinct RGBs under alpha 0) is the same
+// construct and presumed equally broken, but that has not been measured, so it
+// warns instead - see do_compress.
+enum class AlphaShape {
+  Opaque,           // no alpha to carry
+  TransparentIndex, // one RGB under every transparent texel -> masking 2
+  BinaryAlph,       // cut-out, several RGBs underneath -> an ALPH chunk
+  GradedAlph,       // partial alpha anywhere -> an ALPH chunk
+};
+
+static AlphaShape classify_alpha(const Image &img, uint32_t *transparent_rgb) {
+  size_t n = static_cast<size_t>(img.width) * img.height;
+
+  auto rgb_of = [&](size_t i) {
+    return (static_cast<uint32_t>(img.rgba[i * 4 + 0]) << 16) |
+           (static_cast<uint32_t>(img.rgba[i * 4 + 1]) << 8) |
+           static_cast<uint32_t>(img.rgba[i * 4 + 2]);
+  };
+
+  bool any_translucent = false, any_transparent = false;
+  bool one_transparent_colour = true;
+  uint32_t under = 0;
+  for (size_t i = 0; i < n; ++i) {
+    uint8_t a = img.rgba[i * 4 + 3];
+    if (a == 0) {
+      if (!any_transparent) {
+        under = rgb_of(i);
+      } else if (rgb_of(i) != under) {
+        one_transparent_colour = false;
+      }
+      any_transparent = true;
+    } else if (a != 255) {
+      any_translucent = true;
+    }
+  }
+  if (transparent_rgb != nullptr) {
+    *transparent_rgb = under;
+  }
+
+  // masking 2 spends one palette entry on "transparent", so it can only carry a
+  // single colour underneath the transparent texels. That is lossless exactly
+  // when they all share one, and the RGB under a transparent texel is not a
+  // don't-care: bilinear filtering blends it into neighbouring opaque texels,
+  // which is where dark halos come from. Anything else takes an ALPH chunk,
+  // which keeps all four channels - and which the engine drops on the floor.
+  if (any_translucent) {
+    return AlphaShape::GradedAlph;
+  }
+  if (!any_transparent) {
+    return AlphaShape::Opaque;
+  }
+  return one_transparent_colour ? AlphaShape::TransparentIndex
+                                : AlphaShape::BinaryAlph;
+}
+
 struct Palettized {
   std::vector<uint32_t> idx;
   std::vector<uint8_t> cmap; // 3 bytes per entry
   uint8_t planes = 1;
   Masking masking = Masking::None;
   uint16_t transparent = 0;
-  std::vector<uint8_t> alpha; // empty unless the image has graded alpha
+  std::vector<uint8_t> alpha; // empty unless the image needs an ALPH chunk
 };
 
 static Palettized palettize(const Image &img) {
@@ -780,32 +857,11 @@ static Palettized palettize(const Image &img) {
            static_cast<uint32_t>(img.rgba[i * 4 + 2]);
   };
 
-  bool any_translucent = false, any_transparent = false;
-  bool one_transparent_colour = true;
   uint32_t transparent_rgb = 0;
-  for (size_t i = 0; i < n; ++i) {
-    uint8_t a = img.rgba[i * 4 + 3];
-    if (a == 0) {
-      if (!any_transparent) {
-        transparent_rgb = rgb_of(i);
-      } else if (rgb_of(i) != transparent_rgb) {
-        one_transparent_colour = false;
-      }
-      any_transparent = true;
-    } else if (a != 255) {
-      any_translucent = true;
-    }
-  }
-
-  // masking 2 spends one palette entry on "transparent", so it can only carry a
-  // single colour underneath the transparent texels. That is lossless exactly
-  // when they all share one, and the RGB under a transparent texel is not a
-  // don't-care: bilinear filtering blends it into neighbouring opaque texels,
-  // which is where dark halos come from. Anything else takes an ALPH chunk,
-  // which keeps all four channels.
-  bool use_transparent_index =
-      any_transparent && !any_translucent && one_transparent_colour;
-  bool use_alph = (any_transparent || any_translucent) && !use_transparent_index;
+  const AlphaShape shape = classify_alpha(img, &transparent_rgb);
+  bool use_transparent_index = shape == AlphaShape::TransparentIndex;
+  bool use_alph =
+      shape == AlphaShape::BinaryAlph || shape == AlphaShape::GradedAlph;
 
   Palettized out;
   out.idx.resize(n);
@@ -865,6 +921,11 @@ static Palettized palettize(const Image &img) {
 // Round-trip guard for the claim in the header comment. A silent quantisation
 // bug here is invisible in the output file and only shows up in-game, so the
 // encoder checks its own work rather than trusting it.
+//
+// Note what it cannot see: this proves the FILE round-trips, which is a weaker
+// claim than "the engine will show these pixels". A graded-alpha BODY file
+// passes this and every test in utils/rimutil/tests and still renders opaque -
+// see AlphaShape. That is why the refusal is up in do_compress and not here.
 static void check_lossless(const Image &img, const Palettized &pal) {
   size_t n = static_cast<size_t>(img.width) * img.height;
   size_t colours = pal.cmap.size() / 3;
@@ -903,6 +964,34 @@ static int do_compress(const std::string &in, const std::string &out,
 
   std::vector<Chunk> ilbm;
   if (format == OutFormat::Body) {
+    // See AlphaShape: the engine ignores `ALPH`, so a BODY encode that needs one
+    // is lossless on disk and renders opaque. Refusing here is the whole point -
+    // the file it would write passes every round-trip test in
+    // utils/rimutil/tests and is still wrong in the game.
+    switch (classify_alpha(img, nullptr)) {
+    case AlphaShape::GradedAlph:
+      std::cerr
+          << "This image has graded alpha, which body cannot deliver: the\n"
+             "engine ignores the ALPH chunk a palettized image has to carry it\n"
+             "in, so the texture loads fully opaque. Measured on\n"
+             "Units\\alpha junk.RIM - flattening its alpha to a uniform 128\n"
+             "renders pixel-identically to the correct graded version.\n"
+             "Use --format dxt3, whose 4-bit alpha the engine does read."
+          << std::endl;
+      return 1;
+    case AlphaShape::BinaryAlph:
+      std::cerr
+          << "Warning: this cut-out has several distinct RGB values under its\n"
+             "transparent texels, so it cannot use masking 2 and needs an ALPH\n"
+             "chunk - which the engine is known to ignore for graded alpha and\n"
+             "is presumed to ignore here too (not measured). The cut-out will\n"
+             "probably render opaque; --format dxt3 is the safe choice."
+          << std::endl;
+      break;
+    case AlphaShape::Opaque:
+    case AlphaShape::TransparentIndex:
+      break;
+    }
     Palettized pal = palettize(img);
     check_lossless(img, pal);
     std::vector<uint8_t> planar =
@@ -934,7 +1023,10 @@ static int do_compress(const std::string &in, const std::string &out,
       w.raw(abody.data(), abody.size());
       // In the FORM rather than the PROP: the engine looks a chunk up against
       // the ILBM it is processing, and whether PROP properties are in that scope
-      // has not been established.
+      // has not been established. Note that this placement does NOT make the
+      // question moot the way rif_chunk_format.md used to claim - an ALPH here
+      // is ignored (see AlphaShape), which is why graded alpha never reaches
+      // this code any more.
       ilbm.push_back({'ALPH', w.v});
     }
 
@@ -1004,7 +1096,10 @@ static void usage() {
          "DXT3's RGB is no worse while its 4-bit alpha strictly beats DXT1's\n"
          "1-bit. DXT5 is deliberately not offered: the engine drops the fourcc\n"
          "silently and renders such a file with garbage alpha. body is exactly\n"
-         "lossless and needs no DXT compressor, at 2-6x the size.\n";
+         "lossless and needs no DXT compressor, at 2-6x the size - but it is\n"
+         "lossless on DISK only: the engine ignores the ALPH chunk a palettized\n"
+         "image carries alpha in, so body refuses an image with graded alpha\n"
+         "and warns on a cut-out that cannot use a transparent index.\n";
 }
 
 int main(int argc, char *argv[]) {

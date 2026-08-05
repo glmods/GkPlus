@@ -26,6 +26,42 @@ cannot drive is one you cannot align. `d3d9` is now the *second opinion*: it say
 difference lives in the translation layer or in the game. Thirty sections were measured against
 d3d9 before anyone checked whether the real thing was on the machine.
 
+**And the upgrade screen is in** (§4.47). A third play report — "the inventory screen fills the
+whole window, and the selection rectangles and text are shifted" — and a third real defect:
+`D3DVIEWPORT8` has a **rectangle** as well as a depth slice, this layer recorded only the slice,
+and the upgrade screen is the one thing in the game that sets a sub-rectangle (`32,24 575x431`
+against a 640x480 backbuffer). It goes from **17.23 against the real D3D8 to 0.089**, against a
+same-session repeat floor of 0.043. In level it is worth exactly the noise floor, because there
+is only ever one rectangle there — which is why it survived this long with every counter clean.
+The plan had named the shape of it in advance, next to `distinct viewport rects ever set`, and the
+marker fired the first time the screen was opened.
+
+Two API rules came out of `render.viewport_probe`, both measured against the real runtime because
+— as in §4.45 — every rectangle Gunlok had ever set was at 0,0, where the readings coincide:
+**D3D does not add the rectangle's origin to a pre-transformed vertex** (so `BuildMvp` subtracts
+it, cancelling what Vulkan's viewport adds), and **D3D clips to the rectangle** (so it is the
+scissor too).
+
+**Level02's fire camera is at the cross-launch floor.** Two play reports in a row — flames that
+came and went with distance (§4.45) and a concrete ledge "much redder in Vulkan" (§4.46) — were
+two real defects, and with both fixed the whole frame reads **0.522 against a d3d8-vs-d3d8 floor
+of 0.521**. The specular term is bit-identical to D3D's over all 104,693 lit pixels.
+
+**And the light sum was wrong in one condition for twenty sections** (§4.46): D3D's specular sum
+runs only over lights with `N·L > 0`, and `max(0, N·H)` is not that condition — so every face
+turned *away* from a light carried a highlight it should not have. What found it was reading the
+three channels rather than a MAD (the excess had **exactly zero blue**, and only the specular
+colour does), plus a map showing **zero pixels where d3d8 had specular and we did not** — our set
+strictly contained D3D's, which is a missing condition and not a wrong scale.
+
+**One API rule was wrong from the first frame this renderer drew, and play found it** (§4.45):
+D3D does not run the viewport's depth range over a pre-transformed vertex — it clamps `z` into
+it — so every screen-space draw sat `MinZ * (1 - z)` too far away, and level02's flames came and
+went with camera distance. `render.depth_probe` is what settled it, and the lesson is the reason
+it exists: **both readings of that rule fit every draw Gunlok issues**, so the answer had to be
+asked of D3D directly rather than inferred from the game. Read §4.45 before trusting any
+whole-frame number below against a scene with effect layers in it.
+
 No missing *feature* is known, and the 2.59 that stood for six sections is fixed:
 
 - **It was one defect and it was a size mismatch** (§4.37, fixed in §4.38). Gunlok renders into a
@@ -156,6 +192,9 @@ and still forwards every call to d3d8to9 so the A/B stays available.
 | **An offscreen colour target at the backbuffer size, blitted to the swapchain** — the fix for it | ✅ §4.38 — whole frame 2.593 → **0.13** against a 0.034 cross-launch floor, **93% of it bit-identical**, the HUD panel 0.000 and the A4R4G4B4 probe quad **100% bit-exact** |
 | **The overlay in its own pass on the swapchain**, so it stays 1:1 with the window | ✅ §4.38 |
 | **The material override** — retexture, tint or hide by `.rim` name | ✅ §4.44 — the first feature the game never had; a key survives a level reload by re-resolving image 34 → 35, and clearing one restores the frame bit-identically |
+| **The specular sum runs only over lights with `N·L > 0`** | ✅ §4.46 — the ledge that was "much redder in Vulkan". Bit-identical specular over all 104,693 lit pixels, and the whole frame at the fire camera drops **2.093 → 0.522 against a 0.521 cross-launch floor** |
+| **The viewport's RECTANGLE** — `D3DVIEWPORT8::X/Y/Width/Height`, per draw, as the Vulkan viewport *and* scissor | ✅ §4.47 — the upgrade screen that filled the window. 17.23 → **0.089** against the real D3D8 there, and the noise floor in level |
+| **A pre-transformed vertex's depth** — `clamp(z, MinZ, MaxZ)`, not the viewport transform | ✅ §4.45 — the flames that came and went with camera distance. Every screen-space draw sat `MinZ * (1 - z)` too far away; the flame's retention across a distance sweep goes from a 79% → 0.9% collapse to a flat ~92% |
 
 Steady state on level01, in level, under validation:
 
@@ -164,9 +203,9 @@ draws: 370 this frame / 662 peak
 skipped: 0 topology, 0 arena slot, 0 no transform, 0 unconvertible, 0 scratch full, 0 no record
 lit draws: 1405937 (1360542 with a light on, 0 want COLOR2, 0 before any material, 0 lights dropped)
 buffers seeded from their own contents: 9 (0 refused by pool, 0 read failures)
-depth format: 130 = D24_UNORM_S8_UINT (with stencil)
+depth format: 130 = D32_SFLOAT_S8_UINT (with stencil)
 stencil draws: 22302 (0 with no stencil buffer)
-pipelines: 11 (0 failures)
+pipelines: 11 (0 failures)                         <- pre-§4.45; expect more, see the level02 block
 stages: 0 unimplemented ops, 0 needing more than two, 0 bound textures unresolved
 vertex: 10239 KB live / 32768 KB     index: 583 / 8192 KB     slots live: 3469
 images: 56 live / 62 created, 112 MB      bindless: 4096 slots, 5 samplers
@@ -177,7 +216,8 @@ validation errors: 0
 
 Two of those changed with §4.27 and are not regressions: **11 pipelines**, because the five
 stencil fields are part of the key, and **0 topology skips**, because the strips and line lists
-are drawn now. **3468/3469 is the reading, not 3469** — one pre-transformed vertex buffer that
+are drawn now. That pipeline count has not been re-measured since §4.45 added `depth_clamp` to
+the key — level02 is the block to check a change against, and it moved 9 → 12 there. **3468/3469 is the reading, not 3469** — one pre-transformed vertex buffer that
 the game refills while the verifier reads it, stable across repeated calls and identical on every
 build back to §4.29, so it is the instrument rather than an upload defect (§4.27, §4.31). This
 block said 3469 until §4.31 measured it on two builds.
@@ -192,15 +232,25 @@ draws: 274 this frame / 279 peak
 draw calls seen: 128470   submitted: 128470   unaccounted for: 0   <- the reconciliation, §4.32
 skipped: 0 topology, 0 arena slot, 0 no transform, 0 unconvertible, 0 scratch full, 0 no record
 lit draws: 121951 (118532 with a light on, 0 want COLOR2, 0 before any material, 0 lights dropped)
-depth format: 130 = D24_UNORM_S8_UINT (with stencil)   stencil draws: 2712 (0 with no buffer)
-materials: 29 this frame / 30 peak (0 dropped)   2712 flat-shaded draws (all of them the shadow)
-viewport depth-slice changes: 5165                 <- the six slices, §4.32; 0 would be wrong
-backbuffer: 640x480   distinct viewport rects ever set: 1 (0,0 640x480)   <- §4.38 assumes both
-pipelines: 9 (0 failures)
+depth format: 130 = D32_SFLOAT_S8_UINT (with stencil)   stencil draws: 3102 (0 with no buffer)
+materials: 29 this frame / 30 peak (0 dropped)   3108 flat-shaded draws (all of them the shadow)
+viewport depth-slice changes: 5580                 <- the slices, §4.32; 0 would be wrong
+backbuffer: 640x480   distinct viewport rects ever set: 1 (0,0 640x480)   <- one IN LEVEL, §4.47;
+                                                          the upgrade screen makes it 2
+depth buffer the game asked for: D3DFMT_D24S8 (75)  <- what to match, §4.45
+pipelines: 12 (0 failures)
 stages: 0 unimplemented ops, 0 needing more than two, 0 bound textures unresolved
-render.verify_buffers() 2952-2953/2953     render.verify_textures() 292/292
+render.verify_buffers() 2952-2953/2953     render.verify_textures() 292-316/same
 validation errors: 0
 ```
+
+**`depth format: 130` is what `ChooseDepthFormat` picked, not what the game asked for**, and the
+two are printed in different reports for that reason. 130 is `D32_SFLOAT_S8_UINT` — the first
+candidate, `D24_UNORM_S8_UINT` (129), is not universally supported and is absent on the machine
+these numbers come from. The game asks for `D3DFMT_D24S8`; §4.45 measured the two to agree to
+`6e-8` near the far plane, which is where everything so far has been compared, and to diverge
+near the near plane, which nothing has. **Pipeline count rose 9 → 12 with §4.45** and is not a
+regression: `depth_clamp` is part of the key, so the pre-transformed configurations fork.
 
 **`verify_buffers` reads 2952/2953 on level02, and since §4.42 it says why.** The odd buffer is the
 shared pre-transformed one (fvf 0x1c4, refilled about five times a frame) whose arena slot is
@@ -306,6 +356,12 @@ no shader toolchain. After editing `src/shaders/*.slang`:
 python3 src/gen-shaders.py
 ```
 
+**Nothing in CMake runs it, so `cmake --build` after a shader edit is a no-op and reports
+success** (§4.46). The failure mode is a fix that measures as having changed nothing at all —
+and the giveaway is that the screenshots are *byte-identical* to the ones before it, which a real
+no-effect change almost never is. Hash the shots when a change is supposed to move pixels and
+does not.
+
 Testing is the REPL, driven from PowerShell. `utils/rendertest/launch-gunlok.ps1`
 handles the three things that otherwise waste a run — `-skipfmv`, the modal "Run in a window?"
 dialog that blocks *before* the REPL listener opens, and the foreground-lock dance needed to
@@ -350,13 +406,19 @@ level02 when starting fresh.
 | `GKPLUS_NO_MIPMAP=1` | forwarded only: `D3DTSS_MIPFILTER` to `D3DTEXF_NONE`, so the reference samples level 0 whatever the footprint (§4.29) |
 | `GKPLUS_NO_CULL=1` / `GKPLUS_NO_ZTEST=1` / `GKPLUS_NO_ATEST=1` / `GKPLUS_NO_BLEND=1` | forwarded only: `D3DRS_CULLMODE` to NONE, `D3DRS_ZENABLE` off, `D3DRS_ALPHATESTENABLE` off, `D3DRS_ALPHABLENDENABLE` off — the four states that make a draw vanish outright, or stop vanishing, rather than come out wrong (§4.29, §4.39, §4.40). A draw whose fragments are all discarded is indistinguishable from one that was never issued until you switch the test off in the **reference** and watch it appear. `NO_BLEND` is the fourth and it questions this layer's own mirror: forcing blending off in the original collapses its fire into hard orange blobs and dark rectangles — the same artefact class this renderer produces — which is what proved the layer covering the backdrop is the game's blended fire (§4.40) |
 | `GKPLUS_VK_TOPOLOGIES` | **On by default since §4.27.** The variable now selects a *subset*: `none`/`0` for none, `strip`/`line` to bisect the two, `all`/`1` (or unset) for both. Also settable at run time as `render.topologies`, which is what makes them A/B-able on one paused frame |
+| `render.specular` | run-time only, on by default: the specular term of that sum. **The mirror image of `GKPLUS_NO_SPECULAR`**, which reaches only the forwarded call — with only one side switchable, "we add specular the original does not" and "we add three times as much" are the same measurement (§4.46). Turn it off in both and the bases can be diffed directly |
 | `render.lighting` | run-time only, on by default: the real light sum, or the §4.20 material collapse the build before it used. **The way to measure lighting** — toggle it on a paused frame and the difference image is exactly what it paints, at a 0.00 noise floor (§4.26) |
 | `render.half_pixel` | run-time only, on by default: the D3D9 pixel-centre convention as a half-pixel viewport origin (§4.28). Off is the pre-§4.28 behaviour, and worth 1.34/255 over the whole frame |
 | `GKPLUS_VK_OFFSCREEN=0` / `render.offscreen` | on by default: rasterise the world at the **game's** backbuffer size into an offscreen target and blit it onto the swapchain, rather than drawing straight into the swapchain and letting the viewport scale every 2D draw (§4.37, §4.38). Off is the pre-§4.38 behaviour exactly, and worth **2.55/255 over 65% of the frame**. `render.vulkan_report` says which is running |
 | `render.present_linear` | run-time only, **off** by default: the filter for that final scale. NEAREST is a deduction, not a default — the original's own stretch preserves a 4-bit texture's sixteen distinct values, which a filtered downscale could not (§4.37) — and this is the A/B for it |
 | `render.material_override(name, spec)` | **not a diagnostic — the first mod-facing feature** (§4.44). `name` is a case-insensitive substring of a live texture's `.rim` path; `spec` is `{texture, tint: [r,g,b,a?], hide}` or null to remove. Returns the readback, because a substring key that matches nothing — or matches more than was meant — is not an error and cannot be seen from the call. `render.material_overrides` re-reads it, `render.clear_material_overrides()` empties it. **An override that resolves and paints nothing looks exactly like a broken one**: check `draws overridden` in `render.draws`, and pick a target off `render.frame_draws()` so it is one the camera can see |
+| `render.rhw_depth_raw` | run-time only, on by default: a pre-transformed vertex's z is the depth value clamped to the viewport slice, which is what D3D does, rather than something to run the viewport's depth range over (§4.45). Off is the pre-§4.45 behaviour. Read at **record** time, so both halves — `BuildMvp`'s compensation and the pipeline's `depthClampEnable` — move together; the game re-issues the same draws while paused, so it still A/Bs on one frame |
+| `render.depth_probe(armed, quad_z, clear_z, min_z, max_z)` | draw one opaque magenta quad through the capture device against a depth buffer cleared to a known value under a known viewport slice, `ZFUNC LESS`, no depth write. The quad is either there or it is not, which is what settled §4.45 when nothing about Gunlok's own draws could. **Read it in `d3d8` or `d3d9`**: the clear goes straight to the forwarded runtime, because recording it would have made it the whole Vulkan frame's depth clear. Two rules for using it: discriminate **in both directions** — a monotonic map preserves ordering, so one row is always explicable by the other model plus an offset — and keep `quad_z` **inside** the slice unless the range handling is what you are measuring, or you measure the clamp and read it as the mapping |
+| `render.viewport_rect` | run-time only, on by default: honour `D3DVIEWPORT8`'s **rectangle** per draw, as the Vulkan viewport and scissor, rather than covering the whole render target (§4.47). Off is the pre-§4.47 behaviour. Read at **record** time for the same reason as `rhw_depth_raw` — the rectangle reaches both the `DrawItem` and `BuildMvp`'s origin term from there. **The one comparison that cannot use a paused frame**: the upgrade screen will not open while the game is paused, so this A/Bs on consecutive shots inside one session, against a 0.043 repeat floor |
+| `render.viewport_probe(armed, x, y, w, h)` | `depth_probe`'s sibling, for the other half of what a viewport does to a pre-transformed vertex: one opaque magenta `XYZRHW` quad 20 px in from the rectangle's own origin. **Read it in `d3d8`.** The reading is a *differential* — arm it twice with different origins and compare how far the quad moved against how far its own coordinates moved — which is what makes it independent of the frame behind it. It settled both rules in §4.47: the origin is not added, and the rectangle clips |
 | `render.probe(name, scale, mipmap, offset, alpha)` | draw one textured quad through the capture device, so d3d8, d3d9 and vulkan all get the same draw with the scene's lighting, stages, blending and depth removed (§4.35). `name` is a substring of a live texture's `.rim` path, `scale` is screen pixels per texel; `render.probe(null)` disarms |
 | `render.ref_range` / `render.ref_hide` | **`draw_range`/`draw_hide` for the REFERENCE** (§4.42): a draw outside the range, or inside the hide window, is simply not forwarded. Works in `d3d8` and `d3d9` mode, which is the whole point — for three sections "this renderer draws a quad the original does not" could be established and not followed, because every follow-up question is a `draw_range` question and `draw_range` only existed for us |
+| `render.draw_state = <index>` | the device state at the moment that draw was issued, diffed against the mirror — **and since §4.46 the lighting equation's inputs**: the material with its `POWER`, every enabled light's colour, range and attenuation, the four `D3DRS_*MATERIALSOURCE` states, the FVF, and the eye with the view matrix it was derived from. "Does the mirror agree" and "what was this draw actually lit with" are different questions, and only the first had an instrument. `render.state` answers neither per draw: it prints the *last* draw of the frame, which on level02 is the text |
 | `render.frame_draws([first, last])` | the capture layer's **own** draw list for the last complete frame — index, topology, primitives, FVF, buffered/user-pointer, blend, depth, cull, alpha test, depth slice, stage-0 `.rim` name. Mirror-side, so it works in every mode. It is what `ref_range` is aimed with: **an index does not carry between runs** (aiming at 222 because a `vulkan` session called the quad 222 landed on the HUD portraits), so find the draw by its signature in the mode you are in |
 | `render.force_lod` | run-time only, `-1` off: force every texture fetch to an explicit mip level. The probe that ruled mip selection out of the residual (§4.34); pair it with `GKPLUS_NO_MIPMAP=1` on the reference, which pins the original to level 0 |
 | `render.shade_mode` | run-time only, on by default: honour `D3DRS_SHADEMODE`, or interpolate everything the way every build before §4.31 did. Worth **0.000** on level01 and level02, because every flat-shaded draw there is the stencil shadow — kept because that is a fact about two levels, not about the game |
@@ -453,12 +515,15 @@ drawn with, ordered by draw count:
 - **indexed draws reaching past their bound buffer** — 0, and expected to stay 0. Not one of our
   invariants: D3D8 tolerated it and D3D9 rejects the call, so a non-zero reading would be a defect
   in the *reference*;
-- **the backbuffer size and every distinct viewport *rectangle*** (§4.38). The world pass sets one
-  viewport over the whole render target, which is right exactly while this reads **one** rectangle
-  covering the whole backbuffer — level02 reads `0,0 640x480` against a 640x480 backbuffer. A
-  sub-viewport would have to move onto the `DrawItem` beside `min_depth`/`max_depth`, and this
-  prints a marker rather than leaving it to be noticed: a wrongly-scaled sub-viewport looks
-  exactly like the defect §4.37 spent six sections on.
+- **the backbuffer size and every distinct viewport *rectangle*** (§4.38, §4.47). This is the
+  reading that found §4.47, and it found it the way it was designed to: it says how many distinct
+  rectangles the game has ever set and marks any that is not the whole backbuffer, so opening the
+  upgrade screen once turned `1` into `2` with `32,24 575x431` flagged. **In level it still reads
+  one**, and the marker on the second is now "honoured per draw" rather than "the world pass
+  assumes it is not there" — the rectangle rides on the `DrawItem` beside `min_depth`/`max_depth`,
+  which is exactly where this bullet used to predict it would have to go. The *size* assumption
+  that remains is §4.38's: the offscreen target is the backbuffer's size, so a backbuffer this
+  layer has not seen would still scale wrongly.
 
 Twelve stage configurations and twenty pipeline configurations for a level01 session, which is
 small enough to implement one by one rather than approximate. That is the whole reason these
@@ -534,10 +599,16 @@ at all, which no cross-launch measurement could have distinguished from noise.
 
 Four things about the shot itself, each of which invalidated real work before it was found:
 
-- **`PrintWindow` needs `PW_RENDERFULLCONTENT`** — flag 3, i.e. `PW_CLIENTONLY | PW_RENDERFULLCONTENT`.
+- **`PrintWindow` needs flag 3** — `PW_CLIENTONLY | PW_RENDERFULLCONTENT`, and **both bits**.
   With flag 1 alone a Vulkan (or D3D) swapchain window prints **solid black**, because there is no
   WM_PRINT redraw for the compositor to ask for, and a bitmap full of zeros looks exactly like a
-  renderer that is not drawing.
+  renderer that is not drawing. With flag **2** alone — which is what `shot-gunlok.ps1` actually
+  passed until §4.47, against what this line has said since §4.20 — the whole window is rendered,
+  title bar and border included, into a bitmap sized from `GetClientRect`: the picture is pushed
+  down and right and the bottom and right edges of the game's own frame fall off it. That one is
+  silent, because the result still looks like a screenshot of a game in a window. Every shot taken
+  before §4.47 is missing roughly 40 rows and 10 columns; a MAD between two of them is still
+  valid, and anything about *where* something is is not.
 - **Call `SetProcessDPIAware()` in the capturing process.** gl.exe is not DPI aware, so
   `GetClientRect` reports 418x312 against a real 628x468 swapchain, and `PrintWindow` renders at
   the window's own resolution — a bitmap sized from that rect silently keeps the top-left two
@@ -745,6 +816,15 @@ the world by construction rather than by switching the depth test off, and `1.0.
 backdrop to the far plane. `D3DVIEWPORT8::MinZ`/`MaxZ` were recorded nowhere and the viewport was
 hardcoded `0..1`, so the world occluded the layers meant to sit over it — fires rendered as bare
 scenery. It is per-draw dynamic state now.
+
+**...but it does not apply to a pre-transformed draw the way Vulkan applies it** (§4.45). D3D
+skips the viewport transform for a `D3DFVF_XYZRHW` vertex and **clamps** instead —
+`depth = clamp(z, MinZ, MaxZ)`, no scale and no bias — measured with `render.depth_probe` against
+the real D3D8, because both readings fit everything Gunlok itself draws. Vulkan has no bypass, so
+every screen-space draw sat `MinZ * (1 - z)` too far from the camera; an error that shrinks toward
+the far plane, which is why level02's flames came and went with camera distance instead of being
+uniformly wrong. `BuildMvp` now feeds Vulkan the inverse and `PipelineState::depth_clamp` carries
+the clamp — **both halves, or the HUD regresses from bit-exact.**
 
 **The frame is an array of indices** (§4.26, §4.30). A draw's per-draw data lives in a
 `GpuDrawRecord` array and its texture stages in an interned `GpuMaterial` array — 274 draws on

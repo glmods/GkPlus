@@ -11,6 +11,11 @@ still run, which is what makes this usable on a machine with no install.
   the encoder may only choose it when they all share one -- ``tree_alpha.RIM``
   has 790 distinct RGB values under alpha 0, and the RGB *under* transparency is
   not a don't-care because bilinear filtering blends it into its neighbours.
+* **BODY refuses graded alpha.** Lossless on disk is not lossless in the engine:
+  Gunlok ignores the ``ALPH`` chunk, so a graded-alpha BODY file passes every
+  round-trip below and still renders fully opaque. That is exactly the shape of
+  bug these tests cannot see, which is why the encoder refuses it outright and
+  this file asserts the refusal rather than the round trip.
 * **The reference agrees with what the encoder wrote.** rimutil reading its own
   output would prove only that it is self-consistent.
 * **DXT1/DXT3 produce a well-formed file that decodes** with a plausible error.
@@ -39,7 +44,7 @@ SYNTHETIC = [
     ("w1x1", "gradient", 1, 1),
     ("w12_odd", "gradient", 12, 5),       # width not a multiple of 8
     ("w24_two", "twocolour", 24, 9),      # 2 colours -> a single bitplane
-    ("w320_graded", "graded", 320, 7),    # graded alpha -> an ALPH chunk
+    ("w320_graded", "graded", 320, 7),    # graded alpha -> body must refuse
     ("w64_cutout", "cutout", 64, 64),     # one transparent colour -> masking 2
     ("w300_wide", "wide", 300, 300),      # 90,000 colours -> 17 bitplanes
 ]
@@ -87,34 +92,29 @@ EXPECTED_SHAPE = [
 ]
 
 
+def has_graded_alpha(rgba):
+    """True when any texel is partially transparent, which is what body refuses."""
+    return any(a not in (0, 255) for a in rgba[3::4])
+
+
 def check_one(rimutil, work, name, src, failures):
     _w, _h, original = rimref.png_read_rgba(src)
 
-    for mode, extra in (("rle", []), ("raw", ["--raw"])):
-        rim = os.path.join(work, "%s_body_%s.RIM" % (name, mode))
-        back = os.path.join(work, "%s_body_%s.png" % (name, mode))
-        rc, msg = run(rimutil, "compress", src, rim, "--format", "body", *extra)
-        if rc:
-            failures.append("%s body/%s: compress failed: %s" % (name, mode, msg))
-            continue
-        note = msg
-        rc, msg = run(rimutil, "decompress", rim, back)
-        if rc:
-            failures.append("%s body/%s: decompress failed: %s" % (name, mode, msg))
-            continue
-        _, _, got = rimref.png_read_rgba(back)
-        ref = rimref.decode_body_file(rim)
-        lossless = got == original
-        agrees = ref is not None and ref[2] == original
-        if not lossless:
-            differing = sum(1 for a, b in zip(got, original) if a != b)
-            failures.append("%s body/%s: not lossless, %d bytes differ"
-                            % (name, mode, differing))
-        if not agrees:
-            failures.append("%s body/%s: the reference disagrees with the encoder"
-                            % (name, mode))
-        print("   body/%-3s %9d bytes  lossless=%-5s reference-agrees=%-5s  %s"
-              % (mode, os.path.getsize(rim), lossless, agrees, note))
+    if has_graded_alpha(original):
+        # The engine drops the ALPH chunk this would need, so the only correct
+        # outcome is a refusal - see AlphaShape in rimutil.cpp.
+        rim = os.path.join(work, "%s_body_refused.RIM" % name)
+        rc, msg = run(rimutil, "compress", src, rim, "--format", "body")
+        if rc == 0:
+            failures.append("%s body: graded alpha was accepted" % name)
+        elif "graded alpha" not in msg:
+            failures.append("%s body: refused for the wrong reason: %s" % (name, msg))
+        elif os.path.exists(rim):
+            failures.append("%s body: refused but still wrote %s" % (name, rim))
+        else:
+            print("   body     refused (graded alpha), as it must be")
+    else:
+        check_body_roundtrip(rimutil, work, name, src, original, failures)
 
     for fmt in ("dxt1", "dxt3"):
         rim = os.path.join(work, "%s_%s.RIM" % (name, fmt))
@@ -148,6 +148,34 @@ def check_one(rimutil, work, name, src, failures):
                 # the root has to account for the whole file with nothing over.
                 failures.append("%s: root declares %d bytes, the file is %d"
                                 % (name, shape[0][3] + 8, total))
+
+
+def check_body_roundtrip(rimutil, work, name, src, original, failures):
+    for mode, extra in (("rle", []), ("raw", ["--raw"])):
+        rim = os.path.join(work, "%s_body_%s.RIM" % (name, mode))
+        back = os.path.join(work, "%s_body_%s.png" % (name, mode))
+        rc, msg = run(rimutil, "compress", src, rim, "--format", "body", *extra)
+        if rc:
+            failures.append("%s body/%s: compress failed: %s" % (name, mode, msg))
+            continue
+        note = msg
+        rc, msg = run(rimutil, "decompress", rim, back)
+        if rc:
+            failures.append("%s body/%s: decompress failed: %s" % (name, mode, msg))
+            continue
+        _, _, got = rimref.png_read_rgba(back)
+        ref = rimref.decode_body_file(rim)
+        lossless = got == original
+        agrees = ref is not None and ref[2] == original
+        if not lossless:
+            differing = sum(1 for a, b in zip(got, original) if a != b)
+            failures.append("%s body/%s: not lossless, %d bytes differ"
+                            % (name, mode, differing))
+        if not agrees:
+            failures.append("%s body/%s: the reference disagrees with the encoder"
+                            % (name, mode))
+        print("   body/%-3s %9d bytes  lossless=%-5s reference-agrees=%-5s  %s"
+              % (mode, os.path.getsize(rim), lossless, agrees, note))
 
 
 def main():

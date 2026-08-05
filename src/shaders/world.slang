@@ -164,9 +164,11 @@ float4x4 rows_to_matrix(float4 r0, float4 r1, float4 r2, float4 r3) {
 //     colour.rgb = Ce + Ca * (global_ambient + SUM k*L.ambient)
 //                     + Cd * SUM k*L.diffuse*max(0, N.L)
 //     colour.a   = Cd.a
-//     specular   = Cs * SUM k*L.specular*pow(max(0, N.H), power)
+//     specular   = Cs * SUM over lights with N.L > 0 of k*L.specular*pow(max(0, N.H), power)
 //
-// with k = attenuation * spot per light. The C* are the material colours, each of which the
+// with k = attenuation * spot per light. **The N.L > 0 condition on the specular sum is not a
+// restatement of max(0, N.H)** - the two differ over a wide band of orientations, and dropping
+// it wraps a highlight right around onto the faces turned away from a light (§4.46). The C* are the material colours, each of which the
 // game can redirect to a vertex colour through D3DRS_*MATERIALSOURCE - which is exactly the
 // state that made this look unnecessary for so long: with DIFFUSEMATERIALSOURCE = D3DMCS_COLOR1
 // a vertex diffuse is the *material* diffuse, not the final colour, and using it as the final
@@ -275,7 +277,13 @@ VertexOut shade_vertex(uint vertex_id) {
         const float lambert = max(0.0, dot(normal, to_light));
         ambient_sum += k * light.ambient.rgb;
         diffuse_sum += k * light.diffuse.rgb * lambert;
-        if (want_specular) {
+        // **Gated on the diffuse term, not just on N.H.** A light behind the surface contributes
+        // no highlight in D3D, and `max(0, N.H)` alone does not say so: N.H stays positive well
+        // past the point where N.L goes negative, so an ungated term paints a specular wash on
+        // every face turned AWAY from a light (notes §4.46). On level02 that was the near face
+        // of the concrete ledge and the ground in front of it, lit orange by two fires that
+        // are behind them - the whole of "the ledge is much redder in Vulkan".
+        if (want_specular && lambert > 0.0) {
             const float3 halfway = normalize(to_light + to_eye);
             specular_sum +=
                 k * light.specular.rgb * pow(max(0.0, dot(normal, halfway)), max(power, 1e-4));

@@ -96,6 +96,18 @@ JSValue SetLighting(JSContext *ctx, JSValueConst, JSValueConst value) {
   return JS_UNDEFINED;
 }
 
+// `render.specular` - the specular term of that sum on its own. The mirror image of
+// GKPLUS_NO_SPECULAR, which reaches only the forwarded call; with both, the term can be removed
+// from one paused frame of each renderer and the two bases compared directly (§4.46).
+JSValue GetSpecularValue(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, d3d8::GetSpecular());
+}
+
+JSValue SetSpecularValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  d3d8::SetSpecular(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
 // `render.half_pixel` - the D3D9 pixel-centre convention as a viewport offset (VkDraw.h).
 // Writable for the same reason as `topologies` and `lighting`: it moves every pixel in the
 // frame by half of one, so the only comparison fine enough to see it is two shots of the same
@@ -106,6 +118,33 @@ JSValue GetHalfPixel(JSContext *ctx, JSValueConst) {
 
 JSValue SetHalfPixelValue(JSContext *ctx, JSValueConst, JSValueConst value) {
   vulkan::SetHalfPixel(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+// `render.rhw_depth_raw` - take a pre-transformed vertex's z as the depth value, clamped to the
+// viewport's slice, rather than running the viewport's depth range over it (VkDraw.h, §4.45).
+// Writable for the same reason as `half_pixel`: it moves every screen-space draw in the frame
+// along z, and a paused frame is the only place the before and after can be compared at a zero
+// noise floor.
+JSValue GetRhwDepthRaw(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::RhwDepthRaw());
+}
+
+JSValue SetRhwDepthRawValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetRhwDepthRaw(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+// `render.viewport_rect` - honour D3DVIEWPORT8's rectangle per draw (VkDraw.h, §4.47). Writable
+// for the same reason as `rhw_depth_raw`, and it needs the toggle more than most: the only screen
+// it changes is one the game will not hold still for a two-launch comparison, so the A/B has to
+// happen inside one session.
+JSValue GetViewportRect(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::ViewportRect());
+}
+
+JSValue SetViewportRectValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetViewportRect(JS_ToBool(ctx, value) != 0);
   return JS_UNDEFINED;
 }
 
@@ -197,6 +236,41 @@ JSValue SetForceLodValue(JSContext *ctx, JSValueConst, JSValueConst value) {
   }
   vulkan::SetForceLod(static_cast<float>(lod));
   return JS_UNDEFINED;
+}
+
+// `render.depth_probe(armed, quad_z, clear_z, min_z, max_z)` - arm the depth probe
+// (D3D8Capture.h). Drawn through the capture device itself, like `render.probe`, so d3d8, d3d9
+// and vulkan are all asked the same question and the answer is a quad that is either there or
+// not. The defaults are the discriminating case: quad z 0.8, viewport 0..0.5, depth cleared to
+// 0.5, which the viewport transform makes visible and a raw z does not.
+JSValue DepthProbe(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+  const bool armed = argc < 1 || JS_ToBool(ctx, argv[0]) != 0;
+  double values[4] = {0.8, 0.5, 0.0, 0.5};
+  for (int i = 0; i < 4; ++i) {
+    if (argc > i + 1 && JS_ToFloat64(ctx, &values[i], argv[i + 1]) != 0) {
+      return JS_EXCEPTION;
+    }
+  }
+  const std::string result =
+      d3d8::ArmDepthProbe(armed, values[0], values[1], values[2], values[3]);
+  return JS_NewStringLen(ctx, result.data(), result.size());
+}
+
+// `render.viewport_probe(armed, x, y, width, height)` - arm the viewport-rectangle probe
+// (D3D8Capture.h). The depth probe's sibling: same delivery, same "read it in d3d8" rule, and it
+// answers the other half of what a viewport does to a pre-transformed vertex.
+JSValue ViewportProbe(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+  const bool armed = argc < 1 || JS_ToBool(ctx, argv[0]) != 0;
+  int32_t values[4] = {100, 60, 200, 150};
+  for (int i = 0; i < 4; ++i) {
+    if (argc > i + 1 && JS_ToInt32(ctx, &values[i], argv[i + 1]) != 0) {
+      return JS_EXCEPTION;
+    }
+  }
+  const std::string result = d3d8::ArmViewportProbe(
+      armed, values[0], values[1], static_cast<uint32_t>(values[2]),
+      static_cast<uint32_t>(values[3]));
+  return JS_NewStringLen(ctx, result.data(), result.size());
 }
 
 // `render.probe(name, scale, mipmap)` - arm the synthetic quad (D3D8Capture.h). Drawn through
@@ -871,12 +945,17 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("state", GetShadowState, nullptr),
     JS_CGETSET_DEF("topologies", GetTopologies, SetTopologies),
     JS_CGETSET_DEF("lighting", GetLighting, SetLighting),
+    JS_CGETSET_DEF("specular", GetSpecularValue, SetSpecularValue),
     JS_CGETSET_DEF("half_pixel", GetHalfPixel, SetHalfPixelValue),
+    JS_CGETSET_DEF("rhw_depth_raw", GetRhwDepthRaw, SetRhwDepthRawValue),
+    JS_CGETSET_DEF("viewport_rect", GetViewportRect, SetViewportRectValue),
     JS_CGETSET_DEF("offscreen", GetOffscreen, SetOffscreenValue),
     JS_CGETSET_DEF("present_linear", GetPresentLinear, SetPresentLinearValue),
     JS_CGETSET_DEF("shade_mode", GetShadeMode, SetShadeModeValue),
     JS_CGETSET_DEF("force_lod", GetForceLod, SetForceLodValue),
     JS_CFUNC_DEF("probe", 5, ProbeQuad),
+    JS_CFUNC_DEF("depth_probe", 5, DepthProbe),
+    JS_CFUNC_DEF("viewport_probe", 5, ViewportProbe),
     JS_CFUNC_DEF("material_override", 2, MaterialOverrideFn),
     JS_CGETSET_DEF("material_overrides", GetMaterialOverrides, nullptr),
     JS_CFUNC_DEF("clear_material_overrides", 0, ClearMaterialOverridesFn),

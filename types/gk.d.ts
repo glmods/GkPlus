@@ -2152,6 +2152,85 @@ declare module "gk" {
     readonly material_overrides: string;
     clear_material_overrides(): void;
 
+    /** Run the specular term of the per-vertex light sum. The mirror image of
+     *  `GKPLUS_NO_SPECULAR`, which forces `D3DRS_SPECULARENABLE` off in the
+     *  *forwarded* call only: with both, the term can be removed from one paused
+     *  frame of each renderer and the two bases compared directly, which is what
+     *  separates "we add specular the original does not" from "we add more of it"
+     *  (§4.46).
+     *
+     *  On by default. */
+    specular: boolean;
+
+    /** Take a pre-transformed (`D3DFVF_XYZRHW`) vertex's `z` as the depth value,
+     *  clamped to the viewport's `MinZ..MaxZ`, instead of running the viewport's
+     *  depth range over it. That is what D3D does, measured with `depth_probe`;
+     *  Vulkan has no bypass, so without this every screen-space draw sits
+     *  `MinZ * (1 - z)` too far away and the effect layers - fire especially -
+     *  come and go with camera distance.
+     *
+     *  On by default. Setting it false restores the previous behaviour, which is
+     *  how to A/B it on one paused frame. */
+    rhw_depth_raw: boolean;
+
+    /** Honour `D3DVIEWPORT8`'s rectangle per draw, as the Vulkan viewport and
+     *  scissor, instead of covering the whole render target with one (§4.47).
+     *
+     *  Gunlok sets two rectangles: the whole backbuffer for everything in a
+     *  level, where it makes no difference, and `32,24 575x431` for the upgrade
+     *  screen. With it off that screen is stretched over the full 640x480 and
+     *  anchored at 0,0, and because the same frame also carries draws at the
+     *  full rectangle, the two halves end up displaced relative to each other.
+     *
+     *  On by default. Setting it false restores the pre-§4.47 behaviour, which
+     *  is how to A/B it inside one session. */
+    viewport_rect: boolean;
+
+    /** Arm the depth probe: one opaque magenta quad at 16,340..144,436, drawn
+     *  last against a depth buffer cleared to `clear_z` under a viewport slice of
+     *  `min_z..max_z`, with `ZFUNC LESS` and no depth write.
+     *
+     *  It answers whether D3D runs the viewport transform over a pre-transformed
+     *  vertex - the quad is either there or it is not, so the reading needs no
+     *  precision. **Read it in `d3d8` or `d3d9`**: the clear goes straight to the
+     *  forwarded runtime, so under `vulkan` the quad tests against whatever the
+     *  scene left. Returns what it armed and what each answer predicts.
+     *
+     *      render.depth_probe(true, 0.6, 0.7, 0.5, 1.0);  // drawn => z is the depth
+     *      render.depth_probe(false);                     // disarm
+     */
+    depth_probe(
+      armed?: boolean,
+      quad_z?: number,
+      clear_z?: number,
+      min_z?: number,
+      max_z?: number
+    ): string;
+
+    /** Arm the viewport-rectangle probe: one opaque magenta `D3DFVF_XYZRHW` quad
+     *  drawn last under a viewport whose `X`/`Y` are not zero, at 20 pixels in
+     *  from that origin.
+     *
+     *  It answers the other half of what a viewport does to a pre-transformed
+     *  vertex - whether D3D **adds** the rectangle's origin to it. It does not:
+     *  the same quad under `0,0 200x150` and under `100,60 200x150` moves by the
+     *  `100,60` its own coordinates moved by, not by twice that (§4.47). It also
+     *  shows the clipping, since a quad hanging over the edge is cut there.
+     *
+     *  **Read it in `d3d8`**, like `depth_probe`: the question is what D3D does.
+     *  Returns what it armed and where each answer puts the quad.
+     *
+     *      render.viewport_probe(true, 100, 60, 200, 150);
+     *      render.viewport_probe(false);                    // disarm
+     */
+    viewport_probe(
+      armed?: boolean,
+      x?: number,
+      y?: number,
+      width?: number,
+      height?: number
+    ): string;
+
     [key: string]: any;
   }
 

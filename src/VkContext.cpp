@@ -121,6 +121,7 @@ void QueryDevice(VkPhysicalDevice device, DeviceCaps &caps) {
   caps.buffer_device_address = features12.bufferDeviceAddress != 0;
   caps.dynamic_rendering = features13.dynamicRendering != 0;
   caps.synchronization2 = features13.synchronization2 != 0;
+  caps.depth_clamp = features.features.depthClamp != 0;
 
   VkPhysicalDeviceMemoryProperties memory = {};
   vkGetPhysicalDeviceMemoryProperties(device, &memory);
@@ -305,6 +306,10 @@ InitResult DoInitialize() {
 
   VkPhysicalDeviceFeatures2 features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
                                         &features12};
+  // Only the pre-transformed pipelines turn it on, and only where the device has it - see
+  // DeviceCaps::depth_clamp. Asking for an unsupported core feature fails vkCreateDevice, so
+  // this is conditional rather than unconditional.
+  features.features.depthClamp = TheCaps.depth_clamp ? VK_TRUE : VK_FALSE;
 
   const float priority = 1.0f;
   VkDeviceQueueCreateInfo queue = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};

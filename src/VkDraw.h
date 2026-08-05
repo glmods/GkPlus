@@ -210,6 +210,13 @@ struct PipelineState {
   uint32_t stencil_fail = 1;   // D3DSTENCILOP_KEEP
   uint32_t stencil_zfail = 1;
   uint32_t stencil_pass = 1;
+  // `depthClampEnable`, set for a pre-transformed draw and only for one. D3D **clamps** a
+  // pre-transformed vertex's z into the viewport's MinZ..MaxZ rather than clipping the
+  // primitive away - measured both ways round with `render.depth_probe` (notes §4.45) - and
+  // with BuildMvp's compensation in place, "outside the slice" is exactly "outside NDC [0,1]",
+  // which is the case this bit decides. It must stay off for the 3D path, where D3D really does
+  // clip at the near and far planes.
+  uint32_t depth_clamp = 0;
 
   bool operator<(const PipelineState &other) const;
 };
@@ -254,6 +261,21 @@ struct DrawItem {
   // which is the whole technique. Dynamic state, so it costs no pipeline.
   float min_depth = 0.0f;
   float max_depth = 1.0f;
+  // ...and D3DVIEWPORT8's rectangle, per draw for the same reason. **Gunlok sets two of them**
+  // (§4.47): the whole backbuffer for everything in a level, and 32,24 575x431 for the upgrade
+  // screen. It is the rectangle rather than the depth slice that decides where a draw lands, so
+  // ignoring it does not shift a layer by a hair - it stretches a whole screen over the window,
+  // which is what play reported. A width of 0 means "no viewport recorded yet"; RecordDraws
+  // falls back to the render target then, which is what every draw got before this existed.
+  //
+  // The rectangle is in the game's backbuffer pixels, and the offscreen target is the same size
+  // (§4.38), so it needs no scaling on the way to Vulkan. It is BOTH the viewport and the
+  // scissor there: D3D clips a pre-transformed vertex to it, measured with `render.viewport_probe`
+  // (a 64x32 quad under a 60x40 rectangle rasterises 40x20), and a Vulkan viewport does not clip.
+  int32_t viewport_x = 0;
+  int32_t viewport_y = 0;
+  uint32_t viewport_width = 0;
+  uint32_t viewport_height = 0;
   DrawSource vertex_source = DrawSource::Arena;
   DrawSource index_source = DrawSource::Arena;
   bool indexed = true;     // DrawPrimitiveUP has no indices at all
@@ -476,6 +498,52 @@ bool HalfPixel();
 // it - ImGui's Vulkan backend sets its own viewport, and it is drawn for the human rather than
 // to match d3d9.
 float ViewportOrigin();
+
+// A pre-transformed vertex's z is the depth value, clamped to the viewport's slice - it is not
+// something to run the viewport's depth range over.
+//
+// D3D skips the viewport transform for a D3DFVF_XYZRHW vertex - that is what "pre-transformed"
+// means - and clamps instead: `depth = clamp(z, MinZ, MaxZ)`, no scale and no bias. Measured
+// with `render.depth_probe` against the real D3D8 runtime, discriminating in both directions
+// and with z inside the slice and outside it (notes §4.45). Vulkan has no such bypass: minDepth
+// and maxDepth are applied to every vertex the pipeline rasterises. With Gunlok's world slice of
+// 0.1..1.0 that turned every screen-space z into `0.1 + 0.9 * z`, pushing each one away from the
+// camera by `0.1 * (1 - z)` - an error that shrinks as the draw approaches the far plane, which
+// is why the effect layers came and went with camera distance rather than being uniformly wrong.
+//
+// Two halves, and they only work together (the first cut had one and regressed the HUD):
+// `BuildMvp` feeds Vulkan `(z - MinZ) / (MaxZ - MinZ)` so the viewport transform hands back `z`,
+// and `PipelineState::depth_clamp` turns the resulting out-of-NDC case into D3D's clamp rather
+// than a clip.
+//
+// On by default, and read at record time, so both halves move together. `render.rhw_depth_raw =
+// false` restores the previous behaviour on the next frame - the game re-issues the same draws
+// while paused, so this is still A/B-able on one paused frame rather than across two launches.
+void SetRhwDepthRaw(bool enabled);
+bool RhwDepthRaw();
+
+// Honour D3DVIEWPORT8's RECTANGLE per draw, as the Vulkan viewport and scissor, rather than
+// covering the whole render target with one (§4.47).
+//
+// Gunlok sets two rectangles. Everything in a level uses the whole backbuffer, where the two
+// behaviours coincide - which is why this went unnoticed for forty-six sections and why every
+// whole-frame number measured on level02 is unaffected. The **upgrade screen** sets
+// `32,24 575x431`, and with the rectangle ignored its draws are stretched over the full 640x480
+// and anchored at 0,0: the panel and the character grow by 640/575, the edges fall off the
+// window, and - because the frame mixes rectangles, the HUD plates staying at `0,0 640x480` -
+// the parts that did not move end up somewhere else relative to the parts that did. That is the
+// "selection rectangles and text are shifted" a player sees.
+//
+// Two halves again, and again they only work together: the Vulkan viewport places the 3D
+// projection inside the rectangle the way D3D's does, and `BuildMvp` **subtracts** the
+// rectangle's origin from a pre-transformed vertex, because D3D does not add it there and Vulkan
+// will. Both measured with `render.viewport_probe` against the real D3D8 runtime, which also
+// settled the third part - D3D *clips* to the rectangle, so it is the scissor as well.
+//
+// On by default, and read at record time so both halves move together, exactly like
+// `rhw_depth_raw`. `render.viewport_rect = false` is the pre-§4.47 behaviour.
+void SetViewportRect(bool enabled);
+bool ViewportRect();
 
 // --- the material override --------------------------------------------------------------------
 //

@@ -1,8 +1,16 @@
 # Capture the Gunlok window to a PNG.
 #
-# PrintWindow with PW_RENDERFULLCONTENT (2) rather than CopyFromScreen: the game window can be
-# partially covered, and a screen grab would capture whatever is on top of it. The flag is what
-# makes it work for a window whose contents come from a GPU swapchain.
+# PrintWindow rather than CopyFromScreen: the game window can be partially covered, and a screen
+# grab would capture whatever is on top of it.
+#
+# THE FLAG IS 3, NOT 2. PW_RENDERFULLCONTENT (2) is what makes it work at all for a window whose
+# contents come from a GPU swapchain - with it absent the bitmap is solid black, because there is
+# no WM_PRINT redraw for the compositor to ask for. But **PW_CLIENTONLY (1) has to be there too**:
+# without it PrintWindow renders the whole window, title bar and border included, into a bitmap
+# that is sized from GetClientRect - so the frame is pushed down and right by the border and the
+# bottom and right edges of the game's own picture fall off the bitmap entirely. That is silent:
+# the shot looks like a screenshot of the game in its window, and it is missing ~40 rows of what
+# was being measured. Found while chasing §4.47, where the whole question was where a draw lands.
 #
 # Usage:  . .\shot-gunlok.ps1 ; Get-GunlokShot out.png
 
@@ -51,7 +59,7 @@ function Get-GunlokShot([string]$Path) {
     $bmp = New-Object System.Drawing.Bitmap $w, $ht
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $dc = $g.GetHdc()
-    [Shot]::PrintWindow($h, $dc, 2) | Out-Null
+    [Shot]::PrintWindow($h, $dc, 3) | Out-Null
     $g.ReleaseHdc($dc)
     $g.Dispose()
     $bmp.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
