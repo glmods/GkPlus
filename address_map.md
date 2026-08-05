@@ -69,12 +69,12 @@ skips the list entirely, drawing from the calling thread's PRNG for a uniform in
 | 0x007b6954 | unsigned | UITextColorLight 0xffccccd6 (scrolling msgs, briefing) |
 | 0x007b6a64 / 0x007b6a68 | unsigned | UIColorDim 0xff595966 / UIColorYellow 0xffffef47 |
 | 0x007c149c | unsigned | CursorColor (ARGB, init 0xffe5e5e5 in `InitConsole` @ 0x004d5380) |
-| 0x007b6a54/58/5c/60 | Font* | ConsoleSmallFont / ConsoleLargeFont / HudSmallFont / ConsoleLargeFont2 (all built in `InitConsole`) |
+| 0x007b6a54/58/5c/60 | Font* | **SmallFont / LargeFont / HudSmallFont / HeadingFont** (all built in `InitConsole`). Were `ConsoleSmallFont / ConsoleLargeFont / HudSmallFont / ConsoleLargeFont2`; three of those four names were wrong. Only `SmallFont` is a console font — the console draws through it exclusively, and `LargeFont`'s complete xref list (9 entries) contains nothing console-side. `LargeFont` and `HeadingFont` are **the same font twice**: same `large font.RIM`, same width table, same line height. All four are constructed with `line_height = 25`; `HeadingFont` measures 50-75 because `ScaleFontsForClientWidth` @ 0x004d79f0 writes `Font.scale` (+0xaf4) for that one only. Textures: `small font.RIM` / `large font.RIM` / `small font 2.RIM` / `large font.RIM`. **Construction order is not address order** — ctor #3 stores into 0x007b6a60, #4 into 0x007b6a5c |
 | 0x007b6a70..0x007b6a7c | — | command **hash table**: NumRegisteredCommands, CommandTableNumBuckets, CommandTableMask, CommandTableBuckets (`CommandListElem**`) |
 | 0x007b6aa8..0x007b6ab4 | List | command exec queue: CommandsToExecute (anchor), NumCommandsToExecute, cache, cacheValid — one popped per frame by `PumpQueuedConsoleCommand` |
 | 0x007b6a80 / 0x007b6b38 | float | ConsoleTextScrollTarget / ConsoleSlidePos (open/close anim; -1=closed) |
 | 0x007b6b3c | Sprite* | ConsoleBackdropSprite (FUN_004d7b20) |
-| 0x007b6ac8/cc/d0/d4 | — | DrawText scratch arg block (X/Ctx/Scale/4) |
+| 0x007b6ac8..0x007b6ad4 | RECTF | static text rect passed as `Font_QueueText`'s `rect` by the two console draws @ 0x004d7337 / 0x004d73d0. Four **floats** `{left, top, right, bottom}`, normalized 0..1 — was recorded as a "DrawText scratch arg block (X/Ctx/Scale/4)" before the callee was read |
 
 The console keeps text as parallel `List<T>` headers (0x10 bytes each: `{anchor_ptr, count,
 cached_array, cache_valid}` — the anchor is a **pointer** to a heap sentinel, unlike the embedded
@@ -313,6 +313,33 @@ gl.exe's user32 import set contains **no** `MoveWindow`, `SetWindowLongA/W`, `Ad
 in the game can reposition or restyle the window after creation, and the non-client margin is
 hand-rolled (`SM_CXFRAME`x2 horizontally, `SM_CXFRAME`x2 + `SM_CYCAPTION` vertically, missing
 `SM_CXPADDEDBORDER`, which is where the undersized client area comes from).
+
+**Text rendering:** (see `rendering_notes.md` §4.2 — text is its own queue, not the render queue)
+
+| Offset | Signature | Name |
+|--------|-----------|------|
+| 0x005782e0 | ThisCall<int, Font*, RECTF*, char*, uint*, void*, int, TextFlags, float, uint*, int> | Font_QueueText — lays out and **enqueues**, draws nothing. 39 call sites. Was `DrawText?`; carries the stack-smash defect, `game_defects_notes.md` §1 |
+| 0x00578ee0 | StdCall<void> | ScenePass_Overlay2D — walks the font registry at 0x007c14a0 and flushes each. Sole caller `RenderSceneAndPresent` @ 0x00574ccd; sole *callee* of interest below. **The seam for suppressing all text in a frame** |
+| 0x00578180 | ThisCall<bool, Font*> | Font_FlushQueuedText — drains `font+0xb08`, frees each `item.text`, then `RenderBatch_Draw(4,1)` |
+| 0x00578a00 | ThisCall<bool, Font*, int, int, int, char*, int, uint, void*, TextFlags, float, uint> | Font_RenderTextItem — ten args = the ten `TextDrawItem` fields in order (`RET 0x28`) |
+| 0x005792d0 | ThisCall<void, Font*, int, void*, float, uint*, int, int> | Font_EmitGlyphQuad — 4 verts / 6 indices per glyph; `depth` lerps the target camera's two z planes |
+| 0x005782b0 | ThisCall<float*, Font*, float*> | Font_GetNormalizedLineHeight — `(font[+0xaf0] * font[+0xaf4]) / ResolutionHeightF`; returns the out pointer in EAX, and both callers rely on it |
+| 0x00577c70 | ThisCall<Font*, Font*, void*, int, int*, int*> | Font_Ctor — 140 glyphs; registers the font into the 0x007c14a0 list. 4 call sites, all `InitConsole`, all passing `line_height = 25`. Normalizes glyph UVs with the **fixed literal 1/256**, not the texture size, so `large font.RIM`'s 512² sheet buys texel density rather than a bigger glyph box |
+| 0x004d79f0 | CDecl<void> | ScaleFontsForClientWidth — called once from `InitConsole` right after the four constructions. Re-fills each font's advance table by `ClientWidth` band, and for `HeadingFont` **only** also writes `Font.scale` (2.0/2.5/3.0). That store @ 0x004d7b06 is the **only** write to `+0xaf4` in the binary outside `Font_Ctor` |
+| 0x005789a0 | ThisCall<void, Font*, const int*, float> | Font_SetGlyphWidths — 140 entries at `font+0x8c0`, each `(int)(base[i]*scale + 0.5)`. Only caller is `ScaleFontsForClientWidth` |
+| 0x00666640 / 0x00666870 | int[140] | SmallFontGlyphWidths / LargeFontGlyphWidths — differ in 14 entries, so `large font.RIM` is separately authored art rather than a resample |
+| 0x00666aa0 | int[140] | FontGlyphSheetRows — shared by all four fonts |
+| 0x005780d0 | ThisCall<void, Font*> | Font_Dtor — **tail `JMP` to 0x00579170, no `RET` of its own**. 4 call sites, all `FUN_004d5620` |
+| 0x004f72e0 | FastCall<void, uint*> | DrawVersionText — draws the literal `"v1.3 DX8"` bottom-left. Two callers: the Main menu (gated `ChosenMenu == 0`) and the splash frame. Was `DrawVersionNumber?` |
+| 0x007c14a0 | List | the font registry `Font_Ctor` appends to and `ScenePass_Overlay2D` walks |
+| 0x00667434 | char[9] | `"v1.3 DX8"` — the on-screen stamp. **Unrelated** to `CommandVersion` @ 0x0043f1a0, which reports `"00.08 Built on Jun 24 2019"` @ 0x00651b2c |
+| 0x00667440 | unsigned | GREEN_TEXT_COLOR 0xff00e500 (the Main-menu version stamp; channel order unverified) |
+| 0x006ab100 | unsigned | TEXT_OUTLINE_COLOR 0xff000000 — read only under `TF_Outline` |
+| 0x007c1478 | int | TextAnchorAdjustDisabled — suppresses `TF_AnchorBottom`'s per-line y decrement. Cleared/set by `FUN_00484e40`; **why is not established** |
+| 0x0066ccc0 | — | TextDrawNode_vtbl (one slot, dtor 0x00579240) |
+
+`TextFlags` and the 0x28-byte `TextDrawItem` are modelled in the Ghidra DB. The `Font` layout
+(0xb18+) is measured in `rendering_notes.md` §4.2 but deliberately **not** typed.
 
 **Particles:** (see `role_subobjects_notes.md` §3)
 

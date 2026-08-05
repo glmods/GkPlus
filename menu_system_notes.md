@@ -380,6 +380,30 @@ OnMenuItemClicked    0x004ecf10   activate
 GoToMenu             0x004fbfa0   transition
 ```
 
+### The version stamp is drawn by the Main menu, not by the front end
+
+`UpdateAndDrawMenuScreen` calls `DrawVersionText` @ `0x004f72e0` at `0x004ecd6e`, behind
+
+```
+004ecd60  CMP dword ptr [ChosenMenu],0x0
+004ecd67  JNZ 0x004ecd73                    ; skip unless MenuId::Main
+004ecd69  MOV ECX,0x667440                  ; GREEN_TEXT_COLOR 0xff00e500
+004ecd6e  CALL DrawVersionText
+```
+
+so **`"v1.3 DX8"` appears on menu 0 only** — leave the Main menu and it is gone. The string is a
+plain `.rdata` literal at `0x00667434`, not a `GL_RESOURCE_ID`, so it is unlocalized like menu 19's
+`"Particle Rate"` but for a better reason: it is a version, not a label. It is drawn bottom-left
+through `SmallFont`, at a rect of `{0.01, 0.99 - lineheight, 1.00, 0.99}`.
+
+The **only** other caller is `FUN_0056e310` @ `0x0056e32f`, the pre-menu splash frame reached from
+`WinMain` → `FUN_0046edd0`, which passes a near-white `0xffe5e5ea` instead. So the stamp is on
+screen for the splash, off for every menu but Main, and off in game.
+
+Do not confuse it with the console `VERSION` command: `CommandVersion` @ `0x0043f1a0` reports an
+entirely different string, `"00.08 Built on Jun 24 2019"` @ `0x00651b2c`, built from resource id
+`0x2ef7`. The two version strings are independent and disagree.
+
 ### `GoToMenu` @ `0x004fbfa0`
 
 ```c

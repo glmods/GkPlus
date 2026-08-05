@@ -1244,6 +1244,112 @@ declare module "gk" {
     readonly fog: Fog;
   }
 
+  // --- the game's own text layer ---------------------------------------------
+
+  /** One of the four fonts `InitConsole` builds. The names are GkPlus's - the
+   *  game has no string for any of them - and describe the role each actually
+   *  plays, established from the `.RIM` it is built from and its consumers.
+   *
+   *  - `small` - `small font.RIM`. The default UI text: the console, both menu
+   *    systems, the inventory, briefing body text, the version stamp.
+   *  - `large` - `large font.RIM`, a higher-resolution sheet with ~26% wider
+   *    glyphs. The emphasis font: loading messages, the credits.
+   *  - `hud` - `small font 2.RIM`. The in-game HUD, target info and reticule.
+   *  - `heading` - `large font.RIM` at 2x-3x. The oversized heading on the
+   *    briefing, training-debrief and stats pages, and the only font whose
+   *    `line_height` is not 25px. */
+  export type FontName = "small" | "large" | "hud" | "heading";
+
+  /** A normalised 0..1 screen rectangle: the layout box, not the text's bounds.
+   *  Omitted members default to the full screen.
+   *
+   *  `bottom` never reaches the drawn item - it is purely the limit that
+   *  `clip_to_bottom` truncates against. */
+  export interface TextRect {
+    left?: number;
+    top?: number;
+    right?: number;
+    bottom?: number;
+  }
+
+  export interface TextDrawOptions {
+    /** The string. Longer than `text.max_length` is **truncated**, not refused:
+     *  the engine's layout buffer is 1028 bytes and unbounded, and a longer
+     *  string smashes its stack rather than rendering. */
+    text: string;
+    /** Defaults to `"small"`, the font the game's own version stamp, every
+     *  console line and 32 of its 39 text draws use. */
+    font?: FontName;
+    rect?: TextRect;
+    /** A D3DCOLOR, e.g. `0xff00e500`. Defaults to opaque white. */
+    color?: number;
+    /** A bitwise-or of `text.flags`. */
+    flags?: number;
+    /** Characters to lay out; 0 or absent means the whole string. */
+    max_chars?: number;
+    /** 0..1 between the target camera's near and far z planes. 0 is nearest,
+     *  which is what an overlay wants. */
+    depth?: number;
+    /** Only read when `flags` includes `last_char_alt_color`, and only then does
+     *  the final character use it instead of `color`. */
+    alt_color?: number;
+    /** Scroll offset: start at this line and shift the text up accordingly. */
+    skip_lines?: number;
+  }
+
+  /** The nine layout/render flag bits. Four are acted on when the text is
+   *  queued, five when it is drawn. */
+  export interface TextFlags {
+    /** Lay out and measure, emitting nothing. */
+    readonly measure_only: number;
+    readonly align_center: number;
+    /** The console's caret - glyph 0x40 at `ConsoleCursorPos`. Unrelated to
+     *  `last_char_alt_color`. */
+    readonly console_cursor: number;
+    readonly no_layout: number;
+    /** The **final character only** is drawn in `alt_color`. */
+    readonly last_char_alt_color: number;
+    /** A black outline: the glyph is drawn four more times at +-1px diagonals,
+     *  so five draws per glyph. */
+    readonly outline: number;
+    /** Grow upwards from the bottom of the rect. */
+    readonly anchor_bottom: number;
+    /** Truncate at the last line above `rect.bottom`. **Only honoured when
+     *  `anchor_bottom` is clear** - the engine tests the pair together. */
+    readonly clip_to_bottom: number;
+    /** `align_center` wins if both are set. */
+    readonly align_right: number;
+  }
+
+  /** The engine's own text layer.
+   *
+   *  **`draw` queues; it does not draw.** The string is laid out immediately and
+   *  appended to the font's pending list, which the game's per-frame overlay
+   *  pass rasterizes and then frees - so **a string drawn once is on screen for
+   *  one frame**. Anything meant to persist has to be drawn again every frame.
+   *
+   *  For a panel, the ImGui object handed to `draw_gui` is the better tool. This
+   *  is for text that has to look like the game's, because it goes through the
+   *  game's fonts, colours, layout and batching.
+   *
+   *  Main thread only. */
+  export interface Text {
+    /** Queue one string for this frame. Returns the number of lines laid out, or
+     *  0 if it clipped. */
+    draw(options: TextDrawOptions): number;
+    /** Line height as a fraction of screen height - the unit `rect`'s vertical
+     *  members are in. Defaults to `"small"`.
+     *
+     *  All four fonts are built at 25px; `heading` reports double because a
+     *  scale factor is applied to it after construction, so ask rather than
+     *  assuming. */
+    line_height(font?: FontName): number;
+    readonly fonts: readonly FontName[];
+    /** 1027. See `TextDrawOptions.text`. */
+    readonly max_length: number;
+    readonly flags: TextFlags;
+  }
+
   // --- script-queue messages -------------------------------------------------
 
   /** A message payload: anything `JSON.stringify` can encode **except a bare
@@ -2248,6 +2354,7 @@ declare module "gk" {
   export const gls: Gls;
   export const game: Game;
   export const world: World;
+  export const text: Text;
   export const mods: Mods;
   export const fx: Fx;
   export const light: Light;

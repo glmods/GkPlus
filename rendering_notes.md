@@ -255,7 +255,8 @@ Aw_DrawIndexedPrimitiveUP 0x005a3ed0   user pointer + FVF + indices <- no D3D bu
  │
  ├─ IMMEDIATE — RenderBatch_Draw 0x005a3970, 8 callers
  │    0x00582d10  particle renderer
- │    0x00578180 / 0x00578a00 / 0x005792d0  font + 2D overlay (glyph quads)
+ │    Font_FlushQueuedText 0x00578180 / Font_RenderTextItem 0x00578a00 /
+ │    Font_EmitGlyphQuad   0x005792d0            text, see 4.2
  │    0x005695c0 / 0x00569b10 / 0x00569ed0  in-game menu widgets
  │    0x00496df0
  │
@@ -284,9 +285,68 @@ Three things this establishes, in order of how much they constrain a replacement
   reachability query says nothing reaches it. This is CLAUDE.md's function-pointer trap in its
   purest form.
 
-A `RenderBatch` auto-flushes at 0x800 vertices / 0xc00 indices; `FUN_005792d0`, the glyph quad
-emitter, is the clearest read on the structure (`+0x2c` D3DPRIMITIVETYPE, `+0x50` vertex count,
-`+0x54` index count, and it emits 4 verts / 6 indices per glyph).
+A `RenderBatch` auto-flushes at 0x800 vertices / 0xc00 indices; `Font_EmitGlyphQuad` @ 0x005792d0,
+the glyph quad emitter, is the clearest read on the structure (`+0x2c` D3DPRIMITIVETYPE, `+0x50`
+vertex count, `+0x54` index count, and it emits 4 verts / 6 indices per glyph).
+
+## 4.2 Text is a third queue, drained once a frame
+
+Text has **its own retained path**, parallel to the render queue and invisible to it. The function
+that every producer calls does not draw:
+
+```
+producers (39 call sites)
+  └─ Font_QueueText 0x005782e0   lays the text out, appends a List_Member<TextDrawItem>
+                                 to font+0xb08. Touches no device, no vertex buffer,
+                                 and not DAT_007c146c.
+
+RenderSceneAndPresent 0x00574ccd
+  └─ ScenePass_Overlay2D  0x00578ee0   walks the font registry List at DAT_007c14a0
+       └─ Font_FlushQueuedText 0x00578180   per font: pop, render, free item.text, unlink
+            └─ Font_RenderTextItem 0x00578a00   per item; breaks the batch when item.target
+                 │                              differs from font+0xb04 (camera switch)
+                 └─ Font_EmitGlyphQuad 0x005792d0   per glyph
+            └─ RenderBatch_Draw(4, 1)
+```
+
+Consequences worth carrying:
+
+- **Layout happens at submit time, rasterization at flush time.** Wrapping, scrolling, clipping and
+  the `'?'` substitution are all done inside `Font_QueueText`; the item carries pixel coordinates and
+  a plain substring. A hook that wants the *string* belongs on `Font_QueueText`; one that wants the
+  *geometry* belongs on `Font_EmitGlyphQuad`.
+- **`ScenePass_Overlay2D` is the seam** — one call, 14 instructions, and it is the only caller of
+  `Font_FlushQueuedText`. Suppressing every text overlay in the frame is one detour.
+- **There are four fonts**, constructed by `InitConsole` via `Font_Ctor` @ 0x00577c70 and destroyed
+  by `Font_Dtor` @ 0x005780d0 (which is a **tail `JMP`**, not a `RET` — it has no epilogue of its
+  own). Each registers itself into the `DAT_007c14a0` list; the flush is per font, in queue order.
+  They are `SmallFont` / `LargeFont` / `HudSmallFont` / `HeadingFont` @ 0x007b6a54/58/5c/60, and
+  three of those names are corrections — see `address_map.md`, which had three of the four filed as
+  console fonts when only `SmallFont` is one.
+- **A font's size is not its line height.** All four are constructed with `line_height = 25`;
+  `Font_GetNormalizedLineHeight` returns `line_height * scale / ResolutionHeightF`, and `scale`
+  (+0xaf4) is 1.0 out of the constructor with **exactly one other writer in the binary** —
+  `ScaleFontsForClientWidth` @ 0x004d79f0, which sets it to 2.0/2.5/3.0 for `HeadingFont` alone.
+  That same function also rewrites every font's *advance* table per client width, so glyph metrics
+  are resolution-dependent in a way the constructor's arguments do not show. `LargeFont` and
+  `HeadingFont` are otherwise the same font: same texture, same widths, same line height.
+- `Font_QueueText`'s `depth` parameter is a 0..1 fraction lerped between the target camera's two z
+  planes to produce the vertex z, with `rhw = k/z` — so text participates in depth when
+  `target[+0x250]` is set, and is flat at z=0 otherwise.
+
+GkPlus's mirror of this is `src/Font.h/cpp` (`GetFont` / `LineHeight` / `QueueText`, and the
+`text` JS namespace). Two things it does not pass through: it truncates at 1027 characters, because
+past that the engine smashes its own stack, and it normalises `max_chars <= 0` to the whole string,
+because the engine's clamp is an unsigned compare where a negative reads as "no limit". The
+ownership contract is measured — `Font_QueueText` copies the text into its own pool block
+(`malloc(strlen+1)` + inline `strcpy` @ 0x005787f4), so a caller may pass a temporary or a literal;
+`target` is the one argument stored raw and read again at flush time.
+
+`Font_QueueText`'s ten parameters, the nine `TextFlags` bits and the 0x28-byte `TextDrawItem` are
+all modelled in the Ghidra DB (enum `TextFlags`, struct `TextDrawItem`) with plate comments; the
+`Font` layout is measured but deliberately **not** typed, since it is 0xb18+ and reaches many
+functions. The one defect on this path is `Font_QueueText`'s unbounded copy of the caller's string
+into a 1028-byte frame buffer — `game_defects_notes.md` §1.
 
 ## 5. The producers
 

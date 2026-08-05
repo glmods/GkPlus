@@ -6,7 +6,7 @@ second evening blaming our hooks for them.
 
 ---
 
-## 1. `DrawText?` @ 0x005782e0 smashes its stack on any string over ~1024 chars
+## 1. `Font_QueueText` @ 0x005782e0 smashes its stack on any string over ~1024 chars
 
 **Status:** open, unpatched. Reproduces reliably. Blocks the training-level debrief.
 
@@ -15,8 +15,8 @@ smash, not a graceful failure.
 
 ### Mechanism
 
-`DrawText?` is `__thiscall` with the text as its second stack argument
-(`Stack[0x8]`, i.e. `[EBP+0xc]`; the first, `[EBP+8]`, is a `float *`). Its
+`Font_QueueText` is `__thiscall` with the text as its second stack argument
+(`Stack[0x8]`, i.e. `[EBP+0xc]`; the first, `[EBP+8]`, is the `RECTF *`). Its
 prologue is `SUB ESP,0x478` and it copies the caller's string into a **1028-byte
 buffer at `EBP-0x404`** with **no bound**. It then inline-`strlen`s that buffer
 into EBX (0x00578324..0x0057833b) and loops `[0, EBX)` replacing glyph-less
@@ -64,7 +64,7 @@ vanilla Gunlok too.
 
 ### If we decide to fix it
 
-Hook `DrawText?` and clamp the text before calling the original — the bound is
+Hook `Font_QueueText` and clamp the text before calling the original — the bound is
 `0x404` minus the NUL, and the string is just `Stack[0x8]`. A wrapper that copies
 at most 1027 chars into its own buffer and forwards that is ~15 lines and cannot
 regress anything, since longer strings currently corrupt the stack rather than
@@ -76,8 +76,13 @@ has no other "fix the game's bugs" hooks to be consistent with.
 
 ### Ghidra
 
-`DrawText?` @ 0x005782e0 has a plate comment recording all of the above. The name
-still carries a `?` — the body was never fully read, only the buffer handling.
+`Font_QueueText` @ 0x005782e0 has a plate comment recording all of the above, kept
+verbatim as a trailing section under the full analysis of the function. The name was
+`DrawText?` while only the buffer handling had been read; the body has since been read
+end to end, and the function **draws nothing** — it enqueues a `TextDrawItem` node for
+a later flush. That does not change this defect: the unbounded copy is in the layout
+pass, before anything is queued. See `rendering_notes.md` for the queue→flush chain and
+the `TextFlags` bits.
 
 ---
 
@@ -367,6 +372,65 @@ the field is worth caring about here.
 The fix, if one is wanted, is the engine's own correct pattern: give each actor its own copy, the
 way `CommandVulnerability` does. Setting `actor_scoped = 0` instead would stop the destructor
 double-free but not the completion free, which is unconditional on a non-NULL pointer.
+
+---
+
+## 7. `Font_QueueText` @ 0x005782e0 dereferences null when its node allocation fails
+
+**Status:** open, unpatched. **Not reproducible in practice** — see below.
+
+**Severity:** fatal if it ever fires, but gated behind an allocation failure that nothing
+in normal play can reach. Recorded because it is cheaper to have written down than to
+rediscover, not because it needs fixing.
+
+The second defect in this function; §1 is the one that actually bites.
+
+### Mechanism
+
+Having laid the text out and copied it, the function allocates the 0x34-byte queue node
+and does **not** check the result:
+
+```
+00578899  XOR  ECX,ECX                     ; ECX = 0 on the failure path
+...
+005788a7  MOV  dword ptr [ECX + 0x8],EAX   ; <-- write through null
+```
+
+`pool_alloc` (via the `malloc` thunk @ 0x005e3f72) returns null on failure, the failure
+path zeroes ECX, and the very next thing the function does is store the list linkage
+through it. A plain null write at `+8`, so it faults in the first page and looks like an
+ordinary access violation with no useful context.
+
+The text copy leaks on the same path: `malloc(strlen+1)` @ 0x005787f4 has already
+succeeded and nothing frees it before the store. That is the lesser of the two problems
+and it never gets the chance to matter, because the store faults first.
+
+### Why it is not reachable
+
+`pool_alloc` @ 0x00571470 is a page sub-allocator that falls back to the real CRT
+`malloc` for large blocks (see `src/Memory.h`). A 0x34-byte request failing means the
+process is already out of memory in a way that a 32-bit game from 2000 does not
+ordinarily reach — and if it did, this would be one of many things to fall over. Nothing
+about the text path makes it more likely here than anywhere else.
+
+That is the whole reason this is a footnote rather than a fix: the failure mode is real
+and the code is genuinely wrong, but no input, no asset and no script can steer it.
+
+### Consequences for GkPlus
+
+None that need action. `gk::QueueText` (`src/Font.cpp`) forwards to this function, so a
+script calling `text.draw` inherits the same non-reachable path — it neither introduces
+nor worsens it. Worth knowing only if a crash ever lands at 0x005788a7, where the answer
+is "the machine was out of memory", not "the text was malformed".
+
+The mirror deliberately does **not** guard against this. There is nothing to guard: the
+allocation is the engine's, inside the call, and a wrapper cannot observe it.
+
+### Ghidra
+
+`Font_QueueText`'s plate comment records §1's stack smash and the parameter analysis.
+This defect is deliberately kept out of it: the plate should describe what a caller can
+actually hit, and this is recorded here instead.
 
 ---
 

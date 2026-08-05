@@ -411,6 +411,12 @@ IDirect3DDevice9 *ResolveD3D9Device(IDirect3DDevice8 *device);
 // deliberate limitation of a mode whose only job is to be the ground truth in an A/B.
 bool PassthroughToSystemD3D8();
 
+// Which renderer is actually drawing the frame, as a short stable name for display:
+// "vulkan", "d3d8" or "d3d9". This is the *resolved* mode, not what GKPLUS_RENDERER
+// asked for - a `d3d8` request that could not load Windows' own runtime falls back to
+// d3d8to9 and reports "d3d9" accordingly. Never null.
+const char *RendererName();
+
 // Arm the synthetic quad probe: one textured quad, pre-transformed to exact screen pixels, drawn
 // last through the capture device's own methods so the reference and this renderer are handed
 // the same geometry, texture and stage setup (§4.35). `name` is a case-insensitive substring of

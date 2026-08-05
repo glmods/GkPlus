@@ -56,7 +56,7 @@ namespace gk {
 // **The console queue is read, never written.** `PumpQueuedConsoleCommand` is
 // replaced - it has to be, because its pop copies a node's string into
 // ConsoleCommandLine (char[252]) with an unbounded loop whose buffer abuts
-// ConsoleSmallFont - and the replacement dispatches on the envelope, treating a
+// SmallFont - and the replacement dispatches on the envelope, treating a
 // bare line as kind "command". Nothing writes to `CommandsToExecute`, so the
 // `#` directives, front-insertion, CLEAR BATCH, NumCommandsToExecute and
 // SaveGame's serialisation of pending lines are all untouched. An earlier design

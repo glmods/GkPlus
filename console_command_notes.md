@@ -439,7 +439,7 @@ are not just documentation:
   and the six `console` administration members resolve their name from `glres<lang>.dll` at the
   call, because those names are not in the executable at all (§1).
 - **A length check the engine does not do.** `ExecuteCommand` copies into `ConsoleCommandLine`
-  (`char[252]`) with an *unbounded* byte loop, and the next global is `ConsoleSmallFont`. Nothing in
+  (`char[252]`) with an *unbounded* byte loop, and the next global is `SmallFont`. Nothing in
   the game can reach that - `fgets` caps a batch line at 249 - but a script can. Both the dispatcher
   and `console.execute` now refuse an over-long line rather than truncating it.
 - **Whitespace handling that matches the handler.** The console splits arguments on whitespace and

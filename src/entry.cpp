@@ -8,6 +8,7 @@
 #include "D3D8Capture.h"
 #include "Debug.h"
 #include "FileHooks.h"
+#include "Font.h"
 #include "GLS.h"
 #include "GUI.h"
 #include "InputFix.h"
@@ -43,6 +44,11 @@ struct Subsystems {
   // it needs no particular position here: everything in this aggregate is built
   // from DllMain, which runs before WinMain does.
   WindowPlacementSystem window; // keep the game window clear of the taskbar
+  // After D3D8CaptureSystem: the stamp it draws names the renderer, and which one
+  // that is only becomes known when the capture layer resolves Direct3DCreate8.
+  // Reading it is deferred to the first draw, so this is ordering for clarity
+  // rather than correctness - but it is the order the dependency actually runs in.
+  VersionTextSystem version; // "GkPlus - <renderer>" instead of "v1.3 DX8"
   CustomMenuSystem menus;   // front-end menu items owned by GkPlus
   ScriptQueueSystem queue;  // the script queue carries JSON, not bare .gcs names
   gls::GlsSystem gls;       // lets the GLS parser take a source text, not a file

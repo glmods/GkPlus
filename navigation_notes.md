@@ -262,7 +262,7 @@ Two other tests in the same function:
 
 That line is **not** a pathfinding artefact. It is `MobileActor::waypoints` (+0x204) — the
 player's own queued move orders — rendered by `FUN_00565920`, the in-game order/cursor overlay
-called from `RunInGameFrame` @ 0x0046e6c0 (it `sprintf`s, calls `DrawText?` and reads
+called from `RunInGameFrame` @ 0x0046e6c0 (it `sprintf`s, calls `Font_QueueText` and reads
 `MobileActor+0x204` three times). Player waypoints enter through **slot 90
 `MobileActor::AddWaypoint` @ 0x0053a760**, which builds the same 0x18-byte record.
 

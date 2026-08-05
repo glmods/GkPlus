@@ -39,7 +39,7 @@ void ExecuteCommandLine(const char *cmdline); // 0x004d59e0
 //
 // **`ExecuteCommand` @ 0x004d6090 copies into it with an unbounded byte loop**
 // (0x004d6097..0x004d60a2 - no length check of any kind) and the next global is
-// ConsoleSmallFont @ 0x007b6a54, so a longer line writes a caller-controlled
+// SmallFont @ 0x007b6a54, so a longer line writes a caller-controlled
 // string through a font pointer. This is the same hazard `PumpQueuedConsoleCommand`
 // has, and the reason ScriptQueue.cpp replaces that one.
 //

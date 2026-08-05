@@ -39,7 +39,7 @@ Two facts from it that change how bindings get written:
   translated install, a length check the engine does not do, and per-command whitespace rules.
   `src/JsCommands.cpp`'s header comment is the full argument.
 - **`ExecuteCommand` @ 0x004d6090 has no length check.** It copies into `ConsoleCommandLine`
-  (`char[252]`) with an unbounded byte loop, and `ConsoleSmallFont` @ 0x007b6a54 is next. `fgets`
+  (`char[252]`) with an unbounded byte loop, and `SmallFont` @ 0x007b6a54 is next. `fgets`
   caps a batch line at 249 so the game cannot reach it, but a script can — `gk::ExecuteCommand`
   therefore refuses anything over `kConsoleCommandLineMax` and returns false.
 - **Nine binding members do not replicate, and the ones next to them do.** `actor.armor`,
@@ -95,11 +95,12 @@ the host's copy as well. It is an accessor on a namespace object rather than a p
 a C module's named exports are fixed at instantiation — a top-level `simulation_running` could only
 ever report what was true before any level existed.
 
-The `"gk"` QuickJS C module, exposing 22 namespaces to scripts. `src/Js.h` is the public surface
+The `"gk"` QuickJS C module, exposing 24 namespaces to scripts. `src/Js.h` is the public surface
 — `RegisterGkModule`, plus `Log` / `ReportException` / `ReleaseCallbacks` for the host — and
-`src/JsGk.cpp`'s `Namespaces` table builds them. Twelve come one per translation unit —
+`src/JsGk.cpp`'s `Namespaces` table builds them. Fourteen come one per translation unit —
 `JsCamera`, `JsConsole`, `JsActors`, `JsRoles`, `JsTokens`, `JsTriggers`, `JsLevels`, `JsMake`,
-`JsGls`, `JsGame`, `JsWorld`, `JsMods` — and the remaining ten are the command-backed clusters
+`JsGls`, `JsGame`, `JsWorld`, `JsMods`, `JsRender`, `JsText` — and the remaining ten are the
+command-backed clusters
 `JsCommands.cpp` supplies (`fx`, `light`, `objectives`, `music`, `screen`, `units`, `inventory`,
 `tracks`, `demo`, `script`), over shared helpers in `src/JsBindings.h` / `src/JsCommon.cpp`.
 **`JsMenus` is not in that table** — see below. `JsGk.cpp` also owns
@@ -127,6 +128,14 @@ export function setup_menus(menus) {                // `menus` is not an export
   menus[1].add_toggle("Cheats", false, (item) => log(item.value));
 }
 ```
+
+**`text` queues; it does not draw.** `text.draw(...)` appends to the font's pending list and the
+game's per-frame overlay pass rasterizes it and then frees it, so a string drawn once is on screen
+for **one frame** — anything meant to persist has to be drawn again every frame. It is the wrong
+tool for a panel (that is the ImGui object `draw_gui` is handed) and the right one for text that
+has to look like the game's, because it goes through the game's fonts, colours, layout and
+batching. The binding clamps at `text.max_length` (1027): past that the engine smashes its own
+stack, so an unclamped `text.draw` would hand every script a crash. See `src/Font.h`.
 
 **`menus` is the argument to `setup_menus` and nothing else** — `NewMenusNamespace` is declared in
 `src/Js.h` rather than `JsBindings.h`, and `JsGk.cpp`'s `Namespaces` table deliberately omits it.

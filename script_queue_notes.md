@@ -79,7 +79,7 @@ code path, while `CommandsToExecute` keeps byte-for-byte the representation vani
 - **Consuming still had to be a replacement**, and that is a measurement, not a preference.
   `PumpQueuedConsoleCommand` copies a node's string into `ConsoleCommandLine` (`char[252]`
   @ 0x007b6958) with an **unbounded** byte loop at 0x004d61f0, and the next global is
-  `ConsoleSmallFont` @ 0x007b6a54 with nothing in between. An envelope adds ~28 characters to a
+  `SmallFont` @ 0x007b6a54 with nothing in between. An envelope adds ~28 characters to a
   line `fgets` already allows 249 of — `level06.gcs` ships one 399 characters long — so letting
   the game pop an envelope would write JSON through a font pointer. The replacement decodes first
   and puts only the *body* in that buffer, truncating (with a note) if it still does not fit.

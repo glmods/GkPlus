@@ -470,7 +470,7 @@ void __fastcall HookedCommandVulnerability(int length, char *args) {
 //
 //   * the consumer must be replaced anyway. PumpQueuedConsoleCommand copies a
 //     node's string into ConsoleCommandLine (char[252] @ 0x007b6958) with an
-//     unbounded byte loop at 0x004d61f0, and the next global is ConsoleSmallFont
+//     unbounded byte loop at 0x004d61f0, and the next global is SmallFont
 //     @ 0x007b6a54 with nothing in between - so an envelope arriving here from
 //     anywhere has to be decoded before it reaches that buffer, and the decode
 //     is the same code that handles a bare line.

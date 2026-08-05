@@ -2821,6 +2821,21 @@ void ResetStats() {
 
 bool PassthroughToSystemD3D8() { return SystemD3D8; }
 
+// Deliberately reports the *resolved* mode rather than the environment variable. A
+// `GKPLUS_RENDERER=d3d8` that could not load Windows' own runtime keeps d3d8to9 (see
+// ResolveDirect3DCreate8 above), and a version stamp claiming "d3d8" in that case would
+// be reporting the request instead of the truth.
+//
+// Order matters: the Vulkan renderer sits in front of whichever D3D8 path was resolved -
+// it takes the window at Present and the D3D9 device simply stops reaching the screen -
+// so `vulkan` wins over both.
+const char *RendererName() {
+  if (vulkan::RendererRequested()) {
+    return "vulkan";
+  }
+  return SystemD3D8 ? "d3d8" : "d3d9";
+}
+
 IDirect3DDevice9 *ResolveD3D9Device(IDirect3DDevice8 *device) {
   if (!device) {
     return nullptr;
