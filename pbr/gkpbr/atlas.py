@@ -1,6 +1,6 @@
 """Segmenting a texture sheet into the regions the geometry actually uses.
 
-Of the 364 textures the shipped geometry names, only **6** are sampled as wrapping
+Of the 365 textures the shipped geometry names, only **6** are sampled as wrapping
 tiling surfaces; the rest are **atlases**, and the heavily-used ones especially --
 ``baddies3.rim`` is named by 133 ``.rif`` files and packs unrelated materials side by
 side. A single roughness or metalness answer for such a sheet is wrong by
@@ -19,7 +19,7 @@ and a phrase to hand a classifier.
 Four implementation notes, each of which was a wrong version first:
 
 - **Group by part, not by connected components of the occupancy mask.** These
-  atlases have no gutters: ``baddies3.rim`` is 99% covered by the polygons that
+  atlases have no gutters: ``baddies3.rim`` is 96% covered by the polygons that
   sample it, so every patch touches its neighbours and one flood fill swallows the
   entire sheet. Connectivity cannot separate what the artist packed edge to edge;
   the geometry's own grouping can.

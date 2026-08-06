@@ -19,6 +19,7 @@ Shoot-Settled -Renderer vulkan -Level level02 -Out vk.png
 | `shot-gunlok.ps1` | `Get-GunlokShot`. `PrintWindow` with flag **3**, and `SetProcessDPIAware()` in the capturing process |
 | `shoot-settled.ps1` | `Dismiss-Briefing`, `Wait-CameraRest`, `Shoot-Settled`. The whole procedure |
 | `find-draw.ps1` | `Find-Draw -X -Y -Count`: binary-searches `render.draw_hide` for the draw that painted a pixel |
+| `harvest-draws.ps1` | `Seed-Harvest`, `Harvest-Level`, `Save-Harvest`. Accumulates `render.frame_draws()` across a whole session into a per-texture render-state profile, inside the game, over one kept-open socket. Consumed by `pbr` (`gkpbr.cli observed`); its own header is the list of things that waste a run |
 
 Four things they encode, each of which produced a wrong answer first:
 
@@ -51,6 +52,14 @@ Four things they encode, each of which produced a wrong answer first:
 
 `level02` is the level to shoot: no cutscene, and all three renderers settle to bit-identical
 camera values and the same 178 actors. Use `level01` only to reproduce a level01 number.
+
+**Looking at a generated texture** is a second use of `Shoot-Settled` and its recipe lives with
+the generator: `gkpbr.cli preview` packs a PBR map as a `.RIM` into a throwaway mod so the engine
+loads it in place of the sheet it came from, and `Shoot-Settled -Renderer d3d9 -Level level02`
+photographs the result. See `pbr/README.md`, "Putting a map on screen" — including why
+`render.material_override` cannot do it, and the one thing that wastes a run here: **a sheet's
+draw count is not its screen area.** The most-drawn ground texture in level02 covered 234 pixels
+at the settled camera; the one that covered a quarter of the frame was fourth on the list.
 
 Kill `WerFault.exe` as well as `gl.exe` before rebuilding — WER holds the crashed process's handle
 to `d3d8.dll`, so `--target copy` fails with "Permission denied" long after the game is gone.

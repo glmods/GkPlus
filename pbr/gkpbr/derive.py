@@ -236,12 +236,61 @@ def normal_from_height(height, strength=2.0, green_down=False):
     return ((out + 1.0) * 0.5).astype(np.float32)
 
 
+def delight_mask(labels, materials):
+    """Which texels belong to a region stage 1 said carries baked lighting.
+
+    ``None`` means "every texel", which is what an unsegmented sheet gets.
+
+    This exists because painted lighting in Gunlok is a **per-region** property
+    of a minority of regions, measured rather than assumed -- see the README's
+    "Baked lighting". Almost all of
+    it is airbrushed form shading on one curved object's unwrap, so a 24-region
+    unit atlas typically wants de-lighting on the two or three patches that are a
+    pod or a cylinder and on none of the flat-lit photographic plate beside them.
+    Handing the whole sheet to a de-lighter would flatten those twenty-one as
+    well, and they have nothing to flatten -- what would come off them is
+    material contrast.
+    """
+    if labels is None or not materials:
+        return None
+    keep = [label for label, spec in _iter_regions(labels, materials)
+            if (spec or {}).get("delight")]
+    if not keep:
+        return np.zeros(labels.shape, dtype=bool)
+    if len(keep) == len(np.unique(labels)):
+        return None
+    mask = np.zeros(labels.shape, dtype=bool)
+    for label in keep:
+        mask |= labels == label
+    return mask
+
+
+def apply_where(base, replacement, mask):
+    """``replacement`` inside ``mask``, ``base`` outside. ``None`` mask = all of it.
+
+    A hard edge and not a feather: the mask is a region boundary the whole
+    pipeline already paints roughness and metalness across with a hard edge, and
+    a feathered one here would put a band of half-de-lit pixels *outside* the
+    region that asked for it.
+    """
+    if mask is None:
+        return replacement
+    out = base.copy()
+    out[mask] = replacement[mask]
+    return out
+
+
 def delight(albedo, labels, materials, amount=0.6):
     """Flatten baked lighting by dividing out the low-frequency luminance.
 
     A crude but registered de-lighter, useful as the fallback when the model's
     de-lit albedo fails its gate. It cannot tell a painted gradient from a shadow,
     which is precisely what a model can, so ``amount`` stays conservative.
+
+    Applied only to the regions that asked for it (:func:`delight_mask`). The
+    low-frequency term is still computed over the whole sheet, because a blur
+    restricted to a scattered region has no defined value at its edges; it is the
+    *result* that is masked.
     """
     lum = metrics.luminance(albedo)
     _, low = high_pass(lum, sigma=24)
@@ -249,7 +298,7 @@ def delight(albedo, labels, materials, amount=0.6):
     gain = 1.0 + (np.clip(gain, 0.4, 2.5) - 1.0) * amount
     out = albedo.copy()
     out[..., :3] = np.clip(albedo[..., :3] * gain[..., None], 0.0, 1.0)
-    return out
+    return apply_where(albedo, out, delight_mask(labels, materials))
 
 
 def _iter_regions(labels, materials):

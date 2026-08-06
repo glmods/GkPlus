@@ -45,6 +45,20 @@ UV_SLACK = 4.0
 #: Meshes that are never textured, whose texture and UV indices are both junk.
 SHADOW_MARKER = "_shadow"
 
+#: **The shipped geometry is exactly ``<Gunlok>\RIF``**, and the walk is rooted there
+#: rather than at the install root on purpose. All 563 shipped ``.rif`` live under it
+#: (47 ``Levels``, 348 ``Objects``, 163 ``Units``, 5 ``User Interface``); walking the
+#: install instead also picked up ``gkplus\mods\*\RIF\**\*.rif``, so the manifest
+#: depended on which mods happened to be installed on the machine that built it. It
+#: cost nothing measurable here only by luck: the one ``.rif`` in this machine's
+#: leftover ``rimutil-body-test`` mod carries no ``BMPNAMES`` table, and the loop
+#: below skips a file without one. A mod that replaced a level would have landed in
+#: the manifest. A mod is content *about* the shipped set, not part of it.
+SHIPPED_RIF_DIR = "RIF"
+
+#: Where the ``.RIM`` files live, and the root a ``BMPNAMES`` name is relative to.
+TEXTURE_DIR = "Graphics"
+
 
 class Reference:
     """One polygon's use of a texture: its UV triangle and who owns it."""
@@ -125,23 +139,31 @@ def _shape_id(chunk):
     return None
 
 
-def collect(game_dir, wanted=None):
-    """Walk every ``.rif`` and return ``{texture name: [Reference]}``.
+def collect(game_dir, wanted=None, rif_root=None):
+    """Walk every shipped ``.rif`` and return ``{texture name: [Reference]}``.
 
     ``wanted`` restricts the walk to a set of lowercase forward-slash texture
-    names, which is what makes a single-texture run cheap.
+    names, which is what makes a single-texture run cheap. ``rif_root`` narrows the
+    walk to a subtree, which is what makes a smoke test cheap; it defaults to
+    :data:`SHIPPED_RIF_DIR` under ``game_dir`` and is spelled out by the caller
+    rather than inferred, because the whole point of the default is that it is not
+    "whatever ``.rif`` files happen to be under the install".
 
     **A ``_shadow`` file contributes its table but not its polygons.** Those meshes
     are never textured, so their polygons carry junk texture *and* UV indices and
     would poison every region -- but the ``BMPNAMES`` table itself is a real list of
-    real files, and 17 textures in the shipped set are named by nothing else.
-    Skipping shadow files outright therefore dropped 17 textures that may well be
+    real files, and **7** textures in the shipped set are named by nothing else.
+    Skipping shadow files outright therefore dropped 7 textures that may well be
     displayed; they come through here with an empty reference list, which segments
     into a single whole-sheet region, which is the honest answer for a texture no
     usable geometry points at.
+
+    The walk is rooted at ``RIF`` rather than at the install -- see
+    :data:`SHIPPED_RIF_DIR`, and note that ``rif`` paths in the returned references
+    stay relative to ``game_dir`` so they read the same as before.
     """
     refs = collections.defaultdict(list)
-    for dirpath, _, names in os.walk(game_dir):
+    for dirpath, _, names in os.walk(rif_root or os.path.join(game_dir, SHIPPED_RIF_DIR)):
         for name in sorted(names):
             if not name.lower().endswith(".rif"):
                 continue
@@ -164,14 +186,13 @@ def collect(game_dir, wanted=None):
                 continue
 
             # Register every name the table holds before reading any geometry, so a
-            # texture is *known* even when nothing samples it usably. Three separate
-            # cases land here and all three were silently dropped by keying only off
-            # polygons: a ``_shadow`` file's table (real names, junk polygon
-            # indices), an entry no polygon references at all, and an entry whose
-            # polygons carry no UV entry. Ten shipped textures in ordinary level
-            # files -- ``mplay_zorro``'s ``building site 00``, ``tanker lift``'s
-            # ``hull 22`` -- are in the last two groups. They come out as single
-            # whole-sheet regions, which beats vanishing from the manifest.
+            # texture is *known* even when nothing samples it usably. 17 shipped
+            # textures land here and keying only off polygons dropped all of them:
+            # 7 are named only by a ``_shadow`` file's table (real names, junk
+            # polygon indices) and 10 carry an index no polygon in an ordinary file
+            # ever names -- ``mplay_zorro``'s ``building site 00``, ``tanker lift``'s
+            # ``hull 22``. They come out as single whole-sheet regions, which beats
+            # vanishing from the manifest.
             for tex in by_index.values():
                 if wanted is None or tex in wanted:
                     refs[tex]  # noqa: B018 - defaultdict touch, deliberate
@@ -228,9 +249,102 @@ def table_names(rif_path):
     return {e["name"].replace("\\", "/").lower() for e in entries}
 
 
+#: Routes by which the engine reaches a ``.RIM`` that no ``BMPNAMES`` table names.
+#: Both are measured by searching for the file's own path, so neither is a guess
+#: about intent -- but they are also the *only* two routes there are, because
+#: ``BMPNAMES`` is the sole name/index binding in the RIF format (``SHPTEXFN`` is
+#: registered and appears in no shipped file, see ``rif_chunk_format.md``). A
+#: texture no table names therefore cannot be bound by any polygon of any shipped
+#: ``.rif``: it is reachable only as front-end art, and only if something spells its
+#: name out.
+ROUTE_SCRIPT = "a script under scripts\\ names it"
+ROUTE_EXE = "gl.exe holds its name as a literal"
+ROUTE_NONE = "nothing in the install names it"
+
+
+def textures_on_disk(game_dir):
+    """Every shipped ``.RIM``, as a lowercase forward-slash path under ``Graphics``."""
+    root = os.path.join(game_dir, TEXTURE_DIR)
+    out = []
+    for dirpath, _, names in os.walk(root):
+        for name in names:
+            if name.lower().endswith(".rim"):
+                rel = os.path.relpath(os.path.join(dirpath, name), root)
+                out.append(rel.replace(os.sep, "/").lower())
+    return sorted(out)
+
+
+def _folded(blob):
+    """Lowercase, and collapse every path spelling onto a single backslash.
+
+    Both directions matter. ``gl.exe`` writes ``bitmaps\\lava.rim``; a ``.gls``
+    writes ``bitmap "bitmaps\\\\LEVEL02.rim"`` with the backslash **doubled**, and
+    testing for the single-backslash form alone found **2 of the 27** files the
+    scripts name -- every level-map bitmap read as "nothing names this" while
+    ``Maze.gls`` and its fifteen siblings named it plainly.
+    """
+    return blob.lower().replace(b"/", b"\\").replace(b"\\\\", b"\\")
+
+
+def _mentions(blob, rel):
+    needle = rel.replace("/", "\\").encode()
+    if b"\\" in needle:  # directory-qualified: no shorter name can end in it
+        return needle in blob
+    # A bare ``multi buttons.rim`` at the texture root needs a left boundary, or it
+    # would also match the tail of any longer path.
+    start = 0
+    while True:
+        i = blob.find(needle, start)
+        if i < 0:
+            return False
+        if i == 0 or not (0x20 <= blob[i - 1] < 0x7F) or blob[i - 1:i] in (b'"', b"'"):
+            return True
+        start = i + 1
+
+
+def name_routes(game_dir, rels):
+    """``{relative .RIM path: one of the ROUTE_* constants}``.
+
+    Answers "if no geometry names this texture, what does?" by searching the two
+    places a name can be spelled out: ``gl.exe`` (26 ``.rim`` literals, the front
+    end, the fonts, the HUD and the liquid-surface effects) and everything under
+    ``scripts\\`` (the ``bitmap`` field that gives a level its map image, plus the
+    briefing and credits screens).
+
+    **This route is not a synonym for "front-end art"**, which is what it looked like
+    until the running game was asked. Six of the 17 files it accounts for are drawn,
+    and three of those -- ``bitmaps/lava``, ``oil`` and ``swamp`` -- are ordinary world
+    surfaces laid down by the ``LAVA``/``OIL``/``SWAMP`` console commands, which supply
+    the texture name from inside the engine and so need no ``BMPNAMES`` entry. See
+    :mod:`gkpbr.renderstate` and the README.
+    """
+    haystacks = []
+    exe = os.path.join(game_dir, "gl.exe")
+    if os.path.isfile(exe):
+        with open(exe, "rb") as fh:
+            haystacks.append((ROUTE_EXE, _folded(fh.read())))
+
+    chunks = []
+    for dirpath, _, names in os.walk(os.path.join(game_dir, "scripts")):
+        for name in sorted(names):
+            try:
+                with open(os.path.join(dirpath, name), "rb") as fh:
+                    chunks.append(_folded(fh.read()))
+            except OSError:
+                continue
+    if chunks:
+        haystacks.insert(0, (ROUTE_SCRIPT, b"\n".join(chunks)))
+
+    out = {}
+    for rel in rels:
+        out[rel] = next((route for route, blob in haystacks if _mentions(blob, rel)),
+                        ROUTE_NONE)
+    return out
+
+
 def load_texture(game_dir, name, index=None):
     """A ``BMPNAMES`` name -> a decoded :class:`rim.Texture`, or ``None``."""
-    index = index or rim.TextureIndex(os.path.join(game_dir, "Graphics"))
+    index = index or rim.TextureIndex(os.path.join(game_dir, TEXTURE_DIR))
     path = index.resolve(name)
     if not path:
         return None

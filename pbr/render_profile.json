@@ -1,0 +1,3518 @@
+{
+ "run": {
+  "draws_observed": 12185030,
+  "draws_texture_unnamed": 1113,
+  "draws_with_no_texture": 384847,
+  "frames_missed_while_sampling": 67,
+  "frames_sampled": 168496,
+  "harvests": 2,
+  "levels": [
+   "Maze",
+   "cityruins",
+   "frontend",
+   "junkyard",
+   "level01",
+   "level02",
+   "level03",
+   "level04",
+   "level05",
+   "level06",
+   "level07",
+   "level09",
+   "level10",
+   "level11",
+   "level12",
+   "level15",
+   "mplay_atlantic",
+   "prison"
+  ],
+  "note": "2026-08-06, GkPlus d3d8.dll built 2026-08-05; run 1 = 17 levels + the main menu with an arrow-key camera tour each; run 2 = level02 again for the upgrade screen and a forced firefight",
+  "renderer": "d3d9",
+  "source": "harvest_run1.json, harvest_run2.json"
+ },
+ "textures": {
+  "bitmaps/large font.rim": {
+   "additive": 0,
+   "alpha_test": 1083,
+   "blend": 1083,
+   "draws": 1083,
+   "levels": [
+    "cityruins",
+    "frontend",
+    "level02",
+    "level06"
+   ],
+   "primitives": 41930,
+   "zwrite_off": 0
+  },
+  "bitmaps/lava.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 31608,
+   "levels": [
+    "level01",
+    "level02",
+    "level04",
+    "level15",
+    "prison"
+   ],
+   "primitives": 3622124,
+   "zwrite_off": 0
+  },
+  "bitmaps/level01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 5445,
+   "levels": [
+    "level01"
+   ],
+   "primitives": 10890,
+   "zwrite_off": 0
+  },
+  "bitmaps/oil.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 2816,
+   "levels": [
+    "level02",
+    "level07"
+   ],
+   "primitives": 59372,
+   "zwrite_off": 0
+  },
+  "bitmaps/particles.rim": {
+   "additive": 5965,
+   "alpha_test": 26528,
+   "blend": 29111,
+   "draws": 29111,
+   "levels": [
+    "junkyard",
+    "level01",
+    "level02",
+    "level03",
+    "level04",
+    "level06",
+    "level07",
+    "level15",
+    "prison"
+   ],
+   "primitives": 449780,
+   "zwrite_off": 5982
+  },
+  "bitmaps/small font.rim": {
+   "additive": 0,
+   "alpha_test": 40188,
+   "blend": 40188,
+   "draws": 40188,
+   "levels": [
+    "cityruins",
+    "frontend",
+    "junkyard",
+    "level01",
+    "level02",
+    "level03",
+    "level04",
+    "level05",
+    "level06",
+    "level07",
+    "level09",
+    "level10",
+    "level11",
+    "level12",
+    "level15",
+    "prison"
+   ],
+   "primitives": 30023080,
+   "zwrite_off": 0
+  },
+  "bitmaps/swamp.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 17911,
+   "levels": [
+    "cityruins",
+    "junkyard",
+    "level02",
+    "level11"
+   ],
+   "primitives": 1205990,
+   "zwrite_off": 0
+  },
+  "bitmaps/water.rim": {
+   "additive": 0,
+   "alpha_test": 40761,
+   "blend": 40761,
+   "draws": 40761,
+   "levels": [
+    "level01",
+    "level02",
+    "level03",
+    "level05",
+    "level06",
+    "level10"
+   ],
+   "primitives": 3905758,
+   "zwrite_off": 0
+  },
+  "ground/beginning 00 00.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 17678,
+   "levels": [
+    "level01"
+   ],
+   "primitives": 84216,
+   "zwrite_off": 0
+  },
+  "ground/beginning 00 01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 33564,
+   "levels": [
+    "level01"
+   ],
+   "primitives": 270342,
+   "zwrite_off": 0
+  },
+  "ground/beginning 00 02.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 43902,
+   "levels": [
+    "level01"
+   ],
+   "primitives": 430217,
+   "zwrite_off": 0
+  },
+  "ground/beginning 00 03.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 65663,
+   "levels": [
+    "level01",
+    "level04"
+   ],
+   "primitives": 1548744,
+   "zwrite_off": 0
+  },
+  "ground/beginning 00 04.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 41664,
+   "levels": [
+    "level01",
+    "level04"
+   ],
+   "primitives": 1127080,
+   "zwrite_off": 0
+  },
+  "ground/beginning 05.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 37346,
+   "levels": [
+    "level01",
+    "level04"
+   ],
+   "primitives": 1494163,
+   "zwrite_off": 0
+  },
+  "ground/beginning 06.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 17733,
+   "levels": [
+    "level01"
+   ],
+   "primitives": 113659,
+   "zwrite_off": 0
+  },
+  "ground/beginning machine 00.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 6448,
+   "levels": [
+    "level01",
+    "level04"
+   ],
+   "primitives": 109934,
+   "zwrite_off": 0
+  },
+  "ground/beige rock 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 29747,
+   "levels": [
+    "level05"
+   ],
+   "primitives": 1366640,
+   "zwrite_off": 0
+  },
+  "ground/buildcrashland1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 491,
+   "levels": [
+    "level03"
+   ],
+   "primitives": 19709,
+   "zwrite_off": 0
+  },
+  "ground/bunkerfloor.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 685,
+   "levels": [
+    "level03"
+   ],
+   "primitives": 3552,
+   "zwrite_off": 0
+  },
+  "ground/carjunk large.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 37804,
+   "levels": [
+    "junkyard"
+   ],
+   "primitives": 694909,
+   "zwrite_off": 0
+  },
+  "ground/cdiscground tran2.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 16494,
+   "levels": [
+    "level05"
+   ],
+   "primitives": 318707,
+   "zwrite_off": 0
+  },
+  "ground/cdiscsand1.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 17525,
+   "levels": [
+    "level05"
+   ],
+   "primitives": 1025381,
+   "zwrite_off": 0
+  },
+  "ground/city ruins clif.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 6911,
+   "levels": [
+    "cityruins"
+   ],
+   "primitives": 353166,
+   "zwrite_off": 0
+  },
+  "ground/city ruins ground 1_a.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 134396,
+   "levels": [
+    "cityruins",
+    "level02"
+   ],
+   "primitives": 5968616,
+   "zwrite_off": 0
+  },
+  "ground/city ruins ground 1_a_end.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 10483,
+   "levels": [
+    "cityruins"
+   ],
+   "primitives": 144029,
+   "zwrite_off": 0
+  },
+  "ground/city ruins road 1_a.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 47709,
+   "levels": [
+    "cityruins",
+    "level02"
+   ],
+   "primitives": 1300994,
+   "zwrite_off": 0
+  },
+  "ground/city ruins road 2.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 18189,
+   "levels": [
+    "cityruins"
+   ],
+   "primitives": 715227,
+   "zwrite_off": 0
+  },
+  "ground/city ruins tranch.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 35539,
+   "levels": [
+    "level02"
+   ],
+   "primitives": 549030,
+   "zwrite_off": 0
+  },
+  "ground/city ruins water tranch.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 65773,
+   "levels": [
+    "cityruins",
+    "level02",
+    "level03"
+   ],
+   "primitives": 2096491,
+   "zwrite_off": 0
+  },
+  "ground/city ruins water tranch2_b.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 18331,
+   "levels": [
+    "cityruins",
+    "level02"
+   ],
+   "primitives": 569994,
+   "zwrite_off": 0
+  },
+  "ground/city ruins water tranch2_c.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 51262,
+   "levels": [
+    "cityruins",
+    "level02"
+   ],
+   "primitives": 935567,
+   "zwrite_off": 0
+  },
+  "ground/city ruins water tranch_a.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 54597,
+   "levels": [
+    "cityruins",
+    "level02",
+    "level03"
+   ],
+   "primitives": 1400222,
+   "zwrite_off": 0
+  },
+  "ground/city wall conc floor 01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 18318,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 252569,
+   "zwrite_off": 0
+  },
+  "ground/city wall conc floor 02.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 17095,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 195699,
+   "zwrite_off": 0
+  },
+  "ground/city wall conc floor 03.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 10189,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 264283,
+   "zwrite_off": 0
+  },
+  "ground/city wall conc floor 04.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 9087,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 234033,
+   "zwrite_off": 0
+  },
+  "ground/city wall conc floor 05.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 21223,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 322733,
+   "zwrite_off": 0
+  },
+  "ground/city wall conc floor 06.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 19915,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 289151,
+   "zwrite_off": 0
+  },
+  "ground/city wall conc transitions .rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 6394,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 115685,
+   "zwrite_off": 0
+  },
+  "ground/city wall lower.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 32107,
+   "levels": [
+    "level11",
+    "level12"
+   ],
+   "primitives": 1041892,
+   "zwrite_off": 0
+  },
+  "ground/city wall oil rig 1k.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 15876,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 86892426,
+   "zwrite_off": 0
+  },
+  "ground/city wall panels 01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 25879,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 4234986,
+   "zwrite_off": 0
+  },
+  "ground/city wall panels 02.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 24338,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 246869,
+   "zwrite_off": 0
+  },
+  "ground/city wall panels 03.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 13536,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 71511,
+   "zwrite_off": 0
+  },
+  "ground/city wall panels 04.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 14635,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 5587749,
+   "zwrite_off": 0
+  },
+  "ground/city wall sand 01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 17477,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 1549523,
+   "zwrite_off": 0
+  },
+  "ground/city wall sand 02.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 35859,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 2217958,
+   "zwrite_off": 0
+  },
+  "ground/city wall sand transition.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 10608,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 564274,
+   "zwrite_off": 0
+  },
+  "ground/city wall shanty house.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 31899,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 5403636,
+   "zwrite_off": 0
+  },
+  "ground/city wall support.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 29955,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 625612,
+   "zwrite_off": 0
+  },
+  "ground/city wall.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 7771,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 185410,
+   "zwrite_off": 0
+  },
+  "ground/concrete growth.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 3003,
+   "levels": [
+    "level09"
+   ],
+   "primitives": 77559,
+   "zwrite_off": 0
+  },
+  "ground/concretetexturef.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 361,
+   "levels": [
+    "level09"
+   ],
+   "primitives": 1168,
+   "zwrite_off": 0
+  },
+  "ground/cracks.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 2907,
+   "levels": [
+    "level02"
+   ],
+   "primitives": 42188,
+   "zwrite_off": 0
+  },
+  "ground/crashland fragboulder 256 00.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 2830,
+   "levels": [
+    "level03",
+    "level15"
+   ],
+   "primitives": 62260,
+   "zwrite_off": 0
+  },
+  "ground/dock container a.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 1928,
+   "levels": [
+    "level06"
+   ],
+   "primitives": 40139,
+   "zwrite_off": 0
+  },
+  "ground/dock container b.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 3002,
+   "levels": [
+    "level06"
+   ],
+   "primitives": 102268,
+   "zwrite_off": 0
+  },
+  "ground/dock container c.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 585,
+   "levels": [
+    "level06"
+   ],
+   "primitives": 18773,
+   "zwrite_off": 0
+  },
+  "ground/dock cracky.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 16890,
+   "levels": [
+    "level06"
+   ],
+   "primitives": 1259083,
+   "zwrite_off": 0
+  },
+  "ground/dock crate.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 18420,
+   "levels": [
+    "level06"
+   ],
+   "primitives": 542370,
+   "zwrite_off": 0
+  },
+  "ground/dock line.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 32278,
+   "levels": [
+    "level06"
+   ],
+   "primitives": 703545,
+   "zwrite_off": 0
+  },
+  "ground/dock pavement.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 64212,
+   "levels": [
+    "level06"
+   ],
+   "primitives": 1611787,
+   "zwrite_off": 0
+  },
+  "ground/dock rock.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 10705,
+   "levels": [
+    "level06"
+   ],
+   "primitives": 519035,
+   "zwrite_off": 0
+  },
+  "ground/dock rust.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 7961,
+   "levels": [
+    "level06"
+   ],
+   "primitives": 242649,
+   "zwrite_off": 0
+  },
+  "ground/dock tarnsition.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 52729,
+   "levels": [
+    "level06"
+   ],
+   "primitives": 1975218,
+   "zwrite_off": 0
+  },
+  "ground/earth power_01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 6229,
+   "levels": [
+    "cityruins",
+    "level12"
+   ],
+   "primitives": 395757,
+   "zwrite_off": 0
+  },
+  "ground/earthfloor corners.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 31727,
+   "levels": [
+    "level09"
+   ],
+   "primitives": 466420,
+   "zwrite_off": 0
+  },
+  "ground/earthfloor straights.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 2867,
+   "levels": [
+    "level09"
+   ],
+   "primitives": 50096,
+   "zwrite_off": 0
+  },
+  "ground/earthfloor.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 17908,
+   "levels": [
+    "level09"
+   ],
+   "primitives": 355598,
+   "zwrite_off": 0
+  },
+  "ground/endgame 00.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 15353,
+   "levels": [
+    "level15"
+   ],
+   "primitives": 184557,
+   "zwrite_off": 0
+  },
+  "ground/endgame 01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 12815,
+   "levels": [
+    "level15"
+   ],
+   "primitives": 147399,
+   "zwrite_off": 0
+  },
+  "ground/endgame 02.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 1,
+   "levels": [
+    "level15"
+   ],
+   "primitives": 2,
+   "zwrite_off": 0
+  },
+  "ground/escape ground vary 1.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 3678,
+   "levels": [
+    "level01"
+   ],
+   "primitives": 28985,
+   "zwrite_off": 0
+  },
+  "ground/escape ground vary 2.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 278,
+   "levels": [
+    "level01"
+   ],
+   "primitives": 4219,
+   "zwrite_off": 0
+  },
+  "ground/escape ground vary 4.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 1532,
+   "levels": [
+    "level01"
+   ],
+   "primitives": 24648,
+   "zwrite_off": 0
+  },
+  "ground/escape ground.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 21907,
+   "levels": [
+    "level01"
+   ],
+   "primitives": 603522,
+   "zwrite_off": 0
+  },
+  "ground/escape rock pit1.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 334,
+   "levels": [
+    "level01"
+   ],
+   "primitives": 11397,
+   "zwrite_off": 0
+  },
+  "ground/escape rock tran vary 1.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 1443,
+   "levels": [
+    "level01"
+   ],
+   "primitives": 8712,
+   "zwrite_off": 0
+  },
+  "ground/escape rock tran vary 2.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 976,
+   "levels": [
+    "level01"
+   ],
+   "primitives": 4828,
+   "zwrite_off": 0
+  },
+  "ground/escape rock tran vary 3.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 321,
+   "levels": [
+    "level01"
+   ],
+   "primitives": 6299,
+   "zwrite_off": 0
+  },
+  "ground/escape rock tran.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 23397,
+   "levels": [
+    "level01"
+   ],
+   "primitives": 741040,
+   "zwrite_off": 0
+  },
+  "ground/escape rock.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 21124,
+   "levels": [
+    "level01"
+   ],
+   "primitives": 613718,
+   "zwrite_off": 0
+  },
+  "ground/gatepanels.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 1300,
+   "levels": [
+    "level07"
+   ],
+   "primitives": 7187,
+   "zwrite_off": 0
+  },
+  "ground/gravel.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 162266,
+   "levels": [
+    "level03"
+   ],
+   "primitives": 6243083,
+   "zwrite_off": 0
+  },
+  "ground/gravel3.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 12253,
+   "levels": [
+    "level03"
+   ],
+   "primitives": 204325,
+   "zwrite_off": 0
+  },
+  "ground/ground2.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 58419,
+   "levels": [
+    "level05"
+   ],
+   "primitives": 2869043,
+   "zwrite_off": 0
+  },
+  "ground/gunlok road junction a.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 8038,
+   "levels": [
+    "level12"
+   ],
+   "primitives": 373951,
+   "zwrite_off": 0
+  },
+  "ground/gunlok road junction b.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 911,
+   "levels": [
+    "level12"
+   ],
+   "primitives": 9533,
+   "zwrite_off": 0
+  },
+  "ground/gunlok road junction c.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 1838,
+   "levels": [
+    "level12"
+   ],
+   "primitives": 67237,
+   "zwrite_off": 0
+  },
+  "ground/gunlok road01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 37560,
+   "levels": [
+    "level12"
+   ],
+   "primitives": 2072920,
+   "zwrite_off": 0
+  },
+  "ground/gunlok rust.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 134799,
+   "levels": [
+    "cityruins",
+    "level01",
+    "level02",
+    "level03",
+    "level04",
+    "level11",
+    "level12"
+   ],
+   "primitives": 8380349,
+   "zwrite_off": 0
+  },
+  "ground/gunlok varie.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 58660,
+   "levels": [
+    "cityruins",
+    "level12"
+   ],
+   "primitives": 1587711,
+   "zwrite_off": 0
+  },
+  "ground/gunlokgroundcan11.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 7104,
+   "levels": [
+    "level12"
+   ],
+   "primitives": 235402,
+   "zwrite_off": 0
+  },
+  "ground/gunlokgroundcan12.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 82291,
+   "levels": [
+    "level12"
+   ],
+   "primitives": 4635487,
+   "zwrite_off": 0
+  },
+  "ground/hull 02.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 41679,
+   "levels": [
+    "level10",
+    "level11"
+   ],
+   "primitives": 1402599,
+   "zwrite_off": 0
+  },
+  "ground/hull 11.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 39924,
+   "levels": [
+    "level10",
+    "level11"
+   ],
+   "primitives": 1069544,
+   "zwrite_off": 0
+  },
+  "ground/hull 12.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 463,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 45374,
+   "zwrite_off": 0
+  },
+  "ground/inside hull 01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 463,
+   "levels": [
+    "level11"
+   ],
+   "primitives": 115750,
+   "zwrite_off": 0
+  },
+  "ground/inside hull 02.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 12804,
+   "levels": [
+    "level10",
+    "level11"
+   ],
+   "primitives": 176255,
+   "zwrite_off": 0
+  },
+  "ground/inside hull other 01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 45995,
+   "levels": [
+    "level10",
+    "level11"
+   ],
+   "primitives": 1787660,
+   "zwrite_off": 0
+  },
+  "ground/inside hull other 02.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 32,
+   "levels": [
+    "level10"
+   ],
+   "primitives": 512,
+   "zwrite_off": 0
+  },
+  "ground/inside hull ship ribs00.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 3255,
+   "levels": [
+    "level10"
+   ],
+   "primitives": 84158,
+   "zwrite_off": 0
+  },
+  "ground/junkground corners.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 27802,
+   "levels": [
+    "junkyard"
+   ],
+   "primitives": 223954,
+   "zwrite_off": 0
+  },
+  "ground/junkground generic.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 74390,
+   "levels": [
+    "junkyard"
+   ],
+   "primitives": 2201937,
+   "zwrite_off": 0
+  },
+  "ground/junkground straights.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 46825,
+   "levels": [
+    "junkyard"
+   ],
+   "primitives": 996258,
+   "zwrite_off": 0
+  },
+  "ground/l9 special.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 47751,
+   "levels": [
+    "level09"
+   ],
+   "primitives": 1350238,
+   "zwrite_off": 0
+  },
+  "ground/level04sand.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 4893,
+   "levels": [
+    "junkyard"
+   ],
+   "primitives": 13312,
+   "zwrite_off": 0
+  },
+  "ground/level07_door_1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 1196,
+   "levels": [
+    "level07"
+   ],
+   "primitives": 92366,
+   "zwrite_off": 0
+  },
+  "ground/oil rig rustymetal_1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 45698,
+   "levels": [
+    "level07",
+    "mplay_atlantic"
+   ],
+   "primitives": 1761591,
+   "zwrite_off": 0
+  },
+  "ground/ontherunstep.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 31204,
+   "levels": [
+    "level02"
+   ],
+   "primitives": 481462,
+   "zwrite_off": 0
+  },
+  "ground/outskirts robot ring .rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 300,
+   "levels": [
+    "level12"
+   ],
+   "primitives": 2400,
+   "zwrite_off": 0
+  },
+  "ground/outskirts robot riser.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 2801,
+   "levels": [
+    "level12"
+   ],
+   "primitives": 5220,
+   "zwrite_off": 0
+  },
+  "ground/outskirts_cp floor_01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 499,
+   "levels": [
+    "level12"
+   ],
+   "primitives": 7917,
+   "zwrite_off": 0
+  },
+  "ground/outskirts_crater_01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 68,
+   "levels": [
+    "level12"
+   ],
+   "primitives": 272,
+   "zwrite_off": 0
+  },
+  "ground/outskirts_crater_03.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 1036,
+   "levels": [
+    "level12"
+   ],
+   "primitives": 1036,
+   "zwrite_off": 0
+  },
+  "ground/pillar lava & others.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 11610,
+   "levels": [
+    "level15"
+   ],
+   "primitives": 325412,
+   "zwrite_off": 0
+  },
+  "ground/pivot s3.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 6374,
+   "levels": [
+    "prison"
+   ],
+   "primitives": 285582,
+   "zwrite_off": 0
+  },
+  "ground/prison floor 01 512.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 27388,
+   "levels": [
+    "junkyard",
+    "level06"
+   ],
+   "primitives": 1335149,
+   "zwrite_off": 0
+  },
+  "ground/rescue rock side a 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 35411,
+   "levels": [
+    "level04"
+   ],
+   "primitives": 867071,
+   "zwrite_off": 0
+  },
+  "ground/rescue rock side b 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 49317,
+   "levels": [
+    "level04"
+   ],
+   "primitives": 1359567,
+   "zwrite_off": 0
+  },
+  "ground/rescue rock side c1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 6987,
+   "levels": [
+    "level04"
+   ],
+   "primitives": 86605,
+   "zwrite_off": 0
+  },
+  "ground/rescue rock top 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 19402,
+   "levels": [
+    "level04"
+   ],
+   "primitives": 282416,
+   "zwrite_off": 0
+  },
+  "ground/rescue rock top b 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 9657,
+   "levels": [
+    "level04"
+   ],
+   "primitives": 107391,
+   "zwrite_off": 0
+  },
+  "ground/rescue sand 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 68344,
+   "levels": [
+    "level04"
+   ],
+   "primitives": 1198160,
+   "zwrite_off": 0
+  },
+  "ground/rock and sand.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 189,
+   "levels": [
+    "level04"
+   ],
+   "primitives": 189,
+   "zwrite_off": 0
+  },
+  "ground/rock.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 35613,
+   "levels": [
+    "level03"
+   ],
+   "primitives": 263840,
+   "zwrite_off": 0
+  },
+  "ground/rock2.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 103514,
+   "levels": [
+    "level03"
+   ],
+   "primitives": 1364499,
+   "zwrite_off": 0
+  },
+  "ground/rock2a 00.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 7173,
+   "levels": [
+    "level03"
+   ],
+   "primitives": 127241,
+   "zwrite_off": 0
+  },
+  "ground/ruins build_ground transition_2.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 33813,
+   "levels": [
+    "level12"
+   ],
+   "primitives": 308135,
+   "zwrite_off": 0
+  },
+  "ground/ruins concrete cladding 01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 227,
+   "levels": [
+    "cityruins"
+   ],
+   "primitives": 5448,
+   "zwrite_off": 0
+  },
+  "ground/ruins details.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 499,
+   "levels": [
+    "level12"
+   ],
+   "primitives": 4052,
+   "zwrite_off": 0
+  },
+  "ground/ruins floor wooden.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 499,
+   "levels": [
+    "level12"
+   ],
+   "primitives": 8393,
+   "zwrite_off": 0
+  },
+  "ground/ruins interior_wooden.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 3664,
+   "levels": [
+    "level12"
+   ],
+   "primitives": 81466,
+   "zwrite_off": 0
+  },
+  "ground/ruins support_brickside.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 6120,
+   "levels": [
+    "level12"
+   ],
+   "primitives": 48184,
+   "zwrite_off": 0
+  },
+  "ground/ruins_carpets.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 1360,
+   "levels": [
+    "cityruins"
+   ],
+   "primitives": 10985,
+   "zwrite_off": 0
+  },
+  "ground/ruins_concrete_1_ 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 8084,
+   "levels": [
+    "cityruins",
+    "level12"
+   ],
+   "primitives": 107336,
+   "zwrite_off": 0
+  },
+  "ground/ruins_concrete_2_ 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 31676,
+   "levels": [
+    "cityruins",
+    "level12"
+   ],
+   "primitives": 713625,
+   "zwrite_off": 0
+  },
+  "ground/ruins_doors wip.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 4334,
+   "levels": [
+    "cityruins"
+   ],
+   "primitives": 30205,
+   "zwrite_off": 0
+  },
+  "ground/ruins_facade_1024_01a.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 2887,
+   "levels": [
+    "cityruins"
+   ],
+   "primitives": 85883,
+   "zwrite_off": 0
+  },
+  "ground/ruins_facade_1024_01b.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 2200,
+   "levels": [
+    "cityruins"
+   ],
+   "primitives": 60692,
+   "zwrite_off": 0
+  },
+  "ground/ruins_facade_1024_02.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 7095,
+   "levels": [
+    "cityruins"
+   ],
+   "primitives": 149593,
+   "zwrite_off": 0
+  },
+  "ground/ruins_lampand_1024_02.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 22067,
+   "levels": [
+    "cityruins"
+   ],
+   "primitives": 879867,
+   "zwrite_off": 0
+  },
+  "ground/ruins_messy concrete 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 86589,
+   "levels": [
+    "cityruins",
+    "level02",
+    "level03",
+    "level12"
+   ],
+   "primitives": 2085514,
+   "zwrite_off": 0
+  },
+  "ground/ruins_posh front.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 11924,
+   "levels": [
+    "cityruins"
+   ],
+   "primitives": 426269,
+   "zwrite_off": 0
+  },
+  "ground/ruins_roof_1024_02.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 8838,
+   "levels": [
+    "cityruins",
+    "level12"
+   ],
+   "primitives": 101187,
+   "zwrite_off": 0
+  },
+  "ground/ruins_rubble wip.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 27301,
+   "levels": [
+    "cityruins",
+    "level12"
+   ],
+   "primitives": 443684,
+   "zwrite_off": 0
+  },
+  "ground/rust door 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 38387,
+   "levels": [
+    "level01",
+    "level03"
+   ],
+   "primitives": 1930637,
+   "zwrite_off": 0
+  },
+  "ground/rust.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 44488,
+   "levels": [
+    "junkyard",
+    "level06",
+    "level09"
+   ],
+   "primitives": 2167132,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 00.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 6114,
+   "levels": [
+    "prison"
+   ],
+   "primitives": 35873,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 01 (level 15).rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 282,
+   "levels": [
+    "level15"
+   ],
+   "primitives": 12072,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 17152,
+   "levels": [
+    "prison"
+   ],
+   "primitives": 586097,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 02.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 8254,
+   "levels": [
+    "prison"
+   ],
+   "primitives": 53436,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 03.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 19819,
+   "levels": [
+    "prison"
+   ],
+   "primitives": 194249,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 04.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 34071,
+   "levels": [
+    "junkyard",
+    "prison"
+   ],
+   "primitives": 366407,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 05.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 21958,
+   "levels": [
+    "prison"
+   ],
+   "primitives": 279749,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 06_door.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 10181,
+   "levels": [
+    "level04",
+    "level09",
+    "level11",
+    "prison"
+   ],
+   "primitives": 190583,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 07_door.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 28746,
+   "levels": [
+    "level06",
+    "prison"
+   ],
+   "primitives": 353819,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 09_chute edge.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 8798,
+   "levels": [
+    "level03",
+    "prison"
+   ],
+   "primitives": 146626,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 10_floor panels.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 16446,
+   "levels": [
+    "prison"
+   ],
+   "primitives": 78307,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 11_floor panels.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 7697,
+   "levels": [
+    "prison"
+   ],
+   "primitives": 23563,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 12_floor panels.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 19584,
+   "levels": [
+    "level15",
+    "prison"
+   ],
+   "primitives": 216408,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 13_floor panels.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 3264,
+   "levels": [
+    "prison"
+   ],
+   "primitives": 10378,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 14_slipway.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 6750,
+   "levels": [
+    "level15",
+    "prison"
+   ],
+   "primitives": 258898,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 17_chute.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 7388,
+   "levels": [
+    "prison"
+   ],
+   "primitives": 72838,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 17_chute_anim_a.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 1271,
+   "levels": [
+    "prison"
+   ],
+   "primitives": 30504,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 18_chute.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 5703,
+   "levels": [
+    "prison"
+   ],
+   "primitives": 48412,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 21_upper wall copy.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 27434,
+   "levels": [
+    "level15",
+    "prison"
+   ],
+   "primitives": 431563,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 23_upper wall edge.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 32014,
+   "levels": [
+    "prison"
+   ],
+   "primitives": 767641,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 25_mincer.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 4928,
+   "levels": [
+    "prison"
+   ],
+   "primitives": 106814,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 26_mincer.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 2427,
+   "levels": [
+    "prison"
+   ],
+   "primitives": 72567,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 35 rygb.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 13036,
+   "levels": [
+    "level15",
+    "prison"
+   ],
+   "primitives": 83704,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 36 rygb.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 50030,
+   "levels": [
+    "level01",
+    "level15",
+    "prison"
+   ],
+   "primitives": 1696758,
+   "zwrite_off": 0
+  },
+  "ground/s3 level 1k 38 rygb.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 160,
+   "levels": [
+    "prison"
+   ],
+   "primitives": 436,
+   "zwrite_off": 0
+  },
+  "ground/satelite park.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 15847,
+   "levels": [
+    "cityruins",
+    "junkyard",
+    "level05",
+    "level09"
+   ],
+   "primitives": 1116604,
+   "zwrite_off": 0
+  },
+  "ground/satellite park fragboulder 256 00.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 8551,
+   "levels": [
+    "level05"
+   ],
+   "primitives": 188122,
+   "zwrite_off": 0
+  },
+  "ground/science truck_01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 8805,
+   "levels": [
+    "level05",
+    "level09"
+   ],
+   "primitives": 97494,
+   "zwrite_off": 0
+  },
+  "ground/science truck_02.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 12100,
+   "levels": [
+    "level05",
+    "level09"
+   ],
+   "primitives": 595941,
+   "zwrite_off": 0
+  },
+  "ground/shiny.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 725,
+   "levels": [
+    "cityruins"
+   ],
+   "primitives": 25412,
+   "zwrite_off": 0
+  },
+  "ground/stone1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 6616,
+   "levels": [
+    "level03"
+   ],
+   "primitives": 115956,
+   "zwrite_off": 0
+  },
+  "ground/swampbrown.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 17558,
+   "levels": [
+    "level09"
+   ],
+   "primitives": 143056,
+   "zwrite_off": 0
+  },
+  "ground/swampbrown_v2.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 224182,
+   "levels": [
+    "Maze"
+   ],
+   "primitives": 14111047,
+   "zwrite_off": 0
+  },
+  "ground/swampgreen.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 4461,
+   "levels": [
+    "level09"
+   ],
+   "primitives": 67112,
+   "zwrite_off": 0
+  },
+  "ground/swampgreen_v2.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 84290,
+   "levels": [
+    "Maze"
+   ],
+   "primitives": 1029875,
+   "zwrite_off": 0
+  },
+  "ground/turbine control.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 10503,
+   "levels": [
+    "level10"
+   ],
+   "primitives": 69552,
+   "zwrite_off": 0
+  },
+  "ground/vehicles.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 58328,
+   "levels": [
+    "cityruins",
+    "junkyard",
+    "level02",
+    "level03",
+    "level06",
+    "level09",
+    "level11",
+    "level12"
+   ],
+   "primitives": 3529416,
+   "zwrite_off": 0
+  },
+  "ground/vehicles_02.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 8337,
+   "levels": [
+    "level02",
+    "level03"
+   ],
+   "primitives": 279334,
+   "zwrite_off": 0
+  },
+  "ground/walls_breeze_01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 4261,
+   "levels": [
+    "level12"
+   ],
+   "primitives": 131131,
+   "zwrite_off": 0
+  },
+  "ground/warehouse a.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 3927,
+   "levels": [
+    "level06"
+   ],
+   "primitives": 71948,
+   "zwrite_off": 0
+  },
+  "ground/warehouse b.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 12091,
+   "levels": [
+    "level06"
+   ],
+   "primitives": 513862,
+   "zwrite_off": 0
+  },
+  "ground/wetsand.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 70602,
+   "levels": [
+    "level07"
+   ],
+   "primitives": 1097123,
+   "zwrite_off": 0
+  },
+  "ground/wolf's lair lava chunk top512.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 63,
+   "levels": [
+    "level15"
+   ],
+   "primitives": 441,
+   "zwrite_off": 0
+  },
+  "ground/wolfground1.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 38584,
+   "levels": [
+    "level15"
+   ],
+   "primitives": 5506913,
+   "zwrite_off": 0
+  },
+  "ground/wolfs lair 1k 17&18_chute_dry etc.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 46,
+   "levels": [
+    "level15"
+   ],
+   "primitives": 1104,
+   "zwrite_off": 0
+  },
+  "ground/wolfs lair level 1k 07a.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 29480,
+   "levels": [
+    "level01",
+    "level15"
+   ],
+   "primitives": 321474,
+   "zwrite_off": 0
+  },
+  "structures/back of satelite.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 43435,
+   "levels": [
+    "junkyard",
+    "level05"
+   ],
+   "primitives": 1976296,
+   "zwrite_off": 0
+  },
+  "structures/biglaser.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 34488,
+   "levels": [
+    "junkyard"
+   ],
+   "primitives": 2060923,
+   "zwrite_off": 0
+  },
+  "structures/bunker controls.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 146,
+   "levels": [
+    "level03"
+   ],
+   "primitives": 20002,
+   "zwrite_off": 0
+  },
+  "structures/bunker.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 37436,
+   "levels": [
+    "level04"
+   ],
+   "primitives": 543783,
+   "zwrite_off": 0
+  },
+  "structures/crane texture.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 112659,
+   "levels": [
+    "level07",
+    "mplay_atlantic"
+   ],
+   "primitives": 2048276,
+   "zwrite_off": 0
+  },
+  "structures/crane+underpanels00.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 2503,
+   "levels": [
+    "level10"
+   ],
+   "primitives": 20278,
+   "zwrite_off": 0
+  },
+  "structures/cranes_base.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 124,
+   "levels": [
+    "level07"
+   ],
+   "primitives": 744,
+   "zwrite_off": 0
+  },
+  "structures/cratetextf 512.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 12421,
+   "levels": [
+    "level02",
+    "level09"
+   ],
+   "primitives": 272846,
+   "zwrite_off": 0
+  },
+  "structures/cratetextf.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 12571,
+   "levels": [
+    "junkyard",
+    "level09"
+   ],
+   "primitives": 276618,
+   "zwrite_off": 0
+  },
+  "structures/door prison1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 2214,
+   "levels": [
+    "prison"
+   ],
+   "primitives": 56741,
+   "zwrite_off": 0
+  },
+  "structures/end trench.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 8383,
+   "levels": [
+    "level15"
+   ],
+   "primitives": 234593,
+   "zwrite_off": 0
+  },
+  "structures/enemy prison 01 512.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 440,
+   "levels": [
+    "junkyard"
+   ],
+   "primitives": 37476,
+   "zwrite_off": 0
+  },
+  "structures/escape fragboulder rock.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 3226,
+   "levels": [
+    "level01"
+   ],
+   "primitives": 70972,
+   "zwrite_off": 0
+  },
+  "structures/even newer ship floor00.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 104843,
+   "levels": [
+    "level07",
+    "level10"
+   ],
+   "primitives": 5357911,
+   "zwrite_off": 0
+  },
+  "structures/finalbattlefloor_points01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 16074,
+   "levels": [
+    "level15"
+   ],
+   "primitives": 485034,
+   "zwrite_off": 0
+  },
+  "structures/finalbattlefloor_points02r.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 39632,
+   "levels": [
+    "level01",
+    "level15"
+   ],
+   "primitives": 1091638,
+   "zwrite_off": 0
+  },
+  "structures/finalbattlefloor_side00.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 778,
+   "levels": [
+    "level15"
+   ],
+   "primitives": 24673,
+   "zwrite_off": 0
+  },
+  "structures/front of satelite.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 19307,
+   "levels": [
+    "junkyard",
+    "level05"
+   ],
+   "primitives": 654897,
+   "zwrite_off": 0
+  },
+  "structures/funnel rust plain.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 12196,
+   "levels": [
+    "level10"
+   ],
+   "primitives": 272397,
+   "zwrite_off": 0
+  },
+  "structures/funnel rust.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 12089,
+   "levels": [
+    "level10"
+   ],
+   "primitives": 198956,
+   "zwrite_off": 0
+  },
+  "structures/gastower new.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 37168,
+   "levels": [
+    "level06"
+   ],
+   "primitives": 581901,
+   "zwrite_off": 0
+  },
+  "structures/gastower.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 21921,
+   "levels": [
+    "junkyard",
+    "level06",
+    "level09"
+   ],
+   "primitives": 877817,
+   "zwrite_off": 0
+  },
+  "structures/graffiti and rust1.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 49387,
+   "levels": [
+    "Maze",
+    "level03",
+    "level04",
+    "level09"
+   ],
+   "primitives": 1855789,
+   "zwrite_off": 0
+  },
+  "structures/hull intersection a.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 4529,
+   "levels": [
+    "level10"
+   ],
+   "primitives": 16771,
+   "zwrite_off": 0
+  },
+  "structures/hull intersection b.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 7701,
+   "levels": [
+    "level10"
+   ],
+   "primitives": 426891,
+   "zwrite_off": 0
+  },
+  "structures/industrial walls.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 13700,
+   "levels": [
+    "level09"
+   ],
+   "primitives": 263901,
+   "zwrite_off": 0
+  },
+  "structures/l9 concrete.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 41400,
+   "levels": [
+    "level09"
+   ],
+   "primitives": 2253924,
+   "zwrite_off": 0
+  },
+  "structures/l9 panels.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 57465,
+   "levels": [
+    "level09"
+   ],
+   "primitives": 727198,
+   "zwrite_off": 0
+  },
+  "structures/l9 stuff.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 38125,
+   "levels": [
+    "cityruins",
+    "level05",
+    "level09"
+   ],
+   "primitives": 915288,
+   "zwrite_off": 0
+  },
+  "structures/level04.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 10601,
+   "levels": [
+    "junkyard",
+    "level04"
+   ],
+   "primitives": 1329824,
+   "zwrite_off": 0
+  },
+  "structures/lifter.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 12919,
+   "levels": [
+    "junkyard"
+   ],
+   "primitives": 133595,
+   "zwrite_off": 0
+  },
+  "structures/machinery.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 154959,
+   "levels": [
+    "Maze",
+    "level05",
+    "level09"
+   ],
+   "primitives": 3369592,
+   "zwrite_off": 0
+  },
+  "structures/maze carpark.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 21871,
+   "levels": [
+    "level09"
+   ],
+   "primitives": 160789,
+   "zwrite_off": 0
+  },
+  "structures/maze carpark_v2.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 47104,
+   "levels": [
+    "Maze"
+   ],
+   "primitives": 215251,
+   "zwrite_off": 0
+  },
+  "structures/mincer 00.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 1008,
+   "levels": [
+    "prison"
+   ],
+   "primitives": 22930,
+   "zwrite_off": 0
+  },
+  "structures/oil rig 00 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 12373,
+   "levels": [
+    "level07"
+   ],
+   "primitives": 338435,
+   "zwrite_off": 0
+  },
+  "structures/oil rig 00 1024_green.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 139366,
+   "levels": [
+    "level07",
+    "mplay_atlantic"
+   ],
+   "primitives": 4757153,
+   "zwrite_off": 0
+  },
+  "structures/oil rig 00 1024_red.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 140101,
+   "levels": [
+    "level07",
+    "mplay_atlantic"
+   ],
+   "primitives": 4974582,
+   "zwrite_off": 0
+  },
+  "structures/oil rig 01 1024 none .rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 15096,
+   "levels": [
+    "level07"
+   ],
+   "primitives": 113593,
+   "zwrite_off": 0
+  },
+  "structures/oil rig 01 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 41183,
+   "levels": [
+    "level07",
+    "mplay_atlantic"
+   ],
+   "primitives": 394991,
+   "zwrite_off": 0
+  },
+  "structures/oil rig 01 1024_blue.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 1549,
+   "levels": [
+    "level07"
+   ],
+   "primitives": 4654,
+   "zwrite_off": 0
+  },
+  "structures/oil rig 01 1024_green.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 86723,
+   "levels": [
+    "level07",
+    "mplay_atlantic"
+   ],
+   "primitives": 1228699,
+   "zwrite_off": 0
+  },
+  "structures/oil rig 01 1024_red.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 50879,
+   "levels": [
+    "level07",
+    "mplay_atlantic"
+   ],
+   "primitives": 568050,
+   "zwrite_off": 0
+  },
+  "structures/oil rig yellow old 512r.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 966,
+   "levels": [
+    "level10"
+   ],
+   "primitives": 7728,
+   "zwrite_off": 0
+  },
+  "structures/pathway1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 60878,
+   "levels": [
+    "level02",
+    "level03",
+    "level04",
+    "level05",
+    "level06"
+   ],
+   "primitives": 1050446,
+   "zwrite_off": 0
+  },
+  "structures/red sky.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 7248,
+   "levels": [
+    "cityruins",
+    "junkyard",
+    "level01",
+    "level03",
+    "level05",
+    "level07",
+    "level09",
+    "level10",
+    "level12",
+    "level15",
+    "prison"
+   ],
+   "primitives": 691852,
+   "zwrite_off": 0
+  },
+  "structures/rig shaft 1024_red.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 27640,
+   "levels": [
+    "mplay_atlantic"
+   ],
+   "primitives": 1103680,
+   "zwrite_off": 0
+  },
+  "structures/roofing.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 9223,
+   "levels": [
+    "level09"
+   ],
+   "primitives": 182270,
+   "zwrite_off": 0
+  },
+  "structures/satpan plain 00 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 11121,
+   "levels": [
+    "level05"
+   ],
+   "primitives": 40086,
+   "zwrite_off": 0
+  },
+  "structures/satpan plain 01 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 2343,
+   "levels": [
+    "level05"
+   ],
+   "primitives": 8112,
+   "zwrite_off": 0
+  },
+  "structures/satpan plain 02 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 27394,
+   "levels": [
+    "level05"
+   ],
+   "primitives": 306107,
+   "zwrite_off": 0
+  },
+  "structures/satwalk 00 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 21722,
+   "levels": [
+    "level05"
+   ],
+   "primitives": 103847,
+   "zwrite_off": 0
+  },
+  "structures/satwalk 01 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 14654,
+   "levels": [
+    "level05"
+   ],
+   "primitives": 167476,
+   "zwrite_off": 0
+  },
+  "structures/satwalk 02 256.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 177,
+   "levels": [
+    "level05"
+   ],
+   "primitives": 665,
+   "zwrite_off": 0
+  },
+  "structures/satwalk 03 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 12577,
+   "levels": [
+    "level05"
+   ],
+   "primitives": 66778,
+   "zwrite_off": 0
+  },
+  "structures/science truck end.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 3285,
+   "levels": [
+    "level05"
+   ],
+   "primitives": 22793,
+   "zwrite_off": 0
+  },
+  "structures/skorn1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 4968,
+   "levels": [
+    "Maze",
+    "mplay_atlantic"
+   ],
+   "primitives": 298080,
+   "zwrite_off": 0
+  },
+  "structures/supertanker block 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 5785,
+   "levels": [
+    "level10"
+   ],
+   "primitives": 140840,
+   "zwrite_off": 0
+  },
+  "structures/supertanker block 2 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 14706,
+   "levels": [
+    "level10"
+   ],
+   "primitives": 300160,
+   "zwrite_off": 0
+  },
+  "structures/supertanker floor 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 17582,
+   "levels": [
+    "level10"
+   ],
+   "primitives": 468893,
+   "zwrite_off": 0
+  },
+  "structures/supertanker floor again00.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 6661,
+   "levels": [
+    "level10"
+   ],
+   "primitives": 244287,
+   "zwrite_off": 0
+  },
+  "structures/supertanker floor again01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 12075,
+   "levels": [
+    "level10"
+   ],
+   "primitives": 78393,
+   "zwrite_off": 0
+  },
+  "structures/supertanker floor again02.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 1542,
+   "levels": [
+    "level10"
+   ],
+   "primitives": 14085,
+   "zwrite_off": 0
+  },
+  "structures/supertanker ship 1024 copy.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 34936,
+   "levels": [
+    "level10"
+   ],
+   "primitives": 468142,
+   "zwrite_off": 0
+  },
+  "structures/vtol1.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 346,
+   "levels": [
+    "level02"
+   ],
+   "primitives": 121170,
+   "zwrite_off": 0
+  },
+  "structures/vtolknackered.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 7581,
+   "levels": [
+    "level03"
+   ],
+   "primitives": 647785,
+   "zwrite_off": 0
+  },
+  "structures/wolf's lair hell gate .rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 247,
+   "levels": [
+    "level15"
+   ],
+   "primitives": 45524,
+   "zwrite_off": 0
+  },
+  "units/alpha junk.rim": {
+   "additive": 13875,
+   "alpha_test": 263482,
+   "blend": 263482,
+   "draws": 263482,
+   "levels": [
+    "Maze",
+    "cityruins",
+    "frontend",
+    "junkyard",
+    "level01",
+    "level02",
+    "level03",
+    "level04",
+    "level05",
+    "level06",
+    "level07",
+    "level09",
+    "level10",
+    "level11",
+    "level12",
+    "level15",
+    "mplay_atlantic",
+    "prison"
+   ],
+   "primitives": 5329708,
+   "zwrite_off": 13875
+  },
+  "units/arachnid baddies.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 2791,
+   "levels": [
+    "level03"
+   ],
+   "primitives": 264730,
+   "zwrite_off": 0
+  },
+  "units/archore.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 414,
+   "levels": [
+    "level06"
+   ],
+   "primitives": 828,
+   "zwrite_off": 0
+  },
+  "units/baddies2.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 355,
+   "levels": [
+    "level06"
+   ],
+   "primitives": 1775,
+   "zwrite_off": 0
+  },
+  "units/baddies3.rim": {
+   "additive": 0,
+   "alpha_test": 1491,
+   "blend": 1491,
+   "draws": 502215,
+   "levels": [
+    "cityruins",
+    "junkyard",
+    "level01",
+    "level02",
+    "level03",
+    "level04",
+    "level05",
+    "level06",
+    "level07",
+    "level09",
+    "level10",
+    "level11",
+    "level12",
+    "level15",
+    "prison"
+   ],
+   "primitives": 13114625,
+   "zwrite_off": 0
+  },
+  "units/command wheel 01 512.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 161104,
+   "levels": [
+    "Maze",
+    "cityruins",
+    "frontend",
+    "junkyard",
+    "level01",
+    "level02",
+    "level03",
+    "level04",
+    "level05",
+    "level06",
+    "level07",
+    "level09",
+    "level10",
+    "level11",
+    "level12",
+    "level15",
+    "mplay_atlantic",
+    "prison"
+   ],
+   "primitives": 1313936,
+   "zwrite_off": 0
+  },
+  "units/custom screen 01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 1376,
+   "levels": [
+    "level02"
+   ],
+   "primitives": 2752,
+   "zwrite_off": 0
+  },
+  "units/custom screen bg 1k 01.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 9976,
+   "levels": [
+    "level02"
+   ],
+   "primitives": 102512,
+   "zwrite_off": 0
+  },
+  "units/drones.rim": {
+   "additive": 0,
+   "alpha_test": 3907,
+   "blend": 3907,
+   "draws": 4334,
+   "levels": [
+    "junkyard",
+    "level06"
+   ],
+   "primitives": 339442,
+   "zwrite_off": 0
+  },
+  "units/elint_mk2_512.rim": {
+   "additive": 0,
+   "alpha_test": 513240,
+   "blend": 513240,
+   "draws": 1028230,
+   "levels": [
+    "cityruins",
+    "junkyard",
+    "level01",
+    "level02",
+    "level03",
+    "level04",
+    "level05",
+    "level06",
+    "level07",
+    "level09",
+    "level10",
+    "level11",
+    "level12",
+    "level15",
+    "prison"
+   ],
+   "primitives": 57386440,
+   "zwrite_off": 0
+  },
+  "units/frend_mk2_512.rim": {
+   "additive": 0,
+   "alpha_test": 238602,
+   "blend": 238602,
+   "draws": 477204,
+   "levels": [
+    "cityruins",
+    "junkyard",
+    "level05",
+    "level06",
+    "level07",
+    "level09",
+    "level10",
+    "level11",
+    "level12",
+    "level15"
+   ],
+   "primitives": 22430544,
+   "zwrite_off": 0
+  },
+  "units/garbage 00 512.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 153554,
+   "levels": [
+    "Maze",
+    "cityruins",
+    "junkyard",
+    "level01",
+    "level02",
+    "level03",
+    "level04",
+    "level05",
+    "level06",
+    "level07",
+    "level09",
+    "level10",
+    "level11",
+    "level12",
+    "level15",
+    "mplay_atlantic",
+    "prison"
+   ],
+   "primitives": 4477828,
+   "zwrite_off": 0
+  },
+  "units/gunlok_mk2_1024.rim": {
+   "additive": 0,
+   "alpha_test": 589027,
+   "blend": 589027,
+   "draws": 1179804,
+   "levels": [
+    "cityruins",
+    "junkyard",
+    "level01",
+    "level02",
+    "level03",
+    "level04",
+    "level05",
+    "level06",
+    "level07",
+    "level09",
+    "level10",
+    "level11",
+    "level12",
+    "level15",
+    "prison"
+   ],
+   "primitives": 57180120,
+   "zwrite_off": 0
+  },
+  "units/gunloktestface_blue.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 27176,
+   "levels": [
+    "cityruins",
+    "junkyard",
+    "level01",
+    "level02",
+    "level03",
+    "level04",
+    "level05",
+    "level06",
+    "level07",
+    "level09",
+    "level10",
+    "level11",
+    "level12",
+    "level15",
+    "prison"
+   ],
+   "primitives": 2483163,
+   "zwrite_off": 0
+  },
+  "units/guns_512.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 2112,
+   "levels": [
+    "level01",
+    "level15"
+   ],
+   "primitives": 240512,
+   "zwrite_off": 0
+  },
+  "units/hark_512.rim": {
+   "additive": 0,
+   "alpha_test": 325520,
+   "blend": 325520,
+   "draws": 652790,
+   "levels": [
+    "cityruins",
+    "junkyard",
+    "level03",
+    "level04",
+    "level05",
+    "level06",
+    "level07",
+    "level09",
+    "level10",
+    "level11",
+    "level12",
+    "level15"
+   ],
+   "primitives": 22944064,
+   "zwrite_off": 0
+  },
+  "units/jcb 00 512.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 3099,
+   "levels": [
+    "junkyard",
+    "level06"
+   ],
+   "primitives": 379050,
+   "zwrite_off": 0
+  },
+  "units/maskelyn_mk2_512.rim": {
+   "additive": 0,
+   "alpha_test": 77536,
+   "blend": 77536,
+   "draws": 106572,
+   "levels": [
+    "cityruins",
+    "level03",
+    "level15"
+   ],
+   "primitives": 5792701,
+   "zwrite_off": 0
+  },
+  "units/new car b 512.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 5979,
+   "levels": [
+    "cityruins",
+    "level02",
+    "level03",
+    "level04",
+    "level09"
+   ],
+   "primitives": 814376,
+   "zwrite_off": 0
+  },
+  "units/new car c 512.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 13170,
+   "levels": [
+    "cityruins",
+    "level02",
+    "level04",
+    "level09",
+    "level12"
+   ],
+   "primitives": 879790,
+   "zwrite_off": 0
+  },
+  "units/new car512.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 2634,
+   "levels": [
+    "level02",
+    "level03",
+    "level04",
+    "level12"
+   ],
+   "primitives": 287435,
+   "zwrite_off": 0
+  },
+  "units/new digger a.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 12285,
+   "levels": [
+    "junkyard",
+    "level02",
+    "level03"
+   ],
+   "primitives": 797441,
+   "zwrite_off": 0
+  },
+  "units/new digger b.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 4106,
+   "levels": [
+    "level02",
+    "level03"
+   ],
+   "primitives": 204747,
+   "zwrite_off": 0
+  },
+  "units/plates 2 1024.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 947189,
+   "levels": [
+    "Maze",
+    "cityruins",
+    "junkyard",
+    "level01",
+    "level02",
+    "level03",
+    "level04",
+    "level05",
+    "level06",
+    "level07",
+    "level09",
+    "level10",
+    "level11",
+    "level12",
+    "level15",
+    "mplay_atlantic",
+    "prison"
+   ],
+   "primitives": 4472444,
+   "zwrite_off": 0
+  },
+  "units/scythor 512.rim": {
+   "additive": 0,
+   "alpha_test": 560,
+   "blend": 560,
+   "draws": 1120,
+   "levels": [
+    "level07"
+   ],
+   "primitives": 33360,
+   "zwrite_off": 0
+  },
+  "units/sneeker 512.rim": {
+   "additive": 0,
+   "alpha_test": 774,
+   "blend": 774,
+   "draws": 1548,
+   "levels": [
+    "level03"
+   ],
+   "primitives": 38528,
+   "zwrite_off": 0
+  },
+  "units/turrets 512.rim": {
+   "additive": 0,
+   "alpha_test": 6738,
+   "blend": 6738,
+   "draws": 33820,
+   "levels": [
+    "level03",
+    "level09",
+    "level11",
+    "level15"
+   ],
+   "primitives": 799209,
+   "zwrite_off": 0
+  },
+  "units/vtol1.rim": {
+   "additive": 0,
+   "alpha_test": 0,
+   "blend": 0,
+   "draws": 1750,
+   "levels": [
+    "level03"
+   ],
+   "primitives": 992250,
+   "zwrite_off": 0
+  }
+ }
+}

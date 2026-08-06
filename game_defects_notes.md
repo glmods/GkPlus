@@ -434,13 +434,137 @@ actually hit, and this is recorded here instead.
 
 ---
 
+## 8. `ToRole` @ 0x0047cc20 dereferences a null `Hierarchy` when a role's `.rif` is missing
+
+**Latent in the shipped game — and GkPlus's `levels.start` is what makes it reachable.** A role
+whose `shape` names a `hierarchy` section whose `.rif` file is absent gets a **NULL**
+`Role::hierarchy`, stored unchecked, and `ToRole` then calls a `__thiscall` on it. Instant
+`0xc0000005` at **0x005948bd** during level load, before a single frame is drawn.
+
+### Mechanism
+
+`ToRole` converts the role's `shape` field (parsed field id 5, `ParsedRole+0x260`) and stores the
+result without testing it:
+
+```
+0047ccb4  MOV ECX,dword ptr [EBX + 0x260]   ; role field id 5 = `shape`
+0047ccbc  JZ  0x0047ce1c                    ; absent -> skip the whole block
+0047cced  CALL 0x0047c390                   ; ToHierarchy
+0047ccf2  MOV dword ptr [EDI + 0x1c],EAX    ; Role::hierarchy <- NULL, unchecked
+```
+
+`ToHierarchy` @ 0x0047c390 tail-jumps to `GetHierarchy` @ 0x004ae390 (`__fastcall
+void *(char *file /*ECX*/, char *name /*EDX*/)`), which on a cache miss calls `LoadOrGetRifFile`
+@ 0x004ae960 then `BuildHierarchy` @ 0x005a9cc0 and **falls to `XOR EAX,EAX` @ 0x004ae45f if
+either returns zero** — silently, with nothing printed. A missing `.rif` therefore arrives as a
+bare NULL.
+
+The call that faults is guarded, but **on the wrong thing** — the hotspot *name string*, never the
+hierarchy pointer:
+
+```
+0047cd7a  MOV EAX,dword ptr [EBX + 0x260]   ; the parsed hierarchy section
+0047cd80  MOV EAX,dword ptr [EAX + 0x250]   ; its field id 3 = `hotspot`
+0047cd89  TEST EAX,EAX
+0047cd8b  JZ  0x0047cda3                    ; THE ONLY GUARD
+0047cd8f  CALL 0x0044e1a0                   ; strdup
+0047cd97  MOV ECX,dword ptr [EDI + 0x1c]    ; Role::hierarchy == 0
+0047cd9a  PUSH ESI                          ; ESI = EDI+0x2c = &Role::hotspot_point
+0047cd9b  MOV dword ptr [EDI + 0x44],EAX    ; Role::hotspot = strdup(name)
+0047cd9e  CALL 0x00594890                   ; HierarchyResolveNamedPointPos
+```
+
+`HierarchyResolveNamedPointPos` @ **0x00594890** (`__thiscall bool(Hierarchy *this, Vec3f *out_pos,
+char *node_name)`, `RET 0x8` @ 0x00594a00) recursively searches the node tree for `node_name`. It
+dereferences `this` at the third instruction of its body with no null check — `MOV ECX,[EDI+0x88]`
+at **0x005948bd**, `EDI` having just been loaded from `ECX`. `+0x88` is the node's name, compared
+with `__stricmp`. There is a second, identically unguarded call site at 0x0047cdd4 for
+`alternate hotspot`.
+
+So the condition is **missing `.rif` AND a `hotspot` on the hierarchy** — a missing file alone is
+survivable. `level02` is the natural control: `warflash.gsh` names `units\scarflash_shadow.RIF`,
+which is not in the install, but declares no `hotspot`, so the `JZ` at 0x0047cd8b skips the call
+and the level loads with a null hierarchy in that role. This is why "the file is missing" is not
+by itself a prediction of a crash.
+
+`ConvertParsedObjects` @ 0x004747b0 converts **every** parsed section in the `#include` closure
+(`MOV ECX,[EDI+0xc]; MOV EAX,[ECX]; CALL [EAX+0x1c]` — vtable slot 7, the `ToXxx` dispatch), so the
+role does not have to be placed on the map. Including the header is enough.
+
+### Which maps, and why retail never hits it
+
+Four shipped `.gls` `#include` unit headers whose `.RIF` files were never shipped — only the
+`.gsh` are present:
+
+| map | roles | missing `.rif` |
+|---|---|---|
+| `mplay_bombsite`, `mplay_canyon`, `mplay_dockyard` | 10 each | `units\` `fishy`, `frogs head`, `Penguin`, `Gunical`, `Guncraft`, `Klig ship`, `X-rotuse`, `Stingray`, `Tulip`, `Shouldercrab` |
+| `mplay_tf_oilrig01` | 3 | `units\` `creeper`, `stalker`, `claw` |
+
+All ten carry a `hotspot`, so all ten fault. Every campaign level, `prison`, `Maze`,
+`Training_Level`, `cityruins` and `junkyard` are clean.
+
+**The retail game cannot reach any of the four.** `gl.exe` hardcodes its multiplayer map list as
+seven `.gls`/`.gcs` string pairs — `mplay_atlantic`, `mplay_carpark`, `mplay_machine`,
+`mplay_mountain`, `mplay_rorschasch`, `mplay_warehouse`, `mplay_zorro` — and the four defective
+maps are exactly the ones **not** in it. They are dev leftovers: `mplay_bombsite`, `mplay_canyon`,
+`mplay_dockyard` and `mplay_tf_oilrig01` have no level `.RIF` under `RIF\Levels` either, so they
+could not load even with the roles fixed. The same defect sits in the unshipped `railway.gls`,
+`test_level.gls` and `training05.gls` (5/11/10 roles), which likewise have no `.map`.
+
+What makes it reachable is that `levels.start` takes a script name directly, so it will happily
+load a `.gls` the menus never offer.
+
+**All seven maps the exe does list load fine** under `levels.start` — measured, one process, back
+to back: carpark 149 actors, machine 79, mountain 69, rorschasch 107, warehouse 113, zorro 102, and
+atlantic was already known good. Only `mplay_atlantic` has a `.map`/`.cut` sidecar, so the other
+six spend ~10 s building caches on first load and read as `Responding=False` while they do; that is
+the cache build, not a hang.
+
+### GkPlus is not implicated
+
+The stack is the same in both dumps, byte for byte:
+
+```
+gl+0x1948bd                              ; HierarchyResolveNamedPointPos, this == NULL
+gl+0x7cda3                               ; ToRole+0x183
+d3d8!gk::...::HookedToRole+0x66          ; the CALL to the original
+gl+0x747e4                               ; ConvertParsedObjects
+d3d8!gk::...::HookedConvertParsedObjects+0x19
+...
+d3d8!gk::StartLevel+0xa2
+```
+
+Both detours appear only as the frame that *called the original* — `HookedToRole` reads the
+`parsed+0x1b60` cache slot and then calls `ToRole`, and its own work runs after the return it never
+gets; `HookedConvertParsedObjects` adds a null check and calls through. The whole chain
+0x0047ccb4 → 0x0047cd9e → 0x005948bd is stock code on stock data. The mod VFS cannot be blamed
+either: it only *adds* files, and these are absent from the install entirely.
+
+### Reproducing
+
+```
+levels.start({script: "mplay_dockyard.gls", console: "mplay_dockyard.gcs"})
+```
+
+kills the process immediately — exit `0xc0000005`, WER `Fault offset 0x001948bd`, faulting module
+`gl.exe`. It is **not** the hang it looks like from the harness: the REPL socket dies with the
+process, and per the note below a crash always presents as a socket timeout. Dumps:
+`gl.exe.46176.dmp` (2026-08-06 14:15, the original harvest batch) and `gl.exe.23876.dmp`
+(deliberate repro).
+
+### Ghidra
+
+`HierarchyResolveNamedPointPos` @ 0x00594890 has the `RET 0x8` evidence and the null-`this` hazard
+in its plate comment; `ToHierarchy` and `GetHierarchy` have plate comments recording their silent
+NULL returns; both call sites (0x0047cd9e, 0x0047cdd4) carry a pre-comment naming the missing null
+check.
+
+---
+
 ## Debugging Gunlok: what actually works
 
-- **cdb is at** `C:\Program Files\WindowsApps\Microsoft.WinDbg_*\x86\cdb.exe`. It
-  cannot be executed in place (WindowsApps denies execute) but **can be read and
-  copied out** — copy `cdb.exe`, `dbgeng.dll`, `dbghelp.dll`, `dbgcore.dll`,
-  `dbgmodel.dll`, `symsrv.dll`, `srcsrv.dll` plus the `winext\` and `triage\`
-  folders to a writable directory and run it from there.
+- **cdb is at** `C:\Users\franc\AppData\Roaming\Binary Ninja\dbgeng\Windows Kits\10\Debuggers\x86\cdb.exe`.
 - **`cppvsdbg` (VS Code) uses `vsdbg.exe`** from the cpptools extension. It speaks
   DAP on stdio and the handshake works, but it enforces a licence check restricting
   it to VS Code / Visual Studio as the host and aborts the session for anything

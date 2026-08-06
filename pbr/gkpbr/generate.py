@@ -21,11 +21,11 @@ cross-blending, which puts an interior region over every edge.
 import base64
 import os
 
-from . import images, metrics
+from . import cache, images, metrics
 
 #: `gemini-3.1-flash-image` is the balance point: $0.067 per 1K image against
 #: `gemini-3-pro-image` at $0.134 and `gemini-3.1-flash-lite-image` at $0.034.
-#: At 364 textures the whole run is tens of dollars either way, so the model is
+#: At 365 textures the whole run is tens of dollars either way, so the model is
 #: chosen on result quality and escalated per-texture, not budgeted for.
 DEFAULT_MODEL = "gemini-3.1-flash-image"
 ESCALATION_MODEL = "gemini-3-pro-image"
@@ -112,6 +112,37 @@ def _client(client=None):
     return client or genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 
+def fingerprint(albedo_png, prompt, model, require_tiling=False):
+    """What determines one generated artifact, one digest each.
+
+    The same three states as stage 1's (see :mod:`gkpbr.cache`), over a shorter list
+    because the request is shorter: the albedo bytes, the **rendered** prompt, the
+    model, and whether the seam-repair pass ran -- a tiling sheet is generated twice
+    and cross-blended, so the same prompt against the same albedo produces a
+    materially different image depending on that flag.
+
+    The rendered prompt is what makes this worth having rather than a formality: it
+    is ``HEIGHT_PROMPT % (material_summary, relief_summary)``, and both summaries come
+    out of the **stage 1 answer**. So re-classifying a texture -- or hand-editing its
+    material -- changes what the height map should have been asked for, and this is
+    the only thing that notices.
+
+    ``model`` is the model *requested*, not the one that answered: with ``--escalate``
+    a rejected map is retried on the pro model, and "which model produced this file"
+    is a fact about a run rather than an input to it.
+
+    Left out for the same reason as in :func:`classify.fingerprint`: the requested
+    image size, which is a function of the albedo's dimensions and so already covered;
+    and ``OUTPUT_MIME``, which the API leaves no choice about.
+    """
+    return {
+        "albedo": cache.digest(albedo_png),
+        "prompt": cache.digest(prompt),
+        "model": model,
+        "tiling": "yes" if require_tiling else "no",
+    }
+
+
 def _request_size(width, height):
     """The smallest offered size that does not throw away detail.
 
@@ -119,7 +150,7 @@ def _request_size(width, height):
     literal string ``512``, not ``0.5K``**, which is what the published docs call it
     and what the API rejects with a 400. The aspect ratio must also come from a fixed
     list, so a non-square sheet would be re-composed rather than mapped; that is
-    moot here because all 364 referenced sheets are square.
+    moot here because all 365 referenced sheets are square.
     """
     n = max(width, height)
     if n <= 512:
