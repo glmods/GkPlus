@@ -1208,14 +1208,20 @@ def test_sounds_from_scratch(tmp):
 
     step = sc.add_sound(collection, "Robots" + chr(92) + "GL_Footstep_Metal_01.wav")
     clink = sc.add_sound(collection, "Robots" + chr(92) + "CLUNK1.WAV")
-    check(step.data["rif_sound_index"] == 1, "the first sound takes slot 1")
-    check(clink.data["rif_sound_index"] == 2, "the second takes slot 2")
+    check(step["index"] == 1, "the first sound takes slot 1")
+    check(clink["index"] == 2, "the second takes slot 2")
     # Slot 0 must never be handed out: 0 is how a frame says "no sound".
     check(0 not in {e["index"] for e in sc.sound_table(collection)},
           "slot 0 is never allocated")
+    # No Speaker: an INDSOUND entry has no position, so it has no transform to
+    # give one meaning. The Speakers are the DUMOBJTX emitters now.
+    check(not [o for o in collection.objects if o.type == "SPEAKER"],
+          "adding a table entry creates no object")
 
-    step.data.distance_max = 12.0
-    step.data.volume = 0.5
+    # Edited through the active row, which is what the UIList selects.
+    collection[sc.SOUND_ACTIVE_PROP] = 0
+    sc.set_sound_field(collection, "max_distance", 12000)
+    sc.set_sound_field(collection, "volume", 64)
     sc.set_sound_event(action, "Foot", 10.0, 1)
     sc.set_sound_event(action, "Foot", 20.0, 2)
 
@@ -1227,8 +1233,8 @@ def test_sounds_from_scratch(tmp):
     check(len(got) == 2, "both entries reached the file, got %d" % len(got))
     check(got[0][:2] == (1, "Robots" + chr(92) + "GL_Footstep_Metal_01.wav"),
           "entry 1 carries its path, got %s" % (got[0][:2],))
-    check(got[0][3] == 12000, "the speaker's max distance wrote 12000 mm, got %d" % got[0][3])
-    check(got[0][4] == 64, "volume 0.5 wrote 64 of 127, got %d" % got[0][4])
+    check(got[0][3] == 12000, "the edited max distance wrote 12000 mm, got %d" % got[0][3])
+    check(got[0][4] == 64, "and the edited volume wrote 64 of 127, got %d" % got[0][4])
 
     ev = frame_sounds(root)
     check(len(ev) == 2, "two frames trigger a sound, got %d" % len(ev))
@@ -1263,10 +1269,10 @@ def test_sounds_survive_an_import(game_dir, tmp):
                                        source_path=source)
     want = sounds_in(rif.load(source))
     check(bool(want), "the source has a sound table")
-    check(stats.get("speakers") == len(want),
-          "one speaker per entry, got %s for %d" % (stats.get("speakers"), len(want)))
+    check(stats.get("sounds") == len(want),
+          "the whole table imported, got %s for %d" % (stats.get("sounds"), len(want)))
     check(len(sc.sound_table(collection)) == len(want),
-          "the table reads back off the speakers")
+          "and reads back off the collection")
 
     path = os.path.join(tmp, "snd_edit.rif")
     export(collection, path)
@@ -1274,12 +1280,13 @@ def test_sounds_survive_an_import(game_dir, tmp):
     check(frame_sounds(rif.load(path)) == frame_sounds(rif.load(source)),
           "every frame keeps the sound it triggered")
 
-    # Deleting a speaker is how a sound is removed.
-    speakers = sc.sound_speakers(collection)
-    bpy.data.objects.remove(speakers[0], do_unlink=True)
+    # Removing a row is how a sound is removed, now that there is no object to
+    # delete. The entries are kept whole and in order otherwise -- an index is a
+    # stable id, so a row nothing references still belongs to the file.
+    sc.remove_sound(collection, 0)
     export(collection, path)
     check(len(sounds_in(rif.load(path))) == len(want) - 1,
-          "removing a speaker drops its entry")
+          "removing a row drops its entry")
     os.remove(path)
 
 

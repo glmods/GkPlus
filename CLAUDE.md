@@ -51,14 +51,17 @@ python blender/tests/test_roundtrip.py "<Gunlok dir>"   # container, 563/563 byt
 python blender/tests/test_schema.py "<Gunlok dir>"      # 485,663 leaf chunks, 44 ids
 python blender/tests/test_shapes.py "<Gunlok dir>"      # REBSHAPE geometry
 python blender/tests/test_heads.py "<Gunlok dir>"       # record chunks + keyframe timing
+python blender/tests/test_cutscene.py "<Gunlok dir>"    # the cutscene codecs + ID-prop shape
 python blender/tests/test_rim.py "<Gunlok dir>"         # all 513 textures, ~20 min
 ```
 
-Two need Blender itself, and take the scene round trip through a real `.blend`:
+Four need Blender itself, and take the scene round trip through a real `.blend`:
 
 ```bash
 blender --background --python blender/tests/test_scene.py -- "<Gunlok dir>" [N|all]
 blender --background --python blender/tests/test_authoring.py -- ["<Gunlok dir>"]
+blender --background --python blender/tests/test_cutscene_authoring.py -- ["<Gunlok dir>"]
+blender --background --python blender/tests/test_emitter_authoring.py -- ["<Gunlok dir>"]
 ```
 
 `test_scene.py` defaults to a sample rather than all 563 — pass `all` for the full run.
@@ -477,7 +480,9 @@ several features the retail build cannot actually execute:
   subclasses across only four distinct bodies
 - `rif_chunk_format.md` - the `.rif` asset format: 12-byte chunk header, `REBCRIF1` Huffman
   container, all 105 registered chunk types, the `.RIM` texture format (IFF + S3TC, the one
-  asset format that is *not* RIF chunks), **and** the AvP upstream mapping (see below)
+  asset format that is *not* RIF chunks), the **cutscene system** (all twelve chunks decoded -
+  a Catmull-Rom camera path, a cast of participants, a tagged event stream, and the `camera track`
+  GLS section without which none of it is reachable), **and** the AvP upstream mapping (see below)
 - `game_defects_notes.md` - bugs in **Gunlok itself** that reproduce without GkPlus, so nobody
   re-blames our hooks for them. Also the debugging recipes, and the one that matters most: WER
   already writes a full dump to `%LOCALAPPDATA%\CrashDumps\gl.exe.<pid>.dmp`, and

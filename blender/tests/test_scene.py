@@ -151,10 +151,32 @@ def summarize(root):
     seqs.sort(key=lambda s: (s[0], s[1], s[2], s[3], s[4],
                              tuple(b"" if x is None else x for x in s[5])))
 
-    # The sound table is held to byte-exactness, like the texture table: it is
-    # carried rather than regenerated, so an export that touched no speaker has
-    # no reason to disturb a byte -- uninitialised path padding included.
+    # Both sound systems are held to byte-exactness, and they are counted apart
+    # because they *are* apart -- an INDSOUND is a table entry an animation
+    # keyframe names, a DUMOBJTX is a placement in the level. Neither is
+    # regenerated from parsed values: the table is carried whole (uninitialised
+    # path padding included) and the emitter text is spliced, so an export that
+    # touched neither has no reason to disturb a byte of either.
     sound_bodies = sorted(bytes(c.body) for c in root.walk() if c.id == b"INDSOUND")
+
+    # Paired with the dummy's own name and position, because an emitter that came
+    # back with the right text at the wrong place is not the same file. The name
+    # is the DUMOBJDT trailing string; the position is its int32 triple.
+    emitters = []
+    for c in root.walk():
+        if c.id != b"DUMMYOBJ":
+            continue
+        tx = c.find(b"DUMOBJTX")
+        if tx is None:
+            continue
+        dt = c.find(b"DUMOBJDT")
+        emitters.append((
+            sc._trailing_name(dt.body, sc.DUMOBJDT_NAME) if dt is not None else "",
+            tuple(struct.unpack_from("<3i", dt.body, sc.DUMOBJ_LOCATION))
+            if dt is not None else None,
+            bytes(tx.body),
+        ))
+    emitters.sort()
 
     # OBJHIERD is regenerated from the object each node drives, so the bindings
     # are what proves a rename followed the rig instead of breaking it.
@@ -163,8 +185,9 @@ def summarize(root):
 
     table = next((c for c in root.walk() if c.id == b"BMPNAMES"), None)
     return {"objects": objects, "lights": lights, "sequences": seqs,
-            "bindings": bindings, "sounds": sound_bodies,
-            "table": table.body if table is not None else None}
+            "bindings": bindings, "sounds": sound_bodies, "emitters": emitters,
+            "table": table.body if table is not None else None,
+            "inventory": collections.Counter(c.id for c in root.walk())}
 
 
 #: How far a UV coordinate may move through an import/export cycle before it
@@ -209,7 +232,33 @@ def uv_residue(got_uvs, want_uvs):
     return out
 
 
+#: Chunk ids whose count is *expected* to change across a round trip, with why.
+#: Everything else has to come back with exactly the same number of chunks --
+#: a check that costs nothing and that the semantic comparisons cannot make,
+#: since they walk the objects a file describes rather than the chunks in it.
+#: `DUMOBJDT` was emitted twice per dummy for as long as this test existed
+#: (6,847 across the shipped set) and every check here passed regardless: the
+#: duplicate carried the same meaning, so nothing that compares meaning could
+#: see it.
+INVENTORY_EXPECTED = {
+    # Discarded on purpose: 681 of 9,357 shipped shapes have none and every AvP
+    # path guards the lookup, so it is regenerable-by-absence.
+    b"SHPPCINF": "discarded deliberately",
+}
+
+
+def compare_inventory(name, want, got):
+    ids = set(want["inventory"]) | set(got["inventory"])
+    for cid in sorted(ids):
+        a, b = want["inventory"][cid], got["inventory"][cid]
+        if a == b or cid in INVENTORY_EXPECTED:
+            continue
+        check(False, "%s: %s count %d in, %d out"
+              % (name, cid.decode("latin-1").rstrip("\0"), a, b))
+
+
 def compare(name, want, got):
+    compare_inventory(name, want, got)
     check(len(want["objects"]) == len(got["objects"]),
           "%s: %d objects out, %d in" % (name, len(got["objects"]), len(want["objects"])))
     for a, b in zip(want["objects"], got["objects"]):
@@ -259,6 +308,9 @@ def compare(name, want, got):
           % (name, len(want["sequences"])))
     check(want["sounds"] == got["sounds"],
           "%s: %d INDSOUND entr(ies) rebuild byte for byte" % (name, len(want["sounds"])))
+    check(want["emitters"] == got["emitters"],
+          "%s: %d ambient emitter(s) keep their name, position and DUMOBJTX text "
+          "byte for byte" % (name, len(want["emitters"])))
     check(want["bindings"] == got["bindings"],
           "%s: %d hierarchy binding(s) match" % (name, len(want["bindings"])))
     check((want["table"] is None) == (got["table"] is None),

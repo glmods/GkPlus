@@ -43,7 +43,8 @@ def main(game_dir):
             if chunk.children is not None:
                 continue
             seen[chunk.name] += 1
-            if chunk.id in schema.SCHEMA or chunk.id in schema.STRING_CHUNKS:
+            if (chunk.id in schema.SCHEMA or chunk.id in schema.STRING_CHUNKS
+                    or chunk.id in schema.CODECS):
                 named[chunk.name] += 1
             else:
                 generic[chunk.name] += 1

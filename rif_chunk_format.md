@@ -79,9 +79,9 @@ Container chunk bodies consist entirely of concatenated child chunks. Some also 
 | `SOUNDEXD` | (Sound_Extended_Data)         | 0x005ce900 | Extended sound data container. |
 | `LIGHTSET` | (Light_Set_Chunk)             | 0x005d2a00 | Light set container. |
 | `DUMMYOBJ` | (Dummy_Object_Chunk)          | 0x005d2090 | Dummy object. Creates DUMOBJDT child from params. |
-| `CUTSHEAD` | `Cutscene_Header_Chunk`       | 0x005d7b50 | Cutscene header. Creates Cutscene_Data_Chunk child. |
-| `CUTSCUSR` | `Cutscene_User_Chunk`         | 0x005d81c0 | Cutscene user data container. |
-| `CUTTRACK` | (Cutscene_Track_Chunk)        | 0x005d8c90 | Cutscene track container. |
+| `CUTSHEAD` | `Cutscene_Header_Chunk2`      | 0x005d7bf0 | One cutscene. **Empty body**; creates no `CUTSCDAT` of its own - that is the *default* ctor @ 0x005d7b50, which is not the registered one. See "The cutscene chunks" below |
+| `CUTSCUSR` | `Cutscene_User_Chunk2`        | 0x005d81c0 | One participant in a cutscene. **Empty body** |
+| `CUTTRACK` | `Cutscene_Track_Chunk2`       | 0x005d8c90 | One motion track of one participant. **Empty body** |
 | `SUBRIFFL` | (Sub_RIF_File_Chunk)          | 0x005b0ec0 | External RIF file reference. Opens and loads another .rif file. |
 | `OBINTDT\0` | `Object_Interface_Data_Chunk` | 0x005b30a0 | **A container, not a leaf** - and its id is seven characters NUL-padded, `b"OBINTDT\0"`. Every one of the 9,313 in the shipped assets is a child of `RBOBJECT` holding a single `OBJNOTES`, usually the editor's placeholder "Enter notes here". Treating it as a leaf hides 9,313 chunks |
 
@@ -97,8 +97,8 @@ Body is a single null-terminated string.
 |------------|--------------------------------|------------|
 | `RIFFNAME` | Object/asset name              | 0x005b1810 |
 | `OBHIERNM` | Hierarchy node name            | 0x005cb640 |
-| `CUTTRNAM` | Cutscene track name            | 0x005d8f30 |
-| `CTUSRHIE` | Cutscene user hierarchy name   | 0x005d8700 |
+| `CUTTRNAM` | Cutscene track name            | 0x005d8fd0 (0x005d8f30 is the default ctor) - **not a bare string**: the name is followed by 2 int32, see below |
+| `CTUSRHIE` | Cutscene user hierarchy name   | 0x005d87a0 (0x005d8700 is the default ctor) - **not a bare string**: followed by 3 int32, see below |
 | `SOUNDDIR` | Sound directory path           | 0x005ca5d0 |
 | `SOUNDNAM` | Sound file name                | 0x005cebd0 |
 | `SHPEXTFN` | External shape filename        | 0x005b99f0 |
@@ -124,8 +124,8 @@ Body is a fixed number of int32/float values read directly.
 | `MODFLAGS` | Module flags               | 0x005b37c0 | 2 x int32 (8 bytes) |
 | `ENVACOUS` | Environment acoustics      | 0x005ca550 | 3 x int32 (12 bytes) |
 | `MODACOUS` | Module acoustics           | 0x005b3920 | 3 x int32 (12 bytes) |
-| `CUTTRFOV` | Cutscene track FOV         | 0x005d9370 | 3 x float (12 bytes) |
-| `CTUSNDPR` | Cutscene sound properties  | 0x005d8980 | 6 x int32 (24 bytes) |
+| `CUTTRFOV` | Cutscene track FOV         | 0x005d9370 | 12 bytes: **1 float + 2 int32**, not 3 floats. The float is the field of view in degrees (the loader scales it to radians, `tan()`s it and doubles the result) |
+| `CTUSNDPR` | Cutscene sound properties  | 0x005d8980 | 6 x int32 (24 bytes). **Inert**: nothing in gl.exe ever looks this chunk up, so its fields have no consumer to read a meaning off |
 | `CONSTYPE` | Connection shape type      | 0x005b7cd0 | 1 x int32 (type) |
 
 ### Vec3/Geometry Chunks
@@ -152,8 +152,8 @@ Body starts with an element count or size, followed by an array of fixed-size en
 | `SHPMRGDT` | Shape merge data         | 0x005b96c0 | **Exactly one int32 per polygon** - AvP's `Shape_Merge_Data_Chunk` is `{int *merge_data; int num_polys}` with `chunk_size = 12 + num_polys*4`, and the element count equals the `SHPPOLYS` polygon count in all 9,357 shipped shapes. Values are a merge-group id, mostly `-1` (none) with small positive ids. Authored per-polygon data, **not** derived from geometry, so it belongs on the polygon rather than being regenerable |
 | `HIDEGDIS` | Hierarchy degradation distances | 0x005cc1c0 | uint32 `num_detail_levels` + that many int32 distances. AvP's `Hierarchy_Degradation_Distance_Chunk`; the count is 10 in all 13 shipped files that carry one. Sits at the **file root**, and drives the `L<n>#` level-of-detail convention below. Was documented as "hierarchy edge display" |
 | `SHPPRPRO` | Shape preprocessed data  | 0x005bae70 | uint32 count + count x int32 (+ additional context) |
-| `CUTPOINT` | Cutscene points          | 0x005d91a0 | uint32 count + count x 16 bytes (4 x float) |
-| `CTUSSPPO` | Cutscene special points  | 0x005d8a80 | uint32 count + count x 36 bytes (9 x float) |
+| `CUTPOINT` | Cutscene points          | 0x005d91a0 | uint32 count + count x 16 bytes + a **48-byte trailer**. The record is 3 int32 + a packed dword, not 4 floats. Fully decoded under "The cutscene chunks" below |
+| `CTUSSPPO` | Cutscene special points  | 0x005d8a80 | uint32 count + count x 36 bytes + **3 x int32**. None ship, and nothing reads one. Note its `GetDataBlockSize` @ 0x005d8b80 is **wrong** - it returns `36n + 20` where `FillDataBlock` writes `36n + 28`, so a writer trusting it truncates the body by 8 bytes and corrupts the next chunk |
 | `OBANALLS` | OB anim all sequences    | 0x005cd960 | uint32 count + count x 20 bytes (5 x int32) |
 | `OBJTRAK2` | Object track data v2     | 0x005b3aa0 | uint32 count + count x 76 bytes (0x4C) |
 | `VMDARRAY` | VMD array data           | 0x005b32a0 | uint32 count + count x 16 bytes (0x10) |
@@ -216,7 +216,7 @@ Body contains a fixed struct followed by (or interspersed with) null-terminated 
 | `TRAKSOUN` | Track sound                | 0x005b3d70 | 6 x int32 (24 bytes) + string name |
 | `SOUNDOB2` | Sound object v2            | 0x005ce360 | 3 x int32 (12 bytes) + string name (or empty if null) |
 | `SHPVTINT` | Shape vertex intensities   | 0x005d2df0 | **16-byte header then one int32 per vertex.** A child of `RBOBJECT`, never of a shape - all 4,668 of them - so it is per-*object* vertex lighting, not shape data. AvP calls it `Shape_Vertex_Intensities_Chunk` and keeps it in `LTCHUNK.CPP` with the lighting; `Projload.cpp` looks it up on the object. The array length matches the vertex count of the **id-paired** shape (see `OBJHEAD1`) in 4,666 of 4,668 cases - which is what independently confirms both this layout and the pairing rule |
-| `CTUSRDAT` | Cutscene user data         | 0x005d8500 | string name + (padded to 4-byte boundary) + additional bytes |
+| `CTUSRDAT` | Cutscene user data         | 0x005d8500 | padded string + **exactly 12 int32**. The string is the participant's **`.rif` file name** (`Elint MkII.rif`), which is what identifies a cutscene "user" as an actor. See below |
 
 ### Complex Struct Chunks
 
@@ -230,7 +230,7 @@ These chunks have multi-field bodies that don't fit simple patterns.
 | `OBJNOTES` | Object notes               | 0x005b30a0 | Raw text, NUL-terminated and padded. Always inside an `OBINTDT`, never at the top level |
 | `CONSHAPE` | Connection shape           | 0x005b7c40 | Minimal data (container-like structure with no actual data) |
 | `SUBSHPHD` | Sub-shape header           | 0x005b6860 | References parent shape info. Default index = -1. |
-| `DUMOBJTX` | Dummy object transform     | 0x005d2540 | Delegated to internal function FUN_005d2700 |
+| `DUMOBJTX` | Dummy object **text**      | 0x005d2540 (from-buffer 0x005d25b0) | **Not a transform** - the `TX` is text, and it is **live**: see "Ambient sound is `DUMOBJTX`" below. A NUL-terminated CRLF-separated directive padded to `(strlen + 4) & ~3`, in 1,097 of 1,097 shipped chunks, and every one is an ambient sound emitter: `Sound` / `<file>.wav` / `V<volume> P<pitch> R<radius>` (e.g. `Sound\r\nGL_Wind03.wav\r\nV40 P0 R0`). Always a child of `DUMMYOBJ`, in 24 level files, and every dummy carrying one also carries a `DUMOBJDT`. The old "transform" label was inherited from the AvP file name, not measured |
 | `MATCHIMG` | Match image data           | 0x005d11f0 | Linked list + byte flag + additional fields |
 | `RANTEXID` | Random texture ID          | 0x005ca750 | String + linked list structure |
 
@@ -247,7 +247,7 @@ is the authoritative write order and every offset matches Gunlok exactly.
 
 | Offset | Size  | Type      | Description                  |
 |--------|-------|-----------|------------------------------|
-| 0x00   | 4     | int32     | `flags`. Only two values ship: 0x400 (8,810 objects) and 0xFC00 (503 - the same count as `AVPSTRAT`) |
+| 0x00   | 4     | int32     | `flags`. Only two values ship: **0x400** (8,810 objects) and **0xFC00** (503), and the split is *biconditional* with carrying an `OBJPRJDT` - 503/503 both ways. AvP's `OBCHUNK.HPP` names them: 0x400 is `PLACED_OBJECT`, 0xFC00 adds the four game-mode/platform bits (`AVPGAMEMODEMARINE`, `ALIEN`, `PREDATOR`, `PLATFORMLOADSET`, `PCLOAD`). **Gunlok reads exactly one bit of this dword** - `0x100` (`BASE_OBJECT`) into `ChunkObject::is_base_object` - and 0x100 is clear in *both* shipped values, so the engine cannot tell the two apart. See "`AVPSTRAT` and `OBJPRJDT` are inert" below |
 | 0x04   | 16    | char[16]  | `lock_user` - **the editor's lock holder, not the name.** `Player` in 6,383 objects, uninitialised junk in 2,783 |
 | 0x14   | 12    | int32[3]  | `location`, rif units        |
 | 0x20   | 16    | float[4]  | `orientation` quaternion (x, y, z, w); unit in all 9,313 |
@@ -693,7 +693,7 @@ These chunks build internal linked lists during loading:
 | `FRMMORPH` | Frame morph data           | 0x005ba0e0 |
 | `HSETCOLL` | Hierarchy set collection   | 0x005cbe90 |
 | `OBHALTSH` | OB hierarchy alt shape     | 0x005cb7e0 |
-| `CUTEVENT` | Cutscene event             | 0x005d9400 |
+| `CUTEVENT` | Cutscene event - **fully decoded**, see "The cutscene chunks" below | 0x005d94e0 (0x005d9400 is the default ctor) |
 | `SHPHEAD1` | Shape header v1 - **fully decoded**, see below | 0x005b8b30 |
 | `SHPPCINF` | Shape poly change info - AvP's `Shape_Poly_Change_Info_Chunk`. **Optional**: 681 of the 9,357 shipped shapes have none, and every AvP path guards on `lookup_single_child` returning null, so a writer may omit it | 0x005ba7b0 |
 | `BMPMD5ID` | Bitmap MD5 ID              | 0x005d15c0 |
@@ -841,6 +841,401 @@ flag the loader sets.
 
 ---
 
+## `DUMMYOBJ` is the named-locator system
+
+A dummy is a **name at a position**, and that is the whole of it. Every top-level `DUMMYOBJ` in
+the *level* rif becomes one 0x3c-byte `MapAuxObject` in `MapAuxObjectList` @ 0x00739098
+(`MapAuxObject_Ctor` @ 0x005a9660, collected by `BuildMapAuxObjectList` @ 0x005aab50 from
+`RifCollectDummyChunks` @ 0x005b0ae0). Seven consumers then look records up **by name**, always a
+linear scan, always case-insensitive:
+
+| consumer | matches | picks |
+|----------|---------|-------|
+| `ToMap` @ 0x0047f160 | text line 1 == `"Sound"` | consumes it into an ambient emitter and **frees the record** |
+| `ConsoleParsePosition` @ 0x0044ece0 | any name | **first** match. 40 console commands take a position this way - `TELEPORT`, `GOTO`, `ADD TRIGGER`, `LASER FENCE`, spawns … |
+| `EvaluateTriggers` @ 0x0050ccc0 (two sites) | `Goodie <team><A-E>`, `Baddie <A-H>` | **last** match - MP respawn, enemy spawn |
+| `SpawnMultiplayerPlayerCharacters` @ 0x004e3230 | `Goodie <player A-D><team A-E>` | **last** - the MP start positions |
+| `SetupTeamLightingAndCtfPoints` @ 0x004965d0 | `Flag_<n>`, `Capture_<n>` | **last** - CTF |
+| `CommandPresident` @ 0x0043f790 | `dumpres<a-r>` | **last** (`__mbsicmp`) |
+| `PresidentActor::SetTeamId` @ 0x0054d930 | `exit<a-d>` | **last** |
+
+So the *name* is an API: the engine builds these strings itself and scans for them. Shipped data
+matches the code exactly - of 6,847 dummies, 704 are `baddie*`, 163 `goodie*`, 36 `dumpres*`,
+20 each `Flag_*`/`Capture_*`, 8 `exit*`, and the remaining 5,896 are ambient emitters (1,097) plus
+free-form markers that only a trigger or console line names.
+
+**Dummies are invisible to `for "<rif object>"`.** `RifFilterObjectsByName` @ 0x005aaac0 delegates
+to `RifCollectObjectChunks` @ 0x005b0900, which walks the root's direct children and keeps a child
+only if `strncmp(id, "RBOBJECT", 8) == 0`. The dummy sibling `RifCollectDummyChunks` is called
+*only* by `BuildMapAuxObjectList`. There is no path that sees both, so a placed-object spawn point
+must be an `RBOBJECT` and a locator must be a `DUMMYOBJ` - they are disjoint namespaces.
+
+### Authoring one
+
+Measured gates, all of which the shipped set satisfies (6,847/6,847 at depth 0, 6,847/6,847 with a
+`DUMOBJDT`, 0 empty names):
+
+- **Top level only.** `RifCollectDummyChunks` walks `root->children` and never recurses.
+- **A `DUMOBJDT` is mandatory.** `DummyObjectChunk_GetDataChunk` @ 0x005d21d0 returns NULL when it
+  is missing and `MapAuxObject_Ctor` dereferences that unchecked at 0x005a971a - an access
+  violation during level load. No shipped dummy lacks one, so this is untested by the game's own
+  data and is purely a trap for a generator.
+- **A non-empty name**, or `DummyObjectDataChunk_CtorFromBuffer` @ 0x005d2390 stores `NULL` (the
+  empty string is *not* stored) and every consumer skips the record. An emitter still works, since
+  `ToMap` never looks at the name.
+- **The level rif**, not an object rif - only the one `ToMap` hands to `BuildMapAuxObjectList`.
+- **Rif units.** Position is scaled by the rif unit scale and origin-shifted for you; the
+  orientation quaternion is copied verbatim and *is* read (rotation out-params on four of the
+  consumers).
+- **A dummy is an emitter or a marker, never both** - a `"Sound"` record is unlinked and freed by
+  `ToMap` before any name-matching consumer runs.
+- **Duplicate names are legal and shipped** (62 files have them), but resolution differs:
+  `ConsoleParsePosition` takes the *first*, the other six take the *last*.
+
+`DUMOBJDT`'s 0x34-byte header is `location` (int32[3]) at +0x00, `min_extents` at +0x0c,
+`max_extents` at +0x18, an orientation quaternion at +0x24, then the name. The extents reach
+`MapAuxObject+0x20`/`+0x2c` and **nothing in the binary reads either**.
+
+---
+
+## `AVPSTRAT` and `OBJPRJDT` are inert
+
+The counterpart to `DUMOBJTX`, and the reason both had to be checked rather than guessed: these
+two *look* like gameplay data and are not read at all.
+
+- **`OBJPRJDT`** @ 0x005b39a0 (class 0x2c) is registered and constructed, and is a plain
+  `Chunk_With_Children` that stores nothing of its own. The literal `"OBJPRJDT"` occurs once in
+  the image with exactly two referrers - its own constructor and the `RifRegisterCtor_` thunk.
+  **No `lookup_*` call site**, so nothing can ever find it. (The control from the same sweep:
+  `"OBJHEAD1"` has five referrers, one of which is a bare `lookup_single_child` wrapper.)
+- **`AVPSTRAT` is not registered at all** - the byte string does not occur anywhere in `gl.exe`,
+  nor as an immediate dword in any of its 663,010 instructions. So it falls through
+  `Chunk_With_Children::DynCreate` to the generic `Miscellaneous_Chunk` @ 0x005d4cb0, which
+  `malloc`s and copies the 52 bytes into memory that no code path can reach - every child
+  selection in the engine is `lookup_child`/`lookup_single_child`, an 8-char `strncmp`.
+  It is retained and unreachable, which costs 0x34 + 52 bytes per chunk per loaded `.rif`.
+
+They ship in exactly 5 files (`city ruins` 197, `level09` 169, `level12` 119, `level05` 14,
+`level07` 4), always as `RBOBJECT` -> `OBJPRJDT` (empty body) -> `AVPSTRAT` (52 bytes).
+
+The 52 bytes decode cleanly against AvP's `STRACHNK.CPP` - an `AVP_Strategy_Chunk` wrapping a
+`SimpleStrategy` (`4 + 4 + 44`, and `StrategyType` 62 is `StratNewSimpleObject`) - but there is
+nothing to learn from them: **all 503 shipped bodies are byte-identical**, one editor default blob
+with `mass` 50, `integrity` `0x80000002` and `flags` 1 (`NotifyTargetOnDestruction`). A field that
+takes one value across the whole asset set carries no information even if its name is known.
+
+This is the AvP split doing exactly what `CLAUDE.md` warns about: the chunk/RIF *library* is
+shared, the *game layer* is not. An AvP-shaped chunk in Gunlok's data is editor output from a
+tool that still knew about AvP's strategy blocks, and Gunlok's engine - which has Roles and
+Actors instead - never asks for it.
+
+---
+
+## Ambient sound is `DUMOBJTX`
+
+The retail build's **only** source of positional looping ambient sound, and the reason a level
+has wind and machinery: 1,097 emitters across 24 level files, every one a `DUMOBJTX` text chunk
+hanging off a `DUMMYOBJ`. Nothing in the `.gls` places a sound positionally, and the
+`INDSOUND` table is a different system (animation-triggered, and it shares **not one** file name
+with these).
+
+The path is `DUMMYOBJ` -> a runtime `MapAuxObject` -> the sound system:
+
+```
+MapAuxObject_Ctor        @ 0x005a9660   one 0x3c record per DUMMYOBJ; +0x00 name,
+                                        +0x04 Vec3 position, +0x38 the strdup'd DUMOBJTX text
+BuildMapAuxObjectList    @ 0x005aab50   scales positions by the rif unit scale, subtracts the
+                                        map origin. Only caller is ToMap
+  ... parsed inline in ToMap @ 0x004804bf-0x00480b13 ...
+SoundSystem_GetOrLoadSample      @ 0x0058bdb0
+SoundSystem_AddAmbientEmitter    @ 0x0058b9e0   RET 0x20
+SoundSystem_StartAmbientEmitters @ 0x0058bc40   called once, from LoadLevel
+SoundSystem_StopAndClear...      @ 0x0058bc90   called once, from level teardown
+```
+
+**The parser has no function of its own** - it is open-coded inside `ToMap`, which is why
+searching for a `lookup_child("DUMOBJTX")` call site finds only the getter
+(`DummyObjectChunk_GetObjectText` @ 0x005d21e0) and makes the chunk look inert. It is not.
+
+The grammar, line by line:
+
+| line | meaning |
+|------|---------|
+| 1 | must be `"Sound"`, compared with **`lstrcmpiA`** - so case does not matter, which is why 14 of the 1,097 ship as lowercase `sound`. Anything else and the record is left in `MapAuxObjectList` as a plain named marker (which `EvaluateTriggers` and `ConsoleParsePosition` still use) |
+| 2 | the `.wav`, resolved against the sound system's own directory list - **not** `SOUNDDIR`, which is inert. These live in `Sound\environ` and are indexed by the `Sound\environ.dat` bank |
+| 3 | zero or more directives, dispatched through a jump table @ 0x00481c10 keyed `'I'`..`'V'` |
+
+The directives, and two traps in them:
+
+| letter | meaning | default |
+|--------|---------|---------|
+| `V` | volume - **parsed and then discarded**, see below | 100 |
+| `P` | pitch, **divided by 12** (semitones -> octaves) | 0 |
+| `R` | max distance | 0, i.e. the sample's own |
+| `I` | min distance (inferred from the field it lands in; never used in shipped data) | 0 |
+
+- **The directive letters are uppercase-only.** The dispatch does `ADD -0x49` / `CMP 0xd` / `JA`,
+  so a lowercase `v`/`p`/`r` is skipped in silence. Line 1 being case-insensitive makes this
+  easy to get wrong; all 1,540 shipped directives are uppercase, so nothing in the game exercises
+  it, but anything *authoring* one of these must emit uppercase.
+- **`V` does nothing.** `SoundSystem_AddAmbientEmitter` takes the volume as its 5th argument and
+  never reads that stack slot, filling the emitter's volume from the sample's own default instead.
+  514 of the shipped emitters carry a `V` (11 distinct values, 20..100) and every one of them is
+  ignored. See `game_defects_notes.md`.
+
+A sample is acquired with the looping flag (0x10) set, and a `0.0f` pitch/min/max argument is
+replaced by the sample's own default rather than being taken literally.
+
+### `DUMOBJTX` vs `INDSOUND` - the two sound systems do not overlap
+
+Gunlok has exactly two ways to put a sound in the world and they share nothing: not a file, not a
+directory, not a chunk parent, not a trigger. `INDSOUND` belongs to a **thing**, `DUMOBJTX` to a
+**place**.
+
+|  | `INDSOUND` | `DUMOBJTX` |
+|--|------------|------------|
+| What it is | an indexed **table of sound definitions** | a **placement**, one per emitter |
+| Lives in | `Objects\` (47) and `Units\` (193) - never a level | `Levels\` (1,097) - never a model |
+| Chunk parent | direct child of the file root | child of a `DUMMYOBJ` |
+| Addressed by | a slot number 0..127, which the chunk declares itself | nothing - it *is* the placement |
+| Fired by | an animation keyframe (`OBASEQFR.flags` bits 24-30) | `LoadLevel`, once |
+| Position | wherever the animating hierarchy is - it moves with the model | the dummy's fixed world position |
+| Looping | no, one shot per keyframe | yes (sample flag 0x10) |
+| Audio | `Sound\Robots\`, `Sound\UI\` - servos, clicks, footsteps | `Sound\environ\` - wind, hum, fire, dripping |
+| Bank | `robots.dat` / `ui.dat` | `environ.dat` |
+| Volume | a real field, 20 distinct values across the 240 | **parsed and discarded**, see above |
+| Distances | explicit min/max in mm (typically 5,000 / 40,000) | `I`/`R` directives, defaulting to the sample's own |
+| In the addon | Blender **Speakers**, editable | not yet modelled |
+
+The separation is total in the shipped data: the two name **not one file in common**, and neither
+appears in a directory the other uses. So "which sound system is this?" is answered by where the
+chunk sits, with no ambiguity.
+
+---
+
+## The cutscene chunks
+
+Twelve chunk ids, no AvP counterpart, and the family this document was most wrong about.
+They are **not** related to the `.cut` sidecar files despite the name — that is the baked mesh
+cache (`level_loading_notes.md`, "`.cut` is NOT a cutscene file"). A cutscene is a camera path
+plus a cast of animated participants plus a timed event list, stored **inside the level `.rif`**
+and played by `PLAY CUTSCENE <name>`.
+
+Every layout below round-trips **all 1,856 shipped cutscene chunks byte for byte**
+(`encode(decode(body)) == body`, 563 files), and the field *meanings* come from the consumer
+rather than from the loader alone, so they are named by what reads them.
+
+### The tree
+
+```
+REBENVDT
+└── SPECLOBJ
+    └── CUTSHEAD                  one cutscene            (34 across 14 level files)
+        ├── CUTSCDAT              name + id
+        └── CUTSCUSR              one participant         (205)
+            ├── CTUSRDAT          participant's .rif + 12 int32
+            ├── CTUSRHIE          hierarchy name + 3 int32
+            ├── CTUSNDPR          6 int32 — inert
+            └── CUTTRACK          one motion segment      (422)
+                ├── CUTTRNAM      segment name + 2 int32
+                ├── CUTPOINT      the path                (422)
+                ├── CUTTRFOV      field of view           (139)
+                └── CUTEVENT      event list              (300)
+```
+
+`CUTSHEAD`, `CUTSCUSR` and `CUTTRACK` are **pure containers with empty bodies** in every shipped
+file. Note the registered from-buffer constructors are not the addresses this document used to
+list for four of them: `CUTSHEAD` 0x005d7bf0, `CTUSRHIE` 0x005d87a0, `CUTTRNAM` 0x005d8fd0,
+`CUTEVENT` 0x005d94e0 — the older addresses are each class's *default* constructor. `CUTSCDAT`
+@ 0x005d7f80 and `CTUSRDAT` @ 0x005d8500 were previously unrecorded. All twelve are
+`__thiscall(this, Chunk_With_Children *parent, const char *data, int size)` ending `RET 0xc`.
+
+**String padding.** Every string field here is NUL-terminated and padded to
+`pad4 = (strlen + 4) & ~3` — always at least one NUL, so a 3-character name occupies 4 bytes and
+a 4-character name occupies 8. These are **not** the fixed-size buffers the "String Chunks" table
+implies, so a writer regenerates the padding instead of carrying a stored size.
+
+### `CUTSCDAT` — which cutscene this is
+
+`body = 12 + pad4(name) + 16`
+
+| off | type | meaning |
+|-----|------|---------|
+| +0x00 | 3 x int32 | looks like a rif-unit position; **never read by gl.exe** |
+| +0x0c | pad4 string | the cutscene name — the key `PLAY CUTSCENE <name>` matches |
+| +N+0x00 | 2 x int32 | zero in all 34 |
+| +N+0x08 | 2 x uint32 | **`MD5("Cutscene:" + name)[0:8]`**, little-endian, with the top byte of the second dword cleared |
+
+That hash is not a guess: `Cutscene_Data_Chunk` @ 0x005d7e60 does
+`sprintf(buf, "Cutscene:%s", name)` and feeds it to the MD5 at 0x005dc200, and recomputing it
+reproduces the stored id in **34 of 34** shipped chunks. So a hand-authored cutscene can compute a
+valid id rather than having to copy one.
+
+### `CUTPOINT` — the path
+
+This document previously described it as `uint32 count + count x 16 bytes (4 x float)`, which
+reproduces **0 of 422** shipped chunks. The correct rule, from `GetDataBlockSize` @ 0x005d92a0
+(`chunk_size = (count + 4) * 16`), is `body = 16*count + 52`:
+
+```
++0x00           uint32 count
++0x04           count x 16-byte point record
++0x04+16*count  48-byte trailer
+```
+
+The point record is **three int32 and a packed dword, not four floats**:
+
+| off | type | meaning |
+|-----|------|---------|
+| +0x00 | 3 x int32 | position in rif units (scaled by the rif unit scale, then offset by the map origin) |
+| +0x0c | uint32 | **low 24 bits = the interval's duration in milliseconds**; the top 8 bits are masked off and never read |
+
+Two independent confirmations of the time field. The consumer computes
+`(v & 0xffffff) / 1000.0f` and substitutes `1.0f` when it is zero on a non-final point; and on
+disk **763 of 763** points have a low-24 value that is a multiple of 40 — the 25 Hz tick. It is a
+per-interval **duration**, not a cumulative timestamp: the value is 0 on the final point of 94% of
+multi-point tracks (against 38% elsewhere), only 48 of 151 tracks are non-decreasing, and only 52
+start at zero — none of which a timestamp could do. The top byte is non-zero in 125 of 763 points,
+so it is authored junk that a byte-exact writer must preserve and the engine ignores.
+
+The 48-byte trailer is two orientations and their present-flags:
+
+| off | type | meaning |
+|-----|------|---------|
+| +0x00 | 4 x float | start quaternion (x, y, z, w) |
+| +0x10 | 4 x float | end quaternion |
+| +0x20 | int32 | start quaternion present (read as a bool) |
+| +0x24 | int32 | end quaternion present |
+| +0x28 | 2 x int32 | **never read by gl.exe** |
+
+Measured on disk: the two quaternions are equal in 376 of 422 chunks and unit-length in 399.
+
+**The path is a uniform Catmull-Rom spline, not a polyline** (`CatmullRomSample` @ 0x005c1a40,
+the textbook basis with a final `* 0.5`). The loader allocates `count + 2` points and synthesises
+the two phantom control points by reflection (`P[0] = 2*P[1] - P[2]`, mirrored at the tail), so
+every authored point is playable — and an exporter must emit **control points, not baked
+keyframes**. Per-interval arc length is derived by chording the spline in 20 steps and is what
+non-camera tracks use for timing.
+
+### `CUTEVENT` — the event list
+
+A self-describing tagged stream. `body = 12 + pad4(name) + 4 + sum(record_size)`:
+
+```
++0x00  3 x int32     (word 0 is a float; the loader reads it as the group's position)
++0x0c  pad4 string   event-group name ("end", "begin", "guntalk", "cut to next", ...)
++N     uint32        record count
+       then that many variable-length records
+```
+
+The group's position is a float **in authored `CUTPOINT` index space** — integer part is the point
+index, fraction is the position within that interval. Every record opens with the same 24-byte
+header:
+
+| off | type | meaning |
+|-----|------|---------|
+| +0x00 | int32 | **kind** |
+| +0x04 | int32 | **record_size**, including this header — the skip field, which is how the engine tolerates a kind it does not know |
+| +0x08 | int32 | delay in milliseconds |
+| +0x0c | int32 | flags (only bits 0, 1 and 3 are tested) |
+| +0x10 | int32 | delay override — used when non-zero, else +0x08 |
+| +0x14 | int32 | zero in all 1,069 shipped records |
+
+Walking that structure consumes **300 of 300** shipped bodies exactly. The kinds, named from
+`Cutscene_FireEvent` @ 0x005bee20:
+
+| kind | payload | effect | shipped |
+|------|---------|--------|---------|
+| 2 | 7 dwords | play an animation on every track whose `user_id` matches | 217 |
+| 3 | 4 dwords | control: **0 ends the cutscene**, 1 advances matching tracks to their next `CUTTRACK`, 3 queues the console line `NEXT LEVEL` and ends | 253 |
+| 5 | string + 10 dwords | a sound path — **never dispatched**, see below | 206 |
+| 7 | 3 dwords | show the next subtitle line | 128 |
+| 8 | 7 dwords | play an animation, variant | 225 |
+| 10 | 4 dwords (first read as float) | screen fade | 3 |
+| 11 | string + position + 7 dwords | spawn particles at an authored rif-unit position | 4 |
+| 12 | 3 dwords | set the game time scale (slow motion) | 0 |
+| 13 | string + 2 dwords | **run a console command** (`start printing objectives 1`, `next level`, `delete maskelyn`) | 33 |
+| 1, 4, 6, 9 | — | parse but have no dispatch case | 0 |
+
+Kinds 1, 4, 6 and 9 never ship, so nothing is lost to their being inert.
+
+**Kind 5 ships heavily and still never fires**, which is worth understanding before anyone reads
+it as a bug. It is the third most common record (206 of 1,069) and names real files
+(`CUTSCENE\level01\End_of_level\gunlok_step1.wav`), all 46 of which are present in the install —
+but `Cutscene_FireEvent`'s jump table at 0x005bf030 sends `kind - 2 == 3` straight to the function
+epilogue's bare `return true`, the record class's vtable is only 3 slots (destructor, GetSize,
+Write — there is no execute slot), and `CameraTrack_LoadFromCutscene` never copies the string out
+of the chunk. No literal in gl.exe could turn that path into an openable file either.
+
+It is **not** an audible defect: it is the pre-mix era's per-cue sound event, and the retail engine
+plays one streamed Bink track per cutscene instead (`CameraTrackObject_PlayBinkAudio`,
+`sound\cutscene_bink\<name>.bik`). The evidence is on disk — **30 of the 34 cutscene names have an
+identically-named `.bik`**, and the loose wavs those kind-5 records name sit beside the dialogue
+under `Sound\Cutscene\<level>\<scene>\` as the source of that mix (4.3 MB of PCM for
+`End_of_level`, against a 628 KB `.bik`), complete with the audio editor's `.pk` peak files. Same
+generation as `Tools IniFile\`, whose `CutsceneHierarchies.txt` names the internal editor
+("Inteng"). **An authoring tool should emit kind 5 only for round-trip fidelity — it will never
+make a sound.**
+
+### `CTUSRDAT` / `CTUSRHIE` — the cast, and where the camera lives
+
+A `CUTSCUSR` is a **participant**, and `CTUSRDAT`'s string is that participant's `.rif` file name
+(`Elint MkII.rif`). `body = pad4(name) + 48`; of the twelve trailing int32 the loader reads four:
+
+| disk dword | meaning |
+|------------|---------|
+| d1 | animation id (-1 = none) |
+| d2 | **user id** — what a `CUTEVENT` targets |
+| d4 | `is_camera`; **zero marks the camera-position track**, and is also the "give this track a real FOV" test |
+| d5 | flags; **bit 0 marks the camera look-at track** |
+
+So the camera is not a special chunk type: it is **two pseudo-participants**, one supplying the
+position and one the look-at, and the real camera orientation is a look-at rather than the
+quaternions in the `CUTPOINT` trailer (those orient the *actors*). `CTUSRHIE`
+(`body = pad4(name) + 12`) names the `units\*.rif` hierarchy to load when no live actor matches
+the `CTUSRDAT` name; the legal list ships as `<Gunlok>\Tools IniFile\CutsceneHierarchies.txt`
+(14 entries, headed "List of hierarchy files to be used in Cutscene mode in Inteng").
+
+### `CUTTRFOV`, `CUTTRNAM`, and the two inert chunks
+
+`CUTTRFOV` is 12 bytes but **1 float + 2 int32**, not 3 floats. The float is the field of view in
+degrees; the loader computes `2 * tan(radians(fov) / 2)` and defaults to **90 degrees** when the
+chunk is absent, and only for the camera-position track. `CUTTRNAM` is `pad4(name) + 8`.
+
+`CTUSNDPR` (6 int32, 205 shipped) and `CTUSSPPO` (`uint32 count + count x 36 + 3 int32`, **none
+shipped**) have constructors and a chunk registration but **no reader anywhere in gl.exe** — the
+only references to either id string are their own constructors and the registration thunk. They
+are parsed off disk and discarded, so nothing in the binary can say what their fields mean.
+`CTUSSPPO` additionally carries a defect: its `GetDataBlockSize` @ 0x005d8b80 returns `36n + 20`
+where `FillDataBlock` writes `36n + 28`, so a writer trusting it truncates the body and corrupts
+the following chunk.
+
+### Reaching a cutscene at all
+
+**Chunks in the `.rif` are not enough.** `PLAY CUTSCENE` @ 0x0044ab60 does not walk the chunk
+tree; it string-matches the name against a global list of runtime objects
+(`Cutscene_PlayByName` @ 0x005c0aa0), and that list is populated **only** by the GLS
+`camera track` section, which is what triggers `CameraTrack_LoadFromCutscene` @ 0x005bf060:
+
+```
+camera track
+{
+	file "levels\level01.rif"
+	name "first contact"
+}
+```
+
+The shipped scripts contain exactly **34** such sections, matching the 34 `CUTSHEAD` chunks file
+for file. A cutscene authored into a `.rif` with no matching `camera track` section is
+unreachable.
+
+Two more inputs live outside the `.rif`: the Bink audio at `sound\cutscene_bink\<name>.bik`, and
+the **subtitles**, which are read from `<Gunlok>\Tools IniFile\Script_<language>.txt` — a
+TAB-separated file whose non-indented lines name a cutscene and whose indented lines are
+`speaker / text / wav`. Those files ship in five languages.
+
+---
+
 ## Chunk Class Hierarchy
 
 ```
@@ -924,16 +1319,16 @@ Chunk (base, 0x24 bytes)
 | `BMPNAMES` | Struct   | **The file's texture table**   |
 | `CONSHAPE` | Minimal  | Connection shape               |
 | `CONSTYPE` | Fixed    | Connection type (1 x int32)    |
-| `CTUSNDPR` | Fixed    | Cutscene sound props (6 x int32)|
-| `CTUSRDAT` | Mixed    | Cutscene user data (str+struct)|
-| `CTUSRHIE` | String   | Cutscene user hierarchy name   |
-| `CTUSSPPO` | Array    | Cutscene special points        |
-| `CUTEVENT` | Complex  | Cutscene event                 |
-| `CUTPOINT` | Array    | Cutscene points                |
-| `CUTTRFOV` | Fixed    | Cutscene track FOV (3 x float) |
-| `CUTTRNAM` | String   | Cutscene track name            |
+| `CTUSNDPR` | Fixed    | Cutscene sound props (6 x int32), **inert** |
+| `CTUSRDAT` | Mixed    | Cutscene participant: `.rif` name + 12 x int32 |
+| `CTUSRHIE` | Mixed    | Cutscene participant hierarchy name + 3 x int32 |
+| `CTUSSPPO` | Array    | Cutscene special points, **none ship** |
+| `CUTEVENT` | Mixed    | Cutscene event list (tagged record stream) |
+| `CUTPOINT` | Mixed    | Cutscene motion path (count + records + trailer) |
+| `CUTTRFOV` | Fixed    | Cutscene track FOV (1 float + 2 x int32) |
+| `CUTTRNAM` | Mixed    | Cutscene track name + 2 x int32 |
 | `DUMOBJDT` | Struct   | Dummy object data              |
-| `DUMOBJTX` | Complex  | Dummy object transform         |
+| `DUMOBJTX` | String   | Dummy object text (a sound emitter) |
 | `ENDTHEAD` | Struct   | Environment data header        |
 | `ENVACOUS` | Fixed    | Environment acoustics          |
 | `ENVSDSCL` | Fixed    | Environment sound scale        |
@@ -1486,7 +1881,9 @@ Note `CONSHAPE` is a parent id that is never itself registered.
 ### Gunlok-only chunks (17)
 
 No AvP source exists for these; they must be read from the binary. Twelve are the cutscene
-system that backs the `.cut` sidecar files (see `level_loading_notes.md`):
+system - which has **nothing to do with the `.cut` sidecar files**, whatever the extension
+suggests (`level_loading_notes.md`, "`.cut` is NOT a cutscene file"); they are decoded under
+"The cutscene chunks" above:
 
 `CTUSNDPR` `CTUSRDAT` `CTUSRHIE` `CTUSSPPO` `CUTEVENT` `CUTPOINT` `CUTSCDAT` `CUTSCUSR`
 `CUTSHEAD` `CUTTRACK` `CUTTRFOV` `CUTTRNAM` — plus `MODZONE`, `OBINTDT`, `SHPFLAGS`,

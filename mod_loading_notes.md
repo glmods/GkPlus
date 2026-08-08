@@ -22,6 +22,14 @@ Mods mount in ascending name order and **a later name wins** (`20-tweaks.zip` be
 `10-base.zip`); `mods[0]` is the highest priority. `file_io_notes.md` is the measurement
 this rests on — read §1 and §5 before touching either file.
 
+**Every entry under `mods` is mounted, so renaming one does not disable it.** A directory
+called `cutscene-test.disabled` still serves its contents — there is no extension filter and
+no manifest to opt out of. To take a mod out of play, move it out of the tree; renaming it
+produces a "baseline" run that is silently still modded, which is exactly how one in-game
+comparison in this repo ran for several rounds against itself. `mods.served` is the check,
+and it must be read **after** something has been loaded: before the first VFS lookup it is 0
+whether or not anything is mounted, and `mods.recent` names the paths actually served.
+
 Five things decide the shape, in decreasing order of how much else depends on them:
 
 - **The interception is gl.exe's import table, not Detours on kernel32.** Every file call

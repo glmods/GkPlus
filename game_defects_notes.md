@@ -614,3 +614,38 @@ check.
   crashes the game names itself, because the snippet that stopped answering is the
   one that did it. Note the failure mode, though - **a crash looks like a socket
   timeout**, so check the process afterwards rather than trusting the timeout.
+
+## 6. Ambient sound volume (`V` in a `DUMOBJTX`) is parsed and then discarded
+
+Every positional ambient sound in a Gunlok level is a `DUMOBJTX` text chunk on a `DUMMYOBJ`
+(`rif_chunk_format.md`, "Ambient sound is `DUMOBJTX`"), whose third line carries directives:
+
+```
+Sound
+GL_Wind03.wav
+V40 P0 R0
+```
+
+`ToMap`'s inline parser reads `V` correctly - digit accumulation, sign, a default of 100 - and
+passes it as the 5th argument to `SoundSystem_AddAmbientEmitter` @ 0x0058b9e0. **That function
+never reads the argument.** A full instruction sweep of 0x0058b9e0..0x0058bc37 returns zero
+references to the volume's stack slot (`[EBP + 0x18]`); the emitter's volume field at `+0x10` is
+filled from the *sample's* own default instead (`0058bb0d MOV EAX,[ESI + ECX*0x1 + 0x10]`,
+stored at 0058bb96). `P`, `I` and `R` in the same call **are** read, so this is one argument
+dropped rather than the whole parameter block being ignored.
+
+**Consequence:** 514 of the 1,097 shipped emitters carry a `V`, using 11 distinct values from 20
+to 100, and every one of them plays at its sample's default volume instead. So the level
+designers' ambient mix is not what you hear, and no amount of editing that number changes
+anything.
+
+Not worth "fixing" in GkPlus - it is authored intent that the shipped mix was balanced around,
+so honouring it now would change how every level sounds. It matters because a tool that exposes
+these for editing must say the field is inert, exactly as `CUTEVENT` kind 5 is.
+
+**A second, latent one in the same parser:** the directive letters are dispatched through a jump
+table keyed `'I'`..`'V'` via `ADD -0x49` / `CMP 0xd` / `JA`, so **lowercase `v`/`p`/`r` are
+skipped in silence** - while line 1's `"Sound"` test is `lstrcmpiA` and *is* case-insensitive.
+Nothing shipped trips it (all 1,540 directives are uppercase; 14 of the 1,097 first lines are
+lowercase `sound` and work fine), but anything authoring a `DUMOBJTX` must emit uppercase
+directives or they vanish with no error.

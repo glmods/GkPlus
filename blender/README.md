@@ -200,38 +200,108 @@ knowing about:
   a new key gets 0, rather than a copy of its neighbour's — copying would duplicate that
   neighbour's sound.
 
-### Sounds
+### Sounds: there are two systems and they share nothing
 
-**A sound is entirely self-contained in the `.rif`.** A keyframe names one by an index into a
-**128-entry table the file carries itself**: each `INDSOUND` chunk — a direct child of the file
-root — declares its own slot and holds a path (`Robots\GL_click08.wav`), min/max distance in mm, a
-volume and a pitch offset. No per-role table, no engine-side name lookup. Full layout and the trace
-that established it are in `rif_chunk_format.md`.
+Gunlok has exactly two ways to put a sound in the world. Not a file, a directory, a chunk parent or
+a trigger is shared between them — they do not even name one `.wav` in common — so the addon models
+them as two different kinds of thing:
 
-Three separate things, in three separate places, the way textures already split:
+| | `INDSOUND` | `DUMOBJTX` |
+|---|---|---|
+| What it is | an indexed **table of definitions** | a **placement**, one per emitter |
+| Lives in | `Objects\` (47) and `Units\` (193) — never a level | `Levels\` (1,097) — never a model |
+| Fired by | an animation keyframe | `LoadLevel`, once |
+| Position | wherever the animating model is | the dummy's fixed world position |
+| Looping | no, one shot per keyframe | yes |
+| Audio | `Sound\Robots\`, `Sound\UI\` — servos, clicks, footsteps | `Sound\environ\` — wind, hum, fire, dripping |
+| In Blender | a **table** on the collection | a **Speaker** in the level |
+
+#### `INDSOUND` — the table an animation names
+
+A keyframe names a sound by an index into a **128-entry table the file carries itself**: each
+`INDSOUND` chunk — a direct child of the file root — declares its own slot and holds a path
+(`Robots\GL_click08.wav`), min/max distance in mm, a volume and a pitch offset. No per-role table,
+no engine-side name lookup.
+
+This is the same shape as the texture table, and it splits the same three ways:
 
 | | Where it lives | Written back? |
 |---|---|---|
-| the table | a **Speaker object** per entry, holding the path, distances and volume | yes, rebuilt on export |
+| the table | `rif_indsound` on the **collection**, kept whole and in order | yes, rebuilt on export |
 | the index | `rif_sound_events` on the Action — `{bone, frame, index}` | yes, spliced into the frame's `flags` |
-| the audio | a `.wav` loaded from the install into the speaker | no — the `.rif` stores the path, never the sound |
+| the audio | a `.wav` loaded from the install for audition | no — the `.rif` stores the path, never the sound |
 
-The Speaker is the **editing surface, not the storage**: its `distance_reference` / `distance_max` /
-`volume` *are* the stored fields, so you can hear a footstep and see its falloff, and export reads
-them straight back (metres → mm, volume → 0–127). Deleting a speaker is how you remove a sound.
+Edit it in **Properties ▸ Collection ▸ Gunlok RIF Sounds**, with the RIF collection active in the
+outliner: click a row to select it, then edit its slot, path, distances, volume and pitch below.
 
 - ***Object ▸ Add Gunlok RIF Sound*** takes the path the file will store and, optionally, a `.wav`
   to audition. It allocates the next free slot — never 0, which is how a frame says "no sound".
+- ***Remove*** drops a row. Entries no keyframe references are otherwise kept: a slot is a stable
+  id the file assigned, not a position in a list.
 - ***Set Keyframe Sound*** (in the rig's panel, or `pose.rif_set_sound`) puts an index on the
   active bone's key at the current frame; index 0 removes it. The rig panel lists every event.
-
-Editing `rif_sound_file` on the speaker is what retextures a sound — the same relationship
-`rif_bmp_name` has to a material. Swapping the loaded audio does nothing.
 
 Two things that look like bugs and are not: a **dangling index is normal shipped data** (12 of the
 52 files with sound events reference an index no `INDSOUND` declares, and the engine skips it
 silently — so setting one is a warning here, not a refusal), and **`SOUNDDIR`** — despite the name —
 is *not* on this path; nothing looks that chunk up by id, and it rides through untouched.
+
+> These used to be Speakers, and it was misleading: the importer never gave them a location, so all
+> of them stacked at the world origin and dragging one changed nothing in the file. They have no
+> position, because they play wherever the animating model is.
+
+#### `DUMOBJTX` — the ambient emitters, which *are* the Speakers
+
+The retail build's only source of positional looping ambient sound, and the reason a level has wind
+and machinery. Each one is a text directive on a top-level `DUMMYOBJ`:
+
+```
+Sound
+GL_Wind03.wav
+V40 P0 R0
+```
+
+In Blender that dummy **is** a Speaker, at its real position, where the transform,
+`distance_reference` (`I`), `distance_max` (`R`) and `pitch` (`P`, in semitones) all mean something.
+Edit it in **Properties ▸ Speaker Data ▸ Gunlok RIF**; ***Object ▸ Add Gunlok Ambient Emitter***
+makes a new one at the 3D cursor.
+
+Four things worth knowing, all measured:
+
+- **Volume (`V`) does nothing.** `SoundSystem_AddAmbientEmitter` takes it and never reads that stack
+  slot — the sample's own default wins. 514 shipped emitters carry a `V` and not one of them has any
+  effect. It is written back for fidelity and the panel says so.
+- **A max distance of 0 means the sample's own default, not silence**, which is why most shipped
+  emitters import with a collapsed gizmo. The file genuinely specifies no radius.
+- **Directives are uppercase-only.** A lowercase `v`/`p`/`r` is skipped by the engine in silence.
+  Anything the addon writes is uppercase; line 1 is the exception, being case-insensitive, and 14 of
+  the 1,097 shipped chunks say `sound`.
+- **The text is carried, not regenerated.** Only a directive whose value you actually changed is
+  rewritten, so an untouched level exports byte for byte — including the shipped oddities (a
+  trailing CRLF, two of them, and one file whose directives are split across two lines).
+
+The distance unit is **not** measured: the shipped `R` values run 5..60 *and* 500..5000 in the same
+game, so the panel shows the number the file holds and scales nothing.
+
+### Locators (`DUMMYOBJ`)
+
+A dummy is a name at a position, and that is the whole of it — the engine builds strings like
+`Goodie A2`, `baddie c`, `Flag_3` and `dumpresk` itself and scans for them. ***Object ▸ Add as
+Gunlok RIF Locator*** turns a selected Empty into one (or a Speaker, which makes an ambient emitter).
+
+A `for "<rif object>"` spawn point is **not** this: that clause only ever matches an `RBOBJECT`, so
+***Add to Gunlok RIF*** is still what you want for one. The two are disjoint namespaces.
+
+Four gates, enforced because the shipped data never violates them:
+
+- **A dummy must carry a `DUMOBJDT`.** One without is an unchecked null dereference during level
+  load — an access violation, not a quiet failure. Export refuses it.
+- **Top level only**, and **the name must not be empty** (an empty one is stored as `NULL` and no
+  consumer can find it). Export refuses both.
+- **A dummy is an emitter or a marker, never both**: `ToMap` frees the record it turns into a sound,
+  so an emitter's name never resolves. The panel says which one an object is.
+- **Duplicate names are legal and shipped** (210 across 62 files) — a warning, not a refusal. Worth
+  knowing: the console takes the *first* match where triggers take the *last*.
 
 ### Sequence settings
 
@@ -543,6 +613,55 @@ rather than a position. Duplicating a light in Blender copies the id along with 
 which no shipped file does; the panel says so and offers a fresh one. Unlike a shared *shape* id
 this is a warning rather than a refusal, because whether the engine minds is not measured.
 
+### Cutscenes
+
+A level `.rif` can carry cutscenes — a camera path, a cast of participants and a timed event
+list — and the addon imports them as real objects you can edit, or creates new ones. Fourteen of
+the shipped levels have them; `level01.RIF` holds the four `PLAY CUTSCENE` reaches by name,
+including `first contact`.
+
+**Add Cutscene** (Object Properties ▸ Gunlok Cutscene, or the Add menu) makes a camera, an empty
+for it to look at, and the event that ends it. Key the camera's **location** to build the path —
+each keyframe is one control point.
+
+Four things are worth knowing before you author one, because none is guessable from the file:
+
+- **The camera's rotation is ignored.** The engine points the camera by looking from one track at
+  another, so orientation comes from where the *target* empty is, not from how you rotate the
+  camera. Give the camera a **Track To** constraint aimed at the target and animate both.
+- **The path is a spline, and the viewport does not show it.** Your keyframes are Catmull-Rom
+  control points, so the real path bows away from the straight line between them — on the shipped
+  cutscenes by a median 5.6% of the distance between control points, and by as much as 47% (three
+  and a half metres). **Preview Cutscene Path** draws the curve the engine will actually follow.
+  Keys are set to Linear rather than Bezier so nothing pretends otherwise.
+- **One frame is 40 ms**, the engine's tick. Cutscene paths are keyed at 25 fps so a keyframe
+  number converts to a duration exactly; the timing you see is the timing you get.
+- **A cutscene with no end event never ends.** Running off the end of the path leaves the camera
+  parked and the player locked out — it is not a natural stop. `Add Cutscene` includes the end
+  event; the panel warns if one goes missing.
+
+**Add Cutscene Event** offers the end event and a *console command*, which is the powerful one: it
+queues a console line mid-scene, so a cutscene can trigger anything the console can.
+
+Finally, and easiest to miss: **chunks in the `.rif` are not enough to make a cutscene playable**.
+`PLAY CUTSCENE` searches a list the level's script builds, so the level's `.gls` also needs
+
+```
+camera track
+{
+	file "levels\mylevel.rif"
+	name "my cutscene"
+}
+```
+
+with `name` matching exactly. From GkPlus's script layer the equivalent is
+`make.camera_track({name, file})` during a level load.
+
+What is not authored here: a participant's *animation* is chosen from the sequences its own model
+ships, triggered by events, rather than keyed in Blender; and cutscene sound events (`CUTEVENT`
+kind 5) are written for fidelity but never fire — the retail engine plays one Bink track per
+cutscene instead.
+
 ## Semantic, not byte-exact
 
 The bar is that the file coming out *means* the same as the file going in, which is what lets the
@@ -649,6 +768,17 @@ Measured across all 563 shipped files:
 | A UV survives the round trip to 3e-05 texels | worst drift 3.05e-05 across the shipped files, median 1.9e-05 — all of it the V flip, since the scaling is bit-exact |
 | V grows downward | 86.3% of the 8,916 axis-aligned wall polygons across the levels put the low V at the top of the wall; 16 of 17 levels lean that way |
 | UV index survives `colour` | 1,766,071/1,766,071 re-encode exactly, including the four shapes whose table needs more than 16 bits (282,412 of their 282,454 polygons index their own position) |
+| Cutscenes survive becoming objects | all 14 cutscene-bearing levels, 34 cutscenes, 2,517 chunks byte-identical through import → `.blend` → reset → reopen → export |
+| A cutscene's id is its name | `MD5("Cutscene:" + name)[0:8]` with the top byte of the second dword cleared reproduces the stored value in 34 of 34 |
+| A point's time is a duration in ticks | all 763 shipped point times are a multiple of 40 ms; the final point of a multi-point track is 0 in 94% against 38% elsewhere, which no cumulative timestamp could be |
+| Field of view survives the camera lens | degrees → radians → degrees is exact through float32 for all 139 shipped `CUTTRFOV` values |
+| The two sound systems do not overlap | `INDSOUND` occurs in 52 files under `Objects\`/`Units\` and `DUMOBJTX` in 24 under `Levels\`, with no file and not one `.wav` name in common |
+| `DUMOBJTX` rebuilds exactly | `encode(decode(body)) == body` for all 1,097, and all 1,097 are padded to `(strlen + 4) & ~3` with NULs |
+| An emitter survives a `.blend` | `level01` (14), `junkyard` (87) and `level06` (the one whose directives split across two lines) come back byte-identical through import → `.blend` → reset → reopen → export, position and name included |
+| Every shipped dummy satisfies the authoring gates | 6,847 of 6,847 at depth 0, 6,847 of 6,847 with a `DUMOBJDT`, 0 empty names — and 210 duplicate names across 62 files, which is why that one is a warning |
+| The chunk inventory balances | every chunk id comes back with the same count it went in with, across the sampled files — the only id allowed to change is `SHPPCINF`, which is discarded on purpose. This is what caught `DUMOBJDT` being written twice per dummy (590 where `level01.RIF` has 295) and `SHPCENTR` being invented for shapes that shipped without one |
+| **An exported level's dummies and emitters load in Gunlok** | `level01.RIF` exported by this build — 295 regenerated `DUMOBJDT` and 14 `DUMOBJTX` — served through the mod VFS loads to `game.state` 5 with its usual 158 actors / 259 roles, `mods.served` 6 naming the level. A malformed or missing `DUMOBJDT` is an access violation in `MapAuxObject_Ctor`, so a clean load is direct evidence the dummy chunks are well formed. **Not** evidence that the emitters are audible — nothing in the engine exposes the ambient emitter list, so that half needs ears |
+| **An exported cutscene plays in Gunlok** | `level01.RIF` exported and served through the mod VFS: the level loads identically (158 actors / 259 roles) and `PLAY CUTSCENE first contact` renders at MAE **7.95** against the stock build, where two *stock* runs differ by **7.35** — i.e. inside the run-to-run noise. The control moved every camera path 3 m and rendered at MAE **24.62**, 3.3x the floor, so the test can fail. Renaming the cutscene inside the served file stops `PLAY CUTSCENE` finding it at all, which is what proves the engine reads the name and hash this addon regenerates |
 
 Not verified:
 
@@ -658,10 +788,23 @@ Not verified:
   ship without it, not from watching Gunlok load one. It matters most for a file built from
   nothing, where *every* chunk is generated — start by exporting an untouched import and loading
   that, before trusting a hand-made one.
-- **A `DUMMYOBJ` cannot be authored.** Whether the engine's `RifFilterObjectsByName` — which is
-  what resolves a `for "<rif object>"` spawn point — sees a dummy has not been measured, so
-  *Add to Gunlok RIF* only makes `RBOBJECT`s. A geometry-less object is not attested either (see
-  the authoring section) — for a locator, use a small mesh, which is what the shipped levels do.
+- **An authored `DUMMYOBJ` has not been loaded by Gunlok.** The gates it must satisfy are measured
+  and are enforced (see *Locators* above), and an exported `level01` full of *regenerated* ones does
+  load (above) — but a dummy that never existed in a shipped file has not been through the engine.
+- **An exported `level02` crashes Gunlok during `ToMap`, and it is nothing to do with sound.** The
+  fault is an access violation at `gl+0x1d79a5` (a 16-byte `movups` store) reached through
+  `ToMap` → `0x005aa8e9` → `0x005ac842`, and it reproduces **identically with the addon at the
+  commit before the sound work**, with the `.map`/`.cut` sidecar caches deleted, while stock
+  `level02` loads normally (178 actors / 294 roles) and an exported `level01` loads normally. So it
+  is a pre-existing exporter fault that `level02` triggers and `level01` does not — unrelated to
+  `DUMMYOBJ`, `DUMOBJTX` or `INDSOUND`, and not yet diagnosed. **Export an untouched import of the
+  level you intend to mod and load it before trusting an edit**; that check takes one run and is the
+  only thing that separates "the exporter handles this file" from "the exporter handles some files".
+- **An ambient emitter's distance unit is unknown.** `I` and `R` reach the sound system as
+  distances, and the shipped `R` values run 5, 10, 15, 20 … 60 *and* 500 and 5000 in the same game,
+  which no single unit explains. The addon shows the number the file holds and scales nothing, so a
+  round trip is exact either way — but a value you *author* is a guess about which convention that
+  level's designer used.
 - **A generated sequence's timing is a convention, like the import scale.** Where an imported key
   sits is carried exactly, but a *new* key's `time` comes from `floor(k·65536/span)` — the dominant
   shipped generator, not a rule read out of the engine. A from-scratch sequence also carries no
@@ -669,6 +812,12 @@ Not verified:
 - **A frame's origin bit is preserved, never set.** What it does is recovered (see above), but
   choosing the wrong frame silently re-anchors a whole animation and the effect happens inside the
   engine, where nothing here can see it.
+- **A from-scratch cutscene has not been played in Gunlok.** An *exported* one has (see below), so
+  the chunks the addon writes are known to drive the engine — but every cutscene tested so far
+  began life in a shipped file. The pieces most worth doubting when you author one are the ones the
+  format cannot settle: whether a from-scratch participant needs a `CTUSRHIE` (every shipped one
+  that names no live actor has one), what a sensible `CUTSCDAT` position is (gl.exe never reads it,
+  so this writes zeroes), and the event *payload* fields beyond the kind and its first word.
 - **The import scale is a convention.** RIF coordinates are integers; the engine's own factor is
   per-rif data read at level load (`gk::RifUnitScale`), not a constant this addon can know. The
   0.001 default comes from character shapes spanning about ±1900 units against a roughly
@@ -694,6 +843,8 @@ Not verified:
 - **One texture in the game does not decode**, and 23 `.RIM` files overall: the `*_fmv_*` ground
   set stores three palettized `CMAP`/`BODY` variants instead of an `S3TC` image. Their materials
   still carry the name and their table entries are untouched, so only the preview is missing.
-- **26 chunk ids still use the generic typed fallback** rather than named fields — they round-trip
+- **21 chunk ids still use the generic typed fallback** rather than named fields — they round-trip
   exactly, but their contents read as a `data` int array rather than meaningful names. `OBJHEAD1`'s
-  tail, `OBASEQHD`, `DUMOBJDT`, `SHPHEAD1`, `OBINTDT` and `AVPSTRAT` are the notable ones.
+  tail, `OBASEQHD`, `DUMOBJDT`, `SHPHEAD1`, `OBJNOTES` and `AVPSTRAT` are the notable ones.
+  (`BMPNAMES` and `INDSOUND` are in that count too, but only because they are decoded by their own
+  modules rather than by `schema`.)

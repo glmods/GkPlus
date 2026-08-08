@@ -60,6 +60,8 @@ import bpy
 import mathutils
 
 from . import bmpnames
+from . import cutscene
+from . import emitters
 from . import heads
 from . import rif
 from . import rim
@@ -96,6 +98,10 @@ _BASIS = mathutils.Quaternion((1.0, 0.0, 0.0), math.radians(-90.0))
 GEOMETRY_CHUNKS = frozenset(
     (b"SHPRAWVT", b"SHPPOLYS", b"SHPUVCRD", b"SHPVNORM", b"SHPPNORM", b"SHPCENTR")
 )
+
+#: Marks a mesh whose shape shipped *without* a `SHPCENTR`, so export does not
+#: invent one. See `_mesh_for_shape`.
+NO_CENTRE_PROP = "rif_no_centre"
 
 #: Per-polygon and per-vertex data that is *authored*, not derived, so it becomes a
 #: Blender attribute and rides along with the mesh through an edit:
@@ -208,9 +214,9 @@ def _get_fields(datablock, chunk_id):
 #: fields and must never be written back into a chunk body.
 _STRUCTURAL = frozenset(("rif_seq_duration_ms", "rif_seq_flags", "rif_seq_speed",
                          "rif_seq_had", "rif_seq_edited",
-                         "rif_sounds", "rif_sound_index", "rif_sound_path",
-                         "rif_sound_pitch", "rif_sound_padding", "rif_sound_extra",
+                         "rif_indsound", "rif_indsound_active", "rif_sound_path",
                          "rif_sound_events", "rif_sound_dir",
+                         "rif_emitter_text", "rif_emitter_index",
                          "rif_id", "rif_index", "rif_absorbed", "rif_scale", "rif_y_down",
                          "rif_shape_index", "rif_texture_index", "rif_pair",
                          "rif_name", "rif_bound", "rif_objhead", "rif_dumobjdt",
@@ -218,7 +224,8 @@ _STRUCTURAL = frozenset(("rif_seq_duration_ms", "rif_seq_flags", "rif_seq_speed"
                          "rif_anim_index",
                          "rif_anim_absorbed", "rif_vtint_header", "rif_fps",
                          "rif_bmp_name", "rif_bmpnames", "rif_bmpnames_path",
-                         "rif_bmpnames_version", "rif_uv_scale"))
+                         "rif_bmpnames_version", "rif_uv_scale",
+                         "rif_no_centre"))
 
 
 #: Chunks that earn their own Blender datablock. Everything else is data, however
@@ -457,26 +464,49 @@ def _unpack_entry(raw):
 
 
 # --------------------------------------------------------------------------
-# sounds
+# the INDSOUND table
 # --------------------------------------------------------------------------
 #
-# An animation keyframe names a sound by an index into a 128-slot table the file
-# carries itself, one INDSOUND chunk per used slot (:mod:`sounds`). Three things
-# come out of that, and each lands where it belongs:
+# **This is not the ambient sound system.** Gunlok has two, they share nothing,
+# and modelling both as Speakers would put two object types in the outliner that
+# look identical and mean opposite things. `INDSOUND` is a *table of definitions*
+# an animation keyframe selects from by number, and it plays wherever the
+# animating model is -- so it has no position, and the transform of a datablock
+# standing for one would be meaningless. `DUMOBJTX` (below, and :mod:`emitters`)
+# is the *placement* system, and that is what the Speakers are now.
 #
-# - the **table** is file data -> `rif_sounds` on the collection, kept whole and
-#   in order, so an entry no keyframe references survives;
-# - the **index** is what a keyframe stores -> `rif_sound_events` on the Action,
-#   because a sound is a property of a sequence at a time;
-# - the **audio** is not in the `.rif` at all -> a Speaker object per entry,
-#   loaded from the install for audition and never written back.
+# So this follows `BMPNAMES` exactly, because it is structurally the same thing:
+# a file-level indexed table whose index is a stable, sparse id meaningful only
+# inside its own file, with a payload loaded from the install for preview and
+# never written back.
 #
-# The Speaker is the editing surface rather than the storage: it carries the
-# entry's path, distances and volume as real speaker settings, so you can hear a
-# footstep and see its falloff, and export rebuilds the table from the speakers.
+# - the **table** -> `rif_indsound` on the collection, kept whole and in order,
+#   so an entry no keyframe references survives;
+# - the **index** -> `rif_sound_events` on the Action, because a sound is a
+#   property of a sequence at a time;
+# - the **audio** -> a `bpy.types.Sound` per entry, loaded from the install for
+#   audition and never written back;
+# - the **editing surface** -> a UIList panel, the way a material's texture name
+#   is edited.
+#
+# The cost, accepted deliberately: Blender's Speaker widgets (a distance slider,
+# a sound file browser) are gone and the panel has to approximate them.
 
 #: The chunk lifted out of the absorbed tree because the scene models it properly.
 _SOUND_CHUNKS = frozenset((b"INDSOUND",))
+
+#: The table itself, on the collection. Named for its chunk, the way
+#: `rif_bmpnames` is, and *not* `rif_sounds` -- which is what it was called when
+#: it also stood for the ambient emitters. A .blend from that build is still read
+#: (see :func:`sound_table`), so an upgrade does not silently drop the table.
+SOUND_TABLE_PROP = "rif_indsound"
+
+#: The active row of the UIList, which is UI state and nothing else.
+SOUND_ACTIVE_PROP = "rif_indsound_active"
+
+#: Stamped on a loaded `bpy.types.Sound` so an entry can find its audio again.
+#: The same job `rif_rim_path` does for a texture's image.
+SOUND_PATH_PROP = "rif_sound_path"
 
 
 def _read_sound_table(root, collection):
@@ -498,7 +528,8 @@ def _read_sound_table(root, collection):
             return {}
         entry["chunk_index"] = i
         entries.append(entry)
-    collection["rif_sounds"] = [_pack_sound(e) for e in entries]
+    collection[SOUND_TABLE_PROP] = [_pack_sound(e) for e in entries]
+    collection[SOUND_ACTIVE_PROP] = 0
     return {int(e["index"]): e for e in entries}
 
 
@@ -560,88 +591,102 @@ def _resolve_sound(entry, root_dir):
     return None
 
 
-def _build_speakers(collection, table, root_dir):
-    """One Speaker per table entry: the editing surface for the sound table.
+def _load_sound_audio(table, root_dir):
+    """One ``bpy.types.Sound`` per entry whose ``.wav`` is on disk.
 
-    Speakers deliberately get **no** ``rif_id``: they are not chunks, so
-    ``_rebuild`` skips them the way it skips any unadopted object, and the table
-    is rebuilt from them separately.
+    For audition only -- export writes the *path*, never the wave, exactly as it
+    writes a texture's name and never the image. Each one is stamped with the
+    path it stands for and given a fake user, because a Sound nothing points at
+    is dropped on the next ``.blend`` save and the entry would lose its audio
+    across a reopen.
     """
-    made = 0
     loaded = 0
     for index in sorted(table):
         entry = table[index]
-        spk = bpy.data.speakers.new("snd_%02d_%s" % (index, snd.basename(entry["path"])))
-        obj = bpy.data.objects.new(spk.name, spk)
-        collection.objects.link(obj)
-        _apply_sound_entry(spk, entry)
         path = _resolve_sound(entry, root_dir)
-        if path is not None:
-            try:
-                spk.sound = bpy.data.sounds.load(path, check_existing=True)
-                loaded += 1
-            except Exception:  # noqa: BLE001 - a missing sound never fails an import
-                pass
-        made += 1
-    return made, loaded
+        if path is None:
+            continue
+        try:
+            sound = bpy.data.sounds.load(path, check_existing=True)
+        except Exception:  # noqa: BLE001 - a missing sound never fails an import
+            continue
+        sound[SOUND_PATH_PROP] = entry["path"]
+        sound.use_fake_user = True
+        loaded += 1
+    return loaded
 
 
-def _apply_sound_entry(spk, entry):
-    """Table entry -> real Speaker settings, so the falloff is visible."""
-    spk["rif_sound_index"] = int(entry["index"])
-    spk["rif_sound_path"] = entry["path"]
-    spk["rif_sound_pitch"] = int(entry.get("pitch", 0))
-    spk["rif_sound_padding"] = list(entry.get("padding") or ())
-    spk["rif_sound_extra"] = list(entry.get("extra") or ())
-    spk["rif_index"] = int(entry.get("chunk_index", -1))
-    # Millimetres in the file, metres in Blender -- the same 1/1000 the rest of
-    # the addon uses for rif units at the default scale, but fixed here because
-    # these are real distances rather than model coordinates.
-    spk.distance_reference = int(entry.get("min_distance", 0)) / 1000.0
-    spk.distance_max = int(entry.get("max_distance", 0)) / 1000.0
-    spk.volume = max(0.0, min(1.0, int(entry.get("volume", 0)) / float(snd.VOLUME_MAX)))
+def sound_audio(entry):
+    """The loaded ``bpy.types.Sound`` for a table entry, or None.
 
-
-def _sound_entry_from_speaker(obj):
-    """The reverse: a Speaker back into a table entry."""
-    spk = obj.data
-    path = spk.get("rif_sound_path", "") or ""
-    if not path and spk.sound is not None:
-        path = os.path.basename(bpy.path.abspath(spk.sound.filepath))
-    entry = snd.make_entry(int(spk.get("rif_sound_index", 0)), path)
-    entry["min_distance"] = int(round(spk.distance_reference * 1000.0))
-    entry["max_distance"] = int(round(spk.distance_max * 1000.0))
-    entry["volume"] = int(round(max(0.0, min(1.0, spk.volume)) * snd.VOLUME_MAX))
-    entry["pitch"] = int(spk.get("rif_sound_pitch", 0))
-    pad = list(spk.get("rif_sound_padding") or ())
-    if pad:
-        entry["padding"] = pad
-    entry["extra"] = list(spk.get("rif_sound_extra") or ())
-    entry["chunk_index"] = int(obj.get("rif_index", -1))
-    return entry
-
-
-def sound_speakers(collection):
-    """Every Speaker in the collection that stands for a table entry."""
-    return [o for o in collection.objects
-            if o.type == "SPEAKER" and o.data is not None
-            and "rif_sound_index" in o.data]
+    Matched on the stored path rather than held as a pointer: the table is a
+    plain ID property, and a datablock reference inside one of those is not
+    something an array of entries can carry.
+    """
+    want = (entry.get("path") or "").lower()
+    if not want:
+        return None
+    for sound in bpy.data.sounds:
+        if (sound.get(SOUND_PATH_PROP, "") or "").lower() == want:
+            return sound
+    return None
 
 
 def sound_table(collection):
-    """The table this export will write.
+    """The table this export will write, whole and in order.
 
-    **The speakers are the table** when there are any: they are what the user
-    edits, so an entry whose speaker was deleted is *dropped*, which is how a
-    sound is removed. The stored ``rif_sounds`` is the fallback for a ``.blend``
-    that has none -- one saved before speakers existed, or an import that could
-    not build them.
+    Kept exactly as ``rif_bmpnames`` is: entries no keyframe references survive,
+    because an index is a stable id and dropping unused rows would renumber
+    nothing but would lose data the file carried.
+
+    ``rif_sounds`` is read as a fallback for a ``.blend`` saved by the build
+    where this table lived on Speaker objects. It is read, never written -- there
+    is one storage location, and the old one is only a way in.
     """
-    entries = [_sound_entry_from_speaker(o) for o in sound_speakers(collection)]
-    if not entries:
-        entries = [_unpack_sound(r) for r in collection.get("rif_sounds", ())]
+    raw = collection.get(SOUND_TABLE_PROP) if collection is not None else None
+    if raw is None and collection is not None:
+        raw = collection.get("rif_sounds")
+    entries = [_unpack_sound(r) for r in (raw or ())]
     entries.sort(key=lambda e: (e.get("chunk_index", -1), e["index"]))
     return entries
+
+
+def set_sound_table(collection, entries):
+    """Write the table back, keeping the active row inside it."""
+    collection[SOUND_TABLE_PROP] = [_pack_sound(e) for e in entries]
+    active = int(collection.get(SOUND_ACTIVE_PROP, 0))
+    collection[SOUND_ACTIVE_PROP] = max(0, min(active, len(entries) - 1))
+
+
+def active_sound(collection):
+    """``(index, entry)`` for the row the panel is editing, or ``(-1, None)``."""
+    entries = sound_table(collection) if collection is not None else []
+    if not entries:
+        return -1, None
+    at = max(0, min(int(collection.get(SOUND_ACTIVE_PROP, 0)), len(entries) - 1))
+    return at, entries[at]
+
+
+def set_sound_field(collection, name, value):
+    """Edit one field of the active entry. Returns False when there is none."""
+    entries = sound_table(collection)
+    at, entry = active_sound(collection)
+    if entry is None:
+        return False
+    entries[at][name] = value
+    set_sound_table(collection, entries)
+    return True
+
+
+def remove_sound(collection, at=None):
+    """Drop one entry. This is how a sound is removed now that there is no object."""
+    entries = sound_table(collection)
+    at = active_sound(collection)[0] if at is None else at
+    if not 0 <= at < len(entries):
+        return False
+    del entries[at]
+    set_sound_table(collection, entries)
+    return True
 
 
 def next_sound_index(collection):
@@ -650,6 +695,156 @@ def next_sound_index(collection):
         if i not in used:
             return i
     return 0
+
+
+# --------------------------------------------------------------------------
+# ambient sound emitters: the DUMOBJTX half, and the Speakers
+# --------------------------------------------------------------------------
+#
+# **These are the Speakers**, and the reason is that they are the only sound in
+# the game that has a position. A `DUMOBJTX` is a placement, not a definition: a
+# text directive on a top-level `DUMMYOBJ` that `ToMap` turns into one looping
+# emitter at that dummy's fixed world coordinates, started once from `LoadLevel`.
+# So `distance_reference`, `distance_max`, `pitch` and the object's transform all
+# mean something here, which is exactly what they could never mean for an
+# `INDSOUND` entry -- and having both wear the same datablock type would put two
+# indistinguishable things in the outliner with opposite semantics.
+#
+# The dummy *is* the Speaker rather than carrying one. A dummy is a name at a
+# position and nothing else, so there is no second transform for a child object
+# to add, and one object cannot drift out of step with itself.
+#
+# **The text is the storage; the Speaker is a view of it.** The shipped texts are
+# too irregular to reproduce by reformatting (see :mod:`emitters`), so the raw
+# string is carried and `emitters.retext` splices back only the directives whose
+# value actually changed -- which is what keeps an untouched level byte-exact
+# through import, a .blend round trip and export.
+
+#: The `DUMOBJTX` text, verbatim, on the dummy's object. The truth; the Speaker's
+#: own settings are derived from it and compared back against it on export.
+EMITTER_TEXT_PROP = "rif_emitter_text"
+
+#: Where the `DUMOBJTX` sat among its dummy's children, so it goes back there.
+EMITTER_INDEX_PROP = "rif_emitter_index"
+
+#: Where the ambient `.wav` files live, and what indexes them. Not `SOUNDDIR`,
+#: which is inert -- the sound system resolves these against its own directory
+#: list. All 1,097 shipped names are bare files with no folder part.
+EMITTER_DIR = "environ"
+
+
+def _dumobjtx_text(chunk):
+    """The text out of a ``DUMOBJTX`` chunk, or ``None`` if it is unreadable."""
+    if chunk is None:
+        return None
+    try:
+        return schema.decode(b"DUMOBJTX", chunk.body)["text"]
+    except (schema.SchemaError, KeyError, UnicodeDecodeError):
+        return None
+
+
+def resolve_emitter_wav(name, root_dir):
+    """The ambient ``.wav`` on disk, or None.
+
+    Looks in ``Sound\\environ`` first because that is where all 44 of the
+    shipped emitter sounds live, then falls back to a case-insensitive scan of
+    the other ``Sound`` subdirectories -- the engine resolves against a directory
+    *list*, so a name found elsewhere is not wrong.
+    """
+    if not root_dir or not name:
+        return None
+    name = name.replace("\\", "/").split("/")[-1]
+
+    def find_in(folder):
+        if not os.path.isdir(folder):
+            return None
+        match = next((n for n in os.listdir(folder) if n.lower() == name.lower()), None)
+        return os.path.join(folder, match) if match else None
+
+    environ = next((os.path.join(root_dir, n) for n in os.listdir(root_dir)
+                    if n.lower() == EMITTER_DIR and os.path.isdir(os.path.join(root_dir, n))),
+                   None)
+    got = find_in(environ) if environ else None
+    if got:
+        return got
+    for entry in sorted(os.listdir(root_dir)):
+        sub = os.path.join(root_dir, entry)
+        if os.path.isdir(sub):
+            got = find_in(sub)
+            if got:
+                return got
+    return find_in(root_dir)
+
+
+def _apply_emitter(obj, text, root_dir):
+    """Text -> real Speaker settings, so the falloff and pitch are visible.
+
+    Absent directives take the engine's own defaults (``V`` 100, everything else
+    0), and a zero distance means *the sample's own*, not silence -- which is why
+    735 of the 1,097 shipped emitters import with a collapsed gizmo. That is the
+    file speaking, not a loss: it specifies no radius.
+    """
+    spk = obj.data
+    obj[EMITTER_TEXT_PROP] = text
+    vals = emitters.effective(text)
+    spk.distance_reference = vals["I"]
+    spk.distance_max = vals["R"]
+    spk.pitch = emitters.pitch_to_factor(vals["P"])
+    spk.volume = emitters.volume_to_fraction(vals["V"])
+    path = resolve_emitter_wav(emitters.wav(text), root_dir)
+    if path is not None:
+        with contextlib.suppress(Exception):  # a missing wav never fails an import
+            spk.sound = bpy.data.sounds.load(path, check_existing=True)
+    return spk
+
+
+def emitter_objects(collection):
+    """Every dummy in the collection that is an ambient emitter."""
+    return [o for o in (collection.objects if collection else ())
+            if o.get("rif_id") == "DUMMYOBJ" and EMITTER_TEXT_PROP in o]
+
+
+def emitter_text(obj):
+    return obj.get(EMITTER_TEXT_PROP, "") or ""
+
+
+def emitter_values(obj):
+    """What this emitter's text says, absent directives filled in by the engine."""
+    return emitters.effective(emitter_text(obj))
+
+
+def set_emitter_wav(obj, wav_name):
+    """Point the emitter at a different ``.wav``, keeping every other byte."""
+    obj[EMITTER_TEXT_PROP] = emitters.retext(emitter_text(obj), wav_name=wav_name)
+    return True
+
+
+def emitter_text_from_speaker(obj):
+    """The text this emitter would export: its own, with the Speaker spliced in.
+
+    Only what differs is rewritten, and "differs" is decided on the *formatted*
+    argument rather than the float -- so a pitch that made the round trip through
+    a float32 Blender property as 1.9999998 still spells ``P2`` and the chunk
+    comes back byte for byte.
+    """
+    text = emitter_text(obj)
+    spk = obj.data
+    if spk is None or obj.type != "SPEAKER":
+        return text
+    return emitters.retext(text, values_by_letter={
+        "I": spk.distance_reference,
+        "R": spk.distance_max,
+        "P": emitters.factor_to_pitch(spk.pitch),
+        "V": emitters.fraction_to_volume(spk.volume),
+    })
+
+
+def _emitter_chunk(obj):
+    """The ``DUMOBJTX`` for one emitter, or None if it is not one."""
+    text = emitter_text_from_speaker(obj)
+    if not text:
+        return None
+    return rif.Chunk(b"DUMOBJTX", schema.dumobjtx_body(text))
 
 
 def _sound_chunks(collection):
@@ -2030,6 +2225,14 @@ def _mesh_for_shape(shape_chunk, name):
                 uv_layer.data[loop].uv = uv_to_blender(uvs[k], scale)
 
     me.update()
+    # Presence is a separate question from the values, the same way
+    # `rif_vtint_header` marks a SHPVTINT. `SHPCENTR` is *recomputed* rather than
+    # carried, so without this marker a shape that shipped without one acquires
+    # one on export -- 2 of Battler Turret's 4 shapes, and the reason the chunk
+    # inventory did not balance. A shape authored from scratch has no marker and
+    # so does get one, which is what a well-formed new shape wants.
+    if shape_chunk.find(b"SHPCENTR") is None:
+        me[NO_CENTRE_PROP] = 1
     return me, lost
 
 
@@ -2127,14 +2330,21 @@ def _build(chunk, index, parent_obj, collection, pairs, root_kids, stats):
         obj = bpy.data.objects.new(me.name, me)
         skip |= GEOMETRY_CHUNKS | set(ATTRIBUTE_CHUNKS) | DISCARDED_CHUNKS
     else:
-        obj = bpy.data.objects.new(_label_for(chunk), None)
+        # An ambient emitter is a Speaker rather than an Empty -- the one sound
+        # in the game with a position, so the one whose transform and falloff
+        # mean anything. A dummy whose text is not a `Sound` stays a marker.
+        data = None
+        if cid == b"DUMMYOBJ":
+            text = _dumobjtx_text(chunk.find(b"DUMOBJTX"))
+            if text is not None and emitters.is_emitter(text):
+                data = bpy.data.speakers.new(_label_for(chunk))
+        obj = bpy.data.objects.new(_label_for(chunk), data)
 
     obj["rif_id"] = chunk.name
     obj["rif_index"] = index
     # A container that became an object may be the one holding the texture
     # table -- REBENVDT does whenever it also holds a LIGHTSET.
     skip = _note_table_owner(chunk, obj, skip)
-    obj["rif_absorbed"] = _pack_absorbed(_absorb(chunk, skip))
 
     # What the rig pass needs: the name an object answers to, and the name a
     # hierarchy node is looking for.
@@ -2155,12 +2365,33 @@ def _build(chunk, index, parent_obj, collection, pairs, root_kids, stats):
             obj.rotation_mode = "QUATERNION"
             obj.rotation_quaternion = quat_to_blender(
                 struct.unpack_from("<4f", dt.body, DUMOBJ_ORIENT), _CTX["y_down"])
-            obj.empty_display_type = "CUBE"
+            if obj.data is None:
+                obj.empty_display_type = "CUBE"
             skip.add(b"DUMOBJDT")
+        # The emitter half: lifted out of `rif_absorbed` like the two tables,
+        # because the scene models it as the Speaker's own settings. Its child
+        # index is remembered so export puts the chunk back where it sat.
+        if obj.data is not None:
+            for i, kid in enumerate(chunk.children or ()):
+                if kid.id != b"DUMOBJTX":
+                    continue
+                obj[EMITTER_INDEX_PROP] = i
+                _apply_emitter(obj, _dumobjtx_text(kid), _CTX.get("sound_dir"))
+                skip.add(b"DUMOBJTX")
+                break
     elif cid == b"OBJCHIER":
         bound = _hierarchy_binding(chunk)
         if bound:
             obj["rif_bound"] = bound
+
+    # **After** every branch above, because each one decides what it has taken
+    # out of the chunk and must not be absorbed as well. This used to sit before
+    # them, which worked for `RBOBJECT` (it adds to `skip` in the first if-chain,
+    # above) and silently did nothing for `DUMMYOBJ`, whose `skip.add(DUMOBJDT)`
+    # ran after the absorb had already copied it -- so every dummy exported its
+    # DUMOBJDT twice, the absorbed original and the regenerated one. 6,847 of
+    # them across the shipped set.
+    obj["rif_absorbed"] = _pack_absorbed(_absorb(chunk, skip))
 
     _link(obj, collection, parent_obj)
 
@@ -2197,7 +2428,7 @@ def build_scene(root, name, scale=DEFAULT_SCALE, y_down=True, fps=30.0,
     """
     _CTX.update(scale=scale, y_down=y_down, fps=fps,
                 textures={}, materials={}, images={}, texture_index=None,
-                table_chunk=None,
+                table_chunk=None, sound_dir=None,
                 missing_textures=set(), undecodable_textures=set())
     stats = {"lost_faces": 0, "objects": 0}
 
@@ -2207,6 +2438,12 @@ def build_scene(root, name, scale=DEFAULT_SCALE, y_down=True, fps=30.0,
     collection["rif_scale"] = scale
     collection["rif_y_down"] = y_down
     collection["rif_fps"] = fps
+
+    # Found before anything is built, because an ambient emitter loads its own
+    # `.wav` as the object is created -- unlike the INDSOUND table, which is
+    # audio a *panel* offers rather than audio an object holds.
+    _CTX["sound_dir"] = _sound_root(source_path, "") if load_images else None
+    collection["rif_sound_dir"] = _CTX["sound_dir"] or ""
 
     _CTX["textures"] = _read_texture_table(root, collection)
     root_dir = _texture_root(source_path, texture_dir) if load_images else None
@@ -2247,10 +2484,8 @@ def build_scene(root, name, scale=DEFAULT_SCALE, y_down=True, fps=30.0,
         stats["objects"] += 1
 
     collection["rif_absorbed"] = _pack_absorbed(absorbed)
-    sound_dir = _sound_root(source_path, "") if load_images else None
-    collection["rif_sound_dir"] = sound_dir or ""
-    stats["speakers"], stats["sounds_loaded"] = _build_speakers(
-        collection, _CTX["sounds"], sound_dir)
+    stats["sounds_loaded"] = _load_sound_audio(_CTX["sounds"], _CTX["sound_dir"])
+    stats["emitters"] = sum(1 for o in collection.objects if EMITTER_TEXT_PROP in o)
     stats["images"] = len(_CTX["images"])
     stats["missing_textures"] = sorted(_CTX["missing_textures"])
     stats["undecodable_textures"] = sorted(_CTX["undecodable_textures"])
@@ -2261,6 +2496,9 @@ def build_scene(root, name, scale=DEFAULT_SCALE, y_down=True, fps=30.0,
     stats["rigged"] = rigged
     stats["lod_rigged"] = lod_rigged
     stats["sequences"] = sequences
+    # After the armature, because this moves entries out of `rif_absorbed` and
+    # the rig pass reads that for its own chunks.
+    stats["cutscenes"] = build_cutscenes(collection, scale, y_down)
     return collection, stats
 
 
@@ -2456,9 +2694,10 @@ def _shape_chunk_from_mesh(obj, me, scale, y_down, stats, textures=None):
         (2, rif.Chunk(b"SHPPNORM", bodies[b"SHPPNORM"])),
         (3, rif.Chunk(b"SHPPOLYS", bodies[b"SHPPOLYS"])),
         (4, rif.Chunk(b"SHPUVCRD", bodies[b"SHPUVCRD"])),
-        (5, rif.Chunk(b"SHPCENTR", shp.centre_body(verts))),
         (6, rif.Chunk(b"SHPMRGDT", struct.pack("<%di" % len(merge), *merge))),
     ]
+    if not me.get(NO_CENTRE_PROP):
+        children.append((5, rif.Chunk(b"SHPCENTR", shp.centre_body(verts))))
     absorbed = [c for _, c in _emit_absorbed(me)]
     _sync_shape_header(absorbed, obj, verts, len(polys))
     children += [(7 + i, c) for i, c in enumerate(absorbed)]
@@ -2631,6 +2870,11 @@ def _suspend_animation(collection):
         rest = obj.get("rif_rest")
         if anim is None and rest is None:
             continue
+        if obj.get("rif_cut_role") == CUT_TRACK:
+            # A cutscene path *is* its F-curves -- clearing the action here
+            # would leave the exporter reading a single posed location and
+            # silently writing a one-point path.
+            continue
         pose = []
         if obj.type == "ARMATURE":
             # Clearing the action does not clear the pose -- evaluation writes into
@@ -2663,7 +2907,7 @@ def rebuild_tree(collection, scale=None, y_down=None, fps=None):
     y_down = bool(collection.get("rif_y_down", True)) if y_down is None else y_down
     fps = float(collection.get("rif_fps", 30.0)) if fps is None else fps
     stats = {"shapes": 0, "objects": 0, "lights": 0, "textures": 0, "new_textures": 0,
-             "sounds": 0, "degenerate_faces": 0, "lighting_dropped": 0}
+             "sounds": 0, "emitters": 0, "degenerate_faces": 0, "lighting_dropped": 0}
     # Read the rest pose, not whatever the animation system is posing right now.
     # This also runs the depsgraph, which export needs because matrix_world is
     # stale until it does.
@@ -2690,6 +2934,8 @@ def _rebuild(collection, scale, y_down, fps, stats):
     stats["textures"] = len(entries)
     stats["new_textures"] = len(entries) - len(collection.get("rif_bmpnames", ()))
     table_owner, table_extra = _table_chunk(collection, entries)
+    cut_extra = cutscene_chunks(collection, scale, y_down)
+    stats["cutscenes"] = sum(1 for _ in cutscene_roots(collection))
 
     def emit(obj):
         cid = obj["rif_id"].encode("ascii")
@@ -2705,10 +2951,19 @@ def _rebuild(collection, scale, y_down, fps, stats):
             chunk.id = cid
             return chunk
 
-        children = list(_emit_from(obj.get("rif_absorbed"),
-                                   table_extra if table_owner == obj.name else ()))
-        if cid == b"DUMMYOBJ" and "rif_dumobjdt" in obj:
-            children.append((0, _dumobj_chunk(obj, scale, y_down)))
+        extra = list(table_extra) if table_owner == obj.name else []
+        extra += cut_extra.get(obj.name, ())
+        children = list(_emit_from(obj.get("rif_absorbed"), extra))
+        if cid == b"DUMMYOBJ":
+            if "rif_dumobjdt" in obj:
+                children.append((0, _dumobj_chunk(obj, scale, y_down)))
+            # Emitted independently of the DUMOBJDT above: a dummy missing one is
+            # refused before export gets here (`dummy_problems`), and silently
+            # dropping its sound as well would hide which fault is which.
+            emitter = _emitter_chunk(obj) if EMITTER_TEXT_PROP in obj else None
+            if emitter is not None:
+                children.append((int(obj.get(EMITTER_INDEX_PROP, 1)), emitter))
+                stats["emitters"] += 1
         for kid in by_parent.get(obj, ()):
             children.append((kid.get("rif_index", 0), emit(kid)))
         children.sort(key=lambda t: t[0])
@@ -2720,6 +2975,7 @@ def _rebuild(collection, scale, y_down, fps, stats):
     injected = list(table_extra) if table_owner == "" else []
     injected += _sound_chunks(collection)
     stats["sounds"] = len(injected) - (len(table_extra) if table_owner == "" else 0)
+    injected += cut_extra.get("", ())
     top = _emit_from(collection.get("rif_absorbed"), injected)
 
     for obj in by_parent.get(None, ()):
@@ -2733,6 +2989,382 @@ def _rebuild(collection, scale, y_down, fps, stats):
 
     top.sort(key=lambda t: t[0])
     return rif.Chunk(b"REBINFF2", b"", [c for _, c in top]), stats
+
+
+# --------------------------------------------------------------------------
+# cutscenes
+# --------------------------------------------------------------------------
+#
+# A cutscene becomes real datablocks -- a Camera, an Empty it looks at, and an
+# Empty per participant -- with the path in **location F-curves**. There is
+# deliberately no second copy of the path anywhere: the keyframes *are* the
+# CUTPOINT records, which is the same rule `rif_light` follows and the reason
+# the packed-int mirror it replaced was deleted.
+#
+# The timing works because the engine's tick is 40 ms and these objects are
+# keyed at 25 fps, so one frame is one tick exactly and every shipped duration
+# is a whole number of frames (`cutscene.FPS`).
+#
+# These objects carry **`rif_cut_role`, never `rif_id`**, so `_rebuild`'s object
+# loop skips them exactly as it skips a Speaker; their chunks are injected
+# through `_emit_from`'s `extra` instead, the same seam the texture table uses.
+
+#: Roles, in the order they nest.
+CUT_SCENE, CUT_PARTICIPANT, CUT_TRACK = "cutscene", "participant", "track"
+
+
+def _cut_children(obj, role):
+    return [c for c in obj.children if c.get("rif_cut_role") == role]
+
+
+def cutscene_roots(collection):
+    """Every cutscene Empty in the collection."""
+    return [o for o in collection.objects if o.get("rif_cut_role") == CUT_SCENE]
+
+
+def _location_curves(obj):
+    action = obj.animation_data.action if obj.animation_data else None
+    if action is None:
+        return []
+    return [fc for fc in _iter_fcurves(action)
+            if fc.data_path == "location" and fc.array_index < 3]
+
+
+def _keyed_frames(obj):
+    """Sorted integer frames at which this object's location is keyed."""
+    frames = set()
+    for fc in _location_curves(obj):
+        frames.update(int(round(k.co[0])) for k in fc.keyframe_points)
+    return sorted(frames)
+
+
+def _location_at(obj, frame):
+    out = list(obj.location)
+    for fc in _location_curves(obj):
+        out[fc.array_index] = fc.evaluate(frame)
+    return out
+
+
+def _key_location(obj, frames, points, scale, y_down):
+    """Write one location keyframe per point, linear so nothing is implied.
+
+    Blender is left to mint the Action and its slot -- doing it by hand differs
+    between 4.x and the slotted 5.x actions, and `keyframe_insert` handles both.
+    """
+    for frame, pt in zip(frames, points):
+        obj.location = to_blender(pt, scale, y_down)
+        obj.keyframe_insert("location", frame=frame)
+    action = obj.animation_data.action if obj.animation_data else None
+    if action is None:
+        return
+    action.use_fake_user = True
+    for fc in _iter_fcurves(action):
+        for key in fc.keyframe_points:
+            # Bezier would ease into every control point and read as the path;
+            # the real curve is Catmull-Rom and only the preview can show it.
+            key.interpolation = "LINEAR"
+
+
+def _build_track(cs_obj, part_obj, track, part, collection, scale, y_down):
+    """One CUTTRACK -> a Camera (the camera-position track) or an Empty."""
+    if part.is_camera_position:
+        data = bpy.data.cameras.new("%s_cam" % track.name)
+        data.angle = math.radians(track.fov_degrees
+                                  if track.fov_degrees is not None else 90.0)
+        obj = bpy.data.objects.new(track.name or "camera", data)
+    else:
+        obj = bpy.data.objects.new(track.name or "track", None)
+        obj.empty_display_type = "SPHERE"
+        obj.empty_display_size = 0.3
+    collection.objects.link(obj)
+    obj.parent = part_obj
+
+    obj["rif_cut_role"] = CUT_TRACK
+    obj["rif_cut_index"] = track.index
+    obj["rif_track_name"] = track.name
+    obj["rif_track_name_fields"] = list(track.name_fields)
+    obj["rif_start_quat"] = list(track.start_quat)
+    obj["rif_end_quat"] = list(track.end_quat)
+    obj["rif_has_start_quat"] = int(track.has_start_quat)
+    obj["rif_has_end_quat"] = int(track.has_end_quat)
+    obj["rif_point_unread"] = list(track.unread)
+    obj["rif_point_spares"] = track.spares
+    obj["rif_point_zeros"] = cutscene.zero_flags(track)
+    obj["rif_final_ms"] = track.durations[-1] if track.points else 0
+    obj["rif_fov_fields"] = list(track.fov_fields)
+    obj["rif_has_fov"] = int(track.fov_degrees is not None)
+    obj["rif_cut_indices"] = [track._name_index, track._point_index,
+                              track._fov_index]
+    obj["rif_cut_events"] = _pack_absorbed(
+        [("CUTEVENT:%d" % i, props) for i, props in track.events])
+
+    if track.points:
+        _key_location(obj, cutscene.point_frames(track), track.positions,
+                      scale, y_down)
+    return obj
+
+
+def _build_cutscene(collection, cs, owner, scale, y_down):
+    root = bpy.data.objects.new("Cutscene %s" % cs.name, None)
+    root.empty_display_type = "ARROWS"
+    collection.objects.link(root)
+    root["rif_cut_role"] = CUT_SCENE
+    root["rif_cut_owner"] = owner
+    root["rif_cut_prefix"] = cs.prefix
+    root["rif_cut_index"] = cs.index
+    root["rif_cut_name"] = cs.name
+    root["rif_cut_position"] = list(cs.position)
+    root["rif_cut_reserved"] = list(cs.reserved)
+    root["rif_cut_data_index"] = cs._data_index
+
+    for part in cs.participants:
+        pobj = bpy.data.objects.new(part.rif_name or "participant", None)
+        pobj.empty_display_type = "PLAIN_AXES"
+        collection.objects.link(pobj)
+        pobj.parent = root
+        pobj["rif_cut_role"] = CUT_PARTICIPANT
+        pobj["rif_cut_index"] = part.index
+        pobj["rif_user_rif"] = part.rif_name
+        pobj["rif_user_fields"] = [part.field_0, part.anim_id, part.user_id,
+                                   part.field_3, part.is_camera, part.flags]
+        pobj["rif_user_rest"] = list(part.fields_6_11)
+        pobj["rif_user_hierarchy"] = part.hierarchy[0] if part.hierarchy else ""
+        pobj["rif_user_hier_fields"] = list(part.hierarchy[1]) if part.hierarchy else []
+        pobj["rif_has_hierarchy"] = int(part.hierarchy is not None)
+        pobj["rif_user_sound"] = list(part.sound_props or ())
+        pobj["rif_has_sound"] = int(part.sound_props is not None)
+        pobj["rif_cut_indices"] = [part._data_index, part._hier_index,
+                                   part._sound_index]
+        for track in part.tracks:
+            _build_track(root, pobj, track, part, collection, scale, y_down)
+    return root
+
+
+def build_cutscenes(collection, scale, y_down):
+    """Promote every absorbed cutscene subtree to objects. Returns the count."""
+    made = 0
+    owners = [("", collection)] + [(o.name, o) for o in list(collection.objects)]
+    for owner, datablock in owners:
+        mine, rest = cutscene.split_absorbed(_absorbed_entries(datablock))
+        if not mine:
+            continue
+        datablock["rif_absorbed"] = _pack_absorbed(rest)
+        for cs in cutscene.parse(mine):
+            _build_cutscene(collection, cs, owner, scale, y_down)
+            made += 1
+    return made
+
+
+def _track_model(obj, scale, y_down):
+    track = cutscene.Track(obj.get("rif_cut_index", 0))
+    track.name = obj.get("rif_track_name", "")
+    track.name_fields = list(obj.get("rif_track_name_fields", (0, 0)))
+    track.start_quat = list(obj.get("rif_start_quat", (0.0, 0.0, 0.0, 1.0)))
+    track.end_quat = list(obj.get("rif_end_quat", (0.0, 0.0, 0.0, 1.0)))
+    track.has_start_quat = int(obj.get("rif_has_start_quat", 0))
+    track.has_end_quat = int(obj.get("rif_has_end_quat", 0))
+    track.unread = list(obj.get("rif_point_unread", (0, 0)))
+    idx = list(obj.get("rif_cut_indices", (0, 0, 0)))
+    track._name_index, track._point_index, track._fov_index = idx
+
+    if obj.type == "CAMERA" and obj.data is not None:
+        track.fov_degrees = math.degrees(obj.data.angle)
+    elif obj.get("rif_has_fov"):
+        track.fov_degrees = 90.0
+    track.fov_fields = list(obj.get("rif_fov_fields", (0, 0)))
+
+    frames = _keyed_frames(obj)
+    if frames:
+        positions = [to_rif(_location_at(obj, f), scale, y_down) for f in frames]
+    else:
+        # An unkeyed track is a single control point where the object sits.
+        frames, positions = [0], [to_rif(obj.location, scale, y_down)]
+    spares = list(obj.get("rif_point_spares", ()))[:len(positions)]
+    zeros = list(obj.get("rif_point_zeros", ()))[:len(positions)]
+    track.points = cutscene.pack_points(
+        positions, frames, spares, int(obj.get("rif_final_ms", 0)), zeros)
+
+    track.events = [(int(path.rpartition(":")[2]), props)
+                    for path, props in _unpack_absorbed(obj.get("rif_cut_events"))]
+    return track
+
+
+def _cutscene_model(root, scale, y_down):
+    cs = cutscene.Cutscene(int(root.get("rif_cut_index", 0)))
+    cs.prefix = root.get("rif_cut_prefix", "")
+    cs.name = root.get("rif_cut_name", "")
+    cs.position = list(root.get("rif_cut_position", (0, 0, 0)))
+    cs.reserved = list(root.get("rif_cut_reserved", (0, 0)))
+    cs._data_index = int(root.get("rif_cut_data_index", 0))
+
+    for pobj in sorted(_cut_children(root, CUT_PARTICIPANT),
+                       key=lambda o: o.get("rif_cut_index", 0)):
+        part = cutscene.Participant(pobj.get("rif_cut_index", 0))
+        part.rif_name = pobj.get("rif_user_rif", "")
+        f = list(pobj.get("rif_user_fields", (0, -1, 0, 0, 1, 0)))
+        (part.field_0, part.anim_id, part.user_id,
+         part.field_3, part.is_camera, part.flags) = f
+        part.fields_6_11 = list(pobj.get("rif_user_rest", (0,) * 6))
+        if pobj.get("rif_has_hierarchy"):
+            part.hierarchy = (pobj.get("rif_user_hierarchy", ""),
+                              list(pobj.get("rif_user_hier_fields", (0, 0, 0))))
+        if pobj.get("rif_has_sound"):
+            part.sound_props = list(pobj.get("rif_user_sound", (0,) * 6))
+        idx = list(pobj.get("rif_cut_indices", (0, 0, 0)))
+        part._data_index, part._hier_index, part._sound_index = idx
+
+        for tobj in sorted(_cut_children(pobj, CUT_TRACK),
+                           key=lambda o: o.get("rif_cut_index", 0)):
+            part.tracks.append(_track_model(tobj, scale, y_down))
+        cs.participants.append(part)
+    return cs
+
+
+def cutscene_chunks(collection, scale, y_down):
+    """``{owner name: [(path, Chunk)]}`` for every cutscene in the collection."""
+    by_owner = {}
+    for root in cutscene_roots(collection):
+        cs = _cutscene_model(root, scale, y_down)
+        by_owner.setdefault(root.get("rif_cut_owner", ""), []).append(cs)
+    return {owner: cutscene.emit(scenes) for owner, scenes in by_owner.items()}
+
+
+def track_frames(obj):
+    """The keyframes of one cutscene track object -- its control points."""
+    return _keyed_frames(obj)
+
+
+def cutscene_problems_for(root):
+    """Pre-flight checks for one cutscene, in the spirit of the shape-id one."""
+    out = []
+    if not root.get("rif_cut_name", ""):
+        out.append("No name, so PLAY CUTSCENE cannot reach it")
+    try:
+        cs = _cutscene_model(root, 1.0, True)
+    except Exception as exc:  # noqa: BLE001
+        return out + ["%s" % exc]
+
+    if cs.camera_position_track() is None:
+        out.append("No camera-position participant (is_camera == 0)")
+    ends = any(cutscene.EVENT_CONTROL in list(props["kinds"])
+               for part in cs.participants for track in part.tracks
+               for _i, props in track.events)
+    if not ends:
+        # Running off the end of a path does not end a cutscene; the camera
+        # simply parks and the player is left locked out.
+        out.append("No control event: this would never end")
+    cam = cs.camera_position_track()
+    if cam is not None and cam.tracks and len(cam.tracks[0].points) < 2:
+        out.append("The camera path has fewer than two control points")
+    return out
+
+
+def cutscene_problems(collection):
+    """Every cutscene's problems, prefixed with which one."""
+    out = []
+    for root in cutscene_roots(collection):
+        out.extend("%s: %s" % (root.name, why)
+                   for why in cutscene_problems_for(root))
+    return out
+
+
+def add_cutscene_event(root, kind, command="", position=0.0):
+    """Append an event to this cutscene's camera track. Returns the track object."""
+    cam_part = next((p for p in _cut_children(root, CUT_PARTICIPANT)
+                     if list(p.get("rif_user_fields", (0,) * 6))[4] == 0), None)
+    if cam_part is None:
+        return None
+    tracks = _cut_children(cam_part, CUT_TRACK)
+    if not tracks:
+        return None
+    tobj = sorted(tracks, key=lambda o: o.get("rif_cut_index", 0))[0]
+
+    events = list(_unpack_absorbed(tobj.get("rif_cut_events")))
+    index = 1 + max([int(p.rpartition(":")[2]) for p, _f in events], default=-1)
+    if kind == "CONSOLE":
+        props = cutscene.console_event(command, position)
+    else:
+        props = cutscene.end_event(position)
+    events.append(("CUTEVENT:%d" % index, props))
+    tobj["rif_cut_events"] = _pack_absorbed(events)
+    return tobj
+
+
+def preview_cutscene_path(root, per_segment=12):
+    """A poly curve along the spline the engine will actually follow.
+
+    Derived data, regenerated on demand and carrying no ``rif_`` id, so export
+    skips it exactly as it skips a Speaker. It exists because Blender's own
+    F-curve interpolation is *not* the engine's: the keys are Catmull-Rom
+    control points, and on the shipped paths the spline departs from the
+    straight line between them by a median 5.6% of segment length (max 47%).
+    """
+    collection = root.users_collection[0] if root.users_collection else None
+    made = 0
+    for part in _cut_children(root, CUT_PARTICIPANT):
+        for tobj in _cut_children(part, CUT_TRACK):
+            name = "%s_preview" % tobj.name
+            old = bpy.data.objects.get(name)
+            if old is not None:
+                bpy.data.objects.remove(old, do_unlink=True)
+            frames = _keyed_frames(tobj)
+            if len(frames) < 2:
+                continue
+            pts = [_location_at(tobj, f) for f in frames]
+            samples = cutscene.sample_path(pts, per_segment)
+            curve = bpy.data.curves.new(name, "CURVE")
+            curve.dimensions = "3D"
+            spline = curve.splines.new("POLY")
+            spline.points.add(len(samples) - 1)
+            for i, p in enumerate(samples):
+                spline.points[i].co = (p[0], p[1], p[2], 1.0)
+            obj = bpy.data.objects.new(name, curve)
+            if collection is not None:
+                collection.objects.link(obj)
+            obj.parent = tobj.parent
+            made += 1
+    return made
+
+
+def add_cutscene(collection, name, camera=None, target=None):
+    """Author a new cutscene, optionally adopting an existing camera pair."""
+    owner_obj = _rebenvdt_object(collection)
+    owner = owner_obj.name if owner_obj is not None else ""
+    holder = owner_obj if owner_obj is not None else collection
+    prefix = _cutscene_prefix(holder, owner_obj is not None)
+    index = 1 + max([r.get("rif_cut_index", 0) for r in cutscene_roots(collection)
+                     if r.get("rif_cut_owner", "") == owner], default=-1)
+
+    cs = cutscene.new_cutscene(name, prefix, index)
+    scale = collection.get("rif_scale", DEFAULT_SCALE)
+    y_down = bool(collection.get("rif_y_down", True))
+    root = _build_cutscene(collection, cs, owner, scale, y_down)
+
+    tracks = [t for p in _cut_children(root, CUT_PARTICIPANT)
+              for t in _cut_children(p, CUT_TRACK)]
+    for existing, made in zip((camera, target), tracks):
+        if existing is not None:
+            made.location = existing.location
+            if made.type == "CAMERA" and existing.type == "CAMERA":
+                made.data.angle = existing.data.angle
+    return root
+
+
+def _cutscene_prefix(holder, is_object):
+    """``REBENVDT:n/SPECLOBJ:m`` for a new cutscene on this owner.
+
+    Reuses the file's existing `SPECLOBJ` when it has one -- every shipped file
+    with cutscenes keeps them all under a single container.
+    """
+    for path, _props in _absorbed_entries(holder):
+        parts = path.split("/")
+        for i, seg in enumerate(parts):
+            if seg.startswith("%s:" % cutscene.SPECLOBJ):
+                return "/".join(parts[:i + 1])
+    if is_object:
+        # The REBENVDT object owns its children directly.
+        return "%s:0" % cutscene.SPECLOBJ
+    return "REBENVDT:0/%s:0" % cutscene.SPECLOBJ
 
 
 # --------------------------------------------------------------------------
@@ -2941,12 +3573,20 @@ def adopt_object(collection, obj, name=None):
     format allows and the assets never take -- offered because it is the obvious
     thing to reach for, but a small mesh is the choice with evidence behind it.
 
-    ``DUMMYOBJ`` is not offered at all: whether the engine's
-    ``RifFilterObjectsByName`` -- which is what resolves a ``for "<rif object>"``
-    spawn point -- looks at dummies has not been measured.
+    **This never makes a ``DUMMYOBJ``, and that is not an omission.**
+    ``RifFilterObjectsByName`` -> ``RifCollectObjectChunks`` @ 0x005b0900 keeps a
+    child only if its id is literally ``RBOBJECT``, so a ``for "<rif object>"``
+    spawn point can never resolve to a dummy -- the two are disjoint namespaces.
+    A dummy is the *locator* system (ambient sound, console and trigger
+    positions, MP and enemy spawns, CTF points) and has its own entry point,
+    :func:`adopt_dummy`.
     """
     if "rif_id" in obj:
         return "%s is already in a RIF collection" % obj.name
+    if obj.type == "SPEAKER":
+        return ("%s is a speaker; a positional sound is a DUMMYOBJ carrying a "
+                "DUMOBJTX, so use Add as Locator or Add Ambient Emitter"
+                % obj.name)
     if obj.type not in ("MESH", "EMPTY", "ARMATURE", "LIGHT"):
         return ("%s is a %s; only meshes, empties, armatures and lights can be "
                 "RIF objects" % (obj.name, obj.type.lower()))
@@ -3001,6 +3641,159 @@ def adopt_object(collection, obj, name=None):
     if obj.rotation_mode != "QUATERNION":
         obj.rotation_mode = "QUATERNION"
     return None
+
+
+# --------------------------------------------------------------------------
+# Locators: a DUMMYOBJ, and the ambient emitter that is one
+# --------------------------------------------------------------------------
+#
+# A dummy is **a name at a position, and that is the whole of it**. Every
+# top-level one in a level rif becomes a 0x3c-byte `MapAuxObject`, and seven
+# consumers then look records up by name -- always a linear scan, always
+# case-insensitive. So the name is an API: the engine builds strings like
+# `Goodie A2`, `baddie c`, `Flag_3` and `dumpresk` itself and scans for them.
+#
+# Every gate below is measured over all 6,847 shipped dummies, and one of them is
+# a crash rather than a nuisance.
+
+#: The `DUMOBJDT` a new dummy starts with: 13 int32, of which export overwrites
+#: the location and the quaternion from the object's own transform. The
+#: extents at +0x0c and +0x18 are read by **nothing** in the engine, so they are
+#: left at zero rather than derived from a bounding box that has no consumer.
+_NEW_DUMOBJDT = [0] * (DUMOBJDT_NAME // 4)
+
+#: The identity quaternion, in the `(x, y, z, w)` float order `DUMOBJDT` stores.
+#: Written as bits, because the record is an int32 array in Blender.
+_IDENTITY_QUAT_BITS = list(struct.unpack("<4i", struct.pack("<4f", 0.0, 0.0, 0.0, 1.0)))
+
+
+def adopt_dummy(collection, obj, name=None):
+    """Make ``obj`` a top-level ``DUMMYOBJ`` -- a named locator.
+
+    Returns a message on refusal, ``None`` on success. An **Empty** becomes a
+    marker; a **Speaker** becomes an ambient emitter, which is the only thing a
+    dummy can be besides a marker.
+
+    The refusals are the measured gates, not caution:
+
+    - **Top level only.** ``RifCollectDummyChunks`` @ 0x005b0ae0 walks the root's
+      direct children and never recurses, and all 6,847 shipped dummies are at
+      depth 0. A dummy parented under another RIF object would be written and
+      never seen.
+    - **A non-empty name.** ``DummyObjectDataChunk_CtorFromBuffer`` @ 0x005d2390
+      stores ``NULL`` for an empty one -- not ``""`` -- and every name-matching
+      consumer skips the record. 0 of 6,847 ship empty.
+
+    The third gate cannot be refused here because it is about what export
+    *writes*: a dummy with no ``DUMOBJDT`` is an unchecked null dereference
+    during level load (``MapAuxObject_Ctor`` @ 0x005a971a), so one is created
+    here and :func:`dummy_problems` refuses an export that lost it.
+    """
+    if "rif_id" in obj:
+        return "%s is already in a RIF collection" % obj.name
+    if obj.type not in ("EMPTY", "SPEAKER"):
+        return ("%s is a %s; a locator has no geometry, so a dummy is an empty "
+                "(a marker) or a speaker (an ambient sound)" % (obj.name, obj.type.lower()))
+    if obj.parent is not None and "rif_id" in obj.parent:
+        return ("%s is parented to %s; the engine only collects dummies from the "
+                "file root, so a nested one is never seen" % (obj.name, obj.parent.name))
+
+    name = (name or obj.name).strip()
+    if not name:
+        return ("a dummy needs a name -- an empty one is stored as NULL and every "
+                "consumer skips the record")
+
+    obj["rif_id"] = "DUMMYOBJ"
+    obj["rif_index"] = next_chunk_index(collection)
+    obj["rif_name"] = name
+    obj.name = name
+    obj["rif_dumobjdt"] = list(_NEW_DUMOBJDT[:DUMOBJ_ORIENT // 4]) + _IDENTITY_QUAT_BITS
+    obj["rif_absorbed"] = _pack_absorbed([])
+    if obj.rotation_mode != "QUATERNION":
+        obj.rotation_mode = "QUATERNION"
+    if obj.type == "EMPTY":
+        obj.empty_display_type = "CUBE"
+    _link_into(collection, obj)
+    return None
+
+
+def add_emitter(collection, wav_name, name=None, sound_dir=None):
+    """A new ambient sound: a Speaker that *is* a top-level ``DUMMYOBJ``.
+
+    Returns ``(object, None)`` or ``(None, message)``. The wav is a bare file
+    name resolved by the sound system's own directory list -- ``Sound\\environ``
+    is where all 44 shipped ones live -- and is never written back.
+    """
+    wav_name = (wav_name or "").strip()
+    if not wav_name:
+        return None, "an emitter needs a .wav name; that is what line 2 of the text stores"
+
+    label = (name or os.path.splitext(wav_name)[0]).strip() or "emitter"
+    spk = bpy.data.speakers.new(label)
+    obj = bpy.data.objects.new(label, spk)
+    bpy.context.scene.collection.objects.link(obj)
+    why = adopt_dummy(collection, obj, label)
+    if why is not None:
+        bpy.data.objects.remove(obj, do_unlink=True)
+        return None, why
+
+    root_dir = sound_dir or (collection.get("rif_sound_dir", "") or None)
+    _apply_emitter(obj, emitters.new_text(wav_name), root_dir)
+    return obj, None
+
+
+def dummy_problems(collection):
+    """``(errors, warnings)`` for every ``DUMMYOBJ`` this export would write.
+
+    The errors are the two shapes the game's own data never takes, so nothing in
+    Gunlok is hardened against them:
+
+    - **no ``DUMOBJDT``** -- ``DummyObjectChunk_GetDataChunk`` @ 0x005d21d0
+      returns NULL and ``MapAuxObject_Ctor`` dereferences it unchecked, which is
+      an access violation during level load;
+    - **an empty name**, which is stored as ``NULL`` and skipped by every
+      consumer.
+
+    Duplicate names are a **warning**, not a refusal: 62 shipped files have them
+    and they work. The catch is that resolution differs --
+    ``ConsoleParsePosition`` takes the *first* match where the other six
+    consumers take the *last* -- so a duplicate is a thing to know about rather
+    than a thing to forbid.
+    """
+    errors, warnings = [], []
+    by_name = {}
+    for obj in (collection.objects if collection else ()):
+        if obj.get("rif_id") != "DUMMYOBJ":
+            continue
+        name = (obj.get("rif_name", "") or "").strip()
+        if "rif_dumobjdt" not in obj:
+            errors.append("%s has no DUMOBJDT; a dummy without one crashes Gunlok "
+                          "during level load" % obj.name)
+        if not name:
+            errors.append("%s has an empty name in the file; it is stored as NULL "
+                          "and no consumer can find it" % obj.name)
+        if obj.parent is not None and "rif_id" in obj.parent:
+            errors.append("%s is parented to %s; only top-level dummies are "
+                          "collected" % (obj.name, obj.parent.name))
+        if name:
+            by_name.setdefault(name.lower(), []).append(obj.name)
+
+    for _name, objs in sorted(by_name.items()):
+        if len(objs) > 1:
+            warnings.append("%d dummies are named %r; the console takes the first "
+                            "match and triggers take the last"
+                            % (len(objs), objs[0]))
+
+    for obj in emitter_objects(collection):
+        for why in emitters.problems(emitter_text_from_speaker(obj)):
+            warnings.append("%s: %s" % (obj.name, why))
+        # ToMap unlinks and frees the record it turns into a sound, so an
+        # emitter's name never reaches the locator system at all.
+        if (obj.get("rif_name", "") or "").lower() in by_name and len(
+                by_name.get((obj.get("rif_name", "") or "").lower(), ())) > 1:
+            warnings.append("%s is an emitter, so its name never resolves -- ToMap "
+                            "frees the record before any consumer sees it" % obj.name)
+    return errors, warnings
 
 
 def _link_into(collection, obj):
@@ -3467,24 +4260,25 @@ def adopt_action(arm_obj, action, name=None):
 
 
 def add_sound(collection, path, sound_file=None):
-    """Add a table entry, as a Speaker. Returns the new Speaker object.
+    """Add a table entry. Returns it.
 
     ``path`` is what the file stores, relative to the install's ``Sound`` folder
     and backslash-separated (``Robots\\GL_click08.wav``). The audio is optional
     and only ever loaded for audition -- export writes the path, never the wave.
     """
-    index = next_sound_index(collection)
-    entry = snd.make_entry(index, path)
-    spk = bpy.data.speakers.new("snd_%02d_%s" % (index, snd.basename(path)))
-    obj = bpy.data.objects.new(spk.name, spk)
-    collection.objects.link(obj)
-    _apply_sound_entry(spk, entry)
+    entries = sound_table(collection)
+    entry = snd.make_entry(next_sound_index(collection), path)
+    entries.append(entry)
+    set_sound_table(collection, entries)
+    collection[SOUND_ACTIVE_PROP] = len(entries) - 1
     if sound_file and os.path.isfile(sound_file):
         # A sound that will not load is never worth failing the operator: the
         # path is what exports, and the audio is only for audition.
         with contextlib.suppress(Exception):
-            spk.sound = bpy.data.sounds.load(sound_file, check_existing=True)
-    return obj
+            sound = bpy.data.sounds.load(sound_file, check_existing=True)
+            sound[SOUND_PATH_PROP] = path
+            sound.use_fake_user = True
+    return entry
 
 
 def sound_events(action):

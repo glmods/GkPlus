@@ -42,6 +42,27 @@ def _sole_collection(name=""):
     return candidates[0], None
 
 
+def _rif_collection_name(context):
+    """The RIF collection the Properties editor is looking at, by name.
+
+    The sound table lives on the collection, so its panel is drawn in the
+    Collection tab -- where ``context.collection`` is whatever the outliner has
+    active, which need not be a RIF at all.
+    """
+    coll = getattr(context, "collection", None)
+    return coll.name if coll is not None and coll.get("rif_id") == "REBINFF2" else ""
+
+
+def _every_sound_event(collection):
+    """Every keyframe sound event in the file, across every sequence."""
+    out = []
+    for action in bpy.data.actions:
+        if action.get("rif_id") != "OBANSEQC":
+            continue
+        out.extend(sc.sound_events(action))
+    return out
+
+
 class IMPORT_SCENE_OT_rif(bpy.types.Operator, ImportHelper):
     """Import a Rebellion RIF file"""
 
@@ -215,6 +236,18 @@ class EXPORT_SCENE_OT_rif(bpy.types.Operator, ExportHelper):
                                                              len(lighting) - 1))
             return {"CANCELLED"}
 
+        # A dummy with no DUMOBJDT, or with an empty name, is a shape the game's
+        # own data never takes -- and the first of the two is an access violation
+        # during level load rather than a quiet failure. Both are refused here,
+        # for the same reason the shared shape id is: discovering it in Gunlok
+        # costs a crash that names neither the file nor the object.
+        dummy_errors, dummy_warnings = sc.dummy_problems(target)
+        if dummy_errors:
+            self.report({"ERROR"}, dummy_errors[0] if len(dummy_errors) == 1
+                        else "%s (and %d other problem(s))"
+                             % (dummy_errors[0], len(dummy_errors) - 1))
+            return {"CANCELLED"}
+
         # Checked before anything is written, so a missing folder does not leave
         # a .rif on disk whose textures never followed it.
         texture_root = bpy.path.abspath(self.texture_dir) if self.texture_dir else ""
@@ -236,8 +269,12 @@ class EXPORT_SCENE_OT_rif(bpy.types.Operator, ExportHelper):
                       stats["lights"], stats["textures"]))
         if stats.get("new_textures"):
             summary += " (%d added)" % stats["new_textures"]
+        # Counted apart, because they are two systems that share nothing: a
+        # table of definitions an animation names, and a placement in the level.
         if stats.get("sounds"):
-            summary += ", %d sound(s)" % stats["sounds"]
+            summary += ", %d INDSOUND entr(ies)" % stats["sounds"]
+        if stats.get("emitters"):
+            summary += ", %d ambient emitter(s)" % stats["emitters"]
 
         if self.textures != "NONE":
             written = sc.write_textures(target, texture_root,
@@ -288,6 +325,12 @@ class EXPORT_SCENE_OT_rif(bpy.types.Operator, ExportHelper):
                 "if that was not deliberate." % (summary, stats["lighting_dropped"],
                                                  sc.LIGHT_COLOR_ATTR),
             )
+            return {"FINISHED"}
+        if dummy_warnings:
+            self.report({"WARNING"}, "%s; %s%s"
+                        % (summary, dummy_warnings[0],
+                           " (and %d more)" % (len(dummy_warnings) - 1)
+                           if len(dummy_warnings) > 1 else ""))
             return {"FINISHED"}
         self.report({"INFO"}, summary)
         return {"FINISHED"}
@@ -423,7 +466,7 @@ class OBJECT_OT_rif_add_sequence(bpy.types.Operator):
 
 
 class SCENE_OT_rif_add_sound(bpy.types.Operator):
-    """Add an entry to this file's sound table, as a Speaker"""
+    """Add an entry to this file's INDSOUND table, which an animation keyframe names"""
 
     bl_idname = "scene.rif_add_sound"
     bl_label = "Add RIF Sound"
@@ -457,10 +500,151 @@ class SCENE_OT_rif_add_sound(bpy.types.Operator):
         if not path:
             self.report({"ERROR"}, "A sound needs a path; that is what the file stores")
             return {"CANCELLED"}
-        obj = sc.add_sound(target, path, bpy.path.abspath(self.filepath)
-                           if self.filepath else None)
-        self.report({"INFO"}, "Added %s as sound %d"
-                              % (path, obj.data.get("rif_sound_index", 0)))
+        entry = sc.add_sound(target, path, bpy.path.abspath(self.filepath)
+                             if self.filepath else None)
+        self.report({"INFO"}, "Added %s as sound %d" % (path, entry["index"]))
+        return {"FINISHED"}
+
+
+class SCENE_OT_rif_remove_sound(bpy.types.Operator):
+    """Drop the selected entry from this file's INDSOUND table"""
+
+    bl_idname = "scene.rif_remove_sound"
+    bl_label = "Remove RIF Sound"
+    bl_options = {"REGISTER", "UNDO"}
+
+    collection: StringProperty(name="Collection", default="")
+
+    def execute(self, context):
+        target, error = _sole_collection(self.collection or _rif_collection_name(context))
+        if target is None:
+            self.report({"ERROR"}, error)
+            return {"CANCELLED"}
+        _at, entry = sc.active_sound(target)
+        if entry is None or not sc.remove_sound(target):
+            self.report({"WARNING"}, "no table entry selected")
+            return {"CANCELLED"}
+        # A dangling index is legal shipped data, so removing an entry a keyframe
+        # still names is a warning rather than a refusal -- the engine's null-slot
+        # check makes it silent, and 12 shipped files rely on exactly that.
+        using = [e for e in _every_sound_event(target) if e["index"] == entry["index"]]
+        if using:
+            self.report({"WARNING"},
+                        "removed slot %d; %d keyframe(s) still name it and will "
+                        "now play nothing" % (entry["index"], len(using)))
+            return {"FINISHED"}
+        self.report({"INFO"}, "removed slot %d (%s)" % (entry["index"], entry["path"]))
+        return {"FINISHED"}
+
+
+class SCENE_OT_rif_select_sound(bpy.types.Operator):
+    """Edit this entry of the sound table"""
+
+    bl_idname = "scene.rif_select_sound"
+    bl_label = "Select RIF Sound"
+    bl_options = {"REGISTER", "UNDO"}
+
+    index: IntProperty(name="Row", default=0, min=0)
+    collection: StringProperty(name="Collection", default="")
+
+    def execute(self, context):
+        target, error = _sole_collection(self.collection or _rif_collection_name(context))
+        if target is None:
+            self.report({"ERROR"}, error)
+            return {"CANCELLED"}
+        target[sc.SOUND_ACTIVE_PROP] = self.index
+        return {"FINISHED"}
+
+
+class OBJECT_OT_rif_add_dummy(bpy.types.Operator):
+    """Make the selected empties top-level DUMMYOBJ locators"""
+
+    bl_idname = "object.rif_add_dummy"
+    bl_label = "Add as Locator"
+    bl_options = {"REGISTER", "UNDO"}
+
+    collection: StringProperty(
+        name="Collection",
+        description="Which RIF to add to. Empty uses the only one present",
+        default="",
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.selected_objects or context.object)
+
+    def execute(self, context):
+        target, error = _sole_collection(self.collection)
+        if target is None:
+            self.report({"ERROR"}, error)
+            return {"CANCELLED"}
+
+        targets = context.selected_objects or ([context.object] if context.object else [])
+        added, refused = 0, []
+        for obj in targets:
+            why = sc.adopt_dummy(target, obj)
+            if why is None:
+                added += 1
+            else:
+                refused.append(why)
+
+        if refused and not added:
+            self.report({"ERROR"}, refused[0])
+            return {"CANCELLED"}
+        summary = ("Added %d locator(s) to %s; the engine finds these by name"
+                   % (added, target.name))
+        if refused:
+            summary += "; skipped %d (%s)" % (len(refused), refused[0])
+        self.report({"WARNING"} if refused else {"INFO"}, summary)
+        return {"FINISHED"}
+
+
+class SCENE_OT_rif_add_emitter(bpy.types.Operator):
+    """Add a looping ambient sound at the 3D cursor: a DUMMYOBJ carrying a DUMOBJTX"""
+
+    bl_idname = "scene.rif_add_emitter"
+    bl_label = "Add Ambient Emitter"
+    bl_options = {"REGISTER", "UNDO"}
+
+    wav: StringProperty(
+        name="Sound",
+        description=(
+            "The .wav this emitter loops, as a bare file name. The engine "
+            "resolves it against the sound system's own directory list; the "
+            "shipped ambient set lives in Sound\\environ"
+        ),
+        default="GL_Wind03.wav",
+    )
+    name: StringProperty(
+        name="Name",
+        description=(
+            "The dummy's name in the file. An emitter's name never resolves - "
+            "ToMap frees the record - but an empty one is stored as NULL, which "
+            "no shipped dummy is"
+        ),
+        default="",
+    )
+    collection: StringProperty(name="Collection", default="")
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        target, error = _sole_collection(self.collection)
+        if target is None:
+            self.report({"ERROR"}, error)
+            return {"CANCELLED"}
+        obj, why = sc.add_emitter(target, self.wav, self.name or None)
+        if obj is None:
+            self.report({"ERROR"}, why)
+            return {"CANCELLED"}
+        obj.location = context.scene.cursor.location
+        if obj.data.sound is None:
+            self.report({"WARNING"},
+                        "%s added, but %s was not found under the install's Sound "
+                        "folder -- the name still exports" % (obj.name, self.wav))
+            return {"FINISHED"}
+        self.report({"INFO"}, "Added %s, looping %s" % (obj.name, self.wav))
         return {"FINISHED"}
 
 
@@ -789,6 +973,177 @@ def _set_shape_id(self, value):
     sc.set_rif_shape_id(self, value)
 
 
+def _active_collection(context):
+    obj = context.object
+    for coll in (obj.users_collection if obj else ()):
+        if coll.get("rif_id") == "REBINFF2":
+            return coll
+    return next((c for c in bpy.data.collections if c.get("rif_id") == "REBINFF2"),
+                None)
+
+
+def _cutscene_root(context):
+    """The cutscene Empty at or above the active object."""
+    obj = context.object
+    while obj is not None:
+        if obj.get("rif_cut_role") == sc.CUT_SCENE:
+            return obj
+        obj = obj.parent
+    return None
+
+
+class SCENE_OT_rif_add_cutscene(bpy.types.Operator):
+    """Add a cutscene: a camera, the empty it looks at, and an end event"""
+
+    bl_idname = "scene.rif_add_cutscene"
+    bl_label = "Add Cutscene"
+    bl_options = {"REGISTER", "UNDO"}
+
+    name: StringProperty(
+        name="Name",
+        description=("What PLAY CUTSCENE matches, and what the level's GLS "
+                     "`camera track` section must name"),
+        default="new cutscene")
+
+    @classmethod
+    def poll(cls, context):
+        return _active_collection(context) is not None
+
+    def execute(self, context):
+        collection = _active_collection(context)
+        if collection is None:
+            self.report({"ERROR"}, "No Gunlok RIF collection")
+            return {"CANCELLED"}
+        existing = {r.get("rif_cut_name", "") for r in sc.cutscene_roots(collection)}
+        if self.name in existing:
+            self.report({"ERROR"}, "A cutscene called %r already exists; the "
+                                   "name is the key PLAY CUTSCENE matches"
+                        % self.name)
+            return {"CANCELLED"}
+
+        camera = context.object if (context.object
+                                    and context.object.type == "CAMERA") else None
+        root = sc.add_cutscene(collection, self.name, camera=camera)
+        for obj in context.selected_objects:
+            obj.select_set(False)
+        root.select_set(True)
+        context.view_layer.objects.active = root
+        self.report({"INFO"},
+                    "Added %r. Key the camera's location to build the path, then "
+                    "declare it in the level's .gls with: camera track { file "
+                    "\"...\" name \"%s\" }" % (self.name, self.name))
+        return {"FINISHED"}
+
+
+class OBJECT_OT_rif_cutscene_preview(bpy.types.Operator):
+    """Draw the Catmull-Rom path the engine will actually follow"""
+
+    bl_idname = "object.rif_cutscene_preview"
+    bl_label = "Preview Cutscene Path"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return _cutscene_root(context) is not None
+
+    def execute(self, context):
+        root = _cutscene_root(context)
+        made = sc.preview_cutscene_path(root)
+        if not made:
+            self.report({"WARNING"},
+                        "No track has two or more location keyframes yet")
+            return {"CANCELLED"}
+        self.report({"INFO"},
+                    "Drew %d path(s). The keyframes are spline control points, "
+                    "so the curve does not pass straight between them - on the "
+                    "shipped paths it bulges a median 5.6%% of segment length "
+                    "(max 47%%)." % made)
+        return {"FINISHED"}
+
+
+class OBJECT_OT_rif_cutscene_add_event(bpy.types.Operator):
+    """Add an event to this cutscene's camera track"""
+
+    bl_idname = "object.rif_cutscene_add_event"
+    bl_label = "Add Cutscene Event"
+    bl_options = {"REGISTER", "UNDO"}
+
+    kind: EnumProperty(
+        name="Event",
+        items=(("END", "End", "End the cutscene and hand control back"),
+               ("CONSOLE", "Console Command", "Queue a console line")),
+        default="END")
+    command: StringProperty(
+        name="Command",
+        description="The console line to queue, for a Console Command event",
+        default="")
+    position: FloatProperty(
+        name="At point",
+        description=("Where in the path this fires, in point index space: 2.5 "
+                     "is halfway between the third and fourth control points"),
+        default=0.0, min=0.0)
+
+    @classmethod
+    def poll(cls, context):
+        return _cutscene_root(context) is not None
+
+    def execute(self, context):
+        root = _cutscene_root(context)
+        if self.kind == "CONSOLE" and not self.command.strip():
+            self.report({"ERROR"}, "A Console Command event needs a command")
+            return {"CANCELLED"}
+        added = sc.add_cutscene_event(root, self.kind, self.command,
+                                      self.position)
+        if added is None:
+            self.report({"ERROR"}, "This cutscene has no camera track")
+            return {"CANCELLED"}
+        self.report({"INFO"}, "Added %s event at point %.2f"
+                    % (self.kind.lower(), self.position))
+        return {"FINISHED"}
+
+
+class OBJECT_PT_rif_cutscene(bpy.types.Panel):
+    bl_label = "Gunlok Cutscene"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "object"
+
+    @classmethod
+    def poll(cls, context):
+        return (_cutscene_root(context) is not None
+                or _active_collection(context) is not None)
+
+    def draw(self, context):
+        layout = self.layout
+        root = _cutscene_root(context)
+        if root is None:
+            layout.operator(SCENE_OT_rif_add_cutscene.bl_idname, icon="ADD")
+            layout.label(text="Select a cutscene to edit it", icon="INFO")
+            return
+
+        col = layout.column()
+        col.prop(root, '["rif_cut_name"]', text="Name")
+        col.label(text="PLAY CUTSCENE %s" % root.get("rif_cut_name", ""),
+                  icon="CONSOLE")
+
+        obj = context.object
+        if obj is not None and obj.get("rif_cut_role") == sc.CUT_TRACK:
+            box = layout.box()
+            box.label(text="Track: %s" % obj.get("rif_track_name", ""))
+            if obj.type == "CAMERA":
+                box.prop(obj.data, "angle", text="Field of view")
+            keys = len(sc.track_frames(obj))
+            box.label(text="%d control point(s)" % keys,
+                      icon="KEYFRAME" if keys else "ERROR")
+
+        layout.operator(OBJECT_OT_rif_cutscene_preview.bl_idname, icon="CURVE_PATH")
+        layout.operator(OBJECT_OT_rif_cutscene_add_event.bl_idname, icon="ADD")
+
+        problems = sc.cutscene_problems_for(root)
+        for why in problems:
+            layout.label(text=why, icon="ERROR")
+
+
 class OBJECT_PT_rif(bpy.types.Panel):
     bl_label = "Gunlok RIF"
     bl_space_type = "PROPERTIES"
@@ -810,6 +1165,8 @@ class OBJECT_PT_rif(bpy.types.Panel):
             col.label(text="Not part of a RIF file", icon="INFO")
             if sc.rif_collections():
                 col.operator(OBJECT_OT_rif_add.bl_idname, icon="ADD")
+                if obj.type in ("EMPTY", "SPEAKER"):
+                    col.operator(OBJECT_OT_rif_add_dummy.bl_idname, icon="EMPTY_AXIS")
             else:
                 col.operator(SCENE_OT_rif_new.bl_idname, icon="FILE_NEW")
             return
@@ -825,6 +1182,9 @@ class OBJECT_PT_rif(bpy.types.Panel):
             # Deliberately not obj.name: the outliner name is uniquified by
             # Blender and is not what the engine resolves by strcmp.
             layout.prop(obj, "rif_object_name", text="Name in file")
+        if chunk_id == "DUMMYOBJ":
+            self._draw_dummy(obj, layout)
+            return
         if chunk_id != "RBOBJECT" or obj.data is None:
             return
 
@@ -897,6 +1257,48 @@ class OBJECT_PT_rif(bpy.types.Panel):
             nav.label(text="%d of %d face(s) walkable" % (n, len(me.polygons)))
         nav.operator(OBJECT_OT_rif_navmesh_preview.bl_idname,
                      text="Preview Navmesh", icon="MESH_GRID")
+
+    @staticmethod
+    def _draw_dummy(obj, layout):
+        """A locator's panel. The name *is* the API, so it is what this is about.
+
+        The engine builds strings like ``Goodie A2``, ``baddie c`` and ``Flag_3``
+        itself and scans ``MapAuxObjectList`` for them, always case-insensitively.
+        A dummy that is an emitter is a different thing entirely -- ``ToMap``
+        frees the record before any name-matching consumer runs -- so the panel
+        says which of the two this one is rather than showing both.
+        """
+        box = layout.box()
+        if sc.EMITTER_TEXT_PROP in obj:
+            box.label(text="Ambient sound emitter (DUMOBJTX)", icon="SPEAKER")
+            box.label(text="ToMap turns this into a looping emitter and frees the")
+            box.label(text="record, so its name never resolves. Edit it in the")
+            box.label(text="Speaker's own Data tab.")
+        else:
+            box.label(text="Named locator", icon="EMPTY_AXIS")
+            box.label(text="Found by name: console and trigger positions,")
+            box.label(text="MP and enemy spawns (Goodie/Baddie), CTF points.")
+            box.label(text="A `for \"<rif object>\"` spawn point is an RBOBJECT,")
+            box.label(text="never this -- the two are disjoint namespaces.")
+
+        if "rif_dumobjdt" not in obj:
+            err = layout.box()
+            err.label(text="No DUMOBJDT -- export refuses this", icon="ERROR")
+            err.label(text="A dummy without one is an unchecked null dereference")
+            err.label(text="during level load. Re-add it with Add as Locator.")
+
+        collection = sc.collection_for(obj)
+        if collection is None:
+            return
+        name = (obj.get("rif_name", "") or "").strip()
+        sharing = [o for o in collection.objects
+                   if o.get("rif_id") == "DUMMYOBJ" and name
+                   and (o.get("rif_name", "") or "").strip().lower() == name.lower()]
+        if len(sharing) > 1:
+            warn = layout.box()
+            warn.label(text="%d dummies share this name" % len(sharing), icon="INFO")
+            warn.label(text="Legal and shipped (62 files), but the console takes")
+            warn.label(text="the first match where triggers take the last.")
 
     @staticmethod
     def _draw_light(obj, layout):
@@ -1002,7 +1404,94 @@ class OBJECT_PT_rif(bpy.types.Panel):
         box.operator(POSE_OT_rif_set_sound.bl_idname, icon="ADD")
 
 
-class DATA_PT_rif_sound(bpy.types.Panel):
+class COLLECTION_PT_rif_sounds(bpy.types.Panel):
+    """The file's INDSOUND table, which is file data and so lives on the collection."""
+
+    bl_label = "Gunlok RIF Sounds"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "collection"
+
+    @classmethod
+    def poll(cls, context):
+        coll = getattr(context, "collection", None)
+        return coll is not None and coll.get("rif_id") == "REBINFF2"
+
+    def draw(self, context):
+        coll = context.collection
+        layout = self.layout
+        entries = sc.sound_table(coll)
+
+        box = layout.box()
+        box.label(text="INDSOUND: sounds an animation keyframe names", icon="SEQ_HISTOGRAM")
+        box.label(text="No position -- these play wherever the model is.", icon="INFO")
+
+        # Drawn by hand rather than with `template_list`, and that is a measured
+        # decision, not a preference. The table is a plain ID property -- the
+        # same storage `rif_bmpnames` uses, and the reason `scene.py` needs no
+        # registered RNA at all, which is what lets every test drive it with the
+        # addon unregistered. `template_list` cannot take one: it resolves the
+        # bracket form `["rif_indsound"]` and then **crashes Blender 5.2** in
+        # `RNA_property_collection_length` (a null dereference through
+        # `rna_property_rna_or_id_get`), which a background test cannot see
+        # because nothing there ever draws. A registered `CollectionProperty`
+        # would satisfy it and would mean a second place the table lives.
+        #
+        # So this is the approximation the design accepts: a row per entry,
+        # clicking one selects it. No filtering, no sorting, no drag-reorder --
+        # and reordering would mean nothing anyway, since a slot is an id rather
+        # than a position.
+        active_at = int(coll.get(sc.SOUND_ACTIVE_PROP, 0))
+        box = layout.box()
+        rows = box.column(align=True)
+        for i, item in enumerate(entries):
+            row = rows.row(align=True)
+            op = row.operator(SCENE_OT_rif_select_sound.bl_idname,
+                              text="%3d   %s" % (item["index"],
+                                                 item.get("path") or "(no path)"),
+                              icon="PLAY_SOUND" if sc.sound_audio(item) else "BLANK1",
+                              depress=(i == active_at))
+            op.index = i
+        controls = box.row(align=True)
+        controls.operator(SCENE_OT_rif_add_sound.bl_idname, text="Add", icon="ADD")
+        controls.operator(SCENE_OT_rif_remove_sound.bl_idname, text="Remove",
+                          icon="REMOVE")
+
+        _at, entry = sc.active_sound(coll)
+        if entry is None:
+            layout.label(text="No entries. A file may legitimately have none.", icon="INFO")
+            return
+
+        sub = layout.column()
+        sub.use_property_split = True
+        sub.prop(coll, "rif_sound_slot", text="Slot")
+        sub.prop(coll, "rif_sound_path", text="Path in file")
+        sub.prop(coll, "rif_sound_min_distance", text="Min distance (mm)")
+        sub.prop(coll, "rif_sound_max_distance", text="Max distance (mm)")
+        sub.prop(coll, "rif_sound_volume", text="Volume (0-127)")
+        sub.prop(coll, "rif_sound_pitch", text="Pitch offset")
+
+        clashes = [e for e in entries if e["index"] == entry["index"]]
+        if len(clashes) > 1:
+            warn = layout.box()
+            warn.label(text="Slot %d is claimed by %d entries" % (entry["index"], len(clashes)),
+                       icon="ERROR")
+            warn.label(text="The loader installs them into one array slot; the last wins.")
+
+        audio = sc.sound_audio(entry)
+        if audio is None:
+            layout.label(text="No audio found under the install's Sound folder. "
+                              "The path still exports.", icon="INFO")
+        else:
+            layout.label(text="Auditioning %s" % os.path.basename(audio.filepath),
+                         icon="PLAY_SOUND")
+        layout.label(text="Export writes the path; the wave is never written back.",
+                     icon="INFO")
+
+
+class DATA_PT_rif_emitter(bpy.types.Panel):
+    """A Speaker's panel: the ambient emitter, which is the positional sound system."""
+
     bl_label = "Gunlok RIF"
     bl_space_type = "PROPERTIES"
     bl_region_type = "WINDOW"
@@ -1014,29 +1503,43 @@ class DATA_PT_rif_sound(bpy.types.Panel):
         return obj is not None and obj.type == "SPEAKER" and obj.data is not None
 
     def draw(self, context):
-        spk = context.object.data
+        obj = context.object
         layout = self.layout
         layout.use_property_split = True
-        if "rif_sound_index" not in spk:
-            layout.label(text="Not a RIF sound", icon="INFO")
-            layout.operator(SCENE_OT_rif_add_sound.bl_idname, icon="ADD")
+        if sc.EMITTER_TEXT_PROP not in obj:
+            layout.label(text="Not a RIF ambient emitter", icon="INFO")
+            layout.label(text="A positional sound is a DUMMYOBJ carrying a DUMOBJTX.")
+            layout.operator(SCENE_OT_rif_add_emitter.bl_idname, icon="ADD")
             return
-        layout.label(text="Table slot %d" % spk["rif_sound_index"])
-        layout.prop(spk, "rif_sound_file", text="Path in file")
-        # These three ARE the stored fields, shown as what they are rather than
-        # duplicated into custom properties: the exporter reads them back off the
-        # speaker, in millimetres and 0..127.
+
+        spk = obj.data
+        layout.prop(obj, "rif_emitter_wav", text="Sound (.wav)")
+        # These three ARE the stored directives, shown as what they are rather
+        # than duplicated into custom properties: export splices them back into
+        # the text, and only the ones that changed.
         col = layout.column(align=True)
-        col.prop(spk, "distance_reference", text="Min distance (m)")
-        col.prop(spk, "distance_max", text="Max distance (m)")
-        col.prop(spk, "volume", text="Volume")
-        layout.label(text="Writes %d / %d mm, volume %d"
-                          % (round(spk.distance_reference * 1000),
-                             round(spk.distance_max * 1000),
-                             round(max(0.0, min(1.0, spk.volume)) * 127)),
-                     icon="INFO")
+        col.prop(spk, "distance_reference", text="Min distance (I)")
+        col.prop(spk, "distance_max", text="Max distance (R)")
+        col.prop(spk, "pitch", text="Pitch (P)")
+
+        vol = layout.box()
+        vol.label(text="Volume (V) is parsed and discarded", icon="ERROR")
+        vol.prop(spk, "volume", text="Volume")
+        vol.label(text="SoundSystem_AddAmbientEmitter never reads it -- the sample's "
+                       "own default wins. 514 shipped emitters carry a V and not one "
+                       "does anything. Written for fidelity only.")
+
+        info = layout.column(align=True)
+        vals = sc.emitter_values(obj)
+        info.label(text="Writes: %s" % (sc.emitter_text_from_speaker(obj)
+                                        .replace("\r\n", " / ")))
+        if not vals["R"]:
+            info.label(text="Max distance 0 means the sample's own, not silence.",
+                       icon="INFO")
+        for why in sc.emitters.problems(sc.emitter_text_from_speaker(obj)):
+            info.label(text=why, icon="ERROR")
         if spk.sound is None:
-            layout.label(text="No audio loaded; the path still exports.", icon="INFO")
+            info.label(text="No audio loaded; the name still exports.", icon="INFO")
 
 
 def _get_duration_ms(self):
@@ -1073,12 +1576,52 @@ def _set_loop_mode(self, value):
                             heads.set_seq_loop_mode(0 if cur is None else cur, mode))
 
 
-def _get_sound_file(self):
-    return self.get("rif_sound_path", "") or ""
+# The INDSOUND table's fields, as accessors over the *active* row.
+#
+# The table is one ID property holding every entry, which is what keeps it whole
+# and in order -- so there is no per-entry RNA path to draw a field from, and
+# these read and write whichever row the UIList has selected. The same get/set
+# shape `rif_texture_name` and `rif_duration_ms` already use.
 
 
-def _set_sound_file(self, value):
-    self["rif_sound_path"] = (value or "").strip()
+def _sound_field(name, default=0):
+    def get(self):
+        _at, entry = sc.active_sound(self)
+        return default if entry is None else entry.get(name, default)
+
+    def set_(self, value):
+        sc.set_sound_field(self, name, value)
+
+    return get, set_
+
+
+def _get_sound_slot(self):
+    _at, entry = sc.active_sound(self)
+    return 0 if entry is None else int(entry["index"])
+
+
+def _set_sound_slot(self, value):
+    # Not guarded against a clash: an index is a stable id the *file* assigns,
+    # duplicates are visible in the panel, and refusing an edit mid-drag is
+    # worse than saying what it did.
+    sc.set_sound_field(self, "index", max(0, min(int(value), 127)))
+
+
+def _get_sound_path(self):
+    _at, entry = sc.active_sound(self)
+    return "" if entry is None else entry.get("path", "")
+
+
+def _set_sound_path(self, value):
+    sc.set_sound_field(self, "path", (value or "").strip())
+
+
+def _get_emitter_wav(self):
+    return sc.emitters.wav(sc.emitter_text(self))
+
+
+def _set_emitter_wav(self, value):
+    sc.set_emitter_wav(self, (value or "").strip())
 
 
 class MATERIAL_PT_rif(bpy.types.Panel):
@@ -1138,13 +1681,19 @@ def _menu_object(self, context):
     self.layout.separator()
     self.layout.operator(SCENE_OT_rif_new.bl_idname, text="New Gunlok RIF")
     self.layout.operator(OBJECT_OT_rif_add.bl_idname, text="Add to Gunlok RIF")
+    self.layout.operator(OBJECT_OT_rif_add_dummy.bl_idname,
+                         text="Add as Gunlok RIF Locator")
     self.layout.operator(OBJECT_OT_rif_add_sequence.bl_idname,
                          text="Add Action to Gunlok RIF")
     self.layout.operator(SCENE_OT_rif_add_sound.bl_idname, text="Add Gunlok RIF Sound")
+    self.layout.operator(SCENE_OT_rif_add_emitter.bl_idname,
+                         text="Add Gunlok Ambient Emitter")
     self.layout.operator(SCENE_OT_rif_preview_setup.bl_idname,
                          text="Set Up Gunlok Preview")
     self.layout.operator(SCENE_OT_rif_preview_restore.bl_idname,
                          text="Restore Authored Materials")
+    self.layout.operator(SCENE_OT_rif_add_cutscene.bl_idname,
+                         text="Add Gunlok Cutscene")
 
 
 _CLASSES = (IMPORT_SCENE_OT_rif, EXPORT_SCENE_OT_rif, SCENE_OT_rif_new,
@@ -1152,9 +1701,15 @@ _CLASSES = (IMPORT_SCENE_OT_rif, EXPORT_SCENE_OT_rif, SCENE_OT_rif_new,
             OBJECT_OT_rif_new_light_id, OBJECT_OT_rif_navmesh_preview,
             OBJECT_OT_rif_enable_lighting, OBJECT_OT_rif_adopt_color_attribute,
             SCENE_OT_rif_preview_setup, SCENE_OT_rif_preview_restore,
-            SCENE_OT_rif_add_sound, POSE_OT_rif_set_sound,
+            SCENE_OT_rif_add_sound, SCENE_OT_rif_remove_sound,
+            SCENE_OT_rif_select_sound, POSE_OT_rif_set_sound,
+            OBJECT_OT_rif_add_dummy, SCENE_OT_rif_add_emitter,
             ACTION_OT_rif_toggle_setting,
-            OBJECT_PT_rif, DATA_PT_rif_sound, MATERIAL_PT_rif)
+            SCENE_OT_rif_add_cutscene, OBJECT_OT_rif_cutscene_preview,
+            OBJECT_OT_rif_cutscene_add_event,
+            COLLECTION_PT_rif_sounds,
+            OBJECT_PT_rif, OBJECT_PT_rif_cutscene, DATA_PT_rif_emitter,
+            MATERIAL_PT_rif)
 
 
 def register():
@@ -1187,16 +1742,59 @@ def register():
             "the image in the shader does nothing"
         ),
         get=_get_bmp_name, set=_set_bmp_name)
-    # Same reason as rif_texture_name: the ID property it reads is
-    # `rif_sound_path`, and an RNA property of that name would shadow it.
-    bpy.types.Speaker.rif_sound_file = StringProperty(
+    # The INDSOUND table's active row. Named `rif_sound_*` on the Collection,
+    # while the table itself is `rif_indsound` -- an RNA property may not shadow
+    # the ID property it reads, which is the same trap `rif_texture_name` avoids.
+    bpy.types.Collection.rif_sound_slot = IntProperty(
+        name="Slot",
+        description=(
+            "The table index an animation keyframe names. A stable, sparse id "
+            "that means nothing outside this file; 0 is how a frame says "
+            "\"no sound\", so it is never allocated"
+        ),
+        min=0, max=127, get=_get_sound_slot, set=_set_sound_slot)
+    bpy.types.Collection.rif_sound_path = StringProperty(
         name="Path in file",
         description=(
             "What the .rif stores for this sound, relative to the install's "
             "Sound folder and backslash-separated. This is what export writes - "
             "the loaded audio is for audition only"
         ),
-        get=_get_sound_file, set=_set_sound_file)
+        get=_get_sound_path, set=_set_sound_path)
+    _min_get, _min_set = _sound_field("min_distance")
+    bpy.types.Collection.rif_sound_min_distance = IntProperty(
+        name="Min distance",
+        description="Millimetres. 5,000 in 231 of the 240 shipped entries",
+        min=0, soft_max=100000, get=_min_get, set=_min_set)
+    _max_get, _max_set = _sound_field("max_distance")
+    bpy.types.Collection.rif_sound_max_distance = IntProperty(
+        name="Max distance",
+        description="Millimetres. 40,000 in 237 of the 240 shipped entries",
+        min=0, soft_max=100000, get=_max_get, set=_max_set)
+    _vol_get, _vol_set = _sound_field("volume")
+    bpy.types.Collection.rif_sound_volume = IntProperty(
+        name="Volume",
+        description=(
+            "0-127, and unlike an ambient emitter's V directive this one is "
+            "read: the shipped entries take 20 distinct values"
+        ),
+        min=0, max=127, get=_vol_get, set=_vol_set)
+    _pitch_get, _pitch_set = _sound_field("pitch")
+    bpy.types.Collection.rif_sound_pitch = IntProperty(
+        name="Pitch offset",
+        description=(
+            "0 in 225 of the 240 shipped entries; the rest are -640, 512 or "
+            "-1280. The unit is not measured"
+        ),
+        soft_min=-4096, soft_max=4096, get=_pitch_get, set=_pitch_set)
+    bpy.types.Object.rif_emitter_wav = StringProperty(
+        name="Sound (.wav)",
+        description=(
+            "Line 2 of this emitter's DUMOBJTX: the looping ambient sound, as a "
+            "bare file name the sound system resolves against its own directory "
+            "list. Editing it rewrites that line and nothing else"
+        ),
+        get=_get_emitter_wav, set=_set_emitter_wav)
     bpy.types.Action.rif_duration_ms = IntProperty(
         name="Duration",
         description="OBASEQTM: how long this sequence runs, in milliseconds",
@@ -1231,7 +1829,13 @@ def unregister():
     del bpy.types.Action.rif_loop_mode
     del bpy.types.Action.rif_sequence_speed
     del bpy.types.Action.rif_duration_ms
-    del bpy.types.Speaker.rif_sound_file
+    del bpy.types.Object.rif_emitter_wav
+    del bpy.types.Collection.rif_sound_pitch
+    del bpy.types.Collection.rif_sound_volume
+    del bpy.types.Collection.rif_sound_max_distance
+    del bpy.types.Collection.rif_sound_min_distance
+    del bpy.types.Collection.rif_sound_path
+    del bpy.types.Collection.rif_sound_slot
     del bpy.types.Material.rif_texture_name
     del bpy.types.Object.rif_shape_id
     del bpy.types.Object.rif_object_name

@@ -25,7 +25,9 @@ The split is the point: `io_scene_rif/rif.py` (container: huffman, chunk tree, s
 `io_scene_rif/shapes.py` (REBSHAPE geometry), `io_scene_rif/heads.py` (the record chunks —
 `OBJHEAD1`, `SHPHEAD1`, `OBJHIERD`, `OBASEQHD`, `OBASEQFR` — plus the keyframe-timing rule),
 `io_scene_rif/bmpnames.py` (the texture table),
-`io_scene_rif/sounds.py` (the `INDSOUND` sound table) and
+`io_scene_rif/sounds.py` (the `INDSOUND` sound table),
+`io_scene_rif/emitters.py` (the `DUMOBJTX` ambient-emitter grammar — a different
+system entirely, see below) and
 `io_scene_rif/rim.py` (`.RIM` textures: IFF container, DXT1/DXT3 decode, palettized `BODY` both
 ways) import **no `bpy`**, so
 `blender/tests/` exercises them over all 563 shipped files with Blender absent — the opposite of
@@ -248,6 +250,105 @@ These pin the design, in roughly decreasing order of how much everything else re
   shape. AvP's `ChunkPoly` is *not* Gunlok's — it has an explicit `num_verts` and `vert_ind[4]`.
   Every one of those was measured across all 563 files; the old entries read like plausible
   guesses, which is what they were.
+- **A decoded chunk body has to be *flat*, and that is what shapes the cutscene codecs.**
+  `schema.py` can express a fixed field list and nothing else, so the eight variable-length
+  cutscene chunks — a padded string, a counted array, a tagged record stream — get hand-written
+  decode/encode pairs in `schema.CODECS`, consulted before `STRING_CHUNKS` and `SCHEMA`. The
+  representation is constrained by storage, not by the format: `_unpack_absorbed` converts each
+  stored value with a **single `list(val)`**, so a value may be a scalar, a string, or a flat
+  homogeneous list — never nested, and never mixing ints with floats. That is why `CUTEVENT`'s
+  records come back as parallel arrays (`kinds` / `headers` / `payload` / `payload_counts`, plus
+  the per-record strings joined by `\n`) rather than as the list of dicts the format describes.
+  The trap is that a nested list round-trips perfectly in pure Python and only fails once a
+  `.blend` is involved, so `test_schema.py` cannot see it — `tests/test_cutscene.py` checks the
+  storable shape directly, and the `.blend` round trip was confirmed on `level01.RIF` and on
+  `city ruins.RIF`, whose 0-record `CUTEVENT` is the empty-array edge case.
+  Two things are carried rather than regenerated for a reason: a point's packed time keeps its
+  **top byte**, which the engine masks off but 125 of 763 shipped points have set, and
+  `CUTTRNAM`/`CTUSRHIE` left `STRING_CHUNKS` because they are *not* bare strings — the trailing
+  int32 they carry were being stored as `padding`.
+- **A cutscene is real datablocks, and the camera is two objects rather than one.**
+  `cutscene.py` (no `bpy`) turns the absorbed `REBENVDT/SPECLOBJ` subtree into nested objects and
+  back; `scene.py` builds a Camera, an Empty it looks at, and an Empty per participant, with the
+  path in **location F-curves** — no second copy of it anywhere, the same rule `rif_light` follows.
+  Four things make that work, each of which fails silently if you get it wrong:
+  - **The camera's rotation is never exported.** The engine derives orientation as a look-at
+    between two pseudo-participants — `is_camera == 0` supplies the position, `flags` bit 0 the
+    target — so a Blender camera's rotation means nothing and the quaternions in the `CUTPOINT`
+    trailer orient *actors*. Author with a Track To constraint.
+  - **One frame is one tick.** The engine's interval is 40 ms and all 763 shipped durations are a
+    multiple of it, so keying at `cutscene.FPS` (25) makes a keyframe number a lossless duration
+    and removes any need for a parallel array of times.
+  - **A stored duration of 0 on a non-final point means one *second*, not zero.** 129 of 341
+    shipped non-final points store it. Building frames from the raw value puts two control points
+    on one keyframe, Blender keeps one, and the path silently shortens — which is exactly what the
+    first version did. `effective_durations` substitutes; `zero_flags` remembers which encoding to
+    write back. That flag is safe to carry beside the keyframes precisely because both encodings
+    play identically, so a desynced flag can only choose the other spelling of the same duration.
+  - **`_suspend_animation` must skip these objects.** It clears every action to read the rest pose,
+    which for a cutscene track deletes the data — the exporter then reads one posed location and
+    writes a one-point path. The symptom is a path that loses every point but the last.
+  Blender's F-curve is **not** the engine's curve (Bezier vs uniform Catmull-Rom), so keys are
+  drawn as LINEAR and `preview_cutscene_path` builds the real spline as a poly curve carrying no
+  `rif_` id, so export skips it like a Speaker. On the shipped paths the spline departs from the
+  straight line between its own control points by a median 5.6% of segment length and up to 47%
+  (3.5 m), so this is not a cosmetic preview. The loader synthesises the two phantom end control
+  points itself — **never write them**.
+  Verified: all 14 cutscene-bearing levels, 34 cutscenes, 2,517 chunks byte-identical through
+  import → `.blend` → reset → reopen → export, plus `tests/test_cutscene_authoring.py` building one
+  from nothing and reading it back off the wire.
+- **And verified in the running game, which took three false results to get right.** `level01.RIF`
+  exported and served through the mod VFS renders `PLAY CUTSCENE first contact` at MAE 7.95 against
+  stock, where two *stock* runs differ by 7.35 — inside the noise. The control (every camera path
+  moved 3 m) renders at 24.62. Three things made earlier versions of this test lie, all worth
+  knowing before running another:
+  - **Renaming a mod directory does not disable it.** PhysFS mounts every entry under
+    `<Gunlok>\gkplus\mods`, so `cutscene-test.disabled` is still mounted and still serves. The
+    "baseline" ran the mod for several rounds; `mods.served` read 3 with the folder renamed and 0
+    only once it was moved out of the tree entirely. Move it, don't rename it.
+  - **`mods.served` is 0 until something has been asked of the VFS**, so querying it before
+    `levels.start` reports 0 whether or not the mod is mounted — which makes any comparison built
+    on it vacuous. Query after the level load, and read `mods.recent` for the actual paths.
+  - **`camera.position` does not follow the cutscene camera.** It reads `CameraCoords`
+    @ 0x007b4e0c, which during `first contact` moved 5 units in X and 0.27 in Y while the authored
+    path spans 8 units in Y. A trace of it looks like a plausible cutscene and is not one; the
+    frame buffer is what settles this, via `PrintWindow(hwnd, dc, 3)`.
+- **A cutscene needs an end event or it never ends**, and nothing in the file makes that obvious:
+  running off the end of a path leaves the camera parked and the player locked out. Only a control
+  event (kind 3, payload 0) ends one, so `new_cutscene` emits it and `cutscene_problems_for`
+  reports its absence. The other authoring gate is outside the `.rif` entirely — a cutscene is
+  unreachable until the level's `.gls` declares `camera track { file … name … }`, or a script calls
+  `make.camera_track`.
+- **`_build` absorbs a chunk's children *after* every branch has decided what it took**, and
+  getting that order wrong is invisible to every semantic test. `skip` is what stops a chunk being
+  carried in `rif_absorbed` as well as regenerated on export; `RBOBJECT` adds to it in the first
+  if-chain, before the absorb, but `DUMMYOBJ`'s `skip.add(DUMOBJDT)` used to run in the *second*
+  chain, after the absorb had already copied it. So every dummy exported its `DUMOBJDT` twice —
+  6,847 of them across the shipped set, 590 where `level01.RIF` has 295 — for as long as the addon
+  has existed. Nothing caught it because the duplicate carried the same *meaning*, and every check
+  in `test_scene.py` compares meaning: the objects a file describes, their transforms, their
+  geometry. **The chunk inventory is the check that sees this class of bug**, it is now in
+  `compare_inventory`, and `INVENTORY_EXPECTED` is the short list of ids allowed to change (only
+  `SHPPCINF`, which is discarded on purpose). Re-introducing the ordering bug makes it fail on
+  three of eight sampled files.
+  Two things this turned up that are worth keeping:
+  - **The engine did not care.** The in-game cutscene test ran against an exported `level01.rif`
+    carrying the duplicates and the level loaded normally (158 actors / 259 roles) and rendered
+    within the run-to-run noise — `lookup_single_child` takes the first, which was the carried
+    original. So this was structural waste, not a visible fault, which is exactly why it survived.
+  - **Regenerating a chunk is not the same as carrying it, and the difference shows up when the
+    duplicate goes.** With both emitted, the *carried* one won every lookup; with the fix, the
+    regenerated one is all there is. For `DUMOBJDT` that is safe — location and name are
+    byte-exact and the orientation differs by at most **0.03°** — but the raw bodies are not
+    identical, and 128 of 295 differ only by the quaternion double cover (`q` vs `-q`, the same
+    rotation). Comparing quaternion *components* reads that as a drift of 1.83 and is the wrong
+    metric; compare the angle.
+- **`SHPCENTR` is recomputed, so absence has to be recorded or export invents one.** The inventory
+  check found this immediately after the `DUMOBJDT` fix: `Battler Turret.RIF` ships 4 shapes of
+  which 2 carry a `SHPCENTR`, and the export gave all 4 one. `NO_CENTRE_PROP` (`rif_no_centre`) is
+  the marker, set in `_mesh_for_shape` when the source shape had none — the same "presence is a
+  separate question from the values" rule `rif_vtint_header` follows. A shape authored from scratch
+  carries no marker and so still gets a `SHPCENTR`, which is what a new shape wants.
 - **Blender cannot hold two faces on the same three vertices**, and the shipped assets contain
   them (doubled or reverse-wound triangles): 775 across 193 shapes, and 28 of Maskelyn MkII's 44
   polygons. **Drop them deliberately, before `from_pydata`** — letting `validate()` remove them
@@ -320,11 +421,13 @@ These pin the design, in roughly decreasing order of how much everything else re
 
 Export reads exactly the properties **import** minted — `rif_id`, `rif_index`, `rif_objhead`,
 `rif_absorbed` — so a datablock created any other way is skipped in silence. `scene.py`'s
-authoring section and eight operators in `__init__.py` are the way in (`scene.rif_new`,
-`object.rif_add`, `object.rif_add_sequence`, `object.rif_new_shape_id`,
-`object.rif_new_light_id`, `scene.rif_add_sound`,
-`pose.rif_set_sound`, `action.rif_toggle_setting`, beside the import and export pair), with three
-panels over them — Object, Speaker data and Material. `scene.rif_new` builds a `REBINFF2`
+authoring section and twelve operators in `__init__.py` are the way in (`scene.rif_new`,
+`object.rif_add`, `object.rif_add_dummy`, `object.rif_add_sequence`, `object.rif_new_shape_id`,
+`object.rif_new_light_id`, `scene.rif_add_sound`, `scene.rif_remove_sound`,
+`scene.rif_select_sound`, `scene.rif_add_emitter`,
+`pose.rif_set_sound`, `action.rif_toggle_setting`, beside the import and export pair), with four
+panels over them — Object, Collection (the sound table), Speaker data and Material.
+`scene.rif_new` builds a `REBINFF2`
 collection carrying the file-level chunks (`RIFVERIN`, `REBENVDT` +
 `ENDTHEAD`/`RIFFNAME`/`BMNAMEXT`/`BMNAMVER`) laid out as `SQUARE.RIF` — the smallest shipped file,
 1,004 bytes — carries them, and `object.rif_add` gives a selected mesh an `RBOBJECT`/`REBSHAPE`
@@ -447,6 +550,29 @@ Five things there are worth keeping:
   that cannot be confused with an edit); and `light_id` is allocated past the highest in the file
   because it is unique per file in all 38 that have lights but is **not** `0..n-1` (only 10 of the
   38), i.e. an editor-assigned id rather than a position.
+- **A `DUMMYOBJ` is authorable, and it is a different namespace from a spawn point.**
+  `RifFilterObjectsByName` -> `RifCollectObjectChunks` @ 0x005b0900 keeps a child only if its id is
+  literally `RBOBJECT`, so a `for "<rif object>"` clause can **never** resolve to a dummy — which
+  is why `object.rif_add` still makes only `RBOBJECT`s and `object.rif_add_dummy` is a separate
+  gesture. A dummy is the *locator* system: ambient sound, console and trigger positions, MP and
+  enemy spawns, CTF points. Four gates, all measured over the 6,847 shipped dummies, and the first
+  is a crash rather than a nuisance:
+  - **A `DUMOBJDT` is mandatory.** `DummyObjectChunk_GetDataChunk` @ 0x005d21d0 returns NULL when
+    it is missing and `MapAuxObject_Ctor` dereferences that unchecked at 0x005a971a — an access
+    violation during level load. 6,847 of 6,847 have one, so the game's own data never exercises
+    it and nothing in the engine is hardened against it. `adopt_dummy` creates one and
+    `dummy_problems` **refuses the export** if it was lost, beside the shared-shape-id check.
+  - **Top level only** (`RifCollectDummyChunks` walks the root's direct children and never
+    recurses; all 6,847 are at depth 0), and **a non-empty name** — an empty one is stored as
+    `NULL`, not `""`, and every name-matching consumer skips the record. 0 of 6,847 ship empty.
+  - **A dummy is an emitter or a marker, never both.** `ToMap` unlinks and frees the record it
+    turns into a sound, so an emitter's name never reaches a single one of the seven name-matching
+    consumers. The panel says which of the two an object is rather than offering both.
+  - **Duplicate names are legal and shipped** — 210 of them across 62 files — so they are a
+    warning. The catch worth warning about is that resolution differs: `ConsoleParsePosition` takes
+    the *first* match where the other six consumers take the *last*.
+  The extents at `DUMOBJDT+0x0c`/`+0x18` are read by **nothing** in the engine, so a new dummy
+  leaves them zero rather than deriving a bounding box no consumer wants.
 - **A spawn locator is an ordinary object with geometry, not an empty and not a dummy.**
   `level01.RIF`'s `Goodie A`..`Goodie D` are `RBOBJECT`s carrying a 24-vertex marker mesh and its
   `camhund` camera plane is a 4-vertex quad — and the id pairing resolves **all 9,313 objects
@@ -508,16 +634,84 @@ silently breaking the rig. The findings that pin the sequence half:
   stored in that frame's local space; one without is absolute and gets offset at use. Marking the
   wrong frame silently re-anchors the whole animation, which is why the addon preserves it and does
   not yet offer to set it.
-- **A sound is authored as a Blender Speaker, and that is a UI choice, not a storage one.** The
-  table splits three ways like textures already do: the **entries** become one Speaker per slot
-  (its `distance_reference`/`distance_max`/`volume` *are* the stored mm and 0-127 fields, so the
-  falloff is visible and audible), the **index** becomes `rif_sound_events` on the Action —
-  `{bone, frame, index}`, because a sound belongs to a sequence at a time — and the **audio** is
-  loaded from the install for audition and never written back. Deleting a speaker removes the
-  sound. The index is **split out of `flags` on import and spliced back on export**, so there is
-  one place a sound is edited and the residual bits nobody understands are preserved untouched.
-  Speakers deliberately carry no `rif_id`, so `_rebuild` skips them like any unadopted object and
-  the table is rebuilt from them separately.
+- **There are two sound systems, they share nothing, and the addon models them as two different
+  kinds of thing.** `INDSOUND` is an indexed **table of definitions** at the rif root that an
+  animation keyframe selects from by number, and it plays wherever the animating model is; it
+  occurs only in `Objects\` (47) and `Units\` (193). `DUMOBJTX` is a **placement** — a text
+  directive on a `DUMMYOBJ` that becomes one looping emitter at that dummy's fixed world position,
+  started once from `LoadLevel`; it occurs only in `Levels\` (1,097). The two name **not one file
+  in common** (`rif_chunk_format.md`, "`DUMOBJTX` vs `INDSOUND`").
+  So the **Speakers are the emitters**, and the table is a table:
+  - **`INDSOUND` follows `BMPNAMES` exactly**, because it is structurally the same thing — a
+    file-level indexed table whose index is a stable, sparse id meaningful only inside its own
+    file, with a payload loaded from the install for preview and never written back. The **table**
+    is `rif_indsound` on the collection, kept whole and in order so an entry no keyframe references
+    survives; the **index** is `rif_sound_events` on the Action (`{bone, frame, index}`, because a
+    sound belongs to a sequence at a time); the **audio** is a `bpy.types.Sound` per entry, given a
+    fake user so it survives a `.blend` save, and found again by the `rif_sound_path` stamped on it
+    — the same job `rif_rim_path` does for a texture's image. The index is still **split out of
+    `flags` on import and spliced back on export**, so the residual bits nobody understands are
+    preserved untouched.
+  - **It was Speakers, and that was wrong.** `_build_speakers` never set a location, so all of them
+    stacked at the world origin (16 of them in `cyberbay.RIF`) and the transform meant nothing — a
+    user could drag one anywhere and no byte changed. Tolerable only while Speakers were the sole
+    sound thing in the scene; the moment `DUMOBJTX` emitters exist, two object types that look
+    identical in the outliner would carry opposite semantics. That is the ambiguity `rif_light`'s
+    name gate exists to design out.
+  - **The cost is real and was accepted**: no distance slider, no sound file browser, and no
+    `template_list`. The last one is measured, not a preference — the table is a plain ID property
+    (which is what lets every test drive `scene.py` with the addon unregistered), and
+    `template_list` resolves the bracket form `["rif_indsound"]` and then **crashes Blender 5.2** in
+    `RNA_property_collection_length`, a null dereference through `rna_property_rna_or_id_get`. A
+    background test cannot see that, because nothing there ever draws; it took running a real UI
+    Blender under `redraw_timer`. So the panel draws its rows itself and selection is an operator.
+    A registered `CollectionProperty` would satisfy `template_list` and would mean a second place
+    the table lives.
+- **An emitter's storage is its raw text, and the Speaker is a view spliced back into it.** The
+  1,097 shipped texts are far more irregular than the three-line grammar suggests: 362 have no
+  third line at all, 221 end in a trailing CRLF that leaves an empty one, 29 end in two, and
+  `level06.RIF` has one whose directives are split across two lines with a leading space
+  (`Sound\r\nloudcreak01.wav\r\nV30\r\n P0 R60`). Reformatting from parsed values would rewrite
+  every one of them, so `emitters.retext` replaces **only the argument of a directive whose value
+  actually changed**, appends one the text did not carry, and otherwise returns its input. "Changed"
+  is decided on the *formatted* argument, not the float, which is what absorbs the float32 round
+  trip through a Blender property — a `P2` stored as `2**(2/12)` comes back as 1.9999998 and still
+  spells `P2`. Three things fall out:
+  - **The directive letters are uppercase-only.** The dispatch @ 0x00481c10 does `ADD -0x49` /
+    `CMP 0xd` / `JA`, so a lowercase `v`/`p`/`r` is skipped in silence. All 1,540 shipped ones are
+    uppercase, so nothing in the game exercises it — which makes it purely a trap for a generator.
+    Line 1 *is* case-insensitive (`lstrcmpiA`, and 14 ship as `sound`), which is what makes it easy
+    to get backwards.
+  - **`V` is parsed and then discarded** (`game_defects_notes.md` defect 6): the emitter takes the
+    sample's own default. 514 shipped emitters carry one and not one does anything, so the panel
+    shows it as inert and writes it for fidelity — the same standing `CUTEVENT` kind 5 has.
+  - **A zero distance means the sample's own default, not silence**, so 735 of the 1,097 import with
+    a collapsed gizmo. That is the file speaking rather than a loss, and absent-versus-zero stays
+    distinguishable because a value equal to the engine's own default for an absent directive is
+    never written.
+  - **The distance unit is not measured**, and the shipped data does not settle it: `R` takes 5, 10,
+    15, 20 *and* 500 and 5000 in the same game. So the number is shown as the number the file holds
+    and nothing is scaled.
+- **A dummy that is an emitter *is* the Speaker, rather than carrying one.** A dummy is a name at a
+  position and nothing else, so there is no second transform for a child object to add and no way
+  for one object to drift out of step with itself.
+- **Verified in the running game, and the control is what made the result readable.** `level01.RIF`
+  exported by this build — 295 regenerated `DUMOBJDT` and 14 `DUMOBJTX`, none of it carried — served
+  through the mod VFS loads to `game.state` 5 with its usual 158 actors / 259 roles and
+  `mods.served` 6. Since a missing or malformed `DUMOBJDT` is an unchecked null dereference in
+  `MapAuxObject_Ctor`, a clean load is direct evidence the dummy chunks are well formed. What it is
+  **not** is evidence that the emitters are audible: nothing in the engine exposes the ambient
+  emitter list, so there is no assertion to make and that half needs ears.
+  The same run on **`level02` crashes, and it is not this change.** An access violation at
+  `gl+0x1d79a5` reached through `ToMap` → `0x005aa8e9` → `0x005ac842`, which reproduces identically
+  with the addon at the commit *before* this work, with the `.map`/`.cut` sidecars deleted, while
+  stock `level02` loads (178 actors / 294 roles). A pre-existing exporter fault that `level02`
+  triggers and `level01` does not, undiagnosed. Three things that would each have produced a
+  confident wrong answer here: the **stock** control (without it the crash reads as this change's
+  fault), the **pre-change addon** control (without it, as the exporter being fine on level01 only
+  by luck), and deleting the **sidecar caches** — `.cut`/`.map` are keyed on the `.rif`'s FILETIME,
+  which a VFS-served file need not report, so a stale cache was the obvious suspect and was not the
+  cause.
 - **A sequence's three optional chunks are *nearly* per-sequence, and the "nearly" is the whole
   design.** `OBASEQTM` (milliseconds), `OBASEQSP` (`{speed mm/s, angle, spare}`) and `OBASEQFL`
   (`Loops` 0x04 / `NoLoop` 0x08, plus an unexplained 0x80 on 181 chunks) are all AvP's and all
@@ -540,7 +734,8 @@ Not verified against the game: the import scale (a convention — the engine's f
 data at level load, not a constant), the Y-up→Z-up assumption, and a *generated* sequence's timing,
 which follows the dominant shipped convention rather than a rule read out of the engine. Nothing
 exported has been loaded back into Gunlok yet, which matters most for a file built from scratch,
-where every chunk is generated rather than carried. `DUMMYOBJ` still cannot be authored (whether
-`RifFilterObjectsByName` looks at dummies is unmeasured), and a frame's **origin bit is preserved
+where every chunk is generated rather than carried. A frame's **origin bit is preserved
 but never set** — what it does is recovered, but choosing the wrong frame re-anchors a whole
-animation inside the engine, where nothing here can see the result.
+animation inside the engine, where nothing here can see the result. And the **unit** an ambient
+emitter's `I`/`R` distances are read in is not measured: the shipped values run 5..60 and 500..5000
+in the same game, so the addon shows the number the file holds and scales nothing.

@@ -30,6 +30,8 @@ PAYLOAD = (
     "blender_manifest.toml",
     "__init__.py",
     "bmpnames.py",
+    "cutscene.py",
+    "emitters.py",
     "heads.py",
     "rif.py",
     "rim.py",

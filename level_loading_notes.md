@@ -126,10 +126,13 @@ Three things worth knowing:
 The extension invites the assumption, and the RIF format does have `CUTSHEAD` /
 `CUTTRACK` / `CUTEVENT` / `CUTPOINT` chunks. It is wrong. Evidence:
 
-- **Cutscenes live inside `.rif` files as chunks**, looked up by *name*, exactly like
-  shapes and hierarchies. The console command is `PLAY CUTSCENE <name>` ("Requires the
-  name of the cutscene, e.g. PLAY CUTSCENE intro"), and the only cutscene *file* string
-  in the binary is `sound\cutscene_bink\%s.bik` for the Bink audio.
+- **Cutscenes live inside `.rif` files as chunks**, under `REBENVDT/SPECLOBJ`. The console
+  command is `PLAY CUTSCENE <name>` ("Requires the name of the cutscene, e.g. PLAY CUTSCENE
+  intro"), and the only cutscene *file* string in the binary is `sound\cutscene_bink\%s.bik`
+  for the Bink audio. The lookup is **not** a chunk-tree walk by name the way a shape or a
+  hierarchy is found: `Cutscene_PlayByName` @ 0x005c0aa0 matches against a global list of
+  runtime objects that only the GLS `camera track` section populates. All twelve cutscene
+  chunks are decoded in `rif_chunk_format.md`, "The cutscene chunks".
 - There is **no `.cut` string literal anywhere in the binary** - the extension is never a
   constant. `ToMap` builds it three bytes at a time, which is why a text search misses it:
 
@@ -630,7 +633,12 @@ The tail of `ToMap`, gated on `LevelLoadReason != 3`:
 for (binding in map->bindings) {
     int team = binding->team;
     if ((unsigned)team < NumTeamSlots && TeamSlots[team].active != 0) {
-        RifFilterObjectsByName(&matches, rif, binding->object_name); // 0x005aaac0
+        // 0x005aaac0. Candidates come from RifCollectObjectChunks @ 0x005b0900, which
+        // walks the root's *direct children* and keeps only ids matching "RBOBJECT" --
+        // so a spawn point can never resolve to a DUMMYOBJ. Dummies are a disjoint
+        // namespace reached only through MapAuxObjectList; see rif_chunk_format.md,
+        // "`DUMMYOBJ` is the named-locator system".
+        RifFilterObjectsByName(&matches, rif, binding->object_name);
         for (O in matches) {                 // node: next @ +0x8, payload @ +0xc
             Role *role = ToRole(binding->role);
             Vec3f pos  = (Vec3f){ (float)(int)O[0x44], (float)(int)O[0x48],
