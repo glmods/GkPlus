@@ -786,17 +786,39 @@ def encode(width, height, rgba, compress=False):
             _chunk(b"CMAP", palette.cmap),
             _chunk(b"BODY", pack_byterun1(body) if compress else body)]
 
+    # PROP:ILBM holds the properties shared by every FORM:ILBM beside it. TRAN is
+    # always there; an ALPH joins it, because that is the only scope the loader's
+    # lookup can see.
+    prop = [_tran()]
+
     if palette.alpha is not None:
+        # The engine's alpha converter cannot survive a wide palette: above 256
+        # colours ``RimConvertIndexed_Alpha_NoMask`` @ 0x005defe0 faults --
+        # measured, 0xc0000005 at 0x005df14a, on a 40,742-entry re-encode of
+        # ``Units\alpha junk.RIM``. The same image at 8 planes renders correctly.
+        # This palettizes losslessly and has no quantizer, so refusing is the
+        # only honest answer. The cap applies ONLY when an ALPH is emitted: a
+        # wide palette with no alpha takes the other converter and renders.
+        colours = len(palette.cmap) // 3
+        if colours > 256:
+            raise RimError(
+                "this image needs an ALPH chunk but palettizes to %d colours; "
+                "the engine's alpha converter crashes above 256. Reduce the "
+                "palette, or encode as DXT3." % colours)
+
         plane = encode_planar(palette.alpha, width, height, 8)
-        ilbm.append(_chunk(b"ALPH",
+        # **In the PROP, not the FORM.** An ALPH inside the FORM:ILBM is never
+        # found by the loader: measured in the running game, such a file renders
+        # bit-for-bit identically to one carrying no ALPH at all (mean
+        # 0.0000/255, max 0), while the same chunk in the PROP renders correct
+        # graded alpha, matching a 50% blend to within 1/255. The one shipped
+        # ALPH, ``Ground\tree_alpha.RIM``, is in the PROP for the same reason.
+        prop.append(_chunk(b"ALPH",
                            struct.pack(">HHBB", width, height, 8, compression)
                            + (pack_byterun1(plane) if compress else plane)))
 
-    # In the FORM rather than the PROP: `RimOpenAndScan` looks a chunk up against
-    # the ILBM it is processing, and whether PROP properties are in that scope has
-    # not been read out of the binary. Putting it here makes the question moot.
     return _group(b"LIST", b"ILBM",
-                  [_group(b"PROP", b"ILBM", [_tran()]),
+                  [_group(b"PROP", b"ILBM", prop),
                    _group(b"FORM", b"ILBM", ilbm),
                    _empty_mipm()])
 

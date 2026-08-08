@@ -1,6 +1,7 @@
 #include "FileHooks.h"
 
 #include "Core.h"
+#include "ImageCodec.h"
 #include "Vfs.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -146,6 +147,15 @@ HANDLE WINAPI HookedCreateFileA(LPCSTR name, DWORD access, DWORD share,
   // Access rights are deliberately *not* part of the test: IsFirstFileNewer
   // @ 0x004af430 opens with GENERIC_READ|GENERIC_WRITE and only reads
   // timestamps, and it has to see the mod's file or a stale on-disk cache wins.
+  // The first intercepted open is where the DDS codec registers itself, because it is
+  // the one moment that is provably both late enough and early enough: the game only
+  // opens a file from WinMain onwards, so gl.exe's CRT heap (which the codec registry
+  // allocates from) exists - and a file is always opened before its bytes can be
+  // sniffed, so no image can be dispatched before this has run. Idempotent; after the
+  // first call it is a static bool test. See src/ImageCodec.h for why it is not a
+  // detour of its own.
+  image::RegisterDdsCodec();
+
   if (name && disposition == OPEN_EXISTING) {
     try {
       if (auto vpath = vfs::Resolve(name)) {

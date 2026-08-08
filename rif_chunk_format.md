@@ -1710,12 +1710,134 @@ their own `engine_type`/`flags` (see `SHPPOLYS` above), which is where transluce
 the expectation is that DXT3-vs-DXT1 is a storage decision only. The load path is traced; the
 draw path is not.
 
-**This rule has teeth on the uncompressed path, and it is where a `BODY` + `ALPH` texture loses
-its alpha.** `Use32BitTextures` is 0 by default and its only toggle is menu 19, which
-`menu_system_notes.md` lists as unreachable - so `A8R8G8B8` is never available in a retail
-build, and an uncompressed image declaring `alpha_bits = 8` has nowhere to land. The measured
-consequence is under "The engine does not honour an `ALPH` you write" below: such a texture
-loads fully opaque rather than failing. A compressed `DXT3` surface is unaffected.
+**An earlier revision of this section claimed this rule is what makes a `BODY` + `ALPH`
+texture lose its alpha. That was wrong, and the correction matters because it leaves a
+measured effect without an explanation.** The claim was that with `Use32BitTextures` off
+`A8R8G8B8` is unavailable, so an uncompressed image declaring `alpha_bits = 8` "has nowhere
+to land". Tracing `ChooseSurfaceFormatForImage`'s tail settles it: such an image **does not
+fail**. The fallback descriptor is DXT3, which selects the A8R8G8B8 *staging* block at
+0x00838b8c, and `FillSurfaceFromImage` then creates a second texture and blits, re-compressing
+into a DXT3 surface. Alpha survives format selection in both configurations; setting the flag
+removes the DXT round trip, it does not rescue a failure.
+
+`RimLoadErrorCode = 3` is likewise not the failure mode here - it fires only at
+0x005c7e18/0x005c7e25/0x005c7e37 (descriptor invalid, no device, or `DAT_00838b44 & 1` clear
+on a texture-mode request), none of which this path reaches.
+
+So the measured behaviour under "The engine does not honour an `ALPH` you write" below - a
+re-encoded `Units\alpha junk.RIM` losing its graded alpha, pixel-identically to the same image
+with its alpha flattened - **stands, but its cause is not format selection and is currently
+unknown.** The likeliest remaining candidate is that the `ALPH` chunk never reaches the image
+object at all (`RimBindImageChunks` binding it, or `RimConvertRows` selecting an alpha-aware
+converter), which is where to look next. Do not repeat the format-selection explanation.
+
+#### `Use32BitTextures` @ 0x006abde0 - every reference, and why flipping it is not free
+
+Since two of the rules above are gated on it, here is its whole reference set. It is a menu
+variable (bound in `SetupMenus` @ 0x004ea26a) persisted to `GLkeys.cfg` by `WriteGLKeys`
+@ 0x004fa84d, written by `WinMain` @ 0x0046b675 (config restore - a `MOVUPS` that carries
+`VramTextureReduction` @ 0x006abdec in the *same* 16-byte store) and by `OnMenuItemClicked`
+@ 0x004ed918 (the unreachable menu 19 toggle). Read by `PickPreferredTextureFormat`
+@ 0x005762f4, `FUN_00574da0` @ 0x00574dde, `WriteGLKeys`, and the toggle's own read-back.
+
+**Forcing it to 1 cannot regress a shipped texture**, but not for the reason the rules above
+might suggest. It is not that a compressed candidate wins before the uncompressed fallback is
+considered - it is that an S3TC source **overrides the candidate list entirely**. The tail of
+`ChooseSurfaceFormatForImage` branches on slot 18 (`IsS3tc`) at 0x005c7a38 and both arms end
+at the source's own fourcc via `SurfaceDesc_SetCompressedFormat`: 0x005c7a70 for a compressed
+destination, 0x005c7a59 for an uncompressed one. `PickPreferredTextureFormat`'s list is
+consulted only for a non-S3TC source.
+
+**What it does cost** is size, through the other reader. `FUN_00574da0` computes
+`VramTextureReduction` from available texture memory and a bytes-per-texel term
+`bpp = (caps & 4) ? 4 : 0x10`, overridden to `0x20` when the flag is set - it assumes 32 bits
+per texel and therefore derives a *larger* reduction. Its five callers (`ResetD3D2`,
+`InitDirect3DDevice`, `FUN_005a1d10` ×2, `FUN_004b1490`) all discard the return and simply
+refresh the global; the function communicates only through it.
+
+**`VramTextureReduction` is a floor under the user's texture-detail setting, not the skip
+count itself** - both consumers (`FUN_005a19a0` @ 0x005a1ad7 and the device-lost reload
+`FUN_005a1b80` @ 0x005a1c15) do `max(TextureDetail @ 0x006abdf0, VramTextureReduction)` with a
+`CMOVA` and pass that as the `m` option. It reaches `image+0x18` and drives
+`FillSurfaceFromImage`'s skip loop, which is guarded by `while (mipCount != 0)` - so it
+applies to compressed and uncompressed alike but cannot touch a single-level image.
+
+The cost is bounded and small: the loop's threshold divides by 4 per level while `bpp` only
+doubles, so 0x10 -> 0x20 is **at most one extra level**, and a card on the `(caps & 4)` path
+going 4 -> 0x20 is at most two. Each level is one skipped mip, i.e. a quarter of the texels.
+(Arithmetic, not measured - and `DAT_006ab968`/`DAT_006ab978`, the caps bits and the early-out
+threshold, were not traced to their writers, so which real cards take which path is unknown.)
+
+**Confirmed in the running game, and now used deliberately.** `src/ImageCodec` reports
+`alpha_bits = 8` for an uncompressed `.dds` even when it is opaque, and forces
+`Use32BitTextures` from the `Direct3DCreate8` hook - the two together are the only way to
+get true 24-bit colour into this engine. A 256-level grey ramp measures **111 distinct
+levels with a minimum step of 1**, against **16 levels in steps of 17** for the same ramp
+as a 24bpp BMP or an uncompressed `.RIM`. A step of 1 rules out every 16-bit candidate
+(R5G6B5 caps grey at 32 levels, stepping ~8), so the surface really is 32-bit. Colours are
+exact at both 24 and 32 bpp - authored red, blue and green come back unchanged, so the
+B,G,R,A ordering is right.
+
+**Settled: `Use32BitTextures = 1` does make `A8R8G8B8` the surface for an uncompressed
+source - but not through the candidate list.** The list is irrelevant here, because for an
+uncompressed source declaring `alpha_bits = 8` it accepts *nothing* either way; what changes
+is the **fallback descriptor**.
+
+`FUN_005c64c0` (`__fastcall(const D3DFORMAT *chosen /*ECX*/)`) empties the list and then
+initialises three standalone descriptors: `DAT_00838b8c` = A8R8G8B8 staging,
+`DAT_00838bcc` = X8R8G8B8 staging, and **`DAT_00838c24` = the chosen format**, which is
+literally the value `ChooseSurfaceFormatForImage`'s walk starts from. So the chosen format is
+absent from the list precisely because it *is* the fallback:
+
+- flag clear, chosen = DXT3: list `[A4R4G4B4, DXT1, X1R5G5B5, R3G3B2]`, fallback **DXT3**
+- flag set, chosen = A8R8G8B8: list `[DXT3, A4R4G4B4, DXT1, X1R5G5B5, R3G3B2]`, fallback
+  **A8R8G8B8**
+
+With `alpha_bits = 8` every entry is rejected - the compressed ones because `+0x39` requires
+the source's compressedness to match, the rest because `8 <= maxAlphaBits` fails (4, 1, 0, 0).
+The fallback therefore wins in both cases, and the tail at 0x005c7a23 branches on whether it
+is compressed: DXT3 fallback selects the **A8R8G8B8 staging block** and
+`FillSurfaceFromImage` creates a second texture and blits, re-compressing to DXT3; an
+A8R8G8B8 fallback needs no staging at all.
+
+The registration helper is `AddSurfaceFormatCandidate` @ 0x005c6590 - `__fastcall`, `RET 0xc`,
+appending a 0x44-byte node (vtbl 0x0066f138) to the list at 0x00838bb8:
+
+```c
+int AddSurfaceFormatCandidate(const D3DFORMAT *fmt /*ECX*/, unsigned maxAlphaBits /*EDX*/,
+                              int allowOnOpaqueDest, unsigned maxPaletteColours /*0 = any*/,
+                              int matchSourceCompression);
+```
+
+Nodes are appended at the tail and the walk keeps the **last** accepted entry, so later
+registration means higher priority. (An earlier revision of this section said the
+decompiler's `(1,0,1)` at every call site "cannot be right for five parameters". It is right
+- those are the three *stack* arguments. What the decompiler omits is the two `__fastcall`
+register arguments, which are the ones that differ per site.)
+
+### The engine never generates mip levels
+
+`CONT` is not a hint: it is the whole chain, and if a source does not carry one the texture
+has exactly one level. There is **no mip filter anywhere in the binary** - the only D3DX call
+that crosses out of the game layer is `FillSurfaceFromImage` @ 0x005c6950 -> `FUN_00414e8c`
+at 0x005c76fc, which is the fallback for `IDirect3DDevice8::CopyRects` on the DXT staging
+path, not a downsample. `LinearMipmapOn` @ 0x006abdd4 is read only by `InitBuiltinMaterials`
+and sets the sampler's mip *filter*, which does nothing without levels to filter.
+
+The loop in `FillSurfaceFromImage`, which is what a new codec has to satisfy:
+
+- `count = slot6()` - the image's **extra** level count (`RimImage+0x3c`, from `CONT`).
+- Up to `image+0x18` (= `VramTextureReduction`) top levels are dropped, but the skip is
+  `while (count != 0)`, so a single-level image is never reduced.
+- `if ((flags & 0x400) == 0) count = 0;` - a request that does not ask for mipmaps discards
+  the chain regardless. `count > 0x20` sets `RimLoadErrorCode = 8`.
+- `CreateTexture` is called with `count + 1` levels, and the per-level loop steps down with
+  slot 15 (`RimSelectMipLevel`) - **a request to the image for the next level's pixels**. The
+  engine halves only its own rectangle bookkeeping; it never filters a texel.
+
+So a codec reporting zero extra levels produces a valid single-level texture with no error and
+no warning - it simply shimmers. Anything generating a `.RIM` (or standing in for one) owns
+its own mip chain. `rimutil` currently writes an empty `MIPM` and therefore does not.
 
 ### `BMHD` - the header
 
@@ -1843,7 +1965,56 @@ Its presence is what routes `RimConvertRows` to the two alpha-aware converters, 
 `RimImage+0x50` = `ALPH.bits`. On the `S3TC` path that field is set from the fourcc instead
 (`DXT1` -> 0, otherwise 8).
 
-#### The engine does not honour an `ALPH` you write - measured
+#### An `ALPH` must be a child of `PROP:ILBM`. In the `FORM` it is silently ignored - measured
+
+**This section previously said the engine ignores `ALPH` outright. That was wrong**, and the
+cause was where the chunk was written, not the engine. Measured in the running game against
+the front end's menu-selection lozenge (`Units\alpha junk.RIM`, drawn `SRCALPHA`/`INVSRCALPHA`,
+so alpha is directly visible), with one 1024x1024 image encoded three ways - identical RGB, a
+256-colour palette, uniform alpha 128:
+
+| variant | lozenge RGB | vs the no-`ALPH` control |
+|---|---|---|
+| no `ALPH` chunk at all (alpha 255) | (88, 119, 96) | - |
+| `ALPH` inside `FORM:ILBM` | (88, 119, 96) | **pixel-identical: mean 0.0000/255, max 0** |
+| `ALPH` inside `PROP:ILBM` | (46, 78, 54) | differs, mean 0.5724/255, max 163 |
+
+The background behind the lozenge is ~(5, 36, 13), so a correct 50% blend predicts
+`0.5*(88,119,96) + 0.5*(5,36,13)` = **(46, 77, 54)**. The `PROP` variant measures (46, 78, 54).
+**The engine honours graded alpha correctly when the chunk is in the `PROP`**; a `FORM`-level
+`ALPH` produces a frame bit-for-bit identical to having no `ALPH` at all, i.e. it is never
+found.
+
+That is consistent with the only shipped `ALPH` (`Ground\tree_alpha.RIM`) being in the `PROP`,
+and it closes the `PROP`-vs-`FORM` question that was open here: `RimOpenAndScan`'s
+`IffChunk_FindChild` for `'ALPH'` does **not** see a `FORM`-level chunk, so `RimImage+0x50`
+stays 0, `ChooseSurfaceFormatForImage` sees `alpha_bits = 0`, and `RimConvertRows` picks the
+no-alpha converter. Everything downstream is behaving correctly on the information it has.
+
+**So this is a constraint a writer can satisfy, not an engine defect.** `rimutil` and
+`blender/io_scene_rif/rim.py` both emitted their `ALPH` inside the `FORM`, which is why both
+were believed unable to carry graded alpha on the `BODY` path. **Both now write it in the
+`PROP`**, and a file straight out of `rimutil compress --format body` renders correct graded
+alpha in game - measured identical, sample for sample, to the hand-edited `PROP` file above.
+
+**Second, separate constraint, found the same way, and now enforced by both writers: keep a
+palettized image at 256 colours or fewer whenever it carries an `ALPH`.** Of the 513 shipped
+textures, **12 have alpha that needs an `ALPH` chunk and 7 of those palettize to more than 256
+colours**, so the `BODY` path now declines exactly those 7 - six of which the game ships as
+DXT3 anyway. `Ground\tree_alpha.RIM` is the only one that ships as `BODY`, and it is the single
+shipped texture the `body` path cannot round-trip. Both writers palettize *losslessly*, so a photographic source yields a huge palette -
+re-encoding `Units\alpha junk.RIM` gave **40,742 entries / 16 planes**, where every shipped
+palettized image is 4, 8 or 17 planes. With the `ALPH` in the `PROP` (so the alpha converter
+actually runs) that file **crashes the game**: `0xc0000005` at gl.exe+0x1df14a = **0x005df14a**,
+inside `RimConvertIndexed_Alpha_NoMask` @ 0x005defe0. The same wide palette with the `ALPH` in
+the `FORM` does not fault, because the no-alpha converter runs instead. An 8-plane version of
+the identical image is fine.
+
+The original measurement below stands as an observation and is what it always was - but it was
+made with a `FORM`-placed `ALPH` *and* a 40,742-colour palette, so it could never have shown
+the alpha working.
+
+#### The original measurement, for the record
 
 **A `BODY` + `ALPH` texture loads fully opaque, and an `ALPH` in the `FORM` does not fix it.**
 This is measured in the running game, and it contradicts what this section used to say:
@@ -1859,10 +2030,12 @@ This is measured in the running game, and it contradicts what this section used 
   missing mip chain (`rimutil` writes an empty `LIST:MIPM` either way).
 - `rimutil` puts its `ALPH` in the `FORM`, not the `PROP`.
 
-The likely mechanism is the alpha-depth rule above: an *uncompressed* image with
-`alpha_bits >= 2` admits only `A8R8G8B8`, which is gated on `Use32BitTextures` - 0 by default,
-and its only toggle is menu 19, which `menu_system_notes.md` lists as unreachable. DXT3 escapes
-it by being a *compressed* surface. **Not verified**; what is verified is the outcome.
+(The cause was also once recorded as the alpha-depth rule - an uncompressed image with
+`alpha_bits >= 2` admitting only `A8R8G8B8`, gated on an unreachable toggle. That was refuted
+separately: such an image gets the DXT3 fallback descriptor, which selects the A8R8G8B8
+*staging* block, and the engine re-compresses into DXT3. Alpha survives format selection in
+both configurations - see "Use32BitTextures ... is not free" above. Two wrong explanations for
+the same observation, and the real one was the chunk's placement.)
 
 So the `PROP`-vs-`FORM` question is still open and is no longer the interesting one: `ALPH` in
 the `FORM` is found or not, but either way the alpha does not survive. The only shipped `ALPH`

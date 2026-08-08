@@ -53,6 +53,14 @@ struct Subsystems {
   ScriptQueueSystem queue;  // the script queue carries JSON, not bare .gcs names
   gls::GlsSystem gls;       // lets the GLS parser take a source text, not a file
   CustomLevelSystem levels; // levels built from script instead of .gls + .gcs
+  // Detours SetupMenus purely to reach a point where the game's allocator exists:
+  // RegisterImageCodec builds its trie with pool_alloc, which bottoms out in gl.exe's
+  // static CRT heap, and that is not initialised until _mainCRTStartup - long after
+  // DllMain. Every texture loaded before this point is a hardcoded .RIM literal, so
+  // nothing is missed.
+  // The DDS codec has no member here and installs no detour of its own: it registers
+  // from FileHookSystem's first intercepted open, which is the only anchor that is both
+  // past gl.exe's CRT init and ahead of every image dispatch. See src/ImageCodec.h.
   ScriptSystem script;      // QuickJS host; runs gkplus/main.mjs
 };
 

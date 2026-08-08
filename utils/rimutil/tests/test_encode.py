@@ -11,11 +11,14 @@ still run, which is what makes this usable on a machine with no install.
   the encoder may only choose it when they all share one -- ``tree_alpha.RIM``
   has 790 distinct RGB values under alpha 0, and the RGB *under* transparency is
   not a don't-care because bilinear filtering blends it into its neighbours.
-* **BODY refuses graded alpha.** Lossless on disk is not lossless in the engine:
-  Gunlok ignores the ``ALPH`` chunk, so a graded-alpha BODY file passes every
-  round-trip below and still renders fully opaque. That is exactly the shape of
-  bug these tests cannot see, which is why the encoder refuses it outright and
-  this file asserts the refusal rather than the round trip.
+* **BODY carries graded alpha, and refuses it only when the palette is too wide.**
+  The engine honours an ``ALPH`` when it is a child of ``PROP:ILBM`` -- measured
+  in the running game; a ``FORM``-placed one renders bit-for-bit identically to
+  no ``ALPH`` at all. What it cannot survive is an ``ALPH`` alongside more than
+  256 colours: ``RimConvertIndexed_Alpha_NoMask`` faults. So a narrow-palette
+  graded image must round-trip, and a wide-palette one must be refused. Neither
+  of those is a shape these tests can see for themselves, which is why both are
+  asserted explicitly.
 * **The reference agrees with what the encoder wrote.** rimutil reading its own
   output would prove only that it is self-consistent.
 * **DXT1/DXT3 produce a well-formed file that decodes** with a plausible error.
@@ -44,7 +47,8 @@ SYNTHETIC = [
     ("w1x1", "gradient", 1, 1),
     ("w12_odd", "gradient", 12, 5),       # width not a multiple of 8
     ("w24_two", "twocolour", 24, 9),      # 2 colours -> a single bitplane
-    ("w320_graded", "graded", 320, 7),    # graded alpha -> body must refuse
+    ("w320_graded", "graded", 320, 7),    # graded alpha, >256 colours -> refused
+    ("w64_gradedsmall", "gradedsmall", 64, 64),  # graded alpha, 16 colours -> round-trips
     ("w64_cutout", "cutout", 64, 64),     # one transparent colour -> masking 2
     ("w300_wide", "wide", 300, 300),      # 90,000 colours -> 17 bitplanes
 ]
@@ -66,6 +70,11 @@ def generate(kind, w, h):
                     px += bytes(((x * 9) & 0xFF, (y * 7) & 0xFF, 64, 255))
             elif kind == "graded":
                 px += bytes(((x * 3) & 0xFF, (y * 5) & 0xFF, 128, (x * 13) & 0xFF))
+            elif kind == "gradedsmall":
+                # 16 distinct greys, so it palettizes well inside the 256-colour
+                # cap, with a genuinely graded alpha ramp on top.
+                v = (x // 4) * 16
+                px += bytes((v, v, v, 128 + ((y * 2) % 64)))
             elif kind == "wide":
                 v = y * w + x
                 px += bytes(((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF, 255))
@@ -93,26 +102,48 @@ EXPECTED_SHAPE = [
 
 
 def has_graded_alpha(rgba):
-    """True when any texel is partially transparent, which is what body refuses."""
+    """True when any texel is partially transparent, i.e. it needs an ALPH."""
     return any(a not in (0, 255) for a in rgba[3::4])
+
+
+def distinct_colours(rgba):
+    """Palette size a lossless palettization would need."""
+    return len({rgba[i:i + 3] for i in range(0, len(rgba), 4)})
+
+
+def needs_alph(rgba):
+    """True when the alpha can only be carried by an ALPH chunk.
+
+    Mirrors ``classify_alpha`` in rimutil.cpp: opaque needs nothing, a cut-out
+    whose transparent texels all share one RGB uses ``masking 2``, and anything
+    else -- graded alpha, or several RGBs under transparency -- needs an ALPH.
+    """
+    alphas = rgba[3::4]
+    if all(a == 255 for a in alphas):
+        return False
+    if any(a not in (0, 255) for a in alphas):
+        return True
+    under = {rgba[i:i + 3] for i in range(0, len(rgba), 4) if rgba[i + 3] == 0}
+    return len(under) > 1
 
 
 def check_one(rimutil, work, name, src, failures):
     _w, _h, original = rimref.png_read_rgba(src)
 
-    if has_graded_alpha(original):
-        # The engine drops the ALPH chunk this would need, so the only correct
-        # outcome is a refusal - see AlphaShape in rimutil.cpp.
+    if needs_alph(original) and distinct_colours(original) > 256:
+        # An ALPH is delivered correctly, but the engine's alpha converter faults
+        # above 256 colours, and this encoder has no quantizer - so refusing is
+        # the only honest outcome. See rimutil.cpp's palette cap.
         rim = os.path.join(work, "%s_body_refused.RIM" % name)
         rc, msg = run(rimutil, "compress", src, rim, "--format", "body")
         if rc == 0:
-            failures.append("%s body: graded alpha was accepted" % name)
-        elif "graded alpha" not in msg:
+            failures.append("%s body: wide palette needing an ALPH was accepted" % name)
+        elif "256" not in msg:
             failures.append("%s body: refused for the wrong reason: %s" % (name, msg))
         elif os.path.exists(rim):
             failures.append("%s body: refused but still wrote %s" % (name, rim))
         else:
-            print("   body     refused (graded alpha), as it must be")
+            print("   body     refused (alpha needs <=256 colours), as it must be")
     else:
         check_body_roundtrip(rimutil, work, name, src, original, failures)
 

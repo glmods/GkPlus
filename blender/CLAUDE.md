@@ -183,13 +183,17 @@ These pin the design, in roughly decreasing order of how much everything else re
   `nPlanes` follows from the count (up to 31, since the scanline decoder accumulates into a
   uint32), and alpha goes to a transparent palette index when every transparent texel shares one
   RGB and to an `ALPH` chunk otherwise — **that choice is not cosmetic**, because the RGB under a
-  transparent texel is what bilinear filtering blends into its opaque neighbours. **And the `ALPH`
-  branch does not work in the game**: Gunlok ignores the chunk, so a texture written down it loads
-  fully opaque — measured, see `rif_chunk_format.md`, "The engine does not honour an `ALPH` you
-  write". `utils/rimutil` refuses `--format body` for graded alpha on that basis; `rim.encode` has
-  no equivalent guard and no DXT fallback to offer, so **a graded-alpha texture exported by the
-  addon will render opaque**. The round-trip test cannot see it: the file is correct and the engine
-  is what drops the alpha. DXT stays in
+  transparent texel is what bilinear filtering blends into its opaque neighbours. **The `ALPH`
+  goes in `PROP:ILBM`, not in the `FORM`** — measured in the running game, a `FORM`-placed one is
+  never found and renders bit-for-bit identically to a file with no `ALPH` at all, while the same
+  chunk in the `PROP` renders correct graded alpha. Both writers put it in the `FORM` until
+  2026-08-08, which is why this file used to claim the engine ignored `ALPH` outright; it does not.
+  See `rif_chunk_format.md`, "An `ALPH` must be a child of `PROP:ILBM`".
+  The one real limit is a **256-colour cap when an `ALPH` is emitted**: the engine's alpha
+  converter faults above that (measured, 0x005df14a), and neither writer has a quantizer, so both
+  refuse rather than emit a file that crashes. `Ground\tree_alpha.RIM` is the only shipped texture
+  in that shape — it needs an `ALPH` and palettizes to 90,319 colours — so it is the one image the
+  `body` path cannot round-trip. DXT stays in
   `utils/rimutil`, where libsquish is. The two writers emit **identical bytes** for the same
   image, raw and ByteRun1 alike, which is what makes them cross-checkable rather than separately
   believed. Cost: 2–6× a DXT payload, and about a second per 1024² image in pure Python.
@@ -229,9 +233,11 @@ These pin the design, in roughly decreasing order of how much everything else re
   block artifacts being *absent* from the lossless copy rather than any fault in it. So the format
   description above is confirmed end to end, not just self-consistent — **for opaque textures**.
   This measurement looked at static geometry and never at an alpha blend, which is exactly why it
-  missed the `ALPH` defect above: `Units\alpha junk.RIM` was in the set, its alpha was being
+  missed the `ALPH` placement bug above: `Units\alpha junk.RIM` was in the set, its alpha was being
   dropped throughout, and the MAE number is identical either way because the quads that use it in
-  a level are additive over black RGB.
+  a level are additive over black RGB. The instrument that did catch it was the **front-end menu
+  lozenge**, drawn `SRCALPHA`/`INVSRCALPHA` on the main menu, where alpha is directly visible in a
+  screenshot — worth reaching for before any wider comparison.
 - **Files are written uncompressed.** 150 of the 563 shipped files already are, and the game reads
   them, so the Huffman *compressor* is never needed. `huffman/huffman_compress.cpp` still exists for
   byte-parity work.

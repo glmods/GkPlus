@@ -157,7 +157,7 @@ Overlay configuration in `vcpkg-configuration.json`.
 `Subsystems` holds only the **hook-installing** subsystems — `FileHookSystem`,
 `d3d8::D3D8CaptureSystem`, `MusicSystem`, `DebugSystem`, `GUISystem`, `InputFixSystem`,
 `VersionTextSystem`, `CustomMenuSystem`, `WindowPlacementSystem`, `ScriptQueueSystem`,
-`gls::GlsSystem`, `CustomLevelSystem`, `ScriptSystem`.
+`gls::GlsSystem`, `CustomLevelSystem`, `image::ImageCodecSystem`, `ScriptSystem`.
 `FileHookSystem` is deliberately **first**: it patches gl.exe's file imports, and assets
 loaded during `WinMain` (before any other hook can fire) have to pass through it for a mod
 to replace them. `D3D8CaptureSystem` is second, and before `GUISystem` for a reason: it wraps
@@ -397,6 +397,8 @@ reference. Test invocations are under "Running the test suites" above.
 
 | File | Purpose |
 |------|---------|
+| `src/Dds.h/cpp` | DDS parsing, and nothing else — pure, no game memory, harness-testable. Two families. **DXT1/DXT3** take the engine's S3TC path and must **stop their mip chain at 4x4**, which is not a style choice: the row loop decrements by 4 and exits on exactly zero, so a 2x2 level makes it run past the locked surface. **Uncompressed 24/32-bit** is the **only way to get true 24-bit colour into Gunlok** — every other route (DXT, an uncompressed `.RIM`, a 24bpp BMP) lands on a 4-bit-per-channel surface; it works by reporting `alpha_bits = 8` so the candidate walk rejects everything and falls through to the 32-bit descriptor, which needs `Use32BitTextures` (forced by `src/ImageCodec`). It has no 4x4 floor. Refuses **by name** anything the engine cannot render: DXT2/4/5, DX10-extension, cubemap, volume, and any pixel layout that would need a swizzle |
+| `src/ImageCodec.h/cpp` | The game-facing half: `EngineImage` (the engine's 24-slot image interface and its 0x30-byte base layout, `static_assert`ed field by field), a `DdsImage` that serves DXT blocks straight out of its own copy of the file, and `ImageCodecSystem`. **A registration, not a detour** — the image layer picks its decoder by magic bytes via `RegisterImageCodec` @ 0x005c8360, and nothing on the texture path reads a file extension, so `Ground\ground.dds` in a `BMPNAMES` entry just works. Registered from `FileHookSystem`'s **first intercepted open** rather than `DllMain` (the trie is built with `pool_alloc`, whose backing heap gl.exe's CRT has not initialised that early) and rather than a detour of its own (two subsystems detouring one target do not chain — see Conventions). That anchor is provably both late enough and early enough: the game only opens a file from `WinMain` onwards, and a file is always opened before its bytes can be sniffed. **Verified in the running game**, not just by inspection: a DXT1 `.dds` served in place of `Graphics\Bitmaps\Main Menu 01.RIM` renders. The whole contract — slots, base layout, the row-streaming loop, the 4x4 floor, the `RimLoadErrorCode` failure channel, and the `Seek(0)` a codec must issue before its first read — is in `file_io_notes.md` §4 |
 | `src/Vfs.h/cpp` | The mod filesystem: mount, case-folded index, lookup, read, `Materialize`. Pure lookup — touches no game memory, so it is the half a harness can exercise. See "Mod loading" above |
 | `src/FileHooks.h/cpp` | `FileHookSystem` — the nine IAT patches and the two static-CRT detours that make the engine consult `src/Vfs`, plus the virtual-handle table and the `mods.served`/`mods.recent` diagnostics |
 | `src/Repl.h/cpp` | The loopback JavaScript REPL: `StartRepl` / `PumpRepl` / `StopRepl`, owned by `BootScriptHost` rather than by `Subsystems` (it installs no detour). Off unless `GKPLUS_REPL_PORT` is set. See "The REPL channel" above |
@@ -507,7 +509,11 @@ several features the retail build cannot actually execute:
   `.rif` and sound), the chdir-per-category `GLDir` scheme, the classified read/write site tables for
   both the Win32 and CRT `fopen` families, the two memory-source seams the engine already has (the
   GLS parser and the image loader) and the two it does not (Bink, `glres<lang>.dll`), the IAT slot
-  map, and the PhysicsFS assessment in §6
+  map, and the PhysicsFS assessment in §6. §4 also has the **image-codec registry** — the image
+  layer picks its decoder by *magic bytes* through an open registration function
+  (`RegisterImageCodec` @ 0x005c8360), so a new image format is a registration rather than a
+  detour — and the audit proving **nothing on the texture path reads a file extension**, which is
+  what lets a `BMPNAMES` entry name something that is not a `.RIM`
 - `gls.txt` - Game Level Structure file format quick field list (superseded by gls_system_notes.md)
 - `<Gunlok>\html manual\manual.htm` - the shipped manual (Italian). Not RE, but the best
   inventory of what the gameplay layer is *supposed* to do. Treat it as claims to verify:
@@ -779,6 +785,13 @@ unrelated, long after the call.
   puts `data` at 0x0c for a pointer but at 0x10 for an 8-aligned value type, which is exactly
   what makes `MenuListItem` 0x78 rather than 0x10
 - Detour hooks follow: resolve original -> attach in constructor -> detach in destructor
+- **Two subsystems must never detour the same target.** `Subsystems` is constructed inside a
+  single Detours transaction, and two `DetourAttach` calls against one address do not chain
+  there — one hook silently stops running. Measured: adding a second `SetupMenus` detour
+  beside `ScriptSystem`'s killed the script host with no diagnostic at all (the REPL listener
+  simply never opened, and the game otherwise looked normal). If a subsystem needs to run at
+  a point another already hooks, have that hook call it, or find a different anchor — the DDS
+  codec registers from `FileHookSystem`'s first intercepted open for exactly this reason
 - `static_assert` on struct sizes and offsets to catch layout mismatches
 - Game vtables are modelled in `src/Actors.cpp` as **declaration-ordered pure virtuals**: the base
   `Actor` declares 83 (slot 0 is the destructor), and each subclass appends its own extension slots

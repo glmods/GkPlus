@@ -776,11 +776,24 @@ static Chunk make_tran() {
 // same PNG encoded `--format dxt3` matches stock exactly, so it is the chunk and
 // not the missing mip chain.
 //
-// The likely mechanism is `ChooseSurfaceFormatForImage` (rif_chunk_format.md,
-// "The fourcc picks the surface format"): an *uncompressed* image with alpha bits
-// >= 2 admits only A8R8G8B8, which is gated on `Use32BitTextures` - 0 by default,
-// and its only toggle is on menu 19, which nothing can reach. DXT3 escapes that
-// by being a compressed surface. Not measured, so it is a working theory.
+// **The cause is now known, and it is this program's own bug: the `ALPH` goes in
+// the wrong group.** An `ALPH` inside the `FORM:ILBM` is never found by the
+// loader - measured in the running game, where it renders bit-for-bit identically
+// to a file carrying no `ALPH` at all (mean 0.0000/255, max 0). The identical
+// chunk placed in the `PROP:ILBM`, which is where the one shipped `ALPH`
+// (`Ground\tree_alpha.RIM`) lives, renders correct graded alpha. So the engine is
+// fine and the refusal below is working around a defect on this side of the line.
+//
+// (An earlier theory blamed `ChooseSurfaceFormatForImage` admitting only
+// A8R8G8B8 for alpha bits >= 2 with `Use32BitTextures` off. Also refuted: such an
+// image reaches an A8R8G8B8 staging surface and is re-compressed to DXT3.)
+//
+// Fixing it means emitting the `ALPH` in the `PROP` **and** capping the palette at
+// 256 colours: this palettizes losslessly, so `alpha junk` yields 40,742 entries /
+// 16 planes, and such a file with a PROP-placed `ALPH` crashes the game inside the
+// alpha converter at 0x005df14a. Until both are done the refusal stays, because
+// what it currently emits genuinely does not work. See rif_chunk_format.md, "An
+// `ALPH` must be a child of `PROP:ILBM`".
 //
 // So a BODY encode is exactly lossless *on disk* and wrong *in the engine*
 // whenever it has to emit an `ALPH`. Graded alpha is therefore refused outright.
@@ -963,37 +976,34 @@ static int do_compress(const std::string &in, const std::string &out,
   }
 
   std::vector<Chunk> ilbm;
+  // PROP:ILBM holds the properties shared by every FORM:ILBM beside it. TRAN is
+  // always there; an ALPH joins it, because that is the only scope the loader's
+  // lookup can see - see the push below.
+  std::vector<Chunk> prop{make_tran()};
   if (format == OutFormat::Body) {
-    // See AlphaShape: the engine ignores `ALPH`, so a BODY encode that needs one
-    // is lossless on disk and renders opaque. Refusing here is the whole point -
-    // the file it would write passes every round-trip test in
-    // utils/rimutil/tests and is still wrong in the game.
-    switch (classify_alpha(img, nullptr)) {
-    case AlphaShape::GradedAlph:
-      std::cerr
-          << "This image has graded alpha, which body cannot deliver: the\n"
-             "engine ignores the ALPH chunk a palettized image has to carry it\n"
-             "in, so the texture loads fully opaque. Measured on\n"
-             "Units\\alpha junk.RIM - flattening its alpha to a uniform 128\n"
-             "renders pixel-identically to the correct graded version.\n"
-             "Use --format dxt3, whose 4-bit alpha the engine does read."
-          << std::endl;
-      return 1;
-    case AlphaShape::BinaryAlph:
-      std::cerr
-          << "Warning: this cut-out has several distinct RGB values under its\n"
-             "transparent texels, so it cannot use masking 2 and needs an ALPH\n"
-             "chunk - which the engine is known to ignore for graded alpha and\n"
-             "is presumed to ignore here too (not measured). The cut-out will\n"
-             "probably render opaque; --format dxt3 is the safe choice."
-          << std::endl;
-      break;
-    case AlphaShape::Opaque:
-    case AlphaShape::TransparentIndex:
-      break;
-    }
     Palettized pal = palettize(img);
     check_lossless(img, pal);
+
+    // An ALPH is delivered correctly now (it goes in the PROP - see below), but
+    // the engine's alpha converter cannot survive a wide palette: above 256
+    // colours `RimConvertIndexed_Alpha_NoMask` @ 0x005defe0 faults - measured,
+    // 0xc0000005 at 0x005df14a, on a 40,742-entry re-encode of
+    // `Units\alpha junk.RIM`. The same image at 8 planes renders correctly.
+    //
+    // This palettizes losslessly and has no quantizer, so for a photographic
+    // source that also needs alpha the only honest answer is to refuse. The cap
+    // applies ONLY when an ALPH is emitted: a wide palette with no alpha takes
+    // the other converter and demonstrably renders.
+    const size_t colours = pal.cmap.size() / 3;
+    if (!pal.alpha.empty() && colours > 256) {
+      std::cerr << "This image needs an ALPH chunk (its alpha cannot be carried\n"
+                   "by a transparent palette index), but it palettizes to "
+                << colours
+                << "\ncolours and the engine's alpha converter crashes above "
+                   "256.\nReduce it to 256 colours, or use --format dxt3."
+                << std::endl;
+      return 1;
+    }
     std::vector<uint8_t> planar =
         encode_planar(pal.idx, img.width, img.height, pal.planes);
     Compression compression =
@@ -1021,13 +1031,13 @@ static int do_compress(const std::string &in, const std::string &out,
       w.u8(8); // bits, which the planar decoder uses as the plane count
       w.u8(static_cast<uint8_t>(compression));
       w.raw(abody.data(), abody.size());
-      // In the FORM rather than the PROP: the engine looks a chunk up against
-      // the ILBM it is processing, and whether PROP properties are in that scope
-      // has not been established. Note that this placement does NOT make the
-      // question moot the way rif_chunk_format.md used to claim - an ALPH here
-      // is ignored (see AlphaShape), which is why graded alpha never reaches
-      // this code any more.
-      ilbm.push_back({'ALPH', w.v});
+      // **In the PROP, not the FORM.** An ALPH inside the FORM:ILBM is never
+      // found by the loader: measured in the running game, such a file renders
+      // bit-for-bit identically to one carrying no ALPH at all (mean 0.0000/255,
+      // max 0), while the same chunk in the PROP renders correct graded alpha,
+      // matching a 50% blend to within 1/255. The one shipped ALPH,
+      // `Ground\tree_alpha.RIM`, is in the PROP for the same reason.
+      prop.push_back({'ALPH', w.v});
     }
 
     std::cout << "BODY " << img.width << "x" << img.height << ", "
@@ -1066,7 +1076,7 @@ static int do_compress(const std::string &in, const std::string &out,
 
   Chunk root{'LIST',
              Form{'ILBM',
-                  {Chunk{'PROP', Form{'ILBM', {make_tran()}}},
+                  {Chunk{'PROP', Form{'ILBM', prop}},
                    Chunk{'FORM', Form{'ILBM', ilbm}}, make_empty_mipm()}}};
 
   ByteWriter w;

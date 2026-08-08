@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "Core.h"
+#include "ImageCodec.h"
 #include "D3D8Device.gen.inc.h"
 #include "DetourUtils.h"
 #include "Render.h"
@@ -2738,6 +2739,10 @@ Direct3DCreate8Fn ResolveInnerCreate() {
 }
 
 IDirect3D8 *WINAPI HookedDirect3DCreate8(UINT SDKVersion) {
+  // The one window in which Use32BitTextures can still be changed: after WinMain's
+  // config restore, before InitDirect3DDevice enumerates formats off the interface we
+  // are about to return. See src/ImageCodec.h for why that matters and what it costs.
+  image::ForceThirtyTwoBitTextures();
   IDirect3D8 *const inner = ResolveInnerCreate()(SDKVersion);
   if (!inner) {
     return nullptr;

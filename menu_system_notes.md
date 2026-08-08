@@ -578,6 +578,23 @@ field onto the **global block at `0x006abdd0`** — the two are byte-identical, 
 onward is what GkPlus models as `Settings` in `src/Misc.cpp`. `WinMain` seeds defaults before
 the call, so a missing/short file still yields sane values.
 
+**The table below is the in-memory layout. It is NOT the file layout, and the two orders
+differ.** `WriteGLKeys`'s writer is `FUN_0060e3df`, which the symbol table names `__putw`: the
+block is a stream of raw 4-byte ints written **positionally**, with no key names, so a value
+is identified purely by its ordinal in the stream. The write order interleaves globals from
+outside this struct and does not follow the offsets — the run around `Use32BitTextures` is
+`0x006abdf4, 0x007b9cb4, 0x007b9cac, 0x007b9cb8, 0x007b9cbc, FUN_005901c0(), 0x006abdd8,
+0x006abdd4, 0x006abddc, 0x006abdf0, 0x006abde8, 0x006abdec, 0x006abdf8, `**`0x006abde0`**`,
+0x006abdfc, …`. Reading the file's `data` block as if it were this struct produces plausible
+nonsense (booleans reading 5 and 9), which is exactly how it misled one session; recover the
+order from `WriteGLKeys` before patching a byte, or write the global at run time instead.
+
+Note also that `WinMain`'s restore is a single **`MOVUPS`**, so `0x006abde0`, `0x006abde4`,
+`0x006abde8` and `0x006abdec` land as one atomic 16-byte store. It runs **once**, so a runtime
+write to any of them is safe from the config path — but `VramTextureReduction` (`+0x1c`) is
+recomputed on every device init/reset, so its persisted value is transient and setting it
+directly does not stick.
+
 | Off | Global | Name | Default | Meaning |
 |-----|--------|------|---------|---------|
 | 0x00 | 0x006abdd0 | `UnusedPrefToggle` | 0 | vestigial, see below |

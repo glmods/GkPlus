@@ -57,6 +57,16 @@ def round_trip(width, height, rgba, failures, label, modes=(False, True)):
         try:
             blob = rim.encode(width, height, rgba, compress)
             back = rim.decode(blob)
+        except rim.RimError as exc:
+            # One legitimate refusal: an image whose alpha can only be carried by
+            # an ALPH, palettizing to more than 256 colours. The engine's alpha
+            # converter faults on that (measured), and this encoder has no
+            # quantizer, so refusing is correct rather than a failure. The only
+            # shipped file in that shape is Ground	ree_alpha.RIM.
+            if "crashes above 256" in str(exc):
+                return None
+            failures.append((label, "encode(compress=%s): %r" % (compress, exc)))
+            return None
         except Exception as exc:  # noqa: BLE001
             failures.append((label, "encode(compress=%s): %r" % (compress, exc)))
             return None
