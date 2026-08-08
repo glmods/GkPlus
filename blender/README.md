@@ -674,10 +674,14 @@ exporter regenerate rather than mirror:
   record, and Gunlok derives a role's collision extents from the bounds when the GLS gives
   `radius`/`height` as 0 — so carrying it through leaves it wrong the moment a vertex moves.
   Its authored half (`flags`, `lock_user`, `version_no`) is kept.
-- `SHPPCINF` is discarded — 681 of the 9,357 shipped shapes carry none, and every AvP code path
-  guards on its lookup returning null.
+- `SHPPCINF` is discarded — nothing in Gunlok reads it. Its string has three referrers in the
+  binary: its registration, its loader, and the function that *deletes* it once the shape is
+  built. 681 of the 9,357 shipped shapes carry none anyway.
 - `SHPMRGDT` and `SHPVTINT` are authored per-element data, so they ride as mesh attributes and
-  survive an edit instead of going stale.
+  survive an edit instead of going stale. `SHPMRGDT` names *another polygon*, so it rides as a
+  **pair id** (`rif_merge_pair`) rather than the index the file stores — an index would not
+  survive this addon renumbering polygons, and export validates the rebuilt table before writing
+  it because the engine's merge pass has no bounds check.
 
 Nothing is silently dropped when you edit a mesh.
 
@@ -772,6 +776,8 @@ Measured across all 563 shipped files:
 | A cutscene's id is its name | `MD5("Cutscene:" + name)[0:8]` with the top byte of the second dword cleared reproduces the stored value in 34 of 34 |
 | A point's time is a duration in ticks | all 763 shipped point times are a multiple of 40 ms; the final point of a multi-point track is 0 in 94% against 38% elsewhere, which no cumulative timestamp could be |
 | Field of view survives the camera lens | degrees → radians → degrees is exact through float32 for all 139 shipped `CUTTRFOV` values |
+| `SHPMRGDT` is an exact involution | all 9,357 shipped shapes satisfy the predicate the engine's merge pass assumes, and all 9,357 reproduce their wire values byte for byte through the pair-id form the scene stores |
+| The merge fix works where it failed | across the 24 level map objects it turns 15 unwalkable tables into 0, losing 73 pairs of ~320,000 — only where the partner face was genuinely dropped. `level02` and `level11`, which crashed Gunlok on load, now load with 178/294 and 317/352 actors and roles |
 | The two sound systems do not overlap | `INDSOUND` occurs in 52 files under `Objects\`/`Units\` and `DUMOBJTX` in 24 under `Levels\`, with no file and not one `.wav` name in common |
 | `DUMOBJTX` rebuilds exactly | `encode(decode(body)) == body` for all 1,097, and all 1,097 are padded to `(strlen + 4) & ~3` with NULs |
 | An emitter survives a `.blend` | `level01` (14), `junkyard` (87) and `level06` (the one whose directives split across two lines) come back byte-identical through import → `.blend` → reset → reopen → export, position and name included |
@@ -782,24 +788,28 @@ Measured across all 563 shipped files:
 
 Not verified:
 
-- **Nothing exported has been loaded back into Gunlok.** The output is checked against the format
-  and against itself, not against the game. This matters more now that the exporter regenerates
-  rather than mirrors: the `SHPPCINF` drop is reasoned from AvP's null-guards and the shapes that
-  ship without it, not from watching Gunlok load one. It matters most for a file built from
-  nothing, where *every* chunk is generated — start by exporting an untouched import and loading
-  that, before trusting a hand-made one.
+- **Most of what is exported has still not been loaded back into Gunlok.** Four levels have been
+  (see the `SHPMRGDT` limitation above, which is what that testing found), but the general case is
+  checked against the format and against itself, not against the game. It matters most for a file
+  built from nothing, where *every* chunk is generated — start by exporting an untouched import
+  and loading that, before trusting a hand-made one. The `SHPPCINF` drop, which used to be listed
+  here as reasoned-not-measured, is now measured: nothing in gl.exe reads that chunk.
 - **An authored `DUMMYOBJ` has not been loaded by Gunlok.** The gates it must satisfy are measured
   and are enforced (see *Locators* above), and an exported `level01` full of *regenerated* ones does
   load (above) — but a dummy that never existed in a shipped file has not been through the engine.
-- **An exported `level02` crashes Gunlok during `ToMap`, and it is nothing to do with sound.** The
-  fault is an access violation at `gl+0x1d79a5` (a 16-byte `movups` store) reached through
-  `ToMap` → `0x005aa8e9` → `0x005ac842`, and it reproduces **identically with the addon at the
-  commit before the sound work**, with the `.map`/`.cut` sidecar caches deleted, while stock
-  `level02` loads normally (178 actors / 294 roles) and an exported `level01` loads normally. So it
-  is a pre-existing exporter fault that `level02` triggers and `level01` does not — unrelated to
-  `DUMMYOBJ`, `DUMOBJTX` or `INDSOUND`, and not yet diagnosed. **Export an untouched import of the
-  level you intend to mod and load it before trusting an edit**; that check takes one run and is the
-  only thing that separates "the exporter handles this file" from "the exporter handles some files".
+- **A `.blend` saved before the polygon-merge fix exports without `SHPMRGDT`.** That chunk pairs
+  coplanar triangles so the engine can draw them as one quad, and the old build stored the pairing
+  as a raw polygon index — which broke the moment a face was dropped, and crashed Gunlok on load
+  for 15 of the 24 shipped levels. It is now a **pair id** on `rif_merge_pair`, and an old
+  `.blend` has no attribute under that name.
+
+  The consequence is safe and almost invisible, though not quite "cosmetic": the merge feeds the
+  **navmesh**, not the renderer — the engine builds its draw buffers from the unmerged triangles
+  and never rebuilds them — so an unmerged pair is one extra pathfinding section, not one extra
+  drawn triangle. Walkability is unchanged (a pair only merges if both halves already share their
+  flags, and the quad inherits one of the two planes). **Re-import the `.rif` to get the pairing
+  back** — the old values are not converted, because they are indices into a numbering the
+  importer had already changed and converting them would produce a plausible, wrong pairing.
 - **An ambient emitter's distance unit is unknown.** `I` and `R` reach the sound system as
   distances, and the shipped `R` values run 5, 10, 15, 20 … 60 *and* 500 and 5000 in the same game,
   which no single unit explains. The addon shows the number the file holds and scales nothing, so a

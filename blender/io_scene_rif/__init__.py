@@ -13,8 +13,14 @@ the original ``.rif`` and still produce one.
 
 The bar is *semantic* equivalence, not byte equivalence: derived chunks are
 regenerated (``SHPCENTR``), authored per-element data becomes mesh attributes
-(``SHPMRGDT``, ``SHPVTINT``), and preprocessed render data with no known generator
-is dropped (``SHPPCINF``, which 681 of the 9,357 shipped shapes omit anyway).
+(``SHPMRGDT``, ``SHPVTINT``), and preprocessed render data nothing in the engine
+reads is dropped (``SHPPCINF``, which 681 of the 9,357 shipped shapes omit anyway).
+
+``SHPMRGDT`` is a *pairing between polygons*, so it rides as a shared pair id
+rather than the index the file stores -- an index does not survive this addon
+renumbering polygons, and carrying one used to crash Gunlok on 15 of the 24
+shipped levels. Export validates the rebuilt table before writing it, because
+the engine's merge pass has no bounds check. See ``blender/CLAUDE.md``.
 """
 
 import os
@@ -313,6 +319,20 @@ class EXPORT_SCENE_OT_rif(bpy.types.Operator, ExportHelper):
                 "RIF integer units -- keeping them crashes Gunlok during level "
                 "load. Merge by Distance and check for zero-area faces if you "
                 "did not expect any." % (summary, stats["degenerate_faces"]),
+            )
+            return {"FINISHED"}
+        # Never INFO either, and this one is a *saved* crash rather than a loss:
+        # a SHPMRGDT the validator could not prove is an out-of-bounds heap write
+        # inside the engine's quad merge during level load. Dropping it is always
+        # legal; being told is what stops it going unnoticed.
+        if stats.get("merge_dropped"):
+            self.report(
+                {"WARNING"},
+                "%s; dropped the polygon-merge data on %d shape(s) because it "
+                "would not have been safe to write -- the engine's merge pass has "
+                "no bounds check, so a bad pairing crashes it during level load "
+                "(%s)" % (summary, stats["merge_dropped"],
+                          (stats.get("merge_reasons") or ["?"])[0]),
             )
             return {"FINISHED"}
         # Likewise never INFO: the object was marked as carrying lighting and

@@ -231,7 +231,7 @@ Role *__fastcall HookedToRole(void *parsed) {
 // the role's script string.
 //
 // This one repairs Gunlok rather than encoding anything, and it exists because
-// GkPlus is what makes the defect reachable (game_defects_notes.md section 6).
+// GkPlus is what makes the defect reachable (game_defects_notes.md section 7).
 // The original shares `Role::interface_beam_script` **by pointer** into every
 // spawned actor's Vulnerability and sets `actor_scoped = 1`, which is the flag
 // that tells ~Actor to pool-free it. Two live actors of one role therefore

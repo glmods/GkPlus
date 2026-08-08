@@ -4,6 +4,23 @@ Bugs that live in `gl.exe` and reproduce without GkPlus. Recorded here so a late
 session can decide whether the mod should paper over them, and so nobody spends a
 second evening blaming our hooks for them.
 
+Other files cite these **by number** (`game_defects_notes.md` §4), so a number is a
+stable id: append a new defect at the end of the numbered run — before *Debugging
+Gunlok*, which is an appendix and not a defect — and never renumber an existing one.
+
+| | Defect | Reachable from |
+|---|---|---|
+| 1 | `Font_QueueText` smashes its stack past ~1024 characters | the game itself (training debrief) |
+| 2 | `PrintParseWarning` / `PrintParseError` discard their output | — (a trap, not a bug) |
+| 3 | `GetResourceString` walks its table with no terminator | a missing localized string id |
+| 4 | the process faults on exit via the console `QUIT` | any exit |
+| 5 | the section adjacency test overflows its shared-vertex buffer | degenerate-after-weld level geometry |
+| 6 | `TexMergePolys` writes a UV list before deciding not to merge | an authored `SHPMRGDT` |
+| 7 | `Role::interface_beam_script` is shared by pointer and freed per actor | GkPlus only (`make.role`) |
+| 8 | `Font_QueueText` dereferences null when its node allocation fails | out-of-memory |
+| 9 | `ToRole` dereferences a null `Hierarchy` for a missing `.rif` | a role whose `.rif` is absent |
+| 10 | ambient sound volume (`V` in a `DUMOBJTX`) is parsed and discarded | every level in the game |
+
 ---
 
 ## 1. `Font_QueueText` @ 0x005782e0 smashes its stack on any string over ~1024 chars
@@ -176,7 +193,10 @@ session that found this are gone (WER keeps a bounded ring), so reproduce first.
 
 ---
 
-## 5. `PolygonAdjacencyTest` @ 0x0048ecf0 overflows a 3-element buffer on degenerate level geometry
+## 5. The section adjacency test overflows its shared-vertex buffer on degenerate level geometry
+
+Two implementations, one defect: `PolygonAdjacencyTest` @ 0x0048ecf0 (`Vec3[3]`) and
+`NavQuad_AdjacencyTest` @ 0x0048f580 (`Vec3[4]`).
 
 **Status:** open, unpatched in the game; **worked around in the Blender exporter**
 (`shapes.welds_degenerate`), which drops the geometry that triggers it.
@@ -187,46 +207,71 @@ asset nor the polygon.
 
 ### Mechanism
 
-`PolygonAdjacencyTest` is polygon vtable **slot 0x50**, `__thiscall(this, other)`,
-"do these two polygons share an edge?". It walks `this`'s three vertex pointers,
-scans `other`'s vertex-pointer array for each, and appends every match — **by
-pointer identity** — to a local `Vec3[3]`:
+Slot 0x50 is `__thiscall(this, other)`, "do these two polygons share an edge?". It
+walks `this`'s vertex pointers, scans `other`'s vertex-pointer array for each, and
+appends every match — **by pointer identity** — into a fixed local buffer:
 
 ```c
-_eh_vector_constructor_iterator_(&shared, 0xc, 3, ...);   // 3 x 12 bytes, at EBP-0x38
+_eh_vector_constructor_iterator_(&shared, 0xc, N, ...);   // N x 12 bytes
 ...
 dst = (undefined4 *)((int)&shared + count * 0xc);         // no bound on `count`
 if (v == other_verts[i]) { count++; dst[0] = ...; dst[1] = ...; dst[2] = ...; }
 ```
 
-It returns true when exactly **2** matched — a shared edge — after which it
-projects the edge and validates the connection.
+It returns true when exactly **2** matched — a shared edge — after which it projects
+the edge and validates the connection.
 
-There is no capacity check. `shared` is at `EBP-0x38` and the function's `/GS`
-cookie is at `EBP-0x14`, so the **fourth** match writes its first dword exactly
-onto the cookie:
+There is no capacity check, and in **both** implementations the buffer ends exactly
+on the function's `/GS` cookie, so the first overflowing write lands its first dword
+on the cookie rather than somewhere survivable:
 
-```
--0x38 + 3 * 0xc = -0x14
-```
+| | `PolygonAdjacencyTest` @ 0x0048ecf0 | `NavQuad_AdjacencyTest` @ 0x0048f580 |
+|---|---|---|
+| buffer | `Vec3[3]` at `EBP-0x38` | `Vec3[4]` at `EBP-0x44` |
+| cookie | `EBP-0x14` | `EBP-0x14` |
+| own vertices walked | 3 | 4 |
+| arithmetic | `-0x38 + 3*0xc = -0x14` | `-0x44 + 4*0xc = -0x14` |
+| overflows on the | **4th** match | **5th** match |
 
 The epilogue's `__security_check_cookie` then fast-fails with
 `STATUS_STACK_BUFFER_OVERRUN` (**0xc0000409**, subcode 0x2
 `FAST_FAIL_STACK_COOKIE_CHECK_FAILURE`) — *not* an access violation.
 
-### What produces four matches
+**Both implementations are live.** `SHPMRGDT` fuses triangle pairs into `NavQuad`s
+before the sections are built (`rif_chunk_format.md`, "Merging polygons into
+quads"), so a level's sections are a mix: **59% quads** across the shipped set —
+325,598 against 224,116 triangles — though it varies, and level01 is 47.6%.
+`BuildPolygonAdjacencyGrid` dispatches through the vtable
+(`(**(code **)(*poly + 0x50))(other)`), so all four tri/quad combinations occur.
 
-Matches are `sum over this's 3 corners of (occurrences of that corner in other)`.
-With `this` non-degenerate the total can never exceed 3, because `other` has only
-three slots. So the overflow requires **`this` to carry a repeated vertex pointer**
-*and* `other` to repeat a vertex `this` also has — i.e. two polygons that are both
-degenerate once the loader has welded vertex records by position, meeting in the
-same section-grid cell. Observed peak was **9**.
+### What produces an overflow
 
-A triangle becomes degenerate at the weld when two of its corners land on the same
-position. `SHPRAWVT` is **integer**, so this includes corners that were distinct in
-the authoring tool and collapsed on quantization — which is how an exporter creates
-them without any modelling error.
+Matches are `sum over this's corners of (occurrences of that corner in other)` — a
+nested loop, so the ceiling is `|this| * |other|`, not `|other|`. That is how the
+observed peak of **9** arises: `this` and `other` both welded down to a single
+distinct position, 3 corners x 3 slots.
+
+`other`'s slot count is **read through vtable slot 0x18**
+(`iVar7 = (**(code **)(*other + 0x18))()`), not assumed — 3 against a `NavPolygon`,
+4 against a `NavQuad`. Two cases follow:
+
+- With `this` **non-degenerate**, each of its distinct corners claims a given slot of
+  `other` at most once, so the total is bounded by `|other|`: 3 against a triangle,
+  **4 against a quad**. So a perfectly well-formed triangle can still reach its 4th
+  match, and hence its cookie, when tested against a **degenerate quad** — which
+  needs all four of the quad's slots to hold pointers drawn from the triangle's three
+  corners, and so forces a repeat. (`MergePolys` rejects `vert_ind[3] ==
+  vert_ind[0]`, so such a repeat is either one of the other pairings or created by
+  the weld.)
+- With `this` **degenerate** the product bound applies and the count runs away fast —
+  the two-degenerate-triangles case in the reproduction below.
+
+Either way the trigger is the same: geometry that is degenerate once the loader has
+welded vertex records by position, meeting in the same section-grid cell. A triangle
+becomes degenerate at the weld when two of its corners land on the same position, and
+`SHPRAWVT` is **integer** — so this includes corners that were distinct in the
+authoring tool and collapsed on quantization, which is how an exporter creates them
+with no modelling error anywhere.
 
 ### Call path
 
@@ -234,14 +279,16 @@ them without any modelling error.
 ToMap+0x2587
   LoadOrBuildSectionAdjacency+0x307        @ 0x0044fef0 — the .cut sidecar builder
     BuildPolygonAdjacencyGrid+0x137        @ 0x0048aa00 — triple-nested grid loop
-      PolygonAdjacencyTest+0x87d           @ 0x0048ecf0 — slot 0x50
+      <slot 0x50 on the section>           — PolygonAdjacencyTest @ 0x0048ecf0
+                                             or NavQuad_AdjacencyTest @ 0x0048f580
         __security_check_cookie → __report_gsfailure
 ```
 
 `BuildPolygonAdjacencyGrid` walks the level's 3D section grid (dimensions at
-`+0x6c`/`+0x68`/`+0x64`, cells at `+0x34`), and for each polygon rescans the 26
+`+0x6c`/`+0x68`/`+0x64`, cells at `+0x34`), and for each section rescans the 26
 neighbouring cells, calling slot 0x50 on each candidate pair and linking accepted
-ones through slots 0x58 / 0x5c.
+ones through slots 0x58 / 0x5c. The observed crash was in the triangle leaf
+(`PolygonAdjacencyTest+0x87d`).
 
 ### Why the shipped assets are not evidence that this is safe
 
@@ -287,6 +334,10 @@ nothing, so dropping them everywhere is cheaper than working out which shape wil
 become a map. `tests/test_scene.py` accounts for that loss alongside the duplicate
 faces Blender cannot hold; the two are counted disjointly, in pipeline order.
 
+This covers the quad half too, without needing to know about it: a `NavQuad` is built
+from two triangles that survived, so a mesh with no degenerate-after-weld triangle
+cannot produce a degenerate quad by merging.
+
 ### Why the crash is hard to see
 
 Two traps, both of which cost time here:
@@ -309,14 +360,40 @@ Recorded here only so nobody re-diagnoses it.
 
 ### Ghidra
 
-`PolygonAdjacencyTest` @ 0x0048ecf0 and `BuildPolygonAdjacencyGrid` @ 0x0048aa00
-were `FUN_`-named; both now carry plate comments with the above. `RET`-form and
-arity were not re-derived — the calling convention comes from the call site at
-0x0048ab35 (`MOV ECX,EBX` / `PUSH EDI` / `CALL [EAX+0x50]`).
+`PolygonAdjacencyTest` @ 0x0048ecf0, `NavQuad_AdjacencyTest` @ 0x0048f580 and
+`BuildPolygonAdjacencyGrid` @ 0x0048aa00 were all `FUN_`-named; each now carries a
+plate comment with the above. `RET`-form and arity were not re-derived — the calling
+convention comes from the call site at 0x0048ab35 (`MOV ECX,EBX` / `PUSH EDI` /
+`CALL [EAX+0x50]`).
+
+Every offset in the table above is read off the decompilation of the function it
+describes. **Do not derive the quad's numbers from the triangle's by analogy** —
+they agree, but the two frames are laid out independently and nothing guarantees
+that.
 
 ---
 
-## 6. `Role::interface_beam_script` is shared by pointer to every actor, and freed per actor
+## 6. `TexMergePolys` @ 0x005d7590 writes a UV list before deciding not to merge
+
+Reachable only from an **authored** `SHPMRGDT`, which is why it is filed here rather
+than as a shipped-data bug: no shipped table names a non-adjacent pair.
+
+`TexMergePolys` fuses two triangles' UV lists into `shape->uv_list[UVListIndex(a)]`
+at 0x005d777a — and only *then*, at 0x005d779e, tests `out->vert_ind[3] !=
+out->vert_ind[0]`, which is its implicit "do these two actually share an edge?"
+check. A pair that matches on `engine_type`, texture index, flags and shared-vertex
+UVs but does **not** share an edge therefore fails the merge, the caller emits both
+triangles unmerged, and `a`'s UV record has already been overwritten to
+`num_verts = 4` holding four fused coordinates. `a` then renders as a triangle
+against a UV list claiming four vertices.
+
+Consequence for a generator: a `SHPMRGDT` pairing must name **edge-sharing**
+triangles, not merely compatible ones. The three earlier bail-outs inside the walk
+are clean; this is the only one that has already mutated shared state.
+
+---
+
+## 7. `Role::interface_beam_script` is shared by pointer to every actor, and freed per actor
 
 **Latent in the shipped game — and GkPlus is what makes it reachable.** Two failures, in this
 order: a use-after-free when a second interface beam completes, and a **pool double-free** when a
@@ -375,7 +452,7 @@ double-free but not the completion free, which is unconditional on a non-NULL po
 
 ---
 
-## 7. `Font_QueueText` @ 0x005782e0 dereferences null when its node allocation fails
+## 8. `Font_QueueText` @ 0x005782e0 dereferences null when its node allocation fails
 
 **Status:** open, unpatched. **Not reproducible in practice** — see below.
 
@@ -434,7 +511,7 @@ actually hit, and this is recorded here instead.
 
 ---
 
-## 8. `ToRole` @ 0x0047cc20 dereferences a null `Hierarchy` when a role's `.rif` is missing
+## 9. `ToRole` @ 0x0047cc20 dereferences a null `Hierarchy` when a role's `.rif` is missing
 
 **Latent in the shipped game — and GkPlus's `levels.start` is what makes it reachable.** A role
 whose `shape` names a `hierarchy` section whose `.rif` file is absent gets a **NULL**
@@ -562,6 +639,43 @@ check.
 
 ---
 
+## 10. Ambient sound volume (`V` in a `DUMOBJTX`) is parsed and then discarded
+
+Every positional ambient sound in a Gunlok level is a `DUMOBJTX` text chunk on a `DUMMYOBJ`
+(`rif_chunk_format.md`, "Ambient sound is `DUMOBJTX`"), whose third line carries directives:
+
+```
+Sound
+GL_Wind03.wav
+V40 P0 R0
+```
+
+`ToMap`'s inline parser reads `V` correctly - digit accumulation, sign, a default of 100 - and
+passes it as the 5th argument to `SoundSystem_AddAmbientEmitter` @ 0x0058b9e0. **That function
+never reads the argument.** A full instruction sweep of 0x0058b9e0..0x0058bc37 returns zero
+references to the volume's stack slot (`[EBP + 0x18]`); the emitter's volume field at `+0x10` is
+filled from the *sample's* own default instead (`0058bb0d MOV EAX,[ESI + ECX*0x1 + 0x10]`,
+stored at 0058bb96). `P`, `I` and `R` in the same call **are** read, so this is one argument
+dropped rather than the whole parameter block being ignored.
+
+**Consequence:** 514 of the 1,097 shipped emitters carry a `V`, using 11 distinct values from 20
+to 100, and every one of them plays at its sample's default volume instead. So the level
+designers' ambient mix is not what you hear, and no amount of editing that number changes
+anything.
+
+Not worth "fixing" in GkPlus - it is authored intent that the shipped mix was balanced around,
+so honouring it now would change how every level sounds. It matters because a tool that exposes
+these for editing must say the field is inert, exactly as `CUTEVENT` kind 5 is.
+
+**A second, latent one in the same parser:** the directive letters are dispatched through a jump
+table keyed `'I'`..`'V'` via `ADD -0x49` / `CMP 0xd` / `JA`, so **lowercase `v`/`p`/`r` are
+skipped in silence** - while line 1's `"Sound"` test is `lstrcmpiA` and *is* case-insensitive.
+Nothing shipped trips it (all 1,540 directives are uppercase; 14 of the 1,097 first lines are
+lowercase `sound` and work fine), but anything authoring a `DUMOBJTX` must emit uppercase
+directives or they vanish with no error.
+
+---
+
 ## Debugging Gunlok: what actually works
 
 - **cdb is at** `C:\Users\franc\AppData\Roaming\Binary Ninja\dbgeng\Windows Kits\10\Debuggers\x86\cdb.exe`.
@@ -614,38 +728,3 @@ check.
   crashes the game names itself, because the snippet that stopped answering is the
   one that did it. Note the failure mode, though - **a crash looks like a socket
   timeout**, so check the process afterwards rather than trusting the timeout.
-
-## 6. Ambient sound volume (`V` in a `DUMOBJTX`) is parsed and then discarded
-
-Every positional ambient sound in a Gunlok level is a `DUMOBJTX` text chunk on a `DUMMYOBJ`
-(`rif_chunk_format.md`, "Ambient sound is `DUMOBJTX`"), whose third line carries directives:
-
-```
-Sound
-GL_Wind03.wav
-V40 P0 R0
-```
-
-`ToMap`'s inline parser reads `V` correctly - digit accumulation, sign, a default of 100 - and
-passes it as the 5th argument to `SoundSystem_AddAmbientEmitter` @ 0x0058b9e0. **That function
-never reads the argument.** A full instruction sweep of 0x0058b9e0..0x0058bc37 returns zero
-references to the volume's stack slot (`[EBP + 0x18]`); the emitter's volume field at `+0x10` is
-filled from the *sample's* own default instead (`0058bb0d MOV EAX,[ESI + ECX*0x1 + 0x10]`,
-stored at 0058bb96). `P`, `I` and `R` in the same call **are** read, so this is one argument
-dropped rather than the whole parameter block being ignored.
-
-**Consequence:** 514 of the 1,097 shipped emitters carry a `V`, using 11 distinct values from 20
-to 100, and every one of them plays at its sample's default volume instead. So the level
-designers' ambient mix is not what you hear, and no amount of editing that number changes
-anything.
-
-Not worth "fixing" in GkPlus - it is authored intent that the shipped mix was balanced around,
-so honouring it now would change how every level sounds. It matters because a tool that exposes
-these for editing must say the field is inert, exactly as `CUTEVENT` kind 5 is.
-
-**A second, latent one in the same parser:** the directive letters are dispatched through a jump
-table keyed `'I'`..`'V'` via `ADD -0x49` / `CMP 0xd` / `JA`, so **lowercase `v`/`p`/`r` are
-skipped in silence** - while line 1's `"Sound"` test is `lstrcmpiA` and *is* case-insensitive.
-Nothing shipped trips it (all 1,540 directives are uppercase; 14 of the 1,097 first lines are
-lowercase `sound` and work fine), but anything authoring a `DUMOBJTX` must emit uppercase
-directives or they vanish with no error.

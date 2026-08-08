@@ -721,7 +721,7 @@ walkable subset of *those* is the navmesh.
 | 0x14 | `uint flags` | `SHPPOLYS.flags & 0x3fffc1`, plus 0x100 if too steep |
 | 0x18 | `NavPolygon **neighbours` | `NavPoly_AddNeighbour` @ 0x0048e300 writes `[+0x18][ [+0x24]++ ]` |
 | 0x1c | `NavPolygon *came_from` | **A\* scratch**, written by `FindNavPath` — see `navigation_notes.md` §3.4 |
-| 0x20 | unidentified | the ctor does not zero it |
+| 0x20 | `uint section_id` | its own index in `MapBase::sections`, written by `Map_AddNavGeometry` @ 0x00489d70 straight after construction — which is why the ctor leaves it alone. What `.map` serialises neighbours by |
 | 0x24 | `uint num_neighbours` | loop bound in every neighbour walk |
 | 0x28, 0x2c, 0x30 | `float *v0, *v1, *v2` | the three world-space vertex records |
 | 0x34 | `Vec3` | centroid, written through vtable slot 0x14 |
@@ -733,9 +733,48 @@ used to place `Vertex *v[3]` at 0x20 and omit the adjacency array entirely. It c
 §2.2 has the evidence per field, and §2 the rest of the graph — **`Map::sections` *is* this
 array**, so there is no separate section-level pathfinding graph.
 
-There is also a **sibling class**: a second 27-slot vtable at 0x00663ecc parallels every slot,
-with slot 4 returning `+0x38` rather than `+0x34`, so its object is 4 bytes larger in the vertex
-region. A quad nav polygon is the obvious reading, but that is inferred, not measured.
+### `NavQuad`: the sibling class, and it is where `SHPMRGDT` ends up
+
+The second vtable at 0x00663ecc is **`NavQuad`, measured** - it was recorded here as "a quad nav
+polygon is the obvious reading, but that is inferred". It is a full first-class sibling, not a
+stub: 0x44 bytes (against `NavPolygon`'s 0x40, the extra dword being a fourth vertex pointer),
+`NavQuad_Ctor` @ 0x0048dc50, and all 28 slots parallel 0x00663e60 over a shared abstract base at
+0x00663de0 - slot 0x50 `NavQuad_AdjacencyTest` @ 0x0048f580, slot 0x58 `NavQuad_IsNeighbour`
+@ 0x00494d40, slot 0x5c `NavQuad_AddNeighbour` @ 0x0048e330, slot 13 `ContainsPointXZ`
+@ 0x004903f0, slot 4 `NavQuad_GetCentre` @ 0x00490d30. `BuildPolygonAdjacencyGrid` dispatches
+through those slots, so **quads participate fully in adjacency and A\***.
+
+Where quads come from is `SHPMRGDT`. `BuildShapeVertexBuffers` builds the D3D buffers from the
+*unmerged* polygon list, then calls `MergePolygonsInChunkShape` @ 0x005d7900, then writes the
+`LevelMeshHeader` from the *merged* one - a `LevelMeshTri` (0x1c) per 3-vertex polygon and a
+`LevelMeshQuad` (0x20) per 4-vertex one. So the merge never reaches the renderer and reaches
+*only* here. `BuildNavPolygons` reads `tri_count` / `quad_count` / `vert_count` from that header
+and allocates two arrays, with two structurally identical fill loops applying the same
+classification (the same `& 0x3fffc1`, the same 45-degree test), differing only in the vertex
+count and the centroid divisor (3.0 vs 4.0). Full write-up in `rif_chunk_format.md`, "Merging
+polygons into quads".
+
+`Map_AddNavGeometry` @ 0x00489d70 is what interleaves them:
+
+```c
+while (tri_n || quad_n) {
+    id = AllocSectionId();                    // 0x0048c3f0
+    p  = tri_n ? tri_ptr : quad_ptr;
+    p->section_id = id;                       // +0x20
+    this->sections[id] = p;                   // MapBase +0x88
+    tri_n ? (tri_n--, tri_ptr += 0x40) : (quad_n--, quad_ptr += 0x44);
+}
+```
+
+So **`MapBase::sections` is a heterogeneous array of `NavPolygon*` and `NavQuad*`**, triangles
+numbered first and quads after, walked purely through the vtable, with `num_sections` counting
+both. That also identifies `NavPolygon+0x20`, listed above as "unidentified; the ctor does not
+zero it": it is the **section id**, and it is unzeroed precisely because this function writes it
+immediately after construction. `LoadOrBuildSectionAdjacency` serialises `.map` by those ids, so
+the merge outcome is baked into that sidecar.
+
+Measured over the 24 shipped level map objects: 875,312 polygons become **549,714 sections**, a
+37.2% reduction, with 74.4% of polygons half of a merged pair.
 
 Positions go through the affine `AffineTransform` @ 0x0058e7f0 (translation at
 `this[3]/[7]/[0xb]`); normals through the **rotation-only** `Mat3Transform`. So an object

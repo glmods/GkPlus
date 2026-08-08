@@ -26,6 +26,27 @@ import rif  # noqa: E402
 import shapes as shp  # noqa: E402
 
 
+def _control():
+    """The validator must reject each shape the engine cannot walk.
+
+    A predicate nothing violates proves nothing, and every one of these is a
+    real thing the exporter used to produce: a renumbered index that ran off the
+    end, a pairing whose partner was dropped, a table shorter than the polygon
+    list the engine reads regardless.
+    """
+    cases = [
+        ([-1, 2, 1, 4], 4),        # m[3] = 4 is out of range
+        ([1, 0, 3, -1], 4),        # m[2] = 3 but m[3] = -1: not mutual
+        ([2, -1, 2, -1], 4),       # m[2] pairs with itself
+        ([1, 0], 4),               # two entries for four polygons
+    ]
+    caught = sum(1 for merge, n in cases if shp.merge_problems(merge, n))
+    good = [1, 0, -1, -1]
+    if shp.merge_problems(good, 4):
+        return 0                   # a valid table must pass, or the rest is noise
+    return caught
+
+
 def main(game_dir):
     stats = collections.Counter()
     failures = []
@@ -117,6 +138,31 @@ def main(game_dir):
                         stats["SHPCENTR byte-exact"] += 1
                     radius_deltas.append(abs(want[3] - mine[3]))
 
+            # (3b) SHPMRGDT, which is the one chunk a generator can get fatally
+            # wrong: `MergePolygonsInChunkShape` @ 0x005d7900 has no bounds check
+            # anywhere, so a pairing that is not an exact involution is an
+            # out-of-bounds heap write during level load. Two claims here -- that
+            # every shipped shape satisfies the predicate (so it really is the
+            # engine's contract and not a guess), and that the pair-id form the
+            # scene stores reproduces the wire values exactly.
+            src = shape.chunk.find(b"SHPMRGDT")
+            if src is not None:
+                n = len(shape.polys)
+                wire = list(struct.unpack("<%di" % (len(src.body) // 4), src.body))
+                broken = shp.merge_problems(wire, n)
+                if broken:
+                    failures.append((rel, "shipped SHPMRGDT is not walkable: %s" % broken[0]))
+                else:
+                    stats["SHPMRGDT valid as shipped"] += 1
+                    again, unpaired = shp.merge_wire_from_pairs(
+                        shp.merge_pairs_from_wire(wire, n))
+                    if again != wire[:n] or unpaired:
+                        failures.append(
+                            (rel, "SHPMRGDT does not survive the pair-id form "
+                                  "(%d unpaired)" % unpaired))
+                    else:
+                        stats["SHPMRGDT round-trips through pair ids"] += 1
+
             # (4) normal direction
             if shape.poly_normals and len(shape.poly_normals) == len(shape.polys):
                 for p, ref in zip(shape.polys, shape.poly_normals):
@@ -140,6 +186,11 @@ def main(game_dir):
              stats["... whose uv index is its own position"]))
     print("SHPCENTR regenerated          : %d centre exact, %d byte-exact"
           % (stats["SHPCENTR centre exact"], stats["SHPCENTR byte-exact"]))
+    print("SHPMRGDT                      : %d walkable as shipped, %d exact through pair ids"
+          % (stats["SHPMRGDT valid as shipped"],
+             stats["SHPMRGDT round-trips through pair ids"]))
+    print("   control (must be non-zero) : %d synthetic breakages detected"
+          % _control())
     if radius_deltas:
         near = sum(1 for d in radius_deltas if d <= 1e-2)
         print("   radius vs shipped          : %d within 0.01, max delta %.3f (not asserted)"
@@ -159,7 +210,8 @@ def main(game_dir):
         print("    %-45s %s" % (rel, why))
     if len(failures) > 15:
         print("    ... and %d more" % (len(failures) - 15))
-    return 1 if failures else 0
+    # The control has to fire, or the SHPMRGDT checks above are vacuous.
+    return 1 if failures or _control() != 4 else 0
 
 
 if __name__ == "__main__":

@@ -232,6 +232,11 @@ def iter_shapes(root):
 #: Chunks derived from the mesh that this module cannot regenerate. They are
 #: dropped when geometry changes, because keeping a stale one is worse than
 #: keeping none -- their contents are indexed by vertex/polygon count.
+#:
+#: ``scene.py`` does reconstruct ``SHPMRGDT``, and that is safe only because the
+#: scene stores a **pair id** rather than the polygon index the wire holds -- see
+#: :func:`merge_pairs_from_wire` below, and :func:`merge_problems`, which export
+#: runs before writing the chunk at all.
 DERIVED_CHUNKS = (b"SHPPCINF", b"SHPMRGDT", b"SHPVTINT")
 
 
@@ -285,6 +290,110 @@ def welds_degenerate(tri, welded):
     export drops it everywhere rather than guessing which shape will be a map.
     """
     return len({welded[i] for i in tri}) < len(tri)
+
+
+# --------------------------------------------------------------------------
+# SHPMRGDT: a pairing between polygons, stored as a shared id
+# --------------------------------------------------------------------------
+#
+# `SHPMRGDT` holds one int32 per polygon naming **the polygon it pairs with** to
+# be fused into a quad -- an involution, not a per-face group id. So it is a
+# *reference into the polygon list*, and any editor that reorders or drops a
+# polygon invalidates it wholesale: dropping one face renumbers every face after
+# it, so a single drop corrupts the entire table rather than one pair.
+#
+# `MergePolygonsInChunkShape` @ 0x005d7900 walks it bounded by the `SHPPOLYS`
+# count -- never by `SHPMRGDT`'s own, which its loader computes and nothing ever
+# compares -- indexes `poly_list[m[i]]` with **no range check**, and writes into
+# a `malloc(num_polys * 0x24)` with no bound on the write cursor. Break the
+# involution and it writes off the end of the heap block. Full trace in
+# `rif_chunk_format.md`, "Merging polygons into quads".
+#
+# The scene therefore stores a **pair id**: both partners of a pair carry the
+# same number, everything else carries `MERGE_NONE`. That is stable under
+# reordering and degrades correctly under dropping -- a survivor whose partner
+# went simply has an id nothing else shares, and writes `-1`.
+
+#: `SHPMRGDT`'s "this polygon pairs with nothing", and the scene's "unpaired".
+MERGE_NONE = -1
+
+
+def merge_pairs_from_wire(merge, num_polys):
+    """``SHPMRGDT`` values -> one shared id per pair, :data:`MERGE_NONE` elsewhere.
+
+    A pairing the engine would not act on -- out of range, self-referential, or
+    not mirrored -- is read as unpaired rather than carried, so a malformed
+    source file cannot become a malformed output file. No shipped shape needs
+    that: all 9,357 are proper involutions.
+    """
+    out = [MERGE_NONE] * num_polys
+    nxt = 0
+    for i in range(num_polys):
+        if out[i] != MERGE_NONE:
+            continue
+        j = merge[i] if i < len(merge) else MERGE_NONE
+        if j in (MERGE_NONE, i) or not 0 <= j < num_polys:
+            continue
+        if (merge[j] if j < len(merge) else MERGE_NONE) != i:
+            continue
+        out[i] = out[j] = nxt
+        nxt += 1
+    return out
+
+
+def merge_wire_from_pairs(ids):
+    """The reverse: ``(SHPMRGDT values, ids that could not be paired)``.
+
+    An id carried by exactly two polygons becomes a mutual pair. One carried by
+    a single polygon is a pair whose partner was dropped, and writes
+    :data:`MERGE_NONE` -- which is the whole point of storing an id rather than
+    an index. One carried by three or more is what duplicating a face in Blender
+    produces: the first two in index order pair and the rest go unpaired, since
+    nothing can say which two were meant.
+    """
+    where = {}
+    for i, pair_id in enumerate(ids):
+        if pair_id != MERGE_NONE:
+            where.setdefault(pair_id, []).append(i)
+
+    out = [MERGE_NONE] * len(ids)
+    unpaired = 0
+    for members in where.values():
+        if len(members) < 2:
+            unpaired += 1
+            continue
+        a, b = members[0], members[1]
+        out[a], out[b] = b, a
+        unpaired += len(members) - 2
+    return out, unpaired
+
+
+def merge_problems(merge, num_polys):
+    """Every way this ``SHPMRGDT`` would break ``MergePolygonsInChunkShape``.
+
+    Empty means the engine can walk it. This is the predicate all 24 shipped
+    level map objects satisfy, and the one the export validates against before
+    writing -- because the failure is an out-of-bounds heap write during level
+    load, with a fault address that names neither the file nor the polygon.
+    """
+    out = []
+    if len(merge) != num_polys:
+        out.append("%d merge entries for %d polygons; the engine reads "
+                   "num_polys of them regardless" % (len(merge), num_polys))
+    for i, j in enumerate(merge[:num_polys]):
+        if j == MERGE_NONE:
+            continue
+        if not 0 <= j < num_polys:
+            out.append("m[%d] = %d is outside [0, %d)" % (i, j, num_polys))
+        elif j == i:
+            out.append("m[%d] pairs polygon %d with itself" % (i, i))
+        elif j >= len(merge) or merge[j] != i:
+            out.append("m[%d] = %d but m[%d] = %s; the pairing is not mutual"
+                       % (i, j, j, merge[j] if j < len(merge) else "absent"))
+        if len(out) >= 8:
+            out.append("... and possibly more")
+            break
+    return out
 
 
 def build_bodies(verts, polys, uv_lists):

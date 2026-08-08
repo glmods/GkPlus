@@ -423,7 +423,7 @@ The four that cost one here:
 
 - **Four multiplayer maps crash the game on `levels.start`** — `mplay_bombsite`,
   `mplay_canyon`, `mplay_dockyard` and `mplay_tf_oilrig01`. This is
-  `game_defects_notes.md` §8: they `#include` unit headers whose `.RIF` was never
+  `game_defects_notes.md` §9: they `#include` unit headers whose `.RIF` was never
   shipped, and the game's own `ToRole` dereferences the resulting null `Hierarchy`.
   It presents as a hang only because the REPL socket dies with the process; it is an
   immediate `0xc0000005` with a WER dump. **The other seven load fine** —

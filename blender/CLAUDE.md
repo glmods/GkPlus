@@ -47,8 +47,11 @@ These pin the design, in roughly decreasing order of how much everything else re
   `.blend`, *reset Blender*, reopen, export. The rule is container chunks → objects, leaf chunks →
   typed fields on the parent, with `rif_id` / `rif_index` / `rif_absorbed` carrying the structure.
 - **The bar is semantic equivalence, not byte equivalence**, and that is what lets the exporter
-  regenerate instead of mirror. `SHPCENTR` is recomputed; `SHPPCINF` is discarded (681 of 9,357
-  shipped shapes have none and every AvP path guards its lookup); `SHPMRGDT` and `SHPVTINT` are
+  regenerate instead of mirror. `SHPCENTR` is recomputed; `SHPPCINF` is discarded (**inert** —
+  the string has three referrers in gl.exe, its registration, its loader and
+  `StripUnusedShapeChunks` @ 0x005b5df0 which deletes it after the shape is built, and nothing ever
+  reads the fields the loader fills; this was inferred from AvP's null-guards and is now measured
+  against Gunlok itself); `SHPMRGDT` and `SHPVTINT` are
   *authored* per-element data so they become mesh attributes and survive an edit rather than going
   stale. Nothing is silently dropped when you edit a mesh. The byte-exact round-trip test still
   guards the **container** layer (`tests/test_roundtrip.py`, 563/563) and the **typed field** layer
@@ -349,6 +352,71 @@ These pin the design, in roughly decreasing order of how much everything else re
   the marker, set in `_mesh_for_shape` when the source shape had none — the same "presence is a
   separate question from the values" rule `rif_vtint_header` follows. A shape authored from scratch
   carries no marker and so still gets a `SHPCENTR`, which is what a new shape wants.
+- **`SHPMRGDT` is a *pairing*, not a per-face value, and carrying it through a face drop crashed
+  Gunlok on 15 of the 24 shipped levels.** Fixed — the scene now stores a **pair id** and export
+  validates before writing — but the mechanism is worth keeping, because it is the sharpest example
+  in this addon of an index into a list the addon renumbers.
+  - **The consumer, and it is not the renderer.** `MergePolygonsInChunkShape` @ 0x005d7900 (AvP's
+    `merge_polygons_in_chunkshape`, `chnkload.cpp:3130`) fuses coplanar triangle *pairs* named by
+    `merge_data` into quads. It is reached only from `BuildShapeVertexBuffers` @ 0x005ab300, whose
+    merge block runs **only when its `flags & 1`** — and of the eight call sites of
+    `RifFindObjectByName` @ 0x005aa5c0 (which is `__fastcall` with **five** parameters, `RET 0xc`,
+    not the three the DB had), only two pass 1: `ToMap`'s cold geometry path @ 0x0047f926 and
+    `GetShape` @ 0x004ae6c4. So **only the map object and the shadow object are ever merged**,
+    which is why a prop with broken merge data is harmless and the map is not.
+    **The D3D buffers are built before the call and never rebuilt**, so the merge cannot remove a
+    drawn primitive: its only output is the `LevelMeshHeader` that becomes the level's nav
+    sections. `SHPMRGDT` is pathfinding data wearing a rendering name — see `rif_chunk_format.md`,
+    "Merging polygons into quads", and `level_loading_notes.md` §5.5 on `NavQuad`.
+  - **The invariant, and there is no bounds check anywhere in it.** The loop is bounded by
+    `shape->num_polys` — the `SHPPOLYS` count, *never* by `SHPMRGDT`'s own `num_polys`, which
+    `ShapeMergeDataChunk_FromData` @ 0x005b97d0 computes as `size >> 2` and nothing compares — and
+    it indexes `poly_list[merge_data[i]]` unchecked, into an output array of exactly
+    `malloc(num_polys * 0x24)` with no bound on the write cursor. So the data must be a proper
+    involution: `m[i] == -1`, or `m[i] == j` with `j != i`, `j < num_polys` and `m[j] == i`. All
+    24 shipped levels satisfy it; a shipped file can never reach the fault.
+  - **What the addon does wrong.** `rif_merge_group` stores the partner's **raw source polygon
+    index**, and export writes it back verbatim — while import drops faces Blender cannot hold
+    (two on the same three vertices) and export drops triangles that weld degenerate. Dropping a
+    single face renumbers every face after it, so one dropped face does not corrupt one pair, it
+    corrupts the whole table: `level02` loses 14 faces and ends with 14 out-of-range entries,
+    1,349 self-referential and 6,677 non-involutive. Measured across the shipped levels, **15 of
+    24 map objects lose at least one face and would crash; the 9 that lose none load.**
+  - **Confirmed in the game, 4 for 4 against that prediction**: `level01` and `level06` (no faces
+    dropped) load with their usual actor and role counts; `level02` and `level11` (14 and 26
+    dropped) fault at `gl+0x1d79a5` and `gl+0x1d7abe` — the first a *write* past the output array
+    when a broken pairing emits one polygon twice, the second a *read* of `poly_list[j]` with
+    `j == num_polys`. And an exported `level02` with only the stock `land` shape spliced back in
+    loads, which is what isolates the shape from everything else the export changes.
+  - **The fix: the scene stores a pair id, and export validates.** `rif_merge_group` is gone;
+    `rif_merge_pair` (`MERGE_PAIR_ATTR`) gives both partners of a pair the same number and
+    everything else `-1`, which is stable under reordering and degrades correctly under dropping —
+    a survivor whose partner went simply holds an id nothing else shares and writes `-1`.
+    `shapes.merge_pairs_from_wire` / `merge_wire_from_pairs` are the two halves, and they reproduce
+    the wire values exactly for **all 9,357** shipped shapes. Across the 24 map objects the fix
+    turns 15 unwalkable tables into 0, and costs 73 merge pairs out of 325,598 — only where the
+    partner face was genuinely dropped.
+    **What a lost pair costs is one nav section, not one quad on screen.** The merged list never
+    reaches the renderer, and because both mergers refuse unless `a->flags == b->flags` and the
+    quad inherits the lower-indexed triangle's plane, walkability is identical either way. So a
+    lost pair is one extra `NavPolygon` instead of one `NavQuad`, one extra A\* node against the
+    200-500 node budget, and a different `.map` sidecar. 73 extra sections across all 24 levels,
+    against level01's own 29,045 → 19,675, is a rounding error — but "same pixels" was the right
+    answer for the wrong reason, and the honest statement is "same pixels, one more section".
+    - **The rename is the migration.** A `.blend` from the old build has no attribute under the new
+      name, so its shapes export with **no `SHPMRGDT` at all** — legal, guarded, and costing only
+      the quad merge. The old values are deliberately *not* converted: they are indices into a
+      numbering the importer had already changed, so a conversion would produce a plausible and
+      wrong pairing.
+    - **`shapes.merge_problems` is the guard, and it runs at the point of writing**, not as a
+      pre-flight — a validated-then-modified table is exactly the shape of bug this had. Anything
+      it cannot prove is dropped rather than written (`stats["merge_dropped"]`, reported as a
+      warning), because omitting is always safe and writing is not. `tests/test_shapes.py` asserts
+      the predicate over every shipped shape *and* carries four synthetic breakages as a control;
+      `tests/test_scene.py` asserts it on both the source and the exported tree of every sampled
+      file.
+    - **Verified in the running game**: `level02` and `level11`, which faulted before, now load
+      with 178/294 and 317/352 actors and roles.
 - **Blender cannot hold two faces on the same three vertices**, and the shipped assets contain
   them (doubled or reverse-wound triangles): 775 across 193 shapes, and 28 of Maskelyn MkII's 44
   polygons. **Drop them deliberately, before `from_pydata`** — letting `validate()` remove them
@@ -397,6 +465,12 @@ These pin the design, in roughly decreasing order of how much everything else re
   walkable but 2% in the largest is broken — that is what 21.7% open edges (against
   level01's 6.8%) does, and it leaves the walkable *fraction* looking fine. Full
   derivation in `level_loading_notes.md` §5.5.
+  One thing the preview deliberately does not model: the engine's sections are **not** one per
+  triangle. `SHPMRGDT` fuses 74.4% of map polygons into quads first, so level01's 29,045
+  triangles are 19,675 nav sections in game. That changes none of the metrics above — merging
+  two coplanar edge-sharing triangles alters neither the walkable surface nor the connectivity,
+  and a pair only merges when both halves already share their flags — so the *island* numbers are
+  the same either way. It does change the A\* node count, which is what the merge is for.
 - **RIF is Y-down, and the swizzle has to carry the orientation too, not just the position.** A
   biped's parts all sit at negative Y — feet nearest the origin (~-100), top of the head furthest
   (~-1990) — so the body extends in -Y from the ground and **-Y is up**; assembled in Blender a
@@ -682,7 +756,7 @@ silently breaking the rig. The findings that pin the sequence half:
     uppercase, so nothing in the game exercises it — which makes it purely a trap for a generator.
     Line 1 *is* case-insensitive (`lstrcmpiA`, and 14 ship as `sound`), which is what makes it easy
     to get backwards.
-  - **`V` is parsed and then discarded** (`game_defects_notes.md` defect 6): the emitter takes the
+  - **`V` is parsed and then discarded** (`game_defects_notes.md` §10): the emitter takes the
     sample's own default. 514 shipped emitters carry one and not one does anything, so the panel
     shows it as inert and writes it for fidelity — the same standing `CUTEVENT` kind 5 has.
   - **A zero distance means the sample's own default, not silence**, so 735 of the 1,097 import with
@@ -702,16 +776,13 @@ silently breaking the rig. The findings that pin the sequence half:
   `MapAuxObject_Ctor`, a clean load is direct evidence the dummy chunks are well formed. What it is
   **not** is evidence that the emitters are audible: nothing in the engine exposes the ambient
   emitter list, so there is no assertion to make and that half needs ears.
-  The same run on **`level02` crashes, and it is not this change.** An access violation at
-  `gl+0x1d79a5` reached through `ToMap` → `0x005aa8e9` → `0x005ac842`, which reproduces identically
-  with the addon at the commit *before* this work, with the `.map`/`.cut` sidecars deleted, while
-  stock `level02` loads (178 actors / 294 roles). A pre-existing exporter fault that `level02`
-  triggers and `level01` does not, undiagnosed. Three things that would each have produced a
-  confident wrong answer here: the **stock** control (without it the crash reads as this change's
-  fault), the **pre-change addon** control (without it, as the exporter being fine on level01 only
-  by luck), and deleting the **sidecar caches** — `.cut`/`.map` are keyed on the `.rif`'s FILETIME,
-  which a VFS-served file need not report, so a stale cache was the obvious suspect and was not the
-  cause.
+  The same run on **`level02` crashes, and it is not this change** — see the `SHPMRGDT` entry
+  below, which is the diagnosis. Three controls were needed to get even that far, and each one
+  would have produced a confident wrong answer if skipped: the **stock** control (without it the
+  crash reads as this change's fault), the **pre-change addon** control (without it, as the
+  exporter being fine on level01 only by luck), and deleting the **sidecar caches** — `.cut`/`.map`
+  are keyed on the `.rif`'s FILETIME, which a VFS-served file need not report, so a stale cache was
+  the obvious suspect and was not the cause.
 - **A sequence's three optional chunks are *nearly* per-sequence, and the "nearly" is the whole
   design.** `OBASEQTM` (milliseconds), `OBASEQSP` (`{speed mm/s, angle, spare}`) and `OBASEQFL`
   (`Loops` 0x04 / `NoLoop` 0x08, plus an unexplained 0x80 on 181 chunks) are all AvP's and all

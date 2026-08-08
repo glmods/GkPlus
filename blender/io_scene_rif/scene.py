@@ -108,21 +108,41 @@ NO_CENTRE_PROP = "rif_no_centre"
 #:
 #: - ``SHPMRGDT`` is exactly one int32 per polygon in all 9,357 shipped shapes
 #:   (AvP's ``{int *merge_data; int num_polys}``) -> a face attribute.
+#:
+#:   Its wire value is the *index of the polygon this one pairs with*, so it is a
+#:   reference into a list whose numbering this addon changes -- import drops
+#:   faces Blender cannot hold, export drops ones that weld degenerate, and
+#:   dropping a single face renumbers everything after it. Carrying the index
+#:   made 15 of the 24 shipped level map objects unwalkable and crashed the game
+#:   on load, because ``MergePolygonsInChunkShape`` @ 0x005d7900 has **no bounds
+#:   check of any kind**. So the attribute holds a **pair id** instead: see
+#:   :data:`MERGE_PAIR_ATTR` and ``shapes.merge_pairs_from_wire``.
 #: - ``SHPVTINT`` is per-vertex lighting and a child of ``RBOBJECT``, never of a
 #:   shape, in all 4,668 cases -> a **colour** attribute on the object's mesh.
 #:   It is the one entry here that is not stored as the int32 the wire holds:
 #:   see the "Baked vertex lighting" section for why the paintable form is the
 #:   stored one, and :data:`VTINT_HEADER_PROP` for what says it exists at all.
+#: The merge pairing, as a shared id per pair. **Renamed** from
+#: ``rif_merge_group``, which held the raw wire value and was wrong: a ``.blend``
+#: from that build has no attribute under this name, so its shapes export with
+#: no ``SHPMRGDT`` at all -- which is legal, costs only the quad merge, and is
+#: the right direction to fail in. The old values are not converted, because
+#: they are indices into a numbering the importer had already changed and a
+#: conversion would produce a plausible, wrong pairing.
+MERGE_PAIR_ATTR = "rif_merge_pair"
+
 ATTRIBUTE_CHUNKS = {
-    b"SHPMRGDT": ("rif_merge_group", "INT", "FACE"),
+    b"SHPMRGDT": (MERGE_PAIR_ATTR, "INT", "FACE"),
     b"SHPVTINT": ("rif_light", "BYTE_COLOR", "POINT"),
 }
 
-#: Preprocessed render data with no known generator. **Discarded on load and
-#: omitted on export**, which is legal rather than lossy: 681 of the 9,357 shipped
-#: shapes carry no ``SHPPCINF`` at all, and every AvP code path guards on its
-#: lookup returning null. Byte-exact round-tripping is not a goal; semantic
-#: equivalence is.
+#: Preprocessed render data. **Discarded on load and omitted on export**, and
+#: that is now measured against Gunlok rather than inferred from AvP: the
+#: ``SHPPCINF`` string has three referrers in gl.exe -- its registration, its
+#: loader, and ``StripUnusedShapeChunks`` @ 0x005b5df0, which *deletes* it once
+#: the shape is built -- so nothing ever reads the fields the loader fills.
+#: 681 of the 9,357 shipped shapes carry none. Byte-exact round-tripping is not
+#: a goal; semantic equivalence is.
 DISCARDED_CHUNKS = frozenset((b"SHPPCINF",))
 
 
@@ -2198,23 +2218,29 @@ def _mesh_for_shape(shape_chunk, name):
     et = me.attributes.new("rif_engine_type", "INT", "FACE")
     fl = me.attributes.new("rif_flags", "INT", "FACE")
     hu = me.attributes.new("rif_has_uv", "BOOLEAN", "FACE")
-    mg = me.attributes.new("rif_merge_group", "INT", "FACE")
+    mg = me.attributes.new(MERGE_PAIR_ATTR, "INT", "FACE")
 
+    # A **pair id**, not the wire value: the wire names a partner by index, and
+    # this importer changes the numbering (it drops faces Blender cannot hold).
+    # Both partners get the same id, so the pairing survives that; see
+    # `shapes.merge_pairs_from_wire`.
     merge_vals = []
     merge = shape_chunk.find(b"SHPMRGDT")
     if merge is not None:
         n = len(merge.body) // 4
-        merge_vals = list(struct.unpack_from("<%di" % n, merge.body, 0))
+        merge_vals = shp.merge_pairs_from_wire(
+            list(struct.unpack_from("<%di" % n, merge.body, 0)), len(shape.polys))
 
     uv_layer = me.uv_layers.new(name="UVMap")
     for i, (poly, (source_index, src)) in enumerate(zip(me.polygons, kept)):
         poly.material_index = slot_of.get(src.texture_index, 0)
         et.data[i].value = src.engine_type
         fl.data[i].value = src.flags
-        # SHPMRGDT is one value per *source* polygon, so it is indexed by where
-        # the polygon was in the file, not by where it ended up in the mesh.
+        # Indexed by where the polygon was in the *file*, not where it ended up
+        # in the mesh -- which is exactly the renumbering that made storing the
+        # raw wire value wrong.
         mg.data[i].value = (merge_vals[source_index]
-                            if source_index < len(merge_vals) else -1)
+                            if source_index < len(merge_vals) else shp.MERGE_NONE)
         uvs = shape.uvs_for(src)
         hu.data[i].value = uvs is not None
         scale = scale_of.get(src.texture_index, (1.0, 1.0))
@@ -2647,12 +2673,12 @@ def _shape_chunk_from_mesh(obj, me, scale, y_down, stats, textures=None):
     et = me.attributes.get("rif_engine_type")
     fl = me.attributes.get("rif_flags")
     hu = me.attributes.get("rif_has_uv")
-    mg = me.attributes.get("rif_merge_group")
+    mg = me.attributes.get(MERGE_PAIR_ATTR)
     uv_layer = me.uv_layers.active
 
     polys = []
     uv_lists = []
-    merge = []
+    pair_ids = []
     # Dropped before anything parallel is appended, so polys/uv_lists/merge stay
     # in step and `uv_index` stays contiguous. See shapes.welds_degenerate: a
     # triangle that loses a corner to the weld crashes the game while it builds
@@ -2672,7 +2698,8 @@ def _shape_chunk_from_mesh(obj, me, scale, y_down, stats, textures=None):
         engine_type = et.data[face].value if et is not None and face < len(et.data) else 3
         flags = fl.data[face].value if fl is not None and face < len(fl.data) else 0
         has_uv = bool(hu.data[face].value) if hu is not None and face < len(hu.data) else True
-        merge.append(mg.data[face].value if mg is not None and face < len(mg.data) else -1)
+        pair_ids.append(mg.data[face].value if mg is not None and face < len(mg.data)
+                        else shp.MERGE_NONE)
 
         flat = []
         if has_uv and uv_layer is not None:
@@ -2687,6 +2714,12 @@ def _shape_chunk_from_mesh(obj, me, scale, y_down, stats, textures=None):
         colour = shp.encode_colour(texture_index, uv_index)
         polys.append(shp.Poly(engine_type, len(polys), flags, colour, tuple(tri.vertices)))
 
+    # The pairing is rebuilt from the ids rather than replayed, so a partner
+    # dropped anywhere above becomes an honest -1 instead of an index into a
+    # numbering that no longer exists.
+    merge, unpaired = shp.merge_wire_from_pairs(pair_ids)
+    stats["merge_unpaired"] += unpaired
+
     bodies = shp.build_bodies(verts, polys, uv_lists)
     children = [
         (0, rif.Chunk(b"SHPRAWVT", bodies[b"SHPRAWVT"])),
@@ -2694,8 +2727,20 @@ def _shape_chunk_from_mesh(obj, me, scale, y_down, stats, textures=None):
         (2, rif.Chunk(b"SHPPNORM", bodies[b"SHPPNORM"])),
         (3, rif.Chunk(b"SHPPOLYS", bodies[b"SHPPOLYS"])),
         (4, rif.Chunk(b"SHPUVCRD", bodies[b"SHPUVCRD"])),
-        (6, rif.Chunk(b"SHPMRGDT", struct.pack("<%di" % len(merge), *merge))),
     ]
+    # **The chunk is validated, not trusted.** `MergePolygonsInChunkShape` has no
+    # bounds check of any kind, so a malformed table is an out-of-bounds heap
+    # write during level load -- with a fault that names neither the file nor the
+    # polygon. Omitting it is always safe (every reachable lookup guards on
+    # absence, and the only cost is that coplanar pairs stay two triangles), so
+    # anything this cannot prove correct is dropped rather than written.
+    broken = shp.merge_problems(merge, len(polys))
+    if broken:
+        stats["merge_dropped"] += 1
+        stats.setdefault("merge_reasons", []).append("%s: %s" % (me.name, broken[0]))
+    else:
+        children.append((6, rif.Chunk(b"SHPMRGDT",
+                                      struct.pack("<%di" % len(merge), *merge))))
     if not me.get(NO_CENTRE_PROP):
         children.append((5, rif.Chunk(b"SHPCENTR", shp.centre_body(verts))))
     absorbed = [c for _, c in _emit_absorbed(me)]
@@ -2907,7 +2952,8 @@ def rebuild_tree(collection, scale=None, y_down=None, fps=None):
     y_down = bool(collection.get("rif_y_down", True)) if y_down is None else y_down
     fps = float(collection.get("rif_fps", 30.0)) if fps is None else fps
     stats = {"shapes": 0, "objects": 0, "lights": 0, "textures": 0, "new_textures": 0,
-             "sounds": 0, "emitters": 0, "degenerate_faces": 0, "lighting_dropped": 0}
+             "sounds": 0, "emitters": 0, "degenerate_faces": 0, "lighting_dropped": 0,
+             "merge_unpaired": 0, "merge_dropped": 0}
     # Read the rest pose, not whatever the animation system is posing right now.
     # This also runs the depsgraph, which export needs because matrix_world is
     # stale until it does.
@@ -4350,7 +4396,7 @@ def rif_armature(collection):
 def _ensure_mesh_attributes(me):
     for attr_name, kind, default in (("rif_engine_type", "INT", 3),
                                      ("rif_flags", "INT", 0),
-                                     ("rif_merge_group", "INT", -1)):
+                                     (MERGE_PAIR_ATTR, "INT", shp.MERGE_NONE)):
         if me.attributes.get(attr_name) is None:
             attr = me.attributes.new(attr_name, kind, "FACE")
             for item in attr.data:

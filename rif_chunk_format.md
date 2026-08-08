@@ -149,7 +149,7 @@ Body starts with an element count or size, followed by an array of fixed-size en
 | `SHPVNORM` | Shape vertex normals     | 0x005b8430 | Array of float x3 (count = body_size / 12). AvP's `ChunkVectorFloat` |
 | `SHPVFLAG` | Shape vertex flags       | 0x005b8360 | Array of uint32 (count = body_size / 4) |
 | `SHPPOLYS` | Shape polygons           | 0x005b8930 | Array of polygon structs (count = body_size / 36). See below. |
-| `SHPMRGDT` | Shape merge data         | 0x005b96c0 | **Exactly one int32 per polygon** - AvP's `Shape_Merge_Data_Chunk` is `{int *merge_data; int num_polys}` with `chunk_size = 12 + num_polys*4`, and the element count equals the `SHPPOLYS` polygon count in all 9,357 shipped shapes. Values are a merge-group id, mostly `-1` (none) with small positive ids. Authored per-polygon data, **not** derived from geometry, so it belongs on the polygon rather than being regenerable |
+| `SHPMRGDT` | Shape merge data         | 0x005b96c0 | **Exactly one int32 per polygon** - AvP's `Shape_Merge_Data_Chunk` is `{int *merge_data; int num_polys}` with `chunk_size = 12 + num_polys*4`, and the element count equals the `SHPPOLYS` polygon count in all 9,357 shipped shapes. `m[i]` is the **index of the polygon `i` pairs with** to be fused into a quad, or `-1` for none - an *involution*, not a group id (an earlier entry here called it "a merge-group id, mostly -1 with small positive ids", which is wrong in both halves: the values run the whole polygon range). Authored, not derived. **See "Merging polygons into quads" below - the consumer has no bounds check of any kind, so this chunk is only safe if the pairing is exact** |
 | `HIDEGDIS` | Hierarchy degradation distances | 0x005cc1c0 | uint32 `num_detail_levels` + that many int32 distances. AvP's `Hierarchy_Degradation_Distance_Chunk`; the count is 10 in all 13 shipped files that carry one. Sits at the **file root**, and drives the `L<n>#` level-of-detail convention below. Was documented as "hierarchy edge display" |
 | `SHPPRPRO` | Shape preprocessed data  | 0x005bae70 | uint32 count + count x int32 (+ additional context) |
 | `CUTPOINT` | Cutscene points          | 0x005d91a0 | uint32 count + count x 16 bytes + a **48-byte trailer**. The record is 3 int32 + a packed dword, not 4 floats. Fully decoded under "The cutscene chunks" below |
@@ -695,7 +695,7 @@ These chunks build internal linked lists during loading:
 | `OBHALTSH` | OB hierarchy alt shape     | 0x005cb7e0 |
 | `CUTEVENT` | Cutscene event - **fully decoded**, see "The cutscene chunks" below | 0x005d94e0 (0x005d9400 is the default ctor) |
 | `SHPHEAD1` | Shape header v1 - **fully decoded**, see below | 0x005b8b30 |
-| `SHPPCINF` | Shape poly change info - AvP's `Shape_Poly_Change_Info_Chunk`. **Optional**: 681 of the 9,357 shipped shapes have none, and every AvP path guards on `lookup_single_child` returning null, so a writer may omit it | 0x005ba7b0 |
+| `SHPPCINF` | Shape poly change info - AvP's `Shape_Poly_Change_Info_Chunk`. **Inert in Gunlok, and now measured rather than inferred**: the string @ 0x0066e790 has exactly three referrers - its registration @ 0x0043b910, its loader @ 0x005ba7b0, and `StripUnusedShapeChunks` @ 0x005b5df0, which *deletes* it once the shape is built. Nothing reads the fields the loader fills (`original_num_verts` @ +0x28, then a `List` @ +0x2c of 0x18-byte `{poly_num, vert_num_before, vert_num_after}` nodes). 681 of the 9,357 shipped shapes have none, and a writer may omit it freely. (The previous entry said "optional" on the strength of AvP's null-guards, which is not evidence about Gunlok's game layer - see `SHPMRGDT` below for the chunk where that reasoning would have been wrong) | 0x005ba7b0 |
 | `BMPMD5ID` | Bitmap MD5 ID              | 0x005d15c0 |
 
 ### Level of detail: the `L<n>#` object-name convention
@@ -895,6 +895,137 @@ Measured gates, all of which the shipped set satisfies (6,847/6,847 at depth 0, 
 `DUMOBJDT`'s 0x34-byte header is `location` (int32[3]) at +0x00, `min_extents` at +0x0c,
 `max_extents` at +0x18, an orientation quaternion at +0x24, then the name. The extents reach
 `MapAuxObject+0x20`/`+0x2c` and **nothing in the binary reads either**.
+
+---
+
+## Merging polygons into quads: `SHPMRGDT` builds the navmesh, not the picture
+
+**The merge does not touch rendering.** That is the whole point of this section, and it is the
+opposite of what the name and the AvP heritage suggest. The ordering inside
+`BuildShapeVertexBuffers` @ 0x005ab300 settles it:
+
+```
+..0x005ac7xx   D3D vertex + index buffers built from shape->poly_list   (UNMERGED)
+  0x005ac83d   CALL MergePolygonsInChunkShape                           <-- merge happens here
+  0x005acc6c   CMP [poly+0x10], 3   count triangles vs quads            (MERGED)
+  0x005acdf3   CMP [poly+0x10], 3   fill LevelMeshTri / LevelMeshQuad
+..0x005ad2xx   tail: memcpy-shrink the vertex/index buffers. No rebuild.
+```
+
+The render buffers are finished before the call and are never regenerated, so merging cannot
+remove a single drawn primitive. Its only output is the `LevelMeshHeader` at `SceneMesh+0x8c` -
+what `ToMap` hands to `Map_Ctor`, what the `<level>.cut` sidecar caches, and what
+`BuildNavPolygons` @ 0x004888d0 turns into nav polygons. **`SHPMRGDT` is level-collision and
+pathfinding data wearing a rendering name.**
+
+What it buys, then, is a smaller *section* count on flat terrain: one `NavQuad` instead of two
+`NavPolygon`s, one A\* node instead of two against the 200-500 node budget
+`LoadOrBuildSectionAdjacency` clamps, and less work in `BuildPolygonAdjacencyGrid`. Measured
+over the 24 shipped level map objects the merge takes **875,312 polygons down to 549,714
+sections, 37.2%** (level10 47.5%, `mplay_mountain` 18.5%). That the saving was the *author's*
+motive is inference; that the GPU never sees the merge is measured.
+
+A quad that ships in `SHPPOLYS` directly *is* rendered - the index buffer is
+`malloc(num_polys * 6 * 2)` and each polygon emits `num_verts - 2` triangles as a fan, so it is
+expanded at buffer-build time and there is no quad primitive. Merged quads simply never reach
+that code. (Separately: a polygon with `flags & 1` is omitted from the render buffers entirely.)
+
+### What a pair is
+
+Every one of the 325,598 pairs in the shipped level map objects is two triangles sharing an
+edge, coplanar, with the same texture index and the same `engine_type` - and **74.4% of map
+polygons are half of a pair**. The mergers do not check most of that:
+
+| | `MergePolys` @ 0x005d77e0 | `TexMergePolys` @ 0x005d7590 |
+|---|---|---|
+| picked when | `engine_type` outside 5..7 and 0x14..0x18 | inside either range |
+| tests | `engine_type` equal, **whole `colour` dword** equal, `flags` equal | `engine_type` equal, `colour & 0xfff` (texture index **only**) equal, `flags` equal, and `(u,v)` **bit-identical in both triangles at every shared vertex** - so a UV seam never merges |
+| shared edge | implicit: `vert_ind[3] != vert_ind[0]` on the way out | same |
+| coplanarity | **not tested** | **not tested** |
+
+**Gunlok deleted AvP's planarity guard.** `merge_polygons_in_chunkshape` (`chnkload.cpp:3160`)
+computes the plane distance of the odd vertex and skips the merge unless it is within 1 unit;
+that block is absent from 0x005d7900. So the engine trusts `SHPMRGDT` on geometry exactly as
+completely as it trusts it on indices, and a pair naming two non-coplanar triangles produces a
+bent "quad" nav section rather than being refused.
+
+The merged polygon **inherits everything from the lower-indexed partner** - `engine_type`,
+`flags` and `colour` verbatim, `num_verts = 4`, and the plane from `p_normal_list[i]`. The other
+triangle contributes vertex indices and nothing else; its normal is discarded. Winding is
+preserved across the shared edge (`a = {0,1,2}`, `b = {1,0,3}` gives `{0,3,1,2}`). Because the
+flags must already be equal and the normal comes from one of the two, **walkability is identical
+whether a pair merges or not** - merging changes the section count, never the classification.
+
+### A defect in `TexMergePolys`
+
+The fused UV list is written into `shape->uv_list[UVListIndex(a)]` at 0x005d777a, **before** the
+shared-edge check at 0x005d779e. A pair that passes every attribute test but does not share an
+edge therefore returns failure - the caller emits both triangles unmerged - after `a`'s UV record
+has already been clobbered to `num_verts = 4` with four fused coordinates. `a` then renders as a
+triangle against a UV list claiming four vertices. Unreachable from shipped data, since no shipped
+`SHPMRGDT` names a non-adjacent pair; reachable from an authored one.
+
+### The chunk is only safe if the pairing is exact
+
+Its consumer trusts it completely: every count it could have validated against is either ignored
+or absent, and every index it uses is unbounded.
+
+```
+RifFindObjectByName        @ 0x005aa5c0   __fastcall, RET 0xc -- FIVE parameters
+                                          (rif, name, origin_out, out2, merge_and_build)
+BuildShapeVertexBuffers    @ 0x005ab300   merge block runs only when flags & 1
+MergePolygonsInChunkShape  @ 0x005d7900   AvP's merge_polygons_in_chunkshape
+  TexMergePolys            @ 0x005d7590   textured: 5 <= engine_type <= 7, 0x14 <= t <= 0x18
+  MergePolys               @ 0x005d77e0   untextured
+ShapeMergeDataChunk_FromData @ 0x005b97d0 num_polys = payload_size >> 2 -- never read again
+```
+
+**Only the map object and the shadow object are ever merged.** Of the eight call sites of
+`RifFindObjectByName`, exactly two pass `merge_and_build = 1`: `ToMap`'s cold geometry path
+@ 0x0047f926 and `GetShape` @ 0x004ae6c4 (the `shadow object rif` / `shadow object name` pair).
+The other six - `ToMap` @ 0x00480b80, `FUN_0049c7b0` @ 0x0049da28, `FUN_00523440` (twice) and
+`EnterMainMenuScreen` (three times) - pass 0 and skip the merge entirely. So a *prop* with corrupt
+merge data is inert and a *level* with it is a crash.
+
+**The chunk may be omitted.** `BuildShapeVertexBuffers` does `lookup_child(shape, "SHPMRGDT",
+&list)` and tests `list.n_entries` before calling the merger, and the chunk is deleted immediately
+after use. Omitting it costs no pixels at all - it costs *sections*: every pair that would have
+merged becomes two nav polygons instead of one nav quad, so the level's section count rises by
+the pair count and the A\* graph gains that many nodes.
+
+**If it is present, it must be exact.** The loop is bounded by `shape->num_polys` - the `SHPPOLYS`
+count, **never** by `SHPMRGDT`'s own `num_polys`, which the loader computes and nothing ever
+compares - and it indexes `poly_list[merge_data[i]]` with no range check, into an output array of
+exactly `malloc(num_polys * 0x24)` with no bound on the write cursor. The predicate the code
+assumes, and which all 24 shipped levels satisfy:
+
+```
+for every i in [0, num_polys):
+    m[i] == -1,  or  (m[i] == j, j != i, 0 <= j < num_polys, and m[j] == i)
+```
+
+Break it and there are two distinct faults, both reachable:
+
+| address | instruction | what went wrong |
+|---------|-------------|-----------------|
+| 0x005d79a5 | `MOVUPS [ESI+0x10], XMM0` | a **write** past the output array: a pairing where `m[j] != i` makes polygon `j` emitted twice, so the write cursor `p_no` runs past `num_polys` |
+| 0x005d7abe | `MOVUPS XMM0, [EAX+ECX*4+0x10]` | a **read** of `poly_list[j]` with `j >= num_polys`, i.e. an out-of-range partner |
+
+`ECX` at the second is `j * 9` (from `LEA ECX,[EAX + EAX*8]`, `ChunkPoly` being 0x24 bytes), which
+is how you recover `j` from a crash dump.
+
+The merged list **replaces the shape's own**: the tail of `MergePolygonsInChunkShape` frees
+`poly_list` and `p_normal_list` and installs the new arrays with `num_polys = p_no`. Nothing
+downstream can see the unmerged geometry afterwards, which is why the render buffers have to be
+built first.
+
+**This is not a hypothetical.** The Blender addon used to store the partner as a raw
+source-polygon index and carry it through a face drop, and since dropping one face renumbers every
+face after it, one dropped face corrupted the whole table. 15 of the 24 shipped level map objects
+lose at least one face to Blender's "no two faces on the same three vertices" rule, and all 15
+crashed; the 9 that lose none loaded. Confirmed in the game on four - `level01` and `level06`
+loaded, `level02` and `level11` faulted at exactly the two addresses above, then loaded once the
+addon stored a **pair id** instead. Full write-up in `blender/CLAUDE.md`.
 
 ---
 

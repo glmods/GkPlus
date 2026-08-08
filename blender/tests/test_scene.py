@@ -183,9 +183,27 @@ def summarize(root):
     bindings = sorted(heads.objhierd_name(c.body)
                       for c in root.walk() if c.id == b"OBJHIERD")
 
+    # `SHPMRGDT` names the polygon each polygon pairs with, and the engine's
+    # merge pass walks it with no bounds check at all -- so a table that is not
+    # an exact involution is an out-of-bounds heap write during level load. This
+    # is the check that catches a chunk being written from stale indices, which
+    # is what crashed 15 of the 24 shipped levels before the pair-id form.
+    unwalkable = []
+    for c in root.walk():
+        if c.id not in (b"REBSHAPE", b"SUBSHAPE"):
+            continue
+        merge, polys = c.find(b"SHPMRGDT"), c.find(b"SHPPOLYS")
+        if merge is None or polys is None:
+            continue
+        wire = list(struct.unpack("<%di" % (len(merge.body) // 4), merge.body))
+        why = shp.merge_problems(wire, len(polys.body) // 36)
+        if why:
+            unwalkable.append(why[0])
+
     table = next((c for c in root.walk() if c.id == b"BMPNAMES"), None)
     return {"objects": objects, "lights": lights, "sequences": seqs,
             "bindings": bindings, "sounds": sound_bodies, "emitters": emitters,
+            "unwalkable_merge": unwalkable,
             "table": table.body if table is not None else None,
             "inventory": collections.Counter(c.id for c in root.walk())}
 
@@ -259,6 +277,16 @@ def compare_inventory(name, want, got):
 
 def compare(name, want, got):
     compare_inventory(name, want, got)
+    # The engine's merge pass has no bounds check, so this one is about not
+    # writing a file that crashes the game rather than about fidelity. The
+    # source is checked too, so a shipped file that violated it would be
+    # reported as such rather than blamed on the exporter.
+    check(not want["unwalkable_merge"],
+          "%s: source SHPMRGDT is walkable (%s)"
+          % (name, (want["unwalkable_merge"] or [""])[0]))
+    check(not got["unwalkable_merge"],
+          "%s: exported SHPMRGDT is walkable -- the engine's merge pass has no "
+          "bounds check (%s)" % (name, (got["unwalkable_merge"] or [""])[0]))
     check(len(want["objects"]) == len(got["objects"]),
           "%s: %d objects out, %d in" % (name, len(got["objects"]), len(want["objects"])))
     for a, b in zip(want["objects"], got["objects"]):

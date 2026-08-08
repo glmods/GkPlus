@@ -389,6 +389,21 @@ hand-rolled (`SM_CXFRAME`x2 horizontally, `SM_CXFRAME`x2 + `SM_CYCAPTION` vertic
 | 0x004fce90 | FastCall<void*, int, Role*, Vec3*, Vec4*> | ClientSpawnActorForTeam |
 | 0x005aaac0 | FastCall<void, List*, void*, const char*> | RifFilterObjectsByName — **`__fastcall`**, ECX=out list *and* EDX=rif (read at 0x005aaac8), name on the stack. Was declared `ThisCall`, which put the rif on the stack and left EDX garbage |
 | 0x004ae960 | FastCall<void*, const char*, int> | LoadOrGetRifFile |
+| 0x005aa5c0 | FastCall<void*, void*, char*, void*, void*, int> | RifFindObjectByName — **five** parameters, `RET 0xc`; the DB had three. The last, `merge_and_build`, gates the quad-merge pass and is 1 at only two of the eight call sites (`ToMap` @ 0x0047f926, `GetShape` @ 0x004ae6c4) |
+| 0x005ab300 | FastCall<void, void*, void*, void*, unsigned char> | BuildShapeVertexBuffers — arg2 is a nullable `SHPVTINT`; the `SHPMRGDT` block runs only when `flags & 1` and null-checks the lookup |
+| 0x005d7900 | FastCall<void, ChunkShape*, void*> | MergePolygonsInChunkShape — fuses triangle pairs into quads, replacing the shape's own poly/normal lists. Feeds the **navmesh**, never the renderer: the D3D buffers are built before the call and not rebuilt. **No bounds check anywhere, and AvP's planarity guard is absent**; see `rif_chunk_format.md`, "Merging polygons into quads" |
+| 0x0048dc50 | ThisCall (member) | NavQuad_Ctor — 0x44 bytes, vtable 0x00663ecc, the 4-vertex sibling of `NavPolygon` |
+| 0x0048f580 | ThisCall<int, NavQuad*, void*> | NavQuad_AdjacencyTest — slot 0x50 for a quad. Same unbounded append as `PolygonAdjacencyTest`, over a `Vec3[4]`, so the **fifth** match overruns |
+| 0x00494d40 | ThisCall (member) | NavQuad_IsNeighbour — slot 0x58 |
+| 0x0048e330 | ThisCall (member) | NavQuad_AddNeighbour — slot 0x5c |
+| 0x00489d70 | ThisCall (member) | Map_AddNavGeometry — interleaves the tri and quad arrays into `MapBase::sections` (+0x88) and writes each one's `section_id` (+0x20), triangles first |
+| 0x005d5e80 | FastCall<int, ChunkPoly*> | ChunkPoly_TextureIndex — `colour & 0xfff` |
+| 0x005d5e60 | FastCall<int, ChunkPoly*> | ChunkPoly_UVListIndex — the 20-bit form, bits 12-15 folded in when set |
+| 0x005d7590 | FastCall<int, ChunkPoly*, ChunkPoly*, ChunkPoly*, ChunkShape*> | TexMergePolys — textured pair (`5..7`, `0x14..0x18`) |
+| 0x005d77e0 | FastCall<int, ChunkPoly*, ChunkPoly*, ChunkPoly*> | MergePolys — untextured pair |
+| 0x005b97d0 | FastCall (this in ECX) | ShapeMergeDataChunk_FromData — `num_polys = payload >> 2`, and that count is never compared with `SHPPOLYS` |
+| 0x005ba7b0 | FastCall (this in ECX) | ShapePolyChangeInfoChunk_FromData — loads `SHPPCINF`, which nothing reads |
+| 0x005b5df0 | — | StripUnusedShapeChunks — deletes `SHPPCINF` once the shape is built |
 
 **Save System:** (see `save_system_notes.md`)
 
