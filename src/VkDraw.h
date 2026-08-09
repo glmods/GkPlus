@@ -52,6 +52,70 @@ struct GpuLight {
 };
 static_assert(sizeof(GpuLight) == 112, "the scratch stride is part of the shader ABI");
 
+// One of the LEVEL's own lights - the `STDLIGHT` rig that baked its per-vertex colours, which the
+// shipped engine loads and never reads (src/MapLights.h). Nothing to do with `GpuLight` above:
+// that is a D3D light the game set this frame, this is authoring data D3D has never seen.
+//
+// Everything is premultiplied on the CPU so the shader does the least possible per light per
+// pixel, and it is three float4s for the layout reason the rest of this ABI is.
+//
+// The model each field serves is fitted, not chosen - see vulkan_renderer_notes.md §4.54, which
+// is also why `spread` is absent: as a cone exponent it makes the fit *worse* on every level, so
+// carrying it would be carrying a field to ignore.
+struct GpuMapLight {
+  float position[4];  // xyz world space, w = range in world units
+  // rgb = the light's colour times its brightness, already multiplied. w carries
+  // `engine_light_flags` as a float - only bit 0x4 (LFlag_Omni) is read, and it decides whether
+  // the cone below applies at all.
+  float colour[4];
+  // xyz = **row 2** of the orientation matrix, which is the light's axis. Rows 0 and 1 both fit
+  // worse and negating this one collapses the fit, which is what identifies it (§4.54). Unused
+  // on an omni light.
+  float axis[4];
+};
+static_assert(sizeof(GpuMapLight) == 48, "the scratch stride is part of the shader ABI");
+
+// Everything that is the same for every draw in a frame, in one place.
+//
+// **The push constant block ran out.** It reached exactly 128 bytes with the light grid (§4.56) -
+// which is the minimum every Vulkan device guarantees, and AMD commonly reports exactly that - so
+// the next thing to need space had to displace something. A frame-uniform value has no business
+// being copied into a 128-byte block once per draw anyway; §4.56's own note said so.
+//
+// The three ADDRESSES are here for the same reason the knobs are: they are constant for a frame,
+// and only the map-lighting path reads them. The four hot addresses stay in the push, where the
+// vertex shader reaches them without a dependent load.
+//
+// Laid out with the 8-byte members FIRST, where no rule can disagree about their alignment, and
+// 4-byte scalars after - the same reasoning that made GpuMaterial sixteen named uints rather than
+// an array.
+struct GpuFrameData {
+  uint64_t map_lights;    // the level's own STDLIGHT rig for this frame (src/MapLights.h)
+  uint64_t light_grid;    // the world-space grid, and its header
+  uint64_t light_indices;
+  // The LOD probe (§4.34) and the lighting-map knobs (src/VkLighting.h).
+  float force_lod;
+  float bump_scale;
+  float bump_diffuse;
+  float specular_scale;
+  float gloss_min;
+  float gloss_max;
+  float specular_from_diffuse;
+  float chrome_scale;
+  float chrome_blur;
+  float chrome_texgen;
+  // Per-pixel lighting (§4.52) and runtime map lighting (§4.55).
+  float per_pixel_lighting;
+  float map_light_gain;
+  float map_ambience;
+  uint32_t map_light_count;
+  uint32_t map_flags; // bit 0 on, bit 1 substitute everywhere, bit 2 the grid is usable
+  uint32_t pad0;
+  uint32_t pad1;
+  uint32_t pad2;
+};
+static_assert(sizeof(GpuFrameData) == 96, "the scratch stride is part of the shader ABI");
+
 // GpuDrawRecord::lighting flags.
 //
 // The two colour paths are mutually exclusive and neither is the default: with both clear the
@@ -418,7 +482,10 @@ struct DrawStats {
   // Not an invariant - it is the size of the technique in §4.32, and a level where it reads 0
   // would be one where the engine never layers anything in front of the world.
   uint64_t viewport_sets = 0;
-  uint64_t pipelines = 0;        // distinct pipeline states seen, i.e. VkPipelines created
+  uint64_t pipelines = 0;
+  // How many times the world-space light grid has been rebuilt. Once per level with a light set,
+  // so a number that climbs with the frame count means the rebuild test is broken.
+  uint64_t light_grid_builds = 0;        // distinct pipeline states seen, i.e. VkPipelines created
   uint64_t pipeline_binds = 0;   // how often the bound pipeline changed within a frame
   uint64_t pipeline_failures = 0; // must be 0: a state whose pipeline would not build
   uint64_t dropped_over_capacity = 0; // must be 0
@@ -444,6 +511,17 @@ uint32_t PendingDrawIndex();
 // Records the whole list into `cmd`, inside a rendering pass the caller has begun, then clears
 // it. The depth image view is the caller's to attach - see DepthImageView.
 void RecordDraws(void *command_buffer);
+
+// Build the world-space light grid, if the level's light set has changed since it was last built.
+//
+// **Must be called outside a render pass**, which is why it is the renderer's to call and not
+// RecordDraws': a compute dispatch inside vkCmdBeginRendering is invalid, and RecordDraws runs
+// there. It sits with the uploads, before the world pass begins.
+//
+// Usually a no-op. The map's lights are static in world space, so the grid is rebuilt once per
+// level rather than once per frame - see src/shaders/lightgrid.slang for why that is the shape
+// this takes instead of a view-space cluster grid.
+void BuildLightGrid(void *command_buffer);
 
 // Discards the list without drawing it, for a frame that is not rendered.
 void ClearDraws();
@@ -513,6 +591,86 @@ float ForceLod();
 // small (§4.26, §4.28).
 void SetShadeMode(bool enabled);
 bool ShadeMode();
+
+// Run D3D8's light sum per PIXEL rather than per vertex.
+//
+// **On by default, and this is the first thing here that is a deliberate departure from the
+// original rather than a reproduction of it.** Every other knob in this header exists so a
+// difference against real D3D8 can be attributed; this one exists to make the game look better,
+// and switching it off is what restores the reproduction. That is why `false` has to be
+// bit-identical to the build before it and is checked as such.
+//
+// The equation is unchanged - the same `light_sum` runs, over the same lights, with the same
+// N.L > 0 gate on the specular sum (§4.46). What changes is where it is evaluated, and therefore
+// what is interpolated: a lit COLOUR across the triangle, or the position and normal the colour
+// is computed from. Gouraud shading cannot represent a highlight smaller than a triangle or a
+// point light's falloff across one, which on Gunlok's geometry means a projectile - a handful of
+// vertices - has no lighting detail at all.
+//
+// Three consequences worth knowing, all of them real differences rather than approximations:
+//
+//   - the interpolated normal is **renormalised per pixel**, where the vertex path normalises
+//     only under D3DRS_NORMALIZENORMALS. Interpolating two unit normals yields a shorter vector
+//     between them, so not doing it darkens the middle of every triangle;
+//   - `D3DRS_LOCALVIEWER`'s eye vector is per fragment rather than per vertex;
+//   - `D3DRS_SHADEMODE` FLAT now flat-shades the *vertex colour* the sum consumes rather than the
+//     sum's result. Nothing in level01 or level02 can see that - every flat-shaded draw there is
+//     one of the stencil shadow's passes and none is lit (§4.31).
+//
+// `GKPLUS_VK_PER_PIXEL_LIGHTING=0` is the launch-time form, for a session that wants the
+// reproduction from the first frame.
+void SetPerPixelLighting(bool enabled);
+bool PerPixelLighting();
+
+// Runtime map lighting: replace the level's BAKED per-vertex colour with a per-pixel evaluation
+// of the `.rif`'s own light rig (src/MapLights.h, model fitted in §4.54).
+//
+// **It substitutes into the slot the bake already occupies.** `D3DRS_DIFFUSEMATERIALSOURCE` is
+// `D3DMCS_COLOR1` on every lit draw, so the vertex colour *is* the material diffuse inside D3D's
+// own equation - not the final colour. Replacing that one term leaves the live light sum, both
+// texture stages and the gamma-space multiply exactly as they were, which is why the level's
+// brightness balance survives. Neutralising the bake to white and lighting on top instead is
+// §4.25's bug: everything unfogged and far too bright.
+//
+// No gamma conversion anywhere, and that is not an oversight. The model was fitted directly
+// against the stored bytes over 255, so what it produces is already in the encoding the stages
+// consume - the fit absorbed the transfer function rather than leaving one to apply.
+//
+// **Off by default, on performance grounds rather than fidelity ones.** This is brute force over
+// every light in the level per pixel - 686 on level01 - with no culling until phase 2 builds it.
+// Turning it on is what says whether the shading is right; leaving it on is not yet advisable.
+void SetMapLighting(bool enabled);
+bool MapLighting();
+
+// The one free parameter of that model, and the default (1.2) is the mean of the fitted gains on
+// the three levels where the model holds - 0.9 on level01, 1.35 on level04 and level05. It is a
+// per-level quantity rather than a constant, so this is a lever and not a calibration.
+//
+// It is also the sharpest validation the feature has: on level04 the on-screen difference from
+// the bake minimises at **exactly 1.35**, rising either side, which is where the offline fit put
+// it from vertex data with no rendering involved (§4.55).
+// Substitute on every lit draw rather than only on the map's own geometry.
+//
+// Off by default, and the default is measured: a prop or a unit is a separate `RBOBJECT` whose
+// `SHPVTINT` was baked from its OWN file's light rig, so substituting the level's there swaps one
+// object's bake for another's. The fit in §4.54 only ever covered the map object. This exists so
+// that claim stays checkable rather than as a feature.
+// Bin the map's lights into a world-space grid and have each fragment read only its own cell,
+// instead of looping every light in the level.
+//
+// **On by default, and off must be BIT-IDENTICAL rather than close.** A light's `range` is a hard
+// cutoff in the fitted model, so a light whose sphere misses a cell contributes exactly zero to
+// every fragment in it - the grid drops nothing that would have been added. That makes the A/B a
+// correctness test rather than a quality trade, and it is the only test that can catch a cell
+// silently missing a light, which otherwise looks like art.
+void SetMapLightCull(bool enabled);
+bool MapLightCull();
+
+void SetMapLightingAll(bool enabled);
+bool MapLightingAll();
+
+void SetMapLightGain(float gain);
+float MapLightGain();
 
 // The D3D9 pixel-centre convention, as a half-pixel viewport offset.
 //

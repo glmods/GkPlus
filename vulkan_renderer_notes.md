@@ -4439,6 +4439,480 @@ only the world's has been looked at here.
 Incidentally, the vertex dump on that draw shows diffuse `ff080808`, `ff0c0c0a`, `ff090908` — the
 `SHPVTINT` bake, and `0xFF080808` is the commonest value in the whole shipped set.
 
+## 4.52 The light sum, per pixel — and a cross-launch MAD that cannot see it
+
+The first change here that is meant to make the game look *different* rather than to make it match.
+D3D8's light sum now runs per fragment; `render.per_pixel_lighting = false` restores the
+fixed-function path. **Worth 0.48 MAD over 26.9% of a paused level02 frame.**
+
+The equation is untouched — the same lights, the same attenuation and spot factors, the same
+`N·L > 0` gate on the specular sum (§4.46). What changes is what the rasteriser interpolates:
+a finished colour, or the position and normal it is computed from.
+
+### It is mostly promotion, not new code
+
+The fragment shader already contained a working per-pixel light loop — `shade_lighting_map`
+(§4.48) runs the same `light_geometry` over the same `GpuLight` array — and `VertexOut` already
+carried `world_position` and `world_normal` for it. So the work was to factor the loop into
+`light_sum` and the material resolution into `resolve_lit_colour`, and call them from either stage.
+Both are shared *deliberately*, for §4.46's reason: two copies of the same sum diverging silently
+is a defect that reads as an authoring problem rather than as a shader disagreeing with itself.
+
+**No new varying.** On the per-pixel path the vertex shader writes the **raw vertex colour** into
+`color` instead of a lit one, which is what `D3DRS_*MATERIALSOURCE` needs and the only thing
+per-vertex data still contributes. Both stages decide which meaning `color` carries from the same
+push constant, so they cannot disagree.
+
+Three real differences, each a departure rather than an approximation:
+
+- **The interpolated normal is renormalised per pixel**, where the vertex path normalises only
+  under `D3DRS_NORMALIZENORMALS`. Interpolating two unit normals gives a shorter vector between
+  them, so skipping it darkens the middle of every triangle — an artefact of interpolation, with
+  no per-vertex equivalent to reproduce.
+- **`D3DRS_LOCALVIEWER`'s eye vector is per fragment.**
+- **`D3DSHADE_FLAT` now flattens the vertex colour the sum consumes**, not the sum's result.
+  Invisible on level01 and level02, where every flat-shaded draw is one of the stencil shadow's
+  passes and none is lit (§4.31).
+
+Ordering matters in one place: the per-pixel sum runs **before** the lighting-map block, because
+that feature's whole output is a scale on the diffuse the texture stages consume. Computing the sum
+afterwards would discard the scale and look exactly like the map having stopped working.
+
+### What it is worth
+
+level02, Vulkan, settled start camera, paused, 178 actors, 273 draws, all in one session:
+
+| | MAD /255 | pixels |
+|---|---|---|
+| off vs off, two shots — **the floor** | 0.0083 | 0.05% |
+| off → on → off, back to off | 0.0168 | 0.07% |
+| **off vs on — the feature** | **0.4794** | **26.9%** |
+
+The floor is not 0.000 as §4.48's was, and the reason is visible rather than mysterious: the
+differing pixels sit in a single 92x79 box, one animating prop. Everything else is static.
+
+**The difference image is the reading, not the number.** It is shaped exactly as a per-vertex →
+per-pixel change should be: the two units blaze (the most articulated geometry in the frame, where
+Gouraud loses most), broad smooth gradients appear across the large ground and structure polygons
+where linear interpolation of a colour cannot follow a falloff, and the flat mid-right is black.
+
+### `false` is bit-identical — and a whole-frame cross-launch MAD cannot say so
+
+This is the part worth carrying forward. Checking "off restores the previous build" needs two
+*builds*, so it cannot use the toggle, and a cross-launch comparison on level02 runs straight into
+§4.31's warning that **the animation phase is not pinned**:
+
+| comparison | whole frame |
+|---|---|
+| old build vs old build, two launches | 0.0198 |
+| old build vs new build, per-pixel off | 0.1223 (reproduced at 0.1200) |
+| **old build with a 3-second delay vs old build without one** | **0.6712** |
+
+That last row is the same binary against itself, differing only in when the pause landed — and it
+is five times the effect being measured. `Shoot-Settled`'s `-Before` sleeps three extra seconds, so
+a shot that sets a knob and one that does not are at different animation phases. Two units
+idle-animate and nothing else in the frame moves.
+
+**Restricting to regions with no animating geometry is what makes it answerable**, and the answer
+is unambiguous:
+
+| region | old vs old | old vs new, off |
+|---|---|---|
+| pipe + upper-left | 0.0000 (0.00%) | **0.0000 (0.00%)** |
+| right wall | 0.0000 (0.00%) | **0.0000 (0.00%)** |
+| HUD panel | 0.0000 (0.00%) | **0.0000 (0.00%)** |
+| far ground upper-mid | 0.1187 | 0.1193 — the floor, so something animates here too |
+| whole frame | 0.6712 | 0.7119 — the floor again |
+
+So the fixed-function path is reproduced **exactly**, and every whole-frame number above is the
+game rather than the renderer. Three procedural rules fall out:
+
+- **Match the `-Before` between two shots being compared**, or compare only static regions. A knob
+  set through `-Before` costs three seconds of animation.
+- **`render.draws` collapsing to a couple of dozen a frame means the shot is void.** One relaunch
+  here landed the camera somewhere empty and produced 31.77 MAD against everything — read as a
+  catastrophic regression for exactly as long as it took to notice `draws: 20 this frame`. Assert
+  the draw count and the actor count beside the camera.
+- **A cross-launch whole-frame MAD on level02 has a floor of order 1**, not 0.09. §4.28's 0.094 was
+  measured with the camera set explicitly and is not what `Wait-CameraRest` alone delivers.
+
+Invariants unchanged: `seen == submitted` with `unaccounted for: 0`, every must-be-0 counter at 0,
+0 validation errors, 13 pipelines (unchanged — nothing here touches the pipeline key), and
+`render.draws` now prints `light sum: per PIXEL` or `per vertex (the original)` unconditionally,
+because "no line" would read as the original to anyone who had not been told the feature existed.
+
+## 4.53 The level's own lights, loaded — the rig that baked it, which nothing reads
+
+Phase 3a of runtime map lighting: get the `STDLIGHT` set into world space. Nothing renders from it
+yet; this is the loader and the reading that says it found the right file and put the lights in
+the right place.
+
+`src/Rif` is the decoder and is **pure** — bytes in, records out — so it is the only file in
+`src/` with a test that runs without Gunlok: `utils/riflights` over all 563 shipped files against
+`blender/io_scene_rif`, **3,794 lights, every field exact**, integers with no tolerance. Breaking
+one offset fails it 3,794 times.
+
+### It has to be a hook, and on the right function
+
+**Neither the path nor the rif object survives the level load.** `LoadLevel` calls
+`RifCache_Clear` @ 0x004aead0 immediately after `ConvertParsedObjects` (@ 0x004e0e70), and
+`LoadOrGetRifFile` clears the cache on every miss as well — so by the time a level is playable the
+rif is freed and the cache is empty. No global holds either: `ToMap` keeps the handle in a
+register, and `Map` retains only the **shadow** object's rif name (field 0x54), never the map
+section's own `file` (0x01).
+
+So it is caught in flight, and the seam is **`LoadOrGetRifFile` @ 0x004ae960** rather than the
+more obvious `AcquireLevelRifForLocators`: `ToMap` reaches Acquire on both warm paths but calls
+`LoadOrGetRifFile` **directly on the cold one**, which is the load where a level is being built
+for the first time. Hooking Acquire alone would work on every run except the first.
+
+`__fastcall` with arguments in ECX *and* EDX, so it is a free function pointer and not the
+member-pointer trick `InputFix` uses — a `__thiscall` member puts only `this` in ECX and
+everything else on the stack.
+
+**The shortcut was measured and does not work.** Deriving the rif path from `ScriptFileName` holds
+for 28 of the 32 shipped scripts and fails on four: `prison.gls` → `levels\S3 Level.rif`,
+`cityruins.gls` → `levels\city ruins.rif`, `mplay_machine.gls` → `levels\mplay_the machine.rif`,
+and `railway.gls` → `railway.rif` with no `levels\` prefix at all. Guessing would have produced no
+lights on a campaign level and looked like a feature that simply does nothing.
+
+### What it reads back
+
+| | level02 | level01 |
+|---|---|---|
+| lights | **51** | **686** |
+| omni (flag 7) | **27** | **285** |
+| light set / ambience | `NORMALLT` / 0.0312 | same |
+| unit scale | 0.001 | 0.001 |
+| range | 3.29 .. 83.59 | 5.00 .. 111.70 |
+
+Every one of those is independently predicted: the counts and the omni split match the Python
+decoder's, 0.0312 is 2048/65536 exactly, and the ranges are the file's rif units times the scale.
+0.001 is the default scale, which is what **every** shipped asset uses — only 2 of 563 files carry
+an `ENVSDSCL` at all.
+
+**The bounds comparison is the check that the transform is right**, and it is the one no per-light
+number could give: the light set's world bounds sit inside the map's own on both levels. Get the
+scale or the origin wrong and they land orders out.
+
+### Two corrections it produced
+
+- **`Map::bounds_min` and `bounds_max` were named backwards.** 0x128 holds the *larger* corner:
+  level02 has (68.6, 10.0, 66.5) there against 0x134's (-65.8, -14.1, -65.1), and level01 (47.4,
+  30.0, 141.0) against (-50.8, -28.5, -96.1) — six components, two levels, all the same way round,
+  and the lights bracket correctly only when read this way. Renamed in `src/Map.h`,
+  `address_map.md` and `level_loading_notes.md`, including the `MapCameraPlane` fallback formula
+  there, which was written against the old names and had to be rewritten to keep its meaning.
+- **`src/CustomLevel.cpp`'s comment was wrong in both halves.** "The rif is already in the cache by
+  now, so this is a lookup, not a load" — the cache is empty by then, and the `.loc` branch passes
+  flag 0, which flushes and re-reads even on a hit. Every `LevelRifLocators` call is a full disk
+  load.
+
+Also corrected from the same investigation: `rif_chunk_format.md`'s `Chunk` layout (it is **0x28**,
+not 0x24, and every field after the vptr was at the wrong offset; `children` is a head pointer, not
+a list), and `level_loading_notes.md`'s claim that `.opt`/`.loc` are "shipped with the rif" — they
+are generated by `ToMap`'s cold path, and both carry the whole `LIGHTSET`.
+
+### Not yet decided, on purpose
+
+`MapLight` carries the orientation as a raw 3x3 and has **no `direction` field**. Which row a
+light points along is not established: AvP's own consumer reads neither the orientation nor
+`spread` (`setup_light_data`, `avp/win95/Objsetup.cpp:3362`), and the shipped data refuses the
+tidy reading that the orientation is authored only where the flags ask for a spread — it is
+authored on both. `engine_light_flags` does decode cleanly against AvP's header (3 =
+`CosAtten|CosSpreadAtten`, 7 = that plus `Omni`), which is more than the notes had before.
+
+The only ground truth for what actually shaped the bake is `SHPVTINT` itself, so the offline fit
+against it is what gets to choose — inventing a direction here would bake a guess into an ABI that
+the fit would then have to argue with.
+
+One incidental measurement worth keeping: the game loads the level rif **20 times on level02 and
+43 on level01** during a single level load (`rif loads seen ... under levels\`), and per the above
+each of those is a real disk read rather than a cache hit.
+
+## 4.54 What baked the levels: the model, fitted against the bake itself
+
+Phase 3b has to choose an attenuation curve, decide whether there is a diffuse term, and settle
+whether `spread` and the orientation matrix mean anything — and AvP's own consumer of the same
+chunk reads neither of the latter two. A guess here is a plausible picture with no way to tell it
+is wrong. `SHPVTINT` is ground truth, so the choice gets a residual instead.
+`utils/riflights/fit_bake.py` is the harness; it needs no game, only the shipped files and
+`blender/io_scene_rif`.
+
+### The model
+
+```
+for each light with d < range:
+    atten  = 1 - d/range                                  # linear, beats cosine and inverse-square
+    atten *= max(0, N·L)
+    if not (flags & LFlag_Omni):
+        atten *= max(0, dot(row2(orientation), normalize(P - light.position)))
+    sum += colour * brightness * atten
+result = max(ambience, sum * gain)                        # gain 0.9 .. 1.35
+```
+
+### The residuals, which are what "same-ish" means
+
+| level | lights | r | MAE /255 |
+|---|---|---|---|
+| level05 | 356 | **0.957** | **4.87** |
+| level04 | 431 | **0.926** | **9.85** |
+| level01 | 686 | 0.875 | 27.73 |
+| level02 | 51 | 0.367 | 36.38 |
+
+### The ablation is the evidence, term by term
+
+Pearson r against baked luminance, each row adding one term to the row above:
+
+| | level05 | level04 | level01 | level02 |
+|---|---|---|---|---|
+| distance only | 0.360 | 0.506 | 0.399 | −0.131 |
+| + `max(0, N·L)` | 0.838 | 0.831 | 0.720 | 0.197 |
+| + cone on **every** light | 0.923 | **0.640** | 0.809 | 0.235 |
+| + cone, **omni exempt** | **0.957** | **0.926** | **0.875** | 0.367 |
+| cosine falloff instead of linear | 0.942 | 0.918 | 0.850 | 0.359 |
+| inverse-square instead | 0.891 | 0.847 | 0.831 | 0.215 |
+
+Three things that are measurements rather than choices:
+
+- **The axis is row 2** of the orientation. Rows 0 and 1 make the fit worse; **negating row 2
+  collapses it** — 0.02 on level05, 0.17 on level01. A wrong axis degrades a fit; the *opposite*
+  axis destroys it, which is what tells one from the other.
+- **`LFlag_Omni` is a real switch.** Level04 goes 0.831 → **0.640** when the cone is applied to
+  its omni lights and to 0.926 when they are exempted. That is a term making things worse in one
+  configuration and better in another, which no amount of gain fitting can fake.
+- **`spread` shapes nothing.** As a cone exponent it makes the fit worse everywhere
+  (level01 0.723 → 0.646). It is authored on every light and read by nothing — the same standing
+  as `V` on an ambient emitter.
+
+### Level02 is the outlier, and it is the level everything else is measured on
+
+r 0.367 against 0.87–0.96 elsewhere, and it is the only level where the hue test fails: the baked
+colour is no closer to the dominant light's hue (0.44) than to a randomly chosen light's (0.33),
+where level04 gets 0.378 against a 0.885 control. It also has **66% of its bake effectively grey**
+against level01's 13%.
+
+The explanation is in its light rig: **51 lights with ranges up to 83,600 rif units over a
+130,000-unit level**, so every vertex is within range of a mean of 11.5 of them and no light
+dominates anywhere. There is nothing for a spatial model to discriminate on. Every term still
+improves the fit in the same order as elsewhere, so this is a level whose bake the lights explain
+weakly rather than a level that contradicts the model.
+
+**That matters for phase 3b's testing**, because level02 is the level every renderer measurement
+in these notes is taken on. Runtime map lighting will look *least* like the bake exactly where it
+will be judged. Shoot level04 or level05 as well before concluding anything about the feature.
+
+### Two ways this could have gone wrong, and what ruled them out
+
+- **A wrong placement transform would destroy any correlation.** Both map objects turn out to have
+  an identity `OBJHEAD1` (location 0, quaternion identity), and their local vertex extents match
+  the map bounds read out of the running game to the digit — level02's −65754..68633 against
+  −65.8..68.6 at scale 0.001. That also independently confirms §4.53's `bounds_min`/`bounds_max`
+  swap.
+- **A misaligned vertex↔colour index would look exactly like a bad model.** `SHPVTINT` count,
+  shape vertex count and vertex-normal count are all 16026 on level02, and every normal is unit
+  length.
+
+## 4.55 Runtime map lighting: substituting into the slot the bake occupies
+
+Phase 3b. `render.map_lighting` replaces the level's baked per-vertex colour with a per-pixel
+evaluation of §4.54's fitted model over its own `STDLIGHT` rig.
+
+**It substitutes rather than adds.** `D3DRS_DIFFUSEMATERIALSOURCE` is `D3DMCS_COLOR1` on every lit
+draw, so the vertex colour is the *material diffuse* inside D3D's own equation, not the final
+pixel. Replacing that one term leaves the live light sum, both texture stages and the gamma-space
+multiply untouched, which is why the level's brightness balance survives. Neutralising the bake to
+white and lighting on top is §4.25's defect.
+
+**No gamma conversion anywhere**, and that is a consequence of how the fit was run rather than an
+omission: it was fitted against the stored bytes over 255, so the model's output is already in the
+encoding the stages consume. The fit absorbed the transfer function.
+
+### The offline fit predicts the on-screen optimum
+
+This is the result worth keeping. §4.54's gain is one free parameter recovered from *vertex* data
+with no rendering involved, and it puts level04 at **1.35**. Sweeping the knob in game against the
+bake, on a paused level04 frame:
+
+| gain | 0.9 | 1.1 | **1.35** | 1.6 | 1.9 | 2.3 |
+|---|---|---|---|---|---|---|
+| MAD from the bake | 6.333 | 4.990 | **4.170** | 7.414 | 11.404 | 16.483 |
+
+A clean minimum at exactly the fitted value, rising sharply either side. Two independent
+measurements of the same quantity — one over 4,384 vertices offline, one over a rendered frame —
+agreeing to within a sweep step.
+
+### Only the map's own geometry, and that too is measured
+
+The first version substituted on **every** lit draw and measured worse. A prop or a unit is a
+separate `RBOBJECT` carrying its own file's bake from its own light rig, so putting the *level's*
+rig there swaps one object's bake for another's — something §4.54's fit never covered, since it
+only ever looked at the map object.
+
+| level04, at gain 1.1 | MAD from the bake |
+|---|---|
+| map geometry only | **4.990** |
+| every lit draw | 6.954 |
+| floor (off vs off) | 0.013 |
+
+The marker is the **fog stage**: stage 1 is the fog-of-war grid on exactly the draws
+`SubmitAndFlushMapGeometry` submits, and §4.51 tallied a whole level02 frame into only three
+stage-1 groups — fog, chrome, none. So "two stages and not chrome" is "this is the map".
+`render.map_lighting_all` turns the restriction off, which is what keeps that claim checkable.
+
+Note the ordering effect: with the restriction *off*, the on-screen gain optimum sat at 1.1
+instead of 1.35, because the units were contributing error that dragged it. Fixing the wrong thing
+first would have made the fit look 20% out.
+
+### What it is worth, and where to judge it
+
+| level | fit r (§4.54) | MAD from the bake, at the fitted gain |
+|---|---|---|
+| level04 | 0.926 | 4.170 |
+| level02 | 0.367 | 3.316 (gain 1.0, unrestricted) |
+
+**Do not read those two against each other.** Level04's bake is brighter and far more saturated
+(mean luminance 78.8, saturation 0.437) than level02's (60.8, 0.183), so the same *relative*
+accuracy shows up as a larger absolute difference — level04 fits nearly four times better on
+vertices (MAE 9.85 against 36.38) and still moves more pixels. A screen MAD against the bake
+measures how much the feature *changes*, not how wrong it is; §4.54's residual is the accuracy
+number.
+
+Invariants unchanged: `seen == submitted` with `unaccounted for: 0`, every must-be-0 counter at 0,
+0 validation errors, 12 pipelines, and off↔on returns to a 0.008–0.013 floor.
+
+### Off by default, and it is a performance decision not a fidelity one
+
+Brute force over every light in the level per pixel — 686 on level01, 431 on level04 — with no
+culling until phase 2. Turning it on is what says whether the shading is right; leaving it on is
+not yet advisable. The lights ride in a **sixth per-frame scratch slice** rather than a
+device-local buffer of their own, deliberately: the set is static for a whole level so a permanent
+upload is strictly better, and is exactly what phase 2 has to build anyway, so refilling 33 KB a
+frame is the cheaper thing to be wrong about while the shading is still being judged.
+
+## 4.56 The light grid: a compute pass, and the first one in this renderer
+
+Phase 2. Phase 3b evaluated all 431-686 of a level's lights per pixel, which is why it had to
+default off. This bins them into a grid so a fragment reads only its own cell — and it is the
+first compute shader here, so the pipeline, the descriptor set and the dispatch are all new.
+
+### A world-space grid, not the view-space cluster grid the plan named
+
+The plan specified screen tiles with depth slices, rebuilt per frame. **These lights never move
+relative to the world**, which changes the answer:
+
+- it is built **once per level** rather than once per frame — measured, `grid builds` reads 1 and
+  stays there;
+- it needs no view matrix in the fragment shader. A screen-tile scheme needs a view-depth slice,
+  and the view matrix here is per *draw*, inside `GpuDrawRecord` — a real source of quiet error;
+- it is resolution-independent. This machine runs at **3072x1728**, where 16-pixel tiles with 24
+  depth slices is nearly 500,000 clusters; this is 16,384 whatever the window is.
+
+The trade is that it does nothing for a moving light. Gunlok's dynamic lights are the D3D ones,
+capped at eight per draw by the hardware and already carried per draw, so there was nothing there
+for a view-space scheme to earn.
+
+32 x 16 x 32 cells over the map's own bounds — half the resolution vertically because a level is
+far flatter than it is wide (level01 is 98 x 58 x 237 world units).
+
+### The test is bit-identity, and it passes
+
+**The grid is exact, not an approximation.** A light's `range` is a hard cutoff in §4.54's model,
+so a light whose sphere misses a cell contributes exactly zero to every fragment in it. That makes
+`render.map_light_cull` a *correctness* A/B rather than a quality trade — and it is the only thing
+that can catch a cell silently missing a light, which otherwise looks like art.
+
+On level04, paused, culled against brute force: **0.00000 MAD, 0 pixels differing, over the whole
+frame.**
+
+Getting to that number took one correction worth recording. The raw whole-frame comparison read
+0.017 against a same-setting floor of 0.007, with a reproducibly *wider* bounding box — which
+reads exactly like a small systematic error. It is the **"ACTIVE PAUSE" indicator blinking**:
+amplifying the difference shows the text and one animating effect and nothing else, and excluding
+that strip takes every comparison — both floors and both across-toggle pairs — to 0.00000 with a
+`None` bounding box. A blinking HUD element is a *phase*, so it lands in some pairs and not
+others, which is why it moved the box rather than the magnitude.
+
+### Mechanics
+
+- **`src/shaders/lightgrid.slang`**, one compute entry point. `gen-shaders.py` needed exactly the
+  one `ENTRY_POINTS` tuple §4.50 predicted; nothing else in that script is stage-aware.
+- **The dispatch is the renderer's, not `RecordDraws`'**, because a compute dispatch inside
+  `vkCmdBeginRendering` is invalid and `RecordDraws` runs there. `BuildLightGrid` sits beside the
+  uploads, before the world pass begins.
+- **The compute pass binds three storage buffers; the fragment reads two by device address.**
+  Asymmetric on purpose: the bindless set has no storage binding and cannot gain one (binding 1 is
+  pinned last by `VARIABLE_DESCRIPTOR_COUNT`), so the graphics side must use addresses — while a
+  shader that *writes* is the one place a plain binding is simpler than arguing about pointer
+  semantics. The compute layout is its own, so this costs the graphics path nothing.
+- **Two passes over the lights per cell** — count, one atomic, then write — rather than gathering
+  into a local array, which would spill 128 uints per thread.
+- A cell that would overflow the index budget is dropped **whole** rather than half-filled, so
+  exhaustion renders as an unlit cell instead of as plausible-but-wrong lighting.
+
+### The push block is now exactly 128 bytes, which is not slack
+
+Adding the grid's two addresses and its parameters took the block to **184 bytes — past the 128
+every Vulkan device guarantees**, and AMD commonly reports exactly 128. Caught by the
+`static_assert`, which is why that assert exists.
+
+The fix moved the grid's dimensions, origin and cell size **into the grid buffer's own header**
+(written by `vkCmdUpdateBuffer`, 48 bytes inline in the command buffer) and packed three booleans
+into one `map_flags` word. That lands at exactly 128. **There is no room left**: the next thing to
+need push space has to displace something, or move the frame-uniform knobs into a uniform buffer,
+which is what they should have been once there were more than a couple.
+
+### Still off by default, and what would change that
+
+`render.map_lighting` stays off. The point of this section was to make it *affordable*, and it
+does — but **that it is affordable is not measured**: no frame-time comparison has been taken with
+it on against off. Flipping the default is a measurement away, not an opinion away.
+
+## 4.57 The push block ran out, and the frame-uniform data moved into a buffer
+
+A prerequisite for phase 4 rather than a feature: **no pixel changes**, and that is the test.
+
+§4.56 took the push constants to exactly **128 bytes** — the minimum every Vulkan device
+guarantees, and what AMD commonly reports. The next thing to need space was phase 4's light-space
+matrix, which is 64 bytes on its own, so shadows could not start until this was fixed. §4.56's own
+note said what the fix was: a value that is the same for every draw in a frame has no business
+being copied into a 128-byte block once per draw.
+
+`GpuFrameData` is now one 96-byte record in a seventh scratch slice, written once at the top of
+`RecordDraws` — the ten lighting-map and chrome knobs, the LOD probe, `per_pixel_lighting`, the
+whole map-lighting block, and the three addresses only that path reads. The push block is
+**56 bytes**, of which the only genuinely per-draw fields are `record`, `material` and
+`base_vertex`.
+
+**The four hot addresses stayed in the push.** The vertex shader reaches `vertices` before it has
+read anything at all, and putting it behind `frame` would make that a dependent load on every
+vertex in the game to save eight bytes that were not needed.
+
+### Proving a refactor changed nothing, across two builds
+
+The same problem §4.52 had: two *builds* cannot use a run-time toggle, and a cross-launch
+whole-frame MAD on a level with animation has a floor of its own. Here all three modes — map
+lighting off, culled, brute force — differed from the pre-refactor build by **0.27 with an
+identical bounding box**, which is itself the tell: a refactor that had broken the lighting path
+would move "culled" and leave "off" alone.
+
+Restricted to regions with nothing animating in them, against the pre-refactor build:
+
+| region | map lighting off | map lighting culled |
+|---|---|---|
+| right of the animation | **0.00000** | **0.00000** |
+| top strip | **0.00000** | **0.00000** |
+| far left | **0.00000** | **0.00000** |
+
+Bit-identical. Within the build, `culled` against `brute` is still at the floor, so §4.56's
+exactness survived the move.
+
+### What is now unblocked
+
+72 bytes of push, a frame-uniform record with three spare words, and somewhere obvious to put a
+light-space matrix. Phase 4 - the sun's shadow map, then cascades, then the static atlas for the
+map lights - is what this was for, and none of it is started.
+
 ---
 
 GkPlus is a modding framework with a JS layer, a VFS and a REPL; the renderer should join that

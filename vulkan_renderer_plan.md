@@ -211,6 +211,10 @@ and still forwards every call to d3d8to9 so the A/B stays available.
 | **The specular sum runs only over lights with `N·L > 0`** | ✅ §4.46 — the ledge that was "much redder in Vulkan". Bit-identical specular over all 104,693 lit pixels, and the whole frame at the fire camera drops **2.093 → 0.522 against a 0.521 cross-launch floor** |
 | **The viewport's RECTANGLE** — `D3DVIEWPORT8::X/Y/Width/Height`, per draw, as the Vulkan viewport *and* scissor | ✅ §4.47 — the upgrade screen that filled the window. 17.23 → **0.089** against the real D3D8 there, and the noise floor in level |
 | **A pre-transformed vertex's depth** — `clamp(z, MinZ, MaxZ)`, not the viewport transform | ✅ §4.45 — the flames that came and went with camera distance. Every screen-space draw sat `MinZ * (1 - z)` too far away; the flame's retention across a distance sweep goes from a 79% → 0.9% collapse to a flat ~92% |
+| **Runtime map lighting** — the level's own `STDLIGHT` rig, per pixel, replacing the bake | ✅ §4.53 (loader), §4.54 (the fitted model), §4.55 (the substitution) |
+| **Frame-uniform data in a buffer**, not in push constants | ✅ §4.57 — the block went 128 → **56** bytes, bit-identical on every static region. The prerequisite phase 4 could not start without |
+| **A world-space light grid**, built by the renderer's first compute pass | ✅ §4.56 — culled against brute force is **0.00000 MAD over 0 pixels**, and the grid is built once per level rather than once per frame |
+| **The light sum, per PIXEL** — the same equation, evaluated per fragment | ✅ §4.52 — 0.48/255 over 26.9% of level02, and `false` is bit-identical to the build before it on every static region |
 | **Lighting maps** — `<texture> lighting.dds` beside a `.RIM`, bump/metallic/roughness, loaded from a mod or the install | ✅ §4.48 — the first image this side creates and owns a bindless slot for, which is what §5's "a replacement texture the capture layer never saw" needed. 2.00/255 over 22% of level02 with a synthetic map, and off is bit-identical |
 
 Steady state on level01, in level, under validation:
@@ -440,6 +444,9 @@ level02 when starting fresh.
 | `GKPLUS_VK_TOPOLOGIES` | **On by default since §4.27.** The variable now selects a *subset*: `none`/`0` for none, `strip`/`line` to bisect the two, `all`/`1` (or unset) for both. Also settable at run time as `render.topologies`, which is what makes them A/B-able on one paused frame |
 | `render.specular` | run-time only, on by default: the specular term of that sum. **The mirror image of `GKPLUS_NO_SPECULAR`**, which reaches only the forwarded call — with only one side switchable, "we add specular the original does not" and "we add three times as much" are the same measurement (§4.46). Turn it off in both and the bases can be diffed directly |
 | `render.lighting` | run-time only, on by default: the real light sum, or the §4.20 material collapse the build before it used. **The way to measure lighting** — toggle it on a paused frame and the difference image is exactly what it paints, at a 0.00 noise floor (§4.26) |
+| `render.map_light_cull` | run-time only, **on** by default (§4.56): bin the map lights into a world-space grid instead of looping every one per fragment. **Off must be bit-identical** — a light's range is a hard cutoff, so the grid drops nothing that would have been added, and that A/B is the only thing that can catch a cell quietly missing a light. Measured at 0.00000 MAD over 0 pixels once the blinking "ACTIVE PAUSE" indicator is excluded — which is worth knowing about, because with it in frame the same comparison reads 0.017 against a 0.007 floor and looks like a real defect |
+| `render.map_lighting` | **not a diagnostic — a feature**, and **off by default on performance grounds** (§4.55): replace the level's baked per-vertex colour with a per-pixel evaluation of its own `.rif` light rig. The model is **fitted against the bake itself** (§4.54, r 0.87-0.96 on three of four levels), and its one free parameter is validated on screen — level04's difference from the bake minimises at exactly the fitted gain of 1.35. Applies to the **map geometry only**; `render.map_lighting_all` lifts that, and measures worse, because a prop carries its own file's bake. `render.map_light_gain` is the lever (default 1.2, the mean of the fitted values), `render.map_light_report` says what was loaded. **Judge it on level04 or level05, not level02**, whose 51 long-range lights fit at only r 0.37 |
+| `render.per_pixel_lighting` | **not a diagnostic — a feature**, and the first one that departs from the original on purpose (§4.52). On by default: D3D8's light sum evaluated per fragment rather than per vertex, same equation and same lights. `GKPLUS_VK_PER_PIXEL_LIGHTING=0` is the launch-time form, and `false` restores the fixed-function path **bit-identically**. Worth 0.48/255 over 26.9% of level02 — but judge it on the **difference image**, not that number: it concentrates on units and curved geometry and is zero on flat ground, which is exactly what Gouraud shading cannot represent |
 | `render.half_pixel` | run-time only, on by default: the D3D9 pixel-centre convention as a half-pixel viewport origin (§4.28). Off is the pre-§4.28 behaviour, and worth 1.34/255 over the whole frame |
 | `GKPLUS_VK_OFFSCREEN=0` / `render.offscreen` | on by default: rasterise the world at the **game's** backbuffer size into an offscreen target and blit it onto the swapchain, rather than drawing straight into the swapchain and letting the viewport scale every 2D draw (§4.37, §4.38). Off is the pre-§4.38 behaviour exactly, and worth **2.55/255 over 65% of the frame**. `render.vulkan_report` says which is running |
 | `render.present_linear` | run-time only, **off** by default: the filter for that final scale. NEAREST is a deduction, not a default — the original's own stretch preserves a 4-bit texture's sixteen distinct values, which a filtered downscale could not (§4.37) — and this is the A/B for it |
@@ -593,6 +600,19 @@ exactly like a renderer defect (§4.32).
 
 `find-draw.ps1` beside it binary-searches `render.draw_hide` for the draw that painted a given
 pixel.
+
+**Two builds cannot use the toggle, and on level02 a whole-frame cross-launch MAD has a floor of
+order 1** (§4.52). Two units idle-animate and nothing pins their phase, so the *same binary*
+compared against itself differs by **0.6712** when one shot went through `Shoot-Settled`'s
+`-Before` (which sleeps three extra seconds) and the other did not. §4.28's 0.094 was measured with
+the camera set explicitly and is not what `Wait-CameraRest` alone delivers. Two ways out, and use
+both: **match the `-Before` between the shots**, and **restrict to regions with no animating
+geometry** — where the same comparison reads 0.0000 over 0 pixels and answers the question
+outright.
+
+**Assert the draw count and the actor count, not just the camera.** A relaunch here landed the
+camera somewhere empty and produced **31.77 MAD against everything**, which reads as a catastrophic
+regression until you notice `draws: 20 this frame` in `render.draws`.
 
 **Stability is evidence about which defect you have, not whether you have one.** §4.22 needed a
 moving scene and vanished on a still one; §4.23 was perfectly stable — 60 consecutive menu

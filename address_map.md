@@ -388,7 +388,11 @@ hand-rolled (`SM_CXFRAME`x2 horizontally, `SM_CXFRAME`x2 + `SM_CYCAPTION` vertic
 | 0x005035b0 | FastCall<int, int, Role*, Vec3*, Vec4*> | ServerSpawnActorForTeam |
 | 0x004fce90 | FastCall<void*, int, Role*, Vec3*, Vec4*> | ClientSpawnActorForTeam |
 | 0x005aaac0 | FastCall<void, List*, void*, const char*> | RifFilterObjectsByName — **`__fastcall`**, ECX=out list *and* EDX=rif (read at 0x005aaac8), name on the stack. Was declared `ThisCall`, which put the rif on the stack and left EDX garbage |
-| 0x004ae960 | FastCall<void*, const char*, int> | LoadOrGetRifFile |
+| 0x004ae960 | FastCall<void*, const char*, int> | LoadOrGetRifFile(name /*ECX*/, reuse_cached_and_prefer_opt /*DL*/) — bare `RET`. **The one seam every rif load passes through**, which is why `src/MapLights` hooks it rather than `AcquireLevelRifForLocators`: `ToMap` reaches it directly on the cold path (flag **0**) and through Acquire on both warm ones. The flag does two things — reuse a cache hit, *and* prefer `<stem>.opt` when newer |
+| 0x004aead0 | CDecl<void> | RifCache_Clear — no arguments at all. `LoadOrGetRifFile` calls it **on every cache miss** before inserting, so the cache never holds more than one entry, and `LoadLevel` calls it again at 0x004e0e70 right after `ConvertParsedObjects`. **So the level's rif object is freed before the level is playable**, and nothing may retain the pointer `LoadOrGetRifFile` returns |
+| 0x005a9b50 | FastCall<void*, const char*> | BuildRifFileObject — builds the 0x210-byte `RifFile`. `+0x00` unit scale (`ENVSDSCL`/1000, default **0.001f**; only 2 of 563 shipped files carry one, both 1.0), `+0x04`/`+0x08` the `BMPNAMES` table and its count, `+0x0c` the `REBINFF2` root, `+0x10` a 128-slot `INDSOUND` table. **It carries no filename** — the root `File_Chunk` does, at `+0x2c`, but `File_Chunk_WriteFile` @ 0x005b03b0 overwrites that with whatever it last wrote, so after a cold load it reads `<stem>.loc` rather than the authored `.rif` |
+| 0x005aaa70 | FastCall<void, void*> | RifFile_Destroy — `free_sized(this, 0x210)` |
+| 0x007b4918 | HashTable\<RifCacheEntry*\> | RifFileCache — 64 buckets; `{RifFile*, char* name}` entries, `{d, next}` nodes. Effectively single-entry and empty at play time, per RifCache_Clear above, so it is **not** enumerable for "which rifs are loaded" |
 | 0x005aa5c0 | FastCall<void*, void*, char*, void*, void*, int> | RifFindObjectByName — **five** parameters, `RET 0xc`; the DB had three. The last, `merge_and_build`, gates the quad-merge pass and is 1 at only two of the eight call sites (`ToMap` @ 0x0047f926, `GetShape` @ 0x004ae6c4) |
 | 0x005ab300 | FastCall<void, void*, void*, void*, unsigned char> | BuildShapeVertexBuffers — arg2 is a nullable `SHPVTINT`; the `SHPMRGDT` block runs only when `flags & 1` and null-checks the lookup |
 | 0x005d7900 | FastCall<void, ChunkShape*, void*> | MergePolygonsInChunkShape — fuses triangle pairs into quads, replacing the shape's own poly/normal lists. Feeds the **navmesh**, never the renderer: the D3D buffers are built before the call and not rebuilt. **No bounds check anywhere, and AvP's planarity guard is absent**; see `rif_chunk_format.md`, "Merging polygons into quads" |
@@ -501,7 +505,7 @@ Full layout in `level_loading_notes.md`; the C++ mirror is `src/Map.cpp`, modell
 `Map : MapBase, RefCountedBase` (see the vtable convention above). Key fields:
 `lock` @ 0x04 (embedded RWLock), `sections`/`num_sections` @ 0x88/0x8c, the second
 base subobject's vptr/`refcount` @ 0xa4/0xa8, `adjacency_built` @ 0xac, `scene_object` @ 0xc8, `bitmap`
-@ 0xcc, `neg_origin` @ 0x11c, `bounds_min`/`bounds_max` @ 0x128/0x134,
+@ 0xcc, `neg_origin` @ 0x11c, `bounds_max`/`bounds_min` @ 0x128/0x134 (**the larger corner is first** - measured, see src/Map.h),
 `camera_focus_min`/`max` @ 0x140/0x14c, `.rif` FILETIME @ 0x158, `shadow_object_rif`/
 `_name` @ 0x160/0x164, `default_position` @ 0x168, `sky_object` @ 0x188.
 

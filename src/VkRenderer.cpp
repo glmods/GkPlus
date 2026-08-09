@@ -671,6 +671,11 @@ void DrawFrame() {
 
   RecordUploads(frame.cmd, FrameIndex);
 
+  // Outside any render pass, which is the whole reason it is here and not in RecordDraws: a
+  // compute dispatch inside vkCmdBeginRendering is invalid. Usually a no-op - the grid is rebuilt
+  // once per level, not once per frame.
+  BuildLightGrid(frame.cmd);
+
   // Where the world pass draws: the offscreen target when it is up, the swapchain image when it
   // is not. UNDEFINED as the source layout in either case, on purpose - neither image's previous
   // contents are ours to preserve, and saying so lets the driver skip a decompress.

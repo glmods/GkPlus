@@ -147,6 +147,8 @@ struct ResourceStats {
   uint64_t scratch_draws_peak = 0;
   uint64_t scratch_lights_peak = 0;
   uint64_t scratch_materials_peak = 0;
+  uint64_t scratch_map_lights_peak = 0;
+  uint64_t scratch_frames_peak = 0;
   // Allocations that did not fit in the frame's slice, so those draws were dropped. Must be 0;
   // if it ever is not, the slice is too small - the numbers to size it by are the two peaks.
   uint64_t scratch_exhausted = 0;
@@ -295,6 +297,8 @@ ScratchAlloc AllocateScratchIndices(uint32_t count, uint32_t stride);
 ScratchAlloc AllocateScratchDraws(uint32_t count);
 ScratchAlloc AllocateScratchLights(uint32_t count);
 ScratchAlloc AllocateScratchMaterials(uint32_t count);
+ScratchAlloc AllocateScratchMapLights(uint32_t count);
+ScratchAlloc AllocateScratchFrames(uint32_t count);
 
 // The scratch vertex buffer's shader-readable address, and the index scratch as a handle. The
 // address carries the current slice, so it is only valid for the scene now being recorded -
@@ -304,6 +308,27 @@ uint64_t ScratchIndexBuffer();
 uint64_t ScratchDrawAddress();
 uint64_t ScratchLightAddress();
 uint64_t ScratchMaterialAddress();
+uint64_t ScratchMapLightAddress();
+uint64_t ScratchFrameAddress();
+// The same slice as a bindable handle and a byte offset, for the one consumer that binds it as a
+// descriptor rather than reaching it by address - the light-grid compute pass, which writes and
+// therefore uses a plain storage binding. Handle as uint64_t for the reason above.
+uint64_t ScratchMapLightVkBuffer();
+uint64_t ScratchMapLightSliceOffset();
+
+// The light grid: two persistent device-local buffers, built once per level by a compute pass and
+// read by every fragment afterwards. They belong to neither the arenas (suballocated and staged
+// into) nor the scratch (which rotates every frame), which is why they are their own thing.
+//
+// Handles come back as `uint64_t` rather than `VkBuffer` for the reason the index scratch does:
+// this header names no Vulkan type, and a non-dispatchable handle is 64 bits even on x86 - typing
+// one as a pointer would truncate it (see the note above ScratchIndexBuffer).
+bool CreateLightGrid(uint64_t grid_bytes, uint64_t index_bytes);
+void DestroyLightGrid();
+uint64_t LightGridBuffer();
+uint64_t LightGridAddress();
+uint64_t LightIndexBuffer();
+uint64_t LightIndexAddress();
 
 // The host side of the same two slices, for reading back what a user-pointer draw was actually
 // given. Only the scratch has these: it is host-visible and mapped by design, where the arenas

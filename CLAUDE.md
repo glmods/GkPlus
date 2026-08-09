@@ -66,12 +66,20 @@ blender --background --python blender/tests/test_emitter_authoring.py -- ["<Gunl
 
 `test_scene.py` defaults to a sample rather than all 563 — pass `all` for the full run.
 
-The `rimutil` pair takes the built exe first:
+The `rimutil` pair takes the built exe first, and so does `riflights`:
 
 ```bash
 python utils/rimutil/tests/test_decode.py <rimutil.exe> "<Gunlok dir>"
 python utils/rimutil/tests/test_encode.py <rimutil.exe> ["<Gunlok dir>"]
+python utils/riflights/tests/test_lights.py <riflights.exe> "<Gunlok dir>"
 ```
+
+`test_lights.py` is the check on **`src/Rif`**, and it is the only test in this repo that
+exercises a `src/` file: `src/Rif` touches no game memory, so `utils/riflights` can drive it over
+all 563 shipped `.rif` files and compare against `blender/io_scene_rif`, which decodes the same
+format by a different route. 563 files, 38 with a light set, **3,794 lights, every field exact**.
+It asserts, so it is safe under any runner, and breaking one offset in `src/Rif.cpp` was confirmed
+to make it fail.
 
 `pbr/`'s five take no arguments and are run from `pbr/` (the install comes from `GUNLOK_DIR` or
 the Steam registry). **They are not pytest and must not be run under it** — each file's `test_*`
@@ -169,7 +177,7 @@ Overlay configuration in `vcpkg-configuration.json`.
 `Subsystems` holds only the **hook-installing** subsystems — `FileHookSystem`,
 `d3d8::D3D8CaptureSystem`, `MusicSystem`, `DebugSystem`, `GUISystem`, `InputFixSystem`,
 `VersionTextSystem`, `CustomMenuSystem`, `WindowPlacementSystem`, `ScriptQueueSystem`,
-`gls::GlsSystem`, `CustomLevelSystem`, `image::ImageCodecSystem`, `ScriptSystem`.
+`gls::GlsSystem`, `CustomLevelSystem`, `MapLightSystem`, `image::ImageCodecSystem`, `ScriptSystem`.
 `FileHookSystem` is deliberately **first**: it patches gl.exe's file imports, and assets
 loaded during `WinMain` (before any other hook can fire) have to pass through it for a mod
 to replace them. `D3D8CaptureSystem` is second, and before `GUISystem` for a reason: it wraps
@@ -422,6 +430,8 @@ reference. Test invocations are under "Running the test suites" above.
 |------|---------|
 | `src/Dds.h/cpp` | DDS parsing, and nothing else — pure, no game memory, harness-testable. Two families. **DXT1/DXT3** take the engine's S3TC path and must **stop their mip chain at 4x4**, which is not a style choice: the row loop decrements by 4 and exits on exactly zero, so a 2x2 level makes it run past the locked surface. **Uncompressed 24/32-bit** is the **only way to get true 24-bit colour into Gunlok** — every other route (DXT, an uncompressed `.RIM`, a 24bpp BMP) lands on a 4-bit-per-channel surface; it works by reporting `alpha_bits = 8` so the candidate walk rejects everything and falls through to the 32-bit descriptor, which needs `Use32BitTextures` (forced by `src/ImageCodec`). It has no 4x4 floor. Refuses **by name** anything the engine cannot render: DXT2/4/5, DX10-extension, cubemap, volume, and any pixel layout that would need a swizzle |
 | `src/ImageCodec.h/cpp` | The game-facing half: `EngineImage` (the engine's 24-slot image interface and its 0x30-byte base layout, `static_assert`ed field by field), a `DdsImage` that serves DXT blocks straight out of its own copy of the file, and `ImageCodecSystem`. **A registration, not a detour** — the image layer picks its decoder by magic bytes via `RegisterImageCodec` @ 0x005c8360, and nothing on the texture path reads a file extension, so `Ground\ground.dds` in a `BMPNAMES` entry just works. Registered from `FileHookSystem`'s **first intercepted open** rather than `DllMain` (the trie is built with `pool_alloc`, whose backing heap gl.exe's CRT has not initialised that early) and rather than a detour of its own (two subsystems detouring one target do not chain — see Conventions). That anchor is provably both late enough and early enough: the game only opens a file from `WinMain` onwards, and a file is always opened before its bytes can be sniffed. **Verified in the running game**, not just by inspection: a DXT1 `.dds` served in place of `Graphics\Bitmaps\Main Menu 01.RIM` renders. The whole contract — slots, base layout, the row-streaming loop, the 4x4 floor, the `RimLoadErrorCode` failure channel, and the `Seek(0)` a codec must issue before its first read — is in `file_io_notes.md` §4 |
+| `src/Rif.h/cpp` | Reading `.rif` chunk files: the `REBCRIF1` container (via `huffman/`), the tree walk, and `LIGHTSET`/`STDLIGHT`/`AMBIENCE` — **the light rig that baked each level's per-vertex colours, which the shipped engine loads and never reads** (`rif_chunk_format.md`). **Pure**: bytes in, records out, no game memory and no VFS, which makes it the only `src/` file with a test that runs without Gunlok — `utils/riflights` over all 563 shipped files against `blender/io_scene_rif`, 3,794 lights, every field exact |
+| `src/MapLights.h/cpp` | `MapLightSystem` — the game-facing half of the above: where the level's `.rif` is, what scale it is in, and when to reload. **It has to be a hook**, because neither the path nor the rif object survives the load: `LoadLevel` frees the rif right after `ConvertParsedObjects` and `Map` retains only the *shadow* object's rif name. So it detours `LoadOrGetRifFile` @ 0x004ae960 — the one seam all three of `ToMap`'s routes pass through — records the path and the unit scale, and parses lazily on the first read after a level change. Deriving the path from the `.gls` name instead was measured and **fails on 4 of 32 shipped levels** |
 | `src/Vfs.h/cpp` | The mod filesystem: mount, case-folded index, lookup, read, `Materialize`. Pure lookup — touches no game memory, so it is the half a harness can exercise. See "Mod loading" above |
 | `src/FileHooks.h/cpp` | `FileHookSystem` — the nine IAT patches and the two static-CRT detours that make the engine consult `src/Vfs`, plus the virtual-handle table and the `mods.served`/`mods.recent` diagnostics |
 | `src/Repl.h/cpp` | The loopback JavaScript REPL: `StartRepl` / `PumpRepl` / `StopRepl`, owned by `BootScriptHost` rather than by `Subsystems` (it installs no detour). Off unless `GKPLUS_REPL_PORT` is set. See "The REPL channel" above |

@@ -172,6 +172,22 @@ constexpr VkDeviceSize kSmallScratchLightBytes = 512u * sizeof(GpuLight);
 constexpr VkDeviceSize kScratchMaterialBytes = 8192u * sizeof(GpuMaterial);
 constexpr VkDeviceSize kSmallScratchMaterialBytes = 1024u * sizeof(GpuMaterial);
 
+// The level's own STDLIGHT rig (src/MapLights.h), refilled every frame. Sized to 4096 against
+// level15's 988, which is the largest shipped set; at 48 bytes that is 192 KB a slice.
+//
+// **Per-frame scratch rather than a buffer of its own, deliberately.** The set is static for a
+// whole level, so a device-local upload would be strictly better - and is exactly what phase 2's
+// culling needs anyway. Refilling it costs 33 KB of memcpy on the largest level and reuses
+// machinery whose fencing is already proven, which is the cheaper thing to be wrong about while
+// the shading is still being judged.
+constexpr VkDeviceSize kScratchMapLightBytes = 4096u * sizeof(GpuMapLight);
+constexpr VkDeviceSize kSmallScratchMapLightBytes = 1024u * sizeof(GpuMapLight);
+
+// One GpuFrameData per frame - so 64 is generous by a factor of 64, and it is 64 rather than 1
+// because a slice has to be big enough that the bump allocator's alignment cannot round a single
+// element past the end.
+constexpr VkDeviceSize kScratchFrameBytes = 64u * sizeof(GpuFrameData);
+
 struct Scratch {
   VkBuffer buffer = VK_NULL_HANDLE;
   VmaAllocation allocation = VK_NULL_HANDLE;
@@ -187,6 +203,8 @@ Scratch ScratchIndices;
 Scratch ScratchDraws;
 Scratch ScratchLights;
 Scratch ScratchMaterials;
+Scratch ScratchMapLights;
+Scratch ScratchFrames;
 // Which slice the scene now being recorded writes into. It belongs to the *scene*, not to a
 // frame in flight - see kScratchSlices.
 uint32_t ScratchSlice = 0;
@@ -812,6 +830,9 @@ bool StartResources() {
   const VkDeviceSize scratch_light = SmallHeaps ? kSmallScratchLightBytes : kScratchLightBytes;
   const VkDeviceSize scratch_material =
       SmallHeaps ? kSmallScratchMaterialBytes : kScratchMaterialBytes;
+  const VkDeviceSize scratch_map_light =
+      SmallHeaps ? kSmallScratchMapLightBytes : kScratchMapLightBytes;
+  const VkDeviceSize scratch_frame = kScratchFrameBytes;
 
   VmaVulkanFunctions functions = {};
   functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
@@ -847,6 +868,10 @@ bool StartResources() {
                      "light") ||
       !CreateScratch(ScratchMaterials, scratch_material, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                      "material") ||
+      !CreateScratch(ScratchMapLights, scratch_map_light, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     "map light") ||
+      !CreateScratch(ScratchFrames, scratch_frame, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     "frame data") ||
       !CreateBindlessSet()) {
     return false;
   }
@@ -1230,7 +1255,8 @@ void RotateFrameScratch() {
   }
   ScratchSlice = (ScratchSlice + 1) % kScratchSlices;
   for (Scratch *scratch :
-       {&ScratchVertices, &ScratchIndices, &ScratchDraws, &ScratchLights, &ScratchMaterials}) {
+       {&ScratchVertices, &ScratchIndices, &ScratchDraws, &ScratchLights, &ScratchMaterials,
+        &ScratchMapLights, &ScratchFrames}) {
     scratch->base = scratch->slice * ScratchSlice;
     scratch->head = 0;
   }
@@ -1241,7 +1267,8 @@ void ResetFrameScratch() {
     return;
   }
   for (Scratch *scratch :
-       {&ScratchVertices, &ScratchIndices, &ScratchDraws, &ScratchLights, &ScratchMaterials}) {
+       {&ScratchVertices, &ScratchIndices, &ScratchDraws, &ScratchLights, &ScratchMaterials,
+        &ScratchMapLights, &ScratchFrames}) {
     scratch->head = 0;
   }
 }
@@ -1305,6 +1332,16 @@ ScratchAlloc AllocateScratchLights(uint32_t count) {
                          TheStats.scratch_lights_peak);
 }
 
+ScratchAlloc AllocateScratchFrames(uint32_t count) {
+  return AllocateScratch(ScratchFrames, count, static_cast<uint32_t>(sizeof(GpuFrameData)),
+                         TheStats.scratch_frames_peak);
+}
+
+ScratchAlloc AllocateScratchMapLights(uint32_t count) {
+  return AllocateScratch(ScratchMapLights, count, static_cast<uint32_t>(sizeof(GpuMapLight)),
+                         TheStats.scratch_map_lights_peak);
+}
+
 ScratchAlloc AllocateScratchMaterials(uint32_t count) {
   return AllocateScratch(ScratchMaterials, count, static_cast<uint32_t>(sizeof(GpuMaterial)),
                          TheStats.scratch_materials_peak);
@@ -1327,6 +1364,84 @@ uint64_t ScratchDrawAddress() {
 uint64_t ScratchLightAddress() {
   return Ready ? ScratchLights.address + ScratchLights.base : 0;
 }
+
+namespace {
+VkBuffer LightGridVkBuffer = VK_NULL_HANDLE;
+VmaAllocation LightGridAllocation = VK_NULL_HANDLE;
+uint64_t LightGridDeviceAddress = 0;
+VkBuffer LightIndexVkBuffer = VK_NULL_HANDLE;
+VmaAllocation LightIndexAllocation = VK_NULL_HANDLE;
+uint64_t LightIndexDeviceAddress = 0;
+
+bool CreateOneStorageBuffer(uint64_t bytes, const char *what, VkBuffer *buffer,
+                            VmaAllocation *allocation, uint64_t *address) {
+  VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  info.size = bytes;
+  // TRANSFER_DST for the vkCmdFillBuffer that zeroes the allocator before each build.
+  info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+               VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  VmaAllocationCreateInfo alloc = {};
+  alloc.usage = VMA_MEMORY_USAGE_AUTO;
+  alloc.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+  if (vmaCreateBuffer(Allocator, &info, &alloc, buffer, allocation, nullptr) != VK_SUCCESS) {
+    return Fail(std::string("could not allocate the ") + what + " buffer");
+  }
+  VkBufferDeviceAddressInfo query = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+  query.buffer = *buffer;
+  *address = vkGetBufferDeviceAddress(GetDevice(), &query);
+  return true;
+}
+} // namespace
+
+bool CreateLightGrid(uint64_t grid_bytes, uint64_t index_bytes) {
+  if (!Ready) {
+    return false;
+  }
+  DestroyLightGrid();
+  if (!CreateOneStorageBuffer(grid_bytes, "light grid", &LightGridVkBuffer, &LightGridAllocation,
+                              &LightGridDeviceAddress) ||
+      !CreateOneStorageBuffer(index_bytes, "light index", &LightIndexVkBuffer,
+                              &LightIndexAllocation, &LightIndexDeviceAddress)) {
+    DestroyLightGrid();
+    return false;
+  }
+  return true;
+}
+
+void DestroyLightGrid() {
+  if (LightGridVkBuffer != VK_NULL_HANDLE) {
+    vmaDestroyBuffer(Allocator, LightGridVkBuffer, LightGridAllocation);
+    LightGridVkBuffer = VK_NULL_HANDLE;
+    LightGridAllocation = VK_NULL_HANDLE;
+    LightGridDeviceAddress = 0;
+  }
+  if (LightIndexVkBuffer != VK_NULL_HANDLE) {
+    vmaDestroyBuffer(Allocator, LightIndexVkBuffer, LightIndexAllocation);
+    LightIndexVkBuffer = VK_NULL_HANDLE;
+    LightIndexAllocation = VK_NULL_HANDLE;
+    LightIndexDeviceAddress = 0;
+  }
+}
+
+uint64_t LightGridBuffer() { return reinterpret_cast<uint64_t>(LightGridVkBuffer); }
+uint64_t LightGridAddress() { return LightGridDeviceAddress; }
+uint64_t LightIndexBuffer() { return reinterpret_cast<uint64_t>(LightIndexVkBuffer); }
+uint64_t LightIndexAddress() { return LightIndexDeviceAddress; }
+
+uint64_t ScratchMapLightAddress() {
+  return Ready ? ScratchMapLights.address + ScratchMapLights.base : 0;
+}
+
+uint64_t ScratchFrameAddress() {
+  return Ready ? ScratchFrames.address + ScratchFrames.base : 0;
+}
+
+uint64_t ScratchMapLightVkBuffer() {
+  return Ready ? reinterpret_cast<uint64_t>(ScratchMapLights.buffer) : 0;
+}
+
+uint64_t ScratchMapLightSliceOffset() { return Ready ? ScratchMapLights.base : 0; }
 
 uint64_t ScratchMaterialAddress() {
   return Ready ? ScratchMaterials.address + ScratchMaterials.base : 0;
@@ -2071,7 +2186,8 @@ void ShutdownResources() {
     Ring = Staging();
   }
   for (Scratch *scratch :
-       {&ScratchVertices, &ScratchIndices, &ScratchDraws, &ScratchLights, &ScratchMaterials}) {
+       {&ScratchVertices, &ScratchIndices, &ScratchDraws, &ScratchLights, &ScratchMaterials,
+        &ScratchMapLights, &ScratchFrames}) {
     if (scratch->buffer != VK_NULL_HANDLE) {
       vmaDestroyBuffer(Allocator, scratch->buffer, scratch->allocation);
       *scratch = Scratch();

@@ -482,8 +482,15 @@ std::vector<CustomLevelLocator> LevelRifLocators(const char *object_name) {
   }
 
   // The same pair ToMap's warm path uses. AcquireLevelRifForLocators probes the
-  // .loc sidecar next to the rif and returns the loaded rif either way; the rif
-  // is already in the cache by now, so this is a lookup, not a load.
+  // .loc sidecar next to the rif and returns the loaded rif either way.
+  //
+  // **This is a full disk LOAD, not a lookup**, which an earlier revision of this
+  // comment had backwards in both halves. `LoadLevel` calls RifCache_Clear @
+  // 0x004aead0 immediately after ConvertParsedObjects (@ 0x004e0e70), so by the
+  // time anything here runs the cache is empty and the level's rif is freed; and
+  // the .loc branch passes flag 0, which flushes the cache and re-reads even on a
+  // hit. So each call re-reads the file and frees whatever rif was held before -
+  // which is also why nothing may retain the pointer this returns.
   FastCall<void *, const char *> acquire_rif;
   GetObjectAtOffset(acquire_rif, 0x00483da0);
   void *rif = acquire_rif(level->map.rif_file.c_str());

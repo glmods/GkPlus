@@ -22,7 +22,7 @@ Plus four **derived cache/sidecar files**, all optional and all regenerated when
 | `<ScriptFileName>.cut` | `ToMap` | baked mesh (`level01.cut`, `prison.cut`, ...) |
 | `<ScriptFileName>.map` | `LoadOrBuildSectionAdjacency` | per-section adjacency graph |
 | `<ScriptFileName>.shd` | `BakeStaticShadows` @ 0x005542c0 | baked static shadows, see below |
-| `<level rif>.opt` / `.loc` | shipped with the rif | optimisation data / locators |
+| `<level rif>.opt` / `.loc` | **`ToMap`'s cold path**, via two `File_Chunk_WriteFile` calls @ 0x0047ff56 and 0x0048039e | optimisation data / locators. **Generated, not shipped** — only 25 exist beside 563 `.rif`, they share one mtime distinct from the `.rif`s, and `custom_rif.loc`/`.opt` exist with no `custom_rif.rif` at all. Both carry the file's whole `LIGHTSET`, verified over all 24 shipped level pairs |
 
 ### The `_shadow` rifs and the `.shd` cache
 
@@ -426,8 +426,8 @@ directly, only virtually.
 | 0x0fc | list header | |
 | 0x10c | list header | |
 | 0x11c | `neg_origin` | **negated** map origin (Vec3) |
-| 0x128 | `bounds_min` | world bounds; `LoadLevel` reads the pair adjacently |
-| 0x134 | `bounds_max` | |
+| 0x128 | `bounds_max` | world bounds; `LoadLevel` reads the pair adjacently. **The larger corner is first** - every component of 0x128 exceeds 0x134 on both level01 and level02, and the level's own `STDLIGHT` positions bracket correctly inside the pair only when read this way. These were named the other way round until then |
+| 0x134 | `bounds_min` | |
 | 0x140 | `camera_focus_min` | y (0x144) -> `MinCameraFocusHeight` |
 | 0x14c | `camera_focus_max` | y (0x150) -> `MaxCameraFocusHeight` |
 | 0x158 | `rif_time_low/high` | FILETIME of the level `.rif` |
@@ -510,7 +510,10 @@ MapCameraPlane.normal = Mat3Transform(rotation,    shape->pnorms[0])
 where `placement` is `OBJHEAD1`'s quaternion (`obj+0x50..0x5c`) plus its `int32` location
 (`obj+0x44..0x4c`) scaled by the rif unit scale and offset by `Map->neg_origin` — the same
 placement rule as a spawned object. Fallback (0x00481358):
-`point = (0, 1.5*bounds_max.y - 0.5*bounds_min.y, 0)`, `normal = (0,1,0)`.
+`point = (0, 1.5*bounds_min.y - 0.5*bounds_max.y, 0)`, `normal = (0,1,0)` — i.e. `1.5 * [0x134].y
+- 0.5 * [0x128].y`. **Written the other way round here until the two fields were found to be
+named backwards** (see the offset table above); the offsets are what this says, and only the
+names moved.
 `FUN_004af4d0` (called from `WinMain` and early in `LoadLevel`) presets
 `point = normal = (0,0,1)`.
 

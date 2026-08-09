@@ -54,6 +54,9 @@ OUTPUT = ROOT / "src" / "Shaders.gen.inc.h"
 ENTRY_POINTS = [
     ("world.slang", "vertex_main", "vertex"),
     ("world.slang", "fragment_main", "fragment"),
+    # The first compute entry point here. The `stage` string goes straight to `slangc -stage`, so
+    # this list is all it took - nothing else in this script is stage-aware.
+    ("lightgrid.slang", "build_grid", "compute"),
 ]
 
 SLANGC_ARGS = [

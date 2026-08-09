@@ -314,7 +314,7 @@ at 0x48 and the two `pad` words at 0x4c.
 | 0x38   | 4    | int32     | `spread`            | 67 distinct values, 79 .. 2044; **1000 in 2,955 of 3,794** |
 | 0x3c   | 4    | int32     | `range`             | Rif units, 3,000 .. 357,300  |
 | 0x40   | 4    | uint32    | `colour`            | `0x00RRGGBB`                 |
-| 0x44   | 4    | int32     | `engine_light_flags`| Only ever 3 (1,915) or 7 (1,879) |
+| 0x44   | 4    | int32     | `engine_light_flags`| Only ever 3 (1,915) or 7 (1,879) — **decoded below** |
 | 0x48   | 4    | int32     | `local_light_flags` | Always 1                     |
 | 0x4c   | 8    | int32[2]  | `pad1`, `pad2`      | Always zero                  |
 
@@ -323,6 +323,59 @@ The two load-bearing claims are measured: the nine dwords at 0x10 form an
 (rows unit length and mutually perpendicular to within 2e-3), and every value of the
 0x40 field is `<= 0xFFFFFF` across its 320 distinct values, with the palette reading
 as light colours (`#FFFFFF`, `#FFFFBF`, `#FFFF57`, `#FF6600`).
+
+**The two flag values decode against AvP's own header** (`3dc/include/prototyp.h:792`),
+and they are a real distinction rather than a constant:
+
+| bit | AvP name | meaning |
+|-----|----------|---------|
+| 0x01 | `LFlag_CosAtten` | cosine attenuation |
+| 0x02 | `LFlag_CosSpreadAtten` | cosine **spread** attenuation |
+| 0x04 | `LFlag_Omni` | omnidirectional |
+
+So **3 = attenuated with a spread** (1,915 lights) and **7 = the same plus omni**
+(1,879).
+
+The orientation is authored on **both** kinds — non-identity in 401/401 of level01's
+flag-3 lights and 262/285 of its flag-7 ones — which looks like it contradicts the
+flags. It does not: the editor writes a full transform either way and the *flag* is
+what says whether anything uses it.
+
+**Fitted against `SHPVTINT`, which is the only ground truth there is**
+(`utils/riflights/fit_bake.py`), and it confirms the flag reading exactly:
+
+| term | level05 | level04 | level01 |
+|---|---|---|---|
+| distance only | 0.360 | 0.506 | 0.399 |
+| + `max(0, N·L)` | 0.838 | 0.831 | 0.720 |
+| + cone on **every** light | 0.923 | **0.640** | 0.809 |
+| + cone, **omni exempt** | **0.957** | **0.926** | **0.875** |
+
+(Pearson r against baked luminance.) Level04 getting *worse* when the cone is applied to
+its omni lights and then better than ever when they are exempted is what settles
+`LFlag_Omni` as a real switch rather than a name in AvP's header.
+
+Three things fall out, all measured:
+
+- **The light's axis is row 2 of the orientation** (elements 6..8). Rows 0 and 1 both make
+  the fit worse, and *negating* row 2 collapses it — r 0.02 on level05, 0.17 on level01 —
+  which is what identifies an axis rather than a coincidence.
+- **`spread` does not shape the bake.** As a cone exponent it makes the fit worse on every
+  level tried (level01 0.723 → 0.646). It is authored, and nothing here reads it.
+- **The distance falloff is linear in `range`**, beating both a raised cosine and an
+  inverse square on all four levels.
+
+`AMBIENCE` enters as a floor, per AvP's clamp. The whole fitted model and its residuals are
+in `vulkan_renderer_notes.md` §4.54.
+
+**AvP's own consumer reads neither of them.** `setup_light_data` @
+`avp/win95/Objsetup.cpp:3362` fills a `LIGHTBLOCK` from a `Light_Chunk` and touches
+`location` (scaled by `local_scale`, no swizzle), `brightness` (kept as the raw 16.16
+int), `colour` (`((c>>16)&255)*257` per channel, which confirms `0x00RRGGBB`), `range`
+(likewise scaled), and the two flag words — **and nothing else**. `orientation` and
+`spread` are never read, and it forces `LFlag_CosAtten` on regardless of the file. That
+is one engine's answer, not necessarily the authoring tool's; it does say the fields a
+consumer needs are position, brightness, colour and range.
 
 #### `LIGHTSET` - Light Set (0x005d2a00) and `LTSETHDR` (0x005d2ab0)
 
@@ -1370,17 +1423,25 @@ TAB-separated file whose non-indented lines name a cutscene and whose indented l
 
 ## Chunk Class Hierarchy
 
+Measured from `Chunk::Chunk` @ 0x005d4980 and cross-checked against AvP's
+`win95/Chunk.hpp` and the allocation sizes (`Light_Set_Chunk` 0x2c, `File_Chunk`
+0x3c, `Light_Chunk` 0x80). An earlier revision of this block had `Chunk` at 0x24
+with `error_code`, `identifier_store`, `identifier`, `parent`, `next` and
+`previous` all at the wrong offsets, and called `children` a list; it is a plain
+head pointer and siblings chain through `next`.
+
 ```
-Chunk (base, 0x24 bytes)
+Chunk (base, 0x28 bytes)
   vtable @ 0x00
-  error_code @ 0x04
-  identifier_store[9] @ 0x08
-  identifier* @ 0x14
-  parent* @ 0x18
-  next* @ 0x1C
-  previous* @ 0x20
+  identifier* @ 0x04
+  error_code @ 0x08
+  next* @ 0x0C
+  previous* @ 0x10
+  identifier_store[9] @ 0x14
+  chunk_size @ 0x20
+  parent* @ 0x24
   |
-  +-- Chunk_With_Children (adds children list @ 0x28)
+  +-- Chunk_With_Children (0x2c; adds `children`, a head POINTER, @ 0x28)
   |     |
   |     +-- File_Chunk (REBINFF2) - adds filename, object_array, compression handling
   |     +-- Shape_Chunk (REBSHAPE) - adds shape-specific data @ 0x8C

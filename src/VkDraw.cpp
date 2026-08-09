@@ -14,10 +14,14 @@
 #include <vector>
 
 #include "Core.h"
+#include "Map.h"
+#include "MapLights.h"
 #include "Shaders.gen.inc.h"
 #include "VkContext.h"
 #include "VkInternal.h"
 #include "VertexFormat.h"
+#include "Map.h"
+#include "MapLights.h"
 #include "VkLighting.h"
 #include "VkResources.h"
 
@@ -45,35 +49,24 @@ struct PushConstants {
   uint64_t draws;
   uint64_t lights;
   uint64_t materials;
-  uint32_t record;
-  uint32_t material;
-  uint32_t base_vertex;
-  // The LOD probe (§4.34). Negative means "sample normally"; anything else makes every texture
-  // fetch an explicit-LOD one at that level. It occupied what was tail padding when it was added,
-  // so it cost nothing then.
-  float force_lod;
-  // The lighting-map knobs (src/VkLighting.h). They are push constants rather than part of
-  // GpuMaterial because they are the same for every draw in a frame: putting them in the material
-  // would grow the table for nothing and make a tweak from the REPL a re-intern of every surface
-  // instead of twenty-four bytes of a push.
-  float bump_scale;
-  float bump_diffuse;
-  float specular_scale;
-  float gloss_min;
-  float gloss_max;
-  float specular_from_diffuse;
-  // The chrome pass's three, same reasoning. `chrome_texgen` is a float carrying 0 or 1 rather
-  // than a uint, so the whole knob block stays one type and the Slang struct needs no second
-  // layout rule for a single word.
-  float chrome_scale;
-  float chrome_blur;
-  float chrome_texgen;
+  // Everything that is the same for every draw this frame (GpuFrameData in VkDraw.h). It is one
+  // address here rather than forty bytes of knobs, which is what took this block from exactly
+  // Vulkan's guaranteed 128 down to 56 - see the note below.
+  uint64_t frame;
+  uint32_t record;      // this draw's entry in `draws`
+  uint32_t material;    // ... and in `materials`, shared with every draw of the same surface
+  uint32_t base_vertex; // where this draw's buffer starts, in canonical vertices
+  uint32_t pad0;
 };
-// 88 bytes of a guaranteed 128: 84 of members, then 4 the four addresses' 8-byte alignment rounds
-// up to. The padding is C++'s alone - Slang's Push ends at 84 - and that is harmless in the one
-// direction it goes: vkCmdPushConstants writes 88 bytes into a 128-byte range and the shader reads
-// the first 84. Every member's OFFSET agrees, which is the part that has to.
-static_assert(sizeof(PushConstants) == 88);
+// **56 bytes of a guaranteed 128**, and the four fields that are not addresses are the only
+// genuinely per-draw values there are. It reached exactly 128 with the light grid (§4.56), which
+// is where the next feature would have had to displace something - a 64-byte shadow matrix does
+// not fit in nothing. The frame-uniform data moved into a buffer instead, which is what §4.56's
+// own note said should happen once there were more than a couple of knobs.
+//
+// The four hot addresses stay: the vertex shader reaches `vertices` before it has read anything
+// at all, and putting it behind `frame` would make that a dependent load on every vertex.
+static_assert(sizeof(PushConstants) == 56);
 
 constexpr uint32_t kMaxDrawsPerFrame = 8192;
 
@@ -492,6 +485,138 @@ bool CreatePipelineLayout() {
   return true;
 }
 
+// --- the light grid ---------------------------------------------------------------------------
+//
+// One compute dispatch per LEVEL, not per frame: the map's lights are static in world space, so
+// the grid they bin into is too. See the header of src/shaders/lightgrid.slang for why this is a
+// world-space grid rather than the view-space cluster grid a screen-tiled renderer would use.
+
+// 32 x 16 x 32 over the map's own bounds. The y axis gets half the resolution because a level is
+// far flatter than it is wide - level01 spans 98 x 58 x 237 world units - so equal counts would
+// make the vertical cells much thinner than they need to be.
+constexpr uint32_t kGridX = 32;
+constexpr uint32_t kGridY = 16;
+constexpr uint32_t kGridZ = 32;
+constexpr uint32_t kGridCells = kGridX * kGridY * kGridZ;
+// [0] allocator, [1..3] dims, [4..6] grid origin, [7..9] cell size, [10..11] pad. 12 words keeps
+// the cells 16-byte aligned and carries what the FRAGMENT shader needs - which is why it is not
+// just the allocator: those three vectors would otherwise be 48 bytes of push constant the block
+// does not have.
+constexpr uint32_t kGridHeaderWords = 12;
+// 512K entries. level01's 686 lights against 16,384 cells would have to average 32 lights a cell
+// to exhaust it, where the measured mean is far lower - and the shader drops a whole cell rather
+// than half-filling one if it ever does, so exhaustion is visible instead of plausible.
+constexpr uint32_t kGridIndexCapacity = 512u * 1024u;
+
+// Must match GridPush in src/shaders/lightgrid.slang.
+struct LightGridPush {
+  float grid_min[4];
+  float cell_size[4];
+  uint32_t dims[4]; // xyz cells, w = light count
+  uint32_t index_capacity;
+  uint32_t pad0;
+  uint32_t pad1;
+  uint32_t pad2;
+};
+static_assert(sizeof(LightGridPush) == 64);
+
+VkDescriptorSetLayout GridSetLayout = VK_NULL_HANDLE;
+VkDescriptorPool GridPool = VK_NULL_HANDLE;
+VkDescriptorSet GridSet = VK_NULL_HANDLE;
+VkPipelineLayout GridLayout = VK_NULL_HANDLE;
+VkPipeline GridPipeline = VK_NULL_HANDLE;
+VkShaderModule GridModule = VK_NULL_HANDLE;
+
+bool CreateLightGridPipeline() {
+  GridModule = CreateModule(kBuildGridSpv, sizeof(kBuildGridSpv));
+  if (GridModule == VK_NULL_HANDLE) {
+    return Fail("could not create the light grid shader module");
+  }
+  // Three plain storage buffers, bound rather than reached by address. The graphics side reads
+  // the same two by device address, which is the shape the bindless set forces on it - but a
+  // compute shader that WRITES is the one place a binding is simpler than arguing about pointer
+  // semantics, and this layout is its own, so it costs the graphics path nothing.
+  VkDescriptorSetLayoutBinding bindings[3] = {};
+  for (uint32_t i = 0; i < 3; ++i) {
+    bindings[i].binding = i;
+    bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[i].descriptorCount = 1;
+    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  }
+  VkDescriptorSetLayoutCreateInfo set_info = {
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  set_info.bindingCount = 3;
+  set_info.pBindings = bindings;
+  if (vkCreateDescriptorSetLayout(GetDevice(), &set_info, nullptr, &GridSetLayout) !=
+      VK_SUCCESS) {
+    return Fail("could not create the light grid set layout");
+  }
+
+  VkDescriptorPoolSize size = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+  VkDescriptorPoolCreateInfo pool = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  pool.maxSets = 1;
+  pool.poolSizeCount = 1;
+  pool.pPoolSizes = &size;
+  if (vkCreateDescriptorPool(GetDevice(), &pool, nullptr, &GridPool) != VK_SUCCESS) {
+    return Fail("could not create the light grid descriptor pool");
+  }
+  VkDescriptorSetAllocateInfo allocate = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  allocate.descriptorPool = GridPool;
+  allocate.descriptorSetCount = 1;
+  allocate.pSetLayouts = &GridSetLayout;
+  if (vkAllocateDescriptorSets(GetDevice(), &allocate, &GridSet) != VK_SUCCESS) {
+    return Fail("could not allocate the light grid descriptor set");
+  }
+
+  VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(LightGridPush)};
+  VkPipelineLayoutCreateInfo layout = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  layout.setLayoutCount = 1;
+  layout.pSetLayouts = &GridSetLayout;
+  layout.pushConstantRangeCount = 1;
+  layout.pPushConstantRanges = &range;
+  if (vkCreatePipelineLayout(GetDevice(), &layout, nullptr, &GridLayout) != VK_SUCCESS) {
+    return Fail("could not create the light grid pipeline layout");
+  }
+
+  VkComputePipelineCreateInfo info = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  info.stage.module = GridModule;
+  info.stage.pName = "build_grid";
+  info.layout = GridLayout;
+  if (vkCreateComputePipelines(GetDevice(), VK_NULL_HANDLE, 1, &info, nullptr, &GridPipeline) !=
+      VK_SUCCESS) {
+    return Fail("could not create the light grid pipeline");
+  }
+  return CreateLightGrid((kGridHeaderWords + 2u * kGridCells) * sizeof(uint32_t),
+                         kGridIndexCapacity * sizeof(uint32_t));
+}
+
+void DestroyLightGridPipeline() {
+  DestroyLightGrid();
+  if (GridPipeline != VK_NULL_HANDLE) {
+    vkDestroyPipeline(GetDevice(), GridPipeline, nullptr);
+    GridPipeline = VK_NULL_HANDLE;
+  }
+  if (GridLayout != VK_NULL_HANDLE) {
+    vkDestroyPipelineLayout(GetDevice(), GridLayout, nullptr);
+    GridLayout = VK_NULL_HANDLE;
+  }
+  if (GridPool != VK_NULL_HANDLE) {
+    vkDestroyDescriptorPool(GetDevice(), GridPool, nullptr);
+    GridPool = VK_NULL_HANDLE;
+    GridSet = VK_NULL_HANDLE;
+  }
+  if (GridSetLayout != VK_NULL_HANDLE) {
+    vkDestroyDescriptorSetLayout(GetDevice(), GridSetLayout, nullptr);
+    GridSetLayout = VK_NULL_HANDLE;
+  }
+  if (GridModule != VK_NULL_HANDLE) {
+    vkDestroyShaderModule(GetDevice(), GridModule, nullptr);
+    GridModule = VK_NULL_HANDLE;
+  }
+}
+
 } // namespace
 
 static_assert(std::has_unique_object_representations_v<PipelineState>,
@@ -524,6 +649,54 @@ std::map<GpuMaterial, uint32_t> InternedMaterials;
 
 // See SetShadeMode in VkDraw.h. Default on: it is a state the game sets, not a feature.
 bool ShadeModeEnabled = true;
+
+// See SetPerPixelLighting in VkDraw.h. On by default, and `GKPLUS_VK_PER_PIXEL_LIGHTING=0` is the
+// launch-time override - read once, lazily, because DllMain is far too early to be asking the
+// environment anything and this is first needed at the first draw.
+bool PerPixelLightingWanted = true;
+bool PerPixelLightingRead = false;
+
+// See SetMapLighting in VkDraw.h. Off by default because it is brute force over the whole level's
+// light set per pixel until phase 2's culling exists.
+bool MapLightingEnabled = false;
+bool MapLightingAllEnabled = false;
+// The mean of the fitted gains on the three levels where the model actually holds - 0.9 on
+// level01, 1.35 on level04 and level05. Not an identity, and not a taste: on level04 the
+// on-screen difference from the bake minimises at exactly 1.35, which is where the offline fit
+// put it (§4.55).
+float MapLightGainValue = 1.2f;
+// Refilled once a frame in RecordDraws, before any draw is recorded.
+uint64_t FrameMapLightAddress = 0;
+uint32_t FrameMapLightCount = 0;
+float FrameMapAmbience = 0.0f;
+// What the grid was last built for. The light set is identified by its address and count, which
+// change together whenever MapLights() reloads - so a level change rebuilds and nothing else does.
+uint64_t GridBuiltForAddress = 0;
+uint64_t FrameMapLightByteOffset = 0;
+// Where this frame's GpuFrameData sits. Written once at the top of RecordDraws.
+uint64_t FrameDataAddress = 0;
+uint32_t GridBuiltForCount = 0;
+bool GridBuiltForCullOn = false;
+float GridMin[3] = {};
+float GridCell[3] = {};
+bool GridValid = false;
+// See SetMapLightCull in VkDraw.h. On by default: without it the fragment loops every light in
+// the level, which is what phase 3b had to do and why it could not be on by default.
+bool MapLightCullEnabled = true;
+
+bool PerPixelLightingEnabled() {
+  if (!PerPixelLightingRead) {
+    PerPixelLightingRead = true;
+    char value[16] = {};
+    const DWORD len =
+        ::GetEnvironmentVariableA("GKPLUS_VK_PER_PIXEL_LIGHTING", value, sizeof(value));
+    if (len > 0 && len < sizeof(value)) {
+      const std::string text(value, len);
+      PerPixelLightingWanted = !(text == "0" || text == "off" || text == "no");
+    }
+  }
+  return PerPixelLightingWanted;
+}
 
 // See SetForceLod in VkDraw.h. Off by default and not a state the game has - purely the probe.
 float ForcedLod = -1.0f;
@@ -828,6 +1001,13 @@ bool StartDraw(uint32_t width, uint32_t height, uint32_t colour_format) {
   if (!ChooseDepthFormat() || !CreateDepth(width, height) || !CreatePipelineLayout()) {
     return false;
   }
+  // Not fatal: without it the fragment loops every light in the level, which is exactly what
+  // phase 3b did and is still a correct picture. A device that cannot build a compute pipeline
+  // should lose the optimisation, not the renderer.
+  if (!CreateLightGridPipeline()) {
+    DebugWrite("gkplus: light grid unavailable, map lighting will not be culled\n");
+    DestroyLightGridPipeline();
+  }
   Items.reserve(kMaxDrawsPerFrame);
   Ready = true;
   TheStats.ready = true;
@@ -902,6 +1082,246 @@ std::string DescribeWatchedVertices() {
 void SetForceLod(float lod) { ForcedLod = lod; }
 
 float ForceLod() { return ForcedLod; }
+
+void SetPerPixelLighting(bool enabled) {
+  // Marks the env as read, so a REPL write is not undone by the first draw that asks.
+  PerPixelLightingRead = true;
+  PerPixelLightingWanted = enabled;
+}
+
+bool PerPixelLighting() { return PerPixelLightingEnabled(); }
+
+namespace {
+// Copy the level's light rig into this frame's scratch slice, premultiplied.
+//
+// Called once at the top of RecordDraws, **after** the addresses above are read and before any
+// draw is recorded, so the address it publishes belongs to the same slice every draw this frame
+// will pull from. Doing it per draw would be the same bytes many times over; doing it after
+// RotateFrameScratch would publish the next scene's slice.
+void UploadMapLights() {
+  FrameMapLightAddress = 0;
+  FrameMapLightCount = 0;
+  FrameMapAmbience = 0.0f;
+  if (!MapLightingEnabled) {
+    return; // costs nothing at all when off, which is what makes the A/B honest
+  }
+  const std::vector<MapLight> &lights = MapLights();
+  if (lights.empty()) {
+    return;
+  }
+  const ScratchAlloc alloc = AllocateScratchMapLights(static_cast<uint32_t>(lights.size()));
+  if (!alloc.valid || alloc.mapped == nullptr) {
+    return; // the slice is full; the frame draws without map lighting rather than half of it
+  }
+  auto *out = static_cast<GpuMapLight *>(alloc.mapped);
+  for (size_t i = 0; i < lights.size(); ++i) {
+    const MapLight &light = lights[i];
+    GpuMapLight &gpu = out[i];
+    gpu.position[0] = light.position.x;
+    gpu.position[1] = light.position.y;
+    gpu.position[2] = light.position.z;
+    gpu.position[3] = light.range;
+    // Premultiplied here so the shader's inner loop is a multiply-add and nothing else.
+    for (int c = 0; c < 3; ++c) {
+      gpu.colour[c] = light.colour[c] * light.brightness;
+    }
+    gpu.colour[3] = static_cast<float>(light.flags);
+    // Row 2 of the orientation - elements 6..8. §4.54 is why this row and not another.
+    gpu.axis[0] = light.orientation[6];
+    gpu.axis[1] = light.orientation[7];
+    gpu.axis[2] = light.orientation[8];
+    gpu.axis[3] = 0.0f;
+  }
+  FrameMapLightAddress = ScratchMapLightAddress() + alloc.offset * sizeof(GpuMapLight);
+  FrameMapLightByteOffset = ScratchMapLightSliceOffset() + alloc.offset * sizeof(GpuMapLight);
+  FrameMapLightCount = static_cast<uint32_t>(lights.size());
+  FrameMapAmbience = MapAmbience();
+}
+} // namespace
+
+// One GpuFrameData for this frame, written after the lights are uploaded (so the addresses are
+// this frame's) and before any draw is recorded (so every draw's push points at the same block).
+void UploadFrameData() {
+  FrameDataAddress = 0;
+  const ScratchAlloc alloc = AllocateScratchFrames(1);
+  if (!alloc.valid || alloc.mapped == nullptr) {
+    return; // every draw then pushes address 0, and the shader's null check draws unlit
+  }
+  auto *frame = static_cast<GpuFrameData *>(alloc.mapped);
+  *frame = GpuFrameData{};
+  frame->map_lights = FrameMapLightAddress;
+  frame->light_grid = LightGridAddress();
+  frame->light_indices = LightIndexAddress();
+  frame->force_lod = ForcedLod;
+  const LightingMapParams &lighting = LightingParams();
+  frame->bump_scale = lighting.bump_scale;
+  frame->bump_diffuse = lighting.bump_diffuse;
+  frame->specular_scale = lighting.specular_scale;
+  frame->gloss_min = lighting.gloss_min;
+  frame->gloss_max = lighting.gloss_max;
+  frame->specular_from_diffuse = lighting.specular_from_diffuse;
+  frame->chrome_scale = lighting.chrome_scale;
+  frame->chrome_blur = lighting.chrome_blur;
+  frame->chrome_texgen = lighting.chrome_texgen ? 1.0f : 0.0f;
+  frame->per_pixel_lighting = PerPixelLightingEnabled() ? 1.0f : 0.0f;
+  frame->map_light_gain = MapLightGainValue;
+  frame->map_ambience = FrameMapAmbience;
+  frame->map_light_count = FrameMapLightCount;
+  frame->map_flags = 0;
+  if (MapLightingEnabled && FrameMapLightCount > 0) {
+    frame->map_flags |= 1u;
+  }
+  if (MapLightingAllEnabled) {
+    frame->map_flags |= 2u;
+  }
+  // Gated on the buffers existing as well as the build having run, so a device that could not
+  // create the compute pipeline lands on the every-light fallback rather than on a null address.
+  if (GridValid && frame->light_grid != 0 && frame->light_indices != 0) {
+    frame->map_flags |= 4u;
+  }
+  FrameDataAddress = ScratchFrameAddress() + alloc.offset * sizeof(GpuFrameData);
+}
+
+void BuildLightGrid(void *command_buffer) {
+  auto cmd = static_cast<VkCommandBuffer>(command_buffer);
+  if (!Ready || GridPipeline == VK_NULL_HANDLE || cmd == VK_NULL_HANDLE) {
+    return;
+  }
+  // UploadMapLights runs at the top of RecordDraws, which is AFTER this - so the addresses it
+  // publishes belong to the previous frame at this point. That is exactly what is wanted: the
+  // scratch holds the same lights every frame, and rebuilding against last frame's copy of an
+  // unchanged set is the same work as rebuilding against this frame's.
+  const bool want = MapLightingEnabled && MapLightCullEnabled && FrameMapLightCount > 0 &&
+                    FrameMapLightAddress != 0;
+  if (!want) {
+    GridValid = false;
+    GridBuiltForAddress = 0;
+    return;
+  }
+  if (GridValid && GridBuiltForCount == FrameMapLightCount &&
+      GridBuiltForCullOn == MapLightCullEnabled) {
+    return; // already built for this level
+  }
+
+  const gk::Map *map = gk::GetCurrentMap();
+  if (map == nullptr) {
+    return;
+  }
+  // The grid covers the map's own bounds. A light outside them still reaches cells inside, which
+  // the sphere test handles - what the bounds decide is only where cells exist, and a fragment
+  // outside them clamps into the edge cell rather than going unlit.
+  const float lo[3] = {map->bounds_min.x, map->bounds_min.y, map->bounds_min.z};
+  const float hi[3] = {map->bounds_max.x, map->bounds_max.y, map->bounds_max.z};
+  const uint32_t dims[3] = {kGridX, kGridY, kGridZ};
+  for (int i = 0; i < 3; ++i) {
+    GridMin[i] = lo[i];
+    // A degenerate axis would divide by zero and put every light in one cell; 1e-3 keeps the
+    // arithmetic finite and the result merely useless rather than NaN.
+    // Written out rather than with std::max: windows.h is included here without NOMINMAX, so
+    // `max` is a macro and the error lands on this line with nothing pointing at the cause.
+    const float span = (hi[i] - lo[i]) / static_cast<float>(dims[i]);
+    GridCell[i] = span > 1e-3f ? span : 1e-3f;
+  }
+
+  auto grid_buffer = reinterpret_cast<VkBuffer>(LightGridBuffer());
+  auto index_buffer = reinterpret_cast<VkBuffer>(LightIndexBuffer());
+  if (grid_buffer == VK_NULL_HANDLE || index_buffer == VK_NULL_HANDLE) {
+    return;
+  }
+
+  // The three bindings, rewritten each build. The light buffer is the scratch slice, so its
+  // offset moves with the frame - which is why this is a write rather than a one-time setup.
+  VkDescriptorBufferInfo buffers[3] = {};
+  buffers[0].buffer = reinterpret_cast<VkBuffer>(ScratchMapLightVkBuffer());
+  buffers[0].offset = FrameMapLightByteOffset;
+  buffers[0].range = static_cast<VkDeviceSize>(FrameMapLightCount) * sizeof(GpuMapLight);
+  buffers[1].buffer = grid_buffer;
+  buffers[1].range = VK_WHOLE_SIZE;
+  buffers[2].buffer = index_buffer;
+  buffers[2].range = VK_WHOLE_SIZE;
+  VkWriteDescriptorSet writes[3] = {};
+  for (uint32_t i = 0; i < 3; ++i) {
+    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[i].dstSet = GridSet;
+    writes[i].dstBinding = i;
+    writes[i].descriptorCount = 1;
+    writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[i].pBufferInfo = &buffers[i];
+  }
+  vkUpdateDescriptorSets(GetDevice(), 3, writes, 0, nullptr);
+
+  // The header: the allocator zeroed, and the three vectors the fragment shader reads back out.
+  // vkCmdUpdateBuffer rather than a staged copy - it takes up to 64 KB inline and this is 48
+  // bytes, so the values ride in the command buffer itself.
+  uint32_t header[kGridHeaderWords] = {};
+  header[0] = 0;
+  for (int i = 0; i < 3; ++i) {
+    header[1 + i] = dims[i];
+    std::memcpy(&header[4 + i], &GridMin[i], sizeof(float));
+    std::memcpy(&header[7 + i], &GridCell[i], sizeof(float));
+  }
+  vkCmdUpdateBuffer(cmd, grid_buffer, 0, sizeof(header), header);
+  VkMemoryBarrier2 fill_done = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+  fill_done.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+  fill_done.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+  fill_done.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+  fill_done.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+  VkDependencyInfo dependency = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  dependency.memoryBarrierCount = 1;
+  dependency.pMemoryBarriers = &fill_done;
+  vkCmdPipelineBarrier2(cmd, &dependency);
+
+  LightGridPush push = {};
+  for (int i = 0; i < 3; ++i) {
+    push.grid_min[i] = GridMin[i];
+    push.cell_size[i] = GridCell[i];
+    push.dims[i] = dims[i];
+  }
+  push.dims[3] = FrameMapLightCount;
+  push.index_capacity = kGridIndexCapacity;
+
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, GridPipeline);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, GridLayout, 0, 1, &GridSet, 0,
+                          nullptr);
+  vkCmdPushConstants(cmd, GridLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+  vkCmdDispatch(cmd, (kGridCells + 63) / 64, 1, 1);
+
+  // The fragment shader reads both buffers by device address, so the barrier is a memory one
+  // rather than a buffer one - there is no handle on that side to name.
+  VkMemoryBarrier2 build_done = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+  build_done.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+  build_done.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+  build_done.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  build_done.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+  dependency.pMemoryBarriers = &build_done;
+  vkCmdPipelineBarrier2(cmd, &dependency);
+
+  GridValid = true;
+  GridBuiltForAddress = FrameMapLightAddress;
+  GridBuiltForCount = FrameMapLightCount;
+  GridBuiltForCullOn = MapLightCullEnabled;
+  ++TheStats.light_grid_builds;
+}
+
+void SetMapLighting(bool enabled) { MapLightingEnabled = enabled; }
+
+bool MapLighting() { return MapLightingEnabled; }
+
+void SetMapLightCull(bool enabled) {
+  MapLightCullEnabled = enabled;
+  GridValid = false; // force a rebuild rather than leaving a stale grid behind the toggle
+}
+
+bool MapLightCull() { return MapLightCullEnabled; }
+
+void SetMapLightingAll(bool enabled) { MapLightingAllEnabled = enabled; }
+
+bool MapLightingAll() { return MapLightingAllEnabled; }
+
+void SetMapLightGain(float gain) { MapLightGainValue = gain; }
+
+float MapLightGain() { return MapLightGainValue; }
 
 void SetShadeMode(bool enabled) { ShadeModeEnabled = enabled; }
 
@@ -1104,6 +1524,9 @@ void RecordDraws(void *command_buffer) {
     return;
   }
 
+  UploadMapLights();
+  UploadFrameData();
+
   if (set != VK_NULL_HANDLE) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, Layout, 0, 1, &set, 0,
                             nullptr);
@@ -1230,17 +1653,7 @@ void RecordDraws(void *command_buffer) {
     push.record = item.record;
     push.material = item.material;
     push.base_vertex = item.base_vertex;
-    push.force_lod = ForcedLod;
-    const LightingMapParams &lighting = LightingParams();
-    push.bump_scale = lighting.bump_scale;
-    push.bump_diffuse = lighting.bump_diffuse;
-    push.specular_scale = lighting.specular_scale;
-    push.gloss_min = lighting.gloss_min;
-    push.gloss_max = lighting.gloss_max;
-    push.specular_from_diffuse = lighting.specular_from_diffuse;
-    push.chrome_scale = lighting.chrome_scale;
-    push.chrome_blur = lighting.chrome_blur;
-    push.chrome_texgen = lighting.chrome_texgen ? 1.0f : 0.0f;
+    push.frame = FrameDataAddress;
     if (push.vertices == 0) {
       continue;
     }
@@ -1417,6 +1830,21 @@ std::string FormatDrawStats() {
       (unsigned long long)TheStats.dropped_materials,
       (unsigned long long)TheStats.flat_shaded_draws,
       ShadeModeEnabled ? "" : " (SHADEMODE ignored)");
+  // Printed unconditionally rather than only when off, because this one is a departure from the
+  // original: a reader comparing a shot against real D3D8 has to know which equation ran, and
+  // "no line" would read as "the fixed-function one" to anyone who had not been told otherwise.
+  add("light sum: per %s\n", PerPixelLightingEnabled() ? "PIXEL" : "vertex (the original)");
+  if (MapLightingEnabled) {
+    // `grid builds` is the invariant here: the map's lights are static, so this is **once per
+    // level**. A number that climbs with the frame count means the rebuild test has broken and
+    // the dispatch is running every frame - which would still draw correctly, and so would never
+    // show up as anything but a frame rate.
+    add("map lighting: %u lights, gain %.2f, %s (%llu grid builds - one per level)\n",
+        FrameMapLightCount, MapLightGainValue,
+        MapLightCullEnabled ? (GridValid ? "culled by the world grid" : "grid NOT built")
+                            : "every light per pixel",
+        (unsigned long long)TheStats.light_grid_builds);
+  }
   add("viewport depth-slice changes: %llu\n", (unsigned long long)TheStats.viewport_sets);
   add("index binds: %llu   pipelines: %llu (%llu binds, %llu failures - must be 0)\n",
       (unsigned long long)TheStats.index_binds, (unsigned long long)TheStats.pipelines,
@@ -1453,6 +1881,7 @@ std::string FormatDrawStats() {
 }
 
 void ShutdownDraw() {
+  DestroyLightGridPipeline();
   if (!Ready) {
     return;
   }

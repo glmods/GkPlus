@@ -15,6 +15,7 @@
 #include "VkDraw.h"
 #include "VkLighting.h"
 #include "VkRenderer.h"
+#include "MapLights.h"
 #include "VkResources.h"
 
 #include <iterator>
@@ -473,6 +474,91 @@ JSValue GetShadeMode(JSContext *ctx, JSValueConst) {
 JSValue SetShadeModeValue(JSContext *ctx, JSValueConst, JSValueConst value) {
   vulkan::SetShadeMode(JS_ToBool(ctx, value) != 0);
   return JS_UNDEFINED;
+}
+
+// `render.per_pixel_lighting` - **not a diagnostic, a feature** (VkDraw.h). D3D8's light sum,
+// evaluated per pixel instead of per vertex. On by default, and off is the fixed-function
+// reproduction bit-identically - which is the direction that makes it measurable: pause a frame,
+// toggle it, and the difference image is exactly what Gouraud shading could not represent.
+//
+// The whole-frame MAD is the wrong reading for it. Per-vertex against per-pixel is a difference in
+// SHAPE across a triangle, largest where a normal turns most and zero on anything flat, so it
+// concentrates on curved and small geometry - a projectile, a unit's limbs - and averages to
+// nearly nothing over a level's flat ground.
+JSValue GetPerPixelLighting(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::PerPixelLighting());
+}
+
+JSValue SetPerPixelLightingValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetPerPixelLighting(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+// `render.map_lighting` - replace the level's BAKED per-vertex colour with a per-pixel evaluation
+// of its own light rig (VkDraw.h, notes §4.54). **Off by default on performance grounds**: it is
+// brute force over every light in the level per pixel until phase 2's culling exists.
+//
+// Judge it on level04 or level05, not only on level02. The fitted model reaches r 0.93-0.96 there
+// and only 0.37 on level02, whose 51 lights have ranges so long that none dominates anywhere - so
+// the feature looks least like the bake exactly on the level every other measurement uses.
+JSValue GetMapLighting(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::MapLighting());
+}
+
+JSValue SetMapLightingValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetMapLighting(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+// `render.map_lighting_all` - substitute on every lit draw, not just the map's own geometry.
+// Off by default; see SetMapLightingAll in VkDraw.h for why that is a measurement.
+JSValue GetMapLightingAll(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::MapLightingAll());
+}
+
+JSValue SetMapLightingAllValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetMapLightingAll(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+// `render.map_light_cull` - bin the map lights into a world-space grid instead of looping all of
+// them per fragment (VkDraw.h). On by default, and **off must be bit-identical**: the grid drops
+// only lights whose range cannot reach a cell, so it is exact. That A/B is the only thing that can
+// catch a cell quietly missing a light, which otherwise looks like art rather than like a bug.
+JSValue GetMapLightCull(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::MapLightCull());
+}
+
+JSValue SetMapLightCullValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetMapLightCull(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+// `render.map_light_gain` - the model's one free parameter. The fit puts it at 0.9 on level01 and
+// 1.35 on level04 and level05, so 1.0 is the middle rather than an identity.
+JSValue GetMapLightGain(JSContext *ctx, JSValueConst) {
+  return JS_NewFloat64(ctx, vulkan::MapLightGain());
+}
+
+JSValue SetMapLightGainValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  double gain = 1.0;
+  if (JS_ToFloat64(ctx, &gain, value) < 0) {
+    return JS_EXCEPTION;
+  }
+  vulkan::SetMapLightGain(static_cast<float>(gain));
+  return JS_UNDEFINED;
+}
+
+// `render.map_light_report` - the level's own `STDLIGHT` rig, in world space (src/MapLights.h).
+// Nothing renders from it yet; this is the reading that says the loader found the right file and
+// put the lights in the right place.
+//
+// **The bounds comparison is the check that matters.** A light set whose world bounds sit inside
+// the map's own is one whose unit scale and origin were applied correctly; get either wrong and
+// the positions land orders of magnitude out, which no per-light number would make obvious.
+JSValue GetMapLightReport(JSContext *ctx, JSValueConst) {
+  const std::string text = MapLightReport();
+  return JS_NewStringLen(ctx, text.data(), text.size());
 }
 
 // `render.draw_range` - [first, last] of the frame's draw list to record, inclusive. The bisect
@@ -1014,6 +1100,12 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("offscreen", GetOffscreen, SetOffscreenValue),
     JS_CGETSET_DEF("present_linear", GetPresentLinear, SetPresentLinearValue),
     JS_CGETSET_DEF("shade_mode", GetShadeMode, SetShadeModeValue),
+    JS_CGETSET_DEF("per_pixel_lighting", GetPerPixelLighting, SetPerPixelLightingValue),
+    JS_CGETSET_DEF("map_light_report", GetMapLightReport, nullptr),
+    JS_CGETSET_DEF("map_lighting", GetMapLighting, SetMapLightingValue),
+    JS_CGETSET_DEF("map_light_gain", GetMapLightGain, SetMapLightGainValue),
+    JS_CGETSET_DEF("map_lighting_all", GetMapLightingAll, SetMapLightingAllValue),
+    JS_CGETSET_DEF("map_light_cull", GetMapLightCull, SetMapLightCullValue),
     JS_CGETSET_DEF("force_lod", GetForceLod, SetForceLodValue),
     JS_CGETSET_DEF("lighting_maps", GetLightingMaps, SetLightingMapsValue),
     JS_CGETSET_DEF("lighting_map_report", GetLightingMapReport, nullptr),

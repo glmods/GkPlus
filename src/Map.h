@@ -155,8 +155,14 @@ struct Map : MapBase, RefCountedBase {
   // with 0x80000000 before storing it, and ToMap ADDs this to scaled rif
   // locator coordinates. Net effect: pos = rif_pos * RifUnitScale(rif) - origin.
   Vec3 neg_origin;        // 0x11c
-  Vec3 bounds_min;        // 0x128 world bounds, read as a pair by LoadLevel
-  Vec3 bounds_max;        // 0x134
+  // World bounds, read as a pair by LoadLevel. **The larger corner is FIRST**, which is the
+  // opposite of the order these were named in until it was measured: on level02 0x128 holds
+  // (68.6, 10.0, 66.5) against 0x134's (-65.8, -14.1, -65.1), and on level01 (47.4, 30.0, 141.0)
+  // against (-50.8, -28.5, -96.1) - six components across two levels, all the same way round.
+  // Confirmed independently by the level's own `STDLIGHT` positions, which bracket correctly
+  // inside the pair once it is read this way and not otherwise (src/MapLights.cpp).
+  Vec3 bounds_max;        // 0x128
+  Vec3 bounds_min;        // 0x134
   // Camera focus bounds. Only the y components reach the game's globals:
   // 0x144 -> MinCameraFocusHeight @ 0x006a574c, 0x150 -> MaxCameraFocusHeight
   // @ 0x007b3ea8. Both come from the `.loc` locator named by the map section's
@@ -184,8 +190,8 @@ static_assert(offsetof(Map, adjacency_built) == 0xac);
 static_assert(offsetof(Map, scene_object) == 0xc8);
 static_assert(offsetof(Map, bitmap) == 0xcc);
 static_assert(offsetof(Map, neg_origin) == 0x11c);
-static_assert(offsetof(Map, bounds_min) == 0x128);
-static_assert(offsetof(Map, bounds_max) == 0x134);
+static_assert(offsetof(Map, bounds_max) == 0x128);
+static_assert(offsetof(Map, bounds_min) == 0x134);
 static_assert(offsetof(Map, camera_focus_min) == 0x140);
 static_assert(offsetof(Map, camera_focus_max) == 0x14c);
 static_assert(offsetof(Map, rif_time_low) == 0x158);

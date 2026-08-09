@@ -83,6 +83,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Json.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/MakeRole.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Map.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/MapLights.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Math.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Memory.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Menu.cpp"
@@ -90,6 +91,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Music.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Repl.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Rif.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Roles.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Script.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ScriptQueue.cpp"
@@ -108,7 +110,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/WindowPlacement.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/World.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/exports.def")
-target_link_libraries(GkPlus PRIVATE detours imgui::imgui d3d8to9 d3d9 qjs imgui-quickjs ws2_32 volk::volk_headers GPUOpen::VulkanMemoryAllocator Vulkan::Headers
+target_link_libraries(GkPlus PRIVATE huffman detours imgui::imgui d3d8to9 d3d9 qjs imgui-quickjs ws2_32 volk::volk_headers GPUOpen::VulkanMemoryAllocator Vulkan::Headers
     $<IF:$<TARGET_EXISTS:PhysFS::PhysFS>,PhysFS::PhysFS,PhysFS::PhysFS-static>)
 
 if(GKPLUS_RENDERDOC_INTEGRATION)

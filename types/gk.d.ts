@@ -2258,6 +2258,64 @@ declare module "gk" {
     readonly material_overrides: string;
     clear_material_overrides(): void;
 
+    /** D3D8's light sum, evaluated **per pixel** instead of per vertex.
+     *
+     *  On by default, and the first thing in this namespace that deliberately
+     *  departs from the original rather than reproducing it. The equation is
+     *  unchanged - the same lights, the same attenuation and spot terms, the same
+     *  `N·L > 0` gate on the specular sum. What changes is what gets interpolated
+     *  across a triangle: a finished colour, or the position and normal that
+     *  colour is computed from.
+     *
+     *  Gouraud shading cannot represent a highlight smaller than a triangle or a
+     *  point light's falloff across one, so the difference concentrates on
+     *  curved and finely-tessellated geometry - a unit, a projectile - and is
+     *  near zero on flat ground. Judge it there, not on a whole-frame average.
+     *
+     *  `false` restores the fixed-function path bit-identically, which is what
+     *  makes it A/B-able on one paused frame.
+     *  `GKPLUS_VK_PER_PIXEL_LIGHTING=0` is the launch-time form. */
+    per_pixel_lighting: boolean;
+
+    /** Replace the level's **baked** per-vertex lighting with a per-pixel evaluation
+     *  of the light rig that produced it.
+     *
+     *  Every level ships the `STDLIGHT` set its per-vertex colours were baked from,
+     *  and the shipped engine loads it and never reads it. The model used here was
+     *  recovered by fitting against those baked colours rather than chosen -- a
+     *  linear falloff over the light's range, `max(0, N·L)`, and a cone about the
+     *  light's own axis on everything but the omnidirectional ones. It reaches
+     *  r 0.87-0.96 against the real bake on three of the four levels measured.
+     *
+     *  **Off by default**, and on performance grounds rather than fidelity ones: it
+     *  is brute force over every light in the level, per pixel, with no culling yet.
+     *
+     *  Applies to the map's own geometry only. A prop or a unit carries its own
+     *  file's bake from its own rig, and substituting the level's there measures
+     *  worse; `map_lighting_all` lifts the restriction so that stays checkable. */
+    map_lighting: boolean;
+    /** Bin the map's lights into a world-space grid so a fragment reads only its
+     *  own cell, instead of looping every light in the level. On.
+     *
+     *  **Off must be bit-identical, not merely close.** A light's range is a hard
+     *  cutoff, so a light whose sphere misses a cell contributes exactly zero to
+     *  every fragment in it -- the grid drops nothing. That makes this a
+     *  correctness A/B rather than a quality trade, and the only test that can
+     *  catch a cell quietly missing a light. */
+    map_light_cull: boolean;
+    /** Substitute on every lit draw rather than only the map geometry. Off, and the
+     *  default is a measurement -- see `map_lighting`. */
+    map_lighting_all: boolean;
+    /** The model's one free parameter. Default 1.2, the mean of the values fitted per
+     *  level (0.9 on level01, 1.35 on level04 and level05) -- so it is a lever rather
+     *  than a calibration. On level04 the on-screen difference from the bake
+     *  minimises at exactly the fitted 1.35. */
+    map_light_gain: number;
+    /** Which `.rif` the lights came from, how many, the ambient floor, and their world
+     *  bounds beside the map's own -- which is the reading that says the unit scale
+     *  and origin were applied correctly. */
+    readonly map_light_report: string;
+
     /** Lighting maps: a companion `<texture> lighting.dds` beside a `.RIM`, in a
      *  mod under `gkplus/mods` or in the install itself, giving that one texture
      *  a bump/metallic/roughness response the game never had.

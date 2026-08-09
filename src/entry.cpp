@@ -12,6 +12,7 @@
 #include "GLS.h"
 #include "GUI.h"
 #include "InputFix.h"
+#include "MapLights.h"
 #include "Music.h"
 #include "Script.h"
 #include "ScriptQueue.h"
@@ -53,6 +54,11 @@ struct Subsystems {
   ScriptQueueSystem queue;  // the script queue carries JSON, not bare .gcs names
   gls::GlsSystem gls;       // lets the GLS parser take a source text, not a file
   CustomLevelSystem levels; // levels built from script instead of .gls + .gcs
+  // Hooks LoadOrGetRifFile, which is where the level's rif path and unit scale can be caught -
+  // both are gone by the time the level is playable, since LoadLevel frees the rif object right
+  // after ConvertParsedObjects. Position does not matter: it only records, and its first read is
+  // long after every hook here is installed. See src/MapLights.h.
+  MapLightSystem map_lights; // the .rif's own lights, which the engine loads and never reads
   // Detours SetupMenus purely to reach a point where the game's allocator exists:
   // RegisterImageCodec builds its trie with pool_alloc, which bottoms out in gl.exe's
   // static CRT heap, and that is not initialised until _mainCRTStartup - long after

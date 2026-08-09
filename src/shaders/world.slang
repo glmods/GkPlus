@@ -102,43 +102,68 @@ struct GpuMaterial {
     uint pad2;
 };
 
-static const uint kShadeFlat = 1u;
+// One of the LEVEL's own lights - the rig that baked its per-vertex colours. Must match
+// GpuMapLight in src/VkDraw.h. Colour is premultiplied by brightness on the CPU.
+struct GpuMapLight {
+    float4 position;  // xyz world space, w = range
+    float4 colour;    // rgb premultiplied, w = engine_light_flags as a float
+    float4 axis;      // xyz = row 2 of the orientation, the light's axis
+};
 
-// 72 bytes of a guaranteed 128 (§4.19, §4.26, §4.30, §4.48). Four addresses and three indices:
-// nothing there describes a draw, which is the whole of §2's design. The trailing floats are
-// frame-uniform knobs rather than per-draw data - see PushConstants in src/VkDraw.cpp.
+static const uint kShadeFlat = 1u;
+// LFlag_Omni, from AvP's prototyp.h. The one flag bit this shader reads, and it decides whether
+// the cone applies - measured, not assumed: applying the cone to an omni light makes level04's
+// fit against the real bake go 0.831 -> 0.640 (notes §4.54).
+static const uint kMapLightOmni = 0x4u;
+
+// Everything that is the same for every draw in a frame. Must match GpuFrameData in
+// src/VkDraw.h field for field - the 8-byte members first, where no layout rule can disagree
+// about their alignment, then the 4-byte scalars.
+struct GpuFrameData {
+    ConstBufferPointer<GpuMapLight> map_lights;
+    ConstBufferPointer<uint> light_grid;
+    ConstBufferPointer<uint> light_indices;
+    float force_lod;
+    float bump_scale;
+    float bump_diffuse;
+    float specular_scale;
+    float gloss_min;
+    float gloss_max;
+    float specular_from_diffuse;
+    float chrome_scale;
+    float chrome_blur;
+    float chrome_texgen;
+    float per_pixel_lighting;
+    float map_light_gain;
+    float map_ambience;
+    uint map_light_count;
+    uint map_flags;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+};
+
+// **56 bytes of a guaranteed 128.** It reached exactly 128 with the light grid (§4.56), and
+// everything frame-uniform then moved into GpuFrameData above - which is what a value that is the
+// same for every draw should always have been. The four hot addresses stay here because the
+// vertex shader reaches `vertices` before it has read anything at all, and putting it behind
+// `frame` would make that a dependent load on every vertex.
 struct Push {
     ConstBufferPointer<Vertex> vertices;
     ConstBufferPointer<GpuDrawRecord> draws;
     ConstBufferPointer<GpuLight> lights;
     ConstBufferPointer<GpuMaterial> materials;
+    ConstBufferPointer<GpuFrameData> frame;
     uint record;         // this draw's entry in `draws`
     uint material;       // ... and in `materials`, shared with every draw of the same surface
     uint base_vertex;    // where this draw's buffer starts, in canonical vertices
-    // The LOD probe. Negative samples normally; anything else forces every fetch to that mip
-    // level, which is how "we pick the wrong level" is told apart from "we filter the level
-    // wrongly" (§4.34).
-    float force_lod;
-    // The lighting-map knobs, uniform for the whole frame. See LightingMapParams in
-    // src/VkLighting.h; they are here rather than in GpuMaterial because none of them varies per
-    // surface, and a tweak from the REPL should not re-intern the material table.
-    float bump_scale;
-    float bump_diffuse;
-    float specular_scale;
-    float gloss_min;   // the specular exponent at roughness 1
-    float gloss_max;   // ... and at roughness 0
-    // Which colour the highlight reflects: the light's specular at 0, its diffuse at 1. Defaults
-    // to 1 because every light reaching level02's ground authors `specular 0 0 0`; see
-    // LightingMapParams in src/VkLighting.h for the measurement.
-    float specular_from_diffuse;
-    // The chrome pass. `chrome_scale` multiplies the metallic channel before it weighs the reflect
-    // stage, `chrome_blur` is how many mip levels roughness may push that fetch down, and
-    // `chrome_texgen` is 0 or 1 - a float because the rest of this block is, and one word of push
-    // constant is not worth a second layout rule.
-    float chrome_scale;
-    float chrome_blur;
-    float chrome_texgen;
+    uint pad0;
 };
+
+// GpuFrameData::map_flags - must match the bits VkDraw.cpp sets.
+static const uint kMapLightingOn = 0x1u;
+static const uint kMapLightingAll = 0x2u;
+static const uint kMapLightingGrid = 0x4u;
 
 [[vk::push_constant]]
 ConstantBuffer<Push> pc;
@@ -181,12 +206,16 @@ struct VertexOut {
     float4 specular : COLOR1; // D3D's second output colour, added after the texture stages
     nointerpolation float4 color_flat : COLOR2;
     nointerpolation float4 specular_flat : COLOR3;
-    float4 uv : TEXCOORD0;    // xy = uv0, zw = uv1 - stage 1 is the lightmap set
-    // The two the LIGHTING MAP needs and nothing else does: D3D8's own equation is per vertex, so
-    // a bumped normal is the one thing that cannot be, and re-running the sum per pixel needs the
-    // vertex's world position and the surface's geometric normal. Zero on a draw that was not
+    float4 uv : TEXCOORD0;    // xy = uv0, zw = uv1 - uv1 addresses the fog grid (notes §4.51)
+    // The two the fragment shader needs to run D3D's light sum itself: the lighting map's bumped
+    // normal (§4.48) and, since Phase 1, the whole per-pixel path. Zero on a draw that was not
     // lit, where the fragment shader does not read them - a pre-transformed vertex has no world
     // position to carry.
+    //
+    // `world_normal` is deliberately NOT normalised here: D3D normalises only under
+    // D3DRS_NORMALIZENORMALS and the resulting length is a real difference in brightness, so the
+    // vertex path reproduces that. The per-pixel path normalises after interpolation instead,
+    // because interpolation changes the length whatever D3D would have done.
     float3 world_position : TEXCOORD1;
     float3 world_normal : TEXCOORD2;
 };
@@ -280,6 +309,175 @@ LightGeometry light_geometry(GpuLight light, float3 world_position) {
     return out;
 }
 
+// The three sums D3D8's equation accumulates over the enabled lights, before any material colour
+// is applied. Splitting the loop from the material resolution is what lets the SAME code run per
+// vertex and per pixel: the loop needs a position and a normal, the resolution needs a vertex
+// colour, and only the first of those changes between the two.
+struct LightSums {
+    float3 ambient;
+    float3 diffuse;
+    float3 specular;
+};
+
+// The loop, verbatim from what `shade_vertex` used to do inline. `to_eye` is the caller's because
+// the two call sites disagree about where it comes from: per vertex it is computed once from the
+// vertex's world position, per pixel from the fragment's.
+LightSums light_sum(GpuDrawRecord draw, float3 world_position, float3 normal, bool want_specular,
+                    float3 to_eye, float power) {
+    LightSums out;
+    out.ambient = draw.global_ambient.rgb;
+    out.diffuse = float3(0, 0, 0);
+    out.specular = float3(0, 0, 0);
+
+    for (uint i = 0u; i < draw.light_count; ++i) {
+        const GpuLight light = pc.lights[draw.light_offset + i];
+        const LightGeometry geometry = light_geometry(light, world_position);
+        if (!geometry.valid) {
+            continue;
+        }
+        const float3 to_light = geometry.to_light;
+        const float k = geometry.k;
+
+        const float lambert = max(0.0, dot(normal, to_light));
+        out.ambient += k * light.ambient.rgb;
+        out.diffuse += k * light.diffuse.rgb * lambert;
+        // **Gated on the diffuse term, not just on N.H.** A light behind the surface contributes
+        // no highlight in D3D, and `max(0, N.H)` alone does not say so: N.H stays positive well
+        // past the point where N.L goes negative, so an ungated term paints a specular wash on
+        // every face turned AWAY from a light (notes §4.46). On level02 that was the near face
+        // of the concrete ledge and the ground in front of it, lit orange by two fires that
+        // are behind them - the whole of "the ledge is much redder in Vulkan".
+        if (want_specular && lambert > 0.0) {
+            const float3 halfway = normalize(to_light + to_eye);
+            out.specular +=
+                k * light.specular.rgb * pow(max(0.0, dot(normal, halfway)), max(power, 1e-4));
+        }
+    }
+    return out;
+}
+
+// The sums, plus this surface's material colours, into the two colours the texture stages consume.
+// Shared for the same reason the loop is: D3DRS_*MATERIALSOURCE has to be resolved identically
+// wherever the sum ran, and it is the half that needs the vertex colour.
+struct LitColour {
+    float4 color;
+    float3 specular;
+};
+
+LitColour resolve_lit_colour(GpuDrawRecord draw, LightSums sums, float4 vertex_colour,
+                             bool want_specular) {
+    const float4 ambient =
+        material_source(draw.lighting, 10u /* kAmbientSourceShift */, draw.material_ambient,
+                        vertex_colour);
+    const float4 diffuse =
+        material_source(draw.lighting, 8u /* kDiffuseSourceShift */, draw.material_diffuse,
+                        vertex_colour);
+    const float4 emissive =
+        material_source(draw.lighting, 14u /* kEmissiveSourceShift */, draw.material_emissive,
+                        vertex_colour);
+    const float4 specular =
+        material_source(draw.lighting, 12u /* kSpecularSourceShift */, draw.material_specular,
+                        vertex_colour);
+
+    LitColour out;
+    // Saturated because the fixed function's output is a D3DCOLOR: the clamp is where the
+    // pipeline is, not an approximation of it.
+    out.color = float4(saturate(emissive.rgb + ambient.rgb * sums.ambient +
+                                diffuse.rgb * sums.diffuse),
+                       diffuse.a);
+    out.specular = want_specular ? saturate(specular.rgb * sums.specular) : float3(0, 0, 0);
+    return out;
+}
+
+// The level's own baked lighting, re-created at this fragment.
+//
+// **This is a fitted model, not a chosen one** (notes §4.54). It was recovered by least squares
+// against `SHPVTINT` itself over four levels, and it reaches r = 0.957 on level05 (MAE 4.87/255),
+// 0.926 on level04 and 0.875 on level01. Every term below earned its place in an ablation:
+//
+//     distance only          r 0.36 .. 0.51
+//     + max(0, N.L)          r 0.72 .. 0.84
+//     + cone, omni exempt    r 0.87 .. 0.96
+//
+// Three things that look arbitrary and are measurements:
+//
+//   - the falloff is **linear in range**, beating a raised cosine and an inverse square on every
+//     level tried;
+//   - the axis is **row 2** of the orientation. Rows 0 and 1 both fit worse, and negating row 2
+//     collapses the fit to r 0.02 - a wrong axis degrades, the opposite axis destroys;
+//   - `spread` is **not** here. As a cone exponent it makes the fit worse everywhere, so the
+//     field is authored on all 3,794 shipped lights and shapes nothing.
+//
+// **No gamma conversion, and that is deliberate.** The fit was run against the stored bytes over
+// 255, so what this returns is already in the encoding the texture stages consume - the fit
+// absorbed the transfer function rather than leaving one to apply here.
+// Which lights this fragment has to consider.
+//
+// **The grid is exact, not an approximation.** A light's `range` is a hard cutoff in the fitted
+// model (§4.54), so a light whose sphere misses a cell contributes exactly zero to every fragment
+// in it - which is why `render.map_light_cull` on and off must produce a *bit-identical* frame
+// rather than a close one, and why that is the test.
+//
+// A fragment outside the map's bounds clamps into the edge cell rather than going unlit.
+uint2 map_light_range(float3 world_position) {
+    if ((pc.frame[0].map_flags & kMapLightingGrid) == 0u) {
+        return uint2(0u, pc.frame[0].map_light_count); // no grid: every light, phase 3b's behaviour
+    }
+    // The header, written by vkCmdUpdateBuffer before the build: [0] allocator, [1..3] dims,
+    // [4..6] origin, [7..9] cell size, cells from [12]. It lives here rather than in the push
+    // block because that block is full at Vulkan's guaranteed 128 bytes.
+    const uint3 dims = uint3(pc.frame[0].light_grid[1], pc.frame[0].light_grid[2], pc.frame[0].light_grid[3]);
+    const float3 origin = float3(asfloat(pc.frame[0].light_grid[4]), asfloat(pc.frame[0].light_grid[5]),
+                                 asfloat(pc.frame[0].light_grid[6]));
+    const float3 cell_size = float3(asfloat(pc.frame[0].light_grid[7]), asfloat(pc.frame[0].light_grid[8]),
+                                    asfloat(pc.frame[0].light_grid[9]));
+    const float3 cell = (world_position - origin) / cell_size;
+    // Clamped rather than rejected: a fragment outside the map's bounds takes the edge cell, so
+    // geometry that pokes past them is lit rather than black.
+    const uint3 coordinate = uint3(clamp(int3(floor(cell)), int3(0, 0, 0), int3(dims) - 1));
+    const uint index = coordinate.x + dims.x * (coordinate.y + dims.y * coordinate.z);
+    const uint base = pc.frame[0].light_grid[12u + 2u * index + 0u];
+    const uint count = pc.frame[0].light_grid[12u + 2u * index + 1u];
+    return uint2(base, count);
+}
+
+float3 map_light_sum(float3 world_position, float3 normal) {
+    float3 acc = float3(0, 0, 0);
+    const uint2 span = map_light_range(world_position);
+    const bool culled = (pc.frame[0].map_flags & kMapLightingGrid) != 0u;
+    for (uint slot = 0u; slot < span.y; ++slot) {
+        // One indirection when the grid is up, none when it is not - so the fallback really is
+        // the same loop phase 3b ran rather than a second code path to keep in step.
+        const uint i = culled ? pc.frame[0].light_indices[span.x + slot] : slot;
+        const GpuMapLight light = pc.frame[0].map_lights[i];
+        const float3 delta = light.position.xyz - world_position;
+        const float distance_squared = dot(delta, delta);
+        const float range = light.position.w;
+        if (distance_squared >= range * range) {
+            continue;
+        }
+        const float distance = sqrt(max(distance_squared, 1e-12));
+        const float3 to_light = delta / distance;
+        float atten = (1.0 - distance / range) * max(0.0, dot(normal, to_light));
+        if (atten <= 0.0) {
+            continue;
+        }
+        if ((uint(light.colour.w) & kMapLightOmni) == 0u) {
+            // The cone: how far off the light's own axis this fragment lies. Measured from the
+            // light TOWARDS the fragment, which is the opposite of `to_light`.
+            atten *= max(0.0, dot(light.axis.xyz, -to_light));
+            if (atten <= 0.0) {
+                continue;
+            }
+        }
+        acc += light.colour.rgb * atten;
+    }
+    // AMBIENCE is a per-channel max(), not an added term - AvP's own renderer clamps upward
+    // against it, and adding it instead would lift a fully-lit surface past white.
+    return max(saturate(acc * pc.frame[0].map_light_gain), float3(pc.frame[0].map_ambience, pc.frame[0].map_ambience,
+                                                        pc.frame[0].map_ambience));
+}
+
 // The body, with the flat copies left to the entry point below. Two exits, and a third would be
 // easy to add - so nothing here writes `color_flat`.
 VertexOut shade_vertex(uint vertex_id) {
@@ -330,60 +528,25 @@ VertexOut shade_vertex(uint vertex_id) {
     output.world_position = world_position;
     output.world_normal = normal;
 
+    // Per-pixel lighting: hand the fragment shader the ingredients and stop. `color` carries the
+    // RAW vertex colour rather than a lit one, which is what D3DRS_*MATERIALSOURCE needs and the
+    // only thing per-vertex data can still contribute - so this needs no varying that was not
+    // already here, and `world_position`/`world_normal` are the two the lighting map added.
+    //
+    // The fragment shader distinguishes the two meanings of `color` exactly as this does: by
+    // `kLightSum` and this same push constant. Nothing else reads it.
+    if (pc.frame[0].per_pixel_lighting != 0.0) {
+        output.color = vertex_colour;
+        return output;
+    }
+
     const bool want_specular = (draw.lighting & kSpecularEnable) != 0u;
     const float3 to_eye = want_specular ? normalize(draw.eye.xyz - world_position) : float3(0, 0, 1);
-    const float power = draw.material_specular.w;
-
-    float3 ambient_sum = draw.global_ambient.rgb;
-    float3 diffuse_sum = float3(0, 0, 0);
-    float3 specular_sum = float3(0, 0, 0);
-
-    for (uint i = 0u; i < draw.light_count; ++i) {
-        const GpuLight light = pc.lights[draw.light_offset + i];
-        const LightGeometry geometry = light_geometry(light, world_position);
-        if (!geometry.valid) {
-            continue;
-        }
-        const float3 to_light = geometry.to_light;
-        const float k = geometry.k;
-
-        const float lambert = max(0.0, dot(normal, to_light));
-        ambient_sum += k * light.ambient.rgb;
-        diffuse_sum += k * light.diffuse.rgb * lambert;
-        // **Gated on the diffuse term, not just on N.H.** A light behind the surface contributes
-        // no highlight in D3D, and `max(0, N.H)` alone does not say so: N.H stays positive well
-        // past the point where N.L goes negative, so an ungated term paints a specular wash on
-        // every face turned AWAY from a light (notes §4.46). On level02 that was the near face
-        // of the concrete ledge and the ground in front of it, lit orange by two fires that
-        // are behind them - the whole of "the ledge is much redder in Vulkan".
-        if (want_specular && lambert > 0.0) {
-            const float3 halfway = normalize(to_light + to_eye);
-            specular_sum +=
-                k * light.specular.rgb * pow(max(0.0, dot(normal, halfway)), max(power, 1e-4));
-        }
-    }
-
-    const float4 ambient =
-        material_source(draw.lighting, 10u /* kAmbientSourceShift */, draw.material_ambient,
-                        vertex_colour);
-    const float4 diffuse =
-        material_source(draw.lighting, 8u /* kDiffuseSourceShift */, draw.material_diffuse,
-                        vertex_colour);
-    const float4 emissive =
-        material_source(draw.lighting, 14u /* kEmissiveSourceShift */, draw.material_emissive,
-                        vertex_colour);
-    const float4 specular =
-        material_source(draw.lighting, 12u /* kSpecularSourceShift */, draw.material_specular,
-                        vertex_colour);
-
-    // Saturated because the fixed function's output is a D3DCOLOR: the clamp is where the
-    // pipeline is, not an approximation of it.
-    output.color = float4(saturate(emissive.rgb + ambient.rgb * ambient_sum +
-                                   diffuse.rgb * diffuse_sum),
-                          diffuse.a);
-    if (want_specular) {
-        output.specular = float4(saturate(specular.rgb * specular_sum), 0.0);
-    }
+    const LightSums sums = light_sum(draw, world_position, normal, want_specular, to_eye,
+                                     draw.material_specular.w);
+    const LitColour lit = resolve_lit_colour(draw, sums, vertex_colour, want_specular);
+    output.color = lit.color;
+    output.specular = float4(lit.specular, 0.0);
     return output;
 }
 
@@ -578,7 +741,7 @@ LightingMapShade shade_lighting_map(GpuMaterial material, GpuDrawRecord draw, fl
     tangent /= tangent_length;
     bitangent /= bitangent_length;
     const float3 bumped = normalize(
-        normal - pc.bump_scale * (tangent * gradient.x + bitangent * gradient.y));
+        normal - pc.frame[0].bump_scale * (tangent * gradient.x + bitangent * gradient.y));
     out.bumped_normal = bumped;
     if (texgen_only) {
         return out;
@@ -587,7 +750,7 @@ LightingMapShade shade_lighting_map(GpuMaterial material, GpuDrawRecord draw, fl
     // Roughness to exponent, interpolated in log2: a linear walk from 4 to 256 spends nearly all
     // of its range on highlights that are already broad, where the eye reads the difference
     // between 4 and 8 as large and between 200 and 256 as nothing.
-    const float exponent = exp2(lerp(log2(max(pc.gloss_min, 1.0)), log2(max(pc.gloss_max, 1.0)),
+    const float exponent = exp2(lerp(log2(max(pc.frame[0].gloss_min, 1.0)), log2(max(pc.frame[0].gloss_max, 1.0)),
                                      saturate(1.0 - roughness)));
     const float3 to_eye = normalize(draw.eye.xyz - world_position);
 
@@ -617,34 +780,89 @@ LightingMapShade shade_lighting_map(GpuMaterial material, GpuDrawRecord draw, fl
             // one is a mod's response and defaults to the light a player can actually see,
             // because level02's lights all author a black specular.
             const float3 colour =
-                lerp(light.specular.rgb, light.diffuse.rgb, saturate(pc.specular_from_diffuse));
+                lerp(light.specular.rgb, light.diffuse.rgb, saturate(pc.frame[0].specular_from_diffuse));
             specular_sum += geometry.k * colour * pow(max(0.0, dot(bumped, halfway)), exponent);
         }
     }
 
-    out.specular = specular_sum * metallic * pc.specular_scale;
+    out.specular = specular_sum * metallic * pc.frame[0].specular_scale;
     // Clamped to 4x: where the geometric normal faces away from every light the denominator is
     // just the ambient term, and an unbounded ratio would make a bumped pixel there many times
     // brighter than anything around it.
     const float3 ratio = clamp((ambient_sum + diffuse_bumped) /
                                    max(ambient_sum + diffuse_flat, float3(1e-3, 1e-3, 1e-3)),
                                float3(0, 0, 0), float3(4, 4, 4));
-    out.diffuse_scale = lerp(float3(1, 1, 1), ratio, saturate(pc.bump_diffuse));
+    out.diffuse_scale = lerp(float3(1, 1, 1), ratio, saturate(pc.frame[0].bump_diffuse));
     return out;
 }
 
 [shader("fragment")]
 float4 fragment_main(VertexOut input) : SV_Target {
-    // Already the lit colour: the vertex shader ran D3D's lighting equation and what comes out
-    // of it IS the diffuse the texture stages take as D3DTA_DIFFUSE. That is also D3D's own
-    // order - lighting produces a vertex colour, the multitexture cascade consumes it - so
-    // nothing here has to know whether the draw was lit.
+    // What the texture stages take as D3DTA_DIFFUSE, which is D3D's own order: lighting produces
+    // a colour, the multitexture cascade consumes it. Where that colour is COMPUTED is the one
+    // thing `per_pixel_lighting` moves - either the vertex shader already ran the equation and
+    // `input.color` is its result, or it passed the raw vertex colour through and the block below
+    // runs the equation here. Everything after that block is identical either way.
     const GpuMaterial material = pc.materials[pc.material];
+    const GpuDrawRecord draw = pc.draws[pc.record];
     // D3DSHADE_FLAT takes both output colours from the primitive's first vertex; the texture
     // coordinates are interpolated either way, which is why only these two have a flat copy.
     const bool flat_shaded = material.shading == kShadeFlat;
     float4 diffuse = flat_shaded ? input.color_flat : input.color;
-    const float3 specular_in = flat_shaded ? input.specular_flat.rgb : input.specular.rgb;
+    float3 specular_in = flat_shaded ? input.specular_flat.rgb : input.specular.rgb;
+
+    // Per-pixel lighting. `diffuse` is the raw vertex colour on this path - see shade_vertex -
+    // and D3D's equation runs here instead, at this fragment's own position and normal.
+    //
+    // It has to happen BEFORE the lighting map below, because that feature's whole output is a
+    // scale on the diffuse the texture stages are about to consume: computing the sum afterwards
+    // would throw the scale away and make the map look like it had stopped working.
+    if (pc.frame[0].per_pixel_lighting != 0.0 && (draw.lighting & kLightSum) != 0u) {
+        // **Renormalised unconditionally**, where the vertex path does it only under
+        // D3DRS_NORMALIZENORMALS. Linear interpolation of two unit normals across a triangle
+        // yields a SHORTER vector everywhere between them - most so at the midpoint of a wide
+        // corner - so skipping this darkens the middle of every triangle by an amount that grows
+        // with how sharply the normal turns. That is interpolation's artefact rather than
+        // anything D3D decided, and there is no per-vertex equivalent of it to reproduce.
+        const float3 normal = normalize(input.world_normal);
+        // Runtime map lighting: **replace the baked vertex colour, do not add to it.**
+        //
+        // `D3DRS_DIFFUSEMATERIALSOURCE` is `D3DMCS_COLOR1` on every lit draw, so this colour is
+        // the *material diffuse* that the sum below multiplies - not the final pixel. Swapping
+        // one term for a runtime evaluation of the same rig leaves the live D3D light sum, both
+        // texture stages and the gamma-space multiply exactly as they were, which is why the
+        // level's brightness balance survives. Neutralising it to white and lighting on top
+        // instead is §4.25's defect: everything unfogged and far too bright.
+        //
+        // The alpha is kept: it is the vertex's own and nothing here computes one.
+        //
+        // **Only the map's own geometry**, and the marker is the fog stage. The rig being
+        // evaluated is the LEVEL's; a prop or a unit is a separate `RBOBJECT` whose `SHPVTINT`
+        // was baked from its own file's lights, so substituting the level's rig there replaces
+        // one object's bake with another's - which the fit never covered and which measures
+        // worse on screen than leaving it alone.
+        //
+        // Stage 1 is the fog-of-war grid on exactly the draws `SubmitAndFlushMapGeometry`
+        // submits, and the only other stage-1 configuration in a frame is the chrome pass
+        // (notes §4.51 tallies all 273 draws of a level02 frame into those three groups). So
+        // "two stages and not chrome" is "this is the map", measured rather than assumed.
+        // `map_lighting_all` turns the restriction off, which is how that claim stays checkable.
+        const bool map_geometry = material.stage_count == 2u && material.chrome == 0u;
+        if ((pc.frame[0].map_flags & kMapLightingOn) != 0u &&
+            (map_geometry || (pc.frame[0].map_flags & kMapLightingAll) != 0u)) {
+            diffuse = float4(map_light_sum(input.world_position, normal), diffuse.a);
+        }
+        const bool want_specular = (draw.lighting & kSpecularEnable) != 0u;
+        // Per fragment, which is what D3DRS_LOCALVIEWER means taken literally. The vertex path
+        // computes this once per vertex and interpolates the result of the whole highlight.
+        const float3 to_eye =
+            want_specular ? normalize(draw.eye.xyz - input.world_position) : float3(0, 0, 1);
+        const LightSums sums = light_sum(draw, input.world_position, normal, want_specular,
+                                         to_eye, draw.material_specular.w);
+        const LitColour lit = resolve_lit_colour(draw, sums, diffuse, want_specular);
+        diffuse = lit.color;
+        specular_in = lit.specular;
+    }
 
     // The lighting map, in two halves: a scale on the diffuse the texture stages are about to
     // consume, and a highlight added after them. Both derivatives are taken HERE, in uniform
@@ -672,7 +890,6 @@ float4 fragment_main(VertexOut input) : SV_Target {
     // it over. `kNoTexture` is what every material without a companion file carries, so nothing
     // here costs anything on a stock install.
     if (material.lighting_texture != kNoTexture) {
-        const GpuDrawRecord draw = pc.draws[pc.record];
         if ((draw.lighting & kLightSum) != 0u) {
             const LightingMapShade shade =
                 shade_lighting_map(material, draw, base_uv, uv_dx, uv_dy, position_dx,
@@ -696,7 +913,7 @@ float4 fragment_main(VertexOut input) : SV_Target {
             // Only where the shade actually ran: `view_rotation` is written on the same branch of
             // BuildDrawRecord that sets kLightSum, and is zero otherwise - which would collapse
             // every generated coordinate onto one texel.
-            chrome_texgen = chrome && pc.chrome_texgen != 0.0;
+            chrome_texgen = chrome && pc.frame[0].chrome_texgen != 0.0;
         }
     }
     // With every stage disabled the fixed function outputs the diffuse colour alone. That is
@@ -729,12 +946,12 @@ float4 fragment_main(VertexOut input) : SV_Target {
             // Roughness widens the reflection by fetching a coarser mip. B already means the
             // highlight's sharpness; a rough surface reflecting less sharply is the same statement
             // made in the sphere map, and a mip is the cheapest honest blur available here.
-            const float chrome_lod = chrome_stage ? saturate(chrome_roughness) * pc.chrome_blur : 0.0;
+            const float chrome_lod = chrome_stage ? saturate(chrome_roughness) * pc.frame[0].chrome_blur : 0.0;
             // SampleLevel and not Sample with a bias: the probe has to REPLACE the computed LOD,
             // not nudge it, or it cannot answer which level the hardware would have chosen.
-            tex = pc.force_lod >= 0.0
+            tex = pc.frame[0].force_lod >= 0.0
                       ? textures[s.texture].SampleLevel(samplers[s.sampler_index], uv,
-                                                        pc.force_lod)
+                                                        pc.frame[0].force_lod)
                       : (chrome_lod > 0.0
                              ? textures[s.texture].SampleBias(samplers[s.sampler_index], uv,
                                                               chrome_lod)
@@ -759,7 +976,7 @@ float4 fragment_main(VertexOut input) : SV_Target {
         // between the value before the stage and the value after it degenerates exactly at 0 and
         // is bit-identical at 1, whatever the op - which also means this does not hard-code
         // ADDSIGNED, and keeps working if some other material reaches the path.
-        const float weight = chrome_stage ? saturate(chrome_metallic * pc.chrome_scale) : 1.0;
+        const float weight = chrome_stage ? saturate(chrome_metallic * pc.frame[0].chrome_scale) : 1.0;
         current = lerp(current, float4(rgb, a), weight);
     }
 
