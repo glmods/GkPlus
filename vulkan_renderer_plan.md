@@ -7,8 +7,8 @@ one place to correct when something turns out wrong.
 
 ## Where it stands
 
-**`GKPLUS_RENDERER=vulkan` draws the game.** The world geometry, the textures, the lightmaps, the
-units, the HUD, the **fixed-function lighting** and the **stencil shadows** all render through
+**`GKPLUS_RENDERER=vulkan` draws the game.** The world geometry, the textures, the **fog of war**,
+the units, the HUD, the **fixed-function lighting** and the **stencil shadows** all render through
 Vulkan, and **every draw the game issues reaches the renderer**. Against the **real D3D8** on a
 settled, paused level02 frame the whole frame is **0.13/255**, against a cross-launch d3d8-vs-d3d8
 floor of **0.034** — and **93% of the frame is bit-identical** (§4.38).
@@ -184,7 +184,7 @@ and still forwards every call to d3d8to9 so the A/B stays available.
 | **The world drawn by Vulkan**, textured | ✅ §4.16 — A/B matches d3d9 |
 | RenderDoc capture from the REPL | ✅ §4.17 |
 | **User-pointer draws** — text, particles, menus, units | ✅ §4.18, and §4.22 for the scratch's frame skew |
-| **The second texture stage** — the lightmap, which was the whole flat-and-bright gap | ✅ §4.19 |
+| **The second texture stage** — which was the whole flat-and-bright gap. §4.19 called it a lightmap; it is the **fog of war** | ✅ §4.19, identified in §4.51 |
 | **Pipeline buckets** (blend, depth, cull) and the alpha test | ✅ §4.19 — 5 pipelines |
 | **The HUD's colour** — the material emissive, on vertices with no colour | ✅ §4.20 |
 | **Every buffer resident**, including ones unlocked before the renderer existed | ✅ §4.20 |
@@ -369,18 +369,30 @@ cmake --build build && cmake --build build --target copy
 The copy **fails silently while an instance holds the DLL** — check the deployed file's
 timestamp, not the build's. That invalidated a whole bisect once (§4.8).
 
-Shaders are **Slang**, compiled offline; the generated header is checked in so `d3d8.dll` needs
-no shader toolchain. After editing `src/shaders/*.slang`:
+Shaders are **Slang**, and the generated header is still checked in so `d3d8.dll` needs no shader
+toolchain — but **`cmake --build` compiles them now**, so editing `src/shaders/*.slang` and
+building is enough. `src/gen-shaders.py` remains runnable by hand and gained two modes:
 
 ```bash
-python3 src/gen-shaders.py
+python3 src/gen-shaders.py --check    # is the checked-in header stale? needs no slangc
+python3 src/gen-shaders.py --deps     # the sources, for CMake; ENTRY_POINTS is the only list
 ```
 
-**Nothing in CMake runs it, so `cmake --build` after a shader edit is a no-op and reports
-success** (§4.46). The failure mode is a fix that measures as having changed nothing at all —
-and the giveaway is that the screenshots are *byte-identical* to the ones before it, which a real
-no-effect change almost never is. Hash the shots when a change is supposed to move pixels and
-does not.
+**On a machine with no `slangc` the build refuses a stale header rather than using it** — that is
+the half that matters, and it is why staleness is a content hash embedded in the header rather
+than a timestamp (a git checkout shuffles mtimes). Both halves are verified by deliberately
+breaking them.
+
+This replaces the standing warning that nothing in CMake ran the generator (§4.46), and one thing
+from it is worth keeping because it is what the CMake rule had to get right: **the header must be
+a declared `OUTPUT`, not just a stamp.** With a stamp alone Ninja treats it as a plain source,
+decides every TU including it is clean *before* the generator runs, and links a DLL built against
+the previous SPIR-V — measured, and it reproduces §4.46's symptom exactly. The stamp is still
+there beside it so an unchanged shader does not re-run `slangc` every build.
+
+The old giveaway still applies to anything else that measures as having changed nothing: the
+screenshots being *byte-identical* to the ones before a change is what a real no-effect change
+almost never produces. Hash the shots when a change is supposed to move pixels and does not.
 
 Testing is the REPL, driven from PowerShell. `utils/rendertest/launch-gunlok.ps1`
 handles the three things that otherwise waste a run — `-skipfmv`, the modal "Run in a window?"
@@ -776,7 +788,7 @@ the crashed process that makes the harness lie; kill `WerFault.exe` first.
 ### The Vulkan renderer (`src/D3D8Capture`, `src/Vk*`, `src/VertexFormat`)
 
 A bindless Vulkan replacement for Gunlok's renderer. **`GKPLUS_RENDERER=vulkan` draws the
-game** — the world, its textures, its lightmaps, its units, its HUD, its **fixed-function
+game** — the world, its textures, its fog of war, its units, its HUD, its **fixed-function
 lighting** and its **stencil shadows**. **`vulkan_renderer_plan.md` is where to start** — status
 and next steps; `vulkan_renderer_notes.md` is the design record and every measurement behind it.
 Read the plan before touching any of this.
@@ -959,9 +971,11 @@ Things worth knowing before editing:
   `render.staging_watch` is what works: log every upload to one arena offset with its batch.
 - **To find out what the renderer is missing, make the GAME render without it.** Three env vars
   force `D3DRS_LIGHTING`, `D3DRS_SPECULARENABLE` and the texture stages past the first off, in
-  the *forwarded* call only. That is what proved fog was not the gap and the lightmap stage was —
-  after three sections of the plan said the opposite. A hypothesis costs one such switch and one
-  screenshot diff; reading more of the renderer costs a session and settles nothing (§4.19).
+  the *forwarded* call only. That is what proved D3D fog was not the gap and the second texture
+  stage was — after three sections of the plan said the opposite. (The joke §4.51 supplies: that
+  stage turned out to be the game's *own* fog of war, drawn as a texture rather than as
+  `D3DRS_FOGENABLE`. Both readings of "fog" were half right.) A hypothesis costs one such switch
+  and one screenshot diff; reading more of the renderer costs a session and settles nothing (§4.19).
 - **An A/B is only evidence about the pixels that were on screen when it ran.** "Lighting
   contributes nothing, 0.08/255" was measured on a frame whose HUD had not appeared yet; with
   the HUD up the same switch turns the panel from green to grey. Check what is actually in the
@@ -992,6 +1006,6 @@ Things worth knowing before editing:
 | `src/VkDraw.h/cpp` | The world pass: one `VkPipeline` per distinct blend/depth/cull state (five on level01, built on first sight — notes §4.19), the depth buffer, the per-frame draw list, and the **shader ABI** (`GpuLight`, `GpuDrawRecord`, `GpuMaterial` — the three arrays a draw is looked up in, §4.26 and §4.30). A draw binds nothing and its push constants describe nothing: four device addresses and three indices, 44 bytes of the 72 the block is (the rest is frame-uniform knobs — the LOD probe and §4.48's lighting-map parameters — which ride a push because it is the cheapest way to deliver a float that is the same for every draw). Vertices, its own record, its material and the lights are all pulled by address, from the arena for buffered draws and from a per-frame host-visible scratch for user-pointer ones (§4.18). **Materials are interned per frame** — 274 draws on level02 are 29 of them — which is what makes a second pass over the frame a walk over the draw array rather than a replay of the recording loop. **The list is never sorted**: the game's own order is what makes blending correct |
 | `src/VkLighting.h/cpp` | **Lighting maps** (§4.48): the companion `<texture> lighting.dds` beside a `.RIM`, its two lookup roots and two suffix spellings, the per-name cache (**including the misses**, which is what keeps a texture with no companion from costing a file probe per frame), the images this side creates, and the base-slot → lighting-slot table. Keyed and resolved exactly like the material override — by `.rim` name, on `TextureRegistryGeneration()` — and it depends on nothing in the capture layer, because a lighting map is a texture D3D never sees. The decoder is `src/Dds`, unchanged and shared with the engine-facing codec |
 | `src/VkCapture.h/cpp` | RenderDoc via its in-app API, so `render.capture()` grabs one frame from the REPL. Off unless `GKPLUS_RENDERDOC` is set, and loaded before the Vulkan instance because it captures by inserting a layer. **Opening a capture has two traps, both reported as `VK_ERROR_OUT_OF_DEVICE_MEMORY` and neither about VRAM** — the *replayer* must be 32-bit (launching from the x86 tooling does not help; the UI replays in its own x64 process, so it needs `x86\renderdoccmd.exe remoteserver`), and an in-level capture needs `GKPLUS_VK_HEAPS=small` (notes §4.17) |
-| `src/shaders/*.slang`, `src/gen-shaders.py` | The shaders, in **Slang**, compiled offline to `src/Shaders.gen.inc.h` so `d3d8.dll` needs no shader toolchain. Re-run the generator after editing one |
+| `src/shaders/*.slang`, `src/gen-shaders.py` | The shaders, in **Slang**, compiled to `src/Shaders.gen.inc.h`, which is checked in so `d3d8.dll` needs no shader toolchain. `cmake --build` runs the generator where `slangc` exists and **fails on a stale header where it does not**; `--check` and `--deps` are the two modes that serve it. `ENTRY_POINTS` is the single source of truth for the build's shader dependencies |
 | `src/VertexFormat.h/cpp` | Every FVF the game uses → one canonical 48-byte vertex. Pure CPU, no Vulkan and no D3D headers |
 | `src/JsRender.cpp` | The `render` namespace: all of the above, readable from the REPL — plus `material_override`, the one member of it that is a **feature** rather than a measurement. Only that part is in `types/gk.d.ts`; the diagnostics move with whatever is being investigated, so `Render` carries an index signature and says so |

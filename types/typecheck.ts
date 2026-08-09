@@ -733,3 +733,9 @@ render.clear_material_overrides();
 render.material_override("gunlok_mk2", { tint: 0xff00ff });
 // @ts-expect-error - the readback is the host's
 render.material_overrides = "";
+
+render.chrome_scale = 1.0;
+render.chrome_blur = 4.0;
+render.chrome_texgen = false;
+// @ts-expect-error - texgen is a choice between two coordinates, not a blend
+render.chrome_texgen = 0.5;

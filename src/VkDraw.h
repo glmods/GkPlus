@@ -82,12 +82,19 @@ struct GpuDrawRecord {
   float material_emissive[4];
   float global_ambient[4];     // D3DRS_AMBIENT
   float eye[4];                // xyz: the camera in world space, for the specular halfway vector
+  // 3 rows of 4: world->view rotation, for the chrome pass's generated sphere-map coordinate.
+  //
+  // The *rotation* and not the whole view matrix, because that coordinate is a direction and a
+  // translation would do nothing to it. A plain transpose of the view's upper 3x3 rather than an
+  // inverse, which is only legal because the view matrix is rigid - the same property StoreEye
+  // already leans on to recover the camera position from it.
+  float view_rotation[12];
   uint32_t light_offset;       // into the frame's light array
   uint32_t light_count;
   uint32_t lighting;           // the flags above
   uint32_t lit_colour;         // packed D3DCOLOR, read only under kLitCollapse
 };
-static_assert(sizeof(GpuDrawRecord) == 288, "the scratch stride is part of the shader ABI");
+static_assert(sizeof(GpuDrawRecord) == 336, "the scratch stride is part of the shader ABI");
 
 // One of the game's draw calls, already reduced to what the shader needs.
 //
@@ -171,14 +178,25 @@ struct GpuMaterial {
   // src/VkLighting.h for what the file is and where it comes from.
   //
   // It is keyed on stage 0 for the same reason `tint` is: that texture is the surface's identity,
-  // where stage 1 is the lightmap set the game shares across a level. It samples through stage
-  // 0's own sampler, so a clamped surface's map is clamped too - a wrap mismatch between a
-  // texture and its own companion would show as a seam at exactly the edge.
+  // where stage 1 is never the surface at all - measured over a whole level02 frame (notes
+  // 4.51), it is the 256x256 A8 **fog-of-war** grid on 71 draws and `units\reflect.rim` on 90,
+  // and nothing else. It samples through stage 0's own sampler, so a clamped surface's map is
+  // clamped too - a wrap mismatch between a texture and its own companion would show as a seam
+  // at exactly the edge.
   uint32_t lighting_texture = kNoTexture;
-  // Reserved. Twelve useful words are 52 bytes and an array's std140 stride rounds to 64, so
+  // 1 when this material is Gunlok's chrome pass - stage 1 samples `units\reflect.rim`. See
+  // IsChromeTexture in src/VkLighting.h for why that name is the whole test.
+  //
+  // On the material and not derived in the shader from `stage1_texture`, because the shader has
+  // no way to ask what an image is called: a bindless slot is a number there, and the name lives
+  // in the registry the capture layer owns. It is part of the intern key by construction, which
+  // is right - two draws differing in it must not share an entry.
+  //
+  // It occupied what was `pad0` when it was added, so it cost nothing.
+  uint32_t chrome = 0;
+  // Reserved. Thirteen useful words are 56 bytes and an array's std140 stride rounds to 64, so
   // these are free, and spelling them out keeps the C++ and Slang structs the same size rather
   // than leaving one to guess at the tail.
-  uint32_t pad0 = 0;
   uint32_t pad1 = 0;
   uint32_t pad2 = 0;
 
@@ -589,7 +607,7 @@ bool ViewportRect();
 //   - `hide` drops every draw whose stage-0 texture matches, before it reaches the frame's list.
 //
 // `tint` and `hide` key on the draw's **stage 0** texture, which is the surface's own identity;
-// `texture` applies at any stage, so replacing a lightmap works too. This is a Vulkan-renderer
+// `texture` applies at any stage, so replacing the chrome layer works too. This is a Vulkan-renderer
 // feature and does nothing under `GKPLUS_RENDERER=d3d8` or `d3d9` - those forward to a runtime
 // that has never heard of it.
 struct MaterialOverride {

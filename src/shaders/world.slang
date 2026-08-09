@@ -46,6 +46,9 @@ struct GpuDrawRecord {
     float4 material_emissive;
     float4 global_ambient;    // D3DRS_AMBIENT
     float4 eye;               // xyz: the camera in world space
+    // world->view rotation, 3 rows of 4. Only the chrome pass reads it; see src/VkDraw.h for why
+    // it is the rotation alone and why a transpose is enough.
+    float4 view_rotation[3];
     uint light_offset;
     uint light_count;
     uint lighting;
@@ -91,7 +94,10 @@ struct GpuMaterial {
     // and B its sharpness; see src/VkLighting.h for where the file comes from and what the three
     // channels are allowed to mean.
     uint lighting_texture;
-    uint pad0;
+    // 1 when this material is Gunlok's chrome pass: stage 1 samples `units\reflect.rim`, ADDSIGNED
+    // over the unit's own texture, on a second draw of the same mesh. The capture layer decides
+    // this by name - a bindless slot has none here. See src/VkLighting.h.
+    uint chrome;
     uint pad1;
     uint pad2;
 };
@@ -125,6 +131,13 @@ struct Push {
     // to 1 because every light reaching level02's ground authors `specular 0 0 0`; see
     // LightingMapParams in src/VkLighting.h for the measurement.
     float specular_from_diffuse;
+    // The chrome pass. `chrome_scale` multiplies the metallic channel before it weighs the reflect
+    // stage, `chrome_blur` is how many mip levels roughness may push that fetch down, and
+    // `chrome_texgen` is 0 or 1 - a float because the rest of this block is, and one word of push
+    // constant is not worth a second layout rule.
+    float chrome_scale;
+    float chrome_blur;
+    float chrome_texgen;
 };
 
 [[vk::push_constant]]
@@ -487,15 +500,29 @@ Stage stage_at(GpuMaterial m, uint index) {
 struct LightingMapShade {
     float3 specular;      // to add after the stages
     float3 diffuse_scale; // to multiply the vertex-lit colour by BEFORE them
+    // The tilted normal, in world space, and the two channels the chrome pass reads. They fall out
+    // of work this function already does - the gradient taps and one `centre` fetch - so a caller
+    // that wants only these pays for the taps and nothing else, which is what `texgen_only` is.
+    float3 bumped_normal;
+    float metallic;
+    float roughness;
 };
 
+// `texgen_only` runs the height gradient and stops: no light loop, no highlight, no diffuse ratio.
+// That is what the chrome pass wants, and not as an optimisation - the base pass has ALREADY added
+// both terms for this surface, because the chrome pass is a second draw of the same mesh with the
+// same stage-0 texture and therefore the same lighting map. Running them again would apply the map
+// twice to one pixel. It is also, incidentally, much the cheaper half.
 LightingMapShade shade_lighting_map(GpuMaterial material, GpuDrawRecord draw, float2 uv,
                                     float2 uv_dx, float2 uv_dy, float3 position_dx,
                                     float3 position_dy, float3 world_position,
-                                    float3 world_normal) {
+                                    float3 world_normal, bool texgen_only) {
     LightingMapShade out;
     out.specular = float3(0, 0, 0);
     out.diffuse_scale = float3(1, 1, 1);
+    out.bumped_normal = normalize(world_normal);
+    out.metallic = 1.0;
+    out.roughness = 0.0;
 
     const uint index = material.lighting_texture;
     const uint sampler_index = material.stage0_sampler;
@@ -507,6 +534,8 @@ LightingMapShade shade_lighting_map(GpuMaterial material, GpuDrawRecord draw, fl
     const float4 centre = textures[index].SampleGrad(samplers[sampler_index], uv, uv_dx, uv_dy);
     const float metallic = centre.g;
     const float roughness = centre.b;
+    out.metallic = metallic;
+    out.roughness = roughness;
 
     uint width, height;
     textures[index].GetDimensions(width, height);
@@ -539,12 +568,21 @@ LightingMapShade shade_lighting_map(GpuMaterial material, GpuDrawRecord draw, fl
         // pixel. There is no direction for a bump to lean in, so the map contributes nothing
         // rather than a normalised NaN - which would paint one black pixel and be blamed on the
         // artwork.
+        //
+        // `bumped_normal` stays the geometric one and `metallic` stays what was sampled, so a
+        // chrome pass here still reflects and still respects the channel - it just reflects off
+        // the flat surface. Bailing out of the whole effect instead would make a degenerate
+        // triangle a HOLE in the reflection, which is far more visible than a missing bump.
         return out;
     }
     tangent /= tangent_length;
     bitangent /= bitangent_length;
     const float3 bumped = normalize(
         normal - pc.bump_scale * (tangent * gradient.x + bitangent * gradient.y));
+    out.bumped_normal = bumped;
+    if (texgen_only) {
+        return out;
+    }
 
     // Roughness to exponent, interpolated in log2: a linear walk from 4 to 256 spends nearly all
     // of its range on highlights that are already broad, where the eye reads the difference
@@ -620,6 +658,15 @@ float4 fragment_main(VertexOut input) : SV_Target {
     const float3 position_dx = ddx(input.world_position);
     const float3 position_dy = ddy(input.world_position);
     float3 map_specular = float3(0, 0, 0);
+    // The chrome pass's inputs. `chrome_metallic` starts at 1 so that a surface the map says
+    // nothing about reflects at the engine's own strength - the whole feature has to be inert
+    // without a companion file, and a 0 default would silently delete the reflection from every
+    // reflective unit on a stock install.
+    const bool chrome = material.chrome != 0u;
+    float chrome_metallic = 1.0;
+    float chrome_roughness = 0.0;
+    float3 chrome_normal = float3(0, 0, 1);
+    bool chrome_texgen = false;
     // Only on a draw the game itself lit: the map's whole contribution is a light sum, and a
     // pre-transformed or unlit draw has neither a world position to run it at nor lights to run
     // it over. `kNoTexture` is what every material without a companion file carries, so nothing
@@ -629,9 +676,27 @@ float4 fragment_main(VertexOut input) : SV_Target {
         if ((draw.lighting & kLightSum) != 0u) {
             const LightingMapShade shade =
                 shade_lighting_map(material, draw, base_uv, uv_dx, uv_dy, position_dx,
-                                   position_dy, input.world_position, input.world_normal);
+                                   position_dy, input.world_position, input.world_normal, chrome);
+            // Both are identities under `texgen_only`, so this stays one code path rather than
+            // branching on which half ran.
             diffuse = float4(diffuse.rgb * shade.diffuse_scale, diffuse.a);
             map_specular = shade.specular;
+            chrome_metallic = shade.metallic;
+            chrome_roughness = shade.roughness;
+            // World -> view. `mul(vector, matrix)` treats the vector as a ROW vector, which is
+            // the same convention D3D's matrices are written in - so this is literally the
+            // `v * View` the game means, with the rows in the order StoreViewRotation wrote them.
+            // The same pattern the vertex shader uses for `normal_transform`; no transpose is
+            // involved in either, and inserting one would mirror the reflection left-to-right.
+            //
+            // Still unit-length afterwards: the view matrix is rigid, so its 3x3 is orthonormal.
+            chrome_normal = mul(shade.bumped_normal,
+                                float3x3(draw.view_rotation[0].xyz, draw.view_rotation[1].xyz,
+                                         draw.view_rotation[2].xyz));
+            // Only where the shade actually ran: `view_rotation` is written on the same branch of
+            // BuildDrawRecord that sets kLightSum, and is zero otherwise - which would collapse
+            // every generated coordinate onto one texel.
+            chrome_texgen = chrome && pc.chrome_texgen != 0.0;
         }
     }
     // With every stage disabled the fixed function outputs the diffuse colour alone. That is
@@ -641,17 +706,39 @@ float4 fragment_main(VertexOut input) : SV_Target {
 
     for (uint i = 0u; i < material.stage_count && i < 2u; ++i) {
         const Stage s = stage_at(material, i);
+        // The chrome pass's reflect layer, which is always stage 1 - the unit's own texture is
+        // stage 0 and is what the lighting map above was keyed on.
+        const bool chrome_stage = chrome && i == 1u;
         // Texture coordinate set, from D3DTSS_TEXCOORDINDEX. The canonical vertex carries two,
         // which is every set the game's FVFs declare; anything else falls back to the first.
-        const float2 uv = ((s.color >> 24) & 0xffu) == 1u ? input.uv.zw : input.uv.xy;
+        float2 uv = ((s.color >> 24) & 0xffu) == 1u ? input.uv.zw : input.uv.xy;
+        if (chrome_stage && chrome_texgen) {
+            // The sphere-map coordinate, from the BUMPED normal - which is the whole point: the
+            // engine's UV1 is fixed to the surface and cannot answer to a height field.
+            //
+            // The formula is Gunlok's own. Its map-wide chrome variant asks D3D for
+            // D3DTSS_TCI_CAMERASPACENORMAL with no texture transform, which is literally the
+            // camera-space normal's xy - so this is what the engine already does for that path,
+            // per pixel instead of per vertex. The *0.5+0.5 is ours: D3D's raw form runs -1..1 and
+            // leans on the sampler's address mode for the half outside the unit square, which is
+            // a property of whatever `units\reflect.rim` was acquired with rather than a decision.
+            uv = chrome_normal.xy * 0.5 + 0.5;
+        }
         float4 tex = float4(1, 1, 1, 1);
         if (s.texture != kNoTexture) {
+            // Roughness widens the reflection by fetching a coarser mip. B already means the
+            // highlight's sharpness; a rough surface reflecting less sharply is the same statement
+            // made in the sphere map, and a mip is the cheapest honest blur available here.
+            const float chrome_lod = chrome_stage ? saturate(chrome_roughness) * pc.chrome_blur : 0.0;
             // SampleLevel and not Sample with a bias: the probe has to REPLACE the computed LOD,
             // not nudge it, or it cannot answer which level the hardware would have chosen.
             tex = pc.force_lod >= 0.0
                       ? textures[s.texture].SampleLevel(samplers[s.sampler_index], uv,
                                                         pc.force_lod)
-                      : textures[s.texture].Sample(samplers[s.sampler_index], uv);
+                      : (chrome_lod > 0.0
+                             ? textures[s.texture].SampleBias(samplers[s.sampler_index], uv,
+                                                              chrome_lod)
+                             : textures[s.texture].Sample(samplers[s.sampler_index], uv));
         }
 
         // Colour and alpha both read the state from BEFORE this stage, so `current` is
@@ -666,7 +753,14 @@ float4 fragment_main(VertexOut input) : SV_Target {
                      select_arg((s.alpha >> 16) & 0xffu, tex, diffuse, current), tex, diffuse,
                      current)
                 .a;
-        current = float4(rgb, a);
+        // The metallic channel scales the chrome stage's RESULT, not its argument. Scaling the
+        // argument looks equivalent and is not: this stage is ADDSIGNED, `current + (tex - 0.5)`,
+        // so a zeroed argument darkens the surface by half instead of leaving it alone. Blending
+        // between the value before the stage and the value after it degenerates exactly at 0 and
+        // is bit-identical at 1, whatever the op - which also means this does not hard-code
+        // ADDSIGNED, and keeps working if some other material reaches the path.
+        const float weight = chrome_stage ? saturate(chrome_metallic * pc.chrome_scale) : 1.0;
+        current = lerp(current, float4(rgb, a), weight);
     }
 
     // D3D's alpha test compares the 0..255 reference against the fragment's alpha, so the

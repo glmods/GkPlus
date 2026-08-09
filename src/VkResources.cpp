@@ -349,6 +349,10 @@ struct SamplerKey {
 
 std::map<SamplerKey, uint32_t> SamplerIndices;
 std::vector<VkSampler> Samplers;
+// The key each sampler was built from, parallel to `Samplers`. Only MippedSamplerFor needs it -
+// it has an index and wants the same sampler with one field changed, which the key->index map
+// cannot answer in that direction.
+std::vector<SamplerKey> SamplerKeys;
 
 struct PendingImageCopy {
   uint32_t index = 0;
@@ -1184,6 +1188,7 @@ uint32_t AcquireSampler(uint32_t mag_filter, uint32_t min_filter, uint32_t mip_f
 
   const uint32_t index = static_cast<uint32_t>(Samplers.size());
   Samplers.push_back(sampler);
+  SamplerKeys.push_back(key);
   SamplerIndices[key] = index;
   TheStats.samplers_live = Samplers.size();
 
@@ -1201,6 +1206,22 @@ uint32_t AcquireSampler(uint32_t mag_filter, uint32_t min_filter, uint32_t mip_f
     ++TheStats.descriptors_written;
   }
   return index;
+}
+
+uint32_t MippedSamplerFor(uint32_t sampler_index) {
+  if (sampler_index >= SamplerKeys.size()) {
+    return sampler_index;
+  }
+  const SamplerKey &key = SamplerKeys[sampler_index];
+  // Anything other than D3DTEXF_NONE already samples the chain; only NONE is clamped.
+  if (key.mip != 0) {
+    return sampler_index;
+  }
+  const uint32_t mipped =
+      AcquireSampler(key.mag, key.min, 2 /* D3DTEXF_LINEAR */, key.address_u, key.address_v);
+  // A full sampler table is the one failure here, and falling back to the caller's own index is
+  // right: the picture loses the blur rather than the texture.
+  return mipped != 0 || sampler_index == 0 ? mipped : sampler_index;
 }
 
 void RotateFrameScratch() {
@@ -2022,6 +2043,9 @@ void ShutdownResources() {
     vkDestroySampler(GetDevice(), sampler, nullptr);
   }
   Samplers.clear();
+  // Parallel to `Samplers`, so it has to go with it: leaving it behind would make every
+  // MippedSamplerFor after a device teardown read another sampler's key.
+  SamplerKeys.clear();
   SamplerIndices.clear();
   TheStats.samplers_live = 0;
   // The pool owns the set, so it is freed with it rather than separately.

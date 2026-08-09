@@ -132,6 +132,74 @@ set_target_properties(GkPlus
     OUTPUT_NAME "d3d8"
     CXX_STANDARD 23)
 
+# `src/Shaders.gen.inc.h` is checked in, so d3d8.dll builds on a machine with no shader
+# toolchain - the same reasoning that makes the renderer reach Vulkan through volk. The
+# requirement here is therefore not "compile the shaders" but "never silently compile against a
+# STALE header": for as long as nothing in the build ran the generator, editing a `.slang` and
+# running `cmake --build` reported success having changed nothing, and the only tell was that the
+# screenshots came out byte-identical (vulkan_renderer_notes.md 4.46).
+#
+# So: regenerate where slangc exists, and FAIL where it does not and the header is stale.
+# `--deps` keeps `ENTRY_POINTS` in gen-shaders.py the single source of truth for which files that
+# depends on - nothing here names a shader, so the two lists cannot drift.
+set(GKPLUS_SHADER_GENERATOR "${CMAKE_CURRENT_SOURCE_DIR}/src/gen-shaders.py")
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+
+# Mirrors find_slangc() in the generator - PATH first, then the newest installed SDK - so CMake
+# and the script cannot pick different compilers. REVERSE because file(GLOB) sorts ascending and
+# find_program takes the first hint that matches, where the script takes sorted()[-1].
+file(GLOB GKPLUS_VULKAN_SDK_BIN "C:/VulkanSDK/*/Bin")
+list(REVERSE GKPLUS_VULKAN_SDK_BIN)
+find_program(GKPLUS_SLANGC NAMES slangc HINTS ${GKPLUS_VULKAN_SDK_BIN})
+
+if(NOT Python3_Interpreter_FOUND)
+    message(WARNING
+        "Python 3 not found: the shaders will be neither rebuilt nor checked, so a stale "
+        "src/Shaders.gen.inc.h would be compiled in silently. Install Python to re-enable it.")
+elseif(GKPLUS_SLANGC)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" "${GKPLUS_SHADER_GENERATOR}" --deps
+        OUTPUT_VARIABLE GKPLUS_SHADER_SOURCES
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        COMMAND_ERROR_IS_FATAL ANY)
+    string(REPLACE "\n" ";" GKPLUS_SHADER_SOURCES "${GKPLUS_SHADER_SOURCES}")
+    message(STATUS "Slang shaders: ${GKPLUS_SLANGC}")
+
+    # BOTH the header and a stamp are outputs, and each does a different job. Getting this wrong
+    # is silent in exactly the way this whole block exists to prevent, so:
+    #
+    #   - the **header** must be an output or Ninja treats it as a plain source, decides every
+    #     TU including it is clean *before* the generator runs, and links a DLL built against the
+    #     previous SPIR-V. Measured: with the stamp alone, editing a shader recompiled nothing
+    #     and produced a byte-identical d3d8.dll - §4.46's failure mode with extra steps.
+    #   - the **stamp** is always touched, so the edge is clean next build even when the header
+    #     was not rewritten; without it the edge re-runs slangc on every single build.
+    #
+    # The generator rewrites the header only when its contents change, and CMake sets
+    # `restat = 1` on custom-command edges - so an unchanged shader leaves the header's mtime
+    # alone and Ninja keeps every dependent TU out of the rebuild.
+    add_custom_command(
+        OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/src/Shaders.gen.inc.h"
+               "${CMAKE_CURRENT_BINARY_DIR}/shaders.stamp"
+        COMMAND "${Python3_EXECUTABLE}" "${GKPLUS_SHADER_GENERATOR}"
+        COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/shaders.stamp"
+        DEPENDS ${GKPLUS_SHADER_SOURCES} "${GKPLUS_SHADER_GENERATOR}"
+        COMMENT "Compiling Slang shaders"
+        VERBATIM)
+    add_custom_target(gkplus_shaders DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/shaders.stamp")
+    add_dependencies(GkPlus gkplus_shaders)
+else()
+    message(STATUS
+        "slangc not found: using the checked-in src/Shaders.gen.inc.h. The build will fail if it "
+        "is stale; install the Vulkan SDK to regenerate it.")
+    add_custom_target(gkplus_shaders
+        COMMAND "${Python3_EXECUTABLE}" "${GKPLUS_SHADER_GENERATOR}" --check
+        COMMENT "Checking the checked-in SPIR-V against the shader sources"
+        VERBATIM)
+    add_dependencies(GkPlus gkplus_shaders)
+endif()
+
 add_library(huffman
     "${CMAKE_CURRENT_SOURCE_DIR}/huffman/huffman_compress.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/huffman/huffman_decompress.cpp")

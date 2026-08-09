@@ -105,6 +105,53 @@ struct LightingMapParams {
   // The specular exponent at roughness 1 and at roughness 0.
   float gloss_min = 4.0f;
   float gloss_max = 256.0f;
+
+  // --- the chrome pass ------------------------------------------------------------------------
+  //
+  // Gunlok's own sphere-map effect, which these three make answer to a lighting map. A
+  // `reflective` role (48 of the shipped ones) is drawn a second time with `units\reflect.rim`
+  // ADDSIGNED over its own texture; that pass's stage 0 is the same texture as the base pass, so
+  // its lighting map resolves with no extra plumbing. See vulkan_renderer_notes.md.
+  //
+  // **All three are inert without a companion file.** A texture with no lighting map takes the
+  // engine's own path exactly, which is what keeps a stock install looking stock.
+
+  // How much of the chrome stage's result survives, before the metallic channel scales it. 1.0 is
+  // the engine's own strength; 0 removes the reflection and leaves the base pass alone, which is
+  // the A/B.
+  float chrome_scale = 1.0f;
+  // How far the roughness channel may blur the reflection, in mip levels. B already means the
+  // highlight's *sharpness*, and a rough surface reflecting less sharply is that same statement
+  // made in the sphere map. 0 samples the top level whatever B says.
+  //
+  // **DEFAULTS TO 0 BECAUSE IT DOES NOT WORK YET, and the reason is not established.** Measured on
+  // level02 at the settled camera, against a 0.010/255 repeatability floor: sweeping this 0 -> 8
+  // moves 0.006, and 0 -> 20 moves 0.012. Both are noise. What has been ruled out:
+  //
+  //   * the texture - `units\reflect.RIM` is 256x256 and carries all 5 of its mip levels;
+  //   * the channel - the unit maps' B averages 0.58, so the LOD being asked for is ~2.3 at a
+  //     `chrome_blur` of 4, not 0;
+  //   * the push constant - `chrome_scale` and `chrome_texgen` sit either side of it in the same
+  //     block and both demonstrably work, so the block's layout is not adrift;
+  //   * the branch - `chrome_texgen` only takes effect when the shade ran, and it works, which
+  //     proves the same `shade.roughness` this reads is being written.
+  //
+  // What is left, and where to start: the chrome stage's sampler is D3DTEXF_NONE (`render.state`
+  // shows it as `filt 220`), which AcquireSampler reproduces as `maxLod = 0.25`, so a bias cannot
+  // reach a second level. `MippedSamplerFor` below exists to hand that stage a mipping variant and
+  // *should* fix it - but the bindless table still shows **4 samplers** with this set to 20, so
+  // that swap is not allocating one and nobody has yet found out why. Turn it on and check the
+  // sampler count first.
+  float chrome_blur = 0.0f;
+  // Whether the chrome stage's texture coordinate is *generated* from the bumped normal rather
+  // than read from the mesh's second UV set.
+  //
+  // On, because the generated coordinate is the one that responds to the height field at all - an
+  // authored UV1 is fixed to the surface and cannot. The formula is the engine's own: its
+  // map-wide chrome variant asks for D3DTSS_TCI_CAMERASPACENORMAL with no texture transform, so
+  // this is what Gunlok already does for that path, applied per pixel and to a normal the map has
+  // tilted. Off falls back to UV1 and reproduces the engine's per-unit path exactly.
+  bool chrome_texgen = true;
 };
 
 struct LightingMapStats {
@@ -119,6 +166,10 @@ struct LightingMapStats {
   // paint anything with this", and a map on an asset the camera cannot see resolves and reports
   // itself exactly like one that is on screen (§4.44).
   uint64_t materials_lit = 0;
+  // Draws recognised as the engine's chrome pass *and* carrying a lighting map, cumulative and
+  // per draw for the same reason `materials_lit` is. A reflective unit whose texture ships no map
+  // is not counted, because nothing about its draw changed.
+  uint64_t chrome_draws = 0;
 };
 
 // On by default. Off makes every material intern exactly as it did before this existed, so the
@@ -134,6 +185,15 @@ LightingMapParams &MutableLightingParams();
 // The lighting image for a base image's bindless slot, or kNoLightingMap. Cheap: a bounds check
 // and an array read.
 uint32_t LightingMapFor(uint32_t texture_index);
+
+// Whether a bindless slot is the engine's sphere-map texture, `units\reflect.rim` - i.e. whether
+// a material sampling it at stage 1 is Gunlok's chrome pass. That name is the whole interface:
+// nothing registers a chrome material, and the two the engine builds are the only things that
+// ever sample it (`ChromeMaterialUnit` and `ChromeMaterialMap`, both built once from WinMain).
+//
+// False whenever lighting maps are off, so `render.lighting_maps = false` reverts the chrome pass
+// to the engine's own behaviour along with everything else - the A/B stays one switch.
+bool IsChromeTexture(uint32_t texture_index);
 
 // Whether a bindless slot is one of *ours*. The material override resolves its keys by walking
 // every live image's name, and a lighting map's name contains its base texture's - so without

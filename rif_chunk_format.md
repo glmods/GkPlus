@@ -983,7 +983,8 @@ ShapeMergeDataChunk_FromData @ 0x005b97d0 num_polys = payload_size >> 2 -- never
 **Only the map object and the shadow object are ever merged.** Of the eight call sites of
 `RifFindObjectByName`, exactly two pass `merge_and_build = 1`: `ToMap`'s cold geometry path
 @ 0x0047f926 and `GetShape` @ 0x004ae6c4 (the `shadow object rif` / `shadow object name` pair).
-The other six - `ToMap` @ 0x00480b80, `FUN_0049c7b0` @ 0x0049da28, `FUN_00523440` (twice) and
+The other six - `ToMap` @ 0x00480b80, `FUN_0049c7b0` @ 0x0049da28, `InitBuiltinEffectObjects`
+(twice) and
 `EnterMainMenuScreen` (three times) - pass 0 and skip the merge entirely. So a *prop* with corrupt
 merge data is inert and a *level* with it is a crash.
 

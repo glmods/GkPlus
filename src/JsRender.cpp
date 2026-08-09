@@ -445,8 +445,23 @@ GK_LIGHTING_KNOB(specular_scale)
 GK_LIGHTING_KNOB(specular_from_diffuse)
 GK_LIGHTING_KNOB(gloss_min)
 GK_LIGHTING_KNOB(gloss_max)
+GK_LIGHTING_KNOB(chrome_scale)
+GK_LIGHTING_KNOB(chrome_blur)
 
 #undef GK_LIGHTING_KNOB
+
+// `render.chrome_texgen` - generate the chrome pass's texture coordinate from the bumped normal,
+// or read the mesh's UV1 as the engine does. A bool rather than a knob because there is no
+// meaningful blend between the two: they are different coordinates, and half of each is not a
+// sphere map.
+JSValue GetChromeTexgen(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::LightingParams().chrome_texgen);
+}
+
+JSValue SetChromeTexgen(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::MutableLightingParams().chrome_texgen = JS_ToBool(ctx, value) != 0;
+  return JS_UNDEFINED;
+}
 
 // `render.shade_mode` - honour D3DRS_SHADEMODE, or interpolate everything (VkDraw.h). Writable
 // for the same reason as the three above: on level02 it touches 2% of the draws and all of them
@@ -1009,6 +1024,9 @@ const JSCFunctionListEntry RenderProps[] = {
                    Setspecular_from_diffuseValue),
     JS_CGETSET_DEF("gloss_min", Getgloss_min, Setgloss_minValue),
     JS_CGETSET_DEF("gloss_max", Getgloss_max, Setgloss_maxValue),
+    JS_CGETSET_DEF("chrome_scale", Getchrome_scale, Setchrome_scaleValue),
+    JS_CGETSET_DEF("chrome_blur", Getchrome_blur, Setchrome_blurValue),
+    JS_CGETSET_DEF("chrome_texgen", GetChromeTexgen, SetChromeTexgen),
     JS_CFUNC_DEF("probe", 5, ProbeQuad),
     JS_CFUNC_DEF("depth_probe", 5, DepthProbe),
     JS_CFUNC_DEF("viewport_probe", 5, ViewportProbe),

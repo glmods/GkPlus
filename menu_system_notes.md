@@ -652,8 +652,8 @@ zero-init, so editing the cfg by hand is the only way to set it.
 function pointers. `ReadGLKeys` loads the word and immediately calls `ApplyShadowQuality`,
 which reads the *global* `ShadowQuality` — still the pre-load default at that point — so both
 the file value and that call are wasted. It comes out right anyway because `WinMain` ->
-`FUN_00523440` -> `FUN_0054f900` re-runs `ApplyShadowQuality` at `0x0046b9c3`, well after the
-copy-out at `0x0046b667`.
+`InitBuiltinEffectObjects` -> `FUN_0054f900` re-runs `ApplyShadowQuality` at `0x0046b9c3`, well
+after the copy-out at `0x0046b667`.
 
 #### The load guard: a new graphics card wipes everything
 

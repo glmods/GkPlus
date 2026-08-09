@@ -40,17 +40,49 @@ struct Entry {
 
 std::map<std::string, Entry> Entries;
 
+// How many registry slots hold the sphere map. Diagnostic only - see DescribeLightingMaps.
+size_t ChromeCount();
+
 // Base image bindless slot -> lighting image bindless slot. Rebuilt when the texture registry
 // changes, exactly like the material override's table and for the same reason.
 std::vector<uint32_t> ByBase;
 // Our own images' slots, so IsLightingImage can answer without a name comparison.
 std::vector<bool> Mine;
+// Slots holding `units\reflect.rim`, the engine's sphere map. A vector and not one index because
+// the registry can hold the same asset twice - a texture acquired under two GLDir categories gets
+// two images - and a miss here silently reverts a chrome pass to the stock path, which is exactly
+// the kind of thing that would be blamed on the shader.
+std::vector<bool> ChromeSlots;
 uint64_t ResolvedGeneration = 0;
+
+// The engine's sphere map, as `Normalised` spells a name.
+const char kChromeTexture[] = "units/reflect.rim";
+
+size_t ChromeCount() {
+  size_t count = 0;
+  for (const bool slot : ChromeSlots) {
+    count += slot ? 1u : 0u;
+  }
+  return count;
+}
 
 std::string Lowered(const std::string &text) {
   std::string out = text;
   for (char &c : out) {
     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return out;
+}
+
+// `Units\Reflect.RIM` -> `units/reflect.rim`. Lowered and forward-slashed, which is the only
+// spelling two names may be compared in: the engine's own asset names vary in both, and
+// `AwMaterial`'s came out of a `.gls` where an author typed them by hand.
+std::string Normalised(const std::string &rim_path) {
+  std::string out = Lowered(rim_path);
+  for (char &c : out) {
+    if (c == '\\') {
+      c = '/';
+    }
   }
   return out;
 }
@@ -241,6 +273,7 @@ const Entry &LoadFor(const std::string &lowered_rim) {
 // the next bump instead, which is the same frame in practice.
 void ResolveLightingMaps() {
   ByBase.clear();
+  ChromeSlots.clear();
   ++TheStats.resolves;
   if (!Enabled) {
     ResolvedGeneration = TextureRegistryGeneration();
@@ -250,6 +283,14 @@ void ResolveLightingMaps() {
   for (const TextureImageInfo &image : images) {
     if (image.name.empty() || IsLightingImage(image.index)) {
       continue;
+    }
+    // Before the companion lookup, not after: the sphere map has no lighting map of its own and
+    // would `continue` past this on the miss.
+    if (Normalised(image.name) == kChromeTexture) {
+      if (ChromeSlots.size() <= image.index) {
+        ChromeSlots.resize(size_t(image.index) + 1, false);
+      }
+      ChromeSlots[image.index] = true;
     }
     const Entry &entry = LoadFor(Lowered(image.name));
     if (!entry.found) {
@@ -308,6 +349,10 @@ bool IsLightingImage(uint32_t texture_index) {
   return texture_index < Mine.size() && Mine[texture_index];
 }
 
+bool IsChromeTexture(uint32_t texture_index) {
+  return Enabled && texture_index < ChromeSlots.size() && ChromeSlots[texture_index];
+}
+
 void EnsureLightingMapsResolved() {
   if (ResolvedGeneration != TextureRegistryGeneration()) {
     ResolveLightingMaps();
@@ -323,6 +368,7 @@ void ShutdownLightingMaps() {
   Entries.clear();
   ByBase.clear();
   Mine.clear();
+  ChromeSlots.clear();
   ResolvedGeneration = 0;
 }
 
@@ -343,10 +389,21 @@ std::string DescribeLightingMaps() {
       "specular_from_diffuse %.3f\n",
       Params.bump_scale, Params.bump_diffuse, Params.specular_scale, Params.gloss_min,
       Params.gloss_max, Params.specular_from_diffuse);
-  add("  %llu names probed, %llu with a file, %llu refused, %llu images, %llu materials lit\n",
+  add("  chrome_scale %.3f  chrome_blur %.1f  chrome_texgen %s  (%zu slot%s hold "
+      "units\\reflect.rim)\n",
+      Params.chrome_scale, Params.chrome_blur, Params.chrome_texgen ? "on" : "off",
+      ChromeCount(), ChromeCount() == 1 ? "" : "s");
+  add("  %llu names probed, %llu with a file, %llu refused, %llu images, %llu materials lit, "
+      "%llu chrome draws\n",
       (unsigned long long)TheStats.names_probed, (unsigned long long)TheStats.maps_found,
       (unsigned long long)TheStats.load_failures, (unsigned long long)TheStats.images_created,
-      (unsigned long long)TheStats.materials_lit);
+      (unsigned long long)TheStats.materials_lit, (unsigned long long)TheStats.chrome_draws);
+  // The slot count is the one thing here that separates "no reflective unit is on screen" from
+  // "the sphere map is not in the registry under the name we match", which look identical from a
+  // chrome_draws of 0 and have completely different fixes.
+  if (ChromeCount() == 0) {
+    out += "  units\\reflect.rim is not loaded: chrome is stock until a reflective unit spawns\n";
+  }
   // Only the names something was found for, plus the refusals. Listing every miss would print one
   // line per texture in the level, and "no companion file" is the normal case rather than news.
   size_t listed = 0;

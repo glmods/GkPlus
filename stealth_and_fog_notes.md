@@ -440,6 +440,43 @@ blocked by fog; visibility of an enemy in fog is a rendering consequence only.
 The one non-render consumer of the fog *system* is `SubmitAndFlushMapGeometry`, which uses
 the fog material (`FogSystem+0xec`) as the map's material when fog is on.
 
+### How it reaches the screen: the world's second texture stage
+
+Measured from the Vulkan capture layer on a paused level02 frame
+(`vulkan_renderer_notes.md` §4.51), which is what finally identified this from the
+rendering side. The fog material's second stage is the grid:
+
+```
+stage 0: the surface's own .RIM     MODULATE(TEXTURE, DIFFUSE)             texcoord 0
+stage 1: the 256x256 fog grid       BLENDTEXTUREALPHA(TEXTURE, CURRENT)    texcoord 1
+                                    alpha SELECTARG2 - alpha is untouched
+```
+
+Three things follow, and each was a standing question in one file or the other:
+
+- **The grid is uploaded as `D3DFMT_A8`** — 256x256, one mip, 65536 bytes, exactly one
+  byte per cell, matching the grid's own dimensions. An `A8` texture samples as
+  `(0, 0, 0, a)`, so the stage computes `lerp(current, black, a)`: it darkens toward
+  black by the cell's value. `world.fog`'s colour reads `{0, 0, 0, 1}`, which is the
+  same statement from the other end.
+- **It is the texture with no name.** The engine creates it rather than loading a `.RIM`,
+  so nothing that names an image by its asset ever sees it — which is why the renderer's
+  texture inventory carries exactly one unnamed image.
+- **It rides on the world's second UV set**, i.e. FVF `0x252`'s `uv1`. That coordinate is
+  *generated* — the `.rif` carries one UV list — and where it is generated is still not
+  established (`rendering_notes.md` §5 leaves that geometry builder undissected). A
+  world-space planar projection is the obvious shape for addressing a level-wide grid,
+  but no uv1 value has been read.
+
+The causal test, rather than the arithmetic: `world.fog.enabled = false` takes a world
+draw from two stages to one, and setting it back restores the stage.
+
+**This was mistaken for a baked lightmap for thirty-odd sections of the renderer's notes**,
+on the strength of the `.gls` `map` section naming a per-level `bitmaps\<level>.rim`. That
+file is the minimap — a 512x512 DXT1 top-down picture of the level, not resident while a
+level is up. Gunlok bakes its map lighting into per-vertex colours (`SHPVTINT`) and into
+nothing else.
+
 ---
 
 ## 9. Cross-references to fix elsewhere

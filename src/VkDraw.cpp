@@ -62,10 +62,18 @@ struct PushConstants {
   float gloss_min;
   float gloss_max;
   float specular_from_diffuse;
+  // The chrome pass's three, same reasoning. `chrome_texgen` is a float carrying 0 or 1 rather
+  // than a uint, so the whole knob block stays one type and the Slang struct needs no second
+  // layout rule for a single word.
+  float chrome_scale;
+  float chrome_blur;
+  float chrome_texgen;
 };
-// 72 bytes exactly - the six floats fill what was the tail padding the four addresses' 8-byte
-// alignment had left, so both sides end in the same place for once.
-static_assert(sizeof(PushConstants) == 72);
+// 88 bytes of a guaranteed 128: 84 of members, then 4 the four addresses' 8-byte alignment rounds
+// up to. The padding is C++'s alone - Slang's Push ends at 84 - and that is harmless in the one
+// direction it goes: vkCmdPushConstants writes 88 bytes into a 128-byte range and the shader reads
+// the first 84. Every member's OFFSET agrees, which is the part that has to.
+static_assert(sizeof(PushConstants) == 88);
 
 constexpr uint32_t kMaxDrawsPerFrame = 8192;
 
@@ -776,6 +784,27 @@ uint32_t InternMaterial(const DrawItem &item) {
     ++MutableLightingCounters().materials_lit;
   }
 
+  // Gunlok's chrome pass, recognised by what stage 1 samples. Keyed on the stage as it stands now
+  // for the same reason the lighting map is: a `render.material_override` that replaced the sphere
+  // map asked for that surface to stop being a reflection, and one that replaced something else
+  // *with* the sphere map asked for the opposite. Either way the question is what is sampled, not
+  // what the game named.
+  //
+  // Only meaningful with a lighting map on stage 0 - everything it gates is derived from one - so
+  // it is not set without one, which keeps a reflective unit that ships no map interning exactly
+  // as it did before this existed.
+  if (material.stage_count == 2 && material.lighting_texture != kNoTexture &&
+      IsChromeTexture(material.stage1_texture)) {
+    material.chrome = 1;
+    ++MutableLightingCounters().chrome_draws;
+    // The reflect stage asks for D3DTEXF_NONE, which AcquireSampler reproduces as a maxLod clamp -
+    // so `chrome_blur` cannot reach a single mip through the game's own sampler. See
+    // MippedSamplerFor in VkResources.h; it is a no-op unless the blur is switched on.
+    if (LightingParams().chrome_blur > 0.0f) {
+      material.stage1_sampler = MippedSamplerFor(material.stage1_sampler);
+    }
+  }
+
   const auto found = InternedMaterials.find(material);
   if (found != InternedMaterials.end()) {
     return found->second;
@@ -1209,6 +1238,9 @@ void RecordDraws(void *command_buffer) {
     push.gloss_min = lighting.gloss_min;
     push.gloss_max = lighting.gloss_max;
     push.specular_from_diffuse = lighting.specular_from_diffuse;
+    push.chrome_scale = lighting.chrome_scale;
+    push.chrome_blur = lighting.chrome_blur;
+    push.chrome_texgen = lighting.chrome_texgen ? 1.0f : 0.0f;
     if (push.vertices == 0) {
       continue;
     }

@@ -220,6 +220,20 @@ uint64_t TextureRegistryGeneration();
 uint32_t AcquireSampler(uint32_t mag_filter, uint32_t min_filter, uint32_t mip_filter,
                         uint32_t address_u, uint32_t address_v);
 
+// The same sampler with mipmapping permitted, for a caller that wants to select a level itself.
+// Returns `sampler_index` unchanged when it already mips, or when the table is full.
+//
+// It exists for exactly one caller - the chrome pass's roughness blur (src/VkLighting.h). D3D
+// carries "do not mipmap" as `D3DTEXF_NONE`, which Vulkan has no mipmapMode for, so AcquireSampler
+// reproduces it as `maxLod = 0.25`; and Gunlok's chrome material sets MIPFILTER to NONE on its
+// reflect stage. **A LOD bias through that sampler is therefore silently a no-op** - measured, an
+// 8-mip sweep of `render.chrome_blur` moved 0.004/255, below the 0.10 repeatability floor, on a
+// `units\reflect.RIM` that does carry all 5 of its levels.
+//
+// Deliberately a *variant* rather than a relaxation of the original: every draw the game itself
+// makes must keep the clamp, because §4.28 measured it as a real part of the picture.
+uint32_t MippedSamplerFor(uint32_t sampler_index);
+
 // The set and its layout, as opaque handles so this header keeps mentioning no Vulkan type
 // (the same reason RecordUploads takes a `void *`). Zero until the resources are up.
 //

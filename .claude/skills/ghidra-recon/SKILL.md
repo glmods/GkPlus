@@ -11,8 +11,9 @@ decompiles inline runs out of room to do the actual work — writing the C++ mir
 notes, building and testing.
 
 So: **the main context never calls `mcp__ghidra__*`.** It asks a question, a `ghidra-analyst`
-subagent answers it against the binary, and only the answer comes back. The decompiler output,
-the dead ends and the listing dumps stay in the subagent.
+subagent answers it against the binary — and, when it is the only agent running, writes what it
+learned back into the DB itself (see "Who applies the fix"). Only the answer comes back. The
+decompiler output, the dead ends and the listing dumps stay in the subagent.
 
 A `PreToolUse` hook enforces this — `.claude/hooks/deny-ghidra-in-main-context.sh`, wired up in
 `.claude/settings.json`. It denies `mcp__ghidra__*` unless the call comes from inside a subagent,
@@ -66,6 +67,33 @@ Fan out when the questions are independent: several `Agent` calls in one message
 concurrently. Use `SendMessage` to the same agent for a follow-up that depends on what it just
 found, so it keeps the context it built rather than paying to rebuild it.
 
+## Who applies the fix
+
+**One agent at a time: let it write.** If you are running a single `ghidra-analyst` and no other
+agent is touching the DB, it should normally be free to rename, retype, comment and otherwise
+improve what it passes through, as the Ghidra hygiene rules in `CLAUDE.md` ask. Say so in the
+brief.
+
+That is not a relaxation of the read-only habit, it is the cheaper arrangement. The agent already
+has the decompiler open and the surrounding analysis loaded; making it *describe* an edit so the
+main context can replay it is a lossy round trip of exactly the detail that is expensive to
+rebuild — and the main context cannot call `mcp__ghidra__*` at all, so every such edit would need
+a second delegation to apply what the first one already knew.
+
+Scope the authority rather than granting it open-endedly. A brief that says which functions,
+globals and types are in play, and that anything else found should be reported in prose and left
+alone, gets the hygiene without the drift.
+
+**Fanning out: read-only.** The DB is shared mutable state with no merge. Concurrent renames
+collide, one agent retypes a global another is reading through, and `createLabel` deleting a
+`Symbol` handle another holds is a race rather than the documented single-agent gotcha. When
+several agents run at once, they report and the main context applies — sequentially, afterwards,
+in one pass.
+
+The same rule decides `SendMessage` versus a fresh `Agent`: a follow-up to the agent that just
+did the work keeps its write authority and its context, where a new one starts blind and may
+contradict what the first one wrote.
+
 ## Example brief
 
 ```
@@ -93,10 +121,16 @@ The report is now your only record of that work — the tool output is gone. Two
   notes in the same session. That is main-context work; the subagent's job ended at the report.
   A correction in particular should land everywhere at once — the mirror, the notes, and the
   Ghidra DB — per the renaming convention in `CLAUDE.md`.
-- **Audit the DB changes the report lists.** Read-only is not enforced on delegated work, and a
-  subagent has renamed things it was told not to. The report's "Database changes" section is
-  what you check against, and a rename outside the task's scope is worth reverting before it
-  propagates into notes written later.
+- **Audit the DB changes the report lists**, whether or not you authorised them. Read-only is not
+  enforced on delegated work — a subagent told not to write has renamed things anyway — and an
+  agent that *was* given write authority will have used it. The report's "Database changes"
+  section is what you check against. What you are looking for is scope: a rename outside the task
+  is worth reverting before it propagates into notes written later, and a name that turns out to
+  describe the function wrongly is worse in the DB than a `FUN_` was, because it reads as settled.
+
+  A DB rename is also only one of the three surfaces. `CLAUDE.md`'s renaming convention wants the
+  `src/` mirror and every `*_notes.md` moved in the same pass, and the subagent cannot see whether
+  the old name appears there — so grep for it yourself once the report is in.
 
 Treat a finding marked uncertain as uncertain. If the next edit depends on it, send a follow-up
 asking for the measurement rather than building on the inference — the failure mode here is a

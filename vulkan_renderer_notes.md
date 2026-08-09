@@ -1257,8 +1257,15 @@ level01 session, and the two-stage ones are what matters:
 
 Stage 0 is always `MODULATE(TEXTURE, DIFFUSE)`. Stage 1 is `BLENDTEXTUREALPHA(TEXTURE, CURRENT)`
 (op 13, 49% of draws) or `ADDSIGNED(TEXTURE, CURRENT)` (op 8, 20%), on the second UV set, with
-its alpha `SELECTARG2` — i.e. the lightmap keeps the diffuse texture's alpha. `bitmaps\LEVEL01.rim`
+its alpha `SELECTARG2` — i.e. the stage keeps the diffuse texture's alpha. `bitmaps\LEVEL01.rim`
 is the lightmap; the second UV set §4.1 measured on FVF `0x252` is its coordinates.
+
+**There is no lightmap, and `bitmaps\LEVEL01.rim` is the minimap — see §4.51.** The two ops are two
+different subsystems: op 13 is the **fog of war** (a 256x256 `D3DFMT_A8` grid) and op 8 is the
+**chrome** pass §4.49 later identified. The name here was a join artefact; that file is a 512x512
+DXT1 top-down picture of the level, and it is not even resident while a level is up. The *shape*
+of this section's finding stands — the second stage was the whole flat-and-bright gap — and only
+the label was wrong.
 
 The shader implements twelve `D3DTEXTUREOP`s rather than all twenty-six, and the CPU counts a
 draw naming one it does not — `unsupported_stage_op`, 0 on level01. Two stages, not eight:
@@ -3929,6 +3936,10 @@ Two readings, neither of which is a difference image:
   **and then** `cmake --build build`. The first measurement of the fix reported it had changed
   nothing, and the screenshots were byte-identical to the ones before it — which is the signature.
   Hash the shots when a change is supposed to move pixels and does not.
+
+  **No longer true, and §4.50 is the fix**: `cmake --build` compiles the shaders now, and refuses a
+  stale header on a machine that cannot. The *signature* in the last sentence still stands and is
+  the part to carry forward.
 - **A draw index found by `find-draw.ps1` is the draw that painted that *pixel*, not the draw that
   produced the *difference* being chased.** Aiming at a pixel where both renderers agreed found
   draw 12, whose specular is zero in both, and half an hour went into asking why an agreeing draw
@@ -4128,6 +4139,305 @@ one file format.
   destroys every image and clears the cache, so it is a full reload — measured, an edited map
   changes 17% of the frame on the next toggle, and `images: 55 live / 63 created` says the old
   ones went.
+
+## 4.49 Gunlok already had a sphere map, and it collided with §4.48
+
+`chrome_enabled` @ 0x006a3000 — the `CHROME` console command's byte — is **on by default in the
+file image**, and it is live retail code rather than one of the game's several dead features. It
+made §4.48 apply a lighting map **twice** to every reflective unit, which is what sent this
+looking.
+
+### What the engine does
+
+Chrome is **not a modification of a draw; it is an extra draw of the same mesh**. A `Unit` whose
+`Role+0x78` carries bit 0x08 — the `reflective` flag, and 48 shipped roles set `reflective yes` —
+gets an 0x80-byte `WorldEffect` of kind 7 from `CreateChromeEffect` @ 0x0051bd30, called by
+`Unit_EnterWorld` @ 0x004b57c0. That is **Unit-tree vtable slot 51**, and `FUN_004b5b20` runs it
+over every entry of `UnitsTable` at level start, from the client's session-start handshake — so
+these exist from the moment the level is up rather than one per later spawn. `CreateChromeEffect`
+is idempotent per owner: it pre-walks `WorldEffectList` for a kind-7 entry whose `+0x34` is this
+unit. `DrawWorldEffects` @ 0x005201c0, case 7, re-submits that geometry every frame with a second
+material:
+
+| | per-unit `ChromeMaterialUnit` (`0x007b9e80`) | map-wide `ChromeMaterialMap` (`0x007b9f90`) |
+|---|---|---|
+| stages | 2 | 1 |
+| stage 0 | **the unit's own texture**, bound at draw time by `SceneMesh_Render` | `units\reflect.rim` |
+| stage 1 | `units\reflect.rim`, `COLOROP = ADDSIGNED` | — |
+| `TEXCOORDINDEX` | 1 — a plain second UV set, no texgen | **0x00010000 = `D3DTSS_TCI_CAMERASPACENORMAL`** |
+| reachable by | any `reflective` role | typing `REFLECT` with nothing under the cursor |
+
+The map-wide one is effectively debug-only, but it is worth keeping in view for one reason: it is
+**the only texture-coordinate generation anywhere in gl.exe**, and so it is the engine's own
+statement of how a chrome coordinate should be built. Neither `D3DTSS_TEXTURETRANSFORMFLAGS` nor
+`D3DRS_SPECULARENABLE` is set anywhere in the binary.
+
+### The collision, and why it was the good kind
+
+§4.48 hands a lighting map to every material whose **stage 0** is the mapped texture. The chrome
+pass's stage 0 *is* that texture — so a reflective unit with a companion file got the bump-derived
+normal and the highlight computed once per pass, with the ADDSIGNED reflect layer stacked on the
+second. On by default, no user action, 48 roles.
+
+The same accident is what made the fix cheap. Because stage 0 is the unit's texture, the chrome
+pass's `material.lighting_texture` **already resolves**, with no new plumbing to find the map. So
+rather than suppressing the map on that pass, the pass now *uses* it:
+
+- **`texgen_only`.** `shade_lighting_map` runs the height gradient and returns. No light loop, no
+  highlight, no diffuse ratio — those already ran in the base pass, and running them again was the
+  double-apply. Incidentally the cheap half: the chrome pass costs a few taps rather than a light
+  sum.
+- **The coordinate is generated from the bumped normal**, as `N_view.xy * 0.5 + 0.5`. That formula
+  is the engine's, taken from the map-wide material above and applied per pixel to a normal the
+  height field has tilted. An authored UV1 is fixed to the surface and cannot respond to a height
+  field at all; this is the only coordinate that can.
+- **The metallic channel weighs the reflection**, exactly as it weighs the highlight. G is
+  documented as intensity rather than a metal/dielectric switch, so one channel answering "how
+  shiny is this texel" for both responses is the coherent reading rather than a reuse.
+- **Roughness was meant to blur it**, as a mip bias, on the same reasoning. **It does not work,
+  and `chrome_blur` therefore defaults to 0** — see the measurements below.
+
+### The measurements
+
+level02, Vulkan, the settled start camera (`p{-9.909, 4.508, 2.482}`, roll 341, d 20), frame
+pinned with `screen.toggle_pause()`, all shots in one session. `render.lighting_map_report` reads
+`1 slot hold units\reflect.rim` and 86,850 chrome draws; `render.draw_info` finds **90 draws a
+frame** with `units\reflect.RIM` at stage 1.
+
+| comparison | MAD /255 | pixels differing |
+|---|---|---|
+| same settings twice — **the floor** | 0.104 | 0.21% |
+| chrome on vs off (`chrome_scale` 1 vs 0) | 0.435 | 2.61% |
+| generated coordinate vs the engine's UV1 | **0.573** | 2.99% |
+| engine's UV1 vs chrome off | 0.389 | 2.47% |
+| `chrome_scale` 1.0 vs 0.5 | 0.224 | 1.94% |
+| `chrome_scale` 0.5 vs off | 0.217 | 1.94% |
+| `chrome_blur` 0 vs 8 | 0.004 | 0.03% |
+
+Reproduced across two independent runs (0.435 against 0.431, 0.573 against 0.574). The two
+`chrome_scale` halves being equal within 0.007 is the check that the weighting is linear and that
+blending the stage's *result* degenerates the way it was meant to.
+
+The headline is the third row: **the generated coordinate moves the picture more than chrome
+itself does**, so the two coordinates genuinely disagree, and the engine's UV1 is not a sphere
+projection of anything the camera is doing. Visually the UV1 pass washes the units evenly while
+the generated one picks out surfaces by facing, which is what a reflection should do.
+
+**`chrome_blur` does not work**, and this is unresolved rather than explained. Ruled out: the
+texture (`units\reflect.RIM` is 256x256 and carries all 5 mips), the channel (the unit maps' B
+averages 0.58, so the requested LOD is ~2.3 not 0), the push-constant layout (`chrome_scale` and
+`chrome_texgen` sit either side of it and both work), and the branch (`chrome_texgen` only acts
+when the shade ran, so `shade.roughness` is being written). The open lead is the sampler: the
+chrome stage is `D3DTEXF_NONE` (`render.state` shows `filt 220`), which `AcquireSampler`
+reproduces as `maxLod = 0.25` per §4.28, so a bias cannot reach a second level. `MippedSamplerFor`
+was added to hand that stage a mipping variant and should have fixed it — but the bindless table
+still reports **4 samplers** with `chrome_blur` at 20, so the swap is not allocating one. Check
+the sampler count first.
+
+### Two traps in the instrument, not in the renderer
+
+- **The camera edge-scrolls while you are not looking.** Between two shot batches it walked from
+  `x -9.9` to `x -55.2` — the cursor was sitting over the window. Every knob then measured 0.000
+  or exactly the floor, which reads precisely like a dead feature; it was §4.44 again, with the
+  reflective units simply off screen. Park the cursor at the window centre, and **assert the
+  camera before and after a batch** rather than only settling before it. `camera.position` is
+  writable, which makes recovering a known viewpoint a one-liner rather than a relevel.
+- **A REPL string arrives with literal `\n`,** not newlines, so `-split "`n"` silently returns one
+  element and `Where-Object { $_ -match ... }` matches the entire blob. It looks like a successful
+  filter that found one row. Unescape first.
+
+### The three things that are easy to get wrong here
+
+- **Scale the stage's RESULT, not its argument.** The stage is ADDSIGNED — `current + (tex - 0.5)`
+  — so a zeroed *argument* darkens the surface by half instead of leaving it alone. Blending
+  between the value before the stage and the value after it degenerates exactly at 0, is
+  bit-identical at 1, and does not hard-code the op.
+- **An absent lighting map must read as metallic 1.0.** A 0 default is the natural-looking one and
+  it silently deletes the reflection from all 48 reflective roles on a stock install — a
+  regression that would read as "GkPlus broke chrome" rather than as a missing file.
+- **`StoreViewRotation` does not transpose, and `StoreEye` does.** They sit next to each other and
+  take the same matrix. `StoreEye` transposes because it is *inverting* the view to recover the
+  camera position; the sphere-map coordinate runs in the same direction the game does. Getting it
+  backwards mirrors the reflection left-to-right, which looks like a plausible picture rather than
+  like a bug.
+
+### A correction this turned up
+
+`AwTextureStage +0x2c` was modelled in `src/Render.h` as `field0x2c`, commented "read by
+[`AwMaterial_ApplyStage`] but not issued as a stage state". It **is** issued — as
+`D3DTSS_TEXCOORDINDEX`, and issued *last*, so it overrides the identity write that function makes
+first. It is now `texcoord_index`. The prior comment is what an audit that stops at the first
+write concludes; the field is the whole reason the chrome pass has a second UV set at all.
+
+### Not yet measured
+
+The per-unit chrome path uses UV set 1 with no texgen, and **whether a `reflective` unit's mesh
+carries authored sphere-map UVs there or is reusing a lightmap set is not established** — nothing
+in the chrome path touches vertex data, so the binary cannot answer it. It decides how this
+feature should be described: if UV1 is authored sphere coordinates, `chrome_texgen` is a
+deliberate change of look; if it is a lightmap set, the engine's own chrome pass was always wrong
+and this is a fix. One reflective unit through the Blender addon settles it.
+
+Also open, and a design question rather than a defect: a metallic texel now carries the map's
+highlight (base pass) **and** the reflection (chrome pass), both scaled by the same G. The clean
+resolution would be for the base pass to know a chrome pass is coming and back its highlight off —
+a **cross-draw dependency**, which is a different class of thing from anything else in this
+renderer. Not built speculatively; `specular_scale` is the lever until it is shown to need one.
+
+## 4.50 The shaders are built by the build now, and a stamp alone was not enough
+
+§4.46's second trap — editing a `.slang`, rebuilding, and measuring that nothing changed — is a
+defect in the *build*, not in anyone's attention, and it gets worse the moment there is more than
+one shader source. This closes it. It is a prerequisite for the per-pixel lighting work rather
+than part of it: every measurement that work takes is worthless if the binary can silently hold
+the previous SPIR-V.
+
+**The header stays checked in.** That is the constraint, not a detail: `d3d8.dll` must build on a
+machine with no Vulkan SDK, which is the same reasoning that makes the renderer reach Vulkan
+through volk rather than the loader's import library. So the requirement is not "compile the
+shaders" but **"never silently compile against a stale header"**, and it has two halves:
+regenerate where `slangc` exists, and **fail the build** where it does not and the header is stale.
+
+### The one thing that had to be right, and it was wrong first
+
+**The generated header must be a declared `add_custom_command` `OUTPUT`, not merely a side effect
+of one that outputs a stamp.** The first version stamped only, on the reasoning that the generator
+rewrites the header just when its contents change, so an unchanged shader should leave every
+dependent TU out of the rebuild. It does — and it also loses the dependency entirely: Ninja treats
+a file no edge declares as a plain source, decides `VkDraw.cpp.obj` is clean from the header's
+*current* mtime while building the graph, and only then runs the generator. Measured on a real
+edit: `[1/1] Compiling Slang shaders`, `wrote src/Shaders.gen.inc.h`, no recompile, and a d3d8.dll
+built against the previous SPIR-V. That is §4.46's exact symptom with an extra step in front of it,
+and it would have been read as "the fix does nothing".
+
+Both outputs is the answer, and each does a different job:
+
+- the **header**, so Ninja knows it is generated and orders every consumer after it;
+- the **stamp**, always touched, so the edge is clean next build even on the runs where the header
+  was not rewritten — without it `slangc` runs on every single build.
+
+CMake sets `restat = 1` on custom-command edges, which is what makes the pair work: the generator
+writes the header only on a real content change, so an unchanged shader leaves its mtime alone and
+Ninja re-stats and keeps the dependents clean. Verified in both directions — a real edit rebuilds
+`VkDraw.cpp` and relinks, and two consecutive builds report `ninja: no work to do`.
+
+### Staleness is a hash, because mtimes lie
+
+`--check` needs no `slangc`, so it can run on the machine that cannot regenerate. It compares
+hashes embedded in the header as comments: one over each source's bytes and one over the *recipe*
+(`ENTRY_POINTS` + `SLANGC_ARGS`), so adding an entry point or changing a flag marks the header
+stale even though no shader file moved. A timestamp rule would report stale on a clean tree and
+fresh after a branch switch that changed a shader — a git checkout does not preserve mtimes.
+
+`--deps` prints the sources `ENTRY_POINTS` names, and `CMakeLists.txt` consumes that at configure
+time rather than listing shaders itself. Two lists would drift, and the failure mode is a shader
+that silently stops being rebuilt — which is the thing this section exists to prevent.
+
+### What was measured
+
+| | |
+|---|---|
+| regenerating the checked-in header with the local `slangc` | **byte-identical SPIR-V** — 3558 and 5886 words, only the new hash comments differ |
+| second build with nothing changed | `ninja: no work to do` |
+| a real shader edit | generator runs, header rewritten, `VkDraw.cpp.obj` rebuilt, DLL relinked |
+| the same with the stamp as the only output | header rewritten, **nothing recompiled** — the defect above |
+| `--check` against an edited shader | exits 1, names `src/shaders/world.slang` and the command to run |
+| `--check` after changing `-O2` to `-O1` | exits 1, names the recipe |
+| a configure with `slangc` forced absent, then an edited shader | build **fails** with the same message |
+
+Every one of those guards was fired deliberately before being believed. A d3d8.dll hash is **not**
+usable as the signal here, incidentally — MSVC embeds a link timestamp, so it changes on every
+relink whether or not any input did; the reading is whether `VkDraw.cpp.obj` appears in Ninja's
+output.
+
+## 4.51 There is no lightmap: stage 1 is the fog of war, and the name was a join artefact
+
+§4.19 identified the second texture stage as the whole flat-and-bright gap, which was right, and
+called it "the lightmap … `bitmaps\LEVEL01.rim`", which was not. It is the game's **fog of war**.
+This matters beyond tidiness: a plan to re-light Gunlok's maps at runtime has to know what of the
+existing picture is baked lighting to be replaced, and the answer is now **`SHPVTINT` and nothing
+else** — there is no baked lightmap *texture* anywhere in a frame.
+
+### What was measured
+
+level02, Vulkan, settled start camera (`p{-9.909, 4.508, 2.482}`, roll 341, d 20), paused, 178
+actors, 273 draws. Every stage-1 configuration in the whole frame, by texture and colour op:
+
+| stage-1 texture | op | draws | what it is |
+|---|---|---|---|
+| `-1`, none | — | 112 | single-stage draws |
+| **8** — unnamed, 256x256, `format 28` = `D3DFMT_A8`, 1 level, 65536 bytes | `0x0d` `BLENDTEXTUREALPHA` | **71** | the fog of war |
+| **92** — `units\reflect.RIM`, 256x256 DXT1 | `0x08` `ADDSIGNED` | **90** | the chrome pass (§4.49) |
+
+Both stage-1 subsystems are therefore accounted for, and 90 reproduces §4.49's independently
+measured "90 draws a frame with `units\reflect.RIM` at stage 1" exactly.
+
+`render.draw_info(3)` on a world draw, decoded:
+
+```
+0: tex 28 colour 0x00000204   MODULATE(TEXTURE, DIFFUSE),        texcoord 0
+1: tex  8 colour 0x0101020d   BLENDTEXTUREALPHA(TEXTURE, CURRENT), texcoord 1
+                    alpha 0x00010203   SELECTARG2 - the stage does not touch alpha
+```
+
+**The causal test, which is what settles it rather than the arithmetic**: `world.fog.enabled =
+false` takes that draw from **2 stages to 1**, with stage 1's texture going to `-1` and its ops to
+zero; setting it back restores `tex 8` and op `0x0d`. Nothing about a lightmap would respond to the
+fog switch.
+
+### Why it had to be the fog, in hindsight
+
+Four things already in these notes point at it, and each was read as being about a lightmap:
+
+- **An `A8` texture samples as `(0,0,0,a)`**, so `BLENDTEXTUREALPHA(TEXTURE, CURRENT)` is
+  `lerp(current, black, a)` — darkening toward black by a per-texel amount. `world.fog` reports
+  `color {0,0,0,1}`, i.e. **black**, which is the same statement from the other side.
+- §4.19's own `D3DFMT_A8` swizzle defect is a fog defect: `{ONE,ONE,ONE,R}` instead of
+  `{ZERO,ZERO,ZERO,R}` "faded the distance to **white** instead of to black". A lightmap has no
+  reason to be alpha-only.
+- §4.19's `GKPLUS_NO_STAGE1` A/B renders "the ceiling structure that should be hidden clearly
+  visible". Hidden structure *becoming visible* is fog of war. A missing lightmap brightens; it
+  does not reveal.
+- `stealth_and_fog_notes.md` had the whole other half: a **256x256** grid uploaded every frame, and
+  `SubmitAndFlushMapGeometry` using the fog material as the map's material when fog is on. The two
+  files were describing one thing and neither cited the other.
+
+### The name, and the trap it is an instance of
+
+`bitmaps\LEVEL01.rim` is the **minimap / briefing map**: 512x512 DXT1, and decoding it shows a
+top-down render of the level with a radar reticle in the corner. It is one of a set — one per level,
+sitting in `Graphics\Bitmaps` beside the splash screens and briefing backdrops — it comes from the
+`.gls` `map` section's `bitmap` field, `pbr/README.md` measures it at 5,445 draws, and **it is not
+resident at all while a level is up** (absent from `render.textures` on the frame above). It could
+not have been on 75,000 two-stage draws.
+
+Two ways the wrong name survived so long, both worth carrying:
+
+- **A name arrived at by joining two lists is not a measurement.** The `.gls` names a per-level
+  `bitmaps\<level>.rim`, the frame has a per-level stage-1 texture, and the join is irresistible and
+  wrong. The stage-1 texture has **no name at all** — the engine creates it, so nothing in
+  `AcquireRimTexture` ever sees it, which is exactly why §4.14's "one unnamed image, a 256x256 with
+  no cache record" was sitting in these notes unexplained.
+- **A contradiction in the arithmetic was available the whole time.** `BLENDTEXTUREALPHA` reads the
+  stage texture's *alpha*, and `bitmaps\LEVEL02.rim` is DXT1 **with no alpha** — under which that op
+  degenerates to replacing the surface with the texture, i.e. painting the world with a picture of
+  itself from above. The named candidate could not perform the op it was credited with.
+
+### What is still open
+
+**Where `uv1` comes from is still not established**, and this narrows it rather than answering it:
+the coordinate now has a known consumer (a level-wide 256x256 grid), which makes a world-space
+planar projection the obvious shape, but no uv1 value has been read. `render.draw_geometry` prints
+positions and colours and not UVs, and the `.rif` carries one UV list (`SHPUVCRD`), so it is
+generated somewhere in the geometry builder `rendering_notes.md` §5 leaves undissected.
+
+This also tightens §4.49's "not yet measured": that section asked whether a `reflective` unit's UV1
+is authored sphere coordinates or "a lightmap set". **There is no lightmap set**, so the second
+option as phrased is gone — but a unit's UV1 and the world's UV1 need not be the same thing, and
+only the world's has been looked at here.
+
+Incidentally, the vertex dump on that draw shows diffuse `ff080808`, `ff0c0c0a`, `ff090908` — the
+`SHPVTINT` bake, and `0xFF080808` is the commonest value in the whole shipped set.
 
 ---
 

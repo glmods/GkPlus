@@ -2103,6 +2103,23 @@ void StoreNormalTransform(float *out, const D3DMATRIX &world) {
 // The camera in world space, for the specular halfway vector. The view matrix is world->view
 // and rigid, so its rotation inverts by transposition and the eye is the negated translation
 // carried back through it.
+// The world->view rotation, for the chrome pass's generated sphere-map coordinate.
+//
+// D3D is row-vector, so `view` maps a world direction to view space as `v * M` and its upper 3x3
+// is already the rotation we want - this only has to widen the rows to float4 for the shader's
+// std140 view of them. It is NOT transposed here: StoreEye transposes because it is *inverting*
+// the transform to recover the camera position, and this one runs in the same direction the game
+// does. Getting that backwards mirrors the reflection left-to-right, which reads as a plausible
+// picture rather than as a bug.
+void StoreViewRotation(float *out, const D3DMATRIX &view) {
+  for (int row = 0; row < 3; ++row) {
+    out[row * 4 + 0] = view.m[row][0];
+    out[row * 4 + 1] = view.m[row][1];
+    out[row * 4 + 2] = view.m[row][2];
+    out[row * 4 + 3] = 0.0f;
+  }
+}
+
 void StoreEye(float *out, const D3DMATRIX &view) {
   const float(&m)[4][4] = view.m;
   out[0] = -(m[3][0] * m[0][0] + m[3][1] * m[0][1] + m[3][2] * m[0][2]);
@@ -2263,6 +2280,7 @@ bool BuildDrawRecord(vulkan::DrawItem &item, const float *mvp, uint64_t frame) {
   std::memcpy(record.world, &world, sizeof(record.world));
   StoreNormalTransform(record.normal_transform, world);
   StoreEye(record.eye, State.have_view ? State.view : identity);
+  StoreViewRotation(record.view_rotation, State.have_view ? State.view : identity);
 
   StoreColour(record.material_ambient, State.material.Ambient);
   StoreColour(record.material_diffuse, State.material.Diffuse);

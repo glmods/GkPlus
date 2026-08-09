@@ -2303,6 +2303,36 @@ declare module "gk" {
      *  interpolated in log2, so the knob behaves evenly across the range. */
     gloss_max: number;
 
+    /** How much of Gunlok's own chrome pass survives, before the lighting map's
+     *  metallic channel scales it. 1.0 (the default) is the engine's own
+     *  strength; 0 removes the reflection.
+     *
+     *  A `reflective` role - 48 of the shipped ones - is drawn a second time
+     *  with `units\reflect.rim` ADDSIGNED over its own texture. That pass's
+     *  stage 0 is the same texture as the base pass, so the same lighting map
+     *  applies, and its **metallic** channel weighs the reflection exactly as it
+     *  weighs the highlight. All three `chrome_*` knobs are inert on a texture
+     *  with no companion file. */
+    chrome_scale: number;
+    /** How far the roughness channel may blur the reflection, in mip levels.
+     *  B already means the highlight's sharpness, and a rough surface reflecting
+     *  less sharply is that same statement made in the sphere map.
+     *
+     *  **Defaults to 0 because it does not work yet.** Sweeping it 0 to 20 on
+     *  level02 moves 0.012/255 against a 0.010 floor - noise. The texture, the
+     *  channel and the push constant have all been ruled out; the open lead is
+     *  the chrome stage's `D3DTEXF_NONE` sampler and the `maxLod` clamp that
+     *  reproduces it. See `LightingMapParams::chrome_blur` in src/VkLighting.h. */
+    chrome_blur: number;
+    /** Generate the chrome pass's texture coordinate from the bumped normal
+     *  instead of reading the mesh's second UV set. Default true.
+     *
+     *  The generated one is the only coordinate that can respond to the height
+     *  field at all, and the formula is the engine's own - Gunlok's map-wide
+     *  chrome variant asks D3D for `D3DTSS_TCI_CAMERASPACENORMAL`, which is the
+     *  camera-space normal's xy. False reproduces the engine's per-unit path. */
+    chrome_texgen: boolean;
+
     /** Run the specular term of the per-vertex light sum. The mirror image of
      *  `GKPLUS_NO_SPECULAR`, which forces `D3DRS_SPECULARENABLE` off in the
      *  *forwarded* call only: with both, the term can be removed from one paused

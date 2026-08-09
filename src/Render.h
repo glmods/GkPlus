@@ -396,11 +396,20 @@ struct AwTextureStage {
   unsigned min_filter; // +0x1c
   unsigned mag_filter; // +0x20
   unsigned mip_filter; // +0x24
-  // +0x28 is not touched by AwMaterial_ApplyStage at all; +0x2c is read by it but
-  // not issued as a stage state. The 0x30 stride is fixed by AwMaterial_Compile's
-  // walk, so these two exist whatever they hold.
+  // +0x28 is not touched by AwMaterial_ApplyStage at all. The 0x30 stride is fixed
+  // by AwMaterial_Compile's walk, so it exists whatever it holds.
   int field0x28;
-  int field0x2c;
+  // +0x2c D3DTSS_TEXCOORDINDEX, and the authoritative one: AwMaterial_ApplyStage
+  // @ 0x005a2060 issues that state TWICE, first with the stage's own index and
+  // then, as its last act, with this field - so this is what survives. (It was
+  // previously modelled as `field0x2c` with a comment saying it was read but not
+  // issued, which is what an audit stopping at the first write would conclude.)
+  //
+  // The only two values the game ever puts here are 1, on the chrome pass's
+  // stage 1 - a second UV set - and 0x00010000, which is
+  // D3DTSS_TCI_CAMERASPACENORMAL and the binary's ONLY texture-coordinate
+  // generation, on the map-wide chrome material. See src/VkLighting.h.
+  int texcoord_index;
 };
 static_assert(sizeof(AwTextureStage) == 0x30);
 
