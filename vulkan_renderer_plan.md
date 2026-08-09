@@ -19,6 +19,22 @@ the per-frame material table rather than a per-draw interception, which is what 
 built for (§4.44). Verified on level02 paused: each of the three confined to the player character's
 bounding box, and **removing the override restores the frame bit-identically**.
 
+**And it now loads an asset the game never had** (§4.48). A `<texture> lighting.dds` beside a
+`.RIM` — in a mod under `gkplus/mods` or in the install — gives that one texture a bump/metallic/
+roughness response: **R height, G highlight intensity, B highlight sharpness**, with the normal
+derived at draw time from R's gradient against a tangent frame taken from the fragment's own
+derivatives, so the canonical 48-byte vertex is unchanged. **The whole interface is the file
+name**; nothing registers it. That makes it the first image this side creates, uploads and owns a
+bindless slot for — §5's missing half, where the material override could only ever point at a
+texture the game had already loaded. Worth **2.00/255 over 22% of the frame** on level02 with a
+synthetic map, and `render.lighting_maps = false` restores it **bit-identically**.
+
+Three defaults in it are measurements, not taste, and each would have shipped wrong: every light
+reaching level02's ground authors `specular 0 0 0` (so the highlight takes the light's *diffuse*
+colour by default), the key light is `diffuse 4.0` (so `specular_scale` defaults to 0.25, its
+reciprocal), and a bump that only shapes highlights is invisible wherever metallic is 0 (so the
+derived normal reaches the diffuse too, as a ratio).
+
 **Compare against `GKPLUS_RENDERER=d3d8`, not d3d9** (§4.33). Windows 10 still ships a 32-bit
 `d3d8.dll` in SysWOW64, so that mode runs the game on the original runtime with the capture layer
 and the whole REPL harness intact — which is what makes the frame alignable, and a reference you
@@ -195,6 +211,7 @@ and still forwards every call to d3d8to9 so the A/B stays available.
 | **The specular sum runs only over lights with `N·L > 0`** | ✅ §4.46 — the ledge that was "much redder in Vulkan". Bit-identical specular over all 104,693 lit pixels, and the whole frame at the fire camera drops **2.093 → 0.522 against a 0.521 cross-launch floor** |
 | **The viewport's RECTANGLE** — `D3DVIEWPORT8::X/Y/Width/Height`, per draw, as the Vulkan viewport *and* scissor | ✅ §4.47 — the upgrade screen that filled the window. 17.23 → **0.089** against the real D3D8 there, and the noise floor in level |
 | **A pre-transformed vertex's depth** — `clamp(z, MinZ, MaxZ)`, not the viewport transform | ✅ §4.45 — the flames that came and went with camera distance. Every screen-space draw sat `MinZ * (1 - z)` too far away; the flame's retention across a distance sweep goes from a 79% → 0.9% collapse to a flat ~92% |
+| **Lighting maps** — `<texture> lighting.dds` beside a `.RIM`, bump/metallic/roughness, loaded from a mod or the install | ✅ §4.48 — the first image this side creates and owns a bindless slot for, which is what §5's "a replacement texture the capture layer never saw" needed. 2.00/255 over 22% of level02 with a synthetic map, and off is bit-identical |
 
 Steady state on level01, in level, under validation:
 
@@ -301,16 +318,19 @@ Read these before changing the draw path; each cost real time to establish.
 
 In order, most visible first.
 
-1. **Where a material override comes FROM** (§5). The override exists and is verified (§4.44), but
-   the only way to register one is `render.material_override` from a script or the REPL — so it is
-   a session-scoped experiment rather than something a mod ships. The rest of §5's shape is what
-   closes that: a manifest in `gkplus/mods/*.zip` read through `src/Vfs`, so an override arrives
-   with the assets it refers to, and — the bigger half — **a replacement texture loaded from the
-   mod rather than picked out of what the game already loaded**. Today `texture:` can only name
-   another live image, which is enough to prove the mechanism and not enough to reskin anything.
-   `utils/rimutil` already converts PNG → `.RIM` in both directions, and the VFS already serves a
-   `.rim` by name, so the missing piece is a texture the *capture layer* never saw: an image
-   created and uploaded by this side, holding a bindless slot of its own.
+1. **Where a material override comes FROM** (§5). **Half of this is closed by §4.48** — an image
+   this side creates, uploads and owns a bindless slot for now exists, loaded from `src/Vfs` or the
+   install by file name, and the lighting maps prove the whole path. What is left is the *override*
+   half: the only way to register one is `render.material_override` from a script or the REPL, so
+   it stays a session-scoped experiment rather than something a mod ships. The shape that closes it
+   is a manifest in `gkplus/mods/*.zip` read through the VFS, so an override arrives with the
+   assets it refers to — and `texture:` naming a file rather than another live image, which is now
+   a matter of pointing `SetMaterialOverride` at the same loader `VkLighting` uses. `utils/rimutil`
+   already converts PNG → `.RIM` in both directions.
+
+   The lighting maps also suggest the cheaper convention: **a file name is an interface**. Nothing
+   registers a `<texture> lighting.dds`, which is why it needs no manifest at all, and a
+   `<texture> replace.rim` would need none either.
 
 2. **Re-audit what else a deferred readback has been vouching for** (§4.42). `verify_buffers` and
    `verify_textures` both read *now* and compare against what the game holds *now*, which is a
@@ -411,6 +431,8 @@ level02 when starting fresh.
 | `render.half_pixel` | run-time only, on by default: the D3D9 pixel-centre convention as a half-pixel viewport origin (§4.28). Off is the pre-§4.28 behaviour, and worth 1.34/255 over the whole frame |
 | `GKPLUS_VK_OFFSCREEN=0` / `render.offscreen` | on by default: rasterise the world at the **game's** backbuffer size into an offscreen target and blit it onto the swapchain, rather than drawing straight into the swapchain and letting the viewport scale every 2D draw (§4.37, §4.38). Off is the pre-§4.38 behaviour exactly, and worth **2.55/255 over 65% of the frame**. `render.vulkan_report` says which is running |
 | `render.present_linear` | run-time only, **off** by default: the filter for that final scale. NEAREST is a deduction, not a default — the original's own stretch preserves a 4-bit texture's sixteen distinct values, which a filtered downscale could not (§4.37) — and this is the A/B for it |
+| `render.lighting_maps` | **not a diagnostic — a mod-facing feature** (§4.48). On by default: load `graphics/<dir>/<stem> lighting.dds` (or `_lighting.dds`) beside every `.RIM` the renderer knows a name for, from a mod under `gkplus/mods` first and the install second, and give every material whose **stage 0** is that texture a bump/metallic/roughness response. Off interns every material exactly as the build before it did, so it A/Bs on one paused frame at a 0.000 floor — and setting it back to `true` **destroys every image and re-reads every file**, which is the authoring gesture: a map edited while the game runs is picked up by `false` then `true` and by nothing else. `render.lighting_map_report` is the readback, and it is not optional reading — a texture with no companion file is the *normal* case, so a misnamed file and a stock install look identical from the screen |
+| `render.bump_scale` / `bump_diffuse` / `specular_scale` / `specular_from_diffuse` / `gloss_min` / `gloss_max` | the lighting maps' knobs, uniform per frame and therefore free to sweep on a paused frame. Three of the defaults are measurements (§4.48): `specular_scale` is **0.25** because level02's key light is `diffuse 4.0` and 1.0 saturates a floor to white; `specular_from_diffuse` is **1** because every light reaching that floor authors `specular 0 0 0`, so at 0 — the game's own answer, and what the fixed-function term uses — the metallic channel does nothing over most of a level; `bump_diffuse` is **1** because a bump that only shapes highlights is invisible wherever metallic is 0 |
 | `render.material_override(name, spec)` | **not a diagnostic — the first mod-facing feature** (§4.44). `name` is a case-insensitive substring of a live texture's `.rim` path; `spec` is `{texture, tint: [r,g,b,a?], hide}` or null to remove. Returns the readback, because a substring key that matches nothing — or matches more than was meant — is not an error and cannot be seen from the call. `render.material_overrides` re-reads it, `render.clear_material_overrides()` empties it. **An override that resolves and paints nothing looks exactly like a broken one**: check `draws overridden` in `render.draws`, and pick a target off `render.frame_draws()` so it is one the camera can see |
 | `render.rhw_depth_raw` | run-time only, on by default: a pre-transformed vertex's z is the depth value clamped to the viewport slice, which is what D3D does, rather than something to run the viewport's depth range over (§4.45). Off is the pre-§4.45 behaviour. Read at **record** time, so both halves — `BuildMvp`'s compensation and the pipeline's `depthClampEnable` — move together; the game re-issues the same draws while paused, so it still A/Bs on one frame |
 | `render.depth_probe(armed, quad_z, clear_z, min_z, max_z)` | draw one opaque magenta quad through the capture device against a depth buffer cleared to a known value under a known viewport slice, `ZFUNC LESS`, no depth write. The quad is either there or it is not, which is what settled §4.45 when nothing about Gunlok's own draws could. **Read it in `d3d8` or `d3d9`**: the clear goes straight to the forwarded runtime, because recording it would have made it the whole Vulkan frame's depth clear. Two rules for using it: discriminate **in both directions** — a monotonic map preserves ordering, so one row is always explicable by the other model plus an offset — and keep `quad_z` **inside** the slice unless the range handling is what you are measuring, or you measure the clamp and read it as the mapping |
@@ -967,7 +989,8 @@ Things worth knowing before editing:
 | `src/VkContext.h/cpp` | Instance, physical device, logical device, validation. Lazily initialized — **never from `DllMain`**, since volk calls `LoadLibrary` and that deadlocks under the loader lock |
 | `src/VkRenderer.h/cpp` | Surface, swapchain, frames in flight, the ImGui backend, present — and the **offscreen colour target** the world is rasterised into at the game's own backbuffer size, blitted onto the swapchain at the end (§4.38). The extent comes from `d3d8::BackBufferExtent`, i.e. from the present parameters, not from the D3D viewport: the swapchain shows the whole backbuffer, so that is what the blit's source has to be. The overlay has its **own pass on the swapchain image**, after the blit, so it stays 1:1 with the window instead of going through the scale |
 | `src/VkResources.h/cpp` | VMA arenas, the staging ring, the texture images (creation, format mapping, upload, readback verification) and the bindless descriptor set. Nothing device-local is ever mapped. **The vertex arena aligns slots to `sizeof(CanonicalVertex)`, not 16** — a draw addresses its buffer as a vertex index, and a 16-byte-aligned slot silently pulls the wrong vertices (notes §4.16) |
-| `src/VkDraw.h/cpp` | The world pass: one `VkPipeline` per distinct blend/depth/cull state (five on level01, built on first sight — notes §4.19), the depth buffer, the per-frame draw list, and the **shader ABI** (`GpuLight`, `GpuDrawRecord`, `GpuMaterial` — the three arrays a draw is looked up in, §4.26 and §4.30). A draw binds nothing and its push constants describe nothing: four device addresses and three indices, 48 bytes. Vertices, its own record, its material and the lights are all pulled by address, from the arena for buffered draws and from a per-frame host-visible scratch for user-pointer ones (§4.18). **Materials are interned per frame** — 274 draws on level02 are 29 of them — which is what makes a second pass over the frame a walk over the draw array rather than a replay of the recording loop. **The list is never sorted**: the game's own order is what makes blending correct |
+| `src/VkDraw.h/cpp` | The world pass: one `VkPipeline` per distinct blend/depth/cull state (five on level01, built on first sight — notes §4.19), the depth buffer, the per-frame draw list, and the **shader ABI** (`GpuLight`, `GpuDrawRecord`, `GpuMaterial` — the three arrays a draw is looked up in, §4.26 and §4.30). A draw binds nothing and its push constants describe nothing: four device addresses and three indices, 44 bytes of the 72 the block is (the rest is frame-uniform knobs — the LOD probe and §4.48's lighting-map parameters — which ride a push because it is the cheapest way to deliver a float that is the same for every draw). Vertices, its own record, its material and the lights are all pulled by address, from the arena for buffered draws and from a per-frame host-visible scratch for user-pointer ones (§4.18). **Materials are interned per frame** — 274 draws on level02 are 29 of them — which is what makes a second pass over the frame a walk over the draw array rather than a replay of the recording loop. **The list is never sorted**: the game's own order is what makes blending correct |
+| `src/VkLighting.h/cpp` | **Lighting maps** (§4.48): the companion `<texture> lighting.dds` beside a `.RIM`, its two lookup roots and two suffix spellings, the per-name cache (**including the misses**, which is what keeps a texture with no companion from costing a file probe per frame), the images this side creates, and the base-slot → lighting-slot table. Keyed and resolved exactly like the material override — by `.rim` name, on `TextureRegistryGeneration()` — and it depends on nothing in the capture layer, because a lighting map is a texture D3D never sees. The decoder is `src/Dds`, unchanged and shared with the engine-facing codec |
 | `src/VkCapture.h/cpp` | RenderDoc via its in-app API, so `render.capture()` grabs one frame from the REPL. Off unless `GKPLUS_RENDERDOC` is set, and loaded before the Vulkan instance because it captures by inserting a layer. **Opening a capture has two traps, both reported as `VK_ERROR_OUT_OF_DEVICE_MEMORY` and neither about VRAM** — the *replayer* must be 32-bit (launching from the x86 tooling does not help; the UI replays in its own x64 process, so it needs `x86\renderdoccmd.exe remoteserver`), and an in-level capture needs `GKPLUS_VK_HEAPS=small` (notes §4.17) |
 | `src/shaders/*.slang`, `src/gen-shaders.py` | The shaders, in **Slang**, compiled offline to `src/Shaders.gen.inc.h` so `d3d8.dll` needs no shader toolchain. Re-run the generator after editing one |
 | `src/VertexFormat.h/cpp` | Every FVF the game uses → one canonical 48-byte vertex. Pure CPU, no Vulkan and no D3D headers |

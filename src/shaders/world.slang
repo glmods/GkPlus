@@ -53,7 +53,7 @@ struct GpuDrawRecord {
 };
 
 // One material: the two texture stages and the alpha test. Must match GpuMaterial in
-// src/VkDraw.h field for field, and 48 bytes is a multiple of 16, so the array stride is the
+// src/VkDraw.h field for field, and 64 bytes is a multiple of 16, so the array stride is the
 // same under std140, std430 and scalar rules alike.
 //
 // The stages are flat rather than an array for the same layout reason the vertex is three
@@ -86,13 +86,21 @@ struct GpuMaterial {
     // game itself produces, which is the identity, so nothing here branches on whether an
     // override exists.
     uint tint;
+    // The lighting map for this surface's stage-0 texture, or kNoTexture - which is what every
+    // material the game itself produces carries. R is a height field, G the highlight's intensity
+    // and B its sharpness; see src/VkLighting.h for where the file comes from and what the three
+    // channels are allowed to mean.
+    uint lighting_texture;
+    uint pad0;
+    uint pad1;
+    uint pad2;
 };
 
 static const uint kShadeFlat = 1u;
 
-// 44 bytes of a guaranteed 128, where it was 120 before the draw record and 72 before the
-// material table (§4.19, §4.26, §4.30). Four addresses and three indices: nothing here
-// describes a draw, which is the whole of §2's design.
+// 72 bytes of a guaranteed 128 (§4.19, §4.26, §4.30, §4.48). Four addresses and three indices:
+// nothing there describes a draw, which is the whole of §2's design. The trailing floats are
+// frame-uniform knobs rather than per-draw data - see PushConstants in src/VkDraw.cpp.
 struct Push {
     ConstBufferPointer<Vertex> vertices;
     ConstBufferPointer<GpuDrawRecord> draws;
@@ -105,6 +113,18 @@ struct Push {
     // level, which is how "we pick the wrong level" is told apart from "we filter the level
     // wrongly" (§4.34).
     float force_lod;
+    // The lighting-map knobs, uniform for the whole frame. See LightingMapParams in
+    // src/VkLighting.h; they are here rather than in GpuMaterial because none of them varies per
+    // surface, and a tweak from the REPL should not re-intern the material table.
+    float bump_scale;
+    float bump_diffuse;
+    float specular_scale;
+    float gloss_min;   // the specular exponent at roughness 1
+    float gloss_max;   // ... and at roughness 0
+    // Which colour the highlight reflects: the light's specular at 0, its diffuse at 1. Defaults
+    // to 1 because every light reaching level02's ground authors `specular 0 0 0`; see
+    // LightingMapParams in src/VkLighting.h for the measurement.
+    float specular_from_diffuse;
 };
 
 [[vk::push_constant]]
@@ -149,6 +169,13 @@ struct VertexOut {
     nointerpolation float4 color_flat : COLOR2;
     nointerpolation float4 specular_flat : COLOR3;
     float4 uv : TEXCOORD0;    // xy = uv0, zw = uv1 - stage 1 is the lightmap set
+    // The two the LIGHTING MAP needs and nothing else does: D3D8's own equation is per vertex, so
+    // a bumped normal is the one thing that cannot be, and re-running the sum per pixel needs the
+    // vertex's world position and the surface's geometric normal. Zero on a draw that was not
+    // lit, where the fragment shader does not read them - a pre-transformed vertex has no world
+    // position to carry.
+    float3 world_position : TEXCOORD1;
+    float3 world_normal : TEXCOORD2;
 };
 
 // Four float4 rows back into the matrix they are. Rows, because everything on this side is
@@ -187,6 +214,59 @@ float4 material_source(uint lighting, uint shift, float4 material, float4 vertex
     return (source == 1u && have_vertex) ? vertex_colour : material;
 }
 
+// One light's geometry: the direction to it and the attenuation-times-spot factor D3D calls k,
+// or `valid = false` for a light this vertex is out of range of or outside the cone of.
+//
+// Factored out because the FRAGMENT shader runs the same loop for a lighting map, and the two
+// diverging silently is exactly the class of defect §4.46 was: a highlight computed under a
+// slightly different condition from the diffuse it sits on looks like an authoring problem in the
+// map rather than like a shader that disagrees with itself.
+struct LightGeometry {
+    float3 to_light;
+    float k;
+    bool valid;
+};
+
+LightGeometry light_geometry(GpuLight light, float3 world_position) {
+    LightGeometry out;
+    out.to_light = float3(0, 0, 1);
+    out.k = 1.0;
+    out.valid = true;
+
+    const float type = light.spot.w;
+    if (type >= 2.5) {
+        // Directional: no position, no attenuation. The CPU has normalised the direction.
+        out.to_light = -light.direction.xyz;
+        return out;
+    }
+    const float3 delta = light.position.xyz - world_position;
+    const float distance = length(delta);
+    if (distance > light.attenuation.w) {
+        out.valid = false; // outside Range, which switches the light off entirely
+        return out;
+    }
+    out.to_light = distance > 0.0 ? delta / distance : float3(0, 0, 1);
+    const float denominator = light.attenuation.x + light.attenuation.y * distance +
+                              light.attenuation.z * distance * distance;
+    out.k = denominator > 0.0 ? 1.0 / denominator : 1.0;
+    if (type >= 1.5) {
+        // Spot. rho is measured along the cone axis, so it needs the direction from the light to
+        // the vertex - the opposite of the vector the diffuse term wants.
+        const float rho = dot(light.direction.xyz, -out.to_light);
+        const float cos_theta = light.spot.x;
+        const float cos_phi = light.spot.y;
+        if (rho <= cos_phi) {
+            out.valid = false;
+            return out;
+        }
+        if (rho < cos_theta) {
+            out.k *= pow(saturate((rho - cos_phi) / max(cos_theta - cos_phi, 1e-6)),
+                         light.spot.z);
+        }
+    }
+    return out;
+}
+
 // The body, with the flat copies left to the entry point below. Two exits, and a third would be
 // easy to add - so nothing here writes `color_flat`.
 VertexOut shade_vertex(uint vertex_id) {
@@ -206,6 +286,10 @@ VertexOut shade_vertex(uint vertex_id) {
         mul(local, rows_to_matrix(draw.mvp[0], draw.mvp[1], draw.mvp[2], draw.mvp[3]));
     output.uv = v.uv;
     output.specular = float4(0, 0, 0, 0);
+    // Written before either exit below, because Slang requires every output to be assigned on
+    // every path and the fragment shader reads these only on the lit one.
+    output.world_position = float3(0, 0, 0);
+    output.world_normal = float3(0, 0, 1);
 
     const float4 vertex_colour = unpack_colour(asuint(v.normal_and_color.w));
     if ((draw.lighting & kLightSum) == 0u) {
@@ -230,6 +314,8 @@ VertexOut shade_vertex(uint vertex_id) {
     if ((draw.lighting & kNormaliseNormals) != 0u) {
         normal = normalize(normal);
     }
+    output.world_position = world_position;
+    output.world_normal = normal;
 
     const bool want_specular = (draw.lighting & kSpecularEnable) != 0u;
     const float3 to_eye = want_specular ? normalize(draw.eye.xyz - world_position) : float3(0, 0, 1);
@@ -241,38 +327,12 @@ VertexOut shade_vertex(uint vertex_id) {
 
     for (uint i = 0u; i < draw.light_count; ++i) {
         const GpuLight light = pc.lights[draw.light_offset + i];
-        const float type = light.spot.w;
-
-        float3 to_light;
-        float k = 1.0;
-        if (type >= 2.5) {
-            // Directional: no position, no attenuation. The CPU has normalised the direction.
-            to_light = -light.direction.xyz;
-        } else {
-            const float3 delta = light.position.xyz - world_position;
-            const float distance = length(delta);
-            if (distance > light.attenuation.w) {
-                continue; // outside Range, which switches the light off entirely
-            }
-            to_light = distance > 0.0 ? delta / distance : float3(0, 0, 1);
-            const float denominator = light.attenuation.x + light.attenuation.y * distance +
-                                      light.attenuation.z * distance * distance;
-            k = denominator > 0.0 ? 1.0 / denominator : 1.0;
-            if (type >= 1.5) {
-                // Spot. rho is measured along the cone axis, so it needs the direction from the
-                // light to the vertex - the opposite of the vector the diffuse term wants.
-                const float rho = dot(light.direction.xyz, -to_light);
-                const float cos_theta = light.spot.x;
-                const float cos_phi = light.spot.y;
-                if (rho <= cos_phi) {
-                    continue;
-                }
-                if (rho < cos_theta) {
-                    k *= pow(saturate((rho - cos_phi) / max(cos_theta - cos_phi, 1e-6)),
-                             light.spot.z);
-                }
-            }
+        const LightGeometry geometry = light_geometry(light, world_position);
+        if (!geometry.valid) {
+            continue;
         }
+        const float3 to_light = geometry.to_light;
+        const float k = geometry.k;
 
         const float lambert = max(0.0, dot(normal, to_light));
         ambient_sum += k * light.ambient.rgb;
@@ -399,6 +459,142 @@ Stage stage_at(GpuMaterial m, uint index) {
     return s;
 }
 
+// --- lighting maps ----------------------------------------------------------------------------
+//
+// What a `<texture> lighting.dds` beside a `.RIM` adds, and the one thing in this shader the game
+// never asked for beyond the override's tint. src/VkLighting.h is the file format and where it
+// comes from; this is what the three channels do.
+//
+// **The normal is derived, not stored.** R is a height field, and its gradient over one texel
+// tilts the geometric normal inside a tangent frame taken from the fragment's own derivatives -
+// Mikkelsen's cotangent frame, which needs no tangent in the vertex. That matters here more than
+// usual: the canonical vertex is 48 bytes and carries none (§4.10), and adding one would cost 12
+// bytes on every vertex in the game to serve the few surfaces a mod ships a map for.
+//
+// **The highlight is a second, per-pixel specular sum**, added after the texture stages exactly
+// where D3D adds its own second colour. It runs the same `light_geometry` the vertex shader does,
+// so range, attenuation and the spot cone cannot disagree between the two, and it takes the
+// light's **specular** colour, which Gunlok's lights really do author - all 49 `light` sections in
+// the shipped `.gsh` set a `specular red/green/blue`.
+//
+// **The bump also reaches the diffuse**, as a ratio rather than a re-lighting: the same sum with
+// the bumped normal over the same sum with the geometric one, blended by `bump_diffuse`. It is a
+// ratio because the fragment does not know which colour D3DRS_DIFFUSEMATERIALSOURCE selected, and
+// the ratio cancels it. That is exact only where the material's ambient and diffuse colours agree
+// - the ambient term is in both halves to keep a surface facing away from every light from
+// dividing by nothing - and it is why `render.bump_diffuse` exists as a knob rather than being
+// folded in.
+struct LightingMapShade {
+    float3 specular;      // to add after the stages
+    float3 diffuse_scale; // to multiply the vertex-lit colour by BEFORE them
+};
+
+LightingMapShade shade_lighting_map(GpuMaterial material, GpuDrawRecord draw, float2 uv,
+                                    float2 uv_dx, float2 uv_dy, float3 position_dx,
+                                    float3 position_dy, float3 world_position,
+                                    float3 world_normal) {
+    LightingMapShade out;
+    out.specular = float3(0, 0, 0);
+    out.diffuse_scale = float3(1, 1, 1);
+
+    const uint index = material.lighting_texture;
+    const uint sampler_index = material.stage0_sampler;
+
+    // SampleGrad, not Sample: this whole function runs under a branch on the material, and an
+    // implicit-derivative fetch in non-uniform control flow is undefined. The gradients are taken
+    // once at the top of the entry point, where control flow is uniform, and passed in - which
+    // also keeps the mip selection identical to the base texture's.
+    const float4 centre = textures[index].SampleGrad(samplers[sampler_index], uv, uv_dx, uv_dy);
+    const float metallic = centre.g;
+    const float roughness = centre.b;
+
+    uint width, height;
+    textures[index].GetDimensions(width, height);
+    const float2 texel = float2(1.0 / float(max(width, 1u)), 1.0 / float(max(height, 1u)));
+
+    // A central difference over one texel each way, so the gradient is in HEIGHT PER TEXEL and
+    // `bump_scale` means the same thing whatever the map's resolution: at 1.0, a full-contrast
+    // step across one texel is a 45-degree slope.
+    const float left =
+        textures[index].SampleGrad(samplers[sampler_index], uv - float2(texel.x, 0.0), uv_dx, uv_dy).r;
+    const float right =
+        textures[index].SampleGrad(samplers[sampler_index], uv + float2(texel.x, 0.0), uv_dx, uv_dy).r;
+    const float down =
+        textures[index].SampleGrad(samplers[sampler_index], uv - float2(0.0, texel.y), uv_dx, uv_dy).r;
+    const float up =
+        textures[index].SampleGrad(samplers[sampler_index], uv + float2(0.0, texel.y), uv_dx, uv_dy).r;
+    const float2 gradient = float2(right - left, up - down) * 0.5;
+
+    const float3 normal = normalize(world_normal);
+    // The cotangent frame: solve for the tangent and bitangent that carry this triangle's uv
+    // parameterisation, from the derivatives of position and uv that the rasteriser already has.
+    const float3 dp2perp = cross(position_dy, normal);
+    const float3 dp1perp = cross(normal, position_dx);
+    float3 tangent = dp2perp * uv_dx.x + dp1perp * uv_dy.x;
+    float3 bitangent = dp2perp * uv_dx.y + dp1perp * uv_dy.y;
+    const float tangent_length = length(tangent);
+    const float bitangent_length = length(bitangent);
+    if (tangent_length < 1e-12 || bitangent_length < 1e-12) {
+        // A degenerate frame: a zero-area triangle, or a draw whose uv does not vary across the
+        // pixel. There is no direction for a bump to lean in, so the map contributes nothing
+        // rather than a normalised NaN - which would paint one black pixel and be blamed on the
+        // artwork.
+        return out;
+    }
+    tangent /= tangent_length;
+    bitangent /= bitangent_length;
+    const float3 bumped = normalize(
+        normal - pc.bump_scale * (tangent * gradient.x + bitangent * gradient.y));
+
+    // Roughness to exponent, interpolated in log2: a linear walk from 4 to 256 spends nearly all
+    // of its range on highlights that are already broad, where the eye reads the difference
+    // between 4 and 8 as large and between 200 and 256 as nothing.
+    const float exponent = exp2(lerp(log2(max(pc.gloss_min, 1.0)), log2(max(pc.gloss_max, 1.0)),
+                                     saturate(1.0 - roughness)));
+    const float3 to_eye = normalize(draw.eye.xyz - world_position);
+
+    float3 ambient_sum = draw.global_ambient.rgb;
+    float3 diffuse_flat = float3(0, 0, 0);
+    float3 diffuse_bumped = float3(0, 0, 0);
+    float3 specular_sum = float3(0, 0, 0);
+
+    for (uint i = 0u; i < draw.light_count; ++i) {
+        const GpuLight light = pc.lights[draw.light_offset + i];
+        const LightGeometry geometry = light_geometry(light, world_position);
+        if (!geometry.valid) {
+            continue;
+        }
+        ambient_sum += geometry.k * light.ambient.rgb;
+        const float lambert = max(0.0, dot(normal, geometry.to_light));
+        const float lambert_bumped = max(0.0, dot(bumped, geometry.to_light));
+        diffuse_flat += geometry.k * light.diffuse.rgb * lambert;
+        diffuse_bumped += geometry.k * light.diffuse.rgb * lambert_bumped;
+        // Gated on the BUMPED lambert, which is §4.46's condition applied to the normal this term
+        // is actually shaded with: a facet turned away from the light carries no highlight, and
+        // the whole point of the map is that a facet is not the triangle.
+        if (lambert_bumped > 0.0) {
+            const float3 halfway = normalize(geometry.to_light + to_eye);
+            // NOT necessarily light.specular: see `specular_from_diffuse`. The fixed-function
+            // term above uses the authored specular colour because that is what D3D does; this
+            // one is a mod's response and defaults to the light a player can actually see,
+            // because level02's lights all author a black specular.
+            const float3 colour =
+                lerp(light.specular.rgb, light.diffuse.rgb, saturate(pc.specular_from_diffuse));
+            specular_sum += geometry.k * colour * pow(max(0.0, dot(bumped, halfway)), exponent);
+        }
+    }
+
+    out.specular = specular_sum * metallic * pc.specular_scale;
+    // Clamped to 4x: where the geometric normal faces away from every light the denominator is
+    // just the ambient term, and an unbounded ratio would make a bumped pixel there many times
+    // brighter than anything around it.
+    const float3 ratio = clamp((ambient_sum + diffuse_bumped) /
+                                   max(ambient_sum + diffuse_flat, float3(1e-3, 1e-3, 1e-3)),
+                               float3(0, 0, 0), float3(4, 4, 4));
+    out.diffuse_scale = lerp(float3(1, 1, 1), ratio, saturate(pc.bump_diffuse));
+    return out;
+}
+
 [shader("fragment")]
 float4 fragment_main(VertexOut input) : SV_Target {
     // Already the lit colour: the vertex shader ran D3D's lighting equation and what comes out
@@ -409,8 +605,35 @@ float4 fragment_main(VertexOut input) : SV_Target {
     // D3DSHADE_FLAT takes both output colours from the primitive's first vertex; the texture
     // coordinates are interpolated either way, which is why only these two have a flat copy.
     const bool flat_shaded = material.shading == kShadeFlat;
-    const float4 diffuse = flat_shaded ? input.color_flat : input.color;
+    float4 diffuse = flat_shaded ? input.color_flat : input.color;
     const float3 specular_in = flat_shaded ? input.specular_flat.rgb : input.specular.rgb;
+
+    // The lighting map, in two halves: a scale on the diffuse the texture stages are about to
+    // consume, and a highlight added after them. Both derivatives are taken HERE, in uniform
+    // control flow, because that is where they are defined - the branch below is uniform per
+    // draw, but the alpha test's `discard` further down is not, and a helper that took its own
+    // would be reading them across a divergence.
+    const uint stage0_set = (material.stage0_color >> 24) & 0xffu;
+    const float2 base_uv = stage0_set == 1u ? input.uv.zw : input.uv.xy;
+    const float2 uv_dx = ddx(base_uv);
+    const float2 uv_dy = ddy(base_uv);
+    const float3 position_dx = ddx(input.world_position);
+    const float3 position_dy = ddy(input.world_position);
+    float3 map_specular = float3(0, 0, 0);
+    // Only on a draw the game itself lit: the map's whole contribution is a light sum, and a
+    // pre-transformed or unlit draw has neither a world position to run it at nor lights to run
+    // it over. `kNoTexture` is what every material without a companion file carries, so nothing
+    // here costs anything on a stock install.
+    if (material.lighting_texture != kNoTexture) {
+        const GpuDrawRecord draw = pc.draws[pc.record];
+        if ((draw.lighting & kLightSum) != 0u) {
+            const LightingMapShade shade =
+                shade_lighting_map(material, draw, base_uv, uv_dx, uv_dy, position_dx,
+                                   position_dy, input.world_position, input.world_normal);
+            diffuse = float4(diffuse.rgb * shade.diffuse_scale, diffuse.a);
+            map_specular = shade.specular;
+        }
+    }
     // With every stage disabled the fixed function outputs the diffuse colour alone. That is
     // 2,160 draws a frame on level01 and used to sample whatever texture happened to still be
     // bound at stage 0, because the old path keyed off the binding rather than off COLOROP.
@@ -473,7 +696,10 @@ float4 fragment_main(VertexOut input) : SV_Target {
     // it rides its own varying instead of being folded into the diffuse. Zero unless the vertex
     // shader was asked for it, so this costs an add on draws that do not use it - level01 uses
     // none, which is how GKPLUS_NO_SPECULAR ruled it out as a gap (§4.20).
-    const float4 lit = float4(current.rgb + specular_in, current.a);
+    // ... and the lighting map's highlight rides beside it, in the same place and for the same
+    // reason: it is a specular term, so it is added after the stages rather than modulated by
+    // them, and after the alpha test so it cannot change which fragments survive.
+    const float4 lit = float4(current.rgb + specular_in + map_specular, current.a);
 
     // The material override's tint, last: after the stages, after the alpha test and after the
     // specular add. It is the only thing in this shader the game did not ask for, and it is

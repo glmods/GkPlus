@@ -101,6 +101,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/VertexFormat.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/VkContext.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/VkDraw.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/VkLighting.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/VkRenderer.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/VkResources.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Vfs.cpp"

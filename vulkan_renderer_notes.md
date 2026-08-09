@@ -4029,6 +4029,108 @@ level means the two behaviours are the same code path.
   has to happen inside one session, on consecutive shots, and the 0.043 repeat floor above is what
   makes that good enough.
 
+## 4.48 Lighting maps: a texture the capture layer never saw, addressed by file name
+
+The first thing here that loads an asset of its own. `render.material_override` (§4.44) proved a
+material-table entry can be rewritten, and could only ever point at a texture the *game* had
+already loaded — which is enough to prove a mechanism and not enough to reskin anything. This is
+the other half §5 named: an image created, uploaded and given a bindless slot by this side, that
+D3D has never heard of.
+
+**The whole interface is a file name.** For a texture the renderer knows as `Ground\gunlok
+rust.RIM`, `graphics/ground/gunlok rust lighting.dds` — from a mod under `gkplus/mods` or from the
+install — is loaded, and every material whose **stage 0** is that texture carries it. Nothing is
+registered, no script call exists to make one appear, and a texture with no companion costs one
+hash lookup for the life of the session. `src/VkLighting` is the whole subsystem; the shader half
+is `shade_lighting_map` in `world.slang`.
+
+Three channels, and the semantics are deliberately not PBR's: **R is a height field**, **G is the
+highlight's intensity** and **B is its sharpness**. The normal is derived from R's gradient at draw
+time against a tangent frame taken from the fragment's own derivatives (Mikkelsen's cotangent
+frame), which is what lets the canonical 48-byte vertex stay as it is — a tangent would have cost
+12 bytes on every vertex in the game to serve the few surfaces a mod maps.
+
+### It is keyed like the override, and resolved on the same trigger
+
+`TextureRegistryGeneration()` again: an image created, destroyed or named is the only event that
+can change what a name-keyed table resolves to, so `EnsureLightingMapsResolved` is a comparison
+against a counter per draw and a rescan when it moves. The generation is re-read at the **end** of
+a resolve rather than the start, because creating and naming our own image bumps it — reading it
+first leaves the table permanently stale and rescans every draw.
+
+Two things fall out of the two features sharing a name space, and both are real:
+
+- **A lighting map's own name contains its base texture's**, so `render.material_override("lava")`
+  would find `bitmaps\lava lighting.dds` as readily as `bitmaps\lava.rim` and could swap one in as
+  a replacement texture. `IsLightingImage` keeps them out of both name searches.
+- **The map is keyed on the stage-0 texture *after* an override may have replaced it**, which is
+  the opposite of how `tint` is keyed and is deliberate: a retextured wall is a different surface,
+  and giving it the old wall's bumps would be wrong.
+
+### What had to be measured, and what each measurement changed
+
+Every one of these was a default this feature would have shipped wrong.
+
+- **Gunlok's lights author a black specular colour where it matters.** All 49 `light` sections in
+  the shipped `.gsh` set carry a `specular red/green/blue` — but on level02 the four lights
+  reaching the ground (`render.draw_state`) read `specular 0.00 0.00 0.00` every one, including
+  the key directional. Keyed on the authored specular, the metallic channel does **nothing at all**
+  over most of a level: measured, the highlight moved 0.27% of pixels at 0.002 MAD. So
+  `specular_from_diffuse` exists and defaults to 1 — the highlight reflects the light a player can
+  see — with 0 restoring the game's own answer, which is what the fixed-function specular term uses.
+- **Gunlok over-drives its lights**, and that sets `specular_scale`. Level02's key light is
+  `diffuse 4.00 4.00 4.00`. With the highlight taking that colour, a fully-metallic texel at scale
+  1.0 saturates a whole floor to white. The default is **0.25**, the reciprocal of that intensity,
+  so `metallic = 1` reaches exactly 1.0 at normal incidence.
+- **A bump that only shapes highlights is invisible wherever metallic is 0**, which is most of a
+  real map. So the derived normal also reaches the diffuse, as a *ratio* — the same light sum with
+  the bumped normal over the same sum with the geometric one — blended by `bump_diffuse`, default
+  1. A ratio because the fragment does not know which colour `D3DRS_DIFFUSEMATERIALSOURCE`
+  selected, and the ratio cancels it; the ambient term is in both halves so a surface facing away
+  from every light does not divide by nothing, and it is clamped to 4x.
+
+### The measurements
+
+On level02, paused, camera at rest, against the same frame with `render.lighting_maps = false`,
+with a synthetic 256x256 map (checkerboard height, metallic 1, roughness 0.25) on the two textures
+that actually cover the frame:
+
+| | |
+|---|---|
+| off vs on, defaults | **2.00 MAD over 22.3% of the frame** |
+| off vs on, `bump_diffuse 0`, `specular_scale 6`, `gloss_max 32` | 54.1 MAD over 58% — the highlight alone, and blown out, which is what set the default |
+| **off vs off across the toggle** | **0.0000 MAD, 0 pixels** — an un-mapped material is byte-identical to the build before this |
+| mod-served vs install-served | the same picture; the report says which, `mod:graphics/...` or the absolute path |
+| validation, `seen == submitted`, materials, pipelines | unchanged — 0 errors, 274 draws / 29 materials / 12 pipelines |
+
+Both container forms are verified in the running game: uncompressed A8R8G8B8 (which needed the one
+new entry in `MapFormat`, `VK_FORMAT_B8G8R8A8_UNORM` — the game has never created that format, so
+`unsupported_formats` reading 0 for the renderer's whole life is what says adding it changes
+nothing) and **DXT1**, which is what a modder should use: three channels, no alpha, 8 bytes a
+block. The decoder is `src/Dds` unchanged, shared with the engine-facing codec — so DXT5 is
+refused **by name** here too, which is stricter than Vulkan needs and keeps one set of rules for
+one file format.
+
+### Two traps, one of which cost most of the session
+
+- **A key that resolves and paints nothing looks exactly like a broken feature** — §4.44's trap,
+  and it caught this one anyway. The first two textures mapped were `Ground\city ruins ground 1_a`
+  and `Ground\Ruins_MESSY CONCRETE 1024`; the report said 2 images and 3400 draws lit, and the A/B
+  moved **zero pixels**. Both are drawn every frame and neither is *visible* from the camera at
+  rest. What settled it was not reading more of the shader: `render.material_override(".rim",
+  {tint})` moved 99.4% of the frame, proving the material path, and then tinting twelve candidate
+  keys one at a time ranked them by how much of the frame each owns — `city ruins water tranch`
+  58%, `gunlok rust` 25%, the two originally chosen 0.15%. **Rank your target by tinting it before
+  concluding anything about a feature that paints through a material.**
+- **A cache of misses has to be droppable, or a map cannot be authored.** The negative cache is
+  what keeps a texture with no companion from costing a file probe per frame; it also means a file
+  dropped in while the game runs is never noticed. `render.lighting_maps = false` then `true` now
+  destroys every image and clears the cache, so it is a full reload — measured, an edited map
+  changes 17% of the frame on the next toggle, and `images: 55 live / 63 created` says the old
+  ones went.
+
+---
+
 GkPlus is a modding framework with a JS layer, a VFS and a REPL; the renderer should join that
 rather than sit beside it. Concretely: a `render` namespace (draw-list introspection, material
 override, register a post-process pass), and shaders loaded through `src/Vfs` so a mod ships

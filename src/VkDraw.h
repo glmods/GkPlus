@@ -154,22 +154,37 @@ struct GpuMaterial {
   // PipelineState carries its own states that way: the vocabulary stays the game's, so a draw is
   // comparable with `render.state`'s pipeline histogram with no decoder ring.
   //
-  // It occupies what was a pad word, so it costs nothing: 10 useful words round up to 48 bytes
-  // either way. Only FLAT and GOURAUD occur (§4.31); PHONG was never implemented by any D3D
-  // driver, and the shader treats anything that is not 1 as GOURAUD.
+  // It occupied what was a pad word when it was added, so it cost nothing. Only FLAT and GOURAUD
+  // occur (§4.31); PHONG was never implemented by any D3D driver, and the shader treats anything
+  // that is not 1 as GOURAUD.
   uint32_t shading = kShadeGouraud;
   // The material override's tint, as RGBA8 - R in bits 0..7 through A in 24..31, so 0xffffffff
   // is the identity and is what every material the game itself produces carries. Multiplied into
   // the fragment's final colour, after the texture stages, the alpha test and the specular add
   // (see SetMaterialOverride below).
   //
-  // It occupies what was `pad0`, so it costs nothing: eleven useful words round up to 48 bytes
-  // either way, and the two structs stay byte-comparable.
+  // It occupied what was `pad0` when it was added, so it cost nothing either.
   uint32_t tint = 0xffffffffu;
+  // The lighting map for this surface's **stage 0** texture, as a bindless slot, or kNoTexture -
+  // which is what every material the game itself produces carries, and what makes the whole
+  // feature a comparison in the fragment shader rather than a second code path. See
+  // src/VkLighting.h for what the file is and where it comes from.
+  //
+  // It is keyed on stage 0 for the same reason `tint` is: that texture is the surface's identity,
+  // where stage 1 is the lightmap set the game shares across a level. It samples through stage
+  // 0's own sampler, so a clamped surface's map is clamped too - a wrap mismatch between a
+  // texture and its own companion would show as a seam at exactly the edge.
+  uint32_t lighting_texture = kNoTexture;
+  // Reserved. Twelve useful words are 52 bytes and an array's std140 stride rounds to 64, so
+  // these are free, and spelling them out keeps the C++ and Slang structs the same size rather
+  // than leaving one to guess at the tail.
+  uint32_t pad0 = 0;
+  uint32_t pad1 = 0;
+  uint32_t pad2 = 0;
 
   bool operator<(const GpuMaterial &other) const;
 };
-static_assert(sizeof(GpuMaterial) == 48, "the scratch stride is part of the shader ABI");
+static_assert(sizeof(GpuMaterial) == 64, "the scratch stride is part of the shader ABI");
 
 // The fixed-function state that selects a VkPipeline, carried as the D3D values themselves
 // rather than as Vulkan enums: the translation belongs next to the pipeline it builds, and

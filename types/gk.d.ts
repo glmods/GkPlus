@@ -2258,6 +2258,51 @@ declare module "gk" {
     readonly material_overrides: string;
     clear_material_overrides(): void;
 
+    /** Lighting maps: a companion `<texture> lighting.dds` beside a `.RIM`, in a
+     *  mod under `gkplus/mods` or in the install itself, giving that one texture
+     *  a bump/metallic/roughness response the game never had.
+     *
+     *  Nothing registers it - the rule is the file name. A texture the renderer
+     *  knows as `Ground\gunlok rust.RIM` takes
+     *  `graphics/ground/gunlok rust lighting.dds` (or `..._lighting.dds`), and
+     *  the three channels are **R height, G highlight intensity, B highlight
+     *  sharpness**. The normal is derived from R at draw time, so the file is an
+     *  ordinary DXT1 or uncompressed DDS with no tangent data anywhere.
+     *
+     *  On by default. Off interns every material exactly as the build before this
+     *  existed, so it A/Bs on one paused frame at a 0.000 noise floor - and
+     *  setting it back to `true` **re-reads every file**, which is how a map
+     *  edited while the game is running is picked up. */
+    lighting_maps: boolean;
+    /** Which names were probed, what was found for them and where it came from,
+     *  plus the current knobs. Worth reading before concluding a map does not
+     *  work: a texture with no companion file is the normal case, so a misnamed
+     *  file and a stock install look identical from the screen. */
+    readonly lighting_map_report: string;
+    /** How far the height gradient may tilt the normal. 1.0 (the default) makes a
+     *  full-contrast step across one texel a 45-degree slope. Per texel, so a
+     *  higher-resolution map is gentler for the same artwork. */
+    bump_scale: number;
+    /** How much of the derived normal reaches the *diffuse* term, 0 to 1. At 0
+     *  the map only shapes highlights, which leaves a bump invisible wherever
+     *  `metallic` is 0; 1 (the default) relights the surface per pixel. */
+    bump_diffuse: number;
+    /** A multiplier on the added highlight. The default is **0.25**, not 1.0,
+     *  because Gunlok over-drives its lights - level02's key light is `4.0 4.0
+     *  4.0` - so a fully-metallic texel at 1.0 saturates to white. */
+    specular_scale: number;
+    /** Which colour the highlight reflects: the light's own specular colour at 0,
+     *  its diffuse colour at 1 (the default). Every light reaching level02's
+     *  ground authors `specular 0 0 0`, so at 0 the metallic channel does nothing
+     *  over most of a level; 0 is still the game's own answer, and what the
+     *  fixed-function specular term uses. */
+    specular_from_diffuse: number;
+    /** The specular exponent at roughness 1 - the broadest highlight. Default 4. */
+    gloss_min: number;
+    /** ... and at roughness 0, the sharpest. Default 256. The two are
+     *  interpolated in log2, so the knob behaves evenly across the range. */
+    gloss_max: number;
+
     /** Run the specular term of the per-vertex light sum. The mirror image of
      *  `GKPLUS_NO_SPECULAR`, which forces `D3DRS_SPECULARENABLE` off in the
      *  *forwarded* call only: with both, the term can be removed from one paused

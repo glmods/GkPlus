@@ -1,0 +1,29 @@
+[project]
+name = "gklightmap"
+version = "0.1.0"
+description = "Generate GkPlus lighting maps (bump/metallic/roughness .dds) from Gunlok's .RIM textures"
+requires-python = ">=3.11"
+# A *tool*, like `pbr/`, so it may have dependencies at all -- `blender/io_scene_rif`
+# must stay importable by Blender's own interpreter with nothing installed, and this
+# imports its decoders rather than reimplementing them.
+#
+# The HTTP client is stdlib `urllib`: one endpoint, one POST, a JSON body. A
+# dependency would buy retries and nothing else, and the retries are eight lines.
+dependencies = [
+    "numpy>=1.26",
+    "pillow>=10.0",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.6"]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "C4", "SIM"]
+ignore = ["UP031", "B905"]

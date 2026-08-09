@@ -86,7 +86,19 @@ uv run python tests/test_renderstate.py     # the draw-log profile and its norma
 uv run python tests/test_preview.py         # packing a map into a mod, and the de-light mask
 ```
 
-Lint is `uv run --group dev ruff check .` from `blender/` and from `pbr/`; the type check is
+`lightmap/`'s four take no arguments, need no install and no network, and are run from
+`lightmap/`. They are **not** in the style above — their `test_*` functions assert, so they are
+safe under any runner, and the runner has been confirmed to report and exit 1 on a deliberately
+broken assertion:
+
+```bash
+uv run python tests/test_dds.py         # the DDS writer against a re-derivation of src/Dds.cpp
+uv run python tests/test_openrouter.py  # the client's retries, with the POST stubbed
+uv run python tests/test_prompts.py     # prompt assembly - its *bytes* are a cache key
+uv run python tests/test_source.py      # what may be trimmed from an asset name, and what may not
+```
+
+Lint is `uv run --group dev ruff check .` from `blender/`, from `pbr/` and from `lightmap/`; the type check is
 `npx -y -p typescript tsc -p types/tsconfig.json` (see `js_bindings_notes.md`; TypeScript is not a
 dependency of this repo, which is why a bare `npx tsc` refuses to run).
 
@@ -385,6 +397,17 @@ before touching any of it.
 The one fact that shapes everything: **the seam is `Direct3DCreate8`, not the AWAPI render
 queue**, and the ground truth to compare against is `GKPLUS_RENDERER=d3d8` - the original runtime,
 still shipped in SysWOW64.
+
+It also draws two things the game never could, both keyed on a texture's `.rim` name:
+`render.material_override` retextures, tints or hides every draw sampling one asset, and
+**`src/VkLighting`** gives one a bump/metallic/roughness response from a companion
+`<texture> lighting.dds` served by `src/Vfs` or the install - **R height, G highlight intensity,
+B highlight sharpness**, the normal derived at draw time so the 48-byte canonical vertex is
+unchanged. Nothing registers a lighting map; the interface is the file name, and `lightmap/`
+generates one. Its defaults are
+measurements (`vulkan_renderer_notes.md` §4.48) - Gunlok's lights author a **black specular** and
+a **4.0 diffuse**, which is why the highlight follows the diffuse colour and `specular_scale`
+defaults to 0.25.
 ### The Blender addon (`blender/`)
 
 Import/export of `.rif` geometry for Blender, in **pure Python** — no compiled extension, and
@@ -413,8 +436,9 @@ reference. Test invocations are under "Running the test suites" above.
 | `examples/levels/arena.mjs` | A working level module for `levels.add` — `map` + `includes` + `define` + `populate` + `setup` |
 | `examples/headers/` | `bug.gsh` and part of `defaults.gsh` re-implemented with `gls`, as the worked example of translating a header |
 | `types/` | `.d.ts` for the `"gk"` module and the `ImGui` interface, the generator for the latter, and `typecheck.ts`. See "Type definitions" above |
-| `blender/` | The Blender `.rif` import/export addon and its seven test harnesses. Pure Python, unrelated to `d3d8.dll`. Design record in `blender/CLAUDE.md`. **Its decoders are imported by `pbr/`** — the one thing outside this directory a change here can break |
+| `blender/` | The Blender `.rif` import/export addon and its seven test harnesses. Pure Python, unrelated to `d3d8.dll`. Design record in `blender/CLAUDE.md`. **Its decoders are imported by `pbr/` and by `lightmap/`** — the one thing outside this directory a change here can break |
 | `pbr/` | `gkpbr` — a uv project that generates PBR map sets (color/roughness/metallic/normal/emissive/height) from the 365 `.RIM` a `BMPNAMES` table names, **per UV region rather than per sheet**, because most of them are atlases: a vision model decides what each material is, arithmetic decides every pixel. Pure Python, unrelated to `d3d8.dll`, and it imports `blender/io_scene_rif`'s decoders rather than reimplementing them — so an addon change breaks it silently, which is what `pbr/tests/test_addon_boundary.py` exists to catch. Design record in `pbr/README.md` |
+| `lightmap/` | `gklightmap` — a second uv project, and **`pbr/` with the intelligence removed on purpose**: one `.RIM` in, three prompts to an image-editing model over **OpenRouter** (`OPENROUTER_API_KEY`, env or a file of that name at the repo root), one `<stem> lighting.dds` out. No segmentation, no classification, no gates, no cache. The three channels are `src/VkLighting.h`'s and two do not mean what their names mean elsewhere — R is a *height field*, G is highlight *intensity* (not a metal switch), B is highlight sharpness — so `gklightmap/prompts.py` spells all three out. Writes **uncompressed 24-bit + a full mip chain**, not DXT1: two channels are masks and a block's endpoints would smear them, and there is no S3TC compressor here. $0.20 a texture, measured. Design record in `lightmap/README.md` |
 | `huffman/`, `utils/rifutil` | The C++ REBCRIF1 codec and its CLI. The Python port in `blender/io_scene_rif/rif.py` is decode-only; this is the only compressor |
 | `utils/rendertest` | The PowerShell harness for driving Gunlok through the REPL and capturing frames — launch, dismiss the briefing, wait for the camera to come to rest, screenshot, and bisect `render.draw_hide` for the draw behind a pixel. What every renderer comparison should use; its README is the list of things that waste a run otherwise |
 | `utils/rimutil` | `.RIM` <-> PNG CLI over spng + libsquish, both directions, both image forms. `compress` takes `--format dxt1\|dxt3\|body` (default **dxt3**) and `--raw`; **dxt5 is refused by name**, because `TextureFormatCandidates` @ 0x006ac348 lists only DXT1/DXT3 and `SurfaceDesc_SetCompressedFormat` @ 0x005c6820 drops any other fourcc *silently* — a DXT5 file renders with garbage alpha rather than failing. `body` is exactly lossless **on disk** and needs no DXT compressor, and `check_lossless` re-derives every pixel before writing — but **it is not lossless in the engine, and it refuses graded alpha for that reason**: Gunlok ignores the `ALPH` chunk a palettized image carries alpha in, so such a texture loads fully opaque (measured — see `rif_chunk_format.md`, "The engine does not honour an `ALPH` you write"). It picks `masking 2`, the one palettized alpha that works, when every transparent texel shares one RGB; a cut-out that cannot (several RGBs under transparency, so an `ALPH`) is warned about rather than refused, because that case is presumed broken and not measured. Format details in `rif_chunk_format.md`; tests in `utils/rimutil/tests` |

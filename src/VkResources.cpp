@@ -249,7 +249,14 @@ std::string WatchLog;
 //
 // A8 keeps its single channel and is fixed up in the image view instead, with a
 // {ONE, ONE, ONE, R} swizzle - which is what D3DFMT_A8 means and costs nothing at sample time.
+//
+// A8R8G8B8 is the one entry here the *game* has never asked for - `unsupported_formats` has read
+// 0 for the whole life of this renderer, which is the measurement that says so. It exists for the
+// lighting maps (src/VkLighting), whose uncompressed form arrives as B,G,R,A on disk exactly as
+// D3D would store it. Adding it changes nothing for the game by construction: a mapping is only
+// ever consulted for a format something actually creates.
 enum : uint32_t {
+  kD3DFmtA8R8G8B8 = 21,
   kD3DFmtA4R4G4B4 = 26,
   kD3DFmtA8 = 28,
   kD3DFmtDXT1 = 0x31545844, // 'DXT1'
@@ -267,6 +274,12 @@ struct FormatMapping {
 
 bool MapFormat(uint32_t d3d_format, FormatMapping &out) {
   switch (d3d_format) {
+  case kD3DFmtA8R8G8B8:
+    // B8G8R8A8 and not R8G8B8A8: D3D's channel order in an A8R8G8B8 is B,G,R,A in memory, which
+    // is what VK_FORMAT_B8G8R8A8_UNORM means. Getting this the other way round swaps red and blue
+    // and looks like an authoring mistake in the source art.
+    out = {VK_FORMAT_B8G8R8A8_UNORM, 1, 4, 4, false, false};
+    return true;
   case kD3DFmtA4R4G4B4:
     out = {VK_FORMAT_R8G8B8A8_UNORM, 1, 4, 2, true, false};
     return true;

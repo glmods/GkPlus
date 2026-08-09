@@ -18,6 +18,7 @@
 #include "VkContext.h"
 #include "VkInternal.h"
 #include "VertexFormat.h"
+#include "VkLighting.h"
 #include "VkResources.h"
 
 namespace gk {
@@ -26,20 +27,19 @@ namespace {
 
 // The push constant block, matching `Push` in src/shaders/world.slang field for field.
 //
-// **48 bytes of a guaranteed 128**, where it was 120 before the draw record (§4.26) and 72
-// before the material table (§4.30). Everything per-draw is now an index into an array reached
-// by address, which is §2's design arrived at in full: four addresses, three indices, nothing
-// that describes a draw. What is left cannot shrink further without giving up the addresses,
-// and there is no reason to.
+// **72 bytes of a guaranteed 128**, where it was 120 before the draw record (§4.26) and 72
+// before the material table (§4.30) took it to 48. Everything per-draw is an index into an array
+// reached by address, which is §2's design arrived at in full: four addresses, three indices,
+// nothing that describes a draw.
+//
+// The last 28 bytes are not per-draw data at all - they are the LOD probe and the lighting-map
+// knobs (§4.34, §4.48), which are the same for every draw in a frame. They ride here because a
+// push is the cheapest way to deliver a frame-uniform float, not because a draw needs them: they
+// would otherwise be a uniform buffer whose only reader is a feature nobody has switched on.
 //
 // `base_vertex` is the one index that is not into one of those arrays - it is where this draw's
 // buffer starts inside the vertex arena, and it stays here because the vertex shader adds it to
 // SV_VertexID before it has read anything at all.
-//
-// 44 bytes of content and 48 of struct: the four addresses give it 8-byte alignment, so the
-// compiler pads the tail. The pad is spelled out rather than left implicit because the range
-// declared in the pipeline layout is this `sizeof`, and a reader comparing it against the Slang
-// side - which stops at 44 - should not have to work out where the extra four bytes came from.
 struct PushConstants {
   uint64_t vertices;
   uint64_t draws;
@@ -49,11 +49,23 @@ struct PushConstants {
   uint32_t material;
   uint32_t base_vertex;
   // The LOD probe (§4.34). Negative means "sample normally"; anything else makes every texture
-  // fetch an explicit-LOD one at that level. It occupies what was tail padding, so it is free -
-  // see the note above about why the pad exists at all.
+  // fetch an explicit-LOD one at that level. It occupied what was tail padding when it was added,
+  // so it cost nothing then.
   float force_lod;
+  // The lighting-map knobs (src/VkLighting.h). They are push constants rather than part of
+  // GpuMaterial because they are the same for every draw in a frame: putting them in the material
+  // would grow the table for nothing and make a tweak from the REPL a re-intern of every surface
+  // instead of twenty-four bytes of a push.
+  float bump_scale;
+  float bump_diffuse;
+  float specular_scale;
+  float gloss_min;
+  float gloss_max;
+  float specular_from_diffuse;
 };
-static_assert(sizeof(PushConstants) == 48);
+// 72 bytes exactly - the six floats fill what was the tail padding the four addresses' 8-byte
+// alignment had left, so both sides end in the same place for once.
+static_assert(sizeof(PushConstants) == 72);
 
 constexpr uint32_t kMaxDrawsPerFrame = 8192;
 
@@ -623,6 +635,13 @@ uint32_t FindImageByName(const std::vector<TextureImageInfo> &images, const std:
     return kNoTexture;
   }
   for (const TextureImageInfo &image : images) {
+    // A lighting map's own name contains the name of the texture it belongs to, so without this
+    // `"lava"` would match `bitmaps\lava lighting.dds` as readily as `bitmaps\lava.rim` - and
+    // whichever came first would win. They are not textures a mod addresses; see
+    // IsLightingImage in VkLighting.h.
+    if (IsLightingImage(image.index)) {
+      continue;
+    }
     if (Lowered(image.name).find(needle) != std::string::npos) {
       return image.index;
     }
@@ -643,7 +662,7 @@ void ResolveMaterialOverrides() {
   const std::vector<TextureImageInfo> images = TextureImages();
   for (const TextureImageInfo &image : images) {
     const std::string name = Lowered(image.name);
-    if (name.empty()) {
+    if (name.empty() || IsLightingImage(image.index)) {
       continue; // an image with no cache record behind it has no identity to key on
     }
     for (size_t i = 0; i < Overrides.size(); ++i) {
@@ -746,6 +765,15 @@ uint32_t InternMaterial(const DrawItem &item) {
     if (touched) {
       ++TheStats.overridden_draws;
     }
+  }
+
+  // The lighting map, keyed on the stage-0 texture as it stands NOW - after an override may have
+  // replaced it, which is the opposite of how the tint is keyed and is deliberate. A replacement
+  // texture is a different surface, and the map that belongs to it is its own; keying on the
+  // original would give a retextured wall the old wall's bumps.
+  material.lighting_texture = LightingMapFor(material.stage0_texture);
+  if (material.lighting_texture != kNoTexture) {
+    ++MutableLightingCounters().materials_lit;
   }
 
   const auto found = InternedMaterials.find(material);
@@ -976,6 +1004,10 @@ void SubmitDraw(const DrawItem &item) {
   // draws". `PendingDrawIndex` still advances the same way, because the index a diagnostic was
   // armed on is a position in the list, and skipping one shifts the rest either way.
   EnsureOverridesResolved();
+  // The same shape and the same trigger: a comparison against TextureRegistryGeneration, which
+  // moves only when an image is created, destroyed or named. A texture with no companion file
+  // costs one hash lookup once, not a file probe per frame (VkLighting.h).
+  EnsureLightingMapsResolved();
   if (!Resolved.empty() && item.stage_count > 0) {
     if (const ResolvedOverride *over = OverrideFor(item.stages[0].texture_index)) {
       if (over->hide) {
@@ -1170,6 +1202,13 @@ void RecordDraws(void *command_buffer) {
     push.material = item.material;
     push.base_vertex = item.base_vertex;
     push.force_lod = ForcedLod;
+    const LightingMapParams &lighting = LightingParams();
+    push.bump_scale = lighting.bump_scale;
+    push.bump_diffuse = lighting.bump_diffuse;
+    push.specular_scale = lighting.specular_scale;
+    push.gloss_min = lighting.gloss_min;
+    push.gloss_max = lighting.gloss_max;
+    push.specular_from_diffuse = lighting.specular_from_diffuse;
     if (push.vertices == 0) {
       continue;
     }
@@ -1368,6 +1407,16 @@ std::string FormatDrawStats() {
         (unsigned long long)TheStats.overridden_draws,
         (unsigned long long)TheStats.hidden_draws);
   }
+  // Printed on the same terms and for the same reason: only once a companion file has actually
+  // been found, so "no mod ships one" stays silent rather than reading as a broken feature.
+  const LightingMapStats &lighting = LightingMapCounters();
+  if (lighting.maps_found != 0 || lighting.load_failures != 0) {
+    add("lighting maps: %llu images from %llu files (%llu refused - see "
+        "render.lighting_map_report), %llu draws lit%s\n",
+        (unsigned long long)lighting.images_created, (unsigned long long)lighting.maps_found,
+        (unsigned long long)lighting.load_failures,
+        (unsigned long long)lighting.materials_lit, LightingMaps() ? "" : "  (OFF)");
+  }
   return out;
 }
 
@@ -1376,6 +1425,9 @@ void ShutdownDraw() {
     return;
   }
   vkDeviceWaitIdle(GetDevice());
+  // Before the resources go, and from here rather than from the renderer: these are images this
+  // side created, and nothing outside the draw path knows they exist.
+  ShutdownLightingMaps();
   DestroyDepth();
   for (const auto &[state, pipeline] : Pipelines) {
     if (pipeline != VK_NULL_HANDLE) {

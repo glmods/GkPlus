@@ -13,6 +13,7 @@
 #include "VkCapture.h"
 #include "VkContext.h"
 #include "VkDraw.h"
+#include "VkLighting.h"
 #include "VkRenderer.h"
 #include "VkResources.h"
 
@@ -400,6 +401,52 @@ JSValue ClearMaterialOverridesFn(JSContext *ctx, JSValueConst, int, JSValueConst
   vulkan::ClearMaterialOverrides();
   return JS_UNDEFINED;
 }
+
+// `render.lighting_maps` - the companion `<texture> lighting.dds` feature (VkLighting.h). Off
+// interns every material exactly as the build before it did, so this A/Bs the whole feature on one
+// paused frame at a 0.000 noise floor - the same rule `render.lighting` and `render.shade_mode`
+// follow.
+JSValue GetLightingMaps(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::LightingMaps());
+}
+
+JSValue SetLightingMapsValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetLightingMaps(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+// `render.lighting_map_report` - which names were probed, what was found, and the knobs. The
+// readback matters more than for a diagnostic: a texture with no companion file is the *normal*
+// case, so "nothing happened" is what both a working install and a misnamed file look like.
+JSValue GetLightingMapReport(JSContext *ctx, JSValueConst) {
+  const std::string text = vulkan::DescribeLightingMaps();
+  return JS_NewStringLen(ctx, text.data(), text.size());
+}
+
+// The five knobs, each a plain float on LightingMapParams. Separate accessors rather than one
+// object so each can be swept from the REPL with `render.bump_scale = x` on a paused frame, which
+// is the only comparison here with a noise floor worth having.
+#define GK_LIGHTING_KNOB(name)                                                                  \
+  JSValue Get##name(JSContext *ctx, JSValueConst) {                                             \
+    return JS_NewFloat64(ctx, vulkan::LightingParams().name);                                   \
+  }                                                                                             \
+  JSValue Set##name##Value(JSContext *ctx, JSValueConst, JSValueConst value) {                  \
+    double number = 0.0;                                                                        \
+    if (JS_ToFloat64(ctx, &number, value) != 0) {                                               \
+      return JS_EXCEPTION;                                                                      \
+    }                                                                                           \
+    vulkan::MutableLightingParams().name = static_cast<float>(number);                          \
+    return JS_UNDEFINED;                                                                        \
+  }
+
+GK_LIGHTING_KNOB(bump_scale)
+GK_LIGHTING_KNOB(bump_diffuse)
+GK_LIGHTING_KNOB(specular_scale)
+GK_LIGHTING_KNOB(specular_from_diffuse)
+GK_LIGHTING_KNOB(gloss_min)
+GK_LIGHTING_KNOB(gloss_max)
+
+#undef GK_LIGHTING_KNOB
 
 // `render.shade_mode` - honour D3DRS_SHADEMODE, or interpolate everything (VkDraw.h). Writable
 // for the same reason as the three above: on level02 it touches 2% of the draws and all of them
@@ -953,6 +1000,15 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("present_linear", GetPresentLinear, SetPresentLinearValue),
     JS_CGETSET_DEF("shade_mode", GetShadeMode, SetShadeModeValue),
     JS_CGETSET_DEF("force_lod", GetForceLod, SetForceLodValue),
+    JS_CGETSET_DEF("lighting_maps", GetLightingMaps, SetLightingMapsValue),
+    JS_CGETSET_DEF("lighting_map_report", GetLightingMapReport, nullptr),
+    JS_CGETSET_DEF("bump_scale", Getbump_scale, Setbump_scaleValue),
+    JS_CGETSET_DEF("bump_diffuse", Getbump_diffuse, Setbump_diffuseValue),
+    JS_CGETSET_DEF("specular_scale", Getspecular_scale, Setspecular_scaleValue),
+    JS_CGETSET_DEF("specular_from_diffuse", Getspecular_from_diffuse,
+                   Setspecular_from_diffuseValue),
+    JS_CGETSET_DEF("gloss_min", Getgloss_min, Setgloss_minValue),
+    JS_CGETSET_DEF("gloss_max", Getgloss_max, Setgloss_maxValue),
     JS_CFUNC_DEF("probe", 5, ProbeQuad),
     JS_CFUNC_DEF("depth_probe", 5, DepthProbe),
     JS_CFUNC_DEF("viewport_probe", 5, ViewportProbe),
