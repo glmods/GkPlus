@@ -73,6 +73,12 @@ struct DeviceCaps {
   // a renderer that will not start.
   bool depth_clamp = false;
 
+  // Vulkan 1.0 core and optional. Without it `vkCmdDrawIndexedIndirect` is limited to a
+  // `drawCount` of 1, which is the same thing as not having it - the whole point is one command
+  // for a batch. Used only by the map lights' shadow bake (§4.62), which falls back to a draw
+  // call per caster per face without it: slower to bake, identical atlas.
+  bool multi_draw_indirect = false;
+
   // Limits that size the design rather than merely describing the device.
   uint32_t max_bindless_textures = 0; // maxDescriptorSetUpdateAfterBindSampledImages
   uint32_t max_push_constants = 0;    // must fit FrameAddrs; 128 is the guaranteed minimum

@@ -15,6 +15,7 @@
 #define VMA_IMPLEMENTATION
 #include <vk_mem_alloc.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -33,6 +34,10 @@
 #include "VkCapture.h"
 #include "VkContext.h"
 #include "VkInternal.h"
+// For FrameStagingRetired only. The dependency goes this way round and not the other: the
+// renderer already drives the ring (RecordUploads, ReleaseFrameStaging), and asking it whether a
+// fence has signalled is the same relationship read backwards rather than a new one.
+#include "VkRenderer.h"
 
 namespace gk {
 namespace vulkan {
@@ -497,6 +502,42 @@ VkDeviceSize LastRecordedBytes = 0;
 // Blocks until no recorded batch is still being read by the GPU, then marks every slot free.
 // Conservative on purpose: `vkDeviceWaitIdle` rather than per-slot fences, because the ring is
 // only ever handed back at a wrap and the renderer's fences belong to VkRenderer.
+// Microseconds since an arbitrary origin. Used only to price the two blocking paths below - a
+// count of stalls says nothing about whether they matter, and the answer turned out to depend
+// entirely on when they happen rather than how often (§4.63).
+uint64_t NowMicros() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
+}
+
+// Hands back every live slot the GPU has already finished with, **without waiting for anything**.
+//
+// This is what the ring was missing (§4.63). A slot's bytes are released by
+// `ReleaseFrameStaging`, which the renderer calls for the one slot it is about to reuse - so a
+// frame the GPU retired milliseconds ago goes on holding its share of the ring until its turn
+// comes round again. On level01 that share is 13.3 MB of a 32 MB ring and it is what made the
+// ring overflow 511 times in thirty seconds of play; level02, at 6.2 MB a frame, never once did.
+//
+// Returns the bytes reclaimed, so the caller can tell "there was nothing to take back" from
+// "there was, and it is enough".
+VkDeviceSize ReclaimRetiredFrames() {
+  VkDeviceSize freed = 0;
+  for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+    if (!Ring.frame_live[i] || !FrameStagingRetired(i)) {
+      continue;
+    }
+    freed += Ring.frame_bytes[i];
+    Ring.in_flight -= Ring.frame_bytes[i];
+    Ring.frame_bytes[i] = 0;
+    Ring.frame_live[i] = false;
+  }
+  if (freed != 0) {
+    ++TheStats.staging_reclaims;
+  }
+  return freed;
+}
+
 void WaitForLiveFrames() {
   bool any = false;
   for (const bool live : Ring.frame_live) {
@@ -505,6 +546,7 @@ void WaitForLiveFrames() {
   if (!any) {
     return;
   }
+  const uint64_t started = NowMicros();
   vkDeviceWaitIdle(GetDevice());
   for (bool &live : Ring.frame_live) {
     live = false;
@@ -514,6 +556,7 @@ void WaitForLiveFrames() {
   }
   Ring.in_flight = 0;
   ++TheStats.staging_stalls;
+  TheStats.staging_stall_us += NowMicros() - started;
 }
 
 // Reserves staging space. A request that cannot fit even in an empty ring is dropped and
@@ -579,8 +622,12 @@ bool AllocateStaging(VkDeviceSize bytes, VkDeviceSize &offset) {
       TheStats.staging_skipped_bytes += skipped;
       return true;
     }
-    // Retire what the GPU has already been given before recording anything more: a frame whose
-    // copies have run is holding the ring for nothing.
+    // **Ask before blocking.** A frame whose copies have run is holding the ring for nothing,
+    // and finding that out is a `vkGetFenceStatus` - so the free reclaim goes first and the
+    // block is what is left when the GPU genuinely has not caught up (§4.63).
+    if (Ring.in_flight != 0 && ReclaimRetiredFrames() != 0) {
+      continue;
+    }
     if (Ring.in_flight != 0) {
       WaitForLiveFrames();
       continue;
@@ -757,6 +804,36 @@ void WriteImageDescriptor(uint32_t index) {
   vkUpdateDescriptorSets(GetDevice(), 1, &write, 0, nullptr);
   ++TheStats.descriptors_written;
 }
+
+} // namespace
+
+void WriteBindlessView(uint32_t index, uint64_t view) {
+  if (BindlessSet == VK_NULL_HANDLE || view == 0) {
+    return;
+  }
+  if (index >= kBindlessTextures) {
+    ++TheStats.descriptors_out_of_range;
+    return;
+  }
+  VkDescriptorImageInfo info = {};
+  info.imageView = reinterpret_cast<VkImageView>(view);
+  // The shadow map is sampled in the same layout it is read in everywhere else. A depth image in
+  // SHADER_READ_ONLY_OPTIMAL is legal to sample; what it must NOT be is the attachment layout it
+  // was written in, which is why the pass transitions it.
+  info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+  VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  write.dstSet = BindlessSet;
+  write.dstBinding = 1;
+  write.dstArrayElement = index;
+  write.descriptorCount = 1;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  write.pImageInfo = &info;
+  vkUpdateDescriptorSets(GetDevice(), 1, &write, 0, nullptr);
+  ++TheStats.descriptors_written;
+}
+
+namespace {
 
 // D3DTEXTUREFILTERTYPE: 0 NONE, 1 POINT, 2 LINEAR, and 3/4/5 the anisotropic and gaussian
 // variants the recorder never saw. Anything past LINEAR is treated as LINEAR rather than
@@ -2012,6 +2089,9 @@ bool FlushPendingNow() {
   if (Pending.empty() && PendingImages.empty()) {
     return false; // nothing to reclaim, so wrapping would still corrupt
   }
+  // Priced from here, so the figure covers the submit and the fence wait together - and the
+  // WaitForLiveFrames at the end prices itself into `staging_stall_us` separately.
+  const uint64_t started = NowMicros();
   VkCommandBufferAllocateInfo alloc = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
   alloc.commandPool = UploadPool;
   alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -2042,12 +2122,15 @@ bool FlushPendingNow() {
   vkFreeCommandBuffers(GetDevice(), UploadPool, 1, &cmd);
   if (ok) {
     // The wait above covers only what this call submitted, so anything a frame still holds has
-    // to be waited for separately before the head may rewind over it.
+    // to be waited for separately before the head may rewind over it - free reclaim first, for
+    // the same reason AllocateStaging asks before blocking.
     LastRecordedBytes = 0;
+    ReclaimRetiredFrames();
     WaitForLiveFrames();
     Ring.head = 0;
     ++TheStats.staging_flushes;
   }
+  TheStats.staging_flush_us += NowMicros() - started;
   return ok;
 }
 
@@ -2083,18 +2166,31 @@ std::string FormatResourceStats() {
   add("slots live: %llu   staging: %llu KB\n", (unsigned long long)TheStats.slots_live,
       (unsigned long long)(TheStats.staging_bytes >> 10));
   add("uploads: %llu (%llu KB)   staging wraps: %llu   flushes: %llu   stalls: %llu   "
-      "dropped: %llu   arena full: %llu\n",
+      "free reclaims: %llu   dropped: %llu   arena full: %llu\n",
       (unsigned long long)TheStats.uploads,
       (unsigned long long)(TheStats.uploaded_bytes >> 10),
       (unsigned long long)TheStats.staging_wraps,
       (unsigned long long)TheStats.staging_flushes,
       (unsigned long long)TheStats.staging_stalls,
+      (unsigned long long)TheStats.staging_reclaims,
       (unsigned long long)TheStats.dropped_uploads,
       (unsigned long long)TheStats.arena_exhausted);
   add("   ... ring bytes skipped for alignment and wraps: %llu KB (they count against the "
       "batch)   overlapping copies ordered: %llu\n",
       (unsigned long long)(TheStats.staging_skipped_bytes >> 10),
       (unsigned long long)TheStats.ordered_overlapping_copies);
+  // The two blocking paths, PRICED. Session totals, so read them as a difference across a
+  // window - a level load blocks for a long time and presents nothing, which costs a player
+  // nothing at all, and the same block between two frames of play is a hitch (§4.63).
+  add("   ... blocked for %llu ms in stalls + %llu ms in flushes (%llu us and %llu us each)\n",
+      (unsigned long long)(TheStats.staging_stall_us / 1000),
+      (unsigned long long)(TheStats.staging_flush_us / 1000),
+      (unsigned long long)(TheStats.staging_stalls == 0
+                               ? 0
+                               : TheStats.staging_stall_us / TheStats.staging_stalls),
+      (unsigned long long)(TheStats.staging_flushes == 0
+                               ? 0
+                               : TheStats.staging_flush_us / TheStats.staging_flushes));
   add("images: %llu live / %llu created   %llu KB (peak %llu KB)\n",
       (unsigned long long)TheStats.images_live,
       (unsigned long long)TheStats.images_created,

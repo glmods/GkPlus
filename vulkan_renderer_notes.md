@@ -4913,6 +4913,1090 @@ exactness survived the move.
 light-space matrix. Phase 4 - the sun's shadow map, then cascades, then the static atlas for the
 map lights - is what this was for, and none of it is started.
 
+## 4.58 The sun casts a shadow
+
+The first real shadow in Gunlok. Its own are stencil volumes under the units and nothing else
+(§4.27) - no piece of the world has ever shadowed another. `render.sun_shadows` is on by default;
+off is the build before it.
+
+A depth-only pass over the **same draw list** the world pass walks, from the sun. That is §2's
+design paying off exactly as it was meant to: a draw is an index into shared per-frame tables, so
+a second walk over the frame costs a pipeline and a push block and **no new per-draw data at all**
+- `src/shaders/shadow.slang` reads the same `GpuDrawRecord` array and takes `world` out of it.
+
+- **2048x2048, the depth format already chosen**, with `SAMPLED_BIT` - which the main depth buffer
+  deliberately lacks, because nothing reads it. **Two views of one image**: the attachment needs
+  every aspect the format carries, and the sampled one must be depth-only, because a view with a
+  stencil aspect cannot be a sampled image and §4.27's format has one.
+- **A vertex shader and no fragment stage at all**, which is legal with no colour attachment.
+- **Manual 3x3 PCF, not a comparison sampler.** The bindless set's sampler array is
+  `SamplerState`, and a second array of `SamplerComparisonState` would be a third binding on a set
+  whose last is pinned by `VARIABLE_DESCRIPTOR_COUNT`. Nine taps cost the same either way.
+- The map lives at a **fixed high bindless slot** (4095) rather than one from the allocator: it is
+  not a `TextureImage`, has no `.rim` name and nothing to verify against, so taking the top of the
+  array keeps it clear of every path that walks the image list.
+
+### Four decisions that are the difference between a shadow and a black hole
+
+- **The shadow attenuates the diffuse and specular sums, never the ambient one.** Ambient is by
+  definition light that did not arrive along the sun's ray; shadowing it makes a shadowed surface
+  darker than an unlit one, which is how a first shadow implementation ends up with holes in it.
+- **Outside the map's box is LIT, not shadowed.** Clamping into the edge texel instead smears
+  whatever sits at the boundary across the whole level - a huge shadow that follows the camera.
+- **No culling in the shadow pipeline.** Front-face culling is the usual way to hide acne and it
+  assumes closed, consistently-wound geometry; Gunlok has neither across the map object and its
+  props, so it would open holes in the caster set. The bias is the knob instead.
+- **No Y flip in the light matrix.** Vulkan's framebuffer Y runs the other way from D3D's and
+  `BuildMvp` compensates for the world pass - but here one matrix both rasterises the map and
+  looks it up, so a flip would cancel against itself. One fewer convention to get backwards.
+
+### What it is worth
+
+level04, paused: **1.14 MAD over 17.1% of the frame**, and the amplified difference image is the
+reading rather than the number - three unit-silhouette shadows correctly offset from the units
+that cast them, plus a terrain ridge shadowing the slope below it, and black everywhere else.
+`sun shadows: on (171 casters)`, 0 validation errors, `seen == submitted`, every must-be-0 counter
+at 0, 12 pipelines unchanged.
+
+Casters are **opaque, depth-writing, indexed** draws only. A blended draw is an effect layer or a
+decal and would cast a solid shadow it does not have; a draw that does not write depth is by the
+game's own account not part of the scene's occlusion. The shader additionally rejects anything
+without `kLightSum` - the test the CPU cannot make, because the flags live in the record.
+
+### What is left of phase 4
+
+**Cascades.** This is one map over a 70-unit box around the camera focus, so it is sharp near the
+focus and has no shadow at all past the box. That box is what `render.shadow_extent` trades.
+
+**The static atlas** for the 431-686 map lights (§4.53), baked once at level load. Nothing of it
+is started, and it is the larger half.
+
+**The game's own stencil shadow is now dropped** while the sun is casting, or a unit would carry
+both its blob and its real shadow. The three passes are identified by **`stencil_enable`**, which
+is exact rather than a heuristic: §4.31 measured that every flat-shaded draw on level01 and
+level02 is one of them, and nothing else in either level touches stencil at all.
+
+Measured on level04: `seen 159463, submitted 156433, unaccounted for 0` with **3,030 draws
+dropped**, and `stencil draws: 0`. The dropped count is in the `seen == submitted + skips` sum for
+the reason `hidden_draws` is (§4.44) - a feature that drops draws on purpose must not make that
+invariant read as broken, which is exactly how §4.32's real regression stopped being noticed.
+`render.stencil_shadow` puts it back, and the difference between the two is **0.109 MAD over 1.4%
+of the frame**: the amplified image is the three units' blobs and nothing else at all, which is
+what says the marker catches the shadow and only the shadow.
+
+Two things it is gated on beyond the knob: the sun's pipeline existing and a sun matrix having
+been built. Dropping the game's shadow on a device with no shadow pipeline, or on a level with no
+sun set, would remove the only shadow there is.
+
+A level that used stencil for something other than its shadow would lose it. None of the fifteen
+has been checked past level01 and level02, which is what `render.stencil_shadow` is for.
+
+`render.shadow_bias`, `shadow_strength` and `shadow_extent` are knobs rather than constants
+because acne and peter-panning trade against each other and the right value depends on a level's
+scale - the defaults (0.0025, 0.55, 70) are a first pass on level04 and have not been swept.
+**§4.59 swept them, and found the box was in the wrong place while it did.**
+
+## 4.59 Sweeping the shadow knobs, and cascading the map
+
+Four things, in the order they turned up: the box was centred on a stale global, the knob was in
+the wrong units, the map is now four cascades in an atlas, and the strength default is a real
+trade rather than taste. `render.shadow_cascades = 1` is §4.58's single map at the same texel
+density, so all of it A/Bs on one paused frame.
+
+### The box was centred on a global that is only valid during a cutscene
+
+`BuildSunMatrix` centred the box on `gk::GetCameraFocus()`. **`CameraFocus` @ 0x007b3e58 is only
+latched by `SET CAMERA FOCUS`**, and with none in force the global still holds whatever the last
+one left - so in ordinary play the shadow box sat somewhere unrelated to the view and reached it
+only because 70 world units was wide enough to span the gap. `camera.focus` reads `null` on a
+settled level04, which is the whole of the evidence once you look at it.
+
+What made it visible was **sweeping `shadow_extent` down**:
+
+| extent | 20 | 35 | 70 | 120 | 200 |
+|---|---|---|---|---|---|
+| frame shadowed | **0.02%** | **0.02%** | 19.8% | 22.2% | 25.1% |
+
+0.02% is the blinking "ACTIVE PAUSE" indicator and nothing else - a *smaller* box produced no
+shadow at all on a frame where a larger one produced a correct one, which no amount of resolution
+or bias can explain. Latching a focus at the camera's own position with `camera.focus = {...}`
+brought it straight back to **17.4%** at extent 20. One REPL line, and it needed no rebuild.
+
+**The pivot is `CameraCoords` @ 0x007b4e0c, and that is measured rather than assumed.** With the
+camera at rest on level04 it reads (-65, -7, 48) while `render.draw_state`'s `eye (world)` - the
+position the game's own view matrix was built from - is (-67.160, -17.927, 58.046). The distance
+between them is **15.007** against a `camera.distance` of exactly **15**. So the engine stores the
+point the camera looks at and derives the eye by pulling back the distance, which is precisely the
+centre of what is on screen. `ShadowPivot()` prefers the focus when one *is* latched, because then
+the camera is pointed at it by definition and the two agree.
+
+This is the reading §4.58 could not have taken, because it never swept the extent - and it is why
+`shadow_extent` is measured here against the *camera's own reach* rather than by eye. Gunlok's
+`camera.max_distance` on level04 is **75**, and at that distance:
+
+| extent | 40 | 70 | 120 | 200 |
+|---|---|---|---|---|
+| frame shadowed, fully zoomed out | 4.56% | 4.61% | 4.66% | 4.81% |
+
+So 70 covers everything the camera can ever see: 200 buys 0.2% of the frame and 40 costs 0.25%.
+The default stays where it was, now for a reason.
+
+### The bias belongs in texels, and the number is a knee
+
+§4.58's bias was in light-space depth units, which sounds level-dependent and **is not**: the
+depth span is `6 * extent` and a texel is `2 * extent / size`, so the ratio is `bias * 6144`
+whatever the extent. The knob was already texel-denominated by accident. It is now so on purpose,
+because with cascades a texel is a *different* world distance in each one and a single depth
+offset cannot serve four.
+
+Sweeping it on level04's paused start, against the same frame with `sun_shadows = false`:
+
+| bias, texels | 0 | 0.5 | 1.0 | 1.5 | 2.0 | **2.5** | 3.0 | 4.0 | 6.0 | 10.0 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| frame shadowed | 86.6% | 84.5% | 76.5% | 24.7% | 17.5% | **16.6%** | 16.4% | 16.3% | 16.1% | 15.9% |
+
+The acne collapses between 1.0 and 2.5, and everything past it is peter-panning at **0.04-0.3% of
+the frame per texel** against the 14%-per-texel slope on the acne side. 2.5 is the default: the
+last step that removes acne, and two orders of magnitude cheaper to be generous about than to be
+mean about. Under §4.58's single map the same sweep put the old default of 0.0025 at **15.4
+texels**, which is why its shadows sat visibly away from their casters.
+
+**A ragged-mask metric does not find acne here and that is worth knowing.** Perimeter over area
+was the obvious instrument - stripes have a perimeter of the same order as their area - and it
+reads *lowest* at bias 0, because Gunlok's terrain is large flat polygons and acne shadows a whole
+polygon at a time. Facet-scale acne is a solid mask, not a striped one. **The shadowed fraction is
+the instrument**: it is monotonic in the bias, and the knee between the two slopes is the answer.
+
+### Four cascades in one atlas, keyed on the pivot
+
+One 2048² map over a 70-unit box is **0.068 world units per texel**, and at the game's own camera
+distance that is about five screen pixels - a visible staircase on every silhouette. It is now
+four concentric boxes, each half the one outside it, in a **2x2 atlas of 2048² tiles**:
+
+| cascade | 0 | 1 | 2 | 3 |
+|---|---|---|---|---|
+| half-extent at `shadow_extent = 70` | 8.75 | 17.5 | 35 | 70 |
+| world units per texel | **0.0085** | 0.017 | 0.034 | 0.068 |
+
+Cascade 3 is exactly §4.58's map, so nothing got worse anywhere and the near field is **8x
+sharper**. On level04's paused start the shadowed fraction goes 19.7% at one cascade to 16.6% at
+four - the blocky version *over*-covers - and the picture is the reading rather than the number:
+three unit silhouettes with limbs you can count, against three blobs.
+
+Five decisions in it, four of which were choices between working and nearly-working:
+
+- **An atlas, not a texture array or six images.** The bindless set's last binding is pinned by
+  `VARIABLE_DESCRIPTOR_COUNT` (§4.15) and cannot gain a second array, so an atlas keeps the whole
+  feature at one image, one slot and one sampler however many cascades are live. 4096 is the
+  `maxImageDimension2D` every Vulkan device guarantees, which is what fixes the tile at 2048.
+- **One light-space transform, not four clip matrices.** `sun_matrix` is now the sun's orthonormal
+  basis with no scale and no translation, so a fragment's light-space position is in world units
+  and a cascade is a centre and a half-extent in it. Selection is a pair of compares per cascade
+  with an early out, and it needs **no view-space depth** - §4.56's warning about the view matrix
+  being per *draw* applies here exactly as it did to the light grid.
+- **The cascades share one z range**, taken from the outermost, so the depth is computed once.
+  D32_SFLOAT has precision to spare over 420 world units.
+- **Each box's centre is snapped to its own texel grid.** Without it every shadow edge crawls as
+  the pivot moves by a fraction of a texel. Invisible on the paused frames everything here is
+  measured on, which is exactly why it had to be reasoned about rather than seen.
+- **A PCF tap is clamped inside its own tile.** A tap that crossed a tile boundary would read the
+  neighbouring cascade's depth, which is a different scale entirely and paints a hard line along
+  the seam.
+
+The shadow map is now **D32_SFLOAT** where the device has it, falling back to §4.27's depth+stencil
+format: the atlas is four times the old map's area and nothing in this pass reads a stencil aspect.
+At 4096² that is **65 MB**, and `render.draws` prints it, the format and the near cascade's texel
+size rather than leaving them to be derived.
+
+### What it costs
+
+level04 in level, 301 draws and 171 casters a frame, measured over 10-second windows from
+`render.stats.frames`:
+
+| | ms/frame |
+|---|---|
+| `sun_shadows = false` | 18.42 |
+| one cascade | 18.83 |
+| **four cascades** | **20.53** |
+
+So the pass is **2.1 ms** at four cascades and 0.4 ms at one - it is 4x the draw calls (684 against
+171) and no per-fragment work at all beyond the same nine taps, since a fragment reads one cascade
+whatever the count. That is the price of the table above, and `render.shadow_cascades` is how
+anyone who disagrees changes it.
+
+### The shadow attenuates the DIRECTIONAL lights, not the whole sum
+
+§4.58 multiplied the finished diffuse and specular sums by the visibility. That is wrong for the
+same reason shadowing the ambient term is: the map describes what occludes **the sun**, and a point
+light three metres away in the same room is not occluded by the roof between the room and the sky.
+The visibility now rides into `light_sum` and multiplies a light's contribution only where
+`type == D3DLIGHT_DIRECTIONAL`.
+
+Measured on level02, whose visible lighting at the start is one white directional plus two orange
+point lights from the fires (`render.draw_state` prints all three): it moved the whole-frame
+difference from 20.462 to 20.340 MAD. **Almost nothing** - because level02's ground is lit by the
+directional, not by the fires. The change is right regardless, and its smallness is the measurement
+that says level02's darkening is not a point light being wrongly shadowed.
+
+A level with two directional lights would have both shadowed by the one map. None is known.
+
+### Level02 is under cover, and the shadow map is right about it
+
+Level02's start reads **75% of the frame shadowed at 20.3 MAD**, and it is not acne: it is flat
+against the bias from 0 to 100 texels, flat against the extent from 5 to 200, and identical at one
+cascade and at four. Pushing the bias to **2000 texels** is what finally clears it, and 500 does
+not - which puts the occluder above the ground by something of the order of ten world units rather
+than the fraction of one that acne lives in (2.5 texels is 0.021 units on cascade 0). Level02's
+start is a corridor between a rock face and a concrete wall under a sun 30° above the horizon;
+there is a real roof, and the sun genuinely cannot reach in.
+
+**The level's own bake disagrees**, because it was authored with a directional fill light that
+reaches everywhere. So a correct shadow map makes Gunlok's second level substantially darker than
+its authors drew it, and there is no arguing with that from inside the renderer. That is what
+`shadow_strength` is for, and it is the reason it is not 1.
+
+| `shadow_strength` | 0.6 | **0.7** | 0.85 | 1.0 |
+|---|---|---|---|---|
+| level02 ground, fraction of its authored brightness | 0.74 | **0.65** | 0.51 | 0.36 |
+
+Against the other end: on level04's outdoor start §4.58's **0.55 leaves the unit shadows reading as
+a smudge** and 1.0 reads as a shadow. 0.7 is the largest value that keeps level02 legible while
+level04's shadows still read, and both bounds are pictures rather than numbers. 1.0 remains the
+*physically* correct value - the shadow attenuates only the direct terms, so it is exactly "no
+sunlight arrives here" - and it is one REPL line away.
+
+**This is the one knob here that is not a fidelity question**, because the game has no ground truth
+for it: it never had a real shadow.
+
+### A procedural note
+
+The mask this section is measured with is the pixels one toggle darkened - two shots of one paused
+frame at a 0.000 floor, differenced and thresholded at 2/255. It is the right instrument for a
+feature that only ever *removes* light, and a signed difference is a free check that nothing else
+moved. `utils/rendertest` grew nothing for it; it is ten lines of numpy over two `Shoot-Settled`
+shots.
+
+## 4.60 Two standing questions, answered by loading every level once
+
+§4.58 left a caveat - the stencil marker was measured on two levels out of fifteen - and §4.56 left
+a default resting on an unmeasured claim. Both are one launch: **load every shipped level in turn
+and read what the capture layer already records.**
+
+### The instrument is the cumulative pipeline histogram, not a screenshot
+
+`render.state`'s pipeline-configuration histogram is fed from the D3D recorder's per-draw path
+(`D3D8Capture.cpp:622`), so it sees every draw the game issues whatever the Vulkan side then
+decides, and it is **cumulative over the session**. That makes a level's own set the difference
+against the level before it, and one launch enough for all fifteen. A screenshot could only ever
+have answered the question for the pixels that happened to be on screen.
+
+### The stencil marker holds on every level
+
+Sixteen levels loaded and played for fifteen seconds each - the twelve numbered campaign levels
+plus `prison`, `junkyard`, `cityruins` and `Training_Level`, with `sun_shadows` off so nothing was
+being dropped:
+
+| | |
+|---|---|
+| levels loaded and played | **16** — every campaign level, plus `prison`, `junkyard`, `cityruins` and `Training_Level` |
+| distinct pipeline configurations, whole session | 22 |
+| ... with `STENCILENABLE` | **3** |
+| ... first seen on | level01, and no level adds a fourth |
+| stencil draws per level | 2,640 to 16,008 — every level draws them |
+| configurations where stencil and flat shading do not coincide | **none** |
+
+`railway` is the seventeenth and it is not checkable this way: `levels.start` on it takes the game
+down with an **access violation at gl.exe+0xe0e84**, which is inside `ConvertParsedObjects`
+@ 0x004e0e70 — the game's own level conversion, before anything renders. It is also the one shipped
+`.gls` with no `.gcs` beside it. Nothing to do with this renderer, and worth knowing before someone
+else spends a run on it.
+
+`Training_Level` was captured in a second launch after that crash, so its histogram starts from
+empty - which is why it reports all three stencil configurations as "new" and is *stronger*
+evidence rather than weaker: an independent session reproduces the same three, again with equal
+draw counts (1,798 each).
+
+The three are the blob shadow's three passes, and they arrive with **equal draw counts** - 886 each
+on level01, which is what says they are one thing drawn three times rather than three unrelated
+uses. Every one is `SHADEMODE` flat, and no *other* configuration in the game is:
+
+```
+886 draws  fvf 0x112 sten 1 func 8 pass 5 zfail 1 cwrite 15 shade 1
+886 draws  fvf 0x112 sten 1 func 8 pass 7 zfail 1 cwrite 15 shade 1
+886 draws  fvf 0x1c4 sten 1 func 4 pass 2 zfail 1 cwrite 15 shade 1
+```
+
+So §4.31's equivalence - stencil enabled *iff* flat shaded - is now measured on **every shipped
+level** rather than on two, and `render.stencil_shadow` drops the blob shadow and nothing else
+anywhere in the game. One correction to §4.58 while it was checked: all three passes have
+`COLORWRITEENABLE` at 15, not "two of which write no colour at all". What the first two write no
+colour *by*, on this evidence, is their blend state rather than their colour mask.
+
+**What it does not cover, and the limit is worth stating**: each level was played for fifteen
+seconds from its start, so the histogram holds what the *opening area* draws. A stencil use that
+only appears at the far end of a level would be missed. What the reading does establish is that
+nothing in sixteen opening areas - every one of which draws thousands of stencil draws, so the
+blob shadow is live throughout - reaches for a fourth configuration.
+
+`render.stencil_shadow` stays, because "no level does X" is a fact about the fifteen shipped levels
+and this is a modding framework - a level someone else writes is not covered by any of it.
+
+### What runtime map lighting costs, and the default flips
+
+The reading §4.56 said was missing. `render.stats.frames` over 10-second windows, in level,
+`render.map_lighting` toggled between paired windows so a drift in the game's own state cancels:
+
+| level | map lights | off | on | cost |
+|---|---|---|---|---|
+| **level01** | **686** | 31.84 ms | 33.67 ms | **+1.83 ms, +5.8%** |
+| level05 | 356 | 22.44 | 22.36 | none measurable |
+| level04 | 431 | 16.68 | 16.68 | none measurable |
+| level02 | 51 | 17.57 | 17.47 | none measurable |
+
+Three paired repeats on level01, all the same direction and within 0.2 ms of each other, and the
+order reversed for a control. So the feature costs under 6% on the level with the most lights in
+the game and nothing measurable anywhere else.
+
+**And the grid is what makes that true.** The same measurement with `render.map_light_cull = false`
+on level01:
+
+| level01 | ms/frame |
+|---|---|
+| map lighting off | 31.84 |
+| **on, brute force over all 686** | **61.90** |
+| on, culled by the world grid | 33.67 |
+
+§4.56 is worth **28 ms a frame** - it halves the frame rate without it and costs 6% with it. That
+number had never been taken; the grid was built because 686 lights per pixel was obviously
+expensive, which is a different thing from knowing by how much.
+
+That was the whole of the case for `off`: §4.55 says in as many words that it is "a performance
+decision not a fidelity one". So the default is now **on**, and `render.map_lighting = false` is
+the A/B. Two things to carry forward with it:
+
+- **A fidelity comparison against `GKPLUS_RENDERER=d3d8` now has three departures to switch off**,
+  not two: `per_pixel_lighting`, `lighting_maps` and this.
+- **Level02 is still the level it fits worst on** (§4.54, r 0.37 against 0.87-0.96 elsewhere), and
+  level02 is the level every renderer measurement in these notes is taken on. That has not changed
+  and is not what the default turns on.
+
+### A trap this measurement walked into first
+
+The first level04 run said map lighting was free *and* that `map_light_cull` made no difference -
+which should have been suspicious, because §4.56's whole point is that it does. It was a knob left
+set from an earlier command in the same REPL session: every "on" reading in that run had the grid
+**off**, and level04 at 431 lights and a close camera is cheap enough either way to hide it. It
+only showed up on level01, where brute force is 30 ms.
+
+**Set every knob a reading depends on at the top of the reading, not once at the start of the
+session.** A REPL session is long, a paused frame is not the only state that persists, and a knob
+that was set forty commands ago is invisible in the transcript of the one that matters.
+
+## 4.61 The map lights' static shadow atlas
+
+The second half of phase 4, and the last thing in it. The level's own `STDLIGHT` rig (§4.53) now
+casts shadows: one cube per light, baked from the map's own geometry, once per level.
+`render.map_shadows` is **off** by default and the bake is gated on it too, so off costs nothing.
+
+**Neither the lights nor the world ever move**, and every decision below is that fact applied
+somewhere. There is no per-frame work at all beyond one texture fetch per light per fragment.
+
+### The sizing decides the design, so it comes first
+
+- **A face per light is not enough.** §4.54 measured that a non-omni map light lights the
+  *hemisphere* along row 2 of its orientation - there is no cone angle and `spread` shapes
+  nothing - and 42% of level01's lights are omni, which is a whole sphere. So it is a cube:
+  **six 90-degree faces**, for every light, because skipping the one face a hemisphere cannot
+  reach saves 10% of the atlas and costs a special case in two places.
+- **The atlas size is what costs memory; the face size is what buys capacity.** 4096 is the
+  `maxImageDimension2D` every Vulkan device guarantees and `D16_UNORM` is a mandatory depth
+  format, so the image is **32 MB** whatever the face is. 64 then leaves `(4096/64)^2 / 6` =
+  **682 light slots**, against level01's 686 - the most of any shipped level.
+- **A level with more lights than slots shadows the most influential**, ordered by
+  `brightness * range^3`. That exponent is §4.54's model rather than a heuristic: its falloff is
+  linear in range, so the volume integral of one light's contribution goes as the cube of it.
+  Level01 is the only level this bites, and it reports `4 refused`.
+- **D16 is not a compromise here.** A standard perspective spends its depth near the near plane,
+  so with the near plane at `range/64` the resolvable distance at the far plane is
+  `range / (65536/64)` - **0.1 world units at level01's longest range**. The face resolution is
+  what limits this atlas, by two orders of magnitude.
+
+### Three things it borrows and one it could not
+
+It reuses `shadow.slang`'s vertex shader **unchanged**: `shadow_vertex` multiplies a world position
+by whatever matrix it is pushed, and a perspective one works there exactly as §4.59's orthographic
+one does. It reuses the same pipeline layout and the same push block. What it cannot reuse is the
+pipeline, because the atlas is `D16_UNORM` where the sun's cascades are `D32_SFLOAT`, and the depth
+format is part of a pipeline's rendering info.
+
+### The bake is a slice a frame, and that is not a nicety
+
+**686 lights x 6 faces x 213 map draws is 804,924 draw calls.** Issued in one submit that is
+seconds of GPU work, and **Windows resets a device that makes no progress for two** - so the bake
+is spread. `render.map_shadow_rate` lights a frame, picking up where it left off:
+
+| lights a frame | 4 | 8 | 24 |
+|---|---|---|---|
+| level01, ms/frame during the bake | **44.2** | 55.0 | 91.9 |
+| ... and how long it lasts | 7.6 s | 4.7 s | 2.8 s |
+
+The product is constant at about 1.9 seconds of extra GPU time however it is spread, so the rate
+only decides the shape of the hitch. **4 is the default** because a level's opening seconds are the
+ones a player is looking at, and +11 ms is a frame rate rather than a stall.
+
+Two things make a partial bake safe rather than ugly:
+
+- **A cleared tile reads as depth 1, which is "nothing occludes".** So a light the bake has not
+  reached yet is simply unshadowed, and a level's shadows *arrive* over its first seconds instead
+  of the level starting black.
+- **`LOAD` after the first slice, not `CLEAR`.** A clear here is the whole atlas, so clearing every
+  slice would erase every light baked before it - and the symptom would be an atlas holding only
+  the last four lights, which looks like the feature barely working rather than like a bug. The
+  same asymmetry is in the layout barrier: `UNDEFINED` on the first slice, `SHADER_READ_ONLY` after.
+
+### `MapLightsGeneration()`, because neither obvious identity works
+
+The bake has to re-run on a level change and on nothing else. The light grid keys on the light
+*count*, which is the same for two levels that happen to have the same number; the scratch address
+the lights ride in changes **every frame**, so keying on that re-bakes forever. `src/MapLights` now
+exposes the generation counter it already kept, which moves on a level change and on nothing else.
+
+### What it is worth, and it depends entirely on the level
+
+Paused, `map_shadows` off against on at the default bias, on one frame each:
+
+| level | map lights | frame changed | MAD /255 |
+|---|---|---|---|
+| **level02** - a covered start, 51 long-range lights | 51 | **73.3%** | **6.886** |
+| level01 - the most lights in the game | 686 (682 slotted) | 6.2% | 0.195 |
+| level04 - open terrain | 431 | 0.8% | 0.036 |
+
+**That spread is the result, not noise in it.** Level02's 51 lights have ranges up to 83 world
+units over a 130,000-unit level (§4.54), so every one of them reaches through several walls and the
+atlas is the only thing that stops it. Level04's lights sit on open ground with nothing between
+them and what they light, so there is nothing to occlude. Level01 is in between and its difference
+image is the readable one: orange light from the lava pits, correctly blocked by the pipework and
+the ledges above it, with the shadow edges following the geometry.
+
+`off -> on -> off` returns to **0 pixels** on level01 and to §4.56's blinking "ACTIVE PAUSE"
+indicator on level02, so the A/B is reversible at the floor.
+
+### What it costs to sample
+
+level01 in level, 10-second windows, paired and repeated three times:
+
+| | ms/frame |
+|---|---|
+| `map_shadows = false` | 32.95 |
+| `map_shadows = true` | **33.44** |
+
+**+0.50 ms on the level with 686 of them**, and nothing measurable on level02. That is much less
+than a fetch per light per fragment would suggest, and the reason is where the fetch sits: **last**,
+after the range test, the `N·L` test and the cone test have each already `continue`d. A light this
+fragment cannot see costs no texture fetch at all.
+
+### One tap, not nine
+
+The sun's map uses 3x3 PCF; this one uses a single tap. The map lights are a **sum** - a fragment on
+level02 is in range of a mean of 11.5 of them - so the filtering PCF buys is already there in the
+average, and nine taps a light would be a hundred a fragment. The visible cost is blocky shadow
+edges on a large flat floor, which is the 64-texel face rather than the filter.
+
+### The bias is a normal offset, and the two levels disagree about it
+
+A 64-texel cube face is coarse: one texel is `distance / 32` world units, so at 20 units from a
+light it is 0.6 of one. The depth error a flat surface accumulates across a texel that size is
+dominated by its slope against the light, which is exactly what moving the lookup along the surface
+normal cancels - and a *depth* offset large enough to do the same job would detach every shadow
+from its caster by metres. So the knob is an offset along the normal, in texels at the fragment's
+own distance.
+
+| `map_shadow_bias`, texels | 0 | 0.25 | 0.5 | 1.0 | 2.0 |
+|---|---|---|---|---|---|
+| level02, frame changed | 73.6% | 73.3% | 73.3% | 73.2% | 72.5% |
+| level02, MAD | 11.46 | 7.28 | 7.13 | **6.88** | 6.41 |
+| level04, frame changed | 40.9% | 1.86% | 1.47% | **0.82%** | 0 |
+
+The two rows say different things and both are the measurement. **Level02's acne is gone by 0.25
+and its shadow barely moves after that** - flat area, falling MAD - which is what a real occluder
+looks like. **Level04 has almost no real occlusion at all**, so its whole 40.9% at bias 0 is acne
+and the sweep is watching it die. 1.0 is the larger of the two knees; above it level02's real
+occlusion starts going with the acne.
+
+`render.map_shadow_bias = 0` is also the sharpest picture of what the atlas holds: per-light acne
+with visible cube-face stair-stepping and *coloured* fringes, because each light self-shadows in
+its own colour. It is what said the projection was right before anything else did.
+
+### Off by default, and it is a fidelity decision
+
+Not a performance one - 0.50 ms on the worst level is affordable by any standard this renderer has
+used. The game never had these shadows, so **there is no reference that says the picture with them
+is the right one**, and on level02 they change 73% of the frame. §4.55's own precedent is the
+argument: runtime map lighting shipped off until there was a measurement, and its model at least
+had `SHPVTINT` to be fitted against. This has nothing.
+
+The bake is gated on the knob for the same reason - baking an atlas nothing samples would cost 1.9
+seconds of GPU time at every level start to produce no pixels.
+
+### What would make it better, in the order the measurements point
+
+- **`vkCmdDrawIndexedIndirect`, which is the one place in this renderer it genuinely pays.** Done
+  in §4.62, and the prediction was right for the wrong reason - see there.
+- **A bigger face.** 128 would quarter the blockiness and cost four times the slots, which does not
+  fit at 4096; it needs either an 8192 atlas (128 MB, and past the guaranteed maximum) or a budget
+  of ~170 shadowed lights. The right shape is probably a face size that varies with a light's
+  range, since a range-3 light and a range-111 light currently get the same 64 texels.
+- **Nothing here culls a caster against a light.** A draw entirely outside a light's range is still
+  submitted for all six of its faces. Per-draw bounds would cut the bake by most of itself, and the
+  renderer has none - which is the same gap `rendering_notes.md` §1 names as the reason to revisit
+  the `RenderQueue_Submit` seam as *enrichment*. §4.62 removed the reason to want it.
+
+## 4.62 The bake, by indirect draw - and 1.9 seconds that were not what they looked like
+
+§4.61's bake is **804,924 draw calls** on level01 and it now issues **4,092**. One
+`vkCmdDrawIndexedIndirect` per cube face, drawing every caster, over a batch the CPU rebuilds each
+slice. The atlas is the same one - measured, below.
+
+### It is one entry point, and `SV_DrawIndex` was already paid for
+
+The two things that vary per caster - the draw's `record` and its arena slot - cannot ride in a
+push constant when one command draws a batch. They go into a parallel `{record, base_vertex}` array
+beside the indirect buffer, indexed by **`SV_DrawIndex`**, which leaves the push holding only what
+is uniform over a face: the light's matrix.
+
+`SV_DrawIndex` needs `shaderDrawParameters`, and **that was already enabled** - Slang's
+`SV_VertexID` carries D3D semantics and compiles to `gl_VertexIndex - gl_BaseVertex`, so the
+capability has been a hard requirement since the first shadow pass. That is what made this the
+cheap route. The alternative was smuggling the record through the command's `firstInstance`, which
+needs `drawIndirectFirstInstance` *and* a correction by `SV_StartInstanceLocation`, because
+`SV_InstanceID` is D3D-flavoured in exactly the same way and would read 0.
+
+`multiDrawIndirect` is the one new feature, and it is the one that decides which path runs: without
+it `drawCount` is limited to 1, which is the same thing as not having indirect at all.
+`src/shaders/shadow.slang` has both entry points over one shared body, so the two cannot drift on
+the only thing that matters - which draws cast.
+
+Three smaller things it had to get right:
+
+- **The batch is rebuilt every slice, not once.** `record` indexes the frame's own scratch and that
+  rotates, so a buffer built once and reused across the bake's frames would address the wrong
+  records on all but the first. 164 casters is 3.3 KB through `vkCmdUpdateBuffer`, inline in the
+  command buffer.
+- **A batch has one bound index buffer and one `vertices` address**, so `IsMapGeometry` now
+  requires both sources to be the **arena** and the whole batch to share an index width. Neither
+  has ever excluded a map draw - `map casters dropped` is the counter that would say otherwise
+  rather than a silently smaller shadow.
+- **Two destinations in the upload barrier.** The commands are consumed by `DRAW_INDIRECT` and the
+  parameters by the vertex shader reading them as an address; only one of those is what a transfer
+  barrier defaults to thinking about.
+
+### The atlas is unchanged, and that is the test
+
+`render.map_shadow_indirect` rebuilds the pipeline and re-bakes, so both paths are reachable in one
+session. On a paused level02 frame:
+
+| | whole frame MAD | pixels differing |
+|---|---|---|
+| **indirect vs direct** | **0.00603** | **2,552** |
+| indirect vs indirect again, same path | 0.01041 | 2,520 |
+| the feature itself, off vs on | 6.87854 | 3,906,200 |
+
+**The two paths differ from each other by less than one path differs from itself**, and the
+residual in both is §4.56's blinking "ACTIVE PAUSE" indicator. And the feature's own value
+reproduces §4.61's 6.886 to three digits, which is the second half of the same claim.
+
+### What it saved, and what that says about what was actually slow
+
+level01, 682 lights, timed from `render.stats.frames` between the bake starting and
+`render.map_shadow_report` saying finished. The steady-state frame there is **32.9 ms**:
+
+| lights a frame | direct | indirect |
+|---|---|---|
+| 4 | 41.8 ms/frame over 7.32 s | **30.6 ms/frame over 5.24 s** |
+| 24 | 87.0 ms/frame over 3.04 s | **31.2 ms/frame over 1.12 s** |
+| the whole set in one slice | — | **33.6 ms/frame over 0.30 s** |
+
+**The indirect rows are the steady-state frame time.** Baking all 682 lights - 4,092 faces, every
+caster on each - costs a few milliseconds in total, and the last row is one slice: a single frame
+does the whole thing without being noticeably longer than any other.
+
+So §4.61's "1.9 seconds of GPU time" was **not GPU time**. It was CPU-side draw-call submission,
+and the rasterisation it was hiding is trivial: the whole atlas is 16.7M fragments, three frames'
+worth of one screen. The prediction that indirect would pay here was right and the reason given for
+it was wrong - which is worth recording, because "the bake is expensive" and "submitting the bake
+is expensive" call for completely different next steps. **The one that was true makes per-caster
+culling pointless**: there is nothing left to cull away.
+
+### The rate knob lost its reason to exist
+
+`render.map_shadow_rate` was 4 because 1.9 seconds had to be spread thin enough not to trip a TDR.
+With nothing to spread it now defaults to **256 with indirect and 4 without** - taken from the path
+at atlas creation - so level01 bakes in three frames nobody can see, and the fallback keeps the
+gentle behaviour it needs. 256 rather than the whole set only so that a mod with far more lights
+than any shipped level is still bounded to one slice's worth of submit.
+
+### One thing to check after touching the shared push block
+
+Both entry points read one 96-byte block, and adding `params` to it displaced the two pad words the
+sun's cascades never used. **The sun's shadow is the regression test for that**, and it passes: on
+the same paused level04 frame it reads 16.409% of the frame at 1.620 MAD, against 16.407% / 1.620
+before any of this. `0 validation errors`, `unaccounted for: 0`, every must-be-0 counter at 0.
+
+## 4.63 The staging ring: asking before blocking
+
+The oldest performance item on the list - the ring hands itself back with a `vkDeviceWaitIdle`
+rather than per-slot fences, and has since the Vulkan path only cleared the screen. It now **asks
+each frame's fence whether it has signalled** and takes those bytes back for free, and blocks only
+on what is left. On level01 that is **511 stalls down to 38, and 778 ms of blocking down to 122**
+over thirty seconds of play.
+
+### The measurement said something different from the plan, twice
+
+The plan carried "~1080 stalls a session" and filed it as a *level load* problem - a load stages
+360 MB between two Presents. Pricing the two blocking paths in microseconds says the opposite:
+
+| window | frames | stalls | wraps | staged | blocked | ms/frame |
+|---|---|---|---|---|---|---|
+| boot + level01 load | 798 | 9 | 37 | 1.3 GB | 70 ms | 0.09 |
+| **level01, 30 s of play** | 991 | **511** | 407 | 13.2 GB | **778 ms** | **0.79** |
+| level02 load | 926 | 8 | 38 | 1.3 GB | 67 ms | 0.07 |
+| level02, 30 s of play | 1735 | **0** | 339 | 10.7 GB | **0** | 0 |
+
+**A level load costs 70 ms and presents nothing, so it costs a player nothing.** All of it is in
+play, all of it is on one level, and 0.79 ms of a 30 ms frame is 2.6%.
+
+The second thing it says is *why* level01 and not level02, and it is arithmetic rather than
+mystery: level01 stages **13.3 MB a frame** against a 32 MB ring, level02 6.2 MB. The ring accounts
+`batch + in_flight`, and `in_flight` holds a slot's bytes until `ReleaseFrameStaging` is called -
+which the renderer does for the one slot it is about to reuse, once a frame. So with two frames in
+flight the steady state is one frame being staged plus one already-finished frame still counted:
+13.3 + 13.3 = 26.6 of 32, and any wrap tips it over. Level02's 6.2 + 6.2 never comes close.
+
+### The fix is a question, not a wait
+
+`vkGetFenceStatus` on each live slot, releasing the ones the GPU has already finished. It costs
+nothing, it needs no new synchronisation, and it hands back exactly the bytes the old code was
+blocking to reclaim. `WaitForLiveFrames` stays as the fallback for when the GPU genuinely has not
+caught up.
+
+The one thing that had to be checked is the window where a slot is *live* but its fence is
+signalled from the **previous** submit - reclaiming there would hand back bytes the frame being
+built is about to have read. It cannot happen: the renderer resets the fence at the top of
+`DrawFrame` and `RecordUploads` sets `frame_live` well after that, so from the moment a slot is
+live its fence is unsignalled until its own submit completes. There is no early return between the
+two, which is the invariant `FrameStagingRetired` rests on.
+
+| level01, 30 s of play | before | after |
+|---|---|---|
+| stalls | 511 | **38** |
+| blocked | 778.1 ms | **122.7 ms** |
+| per frame | 0.79 ms | **0.12 ms** |
+| frames in the window | 991 | **1025** |
+
+Boot and the level load go from 9 stalls to **0**. Level02 had none and still has none.
+
+**Do not measure this with validation on.** The first after-run showed 853 frames against the
+baseline's 991 and read as a regression; it was `-Validation`, which the baseline did not have.
+Same trap as §4.60's stale knob, one layer out.
+
+### What is left, and it is a different thing
+
+Of the 122 ms remaining, the session totals split it **33 ms over 38 stalls** (870 us each) and
+**159 ms over 26 flushes** (6.1 ms each) - so `FlushPendingNow` is now the bigger half. That is the
+un-recorded batch reaching the ring's size before anything could record it, which no amount of
+fence-asking helps: it is capacity against a 13.3 MB/frame level, and the levers are a bigger ring
+or recording sooner.
+
+**A bigger ring is deliberately not the answer taken.** It is host-visible and permanently mapped,
+and on a 32-bit host the whole 2 GB of address space is shared with the game, the driver and
+QuickJS - the header's first design constraint. 32 MB more of it to remove 0.09 ms a frame is the
+wrong trade; the reason it is written down is so nobody re-derives it.
+
+### The verifiers, because this is the one change that could corrupt
+
+Handing a staging region back early is precisely the hazard that "silently corrupted exactly one
+texture per session during the startup burst" before `ReleaseFrameStaging` existed at all. The
+instrument for that class is the readback, and it is clean: **`render.verify_textures()` reads
+340/340**, and `render.verify_buffers()` reads **3468/3469 on a paused frame**, which is the plan's
+own number and §4.42's deliberately-frozen slot.
+
+It reads 3467 on a *running* level01, and that is the instrument rather than a regression: a second
+`fvf 0x1c4` dynamic buffer is mid-refill while the verifier reads it, which is the whole of §4.42's
+"a deferred readback proves consistency, not correctness". Pausing removes it. Worth knowing before
+someone reads 3467 as a defect.
+
+### 13.5 GB in thirty seconds, which nothing has ever looked at (§4.63)
+
+An incidental measurement, left here because it is surprising and nobody asked for it: level01 in
+steady play stages **13.3 MB a frame**, 450 MB a second, against §4.8's "4.7 MB over 75 locks per
+frame". Three times what the ring was sized from. It is the game's own dynamic buffers being
+re-locked and re-uploaded whole, every frame - nothing here skips an upload whose bytes did not
+change, and nothing has measured whether they do.
+
+## 4.64 Two play reports about the map lights
+
+"Lights other than the sun cast a very clear and unnatural looking disk around them", and "they
+don't cast shadows". Both were right, and neither was reachable from any measurement taken so far -
+the first because the artefact is invisible in the data the model was fitted against, the second
+because it was a default nothing could settle.
+
+### The disk is a first-derivative jump, and the profile says so
+
+The instinct is that a hard edge means a hard cutoff, and there is one - `range` - so the diagnosis
+looks free. It is worth *not* taking it, because two other clamps in the same expression would look
+identical: `saturate(acc * gain)` plateaus at 1.0 and `max(ambience, ...)` plateaus at the floor,
+and a plateau boundary is also a sharp-looking ring.
+
+**Sweeping the gain separates them in one step.** A saturation boundary *moves* when the gain
+changes; a range boundary does not:
+
+| `map_light_gain` | 0.6 | 1.2 | 2.4 |
+|---|---|---|---|
+| the disk's edge | same arc | same arc | same arc |
+
+So it is the range. And a scan across it, in the light's own channel and against the same frame
+with `map_lighting` off, says exactly what kind of edge it is:
+
+```
+y=804   -2.1                                  the light does not reach here
+y=816   -0.6
+y=822    1.1  #                               ... and here it starts, at once
+y=834    4.5  ####
+y=846    8.8  ########
+y=858   12.3  ############
+y=870   15.2  ###############
+```
+
+**Flat, then a linear ramp beginning abruptly from zero.** The value is continuous - there is no
+step - but its *slope* jumps, and that is a Mach band: the eye finds a first-derivative
+discontinuity as readily as a real edge. `1 - d/range` reaches zero with a non-zero slope, which is
+the whole of it.
+
+**Per vertex it is invisible**, which is why §4.54's fit never saw it and why this needed play to
+find. The tail is interpolated across whole terrain triangles, so the kink lands inside a triangle
+and is smoothed away before anything samples it. Going per pixel (§4.55) is what exposed it.
+
+### The fix is measured against the same bake the model was fitted to
+
+`utils/riflights/fit_bake.py` needs no game, so a candidate falloff can be refitted over all four
+levels before anything is rebuilt. **`(1 - t)(1 - t^4)`** has zero derivative at `t = 1` and is
+within 6% of linear at the half-range, so it changes the model only in the tail - where the vertex
+data had least to say:
+
+| level | linear (the fitted model) | **windowed tail** | cosine |
+|---|---|---|---|
+| level05 | 0.957 | **0.949** | 0.942 |
+| level04 | 0.926 | **0.925** | 0.918 |
+| level01 | 0.875 | **0.861** | 0.850 |
+| level02 | 0.367 | **0.362** | 0.359 |
+
+It costs between 0.001 and 0.014 of r and lands nearer linear than the cosine falloff §4.54
+rejected - which is the other smooth-tailed candidate and was the fallback if this had not held.
+
+**The gain default moved with it, and had to**: a dimmer tail refits to a brighter gain. The three
+per-level fits go 0.9 / 1.35 / 1.35 to **1.1 / 1.5 / 1.5**, so the default goes 1.2 to **1.35** by
+the same rule it always was - the mean over the three levels the model actually holds on.
+
+On screen the rim is gone: the same pool that had a clean arc across the middle of the frame now
+fades out with nothing to see.
+
+### The shadows were a default, not a defect
+
+`render.map_shadows` shipped **off** in §4.61, and that section says why in as many words: sampling
+the atlas costs 0.50 ms on the level with the most map lights in the game, so cost was never the
+objection - it was that *nothing could say whether the picture with them was right*, because the
+game never had them.
+
+A play report is exactly the evidence that was missing, and it points the other way: a feature
+nobody can see is not a fidelity question. **On by default.** The bake stays gated on the knob, so
+turning it off still costs nothing.
+
+Both defaults verified at once on level04: the bake finishes in **0.29 s**, 0 validation errors,
+and level02 - the level these shadows change 73% of - remains readable, which was the thing to
+check before shipping it on.
+
+### The general lesson, which is §4.54's own warning read forwards
+
+A model fitted against *vertex* data cannot be trusted about anything that happens **between**
+vertices, and a per-pixel evaluation is nothing but between-vertex behaviour. The fit chose the
+falloff's shape correctly and had no opinion whatever about its derivative, because interpolation
+had already destroyed the evidence. Anything else this model does that only shows up per pixel is
+equally unmeasured - and play is currently the only instrument pointed at it.
+
+## 4.65 Shadows from the game's own point and spot lights
+
+The gap every shadow section so far leaves. Units cast from the sun (§4.58), map geometry casts
+from the level's `STDLIGHT` rig (§4.61), and **nothing at all cast from D3D's point and spot
+lights** - the lights the game sets on the device, which is what level02's fires are. So a fire lit
+the far side of the wall it stands behind.
+
+It is now sixteen slots of §4.61's atlas, and the whole section is a case of **measuring first and
+watching the hard problem evaporate**. The plan named the hard problem correctly - "a light has no
+identity across frames" - and three measurements turned it into a four-line stability gate.
+
+### The three measurements, none of which existed
+
+`render.frame_lights` is the first: the frame's D3D lights **deduplicated by contents**, with how
+many draws each reached and how many frames it has survived. It had to be by contents because
+that is the only identity there is - `SetLight` reuses indices freely, and a `GpuLight` is
+deduplicated by enable mask *within* a frame and thrown away with the frame's scratch.
+
+**How many are there?**
+
+| | distinct in a frame | of those, point/spot | draws each reaches |
+|---|---|---|---|
+| level02, settled start | 7 | **5** | 6 - 42 |
+| level02, the fire camera | 14 | **12** | 4 - 73 |
+| level01 | 7 | 5 | 5 - 56 |
+| level04 | 6 | 4 | 1 - 27 |
+| level05 | 3 | 1 | 26 |
+| prison | 2 | **0** | - |
+
+Against the directional's 161 - 378 draws. **No spot light appears in any of those frames** - but
+see the correction below, which found one the moment an effect was fired in view. Every light in
+the table above is a point light, and the cube is the only case that has been exercised on screen.
+
+**Are they static?** Completely. On level02, **13 distinct point-light contents over 5,525
+consecutive frames** - the five at the start present in every frame since the level loaded, the
+seven that came into view present in every frame since. Nothing is re-authored, and the report's
+`mean frames a distinct point/spot light survives` reads 2,341 against a 1.0 that would mean "new
+every frame".
+
+**What fraction of the frame could a shadow change?** `render.local_lights = false` drops the point
+and spot lights and keeps the directionals, so a paused A/B paints exactly the pixels they reach -
+and since a shadow only ever *removes* light, that set strictly contains anything shadowing them
+could do. It is the ceiling, taken before anything was designed:
+
+| | MAD /255 | frame changed | repeat floor |
+|---|---|---|---|
+| level02, the fire camera | **0.482** | **2.34%** | 0.0003 / 0.07% |
+| level02, settled start | 0.066 | 0.75% | 0.009 / 0.04% |
+| level04 | 0.021 | 0.63% | 0.008 / 0.01% |
+| level01, level05 | at the floor | 0 | |
+| prison | at the floor | 0 | |
+
+Against the sun's 17% and the map atlas's 73%. **Prison is the self-test**: it has no point light
+at all, and the knob moves nothing there, which is what says the switch is measuring the thing it
+claims to.
+
+**Every row of that table is the STATIC lights only**, and that is a limit rather than a caveat:
+each was taken on a paused frame, and pausing is exactly what removes the explosion and effect
+lights the correction below found. What a shadow from a *transient* light would be worth is
+unmeasured, and the instrument for it is this same knob read on a moving frame.
+
+So this is a small feature, and that is what decided its shape. A per-frame cube per light - the
+design the plan sketched, which dissolves the identity problem by rebuilding every frame - is the
+right answer for a feature worth 17%. For one worth 2%, the right answer is the one that costs
+nothing.
+
+### The identity, and what a play-informed correction did to it
+
+**Because they never move, their contents ARE a stable key.** A slot is held under
+`{position, range, type, cone}` and the cube is baked once, exactly as a map light's is.
+
+Two things had to be got right, and the first came from a correction rather than from a
+measurement. Asked whether they are really static, the honest answer was that the census had only
+ever run on **paused frames of a settled camera with no combat** - which is precisely where a
+projectile, a flare or an explosion cannot appear.
+
+**The first attempt to run it against those was wrong, and wrong in the way this whole section is
+about.** It fired `fx.explode`, `fx.sparks` and `fx.lightning` and read **0 new lights**, and
+concluded Gunlok builds no light for an explosion at all. It does. The effects were fired at a
+point the camera was not looking at, and **a D3D light is only enabled on draws near it** - so an
+explosion out of frame enables nothing and the census correctly reports nothing. Pointing the
+camera at the same coordinates and firing the same commands:
+
+| | distinct point/spot lights over the session |
+|---|---|
+| baseline, static lights only | 7 |
+| ... after one `fx.airstrike` | 28 |
+| ... `fx.explode_with_smoke` | 44 |
+| ... `fx.explode` | 74 |
+| ... `fx.pulse_rings` | 103 |
+| ... `fx.lightning` | 134 |
+
+Fifteen to thirty new contents per effect, and **`mean frames a distinct point/spot light
+survives` falls from 2,341 to 9.7** - which is the census's own staticness metric detecting it
+without being asked. An explosion's light **moves**: two consecutive readings put one at
+`(-15.00, -4.71, 8.50)` and then `(-15.00, -3.21, 1.48)` with its colour and range unchanged, so
+it is a light riding a particle. It lives about a dozen frames.
+
+The same run turned up **a spot light** - `range 67.81`, `diffuse 2 2 2`, reaching 165 draws for a
+single frame - which the six settled cameras above had said did not exist anywhere in the game. It
+does; it is an effect's, not a level's.
+
+Neither changes what the feature does, and both change what could be *claimed* about it. A light
+that moves is refused by the gate below and casts nothing at zero cost, which is what these are.
+What it does change is the ceiling: `render.local_lights` was measured on **paused frames with no
+effects running**, so every number in the ceiling table is the *static* lights' contribution and
+says nothing about the transient ones. That reading has not been taken.
+
+The second thing was measured correctly the first time: `ADD BLINKING LIGHT` blinks by rewriting
+its **diffuse** at a fixed position - so the key excludes colour, which is right on its own terms
+(occlusion does not depend on colour) and would otherwise have churned a slot thirty times a
+second. Verified rather than reasoned: `render.frame_lights` shows the blinking light as two
+contents and `render.local_shadow_report` shows it holding **one** slot.
+
+And a genuinely moving light exists in the shipped data as well as in the effects -
+level02's own `.gcs` has
+
+```
+ASSOCIATELIGHT lift_a liftswitchaa light 0.8 0.3 0.1 0.5
+set track lift_a "lift dum a" "lift dum b" "lift dum c" "lift dum d" true
+```
+
+a light attached to a lift on a track. **The stability gate is the whole handling of that case**: a
+key must survive four frames before it claims a slot, so a light that moves makes a new key every
+frame, never reaches the threshold, never claims a slot and never costs a bake. It is unshadowed -
+which is the state every D3D light was in before this section. The cost of the general case is
+zero, and the report says `waiting out the stability gate` for it rather than reporting an error.
+
+Two details that keep the table bounded rather than growing behind a moving light: a key not asked
+for in 120 frames is forgotten, and **a slot is never taken from a light seen this frame**. That
+second one is what stops a thrash - with more qualified lights than slots, evicting the
+least-recent would re-bake six faces every frame forever. Measured by adding twenty lights at once:
+**33 keys against 16 slots baked 38 cubes in total**, not 38 a frame.
+
+### Sixteen slots off the map lights' budget, and one atlas
+
+`kMapShadowSlots` is 682 and the last 16 are now the local lights'. **Only level01 notices** - it
+is the one level with more `STDLIGHT`s than the atlas holds, and it goes from refusing 4 of 686 to
+refusing 20, all at the bottom of the `brightness * range^3` order. Its local lights are worth
+nothing measurable on screen and its map lights are worth 0.195 MAD (§4.61), so trading sixteen of
+the weakest for the whole feature is the right way round.
+
+Three things follow from sharing one image rather than adding a second:
+
+- **`map_shadow_texture` now means "the atlas exists and somebody wants it"**, and which of its two
+  tenants may sample it is two bits of `light_flags`. Two texture fields would have been the
+  obvious spelling and `GpuFrameData` has no room - it is 256 bytes with `offsetof` asserts at 128
+  and 192, and the spare word was the pad.
+- **The atlas is cleared once per level by whichever half gets there first.** It used to be
+  `MapShadowCursor == 0`, which was the same thing while the map lights were the only producer;
+  with a second one that reading clears the whole atlas again the first time a D3D light claims a
+  tile, erasing every map cube baked before it.
+- **One `BuildCubeFaceMatrix` and one `cube_shadow_visibility`** serve both. A `STDLIGHT`'s cube
+  and a D3D point light's differ only in where the centre is, and having two of each would be two
+  more places for the bake and the lookup to project against subtly different frusta.
+
+The visibility rides in on `LightGeometry::shadow` rather than being folded into its `k`, because
+**the ambient term must never be shadowed** (§4.58's first rule) - and it is computed inside
+`light_geometry` for the reason that function exists at all: the fixed-function sum and the
+lighting maps' response both run it, and a highlight computed under a different condition from the
+diffuse it sits on is exactly §4.46.
+
+### What it is worth, and the sweep that says it is real
+
+Paused, `local_shadows` off against on:
+
+| | MAD /255 | frame changed | repeat floor |
+|---|---|---|---|
+| level02, the fire camera | **0.336** | **1.92%** | 0.005 / 0.12% |
+| level02, settled start | 0.070 | 0.77% | 0.001 / 0.03% |
+| level04 | **0.000** | **0 pixels** | 0.000 |
+
+The difference image is the reading rather than the number: at the fire camera it is the rock below
+the ledge, the wedge in front of it and a sliver at the right - the geometry on the **far side of
+the ledge the fires stand on**, which was being lit through it. The ledge top the fires legitimately
+light keeps its orange. At the settled start it is the ceiling above the corridor and nothing else.
+
+Level04's 0.000 is not a failure, it is §4.61's own finding about that level repeated: its lights
+sit on open ground with nothing to occlude. It is also the reversibility check, at a true zero
+floor.
+
+**The bias sweep says this is occlusion and not acne**, which is the one thing the numbers above
+cannot say by themselves. §4.61's instrument, at the fire camera:
+
+| `map_shadow_bias`, texels | 0 | 0.25 | 0.5 | 1.0 | 2.0 | 4.0 |
+|---|---|---|---|---|---|---|
+| frame changed | 2.087% | 1.946% | 1.951% | **1.927%** | 1.884% | 1.840% |
+
+**Flat.** Compare §4.61's level04 row, which collapsed 40.9% -> 1.86% between 0 and 0.25 as acne
+died. Here a 7% relative step at 0.25 removes the acne and everything after it is unchanged out to
+bias 4, which is the signature of a real occluder. The default of 1.0 - shared with the map lights,
+since the knob is denominated in texels at the fragment's own distance and is therefore scale-free -
+sits in the middle of the flat region.
+
+### What it costs
+
+level02, three paired 10-second windows with the knob toggled between them:
+
+| pass | off | on | cost |
+|---|---|---|---|
+| 1 | 16.64 ms | 16.64 ms | 0 |
+| 2 | 16.64 | 16.61 | -0.03 |
+| 3 | 17.39 | 16.64 | -0.75 |
+
+**Nothing measurable.** Which is what §4.61 predicts: the fetch is last, after the range, `N·L` and
+cone rejections have each already `continue`d, and there are five of these lights where the map
+lights are 686 for 0.50 ms.
+
+### Invariants, and the two regression tests this had to pass
+
+| | before | after |
+|---|---|---|
+| the map lights' own worth, level02 (§4.61) | 6.886 MAD / 73.3% | **7.083 / 74.40%** |
+| the sun's own map, level04 (§4.62) | 1.620 MAD / 16.409% | **1.659 / 16.56%** |
+| level01 map-light slots | 682 of 686 | **666 of 686** |
+| validation errors | 0 | **0**, on every level run |
+
+The map-light figure rises because §4.64 moved the default gain 1.20 -> 1.35 after §4.61 measured
+it, not because sixteen slots went missing - level02 uses 51 of the 666 that remain. The sun's is
+§4.62's stated regression test for anything touching the shared shadow machinery.
+
+### An unattributed display fault, and the switch it bought
+
+Partway through this section's testing the **whole display** corrupted - flickering and garbage
+across the desktop, taskbar included - and cleared on a video-driver restart. It is recorded here
+because it happened, not because it was attributed:
+
+- **no TDR and no display-driver reset was logged**, on any provider, in the whole window;
+- **Vulkan validation read 0 errors** on every run before and after, including the runs immediately
+  either side;
+- **Steam had already crashed with an access violation in `ntdll` an hour earlier**, after which
+  `gl.exe` exited cleanly at startup half a dozen times in a row - including with `d3d8.dll`
+  renamed away entirely, so with no GkPlus in the process at all.
+
+A user-mode application writing out of bounds inside its own images cannot reach the Windows
+desktop; that needs a driver or GPU fault. None of which rules the feature out.
+
+What it did buy is a switch that should have existed anyway. **`GKPLUS_VK_LOCAL_SHADOWS=0` is a
+launch-time off switch**, and the reason it is not merely a convenience is that
+`render.local_shadows` is reachable only through the REPL, and the REPL is reachable only from a
+running game on a **usable display**. A GPU feature suspected of wedging the display cannot be
+switched off by the one instrument that needs the display to work. Verified by firing it: `keys
+live: 0`, `cubes baked: 0`, and the knob reads back false.
+
+### The general lesson
+
+**The expensive question was answered by the cheap measurement.** "A light has no identity across
+frames" is true, and it reads as a design problem needing either a per-frame rebuild or a cache
+with an invented key. `render.frame_lights` cost an afternoon and said the lights do not move - at
+which point their contents *are* the identity, and the whole feature is sixteen slots of an atlas
+that was already being baked.
+
+**And the correction that mattered came from someone who had played the game, not from the data -
+twice, and the second time it corrected the correction.** The census was taken on paused, settled
+frames, which is exactly the state in which a projectile, a flare or an explosion cannot appear -
+so "completely static" was a claim about the conditions the instrument had been pointed at rather
+than about the game. Being asked about it produced the discovery that the blinking light rewrites
+its colour (which fixed the key) and the shipped `ASSOCIATELIGHT` on a moving lift (which is why
+there is a stability gate at all rather than a bare cache).
+
+Then it produced "flares, explosions and projectiles still don't cast", and the answer on file was
+"those create no light at all, measured". **That measurement was worthless and read as
+authoritative**: the effects had been fired at coordinates the camera was not pointed at, and a
+D3D light is only enabled on draws near it, so the instrument was being asked about a light that
+was never switched on. Pointing the camera at the same coordinates turns 7 distinct lights into
+134. The failure mode is §4.20's, one level down - *an A/B is only evidence about the pixels that
+were on screen when it ran* - and a null result is where it hides best, because a zero looks the
+same however it was obtained.
+
+**A null result from a measurement deserves a positive control.** `prison` got one in the ceiling
+table above, which is why that row is trustworthy: the knob is known to move something elsewhere.
+"Explosions create no light" got none, and one would have been free - fire the effect where a
+light *is* known to appear and check the count moves at all.
+
 ---
 
 GkPlus is a modding framework with a JS layer, a VFS and a REPL; the renderer should join that

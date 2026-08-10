@@ -110,6 +110,10 @@ struct GpuMapLight {
     float4 axis;      // xyz = row 2 of the orientation, the light's axis
 };
 
+// Must match kMaxShadowCascades in src/VkDraw.h: the atlas is a 2x2 grid of tiles, and the tile
+// index below is derived from a cascade's number exactly as RecordShadowPass derives its viewport.
+static const uint kMaxShadowCascades = 4u;
+
 static const uint kShadeFlat = 1u;
 // LFlag_Omni, from AvP's prototyp.h. The one flag bit this shader reads, and it decides whether
 // the cone applies - measured, not assumed: applying the cone to an omni light makes level04's
@@ -138,9 +142,28 @@ struct GpuFrameData {
     float map_ambience;
     uint map_light_count;
     uint map_flags;
-    uint pad0;
-    uint pad1;
-    uint pad2;
+    // The sun's shadow map. `shadow_texture == kNoTexture` is the one test - "no sun", "the knob
+    // is off" and "this device has no shadow pipeline" are all that state, and none is a branch
+    // of its own.
+    uint shadow_texture;
+    uint shadow_sampler;
+    float shadow_strength;
+    float shadow_texel;      // 1 / the TILE, so a PCF tap is a step in a cascade's own uv
+    float shadow_z_near;
+    float shadow_z_span;
+    uint shadow_cascades;    // how many of `cascades` are live, 0 for none
+    // The map lights' static shadow atlas. Same one test as above: kNoTexture is "off", "not
+    // created" and "this level has no map lights" all at once.
+    uint map_shadow_texture;
+    uint map_shadow_sampler;
+    float map_shadow_offset; // along the normal, in atlas texels at the fragment's own distance
+    uint light_flags;        // kLocalLightsOn
+    // Per cascade: xy the box's snapped centre in light space, z the reciprocal of its
+    // half-extent, w its depth bias already converted out of texels.
+    float4 cascades[kMaxShadowCascades];
+    // World -> **light space**: the sun's basis, no scale and no translation, so the result is in
+    // world units and a cascade is a centre and a half-extent in it. One transform, four boxes.
+    float4 sun_matrix[4];
 };
 
 // **56 bytes of a guaranteed 128.** It reached exactly 128 with the light grid (§4.56), and
@@ -164,6 +187,16 @@ struct Push {
 static const uint kMapLightingOn = 0x1u;
 static const uint kMapLightingAll = 0x2u;
 static const uint kMapLightingGrid = 0x4u;
+// GpuFrameData::light_flags - likewise. `render.local_lights`, off, drops D3D's point and spot
+// lights from the sum and leaves the directionals, so the difference image is exactly the pixels
+// those lights reach. That is the CEILING on what a shadow from them could ever change, which is
+// the measurement phase 5 has to take before it designs anything (§4.65).
+static const uint kLocalLightsOn = 0x1u;
+// Which of the static atlas's two tenants may sample it. `map_shadow_texture` says only that the
+// image exists - the map lights (§4.61) and D3D's own point lights (§4.65) are separate features
+// with separate knobs, so each asks about itself.
+static const uint kMapShadowsOn = 0x2u;
+static const uint kLocalShadowsOn = 0x4u;
 
 [[vk::push_constant]]
 ConstantBuffer<Push> pc;
@@ -256,6 +289,87 @@ float4 material_source(uint lighting, uint shift, float4 material, float4 vertex
     return (source == 1u && have_vertex) ? vertex_colour : material;
 }
 
+// The six cube faces of the map lights' static shadow atlas. **This table is duplicated in
+// src/VkDraw.cpp and the two must agree exactly** - the bake rasterises with it, this projects
+// with it, and a disagreement puts a light's shadow on the wrong face rather than producing
+// anything that looks like a bug.
+static const float3 kFaceForward[6] = {float3(1, 0, 0),  float3(-1, 0, 0), float3(0, 1, 0),
+                                       float3(0, -1, 0), float3(0, 0, 1),  float3(0, 0, -1)};
+static const float3 kFaceRight[6] = {float3(0, 0, -1), float3(0, 0, 1), float3(1, 0, 0),
+                                     float3(1, 0, 0),  float3(1, 0, 0), float3(-1, 0, 0)};
+static const float3 kFaceUp[6] = {float3(0, 1, 0),  float3(0, 1, 0), float3(0, 0, -1),
+                                  float3(0, 0, 1),  float3(0, 1, 0), float3(0, 1, 0)};
+// kMapShadowFace / kMapShadowAtlas / kMapShadowNear in src/VkDraw.h and .cpp. Constants here
+// rather than frame data because they are compile-time on that side too, and a value that cannot
+// change has no business costing a load per fragment per light.
+static const float kMapShadowFace = 64.0;
+static const float kMapShadowTilesPerRow = 64.0;
+static const float kMapShadowNear = 1.0 / 64.0;
+
+// How lit `world_position` is by one light with a cube in the static atlas, 0 to 1. `slot` is
+// which cube.
+//
+// **Shared by the level's own `STDLIGHT` rig and by D3D's point and spot lights** (§4.61, §4.65).
+// The two are completely different light systems - one is authoring data the shipped engine never
+// read, the other is what the game sets on the device this frame - but a cube is a cube, and
+// having one lookup is what keeps them from projecting against subtly different frusta. The CPU
+// side has the same property: one `BuildCubeFaceMatrix` bakes both.
+//
+// **The bias is a normal offset, not a depth one** (notes §4.61). A 64-texel cube face is coarse -
+// a texel is `distance / 32` world units - so the depth error a flat surface accumulates across
+// one is dominated by its slope against the light, and moving the lookup along the normal by a
+// texel or two cancels exactly that. A depth offset large enough to do the same job here would
+// detach every shadow from its caster by metres.
+float cube_shadow_visibility(float3 world_position, float3 normal, float3 light_position,
+                             float light_range, uint slot) {
+    const GpuFrameData frame = pc.frame[0];
+    const float range = max(light_range, 1e-3);
+    float3 delta = world_position - light_position;
+    // The offset is in texels *at this distance*, and a face is 90 degrees across
+    // `kMapShadowFace` of them, so one texel spans `2 * distance / kMapShadowFace` world units.
+    const float texel = 2.0 * length(delta) / kMapShadowFace;
+    delta += normal * (frame.map_shadow_offset * texel);
+
+    const float3 a = abs(delta);
+    uint face;
+    if (a.x >= a.y && a.x >= a.z) {
+        face = delta.x >= 0.0 ? 0u : 1u;
+    } else if (a.y >= a.z) {
+        face = delta.y >= 0.0 ? 2u : 3u;
+    } else {
+        face = delta.z >= 0.0 ? 4u : 5u;
+    }
+    const float z = dot(delta, kFaceForward[face]);
+    const float near_plane = range * kMapShadowNear;
+    if (z <= near_plane || z >= range) {
+        // Nearer than the near plane is geometry the bake clipped, and past the far plane is out
+        // of this light's reach entirely - the caller has already rejected the latter by range,
+        // so this is the near case and it must read LIT. Shadowing it would put a dark halo on
+        // everything close enough to a light to matter most.
+        return 1.0;
+    }
+    // Exactly what the bake's matrix produces: a 90-degree left-handed perspective, so x/z and
+    // y/z land in -1..1 across one face, and the depth is D3D's z/w.
+    const float2 local = float2(dot(delta, kFaceRight[face]), dot(delta, kFaceUp[face])) / z;
+    const float scale = range / (range - near_plane);
+    const float reference = scale * (1.0 - near_plane / z);
+
+    // Half a texel in from the tile's own edge, for §4.59's reason one atlas up: a filtered fetch
+    // at a boundary would otherwise blend in the neighbouring tile, which here is a different
+    // light's cube face rather than merely a different scale.
+    const float2 tile = float2(float(slot * 6u + face) % kMapShadowTilesPerRow,
+                               floor(float(slot * 6u + face) / kMapShadowTilesPerRow));
+    const float2 uv = clamp(local * 0.5 + 0.5, 0.5 / kMapShadowFace, 1.0 - 0.5 / kMapShadowFace);
+    const float2 atlas = (tile + uv) / kMapShadowTilesPerRow;
+    // One tap, not nine. The map lights are a *sum* - a fragment on level02 is in range of a mean
+    // of 11.5 of them (§4.54) - so the filtering the sun's map needs from PCF is already there in
+    // the average, and nine taps a light would be a hundred a fragment.
+    const float depth = textures[frame.map_shadow_texture]
+                            .SampleLevel(samplers[frame.map_shadow_sampler], atlas, 0.0)
+                            .r;
+    return reference <= depth ? 1.0 : 0.0;
+}
+
 // One light's geometry: the direction to it and the attenuation-times-spot factor D3D calls k,
 // or `valid = false` for a light this vertex is out of range of or outside the cone of.
 //
@@ -266,16 +380,39 @@ float4 material_source(uint lighting, uint shift, float4 material, float4 vertex
 struct LightGeometry {
     float3 to_light;
     float k;
+    // How much of this light reaches the surface, from the static atlas (§4.65). **Separate from
+    // `k` rather than folded into it**, because the ambient term must never be shadowed - ambient
+    // is by definition light that did not arrive along the ray, so attenuating it makes a
+    // shadowed surface darker than an unlit one, which is how a first shadow implementation ends
+    // up with holes in it (§4.58). So: ambient uses `k`, the direct terms use `k * shadow`.
+    float shadow;
     bool valid;
 };
 
-LightGeometry light_geometry(GpuLight light, float3 world_position) {
+// `normal` is here **only** for the shadow lookup, whose bias is an offset along it. Nothing else
+// in this function uses it, and passing it is what lets the fixed-function sum and the lighting
+// map's response share one visibility rather than compute two that can disagree.
+LightGeometry light_geometry(GpuLight light, float3 world_position, float3 normal) {
     LightGeometry out;
     out.to_light = float3(0, 0, 1);
     out.k = 1.0;
+    out.shadow = 1.0;
     out.valid = true;
 
     const float type = light.spot.w;
+    // `render.local_lights = false` - a diagnostic, and the one that prices phase 5 (§4.65). It
+    // drops every point and spot light and keeps the directionals, so a paused A/B paints exactly
+    // the pixels D3D's local lights reach. A shadow can only ever REMOVE light, so that set
+    // strictly contains anything shadowing them could change: it is the ceiling, measured before
+    // anything is built.
+    //
+    // Here rather than in either loop for the reason this function exists at all: the fixed
+    // function's sum and the lighting map's response both run it, and a diagnostic that reached
+    // one and not the other would report a ceiling that is not one.
+    if (type < 2.5 && (pc.frame[0].light_flags & kLocalLightsOn) == 0u) {
+        out.valid = false;
+        return out;
+    }
     if (type >= 2.5) {
         // Directional: no position, no attenuation. The CPU has normalised the direction.
         out.to_light = -light.direction.xyz;
@@ -306,6 +443,19 @@ LightGeometry light_geometry(GpuLight light, float3 world_position) {
                          light.spot.z);
         }
     }
+    // **The static shadow, last** - after the range test and the cone test have each already
+    // returned, exactly as the map lights' lookup sits behind theirs (§4.61). A light this
+    // fragment cannot see costs no texture fetch at all.
+    //
+    // `direction.w` is this light's cube in the atlas, or -1 - which is the answer for a light
+    // that moves, one the sixteen reserved slots had no room for, and one whose cube has not been
+    // baked yet. All three are "unshadowed", which is where every D3D light was before §4.65.
+    const int slot = int(light.direction.w);
+    if (slot >= 0 && (pc.frame[0].light_flags & kLocalShadowsOn) != 0u &&
+        pc.frame[0].map_shadow_texture != kNoTexture) {
+        out.shadow = cube_shadow_visibility(world_position, normal, light.position.xyz,
+                                            light.attenuation.w, uint(slot));
+    }
     return out;
 }
 
@@ -322,8 +472,21 @@ struct LightSums {
 // The loop, verbatim from what `shade_vertex` used to do inline. `to_eye` is the caller's because
 // the two call sites disagree about where it comes from: per vertex it is computed once from the
 // vertex's world position, per pixel from the fragment's.
+//
+// `visibility` is the sun's shadow term, and it is applied HERE rather than to the finished sums
+// because it belongs to **one** light. It multiplies a DIRECTIONAL light's contribution and
+// nothing else: the map describes what occludes the sun, and a point light three metres away in
+// the same room is not occluded by the roof between the room and the sky.
+//
+// It is worth only 0.12 MAD on level02's covered start, whose visible lighting turns out to be the
+// directional rather than its two fires (§4.59) - and that smallness is the measurement, because
+// it says the level going dark there is the sun being correctly occluded and not a point light
+// being wrongly shadowed.
+//
+// A level with two directional lights would have both shadowed by the one map. None is known;
+// every draw measured so far carries a single white directional plus point lights.
 LightSums light_sum(GpuDrawRecord draw, float3 world_position, float3 normal, bool want_specular,
-                    float3 to_eye, float power) {
+                    float3 to_eye, float power, float visibility) {
     LightSums out;
     out.ambient = draw.global_ambient.rgb;
     out.diffuse = float3(0, 0, 0);
@@ -331,15 +494,25 @@ LightSums light_sum(GpuDrawRecord draw, float3 world_position, float3 normal, bo
 
     for (uint i = 0u; i < draw.light_count; ++i) {
         const GpuLight light = pc.lights[draw.light_offset + i];
-        const LightGeometry geometry = light_geometry(light, world_position);
+        const LightGeometry geometry = light_geometry(light, world_position, normal);
         if (!geometry.valid) {
             continue;
         }
         const float3 to_light = geometry.to_light;
-        const float k = geometry.k;
+        // **The ambient term is never shadowed**, whatever the light. Ambient is by definition
+        // light that did not arrive along the sun's ray, so attenuating it makes a shadowed
+        // surface darker than an unlit one - the classic way a first shadow implementation ends
+        // up with black holes rather than shade.
+        //
+        // Two visibilities, one per light system, and each reaches only the light it describes:
+        // `visibility` is the sun's cascades and applies to a DIRECTIONAL light alone, and
+        // `geometry.shadow` is the static atlas and applies to whichever point or spot light has
+        // a cube in it (§4.65). A light with neither carries 1.0 in both.
+        const float k =
+            geometry.k * (light.spot.w >= 2.5 ? visibility : 1.0) * geometry.shadow;
 
         const float lambert = max(0.0, dot(normal, to_light));
-        out.ambient += k * light.ambient.rgb;
+        out.ambient += geometry.k * light.ambient.rgb;
         out.diffuse += k * light.diffuse.rgb * lambert;
         // **Gated on the diffuse term, not just on N.H.** A light behind the surface contributes
         // no highlight in D3D, and `max(0, N.H)` alone does not say so: N.H stays positive well
@@ -387,6 +560,74 @@ LitColour resolve_lit_colour(GpuDrawRecord draw, LightSums sums, float4 vertex_c
                        diffuse.a);
     out.specular = want_specular ? saturate(specular.rgb * sums.specular) : float3(0, 0, 0);
     return out;
+}
+
+// How lit this fragment is by the sun, 0 fully shadowed to 1 fully lit.
+//
+// A 3x3 PCF over the depth map. Manual comparison rather than a comparison sampler, because the
+// bindless set's sampler array is `SamplerState` and adding a second array of
+// `SamplerComparisonState` would mean a third binding on a set whose last binding is pinned by
+// VARIABLE_DESCRIPTOR_COUNT - for nine taps that cost the same either way.
+float sun_visibility(float3 world_position) {
+    const GpuFrameData frame = pc.frame[0];
+    if (frame.shadow_texture == kNoTexture || frame.shadow_cascades == 0u) {
+        return 1.0;
+    }
+    // ONE transform, however many cascades: `sun_matrix` is the sun's basis with no scale, so this
+    // is the fragment in light space in world units, and a cascade is a centre and a half-extent
+    // in it. Four matrix multiplies would give the same answer and cost four times as much.
+    const float3 ls = mul(float4(world_position, 1.0),
+                          float4x4(frame.sun_matrix[0], frame.sun_matrix[1],
+                                   frame.sun_matrix[2], frame.sun_matrix[3])).xyz;
+    const float depth = (ls.z - frame.shadow_z_near) / frame.shadow_z_span;
+    // Outside the box the map covers is LIT, not shadowed. The alternative - clamping into the
+    // edge texel - smears whatever is at the boundary across the rest of the level, which reads
+    // as a huge shadow that follows the camera.
+    if (depth < 0.0 || depth > 1.0) {
+        return 1.0;
+    }
+
+    // The FIRST cascade that contains this fragment, which is the smallest one because they are
+    // ordered inward-out - so the sharpest map that covers a fragment is the one it uses, and the
+    // selection needs no view-space depth. §4.56's warning applies here too: the view matrix on
+    // this side is per DRAW, so anything derived from it is a quiet source of error.
+    uint cascade = frame.shadow_cascades;
+    float2 local = float2(0.0, 0.0);
+    for (uint i = 0u; i < frame.shadow_cascades; ++i) {
+        const float2 p = (ls.xy - frame.cascades[i].xy) * frame.cascades[i].z;
+        if (all(abs(p) <= 1.0)) {
+            cascade = i;
+            local = p * 0.5 + 0.5;
+            break;
+        }
+    }
+    if (cascade >= frame.shadow_cascades) {
+        return 1.0; // past the outermost box, which is where shadows stop
+    }
+    // The bias is per cascade because the knob is in TEXELS and a texel is a different world
+    // distance in each one - which is the whole reason one number works across all four.
+    const float reference = depth - frame.cascades[cascade].w;
+    const float2 tile = float2(float(cascade & 1u), float(cascade >> 1));
+    // Half a texel in from the tile's own edge. A PCF tap at the boundary would otherwise read
+    // the neighbouring cascade's depth, which is a different scale entirely and paints a hard
+    // line along the seam.
+    const float2 lo = float2(0.5, 0.5) * frame.shadow_texel;
+    const float2 hi = float2(1.0, 1.0) - lo;
+
+    float lit = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            const float2 tap =
+                clamp(local + float2(float(x), float(y)) * frame.shadow_texel, lo, hi);
+            // SampleLevel, not Sample: this runs under a branch on the material, where an
+            // implicit-derivative fetch is undefined - the same rule shade_lighting_map follows.
+            const float d =
+                textures[frame.shadow_texture].SampleLevel(samplers[frame.shadow_sampler],
+                                                           (tap + tile) * 0.5, 0.0).r;
+            lit += reference <= d ? 1.0 : 0.0;
+        }
+    }
+    return lerp(1.0, lit / 9.0, saturate(frame.shadow_strength));
 }
 
 // The level's own baked lighting, re-created at this fragment.
@@ -441,10 +682,16 @@ uint2 map_light_range(float3 world_position) {
     return uint2(base, count);
 }
 
+
 float3 map_light_sum(float3 world_position, float3 normal) {
     float3 acc = float3(0, 0, 0);
     const uint2 span = map_light_range(world_position);
     const bool culled = (pc.frame[0].map_flags & kMapLightingGrid) != 0u;
+    // Hoisted: the loop runs up to a hundred times on a busy fragment and this is one load.
+    const uint frame_shadow_texture = pc.frame[0].map_shadow_texture;
+    // `map_shadow_texture` says the atlas exists; this bit says the MAP LIGHTS may sample it.
+    // Two features share the image now (§4.65), so each has to ask about itself.
+    const bool map_shadows_on = (pc.frame[0].light_flags & kMapShadowsOn) != 0u;
     for (uint slot = 0u; slot < span.y; ++slot) {
         // One indirection when the grid is up, none when it is not - so the fallback really is
         // the same loop phase 3b ran rather than a second code path to keep in step.
@@ -458,7 +705,22 @@ float3 map_light_sum(float3 world_position, float3 normal) {
         }
         const float distance = sqrt(max(distance_squared, 1e-12));
         const float3 to_light = delta / distance;
-        float atten = (1.0 - distance / range) * max(0.0, dot(normal, to_light));
+        // **The fitted linear falloff, with its tail windowed to zero** (notes §4.64).
+        //
+        // `1 - d/range` reaches zero with a NON-ZERO slope, and per pixel that draws a visible
+        // rim around every light - a first-derivative jump, which the eye reads as a hard disc
+        // even though the value itself is continuous. Play reported it as "an unnatural disk"
+        // and a scan across one measures exactly that: flat, then a linear ramp starting
+        // abruptly from zero.
+        //
+        // Per VERTEX it is invisible, which is why §4.54's fit never saw it - the tail is
+        // interpolated across whole terrain triangles. `(1 - t)(1 - t^4)` has zero derivative at
+        // t = 1 and is within 6% of linear at the half-range, so it changes the model only where
+        // the vertex data had least to say: refitting costs r 0.957 -> 0.949 on level05, 0.926 ->
+        // 0.925 on level04, 0.875 -> 0.861 on level01. Still nearer linear than the cosine
+        // falloff §4.54 rejected, which is the other smooth-tailed candidate.
+        const float t = distance / range;
+        float atten = (1.0 - t) * (1.0 - t * t * t * t) * max(0.0, dot(normal, to_light));
         if (atten <= 0.0) {
             continue;
         }
@@ -466,6 +728,19 @@ float3 map_light_sum(float3 world_position, float3 normal) {
             // The cone: how far off the light's own axis this fragment lies. Measured from the
             // light TOWARDS the fragment, which is the opposite of `to_light`.
             atten *= max(0.0, dot(light.axis.xyz, -to_light));
+            if (atten <= 0.0) {
+                continue;
+            }
+        }
+        // The static shadow, LAST - after every cheap rejection above. A light that this fragment
+        // is out of range of, facing away from or outside the cone of costs no texture fetch at
+        // all, which is what keeps the atlas affordable over a mean of 11.5 lights a fragment.
+        // `axis.w` is -1 until the bake has reached this light, so a level shadows progressively
+        // rather than starting black.
+        const int shadow_slot = int(light.axis.w);
+        if (shadow_slot >= 0 && frame_shadow_texture != kNoTexture && map_shadows_on) {
+            atten *= cube_shadow_visibility(world_position, normal, light.position.xyz,
+                                            light.position.w, uint(shadow_slot));
             if (atten <= 0.0) {
                 continue;
             }
@@ -542,8 +817,9 @@ VertexOut shade_vertex(uint vertex_id) {
 
     const bool want_specular = (draw.lighting & kSpecularEnable) != 0u;
     const float3 to_eye = want_specular ? normalize(draw.eye.xyz - world_position) : float3(0, 0, 1);
+    // Visibility 1: the per-VERTEX path reproduces the fixed function, which has no shadow at all.
     const LightSums sums = light_sum(draw, world_position, normal, want_specular, to_eye,
-                                     draw.material_specular.w);
+                                     draw.material_specular.w, 1.0);
     const LitColour lit = resolve_lit_colour(draw, sums, vertex_colour, want_specular);
     output.color = lit.color;
     output.specular = float4(lit.specular, 0.0);
@@ -761,15 +1037,21 @@ LightingMapShade shade_lighting_map(GpuMaterial material, GpuDrawRecord draw, fl
 
     for (uint i = 0u; i < draw.light_count; ++i) {
         const GpuLight light = pc.lights[draw.light_offset + i];
-        const LightGeometry geometry = light_geometry(light, world_position);
+        const LightGeometry geometry = light_geometry(light, world_position, normal);
         if (!geometry.valid) {
             continue;
         }
+        // The same split as the fixed-function sum: ambient on `k` alone, the direct terms on
+        // `k * shadow`. **The diffuse pair would cancel it** - this function returns a bumped /
+        // flat ratio, so a factor on both is invisible there - but the specular below is not a
+        // ratio, and a highlight that survives a wall the diffuse is blocked by is exactly the
+        // class of self-disagreement §4.46 was.
+        const float k = geometry.k * geometry.shadow;
         ambient_sum += geometry.k * light.ambient.rgb;
         const float lambert = max(0.0, dot(normal, geometry.to_light));
         const float lambert_bumped = max(0.0, dot(bumped, geometry.to_light));
-        diffuse_flat += geometry.k * light.diffuse.rgb * lambert;
-        diffuse_bumped += geometry.k * light.diffuse.rgb * lambert_bumped;
+        diffuse_flat += k * light.diffuse.rgb * lambert;
+        diffuse_bumped += k * light.diffuse.rgb * lambert_bumped;
         // Gated on the BUMPED lambert, which is §4.46's condition applied to the normal this term
         // is actually shaded with: a facet turned away from the light carries no highlight, and
         // the whole point of the map is that a facet is not the triangle.
@@ -781,7 +1063,7 @@ LightingMapShade shade_lighting_map(GpuMaterial material, GpuDrawRecord draw, fl
             // because level02's lights all author a black specular.
             const float3 colour =
                 lerp(light.specular.rgb, light.diffuse.rgb, saturate(pc.frame[0].specular_from_diffuse));
-            specular_sum += geometry.k * colour * pow(max(0.0, dot(bumped, halfway)), exponent);
+            specular_sum += k * colour * pow(max(0.0, dot(bumped, halfway)), exponent);
         }
     }
 
@@ -857,8 +1139,12 @@ float4 fragment_main(VertexOut input) : SV_Target {
         // computes this once per vertex and interpolates the result of the whole highlight.
         const float3 to_eye =
             want_specular ? normalize(draw.eye.xyz - input.world_position) : float3(0, 0, 1);
+        // The sun's shadow rides INTO the loop rather than being applied to the result, so it
+        // reaches the one light it describes - see light_sum. Per pixel only: the vertex path is
+        // the fixed-function reproduction and this is a departure from it.
         const LightSums sums = light_sum(draw, input.world_position, normal, want_specular,
-                                         to_eye, draw.material_specular.w);
+                                         to_eye, draw.material_specular.w,
+                                         sun_visibility(input.world_position));
         const LitColour lit = resolve_lit_colour(draw, sums, diffuse, want_specular);
         diffuse = lit.color;
         specular_in = lit.specular;

@@ -1,0 +1,398 @@
+// Every `render` knob worth turning, as ImGui.
+//
+// Its own module rather than more of main.mjs, for two reasons: main.mjs is a
+// teaching example and this would swamp it, and a panel you can copy into your
+// own entry module beside your own code is more use than one you have to cut out
+// of somebody else's.
+//
+// It draws headers into whatever window the caller has open - no Begin/End of its
+// own - so `draw_render_panel(ImGui)` composes with anything.
+//
+// ## One rule, and it is not a style preference
+//
+// **Write a knob only when the widget says it changed.** `draw_gui` runs every
+// frame the overlay is open, and several of these setters do real work:
+// `render.lighting_maps = true` destroys every lighting-map image and re-reads
+// every file, `render.map_shadow_rate` re-bakes the shadow atlas from the start,
+// and `render.map_shadow_indirect` rebuilds a pipeline. Some of them happen to
+// early-out when the value is unchanged; writing them unconditionally would be
+// betting on which ones, sixty times a second. So everything here goes through
+// the three helpers below, which write on `changed` and nothing else.
+//
+// The second cost is reading. `render.draws`, `render.vulkan_report` and the rest
+// format a page of text every time they are touched, so nothing here reads one
+// per frame - they sit behind a button that caches what it read.
+
+import { console, render } from "gk";
+
+/** Text the readout buttons have fetched, so a page of formatted state is built
+ *  when it is asked for rather than sixty times a second.
+ *  @type {{title: string, body: string} | null} */
+let readout = null;
+
+/** A checkbox bound to a `render` property, written only when it changes.
+ *  @param {ImGui} ImGui
+ *  @param {string} label
+ *  @param {string} key
+ *  @param {string} [tip]
+ *  @returns {boolean} the value now, so a caller can grey out what depends on it
+ */
+function toggle(ImGui, label, key, tip) {
+  const result = ImGui.Checkbox(label, render[key] === true);
+  if (result.changed) {
+    render[key] = result.value;
+  }
+  if (tip) {
+    ImGui.SetItemTooltip(tip);
+  }
+  return result.value;
+}
+
+/** A float slider bound to a `render` property, written only when it changes.
+ *  @param {ImGui} ImGui
+ *  @param {string} label
+ *  @param {string} key
+ *  @param {number} min
+ *  @param {number} max
+ *  @param {string} [tip]
+ *  @param {string} [format]
+ */
+function slider(ImGui, label, key, min, max, tip, format) {
+  const current = Number(render[key]);
+  const result = ImGui.SliderFloat(label, Number.isFinite(current) ? current : 0, min, max, {
+    format: format ?? "%.3f",
+  });
+  if (result.changed) {
+    render[key] = result.value;
+  }
+  if (tip) {
+    ImGui.SetItemTooltip(tip);
+  }
+}
+
+/** The same for a whole-number knob.
+ *  @param {ImGui} ImGui
+ *  @param {string} label
+ *  @param {string} key
+ *  @param {number} min
+ *  @param {number} max
+ *  @param {string} [tip]
+ */
+function intSlider(ImGui, label, key, min, max, tip) {
+  const current = Number(render[key]);
+  const result = ImGui.SliderInt(label, Number.isFinite(current) ? current : min, min, max);
+  if (result.changed) {
+    render[key] = result.value;
+  }
+  if (tip) {
+    ImGui.SetItemTooltip(tip);
+  }
+}
+
+/** A button that fetches one of the text readouts into the cache.
+ *  @param {ImGui} ImGui
+ *  @param {string} label
+ *  @param {() => string} read
+ */
+function readoutButton(ImGui, label, read) {
+  if (ImGui.Button(label)) {
+    try {
+      readout = { title: label, body: read() };
+    } catch (error) {
+      readout = { title: label, body: String(error) };
+    }
+  }
+}
+
+/**
+ * Draw the whole panel into the caller's window.
+ *
+ * @param {ImGui} ImGui
+ */
+export function draw_render_panel(ImGui) {
+  if (!ImGui.CollapsingHeader("Renderer")) {
+    return;
+  }
+  ImGui.TextWrapped(
+    "These are the Vulkan renderer's own knobs. Most are A/B switches meant to be " +
+      "toggled on a paused frame (screen.toggle_pause) - that is the only comparison " +
+      "with a zero noise floor."
+  );
+
+  // Narrow enough that a label fits beside it in the default overlay width.
+  ImGui.PushItemWidth(150);
+
+  // --- the sun's shadow ------------------------------------------------------
+  if (ImGui.TreeNode("Sun shadow")) {
+    const sun = toggle(ImGui, "sun_shadows", "sun_shadows",
+      "A real shadow map from the sun. Off is the build before it existed.");
+    // Everything below only does something while the sun is casting, and a knob
+    // that visibly does nothing is worse than one that is visibly unavailable.
+    ImGui.BeginDisabled(!sun);
+    intSlider(ImGui, "cascades", "shadow_cascades", 1, 4,
+      "1 is the original single map at the same texel density - the A/B for cascading.");
+    slider(ImGui, "bias (texels)", "shadow_bias", 0, 8,
+      "In shadow texels, so one value holds on every cascade, level and extent. " +
+        "Below ~2 the level shadows itself; above ~2.5 the shadow shrinks away from its caster.",
+      "%.2f");
+    slider(ImGui, "strength", "shadow_strength", 0, 1,
+      "1 is 'no sunlight reaches here', which is correct rather than maximum - " +
+        "ambient and the level's own bake still light the surface.",
+      "%.2f");
+    slider(ImGui, "extent", "shadow_extent", 10, 250,
+      "Half-width of the OUTERMOST cascade, in world units. The camera's own max " +
+        "distance is 75, so 70 covers everything it can see.",
+      "%.0f");
+    ImGui.EndDisabled();
+    toggle(ImGui, "stencil_shadow", "stencil_shadow",
+      "Also draw the game's own blob shadow. Off, or a unit carries both.");
+    ImGui.TreePop();
+  }
+
+  // --- the level's own light rig ---------------------------------------------
+  if (ImGui.TreeNode("Map lighting")) {
+    const on = toggle(ImGui, "map_lighting", "map_lighting",
+      "Replace the level's baked vertex colour with a per-pixel evaluation of the " +
+        "rig that baked it. Judge it on level04 or level05, not level02.");
+    ImGui.BeginDisabled(!on);
+    slider(ImGui, "gain", "map_light_gain", 0.5, 2.5,
+      "The fitted model's one free parameter. 0.9 on level01, 1.35 on level04 and 05.",
+      "%.2f");
+    toggle(ImGui, "cull by the grid", "map_light_cull",
+      "Bin the lights into a world-space grid. Worth 28 ms a frame on level01 - and " +
+        "off must be BIT-IDENTICAL, which is the only test that catches a cell missing a light.");
+    toggle(ImGui, "substitute everywhere", "map_lighting_all",
+      "Also substitute on props and units, which carry their own file's bake. " +
+        "Measures worse; it exists so that claim stays checkable.");
+
+    ImGui.SeparatorText("Static shadows from those lights");
+    const shadows = toggle(ImGui, "map_shadows", "map_shadows",
+      "One six-face cube per light, baked once per level. The bake is gated on this " +
+        "too, so off costs nothing and turning it back on restarts it.");
+    ImGui.BeginDisabled(!shadows);
+    slider(ImGui, "normal offset", "map_shadow_bias", 0, 4,
+      "In atlas texels at the fragment's distance. 0 shows exactly what the atlas " +
+        "holds: per-light acne, one colour per light.",
+      "%.2f");
+    intSlider(ImGui, "bake rate", "map_shadow_rate", 1, 512,
+      "Lights baked per frame. Writing this re-bakes from the start.");
+    toggle(ImGui, "indirect submission", "map_shadow_indirect",
+      "One vkCmdDrawIndexedIndirect a face instead of a draw call per caster per " +
+        "face. The two must produce the same atlas - this is what checks it.");
+    ImGui.EndDisabled();
+    readoutButton(ImGui, "map_shadow_report", () => String(render.map_shadow_report));
+    ImGui.SameLine();
+    readoutButton(ImGui, "map_light_report", () => String(render.map_light_report));
+    ImGui.EndDisabled();
+    ImGui.TreePop();
+  }
+
+  // --- the game's own D3D point and spot lights ------------------------------
+  //
+  // Deliberately its own section rather than a line in "Map lighting": they share
+  // an atlas and nothing else. These are the lights the game sets on the device
+  // this frame - level02's fires - where the map lights are authoring data the
+  // shipped engine loaded and never read.
+  if (ImGui.TreeNode("Point and spot lights")) {
+    toggle(ImGui, "local_shadows", "local_shadows",
+      "Shadows from the game's own point and spot lights, out of sixteen reserved " +
+        "slots of the map lights' atlas. A light that MOVES gets none rather than a " +
+        "wrong one, and costs nothing.");
+    toggle(ImGui, "local_lights", "local_lights",
+      "Whether those lights are in the sum at all. A diagnostic: off paints exactly " +
+        "the pixels they reach, which is the ceiling on what shadowing them could change.");
+    readoutButton(ImGui, "local_shadow_report", () => String(render.local_shadow_report));
+    ImGui.SameLine();
+    readoutButton(ImGui, "frame_lights", () => String(render.frame_lights));
+    ImGui.TreePop();
+  }
+
+  // --- the light sum ---------------------------------------------------------
+  if (ImGui.TreeNode("Light sum")) {
+    toggle(ImGui, "per_pixel_lighting", "per_pixel_lighting",
+      "D3D8's light sum per fragment rather than per vertex. Same equation, same " +
+        "lights. Judge it on the difference image: it is zero on flat ground.");
+    toggle(ImGui, "lighting", "lighting",
+      "The whole light sum. Off collapses to the material colour, which is what " +
+        "the build before it did.");
+    toggle(ImGui, "specular", "specular",
+      "The specular term of that sum. The run-time mirror of GKPLUS_NO_SPECULAR, " +
+        "which reaches only the forwarded call.");
+    toggle(ImGui, "shade_mode", "shade_mode",
+      "Honour D3DRS_SHADEMODE. Worth 0 pixels on level01 and level02, where every " +
+        "flat-shaded draw is the stencil shadow.");
+    ImGui.TreePop();
+  }
+
+  // --- lighting maps ---------------------------------------------------------
+  if (ImGui.TreeNode("Lighting maps")) {
+    const maps = toggle(ImGui, "lighting_maps", "lighting_maps",
+      "Load '<texture> lighting.dds' beside each .RIM. Setting this false then " +
+        "true re-reads every file - that is the authoring gesture for a map edited " +
+        "while the game runs.");
+    ImGui.BeginDisabled(!maps);
+    slider(ImGui, "bump_scale", "bump_scale", 0, 4, undefined, "%.2f");
+    slider(ImGui, "bump_diffuse", "bump_diffuse", 0, 1,
+      "A bump that only shapes highlights is invisible wherever metallic is 0, " +
+        "which is why the derived normal reaches the diffuse too.", "%.2f");
+    slider(ImGui, "specular_scale", "specular_scale", 0, 1,
+      "0.25 because level02's key light is diffuse 4.0 and 1.0 saturates a floor to white.",
+      "%.2f");
+    slider(ImGui, "specular_from_diffuse", "specular_from_diffuse", 0, 1,
+      "1 because every light reaching that floor authors specular 0 0 0, so at 0 " +
+        "the metallic channel would do nothing over most of a level.", "%.2f");
+    slider(ImGui, "gloss_min", "gloss_min", 1, 128, undefined, "%.0f");
+    slider(ImGui, "gloss_max", "gloss_max", 1, 512, undefined, "%.0f");
+    slider(ImGui, "chrome_scale", "chrome_scale", 0, 2, undefined, "%.2f");
+    slider(ImGui, "chrome_blur", "chrome_blur", 0, 8,
+      "A mip bias on the sphere map. The game's own sampler clamps to level 0, so " +
+        "this swaps in a sampler that does not.", "%.2f");
+    toggle(ImGui, "chrome_texgen", "chrome_texgen");
+    readoutButton(ImGui, "lighting_map_report", () => String(render.lighting_map_report));
+    ImGui.SetItemTooltip(
+      "Not optional reading: a texture with no companion file is the normal case, " +
+        "so a misnamed file and a stock install look identical from the screen."
+    );
+    ImGui.EndDisabled();
+    ImGui.TreePop();
+  }
+
+  // --- fidelity against the original -----------------------------------------
+  if (ImGui.TreeNode("Fidelity switches")) {
+    ImGui.TextWrapped(
+      "Each of these reproduces something D3D8 does. Turning one off is how it was " +
+        "measured; leaving one off is a renderer that no longer matches."
+    );
+    toggle(ImGui, "offscreen", "offscreen",
+      "Rasterise at the game's 640x480 backbuffer size and blit, rather than " +
+        "letting the viewport scale every 2D draw. Worth 2.55/255 over 65% of the frame.");
+    toggle(ImGui, "half_pixel", "half_pixel",
+      "D3D9's pixel-centre convention, as a half-pixel viewport origin. 1.34/255.");
+    toggle(ImGui, "rhw_depth_raw", "rhw_depth_raw",
+      "A pre-transformed vertex's z is clamped into the viewport slice, not run " +
+        "through it. Off makes level02's flames come and go with camera distance.");
+    toggle(ImGui, "viewport_rect", "viewport_rect",
+      "Honour D3DVIEWPORT8's rectangle per draw. Only the upgrade screen sets one " +
+        "that is not the whole backbuffer.");
+    toggle(ImGui, "present_linear", "present_linear",
+      "Filter the final blit. NEAREST is a deduction, not a default: the original's " +
+        "stretch preserves a 4-bit texture's sixteen distinct values.");
+    ImGui.TreePop();
+  }
+
+  // --- diagnostics -----------------------------------------------------------
+  if (ImGui.TreeNode("Diagnostics")) {
+    slider(ImGui, "force_lod", "force_lod", -1, 12,
+      "Force every texture fetch to one mip level. -1 is off. Pair it with " +
+        "GKPLUS_NO_MIPMAP=1 on the reference to pin both sides to level 0.",
+      "%.0f");
+
+    // The bisect. `draw_hide` is the one to reach for: hiding a window leaves the
+    // depth and stencil buffers intact, where truncating a prefix does not - and a
+    // draw that is merely unoccluded then reads as the one that painted the pixel.
+    //
+    // **`draw_hide` always reads back as a two-element array**, and "nothing
+    // hidden" is `[1, 0]` - a window no index can fall in. So the empty state is
+    // `first > last`, not null and not an empty array: testing the array for
+    // truthiness says "something is hidden" every single frame.
+    ImGui.SeparatorText("Bisect the draw list");
+    const window = /** @type {number[]} */ (render.draw_hide);
+    const from = window[0] ?? 1;
+    const to = window[1] ?? 0;
+    ImGui.Text(from > to ? "hiding nothing" : `hiding draws ${from}..${to}`);
+    // Typed rather than dragged: a bisect converges on one index, and a slider
+    // over a frame's ~300 draws cannot address one.
+    const first = ImGui.InputInt("hide from", from);
+    const last = ImGui.InputInt("hide to", to);
+    if (first.changed || last.changed) {
+      render.draw_hide = [first.value, last.value];
+    }
+    if (ImGui.Button("Show everything")) {
+      render.draw_hide = null;
+      render.draw_range = null;
+    }
+    ImGui.SetItemTooltip("Clears both draw_hide and draw_range.");
+
+    ImGui.SeparatorText("Readouts");
+    readoutButton(ImGui, "draws", () => String(render.draws));
+    ImGui.SameLine();
+    readoutButton(ImGui, "vulkan_report", () => String(render.vulkan_report));
+    ImGui.SameLine();
+    readoutButton(ImGui, "validation", () => JSON.stringify(render.validation, null, 1));
+    readoutButton(ImGui, "verify_textures()", () => String(render.verify_textures()));
+    ImGui.SameLine();
+    readoutButton(ImGui, "verify_buffers()", () => String(render.verify_buffers()));
+    ImGui.SetItemTooltip(
+      "Reads one short on a running level and that is the instrument, not a defect: " +
+        "a dynamic buffer the game refills while the verifier reads it. Pause first."
+    );
+    if (ImGui.Button("Reset counters")) {
+      render.reset();
+    }
+    ImGui.TreePop();
+  }
+
+  // --- material overrides ----------------------------------------------------
+  if (ImGui.TreeNode("Material override")) {
+    ImGui.TextWrapped(
+      "Names a case-insensitive substring of a live texture's .rim path. An override " +
+        "that resolves and paints nothing looks exactly like a broken one - the " +
+        "readback is what tells them apart."
+    );
+    const name = ImGui.InputText("texture", overrideName);
+    if (name.changed) {
+      overrideName = name.text;
+    }
+    if (ImGui.Button("Tint magenta")) {
+      readout = {
+        title: "material_override",
+        body: render.material_override(overrideName, { tint: [1, 0, 1] }),
+      };
+    }
+    ImGui.SameLine();
+    if (ImGui.Button("Hide")) {
+      readout = {
+        title: "material_override",
+        body: render.material_override(overrideName, { hide: true }),
+      };
+    }
+    ImGui.SameLine();
+    if (ImGui.Button("Clear all")) {
+      render.clear_material_overrides();
+      readout = { title: "material_override", body: "cleared" };
+    }
+    readoutButton(ImGui, "material_overrides", () => String(render.material_overrides));
+    ImGui.TreePop();
+  }
+
+  ImGui.PopItemWidth();
+
+  // Whatever a readout button last fetched, in a scrolling child so a page of
+  // text does not push the rest of the overlay off screen.
+  // Copied into a local first: the Close button below clears the module-level
+  // one, and reading it again afterwards would be reading what was just dropped.
+  const shown = readout;
+  if (shown) {
+    ImGui.SeparatorText(shown.title);
+    if (ImGui.Button("Close")) {
+      readout = null;
+    }
+    if (ImGui.BeginChild("render-readout", { size: { x: 0, y: 220 } })) {
+      ImGui.TextWrapped(shown.body);
+    }
+    ImGui.EndChild();
+  }
+}
+
+/** The material-override key, kept across frames because InputText hands back
+ *  the edited text rather than writing through a pointer.
+ *  @type {string} */
+let overrideName = "";
+
+/** Log the state of everything this panel touches, for a bug report or a note.
+ *  Exported because it is the one thing more useful from the console than from
+ *  a slider. */
+export function log_render_state() {
+  console.log(String(render.draws));
+  console.log(String(render.vulkan_report));
+}

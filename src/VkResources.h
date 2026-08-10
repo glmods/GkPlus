@@ -97,6 +97,16 @@ struct ResourceStats {
   // Times the ring had to block because the region it was about to reuse was still being read
   // by a frame in flight. See WaitForLiveFrames.
   uint64_t staging_stalls = 0;
+  // Times it took bytes back from a frame the GPU had already finished, **without blocking** -
+  // one `vkGetFenceStatus` per live slot. This is the path that replaced most of the stalls
+  // above (§4.63); the two counters together say which one the ring is living on.
+  uint64_t staging_reclaims = 0;
+  // **How long those two actually took**, in microseconds, because a count says nothing about
+  // whether they matter: a block during a level load - which presents no frames and stages
+  // 360 MB - is invisible, and the same block between two frames of play is a hitch. Read them
+  // as a *difference* across a window rather than as session totals (§4.63).
+  uint64_t staging_stall_us = 0;
+  uint64_t staging_flush_us = 0;
   // Ring bytes the head skipped without handing them out - alignment padding, and the tail
   // abandoned at a wrap. They count against the batch like any other byte; the figure is here
   // because it used to not, which let the head lap its own un-recorded batch (see
@@ -235,6 +245,16 @@ uint32_t AcquireSampler(uint32_t mag_filter, uint32_t min_filter, uint32_t mip_f
 // Deliberately a *variant* rather than a relaxation of the original: every draw the game itself
 // makes must keep the clamp, because §4.28 measured it as a real part of the picture.
 uint32_t MippedSamplerFor(uint32_t sampler_index);
+
+// The bindless slots the two shadow maps live in, and the function that points one at a view.
+//
+// **Fixed high slots** rather than ones from the allocator: image indices are handed out by
+// push_back from 0 and a shadow map is not a `TextureImage` - it has no `.rim` name, no D3D
+// resource behind it and nothing to verify against - so taking the top of the array keeps them
+// permanently clear of every path that walks the image list.
+constexpr uint32_t kShadowMapSlot = 4095;    // the sun's cascades (§4.59)
+constexpr uint32_t kMapShadowMapSlot = 4094; // the map lights' static atlas (§4.61)
+void WriteBindlessView(uint32_t index, uint64_t view);
 
 // The set and its layout, as opaque handles so this header keeps mentioning no Vulkan type
 // (the same reason RecordUploads takes a `void *`). Zero until the resources are up.

@@ -70,6 +70,18 @@ struct RendererStats {
 
 const RendererStats &Stats();
 
+// Has the GPU finished the frame this slot last submitted?
+//
+// **A poll, never a wait** - `vkGetFenceStatus`, so it costs nothing and may be asked from
+// anywhere. It exists for the staging ring (§4.63): the ring holds a slot's bytes until
+// `ReleaseFrameStaging` is called, and the renderer only calls that for the one slot it is about
+// to reuse - so a frame the GPU finished milliseconds ago goes on holding a third of the ring
+// until its turn comes round again. Asking is what lets the ring hand those bytes back early.
+//
+// Safe against the frame currently being built: the fence is reset before anything is recorded
+// into that slot, so this reads "not retired" from then until the submit completes.
+bool FrameStagingRetired(uint32_t frame_index);
+
 // Whether the world is rasterised into an offscreen target at the GAME's backbuffer size and
 // scaled onto the swapchain afterwards, rather than straight into the swapchain (§4.37).
 //

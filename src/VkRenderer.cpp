@@ -675,6 +675,14 @@ void DrawFrame() {
   // compute dispatch inside vkCmdBeginRendering is invalid. Usually a no-op - the grid is rebuilt
   // once per level, not once per frame.
   BuildLightGrid(frame.cmd);
+  // Also outside any render pass, and after the scene has been recorded: it walks the same draw
+  // list the world pass is about to.
+  RecordShadowPass(frame.cmd);
+  // And so does the map lights' static atlas, which is why it is here rather than at level load -
+  // the map's geometry is only reachable as a draw list, and a draw list only exists inside a
+  // frame. Usually a no-op: it bakes a few lights a frame until the level's set is done and then
+  // stops until the next level (§4.61).
+  BakeMapShadows(frame.cmd);
 
   // Where the world pass draws: the offscreen target when it is up, the swapchain image when it
   // is not. UNDEFINED as the source layout in either case, on purpose - neither image's previous
@@ -917,6 +925,17 @@ void ShutdownRenderer() {
 }
 
 const RendererStats &Stats() { return TheStats; }
+
+bool FrameStagingRetired(uint32_t frame_index) {
+  if (frame_index >= kFramesInFlight) {
+    return true;
+  }
+  const VkFence fence = Frames[frame_index].in_flight;
+  if (fence == VK_NULL_HANDLE) {
+    return true; // no fence, so nothing of ours is reading that staging
+  }
+  return vkGetFenceStatus(GetDevice(), fence) == VK_SUCCESS;
+}
 
 void SetOffscreen(bool enabled) {
   // The env read is marked done as well, so a run-time write is not undone the first time

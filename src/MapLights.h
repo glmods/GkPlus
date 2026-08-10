@@ -77,6 +77,13 @@ public:
 // includes `level03`, so an empty result is ordinary rather than a failure.
 const std::vector<MapLight> &MapLights();
 
+// Which load the set above came from. It moves on every level change and on nothing else, which
+// makes it the identity for anything cached against the lights - a shadow atlas baked from them
+// (vulkan_renderer_notes.md §4.61), a spatial index built over them. Comparing the light *count*
+// instead would miss two levels that happen to have the same number, and comparing the vector's
+// address would miss an allocator reusing a block.
+uint32_t MapLightsGeneration();
+
 // `AMBIENCE` as a 0..1 fraction (the file's 16.16 over 65536), or 0 where the file has none.
 // **A per-channel `max()` floor, not a term to add** - it is scalar and colourless, and Gunlok's
 // 2048 is 3.125%. That is AvP's own renderer's reading of it, not an inference.

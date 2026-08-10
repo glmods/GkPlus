@@ -467,6 +467,16 @@ std::string ArmViewportProbe(bool armed, int32_t x, int32_t y, uint32_t width, u
 // `vulkan` session lands on a different draw. This is how to find the same draw again.
 std::string FormatFrameDraws(uint32_t first, uint32_t last);
 
+// `render.frame_lights` - the D3D lights of the last complete frame, deduplicated by CONTENTS,
+// with how many draws each reached and how many frames it has survived.
+//
+// The reading phase 5 needs and nothing had: a `GpuLight` is deduplicated by enable mask *within*
+// a frame and carries no identity at all across one, so "how many distinct point and spot lights
+// does a frame have" was unanswerable. Read `distinct this frame` against `distinct over the
+// session` - a rig that never moves makes the second converge on the first, and one the game
+// re-authors leaves a new key behind every frame.
+std::string FormatFrameLights();
+
 void SetRefRange(uint32_t first, uint32_t last);
 void GetRefRange(uint32_t &first, uint32_t &last);
 void SetRefHide(uint32_t first, uint32_t last);

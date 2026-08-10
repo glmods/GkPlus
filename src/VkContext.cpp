@@ -122,6 +122,7 @@ void QueryDevice(VkPhysicalDevice device, DeviceCaps &caps) {
   caps.dynamic_rendering = features13.dynamicRendering != 0;
   caps.synchronization2 = features13.synchronization2 != 0;
   caps.depth_clamp = features.features.depthClamp != 0;
+  caps.multi_draw_indirect = features.features.multiDrawIndirect != 0;
 
   VkPhysicalDeviceMemoryProperties memory = {};
   vkGetPhysicalDeviceMemoryProperties(device, &memory);
@@ -310,6 +311,10 @@ InitResult DoInitialize() {
   // DeviceCaps::depth_clamp. Asking for an unsupported core feature fails vkCreateDevice, so
   // this is conditional rather than unconditional.
   features.features.depthClamp = TheCaps.depth_clamp ? VK_TRUE : VK_FALSE;
+  // Conditional for the same reason, and optional for a different one: without it the map
+  // shadow bake issues a draw call per caster per face instead of one command per face, which
+  // produces the same atlas more slowly (§4.62).
+  features.features.multiDrawIndirect = TheCaps.multi_draw_indirect ? VK_TRUE : VK_FALSE;
 
   const float priority = 1.0f;
   VkDeviceQueueCreateInfo queue = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};

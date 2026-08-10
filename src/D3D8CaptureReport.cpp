@@ -925,6 +925,53 @@ void LogDraw(D3DPRIMITIVETYPE type, bool user_pointer, uint32_t primitives) {
   DrawLog.push_back(std::move(entry));
 }
 
+// The frame's distinct lights, expanded from one draw's run.
+//
+// Called from ResolveLightRun on every lit draw - including a cache hit, because the question is
+// how many DRAWS each light reaches and the mask cache exists precisely so most draws are hits.
+// Up to eight map inserts a draw, which is why it is here rather than on the recorder's path.
+void NoteLightRun(const vulkan::GpuLight *lights, uint32_t count, uint64_t frame) {
+  for (uint32_t i = 0; i < count; ++i) {
+    const vulkan::GpuLight &light = lights[i];
+    LightKey key;
+    key.type = static_cast<uint32_t>(light.spot[3]);
+    std::memcpy(key.position, light.position, sizeof(key.position));
+    std::memcpy(key.direction, light.direction, sizeof(key.direction));
+    std::memcpy(key.diffuse, light.diffuse, sizeof(key.diffuse));
+    std::memcpy(&key.range, &light.attenuation[3], sizeof(key.range));
+    std::memcpy(key.attenuation, light.attenuation, sizeof(key.attenuation));
+    std::memcpy(&key.theta, &light.spot[0], sizeof(key.theta));
+    std::memcpy(&key.phi, &light.spot[1], sizeof(key.phi));
+    std::memcpy(&key.falloff, &light.spot[2], sizeof(key.falloff));
+
+    LightCensusEntry &entry = LightCensus[key];
+    ++entry.draws;
+    LightCensusEntry &session = LightCensusSession[key];
+    // The session row counts FRAMES, not draws, and it is the staticness reading: a light that
+    // never moves accumulates frames under one key, and a light that does leaves a new key
+    // behind every frame with `frames == 1`.
+    if (session.last_frame != frame || session.frames == 0) {
+      session.last_frame = frame;
+      if (session.frames == 0) {
+        session.first_frame = frame;
+      }
+      ++session.frames;
+    }
+  }
+}
+
+void RotateLightCensus(uint64_t frame) {
+  if (!LightCensus.empty()) {
+    ++LightCensusFramesWithLights;
+    if (LightCensus.size() > LightCensusMaxPerFrame) {
+      LightCensusMaxPerFrame = LightCensus.size();
+    }
+  }
+  LightCensusLastFrame.swap(LightCensus);
+  LightCensus.clear();
+  (void)frame;
+}
+
 // Did the runtime we forward to accept this draw? A refused call is the one way the reference
 // can render fewer pixels than this renderer while agreeing about every state, every vertex and
 // every texture - which is precisely the residue §4.40 was left with, and nothing here had ever
@@ -1217,6 +1264,83 @@ std::string FormatFrameDraws(uint32_t first, uint32_t last) {
         draw.index, draw.type, draw.primitives, draw.fvf, draw.user_pointer ? "ptr" : "buf",
         draw.blend, draw.src_blend, draw.dest_blend, draw.z_test, draw.z_write, draw.cull,
         draw.alpha_test, draw.min_z, draw.max_z, rect, draw.texture.c_str());
+  }
+  return out;
+}
+
+// The frame's distinct D3D lights, and whether they are static in world space.
+//
+// **The three questions phase 5 has to answer before anything is designed**, and none of them had
+// an instrument: how many distinct point and spot lights are enabled in a frame, over how many
+// draws, and do they move? A per-frame shadow cube per light is affordable at two to six and is
+// not at dozens - and if they never move, their occlusion by the map bakes exactly like §4.61's.
+//
+// The two counts to read together are `distinct this frame` and `distinct over the session`. A
+// static rig makes the second converge on the first; a light the game re-authors every frame
+// leaves a new key behind each time, so the session total climbs without bound and the per-light
+// `frames` column reads 1.
+std::string FormatFrameLights() {
+  std::string out;
+  char line[256];
+  const auto add = [&](const char *format, auto... args) {
+    std::snprintf(line, sizeof(line), format, args...);
+    out += line;
+  };
+  const auto type_name = [](uint32_t type) {
+    switch (type) {
+    case D3DLIGHT_POINT: return "point";
+    case D3DLIGHT_SPOT: return "spot";
+    case D3DLIGHT_DIRECTIONAL: return "dir";
+    default: return "?";
+    }
+  };
+  const auto as_float = [](uint32_t bits) {
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+  };
+
+  uint32_t local_this_frame = 0;
+  for (const auto &[key, entry] : LightCensusLastFrame) {
+    local_this_frame += key.type != D3DLIGHT_DIRECTIONAL ? 1u : 0u;
+  }
+  uint32_t local_session = 0;
+  uint64_t local_session_frames = 0;
+  for (const auto &[key, entry] : LightCensusSession) {
+    if (key.type != D3DLIGHT_DIRECTIONAL) {
+      ++local_session;
+      local_session_frames += entry.frames;
+    }
+  }
+  add("%u distinct lights in the last complete frame (%u point/spot), %llu at the frame peak\n",
+      (unsigned)LightCensusLastFrame.size(), local_this_frame,
+      (unsigned long long)LightCensusMaxPerFrame);
+  add("%u distinct over the session (%u point/spot) across %llu frames with any light\n",
+      (unsigned)LightCensusSession.size(), local_session,
+      (unsigned long long)LightCensusFramesWithLights);
+  // The one line that answers "are they static". A static rig has every light in nearly every
+  // frame it could be in, so the mean is close to the frame count; a moving one is close to 1.
+  if (local_session != 0) {
+    add("mean frames a distinct point/spot light survives: %.1f  (1.0 = re-authored every frame, "
+        "%llu = never moves)\n",
+        double(local_session_frames) / double(local_session),
+        (unsigned long long)LightCensusFramesWithLights);
+  }
+  out += "  type   draws  frames    position                  range   diffuse           "
+         "attenuation\n";
+  for (const auto &[key, entry] : LightCensusLastFrame) {
+    const auto found = LightCensusSession.find(key);
+    const uint64_t frames = found != LightCensusSession.end() ? found->second.frames : 0;
+    char position[48];
+    std::snprintf(position, sizeof(position), "%.2f %.2f %.2f", as_float(key.position[0]),
+                  as_float(key.position[1]), as_float(key.position[2]));
+    char diffuse[32];
+    std::snprintf(diffuse, sizeof(diffuse), "%.2f %.2f %.2f", as_float(key.diffuse[0]),
+                  as_float(key.diffuse[1]), as_float(key.diffuse[2]));
+    add("  %-5s  %5llu  %6llu    %-24s  %6.2f  %-16s  %.3f %.4f %.5f\n", type_name(key.type),
+        (unsigned long long)entry.draws, (unsigned long long)frames, position,
+        key.type == D3DLIGHT_DIRECTIONAL ? 0.0f : as_float(key.range), diffuse,
+        as_float(key.attenuation[0]), as_float(key.attenuation[1]), as_float(key.attenuation[2]));
   }
   return out;
 }

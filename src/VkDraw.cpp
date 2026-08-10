@@ -14,14 +14,18 @@
 #include <vector>
 
 #include "Core.h"
+#include "Camera.h"
 #include "Map.h"
 #include "MapLights.h"
+#include "World.h"
 #include "Shaders.gen.inc.h"
 #include "VkContext.h"
 #include "VkInternal.h"
 #include "VertexFormat.h"
+#include "Camera.h"
 #include "Map.h"
 #include "MapLights.h"
+#include "World.h"
 #include "VkLighting.h"
 #include "VkResources.h"
 
@@ -485,6 +489,642 @@ bool CreatePipelineLayout() {
   return true;
 }
 
+// --- the sun's shadow map ---------------------------------------------------------------------
+//
+// A depth-only pass over the same draw list the world pass walks, from the sun's point of view.
+// §2's design is what makes it cheap: a draw is an index into shared per-frame tables, so a second
+// walk needs a pipeline and a push block and no new per-draw data at all.
+
+// One tile per cascade, in a 2x2 atlas - so ONE image, one bindless slot and one sampler however
+// many cascades are live (§4.59). A texture array would need a second declaration in the bindless
+// set, whose last binding is pinned by VARIABLE_DESCRIPTOR_COUNT; the atlas costs a uv offset in
+// the lookup and nothing else. 4096 is the `maxImageDimension2D` every Vulkan device guarantees,
+// which is the reason the tile is 2048 and not larger.
+constexpr uint32_t kShadowTile = 2048;
+constexpr uint32_t kShadowAtlas = kShadowTile * 2;
+
+// Must match ShadowPush in src/shaders/shadow.slang. One block for both of that file's entry
+// points, because a stage may only have one: the sun's pass fills `record`/`base_vertex` and
+// leaves `params` null, the map lights' indirect bake does the opposite (§4.62).
+struct ShadowPushConstants {
+  uint64_t vertices;
+  uint64_t draws;
+  uint64_t params;      // the indirect path only - {record, base_vertex} per command
+  uint32_t record;      // the direct path only
+  uint32_t base_vertex; // ... and so is this
+  float light_matrix[16];
+};
+// 96: three addresses, two words, and the matrix. Well inside the guaranteed 128, which this
+// block can afford because it is its own layout rather than a share of the world pass's.
+static_assert(sizeof(ShadowPushConstants) == 96);
+
+VkImage ShadowImage = VK_NULL_HANDLE;
+VkFormat ShadowFormat = VK_FORMAT_UNDEFINED;
+bool ShadowStencilAspect = false;
+VkDeviceSize ShadowBytes = 0;
+VkDeviceMemory ShadowMemory = VK_NULL_HANDLE;
+VkImageView ShadowAttachmentView = VK_NULL_HANDLE; // every aspect, for rendering into
+VkImageView ShadowSampleView = VK_NULL_HANDLE;     // depth only, for sampling
+VkPipelineLayout ShadowLayout = VK_NULL_HANDLE;
+VkPipeline ShadowPipeline = VK_NULL_HANDLE;
+VkShaderModule ShadowModule = VK_NULL_HANDLE;
+bool ShadowReady = false;
+bool SunShadowsEnabled = true;
+// See SetStencilShadow in VkDraw.h. Draw the game's own blob shadow as well as the sun's map.
+bool StencilShadowEnabled = false;
+// In shadow texels - see SetShadowBias. 2.5 is where level04's self-shadowing collapses and
+// level02's is already gone; below 2 both levels shadow themselves everywhere (§4.59).
+float ShadowBiasValue = 2.5f;
+// 1.0 is the *physically* correct value - the shadow attenuates only the direct terms, so 1 is
+// "no sunlight arrives here" - and 0.7 is the measured one (§4.59). Two frames decide it: on
+// level04's outdoor start §4.58's 0.55 leaves the unit shadows reading as a smudge, and on
+// level02's covered start 1.0 takes the ground to 36% of its authored brightness where 0.7 leaves
+// it at 65%. Level02 is genuinely under cover and the shadow map is right about it; the level's
+// own bake is what disagrees, and there is no arguing with that from here.
+float ShadowStrengthValue = 0.7f;
+float ShadowExtentValue = 70.0f;
+int ShadowCascadeCount = static_cast<int>(kMaxShadowCascades);
+
+// Built once a frame by BuildSunCascades and read by both the shadow pass and UploadFrameData.
+float FrameSunMatrix[16] = {};                          // world -> light space, rotation only
+float FrameCascade[kMaxShadowCascades][4] = {};         // centre.xy, 1/extent, bias in ndc depth
+float FrameCascadeMatrix[kMaxShadowCascades][16] = {};  // ... and the clip matrix that rasterises it
+float FrameSunZNear = 0.0f;
+float FrameSunZSpan = 1.0f;
+uint32_t FrameCascadeCount = 0;
+bool FrameSunValid = false;
+
+bool CreateShadowPass() {
+  ShadowModule = CreateModule(kShadowVertexSpv, sizeof(kShadowVertexSpv));
+  if (ShadowModule == VK_NULL_HANDLE) {
+    return Fail("could not create the shadow shader module");
+  }
+
+  // **D32_SFLOAT where the device has it, not the world pass's format.** Nothing here reads a
+  // stencil aspect, and the format §4.27 chose carries one - which costs a byte a texel over an
+  // atlas four times the old map's area, and forces the two-view dance below. The fallback is
+  // that same format, so a device without it is merely fatter rather than shadowless.
+  VkFormatProperties properties = {};
+  vkGetPhysicalDeviceFormatProperties(GetPhysicalDevice(), VK_FORMAT_D32_SFLOAT, &properties);
+  constexpr VkFormatFeatureFlags kNeeded = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                           VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+  ShadowFormat = (properties.optimalTilingFeatures & kNeeded) == kNeeded ? VK_FORMAT_D32_SFLOAT
+                                                                        : DepthFormat;
+  ShadowStencilAspect = ShadowFormat != VK_FORMAT_D32_SFLOAT && DepthStencil;
+
+  VkImageCreateInfo image = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  image.imageType = VK_IMAGE_TYPE_2D;
+  image.format = ShadowFormat;
+  image.extent = {kShadowAtlas, kShadowAtlas, 1};
+  image.mipLevels = 1;
+  image.arrayLayers = 1;
+  image.samples = VK_SAMPLE_COUNT_1_BIT;
+  image.tiling = VK_IMAGE_TILING_OPTIMAL;
+  // SAMPLED as well as the attachment bit - which the main depth buffer deliberately lacks,
+  // because nothing reads it. This one exists to be read.
+  image.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  image.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  image.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (vkCreateImage(GetDevice(), &image, nullptr, &ShadowImage) != VK_SUCCESS) {
+    return Fail("could not create the shadow image");
+  }
+
+  VkMemoryRequirements requirements = {};
+  vkGetImageMemoryRequirements(GetDevice(), ShadowImage, &requirements);
+  VkPhysicalDeviceMemoryProperties memory = {};
+  vkGetPhysicalDeviceMemoryProperties(GetPhysicalDevice(), &memory);
+  uint32_t type = UINT32_MAX;
+  for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+    if ((requirements.memoryTypeBits & (1u << i)) != 0 &&
+        (memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+      type = i;
+      break;
+    }
+  }
+  if (type == UINT32_MAX) {
+    return Fail("no device-local memory type for the shadow image");
+  }
+  ShadowBytes = requirements.size;
+  VkMemoryAllocateInfo allocate = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  allocate.allocationSize = requirements.size;
+  allocate.memoryTypeIndex = type;
+  if (vkAllocateMemory(GetDevice(), &allocate, nullptr, &ShadowMemory) != VK_SUCCESS ||
+      vkBindImageMemory(GetDevice(), ShadowImage, ShadowMemory, 0) != VK_SUCCESS) {
+    return Fail("could not back the shadow image");
+  }
+
+  // **Two views of one image**, and only where the fallback format is in force. The attachment
+  // needs every aspect the format carries; the sampled one must be DEPTH ONLY, because a view
+  // with a stencil aspect cannot be a sampled image. With D32_SFLOAT the two are identical and
+  // this creates the same view twice, which is cheaper to read than a branch.
+  VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  view.image = ShadowImage;
+  view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view.format = ShadowFormat;
+  view.subresourceRange.aspectMask =
+      VK_IMAGE_ASPECT_DEPTH_BIT | (ShadowStencilAspect ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+  view.subresourceRange.levelCount = 1;
+  view.subresourceRange.layerCount = 1;
+  if (vkCreateImageView(GetDevice(), &view, nullptr, &ShadowAttachmentView) != VK_SUCCESS) {
+    return Fail("could not create the shadow attachment view");
+  }
+  view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+  if (vkCreateImageView(GetDevice(), &view, nullptr, &ShadowSampleView) != VK_SUCCESS) {
+    return Fail("could not create the shadow sample view");
+  }
+  WriteBindlessView(kShadowMapSlot, reinterpret_cast<uint64_t>(ShadowSampleView));
+
+  VkPushConstantRange range = {VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(ShadowPushConstants)};
+  VkPipelineLayoutCreateInfo layout = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  layout.pushConstantRangeCount = 1;
+  layout.pPushConstantRanges = &range;
+  if (vkCreatePipelineLayout(GetDevice(), &layout, nullptr, &ShadowLayout) != VK_SUCCESS) {
+    return Fail("could not create the shadow pipeline layout");
+  }
+
+  VkPipelineShaderStageCreateInfo stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+  stage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+  stage.module = ShadowModule;
+  stage.pName = "shadow_vertex";
+
+  VkPipelineVertexInputStateCreateInfo vertex_input = {
+      VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineInputAssemblyStateCreateInfo assembly = {
+      VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineViewportStateCreateInfo viewport = {
+      VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  viewport.viewportCount = 1;
+  viewport.scissorCount = 1;
+  VkPipelineRasterizationStateCreateInfo raster = {
+      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  raster.polygonMode = VK_POLYGON_MODE_FILL;
+  // **No culling.** Front-face culling is the usual trick for hiding acne, and it assumes closed,
+  // consistently-wound geometry; Gunlok has neither across the map object and its props, so it
+  // would open holes in the caster set instead. The depth bias is the knob for acne.
+  raster.cullMode = VK_CULL_MODE_NONE;
+  raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  raster.lineWidth = 1.0f;
+  VkPipelineMultisampleStateCreateInfo multisample = {
+      VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineDepthStencilStateCreateInfo depth = {
+      VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+  depth.depthTestEnable = VK_TRUE;
+  depth.depthWriteEnable = VK_TRUE;
+  depth.depthCompareOp = VK_COMPARE_OP_LESS;
+  VkPipelineColorBlendStateCreateInfo blend = {
+      VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+  VkPipelineDynamicStateCreateInfo dynamic = {
+      VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+  dynamic.dynamicStateCount = 2;
+  dynamic.pDynamicStates = dynamic_states;
+
+  VkPipelineRenderingCreateInfo rendering = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+  rendering.depthAttachmentFormat = ShadowFormat;
+  if (ShadowStencilAspect) {
+    rendering.stencilAttachmentFormat = ShadowFormat;
+  }
+
+  VkGraphicsPipelineCreateInfo info = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  info.pNext = &rendering;
+  // One stage and **no fragment shader at all**, which is legal with no colour attachment and is
+  // what makes this pass nearly free per fragment.
+  info.stageCount = 1;
+  info.pStages = &stage;
+  info.pVertexInputState = &vertex_input;
+  info.pInputAssemblyState = &assembly;
+  info.pViewportState = &viewport;
+  info.pRasterizationState = &raster;
+  info.pMultisampleState = &multisample;
+  info.pDepthStencilState = &depth;
+  info.pColorBlendState = &blend;
+  info.pDynamicState = &dynamic;
+  info.layout = ShadowLayout;
+  if (vkCreateGraphicsPipelines(GetDevice(), VK_NULL_HANDLE, 1, &info, nullptr, &ShadowPipeline) !=
+      VK_SUCCESS) {
+    return Fail("could not create the shadow pipeline");
+  }
+  ShadowReady = true;
+  return true;
+}
+
+// --- the map lights' static shadow atlas ------------------------------------------------------
+//
+// One cube per map light, baked from the map's own geometry once per level. Everything about it
+// that differs from the sun's pass follows from one fact: **neither the lights nor the world ever
+// move**, so this is authored data rather than a per-frame quantity (§4.61).
+//
+// It shares the sun's vertex shader unchanged - `shadow_vertex` multiplies a world position by
+// whatever matrix it is pushed, and a perspective one works exactly as an orthographic one does
+// there. What it cannot share is the pipeline, because the atlas is `D16_UNORM` where the sun's
+// is `D32_SFLOAT`, and the depth format is part of a pipeline's rendering info.
+
+VkImage MapShadowImage = VK_NULL_HANDLE;
+VkDeviceMemory MapShadowMemory = VK_NULL_HANDLE;
+VkImageView MapShadowView = VK_NULL_HANDLE;
+VkPipeline MapShadowPipeline = VK_NULL_HANDLE;
+VkFormat MapShadowFormat = VK_FORMAT_UNDEFINED;
+VkDeviceSize MapShadowBytes = 0;
+bool MapShadowReady = false;
+
+// The indirect batch (§4.62). One `VkDrawIndexedIndirectCommand` per caster plus a parallel
+// {record, base_vertex} for the shader, in one buffer - the commands first, the parameters after
+// them at a 16-byte-aligned offset.
+//
+// **Both regions are rewritten every bake frame**, and that is not laziness: `record` is an index
+// into the frame's own scratch, which rotates, so a buffer built once and reused across the
+// bake's hundred-odd frames would address the wrong records on all but the first. 213 casters is
+// 4.3 KB, written with `vkCmdUpdateBuffer` inline in the command buffer.
+constexpr uint32_t kMaxMapCasters = 2048;
+constexpr uint32_t kMapIndirectStride = 20; // sizeof(VkDrawIndexedIndirectCommand)
+constexpr uint32_t kMapParamOffset = kMaxMapCasters * kMapIndirectStride;
+static_assert(kMapIndirectStride * kMaxMapCasters <= 65536,
+              "vkCmdUpdateBuffer takes at most 64 KB in one call");
+static_assert(kMapParamOffset % 16 == 0, "the parameter array is read as uint2 by address");
+VkBuffer MapIndirectBuffer = VK_NULL_HANDLE;
+VkDeviceMemory MapIndirectMemory = VK_NULL_HANDLE;
+uint64_t MapIndirectAddress = 0;
+VkShaderModule MapShadowModule = VK_NULL_HANDLE;
+// Whether the bake is issuing one command per face or one draw call per caster per face. Read
+// back rather than assumed, because the fallback is a device feature away and produces the same
+// atlas - so nothing on screen would ever say which ran.
+bool MapShadowIndirect = false;
+uint32_t MapShadowCastersDropped = 0; // casters past kMaxMapCasters, or of the wrong index width
+uint32_t MapShadowLastCasters = 0;    // how many the last baked slice submitted
+
+// **On since §4.64, and it was play that settled it.** §4.61 left it off because no measurement
+// could say whether the picture with these shadows was the right one - the game never had them -
+// and then the first report from actually playing was that the map lights "don't cast shadows".
+// A feature nobody can see is not a fidelity question, and 0.50 ms on the level with the most map
+// lights in the game was never the objection.
+// See SetLocalLights in VkDraw.h. A diagnostic, on by default: off drops D3D's point and spot
+// lights from the sum, which measures the ceiling on what shadowing them could ever be worth.
+bool LocalLightsEnabled = true;
+
+bool MapShadowsEnabled = true;
+// In atlas texels at the fragment's own distance from the light. 1.0 is the larger of two knees
+// (§4.61): level02's acne is gone by 0.25 and level04's needs about 1, and above 1 the real
+// occlusion starts going with it.
+float MapShadowBiasValue = 1.0f;
+// Lights per frame. **Set from the submission path at atlas creation** - 256 with indirect
+// drawing and 4 without - because §4.62 changed what it is for. It used to spread 1.9 seconds of
+// bake across frames; with one command a face that 1.9 seconds turns out to have been almost
+// entirely draw-call submission, the whole bake is a few milliseconds of GPU work, and level01's
+// 682 lights land in three frames nobody can see. 256 rather than the whole set so that a mod
+// with far more lights than any shipped level is still bounded.
+int MapShadowRateValue = 4;
+
+// See SetLocalShadows in VkDraw.h. Whether D3D's own point and spot lights sample the atlas -
+// independent of MapShadowsEnabled, because they are a different light system sharing one image.
+//
+// **`GKPLUS_VK_LOCAL_SHADOWS=0` is the launch-time form, and it exists for a specific reason**:
+// `render.local_shadows` is reachable only through the REPL, and the REPL is reachable only from a
+// running game on a usable display. A GPU feature that is suspected of wedging the display cannot
+// be switched off by the one instrument that needs the display to work, so it needs a switch that
+// is decided before the device exists. Read once, lazily - `DllMain` is far too early to ask the
+// environment anything.
+bool LocalShadowsWanted = true;
+bool LocalShadowsRead = false;
+
+bool LocalShadowsEnabled() {
+  if (!LocalShadowsRead) {
+    LocalShadowsRead = true;
+    char value[16] = {};
+    const DWORD len = ::GetEnvironmentVariableA("GKPLUS_VK_LOCAL_SHADOWS", value, sizeof(value));
+    if (len > 0 && len < sizeof(value)) {
+      const std::string text(value, len);
+      LocalShadowsWanted = !(text == "0" || text == "off" || text == "no");
+    }
+  }
+  return LocalShadowsWanted;
+}
+
+// --- the local half of that atlas (§4.65) ------------------------------------------------------
+//
+// D3D's point and spot lights, keyed on their occlusion geometry. Everything here exists because
+// **a D3D light has no identity across frames**: `SetLight` reuses indices, and a `GpuLight` is
+// deduplicated by enable mask within one frame and thrown away with the frame's scratch. The key
+// is the identity, and the stability gate below is what keeps that honest for a light that moves.
+
+// How many consecutive frames a key must survive before it claims a slot. **The whole handling of
+// moving lights**, and it costs nothing: a light on a track or a mod's light on a projectile makes
+// a new key every frame, so no key ever reaches the threshold, no slot is claimed and no cube is
+// baked. It is unshadowed, which is the state every D3D light was in before this existed.
+//
+// Four, because the cost of being wrong is asymmetric: a static light waits four frames for its
+// shadow at level start and nobody sees it, where a light that stutters for four frames and then
+// stops would otherwise re-bake six faces for nothing.
+constexpr uint32_t kLocalShadowStableFrames = 4;
+
+struct LocalShadowEntry {
+  int32_t slot = -1;       // its slot in the LOCAL range, or -1 while it holds none
+  uint64_t last_seen = 0;  // the frame it was last asked for
+  uint32_t stable = 0;     // distinct frames it has been asked for in a row
+  bool baked = false;      // its cube is in the atlas, so it may be sampled
+  LocalShadowKey key;
+};
+
+std::map<LocalShadowKey, LocalShadowEntry> LocalShadowKeys;
+// Which key owns each local slot, so an eviction can find the entry to take it from. A pointer
+// into a `std::map` node, which never moves - the one property that makes this safe.
+const LocalShadowKey *LocalShadowOwner[kLocalShadowSlots] = {};
+// Slots whose cube still has to be rendered. Drained by the bake, a few a frame like the map's.
+std::vector<uint32_t> LocalShadowPending;
+uint32_t LocalShadowBuiltForGeneration = 0;
+uint64_t LocalShadowFrame = 0;      // the frame the current pass is resolving lights for
+// Keys dropped for going stale - a light that moved away from its own contents and never came
+// back. **Cumulative, and it counts KEYS rather than calls**, which is the distinction that makes
+// it readable: `AcquireLocalShadowSlot` runs once per distinct light run per frame, so anything
+// counted per call reports the frame rate rather than the fact. The first draft of this counted
+// refusals per call and read 47,759 for seventeen unslotted lights.
+uint32_t LocalShadowForgotten = 0;
+uint64_t LocalShadowBakes = 0; // cubes rendered for this level, evictions included
+
+// Light index -> atlas slot, and its inverse. Rebuilt whenever the level's light set changes,
+// which is the same test the light grid uses.
+std::vector<int32_t> MapShadowSlotForLight;
+std::vector<uint32_t> MapShadowLightForSlot;
+// The atlas is cleared **once per level**, by whichever bake gets there first. A bool rather than
+// `cursor == 0`, because two independent producers write into one image now: with the map half
+// switched off the local half would otherwise never clear, and with it on a local slice arriving
+// first would clear the map tiles out from under it.
+bool MapShadowAtlasCleared = false;
+// 0 is "nothing baked yet" and MapLightsGeneration() never returns it for a loaded set, so a
+// fresh process re-bakes rather than trusting an empty table.
+uint32_t MapShadowBuiltForGeneration = 0;
+uint32_t MapShadowCursor = 0;   // the next slot to bake; == size() when the bake is finished
+uint32_t MapShadowRefused = 0;  // lights the atlas had no room for
+uint64_t MapShadowDraws = 0;    // draw calls the bake has issued for this level
+
+// The six cube faces, as an orthonormal basis each. **This table is duplicated in world.slang and
+// the two must agree exactly** - the bake rasterises with it and the lookup projects with it, so a
+// disagreement is a shadow that lands on the wrong face rather than anything that looks like a
+// bug. Forward is the face's axis; right and up are chosen so that `u = (d.R)/(d.F)` and
+// `v = (d.U)/(d.F)` both land in -1..1 across the face.
+const float kFaceForward[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+const float kFaceRight[6][3] = {{0, 0, -1}, {0, 0, 1}, {1, 0, 0}, {1, 0, 0}, {1, 0, 0}, {-1, 0, 0}};
+const float kFaceUp[6][3] = {{0, 1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}, {0, 1, 0}, {0, 1, 0}};
+
+// The near plane, as a fraction of the light's range. It is a compromise between depth precision
+// and how close geometry may be: a standard perspective spends its depth near the near plane, so
+// the resolvable distance at the far plane is `range / (65536 * fraction)` - 0.1 world units at
+// range 111 with this value - while geometry closer to the light than `range * fraction` is
+// clipped and stops occluding. **Also duplicated in world.slang.**
+constexpr float kMapShadowNear = 1.0f / 64.0f;
+
+bool CreateMapShadowPipeline();
+
+bool CreateMapShadowAtlas() {
+  // D16_UNORM is mandatory for a depth attachment, so this is a query for the sampled bit rather
+  // than for the format. Failing it is not fatal - the atlas simply does not exist and every
+  // light stays unshadowed, which is the state the build before this was always in.
+  VkFormatProperties properties = {};
+  vkGetPhysicalDeviceFormatProperties(GetPhysicalDevice(), VK_FORMAT_D16_UNORM, &properties);
+  constexpr VkFormatFeatureFlags kNeeded = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                           VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+  if ((properties.optimalTilingFeatures & kNeeded) != kNeeded) {
+    return Fail("no D16_UNORM depth format for the map shadow atlas");
+  }
+  MapShadowFormat = VK_FORMAT_D16_UNORM;
+
+  VkImageCreateInfo image = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  image.imageType = VK_IMAGE_TYPE_2D;
+  image.format = MapShadowFormat;
+  image.extent = {kMapShadowAtlas, kMapShadowAtlas, 1};
+  image.mipLevels = 1;
+  image.arrayLayers = 1;
+  image.samples = VK_SAMPLE_COUNT_1_BIT;
+  image.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  image.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  image.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (vkCreateImage(GetDevice(), &image, nullptr, &MapShadowImage) != VK_SUCCESS) {
+    return Fail("could not create the map shadow atlas");
+  }
+
+  VkMemoryRequirements requirements = {};
+  vkGetImageMemoryRequirements(GetDevice(), MapShadowImage, &requirements);
+  VkPhysicalDeviceMemoryProperties memory = {};
+  vkGetPhysicalDeviceMemoryProperties(GetPhysicalDevice(), &memory);
+  uint32_t type = UINT32_MAX;
+  for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+    if ((requirements.memoryTypeBits & (1u << i)) != 0 &&
+        (memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+      type = i;
+      break;
+    }
+  }
+  if (type == UINT32_MAX) {
+    return Fail("no device-local memory type for the map shadow atlas");
+  }
+  MapShadowBytes = requirements.size;
+  VkMemoryAllocateInfo allocate = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  allocate.allocationSize = requirements.size;
+  allocate.memoryTypeIndex = type;
+  if (vkAllocateMemory(GetDevice(), &allocate, nullptr, &MapShadowMemory) != VK_SUCCESS ||
+      vkBindImageMemory(GetDevice(), MapShadowImage, MapShadowMemory, 0) != VK_SUCCESS) {
+    return Fail("could not back the map shadow atlas");
+  }
+
+  // One view: D16_UNORM has no stencil aspect, so the attachment and the sampled view are the
+  // same thing - which is the second reason this atlas does not use the sun's format.
+  VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  view.image = MapShadowImage;
+  view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view.format = MapShadowFormat;
+  view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+  view.subresourceRange.levelCount = 1;
+  view.subresourceRange.layerCount = 1;
+  if (vkCreateImageView(GetDevice(), &view, nullptr, &MapShadowView) != VK_SUCCESS) {
+    return Fail("could not create the map shadow atlas view");
+  }
+  WriteBindlessView(kMapShadowMapSlot, reinterpret_cast<uint64_t>(MapShadowView));
+
+  // The batch, and the parameters the shader reads beside it. Device-local and never mapped: it
+  // is written with `vkCmdUpdateBuffer`, which puts the bytes in the command buffer itself.
+  // BUFFER_DEVICE_ADDRESS as well as INDIRECT_BUFFER, because the parameter half is reached by
+  // address from the vertex shader rather than bound.
+  VkBufferCreateInfo buffer = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  buffer.size = kMapParamOffset + kMaxMapCasters * 8;
+  buffer.usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+  buffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  if (vkCreateBuffer(GetDevice(), &buffer, nullptr, &MapIndirectBuffer) != VK_SUCCESS) {
+    return Fail("could not create the map shadow indirect buffer");
+  }
+  VkMemoryRequirements buffer_requirements = {};
+  vkGetBufferMemoryRequirements(GetDevice(), MapIndirectBuffer, &buffer_requirements);
+  uint32_t buffer_type = UINT32_MAX;
+  for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+    if ((buffer_requirements.memoryTypeBits & (1u << i)) != 0 &&
+        (memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+      buffer_type = i;
+      break;
+    }
+  }
+  if (buffer_type == UINT32_MAX) {
+    return Fail("no device-local memory type for the map shadow indirect buffer");
+  }
+  VkMemoryAllocateFlagsInfo flags = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+  flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+  VkMemoryAllocateInfo buffer_allocate = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+  buffer_allocate.allocationSize = buffer_requirements.size;
+  buffer_allocate.memoryTypeIndex = buffer_type;
+  if (vkAllocateMemory(GetDevice(), &buffer_allocate, nullptr, &MapIndirectMemory) != VK_SUCCESS ||
+      vkBindBufferMemory(GetDevice(), MapIndirectBuffer, MapIndirectMemory, 0) != VK_SUCCESS) {
+    return Fail("could not back the map shadow indirect buffer");
+  }
+  VkBufferDeviceAddressInfo address = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+  address.buffer = MapIndirectBuffer;
+  MapIndirectAddress = vkGetBufferDeviceAddress(GetDevice(), &address);
+
+  // **`multiDrawIndirect` is what decides which path runs**, not the buffer existing: without it
+  // `vkCmdDrawIndexedIndirect` is limited to a `drawCount` of 1, which is the same thing as not
+  // having it. The fallback issues a draw call per caster per face and produces the same atlas.
+  MapShadowIndirect = Caps().multi_draw_indirect;
+  MapShadowRateValue = MapShadowIndirect ? 256 : 4;
+  MapShadowModule = CreateModule(kMapShadowVertexSpv, sizeof(kMapShadowVertexSpv));
+  if (MapShadowModule == VK_NULL_HANDLE) {
+    return Fail("could not create the map shadow shader module");
+  }
+  return CreateMapShadowPipeline();
+}
+
+// The bake's pipeline, which is the sun's with two fields changed. Its own function because
+// `render.map_shadow_indirect` rebuilds it: the two submission paths differ only in the entry
+// point, and having both reachable at run time is what makes "the atlas is the same either way"
+// a measurement rather than an assertion (§4.62).
+bool CreateMapShadowPipeline() {
+  VkPipelineShaderStageCreateInfo stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+  stage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+  stage.module = MapShadowIndirect ? MapShadowModule : ShadowModule;
+  stage.pName = MapShadowIndirect ? "map_shadow_vertex" : "shadow_vertex";
+
+  VkPipelineVertexInputStateCreateInfo vertex_input = {
+      VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineInputAssemblyStateCreateInfo assembly = {
+      VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineViewportStateCreateInfo viewport = {
+      VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  viewport.viewportCount = 1;
+  viewport.scissorCount = 1;
+  VkPipelineRasterizationStateCreateInfo raster = {
+      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  raster.polygonMode = VK_POLYGON_MODE_FILL;
+  // No culling, for §4.58's reason and one more of its own: a terrain mesh is a single-sided
+  // surface, so front-face culling - the usual way to hide acne - would leave the ground with no
+  // occluder at all rather than with a biased one.
+  raster.cullMode = VK_CULL_MODE_NONE;
+  raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  raster.lineWidth = 1.0f;
+  VkPipelineMultisampleStateCreateInfo multisample = {
+      VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineDepthStencilStateCreateInfo depth = {
+      VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+  depth.depthTestEnable = VK_TRUE;
+  depth.depthWriteEnable = VK_TRUE;
+  depth.depthCompareOp = VK_COMPARE_OP_LESS;
+  VkPipelineColorBlendStateCreateInfo blend = {
+      VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+  VkPipelineDynamicStateCreateInfo dynamic = {
+      VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+  dynamic.dynamicStateCount = 2;
+  dynamic.pDynamicStates = dynamic_states;
+
+  VkPipelineRenderingCreateInfo rendering = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+  rendering.depthAttachmentFormat = MapShadowFormat;
+
+  VkGraphicsPipelineCreateInfo info = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  info.pNext = &rendering;
+  info.stageCount = 1;
+  info.pStages = &stage;
+  info.pVertexInputState = &vertex_input;
+  info.pInputAssemblyState = &assembly;
+  info.pViewportState = &viewport;
+  info.pRasterizationState = &raster;
+  info.pMultisampleState = &multisample;
+  info.pDepthStencilState = &depth;
+  info.pColorBlendState = &blend;
+  info.pDynamicState = &dynamic;
+  info.layout = ShadowLayout;
+  if (vkCreateGraphicsPipelines(GetDevice(), VK_NULL_HANDLE, 1, &info, nullptr,
+                                &MapShadowPipeline) != VK_SUCCESS) {
+    return Fail("could not create the map shadow pipeline");
+  }
+  MapShadowReady = true;
+  return true;
+}
+
+void DestroyMapShadowAtlas() {
+  MapShadowReady = false;
+  if (MapShadowPipeline != VK_NULL_HANDLE) {
+    vkDestroyPipeline(GetDevice(), MapShadowPipeline, nullptr);
+    MapShadowPipeline = VK_NULL_HANDLE;
+  }
+  if (MapShadowModule != VK_NULL_HANDLE) {
+    vkDestroyShaderModule(GetDevice(), MapShadowModule, nullptr);
+    MapShadowModule = VK_NULL_HANDLE;
+  }
+  if (MapIndirectBuffer != VK_NULL_HANDLE) {
+    vkDestroyBuffer(GetDevice(), MapIndirectBuffer, nullptr);
+    MapIndirectBuffer = VK_NULL_HANDLE;
+  }
+  if (MapIndirectMemory != VK_NULL_HANDLE) {
+    vkFreeMemory(GetDevice(), MapIndirectMemory, nullptr);
+    MapIndirectMemory = VK_NULL_HANDLE;
+  }
+  MapIndirectAddress = 0;
+  if (MapShadowView != VK_NULL_HANDLE) {
+    vkDestroyImageView(GetDevice(), MapShadowView, nullptr);
+    MapShadowView = VK_NULL_HANDLE;
+  }
+  if (MapShadowImage != VK_NULL_HANDLE) {
+    vkDestroyImage(GetDevice(), MapShadowImage, nullptr);
+    MapShadowImage = VK_NULL_HANDLE;
+  }
+  if (MapShadowMemory != VK_NULL_HANDLE) {
+    vkFreeMemory(GetDevice(), MapShadowMemory, nullptr);
+    MapShadowMemory = VK_NULL_HANDLE;
+  }
+}
+
+void DestroyShadowPass() {
+  ShadowReady = false;
+  if (ShadowPipeline != VK_NULL_HANDLE) {
+    vkDestroyPipeline(GetDevice(), ShadowPipeline, nullptr);
+    ShadowPipeline = VK_NULL_HANDLE;
+  }
+  if (ShadowLayout != VK_NULL_HANDLE) {
+    vkDestroyPipelineLayout(GetDevice(), ShadowLayout, nullptr);
+    ShadowLayout = VK_NULL_HANDLE;
+  }
+  if (ShadowModule != VK_NULL_HANDLE) {
+    vkDestroyShaderModule(GetDevice(), ShadowModule, nullptr);
+    ShadowModule = VK_NULL_HANDLE;
+  }
+  if (ShadowSampleView != VK_NULL_HANDLE) {
+    vkDestroyImageView(GetDevice(), ShadowSampleView, nullptr);
+    ShadowSampleView = VK_NULL_HANDLE;
+  }
+  if (ShadowAttachmentView != VK_NULL_HANDLE) {
+    vkDestroyImageView(GetDevice(), ShadowAttachmentView, nullptr);
+    ShadowAttachmentView = VK_NULL_HANDLE;
+  }
+  if (ShadowImage != VK_NULL_HANDLE) {
+    vkDestroyImage(GetDevice(), ShadowImage, nullptr);
+    ShadowImage = VK_NULL_HANDLE;
+  }
+  if (ShadowMemory != VK_NULL_HANDLE) {
+    vkFreeMemory(GetDevice(), ShadowMemory, nullptr);
+    ShadowMemory = VK_NULL_HANDLE;
+  }
+}
+
 // --- the light grid ---------------------------------------------------------------------------
 //
 // One compute dispatch per LEVEL, not per frame: the map's lights are static in world space, so
@@ -656,15 +1296,20 @@ bool ShadeModeEnabled = true;
 bool PerPixelLightingWanted = true;
 bool PerPixelLightingRead = false;
 
-// See SetMapLighting in VkDraw.h. Off by default because it is brute force over the whole level's
-// light set per pixel until phase 2's culling exists.
-bool MapLightingEnabled = false;
+// See SetMapLighting in VkDraw.h. **On** since §4.60, which took the frame-time reading §4.56 said
+// was missing: with the grid it costs 1.83 ms on level01 - the level with the most map lights in
+// the game, 686 - and nothing measurable on level02, level04 or level05. Without the grid the same
+// level costs 30 ms, which is what it was off for.
+bool MapLightingEnabled = true;
 bool MapLightingAllEnabled = false;
-// The mean of the fitted gains on the three levels where the model actually holds - 0.9 on
-// level01, 1.35 on level04 and level05. Not an identity, and not a taste: on level04 the
-// on-screen difference from the bake minimises at exactly 1.35, which is where the offline fit
-// put it (§4.55).
-float MapLightGainValue = 1.2f;
+// The mean of the fitted gains on the three levels where the model actually holds. Not an
+// identity and not a taste: on level04 the on-screen difference from the bake minimises at
+// exactly the value the offline fit put it at (§4.55).
+//
+// **It moved with §4.64's windowed tail**, and had to: a dimmer tail refits to a brighter gain.
+// The three are now 1.1 on level01 and 1.5 on level04 and level05, a mean of 1.37, against 0.9 /
+// 1.35 / 1.35 and a mean of 1.2 before. 1.35 is that rounded to the sweep's own step.
+float MapLightGainValue = 1.35f;
 // Refilled once a frame in RecordDraws, before any draw is recorded.
 uint64_t FrameMapLightAddress = 0;
 uint32_t FrameMapLightCount = 0;
@@ -1004,6 +1649,18 @@ bool StartDraw(uint32_t width, uint32_t height, uint32_t colour_format) {
   // Not fatal: without it the fragment loops every light in the level, which is exactly what
   // phase 3b did and is still a correct picture. A device that cannot build a compute pipeline
   // should lose the optimisation, not the renderer.
+  // Not fatal either: a device that cannot build it loses shadows, not the renderer.
+  if (!CreateShadowPass()) {
+    DebugWrite("gkplus: shadow pass unavailable, the sun casts nothing\n");
+    DestroyShadowPass();
+  }
+  // After the sun's, because it borrows `ShadowModule` and `ShadowLayout` from it - the two
+  // passes differ only in the depth format and the matrix they are pushed. Not fatal for the
+  // same reason: a device without it loses the map lights' shadows and nothing else.
+  if (!MapShadowReady && !CreateMapShadowAtlas()) {
+    DebugWrite("gkplus: map shadow atlas unavailable, the map lights cast nothing\n");
+    DestroyMapShadowAtlas();
+  }
   if (!CreateLightGridPipeline()) {
     DebugWrite("gkplus: light grid unavailable, map lighting will not be culled\n");
     DestroyLightGridPipeline();
@@ -1130,7 +1787,12 @@ void UploadMapLights() {
     gpu.axis[0] = light.orientation[6];
     gpu.axis[1] = light.orientation[7];
     gpu.axis[2] = light.orientation[8];
-    gpu.axis[3] = 0.0f;
+    // The static shadow atlas slot, or -1. Published only once the bake has actually reached it,
+    // so a light whose tile is still the clear value is not sampled at all rather than sampled
+    // and found unshadowed - the two look the same on screen and only the first is honest.
+    const int32_t slot = i < MapShadowSlotForLight.size() ? MapShadowSlotForLight[i] : -1;
+    const bool baked = slot >= 0 && static_cast<uint32_t>(slot) < MapShadowCursor;
+    gpu.axis[3] = baked ? static_cast<float>(slot) : -1.0f;
   }
   FrameMapLightAddress = ScratchMapLightAddress() + alloc.offset * sizeof(GpuMapLight);
   FrameMapLightByteOffset = ScratchMapLightSliceOffset() + alloc.offset * sizeof(GpuMapLight);
@@ -1179,7 +1841,739 @@ void UploadFrameData() {
   if (GridValid && frame->light_grid != 0 && frame->light_indices != 0) {
     frame->map_flags |= 4u;
   }
+  // kNoTexture unless the pass actually rendered a map this frame - which is the one test the
+  // fragment shader makes, so "no sun", "knob off" and "no shadow pipeline" are one state there.
+  frame->shadow_texture = (ShadowReady && SunShadowsEnabled && FrameSunValid) ? kShadowMapSlot
+                                                                             : kNoTexture;
+  // D3D enums, which is what AcquireSampler speaks: LINEAR mag and min, no mip, CLAMP on both
+  // axes. Clamp matters - a fragment outside the map's box must sample the edge rather than wrap
+  // round and be shadowed by geometry on the other side of the level.
+  frame->shadow_sampler = AcquireSampler(2, 2, 0, 3, 3);
+  frame->shadow_strength = ShadowStrengthValue;
+  // The TILE's reciprocal, not the atlas's: a PCF tap is a step in a cascade's own uv, and the
+  // atlas offset is applied after the tap. Getting this wrong halves the filter width silently.
+  frame->shadow_texel = 1.0f / static_cast<float>(kShadowTile);
+  frame->shadow_z_near = FrameSunZNear;
+  frame->shadow_z_span = FrameSunZSpan;
+  frame->shadow_cascades = frame->shadow_texture == kNoTexture ? 0u : FrameCascadeCount;
+  // The static shadow atlas. **`map_shadow_texture` now means "the atlas exists and somebody wants
+  // it"**, and which of its two producers may sample it is `light_flags` below - because the map
+  // lights (§4.61) and D3D's own point lights (§4.65) are separate features sharing one image and
+  // each has its own knob. A light with no slot carries -1 in its own record, so "more lights than
+  // the atlas holds" still needs no test here.
+  frame->map_shadow_texture = (MapShadowReady && (MapShadowsEnabled || LocalShadowsEnabled()))
+                                  ? kMapShadowMapSlot
+                                  : kNoTexture;
+  // The same sampler the sun's map uses, and for the same reason - LINEAR with CLAMP on both
+  // axes. Clamp matters more here: the atlas is a grid of unrelated tiles, so a wrapped fetch
+  // would read another light's cube face entirely.
+  frame->map_shadow_sampler = AcquireSampler(2, 2, 0, 3, 3);
+  frame->map_shadow_offset = MapShadowBiasValue;
+  frame->light_flags = 0;
+  if (LocalLightsEnabled) {
+    frame->light_flags |= 1u;
+  }
+  if (MapShadowsEnabled) {
+    frame->light_flags |= 2u;
+  }
+  if (LocalShadowsEnabled()) {
+    frame->light_flags |= 4u;
+  }
+  std::memcpy(frame->cascades, FrameCascade, sizeof(frame->cascades));
+  std::memcpy(frame->sun_matrix, FrameSunMatrix, sizeof(frame->sun_matrix));
   FrameDataAddress = ScratchFrameAddress() + alloc.offset * sizeof(GpuFrameData);
+}
+
+namespace {
+// The world point the shadow boxes are centred on: **the camera's orbit pivot**, not its eye and
+// not `GetCameraFocus()`.
+//
+// §4.58 used the focus and it is stale in ordinary play (§4.59). `CameraFocus` @ 0x007b3e58 is
+// only latched by `SET CAMERA FOCUS`; with none in force the global still holds whatever the last
+// one left, so the box sat somewhere unrelated to the view and only reached it because the extent
+// was large enough to span the gap. The tell was that `shadow_extent = 20` produced **no shadow
+// at all** on a frame where 70 produced a correct one, and latching a focus at the camera's own
+// position brought it straight back.
+//
+// `CameraCoords` @ 0x007b4e0c is the pivot, which is measured rather than assumed: with the
+// camera at rest on level04 it read (-65, -7, 48) while the view matrix in `GpuDrawRecord::eye`
+// put the eye at (-67.16, -17.93, 58.05) - 15.007 units away, against a `camera.distance` of
+// exactly 15. So the engine stores the point the camera looks at and derives the eye by pulling
+// back the distance, which is precisely the centre of what is on screen.
+//
+// The focus still wins when one IS latched, because then the camera is pointed at it by
+// definition - and that is the only reading under which both globals agree.
+Vec3 ShadowPivot() {
+  return gk::IsCameraFocusSet() ? gk::GetCameraFocus() : gk::GetCameraPosition();
+}
+
+// The sun's cascades: one light-space basis, and N concentric boxes in it.
+//
+// An orthographic box around the camera's pivot, looking along the sun. It is deliberately NOT
+// fitted to the view frustum: the frustum is not available as a per-frame quantity on this side -
+// the view and projection are folded into each draw's `mvp` - and a box around the pivot is what
+// the camera is actually looking at in a game whose camera orbits a point. That is also what makes
+// concentric cascades the right shape here rather than the usual per-frustum-slice ones: the pivot
+// is the middle of the screen, so "near the pivot" is "near the middle", in every direction at once.
+//
+// **The cascades share a z range**, taken from the outermost. That is what lets one light-space
+// transform serve all of them - a fragment's depth is computed once and only its xy is tested
+// against each box - and D32_SFLOAT has depth precision to spare over a span this size.
+//
+// **Each box's centre is snapped to its own texel grid.** Without it the whole map re-samples
+// every time the pivot moves by a fraction of a texel, and every shadow edge crawls; the snap
+// costs two rounds per cascade and makes the map move in whole texels or not at all.
+//
+// No Y flip. Vulkan's framebuffer Y runs the other way from D3D's, and the world pass compensates
+// in BuildMvp - but here the same basis both rasterises the map and looks it up, so a flip would
+// cancel against itself. Leaving it out is one fewer convention to get backwards.
+void BuildSunCascades() {
+  FrameSunValid = false;
+  FrameCascadeCount = 0;
+  const Vec3 sun = gk::GetSunDirection();
+  const float length = std::sqrt(sun.x * sun.x + sun.y * sun.y + sun.z * sun.z);
+  if (length < 1e-4f) {
+    return; // no sun set yet, which is every frame before a level is up
+  }
+  const float dx = sun.x / length, dy = sun.y / length, dz = sun.z / length;
+
+  // An up vector that is not parallel to the sun. Gunlok's world is Y-down, so Y is the natural
+  // choice and X is the fallback for a sun pointing straight up or down.
+  float ux = 0.0f, uy = 1.0f, uz = 0.0f;
+  if (std::fabs(dy) > 0.99f) {
+    ux = 1.0f;
+    uy = 0.0f;
+  }
+  // Left-handed look-at: z along the view direction, x = up cross z, y = z cross x.
+  float xx = uy * dz - uz * dy, xy = uz * dx - ux * dz, xz = ux * dy - uy * dx;
+  const float xl = std::sqrt(xx * xx + xy * xy + xz * xz);
+  if (xl < 1e-6f) {
+    return;
+  }
+  xx /= xl;
+  xy /= xl;
+  xz /= xl;
+  const float yx = dy * xz - dz * xy, yy = dz * xx - dx * xz, yz = dx * xy - dy * xx;
+
+  // World -> light space: the basis, no scale and no translation, so the result is in world
+  // units. Row-vector, so the axes are the columns.
+  float *m = FrameSunMatrix;
+  m[0] = xx;   m[1] = yx;   m[2] = dx;   m[3] = 0.0f;
+  m[4] = xy;   m[5] = yy;   m[6] = dy;   m[7] = 0.0f;
+  m[8] = xz;   m[9] = yz;   m[10] = dz;  m[11] = 0.0f;
+  m[12] = 0.0f; m[13] = 0.0f; m[14] = 0.0f; m[15] = 1.0f;
+
+  const Vec3 pivot = ShadowPivot();
+  const float px = pivot.x * xx + pivot.y * xy + pivot.z * xz;
+  const float py = pivot.x * yx + pivot.y * yy + pivot.z * yz;
+  const float pz = pivot.x * dx + pivot.y * dy + pivot.z * dz;
+
+  const float outer = ShadowExtentValue > 1.0f ? ShadowExtentValue : 1.0f;
+  // Far enough back that the box always contains the geometry casting into it. `span` is the
+  // near-to-far distance, and it is generous rather than fitted because a caster clipped by the
+  // near plane stops casting, which reads as a shadow that vanishes when the camera moves.
+  FrameSunZNear = pz - outer * 3.0f;
+  FrameSunZSpan = outer * 6.0f;
+
+  uint32_t live = static_cast<uint32_t>(ShadowCascadeCount);
+  if (live < 1) {
+    live = 1;
+  }
+  if (live > kMaxShadowCascades) {
+    live = kMaxShadowCascades;
+  }
+  for (uint32_t i = 0; i < live; ++i) {
+    // Halving outward from the outermost, so `shadow_extent` keeps meaning "where shadows stop"
+    // however many cascades are live and cascade 0 is always the sharp one.
+    float extent = outer;
+    for (uint32_t step = i + 1; step < live; ++step) {
+      extent *= 0.5f;
+    }
+    const float texel = extent * 2.0f / static_cast<float>(kShadowTile);
+    const float cx = std::floor(px / texel + 0.5f) * texel;
+    const float cy = std::floor(py / texel + 0.5f) * texel;
+    FrameCascade[i][0] = cx;
+    FrameCascade[i][1] = cy;
+    FrameCascade[i][2] = 1.0f / extent;
+    // The knob is in texels (SetShadowBias); the shader compares in the shared 0..1 depth range,
+    // so each cascade converts with its OWN texel size. That conversion is the whole reason the
+    // one number works on every cascade.
+    FrameCascade[i][3] = ShadowBiasValue * texel / FrameSunZSpan;
+
+    // view * ortho, multiplied out, for the pass that rasterises this cascade's tile. The ortho
+    // is the D3D LH form, whose z already lands in 0..1 - which is Vulkan's range too, so nothing
+    // has to be remapped.
+    const float sx = 1.0f / extent;
+    const float sz = 1.0f / FrameSunZSpan;
+    float *c = FrameCascadeMatrix[i];
+    c[0] = xx * sx;  c[1] = yx * sx;  c[2] = dx * sz;  c[3] = 0.0f;
+    c[4] = xy * sx;  c[5] = yy * sx;  c[6] = dy * sz;  c[7] = 0.0f;
+    c[8] = xz * sx;  c[9] = yz * sx;  c[10] = dz * sz; c[11] = 0.0f;
+    c[12] = -cx * sx; c[13] = -cy * sx; c[14] = -FrameSunZNear * sz; c[15] = 1.0f;
+  }
+  FrameCascadeCount = live;
+  FrameSunValid = true;
+}
+} // namespace
+
+void RecordShadowPass(void *command_buffer) {
+  auto cmd = static_cast<VkCommandBuffer>(command_buffer);
+  // Zeroed on every path that does not render, so `sun shadows: off` is never printed beside a
+  // caster count left over from before the knob moved - which reads as the pass still running.
+  TheStats.shadow_casters = 0;
+  if (!Ready || !ShadowReady || cmd == VK_NULL_HANDLE || !SunShadowsEnabled) {
+    FrameSunValid = false;
+    return;
+  }
+  BuildSunCascades();
+  if (!FrameSunValid || Items.empty()) {
+    return;
+  }
+  const uint64_t arena_vertices = VertexArenaAddress();
+  const uint64_t scratch_vertices = ScratchVertexAddress();
+  const uint64_t draw_records = ScratchDrawAddress();
+  if (draw_records == 0) {
+    FrameSunValid = false;
+    return;
+  }
+
+  VkImageMemoryBarrier2 to_attachment = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+  to_attachment.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  to_attachment.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT;
+  to_attachment.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+  to_attachment.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  to_attachment.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  to_attachment.image = ShadowImage;
+  to_attachment.subresourceRange.aspectMask =
+      VK_IMAGE_ASPECT_DEPTH_BIT | (ShadowStencilAspect ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+  to_attachment.subresourceRange.levelCount = 1;
+  to_attachment.subresourceRange.layerCount = 1;
+  VkDependencyInfo dependency = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  dependency.imageMemoryBarrierCount = 1;
+  dependency.pImageMemoryBarriers = &to_attachment;
+  vkCmdPipelineBarrier2(cmd, &dependency);
+
+  VkRenderingAttachmentInfo attachment = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  attachment.imageView = ShadowAttachmentView;
+  attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE; // the whole point, unlike the world pass
+  attachment.clearValue.depthStencil.depth = 1.0f;
+
+  // One pass over the whole atlas, cleared once; each cascade is then a viewport and a scissor
+  // into its own tile. Four `vkCmdBeginRendering`s would clear four times and barrier three times
+  // for nothing - the tiles do not overlap, so a scissor is the whole of the isolation needed.
+  VkRenderingInfo rendering = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+  rendering.renderArea.extent = {kShadowAtlas, kShadowAtlas};
+  rendering.layerCount = 1;
+  rendering.pDepthAttachment = &attachment;
+  vkCmdBeginRendering(cmd, &rendering);
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ShadowPipeline);
+
+  ShadowPushConstants push = {};
+  push.draws = draw_records;
+
+  VkBuffer bound_index = VK_NULL_HANDLE;
+  uint64_t casters = 0;
+  for (uint32_t cascade = 0; cascade < FrameCascadeCount; ++cascade) {
+    // The 2x2 tile this cascade owns. Must agree with the shader's atlas offset, which derives it
+    // the same way from the same index - see `sun_visibility` in world.slang.
+    const float tx = static_cast<float>((cascade & 1u) * kShadowTile);
+    const float ty = static_cast<float>((cascade >> 1) * kShadowTile);
+    VkViewport viewport = {tx, ty, float(kShadowTile), float(kShadowTile), 0.0f, 1.0f};
+    VkRect2D scissor = {{int32_t(tx), int32_t(ty)}, {kShadowTile, kShadowTile}};
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    std::memcpy(push.light_matrix, FrameCascadeMatrix[cascade], sizeof(push.light_matrix));
+
+    for (const DrawItem &item : Items) {
+      // **Opaque, depth-writing, indexed geometry only.** A blended draw is an effect layer or a
+      // decal and would cast a solid shadow it does not have; a draw that does not write depth is
+      // by the game's own account not part of the scene's occlusion. The shader rejects anything
+      // that is not a lit 3D draw as well, which is the test the CPU cannot make - the flags live
+      // in the record.
+      if (!item.indexed || item.pipeline.blend_enable || !item.pipeline.depth_write) {
+        continue;
+      }
+      push.vertices = item.vertex_source == DrawSource::Arena ? arena_vertices : scratch_vertices;
+      if (push.vertices == 0) {
+        continue;
+      }
+      push.record = item.record;
+      push.base_vertex = item.base_vertex;
+      VkBuffer index_buffer = item.index_source == DrawSource::Arena
+                                  ? reinterpret_cast<VkBuffer>(IndexArenaBuffer())
+                                  : reinterpret_cast<VkBuffer>(ScratchIndexBuffer());
+      if (index_buffer == VK_NULL_HANDLE) {
+        continue;
+      }
+      if (index_buffer != bound_index) {
+        vkCmdBindIndexBuffer(cmd, index_buffer, 0,
+                             item.index_stride == 4 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
+        bound_index = index_buffer;
+      }
+      vkCmdPushConstants(cmd, ShadowLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
+      vkCmdDrawIndexed(cmd, item.count, 1, item.first_index, item.vertex_offset, 0);
+      ++casters;
+    }
+  }
+  vkCmdEndRendering(cmd);
+  // Across every cascade, so it is the pass's cost rather than the scene's caster count - divide
+  // by the live cascade count for the latter.
+  TheStats.shadow_casters = casters;
+
+  VkImageMemoryBarrier2 to_read = to_attachment;
+  to_read.srcStageMask = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+  to_read.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+  to_read.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+  to_read.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  dependency.pImageMemoryBarriers = &to_read;
+  vkCmdPipelineBarrier2(cmd, &dependency);
+}
+
+namespace {
+// Which lights get a slot, when the atlas holds fewer than the level has.
+//
+// **Ordered by `brightness * range^3`**, which is the fitted model's own answer to "how much light
+// does this one put into the world": its falloff is linear in range, so the volume integral of a
+// light's contribution goes as the cube of it. That is a property of §4.54's model rather than a
+// heuristic, and it is why the cut is here rather than on brightness alone.
+void AssignMapShadowSlots() {
+  const std::vector<MapLight> &lights = MapLights();
+  MapShadowSlotForLight.assign(lights.size(), -1);
+  MapShadowLightForSlot.clear();
+  MapShadowRefused = 0;
+  if (lights.empty()) {
+    return;
+  }
+  std::vector<uint32_t> order(lights.size());
+  for (uint32_t i = 0; i < order.size(); ++i) {
+    order[i] = i;
+  }
+  const auto influence = [&lights](uint32_t i) {
+    const float range = lights[i].range;
+    return lights[i].brightness * range * range * range;
+  };
+  std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+    // The index breaks a tie, so the assignment is the same on every run of a level rather than
+    // depending on how the sort happened to partition equal keys.
+    const float ia = influence(a), ib = influence(b);
+    return ia != ib ? ia > ib : a < b;
+  });
+  // **The map lights' budget, not the whole atlas.** The last `kLocalShadowSlots` tiles belong to
+  // D3D's own point and spot lights (§4.65), so the cut here is sixteen lights earlier than it was
+  // - which only level01 reaches, and only at the bottom of the influence order.
+  const uint32_t capacity = kMapShadowLightSlots;
+  for (uint32_t i = 0; i < order.size(); ++i) {
+    if (i >= capacity) {
+      ++MapShadowRefused;
+      continue;
+    }
+    MapShadowSlotForLight[order[i]] = static_cast<int32_t>(MapShadowLightForSlot.size());
+    MapShadowLightForSlot.push_back(order[i]);
+  }
+}
+
+// World -> one cube face's clip space for one light, row-vector like every other matrix here.
+//
+// A standard left-handed perspective at 90 degrees with a square aspect, so `x/z` and `y/z` land
+// in -1..1 across exactly one face and six of them tile the sphere. The lookup in world.slang
+// re-derives the same quantities from the same face table rather than from this matrix, which is
+// what makes the two halves comparable line by line.
+//
+// Taken as a position and a range rather than as a `MapLight`, because a D3D point light gets a
+// cube out of the same function (§4.65) - and the two **must** use one, or the lookup that serves
+// both would be projecting against two slightly different frusta.
+void BuildCubeFaceMatrix(const Vec3 &position, float range, uint32_t face, float *m) {
+  const float *R = kFaceRight[face];
+  const float *U = kFaceUp[face];
+  const float *F = kFaceForward[face];
+  const float far_plane = range > 1e-3f ? range : 1e-3f;
+  const float near_plane = far_plane * kMapShadowNear;
+  const float a = far_plane / (far_plane - near_plane);
+  const float b = near_plane * a;
+  const float lr = position.x * R[0] + position.y * R[1] + position.z * R[2];
+  const float lu = position.x * U[0] + position.y * U[1] + position.z * U[2];
+  const float lf = position.x * F[0] + position.y * F[1] + position.z * F[2];
+  m[0] = R[0];      m[1] = U[0];      m[2] = F[0] * a;        m[3] = F[0];
+  m[4] = R[1];      m[5] = U[1];      m[6] = F[1] * a;        m[7] = F[1];
+  m[8] = R[2];      m[9] = U[2];      m[10] = F[2] * a;       m[11] = F[2];
+  m[12] = -lr;      m[13] = -lu;      m[14] = -lf * a - b;    m[15] = -lf;
+}
+
+// Forget every local key. A level change invalidates all of them - the geometry that occludes
+// them is gone - and so does turning the feature off, which must leave no half-baked slot behind.
+void ResetLocalShadows() {
+  LocalShadowKeys.clear();
+  LocalShadowPending.clear();
+  for (const LocalShadowKey *&owner : LocalShadowOwner) {
+    owner = nullptr;
+  }
+  LocalShadowForgotten = 0;
+  LocalShadowBakes = 0;
+}
+} // namespace
+
+// See VkDraw.h. Called once per distinct light run, from the capture layer's StoreLight - which is
+// the only place a D3D light is in hand at all.
+int32_t AcquireLocalShadowSlot(const LocalShadowKey &key, uint64_t frame) {
+  if (!Ready || !MapShadowReady || !LocalShadowsEnabled()) {
+    return -1;
+  }
+  // The same identity the map half keys on, and for the same reason: the level's geometry is what
+  // these cubes hold, so a level change invalidates every one of them. `MapLightsGeneration()`
+  // moves on a level change and on nothing else.
+  const uint32_t generation = MapLightsGeneration();
+  if (LocalShadowBuiltForGeneration != generation) {
+    LocalShadowBuiltForGeneration = generation;
+    ResetLocalShadows();
+  }
+  // A directional light has no position to build a cube around, and the sun's cascades already
+  // cover it. Nothing here should ever see one - the caller filters - but a `range` of 0 would
+  // divide by itself in the projection, so it is refused rather than trusted.
+  float range = 0.0f;
+  std::memcpy(&range, &key.range, sizeof(range));
+  if (key.type == 3 /* D3DLIGHT_DIRECTIONAL */ || !(range > 1e-3f)) {
+    return -1;
+  }
+
+  auto found = LocalShadowKeys.find(key);
+  if (found == LocalShadowKeys.end()) {
+    LocalShadowEntry fresh;
+    fresh.last_seen = frame;
+    fresh.stable = 1;
+    fresh.key = key;
+    LocalShadowKeys.emplace(key, fresh);
+    // Housekeeping, and it is what keeps a MOVING light from filling this table without bound:
+    // a light on a track leaves one dead key a frame behind it. Anything not asked for in a while
+    // goes, and a dead key holding a slot hands it back.
+    if (LocalShadowKeys.size() > 4 * kLocalShadowSlots) {
+      for (auto it = LocalShadowKeys.begin(); it != LocalShadowKeys.end();) {
+        if (it->second.slot < 0 && frame - it->second.last_seen > 120) {
+          ++LocalShadowForgotten;
+          it = LocalShadowKeys.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+    return -1;
+  }
+
+  LocalShadowEntry &entry = found->second;
+  if (entry.last_seen != frame) {
+    ++entry.stable;
+    entry.last_seen = frame;
+  }
+  if (entry.slot >= 0) {
+    return entry.baked ? static_cast<int32_t>(kMapShadowLightSlots) + entry.slot : -1;
+  }
+  // **The stability gate**, and it is the whole handling of a light that moves: a new key every
+  // frame never gets here twice, so it never claims a slot and never costs a bake.
+  if (entry.stable < kLocalShadowStableFrames) {
+    return -1;
+  }
+
+  int32_t slot = -1;
+  for (uint32_t i = 0; i < kLocalShadowSlots; ++i) {
+    if (LocalShadowOwner[i] == nullptr) {
+      slot = static_cast<int32_t>(i);
+      break;
+    }
+  }
+  if (slot < 0) {
+    // Least recently seen, and **never one seen this frame** - evicting a light that is lit right
+    // now would take its shadow away and re-bake it on the next, forever.
+    uint64_t oldest = frame;
+    for (uint32_t i = 0; i < kLocalShadowSlots; ++i) {
+      const auto owner = LocalShadowKeys.find(*LocalShadowOwner[i]);
+      if (owner != LocalShadowKeys.end() && owner->second.last_seen < oldest) {
+        oldest = owner->second.last_seen;
+        slot = static_cast<int32_t>(i);
+      }
+    }
+    if (slot < 0) {
+      // Sixteen lights all live this frame, so nothing may be taken: this one goes unshadowed.
+      // **Refusing rather than evicting a light seen this frame is what stops a thrash** - with
+      // more qualified lights than slots, evicting the least-recent would re-bake six faces every
+      // frame forever. Measured: 33 keys against 16 slots baked 38 cubes in total, not 38 a frame.
+      return -1;
+    }
+    const auto owner = LocalShadowKeys.find(*LocalShadowOwner[slot]);
+    if (owner != LocalShadowKeys.end()) {
+      owner->second.slot = -1;
+      owner->second.baked = false;
+    }
+  }
+  entry.slot = slot;
+  entry.baked = false;
+  LocalShadowOwner[slot] = &found->first;
+  LocalShadowPending.push_back(static_cast<uint32_t>(slot));
+  return -1; // unshadowed until the bake reaches it, which is one frame at the default rate
+}
+
+namespace {
+// **The map object, and not a prop or a unit.** The occluders for a level's own light rig are the
+// level's own geometry: a unit walks away from the shadow it baked, and a prop carries its own
+// file's rig anyway (§4.55). The marker is §4.51's - two texture stages, and stage 1 is not the
+// chrome sphere map - which is exactly the set `SubmitAndFlushMapGeometry` submits.
+//
+// Tighter than the fragment shader's `stage_count == 2 && chrome == 0`, deliberately: that one
+// only sets `chrome` on a material that also carries a lighting map, because everything it gates
+// is derived from one. Here the question is what the geometry *is*, so it asks the texture.
+bool IsMapGeometry(const DrawItem &item) {
+  if (item.stage_count != 2 || !item.indexed) {
+    return false;
+  }
+  if (item.pipeline.blend_enable || !item.pipeline.depth_write) {
+    return false;
+  }
+  // **Both sources have to be the arena**, which is a real restriction and not a formality: one
+  // indirect batch has one index buffer bound and one `vertices` address in the push, so a caster
+  // living in the frame's scratch could not join it. The map's geometry is buffered by the game
+  // and has never been anything else - `map casters dropped` in the report is what would say
+  // otherwise rather than a silently smaller shadow.
+  if (item.vertex_source != DrawSource::Arena || item.index_source != DrawSource::Arena) {
+    return false;
+  }
+  return !IsChromeTexture(item.stages[1].texture_index);
+}
+} // namespace
+
+void BakeMapShadows(void *command_buffer) {
+  auto cmd = static_cast<VkCommandBuffer>(command_buffer);
+  if (!Ready || !MapShadowReady || cmd == VK_NULL_HANDLE) {
+    return;
+  }
+  const std::vector<MapLight> &lights = MapLights();
+  // **`MapLightsGeneration()` and not the light count**, which is what the grid keys on: the count
+  // is the same for two levels that happen to have the same number of lights, and the scratch
+  // address the lights ride in changes every frame, so neither is the identity of a light *set*.
+  // The generation moves on a level change and on nothing else.
+  const uint32_t generation = MapLightsGeneration();
+  if (MapShadowBuiltForGeneration != generation) {
+    MapShadowBuiltForGeneration = generation;
+    AssignMapShadowSlots();
+    MapShadowCursor = 0;
+    MapShadowDraws = 0;
+    MapShadowAtlasCleared = false;
+  }
+  // **Gated on the knob, and after the slot table above rather than before it.** Baking an atlas
+  // nothing samples costs 1.9 seconds of GPU time on level01 (§4.61), so `off` has to mean off -
+  // but the table has to be rebuilt on a level change either way, or turning the knob on later
+  // would bake against the previous level's assignment.
+  const bool map_work = MapShadowsEnabled && !lights.empty() &&
+                        MapShadowCursor < MapShadowLightForSlot.size();
+  // The local half (§4.65) has its own queue and its own knob, and either producer is reason
+  // enough to open the pass - the two write disjoint tiles of one image.
+  const bool local_work = LocalShadowsEnabled() && !LocalShadowPending.empty();
+  if (!map_work && !local_work) {
+    return; // switched off, nothing to bake, or the bake finished for this level
+  }
+  const uint64_t arena_vertices = VertexArenaAddress();
+  const uint64_t draw_records = ScratchDrawAddress();
+  auto index_buffer = reinterpret_cast<VkBuffer>(IndexArenaBuffer());
+  if (draw_records == 0 || arena_vertices == 0 || index_buffer == VK_NULL_HANDLE ||
+      Items.empty()) {
+    return;
+  }
+  // The map's own draws, gathered once for the whole slice - the test is per draw and the slice
+  // renders the same set `rate * 6` times.
+  std::vector<const DrawItem *> casters;
+  MapShadowCastersDropped = 0;
+  for (const DrawItem &item : Items) {
+    if (!IsMapGeometry(item)) {
+      continue;
+    }
+    if (casters.size() >= kMaxMapCasters) {
+      ++MapShadowCastersDropped;
+      continue;
+    }
+    casters.push_back(&item);
+  }
+  if (casters.empty()) {
+    return; // no map geometry in this frame - the briefing screen, or a level still loading
+  }
+  // **One index type for the whole batch**, since a batch has one bound index buffer. Everything
+  // in the arena is 16-bit today (`0 32-bit index buffer` in `render.draws`); a 32-bit caster
+  // would have to be dropped rather than drawn with the wrong stride.
+  const VkIndexType index_type =
+      casters[0]->index_stride == 4 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+  for (size_t i = casters.size(); i-- > 0;) {
+    if ((casters[i]->index_stride == 4) != (index_type == VK_INDEX_TYPE_UINT32)) {
+      casters.erase(casters.begin() + static_cast<ptrdiff_t>(i));
+      ++MapShadowCastersDropped;
+    }
+  }
+
+  // The batch and its parameters, rebuilt every slice because `record` indexes the frame's own
+  // scratch and that rotates. Written straight into the command buffer - 213 casters is 4.3 KB.
+  if (MapShadowIndirect) {
+    std::vector<VkDrawIndexedIndirectCommand> commands(casters.size());
+    std::vector<uint32_t> params(casters.size() * 2);
+    for (size_t i = 0; i < casters.size(); ++i) {
+      commands[i].indexCount = casters[i]->count;
+      commands[i].instanceCount = 1;
+      commands[i].firstIndex = casters[i]->first_index;
+      commands[i].vertexOffset = casters[i]->vertex_offset;
+      commands[i].firstInstance = 0;
+      params[i * 2 + 0] = casters[i]->record;
+      params[i * 2 + 1] = casters[i]->base_vertex;
+    }
+    vkCmdUpdateBuffer(cmd, MapIndirectBuffer, 0,
+                      commands.size() * sizeof(VkDrawIndexedIndirectCommand), commands.data());
+    vkCmdUpdateBuffer(cmd, MapIndirectBuffer, kMapParamOffset, params.size() * sizeof(uint32_t),
+                      params.data());
+    // Both halves, and they need different destinations: the commands are consumed by the
+    // DRAW_INDIRECT stage and the parameters by the vertex shader reading them as an address.
+    VkMemoryBarrier2 written = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    written.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    written.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    written.dstStageMask =
+        VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+    written.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT;
+    VkDependencyInfo upload = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    upload.memoryBarrierCount = 1;
+    upload.pMemoryBarriers = &written;
+    vkCmdPipelineBarrier2(cmd, &upload);
+  }
+
+  // **Cleared exactly once per level, by whichever half gets here first.** It used to be
+  // `MapShadowCursor == 0`, which was the same thing while the map lights were the only producer -
+  // with the local half beside them (§4.65) that reading clears the whole atlas again the first
+  // time a D3D light claims a tile, erasing every map cube baked before it.
+  const bool first = !MapShadowAtlasCleared;
+  MapShadowAtlasCleared = true;
+  VkImageMemoryBarrier2 to_attachment = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+  to_attachment.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  to_attachment.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT;
+  to_attachment.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+  // UNDEFINED only on the first slice, which is what discards the previous level's atlas. Every
+  // later slice must PRESERVE what the earlier ones wrote, so it declares the layout it is in -
+  // getting this wrong would leave the finished atlas holding only the last slice's lights.
+  to_attachment.oldLayout =
+      first ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  to_attachment.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  to_attachment.image = MapShadowImage;
+  to_attachment.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+  to_attachment.subresourceRange.levelCount = 1;
+  to_attachment.subresourceRange.layerCount = 1;
+  VkDependencyInfo dependency = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  dependency.imageMemoryBarrierCount = 1;
+  dependency.pImageMemoryBarriers = &to_attachment;
+  vkCmdPipelineBarrier2(cmd, &dependency);
+
+  VkRenderingAttachmentInfo attachment = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  attachment.imageView = MapShadowView;
+  attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  // **CLEAR on the first slice and LOAD after it.** A clear here is the whole atlas, so clearing
+  // every slice would erase the lights baked before it - and a cleared tile reads as depth 1,
+  // which is "nothing occludes". That is what makes an unbaked light simply unshadowed rather
+  // than fully shadowed, and it is why a level does not start black while the bake catches up.
+  attachment.loadOp = first ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+  attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  attachment.clearValue.depthStencil.depth = 1.0f;
+
+  VkRenderingInfo rendering = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+  rendering.renderArea.extent = {kMapShadowAtlas, kMapShadowAtlas};
+  rendering.layerCount = 1;
+  rendering.pDepthAttachment = &attachment;
+  vkCmdBeginRendering(cmd, &rendering);
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, MapShadowPipeline);
+
+  ShadowPushConstants push = {};
+  push.draws = draw_records;
+  push.vertices = arena_vertices;
+  push.params = MapIndirectAddress + kMapParamOffset;
+  // Once for the whole slice, not once per draw: every caster is in the arena by construction
+  // (IsMapGeometry), which is what makes an indirect batch possible at all.
+  vkCmdBindIndexBuffer(cmd, index_buffer, 0, index_type);
+
+  // One cube, six faces, into whichever tiles that slot owns. Shared by both producers because the
+  // only thing that differs between a `STDLIGHT`'s cube and a D3D point light's is where the
+  // centre is - and having one body is what stops the two drifting apart in the projection.
+  const auto bake_cube = [&](uint32_t slot, const Vec3 &position, float range) {
+    for (uint32_t face = 0; face < 6; ++face) {
+      // The tile this (slot, face) owns. The same arithmetic is in world.slang's lookup, and it
+      // is the one thing that has to agree between them beyond the face table.
+      const uint32_t tile = slot * 6 + face;
+      const float tx = static_cast<float>((tile % kMapShadowTilesPerRow) * kMapShadowFace);
+      const float ty = static_cast<float>((tile / kMapShadowTilesPerRow) * kMapShadowFace);
+      VkViewport viewport = {tx, ty, float(kMapShadowFace), float(kMapShadowFace), 0.0f, 1.0f};
+      VkRect2D scissor = {{int32_t(tx), int32_t(ty)}, {kMapShadowFace, kMapShadowFace}};
+      vkCmdSetViewport(cmd, 0, 1, &viewport);
+      vkCmdSetScissor(cmd, 0, 1, &scissor);
+      BuildCubeFaceMatrix(position, range, face, push.light_matrix);
+
+      vkCmdPushConstants(cmd, ShadowLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
+      if (MapShadowIndirect) {
+        // **One command for every caster on this face.** The whole optimisation: what was 213
+        // `vkCmdDrawIndexed` calls is one, and the record each vertex needs comes out of
+        // `params` at `SV_DrawIndex` instead of out of the push (§4.62).
+        vkCmdDrawIndexedIndirect(cmd, MapIndirectBuffer, 0,
+                                 static_cast<uint32_t>(casters.size()), kMapIndirectStride);
+        ++MapShadowDraws;
+      } else {
+        for (const DrawItem *item : casters) {
+          push.record = item->record;
+          push.base_vertex = item->base_vertex;
+          vkCmdPushConstants(cmd, ShadowLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push),
+                             &push);
+          vkCmdDrawIndexed(cmd, item->count, 1, item->first_index, item->vertex_offset, 0);
+          ++MapShadowDraws;
+        }
+      }
+    }
+  };
+
+  const uint32_t rate = MapShadowRateValue > 0 ? static_cast<uint32_t>(MapShadowRateValue) : 1;
+  uint32_t end = MapShadowCursor;
+  if (map_work) {
+    end = (std::min)(MapShadowCursor + rate, static_cast<uint32_t>(MapShadowLightForSlot.size()));
+    for (uint32_t slot = MapShadowCursor; slot < end; ++slot) {
+      const MapLight &light = lights[MapShadowLightForSlot[slot]];
+      bake_cube(slot, light.position, light.range);
+    }
+  }
+  MapShadowCursor = end;
+
+  // The local queue, drained whole: it is at most `kLocalShadowSlots` cubes and in practice one or
+  // two at a time, where the map's is hundreds. Rate-limiting it would only delay a shadow the
+  // player is looking at.
+  if (local_work) {
+    for (const uint32_t local : LocalShadowPending) {
+      const LocalShadowKey *owner = LocalShadowOwner[local];
+      if (owner == nullptr) {
+        continue; // evicted between claiming the slot and baking it
+      }
+      const auto entry = LocalShadowKeys.find(*owner);
+      if (entry == LocalShadowKeys.end() || entry->second.slot != static_cast<int32_t>(local)) {
+        continue;
+      }
+      Vec3 position = {};
+      float range = 0.0f;
+      std::memcpy(&position.x, entry->second.key.position, sizeof(float) * 3);
+      std::memcpy(&range, &entry->second.key.range, sizeof(range));
+      bake_cube(kMapShadowLightSlots + local, position, range);
+      entry->second.baked = true;
+      ++LocalShadowBakes;
+    }
+    LocalShadowPending.clear();
+  }
+  MapShadowLastCasters = static_cast<uint32_t>(casters.size());
+  vkCmdEndRendering(cmd);
+
+  VkImageMemoryBarrier2 to_read = to_attachment;
+  to_read.srcStageMask = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+  to_read.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+  to_read.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+  to_read.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  dependency.pImageMemoryBarriers = &to_read;
+  vkCmdPipelineBarrier2(cmd, &dependency);
 }
 
 void BuildLightGrid(void *command_buffer) {
@@ -1307,6 +2701,155 @@ void BuildLightGrid(void *command_buffer) {
 void SetMapLighting(bool enabled) { MapLightingEnabled = enabled; }
 
 bool MapLighting() { return MapLightingEnabled; }
+
+void SetStencilShadow(bool enabled) { StencilShadowEnabled = enabled; }
+bool StencilShadow() { return StencilShadowEnabled; }
+
+void SetSunShadows(bool enabled) { SunShadowsEnabled = enabled; }
+bool SunShadows() { return SunShadowsEnabled; }
+void SetShadowBias(float bias) { ShadowBiasValue = bias; }
+float ShadowBias() { return ShadowBiasValue; }
+void SetShadowStrength(float strength) { ShadowStrengthValue = strength; }
+float ShadowStrength() { return ShadowStrengthValue; }
+void SetShadowExtent(float extent) { ShadowExtentValue = extent; }
+float ShadowExtent() { return ShadowExtentValue; }
+void SetMapShadows(bool enabled) { MapShadowsEnabled = enabled; }
+bool MapShadows() { return MapShadowsEnabled; }
+void SetMapShadowBias(float texels) { MapShadowBiasValue = texels; }
+float MapShadowBias() { return MapShadowBiasValue; }
+void SetMapShadowIndirect(bool enabled) {
+  const bool want = enabled && Caps().multi_draw_indirect;
+  if (!MapShadowReady || want == MapShadowIndirect) {
+    return; // nothing to rebuild, or the device has no multiDrawIndirect to turn on
+  }
+  MapShadowIndirect = want;
+  // The pipeline is in flight for as long as a frame is; waiting is the honest way to swap it,
+  // and this is a diagnostic that runs once, not a per-frame path.
+  vkDeviceWaitIdle(GetDevice());
+  vkDestroyPipeline(GetDevice(), MapShadowPipeline, nullptr);
+  MapShadowPipeline = VK_NULL_HANDLE;
+  MapShadowReady = CreateMapShadowPipeline();
+  MapShadowBuiltForGeneration = 0; // and re-bake, or the A/B compares one path against itself
+}
+bool MapShadowIndirectEnabled() { return MapShadowIndirect; }
+
+void SetMapShadowRate(int lights) {
+  MapShadowRateValue = lights < 1 ? 1 : lights;
+  // A rate change re-bakes from the start, because the interesting reason to change it is to see
+  // whether a longer submit is affordable - and that question is about the first slice, which has
+  // already gone by the time anyone asks.
+  MapShadowBuiltForGeneration = 0;
+}
+int MapShadowRate() { return MapShadowRateValue; }
+
+std::string MapShadowReport() {
+  std::string out;
+  char line[256];
+  const auto add = [&out, &line](auto... args) {
+    std::snprintf(line, sizeof(line), args...);
+    out += line;
+  };
+  if (!MapShadowReady) {
+    return "map shadow atlas: NOT CREATED - this device has no D16_UNORM sampled depth, or the "
+           "pipeline failed\n";
+  }
+  const size_t lights = MapLights().size();
+  add("map shadow atlas: %ux%u (%u KB), %u faces of %u, %u light slots\n", kMapShadowAtlas,
+      kMapShadowAtlas, (unsigned)(MapShadowBytes / 1024),
+      kMapShadowTilesPerRow * kMapShadowTilesPerRow, kMapShadowFace, kMapShadowSlots);
+  add("  %u of this level's %u lights have a slot (%u refused - the atlas is full)\n",
+      (unsigned)MapShadowLightForSlot.size(), (unsigned)lights, MapShadowRefused);
+  add("  baked %u of %u, %d lights a frame, %llu %s so far%s\n", MapShadowCursor,
+      (unsigned)MapShadowLightForSlot.size(), MapShadowRateValue,
+      (unsigned long long)MapShadowDraws,
+      MapShadowIndirect ? "indirect commands" : "draw calls",
+      MapShadowCursor >= MapShadowLightForSlot.size() ? " (finished)" : " (in progress)");
+  // Printed even when it reads zero, unlike most counters here: "no caster was dropped" is what
+  // says the batch is the whole map rather than most of it, and the two are indistinguishable
+  // from the picture.
+  add("  submission: %s (%u casters, %u dropped - must be 0)\n",
+      MapShadowIndirect ? "vkCmdDrawIndexedIndirect, one command a face"
+                        : "a draw call per caster per face - no multiDrawIndirect",
+      MapShadowLastCasters, MapShadowCastersDropped);
+  add("  normal offset %.2f texels, sampled: %s\n", MapShadowBiasValue,
+      MapShadowsEnabled ? "yes" : "NO - render.map_shadows is off");
+  return out;
+}
+
+void SetShadowCascades(int count) {
+  ShadowCascadeCount = count < 1 ? 1
+                                 : (count > static_cast<int>(kMaxShadowCascades)
+                                        ? static_cast<int>(kMaxShadowCascades)
+                                        : count);
+}
+int ShadowCascades() { return ShadowCascadeCount; }
+
+void SetLocalLights(bool enabled) { LocalLightsEnabled = enabled; }
+bool LocalLights() { return LocalLightsEnabled; }
+
+void SetLocalShadows(bool enabled) {
+  if (LocalShadowsEnabled() == enabled) {
+    return;
+  }
+  LocalShadowsWanted = enabled;
+  LocalShadowsRead = true;
+  // Forget every key on the way off, so turning it back on re-earns and re-bakes each slot rather
+  // than sampling tiles whose lights may have moved while nobody was watching them.
+  ResetLocalShadows();
+}
+
+bool LocalShadows() { return LocalShadowsEnabled(); }
+
+std::string LocalShadowReport() {
+  std::string out;
+  char line[256];
+  const auto add = [&](const char *format, auto... args) {
+    std::snprintf(line, sizeof(line), format, args...);
+    out += line;
+  };
+  // **Every count here is of LIGHTS, derived from the table now**, not accumulated per call:
+  // this function is asked once and the acquire path runs once per light per frame, so a
+  // cumulative refusal counts frames rather than lights. Only `forgotten` is cumulative, and it
+  // is the one thing that genuinely is an event rather than a state.
+  uint32_t held = 0;
+  uint32_t baked = 0;
+  uint32_t waiting = 0;
+  uint32_t unslotted = 0;
+  for (const auto &[key, entry] : LocalShadowKeys) {
+    held += entry.slot >= 0 ? 1u : 0u;
+    baked += entry.slot >= 0 && entry.baked ? 1u : 0u;
+    waiting += entry.slot < 0 && entry.stable < kLocalShadowStableFrames ? 1u : 0u;
+    unslotted += entry.slot < 0 && entry.stable >= kLocalShadowStableFrames ? 1u : 0u;
+  }
+  add("local light shadows: %s\n",
+      LocalShadowsEnabled() ? "on" : "OFF - render.local_shadows / GKPLUS_VK_LOCAL_SHADOWS");
+  add("atlas: %u slots reserved of %u, at tiles %u..%u\n", kLocalShadowSlots, kMapShadowSlots,
+      kMapShadowLightSlots, kMapShadowSlots - 1);
+  add("keys live: %u   holding a slot: %u   baked and sampled: %u\n",
+      (unsigned)LocalShadowKeys.size(), held, baked);
+  // These two are the pair to read, and they mean opposite things. **`waiting` is the feature
+  // working**: a light that moves is here every frame under a new key and never leaves, which is
+  // exactly why it costs nothing. `unslotted` is the only real limit - lights that held still and
+  // found the sixteen slots taken.
+  add("waiting out the %u-frame stability gate: %u   (a light that MOVES lives here permanently)\n",
+      kLocalShadowStableFrames, waiting);
+  add("held still but found no free slot: %u\n", unslotted);
+  add("keys forgotten for going stale: %u   cubes baked for this level: %llu\n",
+      LocalShadowForgotten, (unsigned long long)LocalShadowBakes);
+  for (const auto &[key, entry] : LocalShadowKeys) {
+    if (entry.slot < 0) {
+      continue;
+    }
+    float position[3] = {};
+    float range = 0.0f;
+    std::memcpy(position, key.position, sizeof(position));
+    std::memcpy(&range, &key.range, sizeof(range));
+    add("  slot %2u  %s  %.2f %.2f %.2f  range %.2f  seen %u frames running\n",
+        kMapShadowLightSlots + entry.slot, entry.baked ? "baked  " : "PENDING", position[0],
+        position[1], position[2], range, entry.stable);
+  }
+  return out;
+}
 
 void SetMapLightCull(bool enabled) {
   MapLightCullEnabled = enabled;
@@ -1457,6 +3000,16 @@ void SubmitDraw(const DrawItem &item) {
   // moves only when an image is created, destroyed or named. A texture with no companion file
   // costs one hash lookup once, not a file probe per frame (VkLighting.h).
   EnsureLightingMapsResolved();
+  // The game's own stencil shadow, dropped once the sun is casting a real one - otherwise a unit
+  // carries both. All three of its passes have stencil on and nothing else in level01 or level02
+  // does (§4.31), so this is exact rather than a guess; `render.stencil_shadow` puts it back.
+  //
+  // Gated on the sun actually drawing, not merely on the knob: with no shadow pipeline or no sun
+  // set, dropping the game's shadow would remove the only one there is.
+  if (!StencilShadowEnabled && SunShadowsEnabled && ShadowReady && item.pipeline.stencil_enable) {
+    ++TheStats.stencil_shadow_draws_hidden;
+    return;
+  }
   if (!Resolved.empty() && item.stage_count > 0) {
     if (const ResolvedOverride *over = OverrideFor(item.stages[0].texture_index)) {
       if (over->hide) {
@@ -1789,7 +3342,8 @@ std::string FormatDrawStats() {
       TheStats.submitted + TheStats.skipped_topology + TheStats.skipped_no_slot +
       TheStats.skipped_no_transform + TheStats.skipped_unconvertible +
       TheStats.skipped_scratch_full + TheStats.skipped_no_record +
-      TheStats.dropped_over_capacity + TheStats.dropped_materials + TheStats.hidden_draws;
+      TheStats.dropped_over_capacity + TheStats.dropped_materials + TheStats.hidden_draws +
+      TheStats.stencil_shadow_draws_hidden;
   add("draw calls seen: %llu   submitted: %llu   unaccounted for: %lld (must be 0)\n",
       (unsigned long long)TheStats.seen, (unsigned long long)TheStats.submitted,
       (long long)TheStats.seen - (long long)accounted);
@@ -1844,6 +3398,55 @@ std::string FormatDrawStats() {
         MapLightCullEnabled ? (GridValid ? "culled by the world grid" : "grid NOT built")
                             : "every light per pixel",
         (unsigned long long)TheStats.light_grid_builds);
+    // One line, with `render.map_shadow_report` for the rest. `baked N/M` is the one number worth
+    // having here: a bake still in progress and a bake that never started look the same on screen.
+    if (MapShadowReady) {
+      add("  static shadows: %s, baked %u/%u lights (%u refused, offset %.2f texels)\n",
+          MapShadowsEnabled ? "on" : "off (render.map_shadows)", MapShadowCursor,
+          (unsigned)MapShadowLightForSlot.size(), MapShadowRefused, MapShadowBiasValue);
+    }
+  }
+  // Four states, not two: a level with no sun set produces no matrix and therefore no shadow,
+  // and a device that could not build the pipeline produces none either. Both look exactly like
+  // the knob being off from the screen, so the report is what tells them apart.
+  add("sun shadows: %s (%llu casters over %u cascades, bias %.2f texels, strength %.2f, "
+      "extent %.0f)\n",
+      !SunShadowsEnabled ? "off"
+                         : (!ShadowReady ? "NO PIPELINE" : (FrameSunValid ? "on" : "no sun")),
+      (unsigned long long)TheStats.shadow_casters, FrameCascadeCount, ShadowBiasValue,
+      ShadowStrengthValue, ShadowExtentValue);
+  if (ShadowReady) {
+    // The near cascade's extent and its texel are what "sharp" means here, and they are the two
+    // numbers a level's scale actually moves - printed rather than derived, because the halving
+    // makes the near extent depend on the cascade COUNT as well as on `shadow_extent`.
+    float near_extent = ShadowExtentValue;
+    for (int i = 1; i < ShadowCascadeCount; ++i) {
+      near_extent *= 0.5f;
+    }
+    add("  atlas %ux%u (%u KB, format %u), tile %u: near cascade +-%.2f world units, "
+        "%.4f per texel\n",
+        kShadowAtlas, kShadowAtlas, (unsigned)(ShadowBytes / 1024), (unsigned)ShadowFormat,
+        kShadowTile, near_extent, near_extent * 2.0f / static_cast<float>(kShadowTile));
+  }
+  if (TheStats.stencil_shadow_draws_hidden > 0) {
+    add("  the game's own stencil shadow: %llu draws dropped (render.stencil_shadow puts it "
+        "back)\n",
+        (unsigned long long)TheStats.stencil_shadow_draws_hidden);
+  }
+  // The local half of the static atlas (§4.65), in one line - `render.local_shadow_report` is the
+  // detail. `holding` against `keys` is the reading: the gap is lights that move, which is the
+  // design working rather than failing.
+  {
+    uint32_t held = 0;
+    uint32_t moving = 0;
+    for (const auto &[key, entry] : LocalShadowKeys) {
+      held += entry.slot >= 0 && entry.baked ? 1u : 0u;
+      moving += entry.slot < 0 && entry.stable < kLocalShadowStableFrames ? 1u : 0u;
+    }
+    add("local light shadows: %s (%u of %u keys hold a baked cube, %u reserved slots, "
+        "%u still moving)\n",
+        LocalShadowsEnabled() ? "on" : "off", held, (unsigned)LocalShadowKeys.size(),
+        kLocalShadowSlots, moving);
   }
   add("viewport depth-slice changes: %llu\n", (unsigned long long)TheStats.viewport_sets);
   add("index binds: %llu   pipelines: %llu (%llu binds, %llu failures - must be 0)\n",
@@ -1881,6 +3484,10 @@ std::string FormatDrawStats() {
 }
 
 void ShutdownDraw() {
+  // Before the sun's, which owns the module and layout this one borrows - destroying a pipeline
+  // after its layout is legal, but the reverse order is the one that reads correctly.
+  DestroyMapShadowAtlas();
+  DestroyShadowPass();
   DestroyLightGridPipeline();
   if (!Ready) {
     return;

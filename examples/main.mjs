@@ -11,10 +11,19 @@
 // checking in an editor - the JSDoc annotations below are what drive it.
 
 import { actors, camera, console, fx, game, levels, light, tokens, world } from "gk";
+// The Vulkan renderer's own knobs, as ImGui. Its own module because it is longer
+// than everything else here put together, and because it is the piece most worth
+// copying into an entry module of your own.
+import { draw_render_panel } from "./render-panel.mjs";
 // A level module is an ordinary module, imported the ordinary way. Its namespace
 // - `map` plus the hooks - is exactly the description `levels.add` wants, so
 // there is nothing else to unpack. Drop this line (and the add() below) if you
-// have not copied levels/ alongside.
+// have not copied levels/ alongside - **and headers/, which arena.mjs imports**.
+//
+// A module this fails to find takes the whole entry module with it: the host
+// reports `could not load module '<path>'` on the game's own text layer and then
+// registers no hooks at all, so the symptom is that nothing here happens rather
+// than that one level is missing.
 import * as arena from "./levels/arena.mjs";
 
 // There is no global console - this one comes from "gk", and carries both the
@@ -141,6 +150,11 @@ export function draw_gui(ImGui) {
         }
       }
     }
+
+    // Every `render` knob, in its own set of collapsing headers. It draws into
+    // this window rather than opening one of its own, so the order here is the
+    // order on screen.
+    draw_render_panel(ImGui);
 
     const check = ImGui.Checkbox("Show the actor list", showActors);
     showActors = check.value;

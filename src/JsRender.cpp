@@ -534,6 +534,101 @@ JSValue SetMapLightCullValue(JSContext *ctx, JSValueConst, JSValueConst value) {
   return JS_UNDEFINED;
 }
 
+// `render.sun_shadows` and its three knobs (VkDraw.h). A real shadow map from the sun, which is
+// the first thing here the game never had at all - its own shadows are stencil volumes under the
+// units and nothing else.
+//
+// `shadow_bias` and `shadow_extent` are knobs rather than constants on purpose: acne and
+// peter-panning trade against each other, so sweeping them on a paused frame is how you find one.
+// Their defaults are a sweep and not a guess (§4.59) - and `shadow_bias` is in **shadow texels**,
+// which is what makes one value hold across every cascade, level and extent.
+//
+// `render.shadow_cascades` (1..4) is the A/B for cascading itself: 1 is §4.58's single map at the
+// same texel density, so it toggles on one paused frame.
+// `render.stencil_shadow` - draw the game's OWN blob shadow as well as the sun's map. Off, since
+// otherwise a unit has both. Its three passes are identified by stencil being enabled, which
+// §4.31 measured is exact on level01 and level02; this knob is what checks that on a level those
+// measurements never covered.
+JSValue GetStencilShadow(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::StencilShadow());
+}
+
+JSValue SetStencilShadowValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetStencilShadow(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+JSValue GetSunShadows(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::SunShadows());
+}
+
+JSValue SetSunShadowsValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetSunShadows(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+#define GK_SHADOW_KNOB(name, setter)                                                               JSValue Get##setter(JSContext *ctx, JSValueConst) {                                                return JS_NewFloat64(ctx, vulkan::setter());                                                   }                                                                                                JSValue Set##setter##Value(JSContext *ctx, JSValueConst, JSValueConst value) {                     double v = 0.0;                                                                                  if (JS_ToFloat64(ctx, &v, value) < 0) {                                                            return JS_EXCEPTION;                                                                           }                                                                                                vulkan::Set##setter(static_cast<float>(v));                                                      return JS_UNDEFINED;                                                                           }
+
+GK_SHADOW_KNOB(shadow_bias, ShadowBias)
+GK_SHADOW_KNOB(shadow_strength, ShadowStrength)
+GK_SHADOW_KNOB(shadow_extent, ShadowExtent)
+GK_SHADOW_KNOB(map_shadow_bias, MapShadowBias)
+
+// `render.map_shadows` and its two knobs (VkDraw.h, §4.61) - the static shadow atlas for the
+// level's own STDLIGHT rig. Off by default, and the atlas is baked whether or not it is sampled,
+// so this A/Bs on one paused frame at a 0.000 floor.
+//
+// `render.map_shadow_report` is not optional reading: a level with no map lights, an atlas that
+// could not be created and a bake that has not finished all look identical from the screen.
+JSValue GetMapShadows(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::MapShadows());
+}
+
+JSValue SetMapShadowsValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetMapShadows(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+JSValue GetMapShadowReport(JSContext *ctx, JSValueConst) {
+  const std::string report = vulkan::MapShadowReport();
+  return JS_NewStringLen(ctx, report.c_str(), report.size());
+}
+
+JSValue GetMapShadowIndirect(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::MapShadowIndirectEnabled());
+}
+
+JSValue SetMapShadowIndirectValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetMapShadowIndirect(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+JSValue GetMapShadowRate(JSContext *ctx, JSValueConst) {
+  return JS_NewInt32(ctx, vulkan::MapShadowRate());
+}
+
+JSValue SetMapShadowRateValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  int32_t rate = 1;
+  if (JS_ToInt32(ctx, &rate, value) < 0) {
+    return JS_EXCEPTION;
+  }
+  vulkan::SetMapShadowRate(rate);
+  return JS_UNDEFINED;
+}
+
+JSValue GetShadowCascades(JSContext *ctx, JSValueConst) {
+  return JS_NewInt32(ctx, vulkan::ShadowCascades());
+}
+
+JSValue SetShadowCascadesValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  int32_t count = 1;
+  if (JS_ToInt32(ctx, &count, value) < 0) {
+    return JS_EXCEPTION;
+  }
+  vulkan::SetShadowCascades(count);
+  return JS_UNDEFINED;
+}
+
 // `render.map_light_gain` - the model's one free parameter. The fit puts it at 0.9 on level01 and
 // 1.35 on level04 and level05, so 1.0 is the middle rather than an identity.
 JSValue GetMapLightGain(JSContext *ctx, JSValueConst) {
@@ -719,6 +814,47 @@ JSValue FrameDraws(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
   }
   const std::string text = d3d8::FormatFrameDraws(first, last);
   return JS_NewStringLen(ctx, text.data(), text.size());
+}
+
+// `render.frame_lights` - the last complete frame's D3D lights, deduplicated by contents, with
+// how many draws each reached and how many frames it has survived. Mirror-side like `frame_draws`,
+// so it reads the same in every renderer mode. See FormatFrameLights in D3D8Capture.h for what
+// the two "distinct" counts mean together.
+JSValue GetFrameLights(JSContext *ctx, JSValueConst) {
+  const std::string text = d3d8::FormatFrameLights();
+  return JS_NewStringLen(ctx, text.data(), text.size());
+}
+
+// `render.local_lights` - on by default. Off drops D3D's point and spot lights from the sum, so a
+// paused A/B is exactly the pixels they reach: the ceiling on what shadowing them could be worth.
+JSValue GetLocalLights(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::LocalLights());
+}
+
+JSValue SetLocalLightsValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetLocalLights(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+// `render.local_shadows` - a feature, on by default (§4.65). Shadows from D3D's own point and spot
+// lights, out of the same static atlas the map lights use. Independent of `render.map_shadows`
+// because they are two light systems sharing one image.
+//
+// `render.local_shadow_report` is not optional reading: a light that moves, a light the sixteen
+// reserved slots had no room for, and a cube that has not been baked yet all look identical on
+// screen, and the first of those is the design working rather than failing.
+JSValue GetLocalShadows(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::LocalShadows());
+}
+
+JSValue SetLocalShadowsValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetLocalShadows(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+JSValue GetLocalShadowReport(JSContext *ctx, JSValueConst) {
+  const std::string report = vulkan::LocalShadowReport();
+  return JS_NewStringLen(ctx, report.c_str(), report.size());
 }
 
 JSValue DrawInfo(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
@@ -1058,6 +1194,11 @@ JSValue GetVulkan(JSContext *ctx, JSValueConst) {
   put("staging_wraps", JS_NewInt64(ctx, static_cast<int64_t>(m.staging_wraps)));
   put("staging_flushes", JS_NewInt64(ctx, static_cast<int64_t>(m.staging_flushes)));
   put("staging_stalls", JS_NewInt64(ctx, static_cast<int64_t>(m.staging_stalls)));
+  put("staging_reclaims", JS_NewInt64(ctx, static_cast<int64_t>(m.staging_reclaims)));
+  // Read these two as a DIFFERENCE across a window, not as session totals: whether the ring's
+  // blocking matters depends on when it happens, not on how often (§4.63).
+  put("staging_stall_us", JS_NewInt64(ctx, static_cast<int64_t>(m.staging_stall_us)));
+  put("staging_flush_us", JS_NewInt64(ctx, static_cast<int64_t>(m.staging_flush_us)));
   put("dropped_uploads", JS_NewInt64(ctx, static_cast<int64_t>(m.dropped_uploads)));
   put("arena_exhausted", JS_NewInt64(ctx, static_cast<int64_t>(m.arena_exhausted)));
   put("images_live", JS_NewInt64(ctx, static_cast<int64_t>(m.images_live)));
@@ -1106,6 +1247,17 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("map_light_gain", GetMapLightGain, SetMapLightGainValue),
     JS_CGETSET_DEF("map_lighting_all", GetMapLightingAll, SetMapLightingAllValue),
     JS_CGETSET_DEF("map_light_cull", GetMapLightCull, SetMapLightCullValue),
+    JS_CGETSET_DEF("sun_shadows", GetSunShadows, SetSunShadowsValue),
+    JS_CGETSET_DEF("stencil_shadow", GetStencilShadow, SetStencilShadowValue),
+    JS_CGETSET_DEF("shadow_bias", GetShadowBias, SetShadowBiasValue),
+    JS_CGETSET_DEF("shadow_strength", GetShadowStrength, SetShadowStrengthValue),
+    JS_CGETSET_DEF("shadow_extent", GetShadowExtent, SetShadowExtentValue),
+    JS_CGETSET_DEF("shadow_cascades", GetShadowCascades, SetShadowCascadesValue),
+    JS_CGETSET_DEF("map_shadows", GetMapShadows, SetMapShadowsValue),
+    JS_CGETSET_DEF("map_shadow_bias", GetMapShadowBias, SetMapShadowBiasValue),
+    JS_CGETSET_DEF("map_shadow_rate", GetMapShadowRate, SetMapShadowRateValue),
+    JS_CGETSET_DEF("map_shadow_indirect", GetMapShadowIndirect, SetMapShadowIndirectValue),
+    JS_CGETSET_DEF("map_shadow_report", GetMapShadowReport, nullptr),
     JS_CGETSET_DEF("force_lod", GetForceLod, SetForceLodValue),
     JS_CGETSET_DEF("lighting_maps", GetLightingMaps, SetLightingMapsValue),
     JS_CGETSET_DEF("lighting_map_report", GetLightingMapReport, nullptr),
@@ -1131,6 +1283,10 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("ref_hide", GetRefHide, SetRefHideValue),
     JS_CFUNC_DEF("draw_info", 1, DrawInfo),
     JS_CFUNC_DEF("frame_draws", 2, FrameDraws),
+    JS_CGETSET_DEF("frame_lights", GetFrameLights, nullptr),
+    JS_CGETSET_DEF("local_lights", GetLocalLights, SetLocalLightsValue),
+    JS_CGETSET_DEF("local_shadows", GetLocalShadows, SetLocalShadowsValue),
+    JS_CGETSET_DEF("local_shadow_report", GetLocalShadowReport, nullptr),
     JS_CGETSET_DEF("draw_vertices", GetDrawVertices, SetDrawVerticesValue),
     JS_CGETSET_DEF("draw_state", GetDrawState, SetDrawStateValue),
     JS_CGETSET_DEF("draw_geometry", GetDrawGeometry, nullptr),

@@ -57,6 +57,10 @@ ENTRY_POINTS = [
     # The first compute entry point here. The `stage` string goes straight to `slangc -stage`, so
     # this list is all it took - nothing else in this script is stage-aware.
     ("lightgrid.slang", "build_grid", "compute"),
+    ("shadow.slang", "shadow_vertex", "vertex"),
+    # The same pass driven by vkCmdDrawIndexedIndirect - the map lights' bake, which needs the
+    # record out of a buffer rather than out of the push (§4.62).
+    ("shadow.slang", "map_shadow_vertex", "vertex"),
 ]
 
 SLANGC_ARGS = [

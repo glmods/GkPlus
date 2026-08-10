@@ -244,6 +244,11 @@ float MapAmbience() {
   return Ambience;
 }
 
+uint32_t MapLightsGeneration() {
+  EnsureLoaded();
+  return LoadedGeneration;
+}
+
 std::string MapLightReport() {
   EnsureLoaded();
   std::string out;

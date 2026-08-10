@@ -20,7 +20,9 @@
 // addresses and three indices, and nothing else.
 
 #include <cstdint>
+#include <cstring>
 #include <string>
+#include <type_traits>
 
 namespace gk {
 namespace vulkan {
@@ -43,7 +45,11 @@ namespace vulkan {
 // component and the layout question does not arise a second time.
 struct GpuLight {
   float position[4];    // xyz in world space
-  float direction[4];   // xyz in world space, already normalised
+  // xyz in world space, already normalised. **w is this light's slot in the static shadow atlas**
+  // (§4.65), or -1 for a light that has none - which is the normal case for a light that moves,
+  // for one the atlas had no room for, and for every light before the bake reaches it. Carried as
+  // a float in the same spare lane `GpuMapLight::axis[3]` uses, and read back with a cast.
+  float direction[4];
   float diffuse[4];
   float specular[4];
   float ambient[4];
@@ -71,9 +77,47 @@ struct GpuMapLight {
   // xyz = **row 2** of the orientation matrix, which is the light's axis. Rows 0 and 1 both fit
   // worse and negating this one collapses the fit, which is what identifies it (§4.54). Unused
   // on an omni light.
+  //
+  // w is this light's slot in the **static shadow atlas** (§4.61), or -1 for a light that has
+  // none - which is the normal case for a level with more lights than the atlas holds, and for
+  // every light before the bake reaches it. Carried as a float because the whole struct is
+  // float4s for the layout reason above, and read back with a cast.
   float axis[4];
 };
 static_assert(sizeof(GpuMapLight) == 48, "the scratch stride is part of the shader ABI");
+
+// The static shadow atlas for the map lights (§4.61): one cube per light, six 90-degree faces in
+// a square grid of tiles.
+//
+// **The atlas size is what costs memory and the face size is what buys capacity**, which is the
+// arithmetic that picks both. 4096 is the `maxImageDimension2D` every Vulkan device guarantees and
+// `D16_UNORM` is a mandatory depth format, so the image is **32 MB** whatever the face size; 64
+// then leaves room for 682 lights, against level01's 686 - the most of any shipped level. A level
+// with more than the atlas holds shadows the most influential and leaves the rest as they were.
+constexpr uint32_t kMapShadowFace = 64;
+constexpr uint32_t kMapShadowAtlas = 4096;
+constexpr uint32_t kMapShadowTilesPerRow = kMapShadowAtlas / kMapShadowFace;
+constexpr uint32_t kMapShadowSlots = kMapShadowTilesPerRow * kMapShadowTilesPerRow / 6;
+
+// The last few slots of that atlas belong to **D3D's own point and spot lights** (§4.65) - the
+// game's runtime lights, which are a different system from the `STDLIGHT` rig above and had no
+// shadow at all. They are a handful: 5 on level02's start, 12 at its fire camera, 4 on level04,
+// 1 on level05 and none on prison, measured with `render.frame_lights`.
+//
+// **Sixteen, and they come off the map lights' budget** rather than out of a second image. Only
+// level01 notices - it is the one level with more `STDLIGHT`s than the atlas holds (686 against
+// 682), so it goes from refusing 4 of them to refusing 20, all at the bottom of the
+// `brightness * range^3` order. Its D3D lights are worth nothing measurable on screen and its map
+// lights are worth 0.195 MAD, so trading sixteen of the weakest for the whole feature is the
+// right way round.
+constexpr uint32_t kLocalShadowSlots = 16;
+constexpr uint32_t kMapShadowLightSlots = kMapShadowSlots - kLocalShadowSlots;
+
+// How many cascades the sun's shadow map is split into, and therefore how many tiles the atlas
+// carries. Four, in a 2x2 grid - the atlas is square either way, and a fifth would take it to a
+// 3x2 that wastes a third of the image. `render.shadow_cascades` selects how many are LIVE, from
+// 1 (which is §4.58's single map, at the same texel density) to this.
+constexpr uint32_t kMaxShadowCascades = 4;
 
 // Everything that is the same for every draw in a frame, in one place.
 //
@@ -110,11 +154,53 @@ struct GpuFrameData {
   float map_ambience;
   uint32_t map_light_count;
   uint32_t map_flags; // bit 0 on, bit 1 substitute everywhere, bit 2 the grid is usable
-  uint32_t pad0;
-  uint32_t pad1;
-  uint32_t pad2;
+  // The sun's shadow map. `shadow_texture` is kNoTexture when there is none, which is the one
+  // test the fragment shader makes - so a device without the pass, a level without a sun and the
+  // knob being off all look the same from the shader and none of them is a branch of its own.
+  uint32_t shadow_texture;
+  uint32_t shadow_sampler;
+  float shadow_strength;    // 0 no shadow, 1 fully dark - see SetShadowStrength for why 1
+  float shadow_texel;       // 1 / the TILE's size, so a PCF tap is in a cascade's own uv
+  float shadow_z_near;      // light-space z at the near plane, shared by every cascade
+  float shadow_z_span;      // ... and the near-to-far distance, likewise shared
+  uint32_t shadow_cascades; // how many of `cascades` below are live, 0 for none
+  // The map lights' static shadow atlas (§4.61). `kNoTexture` is the one test, exactly as
+  // `shadow_texture` above is for the sun's - "the knob is off", "the atlas could not be created"
+  // and "this level has no map lights" are one state in the shader.
+  uint32_t map_shadow_texture;
+  uint32_t map_shadow_sampler;
+  // How far along the surface normal a lookup is moved before it is projected, **in atlas texels
+  // at that fragment's own distance from the light** (see SetMapShadowBias). The bias for this
+  // atlas is a normal offset rather than a depth one because a 64-texel cube face is coarse - a
+  // texel is `distance / 32` world units - so the depth error across one texel is dominated by
+  // the surface's slope, which is exactly what an offset along the normal cancels.
+  float map_shadow_offset;
+  // Bit 0: D3D's point and spot lights are in the sum (`render.local_lights`, on by default).
+  // Bit 1: the map lights sample the atlas above (`render.map_shadows`).
+  // Bit 2: D3D's point and spot lights sample it too (`render.local_shadows`, §4.65).
+  //
+  // The last two are separate bits rather than two texture fields because they are two features
+  // sharing one image, and this was the pad word - which the `offsetof` asserts below check rather
+  // than assume: 24 bytes of addresses plus twenty-five 4-byte scalars is 124, and both arrays
+  // that follow have to start on a 16-byte boundary or their rows are not where any layout rule
+  // puts them.
+  uint32_t light_flags;
+  //
+  // Per cascade, in light space: `x`/`y` the box's snapped centre, `z` the reciprocal of its
+  // half-extent, `w` its depth bias already converted out of texels (see SetShadowBias).
+  float cascades[kMaxShadowCascades][4];
+  // World -> **light space**, not to a cascade's clip space: the sun's orthonormal basis with no
+  // scale and no translation, so the result is in world units and every cascade is then a centre
+  // and a half-extent in it. That is what lets one transform serve four boxes, and it is why the
+  // cascade selection is a pair of compares rather than four matrix multiplies.
+  //
+  // Row-vector, like every other matrix here. Last because it is 16 floats and putting it first
+  // would push every scalar above past an offset worth checking.
+  float sun_matrix[16];
 };
-static_assert(sizeof(GpuFrameData) == 96, "the scratch stride is part of the shader ABI");
+static_assert(sizeof(GpuFrameData) == 256, "the scratch stride is part of the shader ABI");
+static_assert(offsetof(GpuFrameData, cascades) == 128, "std430 puts a float4 array on 16");
+static_assert(offsetof(GpuFrameData, sun_matrix) == 192, "... and so does the matrix after it");
 
 // GpuDrawRecord::lighting flags.
 //
@@ -478,6 +564,10 @@ struct DrawStats {
   // indistinguishable from a broken override without this (§4.44).
   uint64_t overridden_draws = 0;
   uint64_t hidden_draws = 0;
+  // The game's own stencil shadow, dropped because the sun's shadow map has replaced it. Counted
+  // into the seen == submitted + skips reconciliation for the reason hidden_draws is: a feature
+  // that drops draws on purpose must not make that invariant read as broken.
+  uint64_t stencil_shadow_draws_hidden = 0;
   // How often the viewport had to be reissued because a draw wanted a different depth slice.
   // Not an invariant - it is the size of the technique in §4.32, and a level where it reads 0
   // would be one where the engine never layers anything in front of the world.
@@ -485,7 +575,9 @@ struct DrawStats {
   uint64_t pipelines = 0;
   // How many times the world-space light grid has been rebuilt. Once per level with a light set,
   // so a number that climbs with the frame count means the rebuild test is broken.
-  uint64_t light_grid_builds = 0;        // distinct pipeline states seen, i.e. VkPipelines created
+  uint64_t light_grid_builds = 0;
+  // How many draws cast into the sun's shadow map on the last frame that rendered one.
+  uint64_t shadow_casters = 0;        // distinct pipeline states seen, i.e. VkPipelines created
   uint64_t pipeline_binds = 0;   // how often the bound pipeline changed within a frame
   uint64_t pipeline_failures = 0; // must be 0: a state whose pipeline would not build
   uint64_t dropped_over_capacity = 0; // must be 0
@@ -522,6 +614,191 @@ void RecordDraws(void *command_buffer);
 // level rather than once per frame - see src/shaders/lightgrid.slang for why that is the shape
 // this takes instead of a view-space cluster grid.
 void BuildLightGrid(void *command_buffer);
+
+// Render the sun's shadow map: a depth-only pass over the same draw list, from the sun.
+//
+// **Outside any render pass and AFTER the draw records exist**, which pins it to one place - the
+// renderer calls it beside BuildLightGrid, before the world pass begins. It reads the same
+// GpuDrawRecord array the world pass does, so it must run after the scene has been recorded and
+// before the scratch rotates.
+void RecordShadowPass(void *command_buffer);
+
+// Bake a slice of the map lights' static shadow atlas: one cube per light, from the map's own
+// geometry, in the current frame's draw list (§4.61).
+//
+// **Outside any render pass and beside RecordShadowPass**, for the same two reasons - it needs the
+// GpuDrawRecord array the scene was recorded into, and it begins a rendering of its own.
+//
+// **A slice, not the whole thing.** 686 lights x 6 faces x ~150 map draws is over half a million
+// draw calls; issued in one submit that is seconds of GPU work, and Windows resets a device that
+// does not make progress for two. So it bakes `render.map_shadow_rate` lights a frame and picks up
+// where it left off, which finishes inside a second of a level starting. An unbaked light's tile
+// holds the clear value, which reads as "nothing occludes" - so the shadows arrive rather than the
+// level starting black.
+void BakeMapShadows(void *command_buffer);
+
+// The map lights' static shadows. **On since §4.64, and play is what settled it.**
+//
+// §4.61 left it off because no measurement could say whether the picture with these shadows was
+// the right one - the game never had them - and then the first report from actually playing was
+// that the map lights "don't cast shadows". A feature nobody can see is not a fidelity question.
+// Sampling the atlas costs 0.50 ms on level01, the level with the most map lights in the game,
+// and nothing measurable on level02, so cost was never the objection either.
+//
+// **The bake is gated on this as well**, so off costs nothing rather than a bake at every level
+// start. Turning it back on restarts the bake, and the shadows arrive over the next few frames -
+// which means the A/B is instant only once `render.map_shadow_report` says finished.
+void SetMapShadows(bool enabled);
+bool MapShadows();
+
+// The normal offset a lookup is moved by, in atlas texels at the fragment's own distance from the
+// light. See GpuFrameData::map_shadow_offset for why the bias for this atlas is an offset along
+// the normal rather than a depth one.
+void SetMapShadowBias(float texels);
+float MapShadowBias();
+
+// Whether the bake submits one `vkCmdDrawIndexedIndirect` per cube face or one draw call per
+// caster per face (§4.62). On wherever the device has `multiDrawIndirect`, which is what turns
+// 804,924 draw calls into 4,092 commands on level01.
+//
+// **The two must produce the same atlas**, and this knob is the only thing that can say so: they
+// differ in the shader entry point, so switching it rebuilds the pipeline and re-bakes. Setting
+// it on a device without the feature does nothing and reads back false.
+void SetMapShadowIndirect(bool enabled);
+bool MapShadowIndirectEnabled();
+
+// How many lights are baked per frame. **The default comes from the submission path** - 256 with
+// indirect drawing and 4 without - because §4.62 changed what the knob is for: what it used to
+// spread was 1.9 seconds of draw-call submission, and one command a face leaves a bake that is a
+// few milliseconds of GPU work in total. Changing it re-bakes from the start.
+void SetMapShadowRate(int lights);
+int MapShadowRate();
+
+// What the atlas holds, what it refused and how far the bake has got - which is not optional
+// reading, because a level with no map lights, an atlas that could not be created and a bake that
+// has not started all look identical from the screen.
+std::string MapShadowReport();
+
+// The sun's shadow map. On by default; off is the build before it, and a level with no sun set
+// produces no matrix and therefore no shadow, which is the same state.
+// Drop the game's OWN stencil shadow - the blob under each unit - when the sun's shadow map is
+// drawing a real one. On by default, because otherwise a unit has both.
+//
+// The three passes are identified by `stencil_enable`, which is exact rather than a heuristic:
+// §4.31 measured that every flat-shaded draw on level01 and level02 is one of them, and nothing
+// else in either level touches stencil at all. A level that used stencil for something else
+// would lose it, which is what `render.stencil_shadow` exists to check.
+void SetStencilShadow(bool enabled);
+bool StencilShadow();
+
+void SetSunShadows(bool enabled);
+bool SunShadows();
+
+// The depth offset a lookup is compared with, **in shadow-map texels of whichever cascade the
+// fragment landed in** (§4.59). Texels rather than depth units because that is the unit acne is
+// actually measured in: the depth error a flat surface accumulates across one texel is the texel's
+// world size times the surface's slope in light space, so a value in texels is the same value on
+// every cascade, on every level and at every `shadow_extent`. The same knob in depth units is
+// none of those things.
+//
+// The default is a sweep, not a guess: on level04 the self-shadowing collapses between 1 and 2.5
+// texels - 76% of the frame shadowed at 1, 16.6% at 2.5 - and everything above it is pure
+// peter-panning, at 0.04-0.3% of the frame per texel.
+void SetShadowBias(float texels);
+float ShadowBias();
+
+// How dark a shadowed fragment goes, 0 to 1. **The one knob here that is not a fidelity
+// question**, because the game has no ground truth for it - it never had a real shadow.
+//
+// 1 is the physically correct value rather than the maximum one: the shadow attenuates only the
+// direct terms, so 1 is "no sunlight reaches here" while the ambient and the level's own bake
+// still light the surface. The default is 0.7, and both bounds are measured (§4.59) - §4.58's
+// 0.55 leaves level04's unit shadows reading as a smudge, and 1.0 takes level02's covered start
+// to 36% of its authored brightness.
+void SetShadowStrength(float strength);
+float ShadowStrength();
+
+// Half the width of the world-space box the OUTERMOST cascade covers, centred on the camera's
+// orbit pivot. Every inner cascade is half the one outside it, so `extent` is the range at which
+// shadows stop and `extent / 2^(cascades-1)` is the sharp near field.
+void SetShadowExtent(float extent);
+float ShadowExtent();
+
+// How many cascades are live, 1..kMaxShadowCascades. **1 is §4.58's single map**, at the same
+// texel density, which is what makes cascading A/B-able on one paused frame.
+void SetShadowCascades(int count);
+int ShadowCascades();
+
+// **A diagnostic, and the one that prices shadows from D3D's own point and spot lights** (§4.65).
+// On by default. Off drops every point and spot light from the light sum and keeps the
+// directionals, so a paused A/B paints exactly the pixels those lights reach - and since a shadow
+// only ever removes light, that set strictly contains anything shadowing them could change. It is
+// the ceiling, and taking it before designing the feature is what says whether the feature is
+// worth a millisecond.
+//
+// It is a shader-side skip inside `light_geometry`, so it reaches the fixed-function sum and the
+// lighting maps' response alike, and `true` restores the frame bit-identically.
+void SetLocalLights(bool enabled);
+bool LocalLights();
+
+// --- shadows from D3D's own point and spot lights (§4.65) --------------------------------------
+
+// One D3D light reduced to **what decides its occlusion**, which is the key its atlas slot is
+// held under. Position, range, type and the cone - and deliberately **not its colour**, because
+// occlusion does not depend on colour and the game's `ADD BLINKING LIGHT` blinks by rewriting the
+// diffuse at a fixed position (measured, `render.frame_lights` shows it as two alternating
+// contents at one place). Keying on colour would churn a slot thirty times a second for a light
+// that never moves, and would have read as a cache that simply does not work.
+// **Every field is the float's BITS**, not the float, for the reason `d3d8::LightKey` is: the key
+// is byte-compared, and a float type has representations that compare unequal while meaning the
+// same thing (-0.0 against 0.0) and equal-meaning bits that are not equal values (any NaN). Bits
+// make the comparison total and let `has_unique_object_representations_v` below stand as the
+// no-padding proof, which is the thing that would actually go wrong silently.
+struct LocalShadowKey {
+  uint32_t position[3] = {0, 0, 0};
+  uint32_t range = 0;
+  uint32_t direction[3] = {0, 0, 0};
+  uint32_t cos_phi = 0; // the spot's outer cone; 0 for a point light
+  uint32_t type = 0;    // D3DLIGHTTYPE
+
+  // Two lights are the same occluder iff they are the same numbers. No quantisation - a light the
+  // game nudges every frame SHOULD read as a new key, because that is precisely what the stability
+  // gate is watching for.
+  bool operator<(const LocalShadowKey &other) const {
+    return std::memcmp(this, &other, sizeof(LocalShadowKey)) < 0;
+  }
+};
+static_assert(sizeof(LocalShadowKey) == 36, "no padding, or memcmp compares uninitialised bytes");
+static_assert(std::has_unique_object_representations_v<LocalShadowKey>);
+
+// The slot this light's cube occupies in the static atlas, or **-1**, which is the answer for a
+// light that has not been still long enough to earn one, one the atlas had no room for, and one
+// whose cube has not been baked yet.
+//
+// **A light has no identity across frames** - `SetLight` reuses indices freely and a `GpuLight` is
+// deduplicated by enable mask *within* one frame - so the key above is the only identity there is.
+// That works because the game's local lights are measurably static (13 distinct contents over
+// 5,525 consecutive frames of level02, none re-authored), and it degrades correctly for the ones
+// that are not: level02's own `.gcs` attaches a light to `lift_a`, which runs on a track, and a
+// mod can attach one to anything. A moving light produces a new key every frame, never reaches the
+// stability threshold, never claims a slot and never costs a bake - it is simply unshadowed, which
+// is exactly the state every one of them is in today.
+// `frame` is the capture layer's own frame counter, because there is none on this side and the
+// stability gate counts frames rather than calls - a light enabled on forty draws of one frame has
+// held still for one frame, not forty.
+int32_t AcquireLocalShadowSlot(const LocalShadowKey &key, uint64_t frame);
+
+// **A feature**, on by default. Whether D3D's point and spot lights sample that atlas. Independent
+// of `render.map_shadows`, because they are two different light systems sharing one image - but
+// the atlas is baked if *either* wants it.
+void SetLocalShadows(bool enabled);
+bool LocalShadows();
+
+// What the local half of the atlas is doing: how many keys are live, how many hold a slot, how
+// many were refused for moving and how many for want of room. **Not optional reading** - a light
+// that moves and a light the atlas is full for both read as "no shadow" on screen, and so does a
+// bake that has not run.
+std::string LocalShadowReport();
 
 // Discards the list without drawing it, for a frame that is not rendered.
 void ClearDraws();
@@ -636,19 +913,27 @@ bool PerPixelLighting();
 // against the stored bytes over 255, so what it produces is already in the encoding the stages
 // consume - the fit absorbed the transfer function rather than leaving one to apply.
 //
-// **Off by default, on performance grounds rather than fidelity ones.** This is brute force over
-// every light in the level per pixel - 686 on level01 - with no culling until phase 2 builds it.
-// Turning it on is what says whether the shading is right; leaving it on is not yet advisable.
+// **On by default since §4.60.** It was off on performance grounds rather than fidelity ones - it
+// evaluated every light in the level per pixel, 686 of them on level01 - and §4.56's world-space
+// grid fixed that without anyone measuring by how much. §4.60 did: with the grid it costs
+// **1.83 ms on level01** and nothing measurable on level02, level04 or level05, against 30 ms
+// without it. That was the whole of the case for off.
+//
+// It is still the level's rig, so it is still judged on level04 or level05 - level02 fits it at
+// r 0.37 against 0.87-0.96 elsewhere (§4.54), and level02 is the level everything else here is
+// measured on. A fidelity comparison against `GKPLUS_RENDERER=d3d8` now has three departures to
+// switch off, not two.
 void SetMapLighting(bool enabled);
 bool MapLighting();
 
-// The one free parameter of that model, and the default (1.2) is the mean of the fitted gains on
-// the three levels where the model holds - 0.9 on level01, 1.35 on level04 and level05. It is a
+// The one free parameter of that model, and the default (1.35) is the mean of the fitted gains on
+// the three levels where the model holds - 1.1 on level01, 1.5 on level04 and level05. It is a
 // per-level quantity rather than a constant, so this is a lever and not a calibration.
 //
 // It is also the sharpest validation the feature has: on level04 the on-screen difference from
-// the bake minimises at **exactly 1.35**, rising either side, which is where the offline fit put
-// it from vertex data with no rendering involved (§4.55).
+// the bake minimises at exactly what the offline fit put it at, from vertex data with no
+// rendering involved (§4.55). **The three moved from 0.9 / 1.35 / 1.35 with §4.64's windowed
+// tail**, and had to: a dimmer tail refits to a brighter gain.
 // Substitute on every lit draw rather than only on the map's own geometry.
 //
 // Off by default, and the default is measured: a prop or a unit is a separate `RBOBJECT` whose

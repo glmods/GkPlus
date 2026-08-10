@@ -180,6 +180,18 @@ def predict(vertex, lights, model, ambience):
         d = math.sqrt(d2)
         if model["falloff"] == "linear":
             atten = 1.0 - d / rng
+        elif model["falloff"] == "windowed":
+            # The fitted linear shape with its TAIL smoothed to zero (notes 4.64).
+            #
+            # `1 - d/range` reaches zero with a non-zero slope, so per pixel every light draws a
+            # disc with a visible rim -- a first-derivative jump, which the eye reads as an edge
+            # even though the value itself is continuous. Per VERTEX that is invisible, which is
+            # why the fit never saw it: the tail is interpolated across whole terrain triangles.
+            #
+            # `(1 - t)(1 - t^4)` has zero derivative at t = 1 and is within 6% of linear at the
+            # half-range, so it changes the model only where the vertex data had least to say.
+            t = d / rng
+            atten = (1.0 - t) * (1.0 - t ** 4)
         elif model["falloff"] == "inverse_square":
             # Normalised by range so every model's gain lives on one scale; raw 1/d^2 in rif
             # units is ~1e-8 and would need a gain no sweep here would find.
@@ -412,6 +424,7 @@ def main():
             ("  + N.L", {"falloff": "linear", "lambert": True, "cone": False}),
             ("  + cone on every light", {"falloff": "linear", "lambert": True, "cone": "all"}),
             ("  + cone, omni exempt = FITTED", {"falloff": "linear", "lambert": True, "cone": True}),
+            ("fitted, windowed tail", {"falloff": "windowed", "lambert": True, "cone": True}),
             ("fitted, cosine falloff", {"falloff": "cosine", "lambert": True, "cone": True}),
             ("fitted, inverse-square falloff", {"falloff": "inverse_square", "lambert": True, "cone": True}),
         ]

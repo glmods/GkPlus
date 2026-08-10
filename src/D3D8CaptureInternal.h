@@ -315,6 +315,49 @@ static_assert(std::has_unique_object_representations_v<LightingInputs>);
 
 inline std::map<LightingInputs, uint64_t> LightingByFvf;
 
+// One D3D light, reduced to a memcmp-comparable key so "the same light" means "the same
+// numbers". **That is the only identity a D3D light has**: `SetLight` takes an index the game
+// reuses freely, `GpuLight`s are deduplicated by enable mask within a frame, and nothing carries
+// across a frame boundary at all - so the census below counts *contents*, and whether a light is
+// static in world space is read off how many distinct contents the session has ever seen against
+// how many are live in one frame.
+//
+// Everything is stored as bits rather than as floats so the key is byte-comparable and a NaN
+// cannot make two identical lights compare unequal. No quantisation: a light the game re-sets to
+// a slightly different position every frame SHOULD read as a new key, because that is exactly the
+// thing this measurement is asking about.
+struct LightKey {
+  uint32_t type = 0;
+  uint32_t position[3] = {0, 0, 0};
+  uint32_t direction[3] = {0, 0, 0};
+  uint32_t diffuse[3] = {0, 0, 0};
+  uint32_t range = 0;
+  uint32_t attenuation[3] = {0, 0, 0};
+  uint32_t theta = 0, phi = 0, falloff = 0;
+
+  bool operator<(const LightKey &other) const {
+    return std::memcmp(this, &other, sizeof(LightKey)) < 0;
+  }
+};
+static_assert(std::has_unique_object_representations_v<LightKey>);
+
+// What one distinct light did in one frame, and over the session.
+struct LightCensusEntry {
+  uint64_t draws = 0;         // draws this light was enabled on, this frame
+  uint64_t frames = 0;        // frames it has been present in, over the session
+  uint64_t first_frame = 0;   // ... and the first of them
+  uint64_t last_frame = 0;
+};
+
+// The frame being built, the last complete one, and the session. `FormatFrameLights` reads the
+// middle one for the same reason `render.frame_draws` does: the REPL runs at Present, so the
+// frame in progress is one draw long by the time anything asks.
+inline std::map<LightKey, LightCensusEntry> LightCensus;
+inline std::map<LightKey, LightCensusEntry> LightCensusLastFrame;
+inline std::map<LightKey, LightCensusEntry> LightCensusSession;
+inline uint64_t LightCensusFramesWithLights = 0;
+inline uint64_t LightCensusMaxPerFrame = 0;
+
 
 // Ours is the only reference the game gets; `inner` is released when ours reaches zero.
 // Kept deliberately simple: Gunlok creates one device and never queries for another
@@ -1020,6 +1063,12 @@ std::string CompareShadowToDevice(CaptureDevice *capture);
 void NoteOddTopology(D3DPRIMITIVETYPE type, bool user_pointer, uint32_t primitives,
                      const void *vertex_data, uint32_t vertex_stride, uint32_t vertex_count);
 void LogDraw(D3DPRIMITIVETYPE type, bool user_pointer, uint32_t primitives);
+// One draw's enabled lights, from ResolveLightRun - which is where they are already in hand, and
+// which runs for every lit draw whether or not the run itself was a cache hit. `lights` is the
+// run's contents; the collector expands them into the per-frame census above.
+void NoteLightRun(const vulkan::GpuLight *lights, uint32_t count, uint64_t frame);
+// Rotate the census at Present, exactly as the draw log rotates.
+void RotateLightCensus(uint64_t frame);
 void NoteDrawResult(HRESULT hr, const char *which, D3DPRIMITIVETYPE type,
                     uint32_t primitive_count);
 // Snapshots the device state, the game's own vertices and the arena AT THE MOMENT one draw is

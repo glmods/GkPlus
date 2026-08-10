@@ -1343,6 +1343,7 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::Present(const RECT *pSourceRect,
   // reads it. Keep the finished one.
   DrawLogLastFrame.swap(DrawLog);
   DrawLog.clear();
+  RotateLightCensus(TheStats.frames);
   if (TheStats.locked_bytes_this_frame > TheStats.max_locked_bytes_per_frame) {
     TheStats.max_locked_bytes_per_frame = TheStats.locked_bytes_this_frame;
   }
@@ -2137,13 +2138,20 @@ void StoreEye(float *out, const D3DMATRIX &view) {
 struct LightRun {
   uint32_t offset = 0;
   uint32_t count = 0;
+  // The run's contents, kept beside the offset purely so the census can be fed on a cache HIT
+  // as well as a miss - the scratch is write-combined host memory this side never reads back,
+  // and "how many draws is each light on" is a question only the hits can answer. Eight lights
+  // is D3D's own cap and there are a handful of masks a frame, so it is under 8 KB.
+  vulkan::GpuLight lights[8] = {};
 };
 
 std::map<uint32_t, LightRun> LightRunByMask;
 uint64_t LightRunFrame = UINT64_MAX;
 uint64_t LightRunGeneration = UINT64_MAX;
 
-void StoreLight(vulkan::GpuLight &out, const D3DLIGHT8 &light) {
+// `frame` is only for the shadow-slot key below (§4.65): the stability gate counts frames,
+// and a light enabled on forty draws of one frame has held still for one frame.
+void StoreLight(vulkan::GpuLight &out, const D3DLIGHT8 &light, uint64_t frame) {
   out.position[0] = light.Position.x;
   out.position[1] = light.Position.y;
   out.position[2] = light.Position.z;
@@ -2157,7 +2165,22 @@ void StoreLight(vulkan::GpuLight &out, const D3DLIGHT8 &light) {
   out.direction[0] = light.Direction.x * scale;
   out.direction[1] = light.Direction.y * scale;
   out.direction[2] = light.Direction.z * scale;
-  out.direction[3] = 0.0f;
+  // **This light's slot in the static shadow atlas, or -1** (§4.65). Asked for here because this
+  // is the only place a D3D light is in hand at all - `SetLight` reuses indices freely and a
+  // `GpuLight` is thrown away with the frame's scratch, so the renderer has nothing to key on.
+  // A directional light is the sun's business and never asks; everything else asks and mostly
+  // gets -1 until its position has held still for a few frames.
+  out.direction[3] = -1.0f;
+  if (light.Type != D3DLIGHT_DIRECTIONAL) {
+    const float cos_phi = light.Type == D3DLIGHT_SPOT ? std::cos(light.Phi * 0.5f) : 0.0f;
+    vulkan::LocalShadowKey key;
+    std::memcpy(key.position, &light.Position.x, sizeof(key.position));
+    std::memcpy(&key.range, &light.Range, sizeof(key.range));
+    std::memcpy(key.direction, out.direction, sizeof(key.direction));
+    std::memcpy(&key.cos_phi, &cos_phi, sizeof(key.cos_phi));
+    key.type = static_cast<uint32_t>(light.Type);
+    out.direction[3] = static_cast<float>(vulkan::AcquireLocalShadowSlot(key, frame));
+  }
   StoreColour(out.diffuse, light.Diffuse);
   StoreColour(out.specular, light.Specular);
   StoreColour(out.ambient, light.Ambient);
@@ -2199,6 +2222,7 @@ void ResolveLightRun(uint64_t frame, uint32_t &offset, uint32_t &count) {
   if (found != LightRunByMask.end()) {
     offset = found->second.offset;
     count = found->second.count;
+    NoteLightRun(found->second.lights, count, frame);
     return;
   }
 
@@ -2212,15 +2236,24 @@ void ResolveLightRun(uint64_t frame, uint32_t &offset, uint32_t &count) {
     return;
   }
   auto *lights = static_cast<vulkan::GpuLight *>(alloc.mapped);
+  LightRun run;
   uint32_t written = 0;
   for (uint32_t i = 0; i < kLights; ++i) {
     if ((mask & (1u << i)) != 0) {
-      StoreLight(lights[written++], State.lights[i]);
+      // Into the local copy first and then into the scratch: the scratch is host-visible memory
+      // the GPU reads and this side never does, so building the value here is what keeps the
+      // census off a read of it.
+      StoreLight(run.lights[written], State.lights[i], frame);
+      lights[written] = run.lights[written];
+      ++written;
     }
   }
   offset = alloc.offset;
   count = written;
-  LightRunByMask[mask] = LightRun{offset, written};
+  run.offset = offset;
+  run.count = written;
+  LightRunByMask[mask] = run;
+  NoteLightRun(run.lights, written, frame);
 }
 
 // Builds this draw's GpuDrawRecord and points the item at it. False means the frame's record

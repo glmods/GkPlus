@@ -2306,10 +2306,12 @@ declare module "gk" {
     /** Substitute on every lit draw rather than only the map geometry. Off, and the
      *  default is a measurement -- see `map_lighting`. */
     map_lighting_all: boolean;
-    /** The model's one free parameter. Default 1.2, the mean of the values fitted per
-     *  level (0.9 on level01, 1.35 on level04 and level05) -- so it is a lever rather
-     *  than a calibration. On level04 the on-screen difference from the bake
-     *  minimises at exactly the fitted 1.35. */
+    /** The model's one free parameter. Default 1.35, the mean of the values fitted per
+     *  level (1.1 on level01, 1.5 on level04 and level05) -- so it is a lever rather
+     *  than a calibration.
+     *
+     *  It moved from 1.2 when the falloff's tail was windowed to kill the visible rim
+     *  around every light, and had to: a dimmer tail refits to a brighter gain. */
     map_light_gain: number;
     /** Which `.rif` the lights came from, how many, the ambient floor, and their world
      *  bounds beside the map's own -- which is the reading that says the unit scale
@@ -2469,6 +2471,179 @@ declare module "gk" {
       width?: number,
       height?: number
     ): string;
+
+    /** A real shadow map from the sun - the first shadow in Gunlok that is not a
+     *  blob under a unit. Four concentric cascades in one 2x2 atlas of 2048
+     *  tiles, centred on the camera's orbit pivot, 3x3 PCF.
+     *
+     *  On by default. A level with no sun set produces no matrix and therefore
+     *  no shadow, which from the screen is the same as this being off -
+     *  `render.draws` is what tells the two apart. */
+    sun_shadows: boolean;
+
+    /** How many of the four cascades are live, 1..4.
+     *
+     *  **1 is the single map this started as**, at the same texel density, which
+     *  is what makes cascading A/B-able on one paused frame. Each cascade is half
+     *  the extent of the one outside it, so four of them put the near field at
+     *  0.0085 world units per texel against a single map's 0.068 - and cost about
+     *  1.7 ms, since the caster list is walked once per cascade. */
+    shadow_cascades: number;
+
+    /** The sun shadow's depth offset, **in shadow-map texels of whichever cascade
+     *  the fragment landed in**.
+     *
+     *  Texels rather than depth units because that is the unit acne is measured
+     *  in: the depth error a flat surface accumulates across one texel is the
+     *  texel's world size times the surface's slope in light space. So one value
+     *  holds on every cascade, on every level and at every `shadow_extent`, which
+     *  a value in depth units does not.
+     *
+     *  2.5 by default, which is the knee of a sweep rather than a guess. Below it
+     *  level04 shadows itself everywhere; above it the shadow shrinks away from
+     *  its caster at 0.04-0.3% of the frame per texel. */
+    shadow_bias: number;
+
+    /** How dark a sun-shadowed fragment goes, 0 to 1. **The one knob here that is
+     *  not a fidelity question**, because the game never had a real shadow and so
+     *  has no ground truth for it.
+     *
+     *  1 is the physically correct value rather than the maximum one: the shadow
+     *  attenuates only the diffuse and specular terms, so 1 means "no sunlight
+     *  reaches here" while the ambient and the level's own baked colour still
+     *  light the surface. 0.7 is the default, and both bounds are measured -
+     *  0.55 leaves level04's unit shadows reading as a smudge, and 1.0 takes
+     *  level02's covered start to 36% of its authored brightness. */
+    shadow_strength: number;
+
+    /** Half the width of the box the **outermost** cascade covers, in world
+     *  units, centred on the camera's orbit pivot. So this is the range at which
+     *  shadows stop, and `extent / 2^(cascades-1)` is the sharp near field.
+     *
+     *  70 by default, which is Gunlok's own `camera.max_distance` of 75 rounded
+     *  down: it covers everything the camera can ever see. Raising it to 200 buys
+     *  0.2% of the frame. */
+    shadow_extent: number;
+
+    /** Draw the game's **own** blob shadow as well as the sun's map. Off by
+     *  default, since otherwise a unit carries both.
+     *
+     *  Its three passes are identified by stencil being enabled, which is exact
+     *  rather than a heuristic: over sixteen shipped levels the game draws with
+     *  22 distinct pipeline configurations, exactly 3 of them use stencil, and
+     *  all 3 are that shadow. A level someone else writes is not covered by that,
+     *  which is what this exists to check. */
+    stencil_shadow: boolean;
+
+    /** Real shadows for the level's own `STDLIGHT` rig - one six-face cube per
+     *  light in a 32 MB atlas, baked once per level from the map's own geometry.
+     *
+     *  **On, and play is what settled it.** It shipped off because no measurement
+     *  could say whether the picture with these shadows was the right one - the
+     *  game never had them - and then the first report from actually playing was
+     *  that the map lights do not cast any. Cost was never the objection: 0.50 ms
+     *  on level01, the level with the most map lights in the game, and nothing
+     *  measurable on level02.
+     *
+     *  Needs `map_lighting`, which is what evaluates that rig at all. The bake is
+     *  gated on this too, so off costs nothing; turning it back on restarts it,
+     *  and `map_shadow_report` says when it has finished. */
+    map_shadows: boolean;
+
+    /** How far a map-light shadow lookup is moved along the surface normal
+     *  before it is projected, in atlas texels at that fragment's own distance
+     *  from the light.
+     *
+     *  A **normal** offset rather than a depth one because a 64-texel cube face
+     *  is coarse - a texel is `distance / 32` world units - so the error is
+     *  dominated by the surface's slope, and a depth offset large enough to
+     *  cancel it would detach every shadow by metres. 1.0 by default, the larger
+     *  of two knees: level02's acne is gone by 0.25 and level04's needs about 1.
+     *
+     *  **`= 0` is the sharpest picture of what the atlas holds** - per-light acne
+     *  with cube-face stair-stepping and coloured fringes, one colour per light. */
+    map_shadow_bias: number;
+
+    /** How many map lights the bake does per frame, picking up where it left off.
+     *
+     *  256 with indirect drawing and 4 without, taken from the path at startup.
+     *  With one indirect command a face the whole bake is a few milliseconds, so
+     *  level01's 682 lights land in three frames; the fallback issues a draw call
+     *  per caster per face and wants spreading. Writing this **re-bakes from the
+     *  start**, so only write it when it has actually changed. */
+    map_shadow_rate: number;
+
+    /** Whether the bake submits one `vkCmdDrawIndexedIndirect` per cube face or a
+     *  draw call per caster per face - 4,092 commands against 804,924 on level01.
+     *
+     *  On wherever the device has `multiDrawIndirect`. **The two must produce the
+     *  same atlas and this is the only thing that can say so**, so writing it
+     *  rebuilds the pipeline and re-bakes; on a device without the feature it
+     *  does nothing and reads back false. */
+    map_shadow_indirect: boolean;
+
+    /** What the map-light shadow atlas holds, what it refused for want of a slot,
+     *  and how far the bake has got.
+     *
+     *  Not optional reading: a level with no map lights, an atlas that could not
+     *  be created and a bake that has not finished all look identical from the
+     *  screen. */
+    readonly map_shadow_report: string;
+
+    /** Shadows from **the game's own D3D point and spot lights** - level02's fires,
+     *  and anything a `.gcs` adds with `ADD LIGHT`. A different light system from
+     *  `map_shadows` above, sharing the same static atlas: sixteen of its 682
+     *  slots are reserved for these.
+     *
+     *  On. It is affordable because a LEVEL's own local lights are few and do not
+     *  move - five on level02's start, twelve at its fire camera, four on level04,
+     *  none on prison - so a cube per light is baked once and sampled behind the
+     *  same range, `N·L` and cone rejections the map lights' lookup sits behind.
+     *  Nothing measurable on level02.
+     *
+     *  **An effect's light is a different animal and gets nothing.** An explosion's
+     *  light rides a particle, so it moves every frame, never survives the gate
+     *  below and never casts - one `fx.explode` in view leaves ~30 distinct
+     *  contents behind. Effects are also where the game's only spot lights come
+     *  from.
+     *
+     *  **A light that moves gets no shadow rather than a wrong one.** A D3D light
+     *  has no identity across frames, so a slot is held under a key made of the
+     *  light's position, range and cone - deliberately not its colour, since
+     *  `ADD BLINKING LIGHT` rewrites exactly that - and a key must survive four
+     *  frames before it claims one. A light on a track, or a mod's light on a
+     *  projectile, therefore never claims a slot and costs nothing. */
+    local_shadows: boolean;
+
+    /** What the local half of that atlas holds: keys live, how many hold a baked
+     *  cube, how many are still moving, and how many held still but found no free
+     *  slot.
+     *
+     *  Not optional reading, and the pair to read is `waiting out the stability
+     *  gate` against `held still but found no free slot`. The first is the feature
+     *  working - a light that moves lives there permanently - and only the second
+     *  is a limit. */
+    readonly local_shadow_report: string;
+
+    /** Whether D3D's point and spot lights are in the light sum at all. On.
+     *
+     *  **A diagnostic, and the one that prices `local_shadows`**: off drops them
+     *  and keeps the directionals, so a paused A/B paints exactly the pixels they
+     *  reach - and since a shadow only ever removes light, that set strictly
+     *  contains anything shadowing them could change. It measures 0.75% of
+     *  level02's settled start, 2.34% at its fire camera and 0.63% on level04,
+     *  against the sun's 17%. */
+    local_lights: boolean;
+
+    /** The last complete frame's D3D lights, deduplicated by **contents**, with how
+     *  many draws each reached and how many frames it has survived.
+     *
+     *  A `GpuLight` is deduplicated by enable mask within a frame and carries no
+     *  identity across one, so "how many distinct point lights does a frame have"
+     *  was otherwise unanswerable. Read `distinct this frame` against `distinct
+     *  over the session`: a rig that never moves makes the second converge on the
+     *  first, and one the game re-authors leaves a new key behind every frame. */
+    readonly frame_lights: string;
 
     [key: string]: any;
   }
