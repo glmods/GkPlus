@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <set>
 #include <tuple>
 #include <vector>
@@ -219,6 +220,33 @@ uint32_t ScratchSlice = 0;
 // buffers are allocated, submitted once and freed.
 VkCommandPool UploadPool = VK_NULL_HANDLE;
 VkFence UploadFence = VK_NULL_HANDLE;
+
+// Serializes every mutation of this module's state - the two arenas, the staging ring, the two
+// pending batches and the image registry. All of it is process-global, and the header used to
+// promise it was only ever reached from the main thread.
+//
+// It is not. The **executor thread locks and unlocks vertex buffers too**, measured off a hung
+// build: `CaptureVertexBuffer::Unlock` -> UploadIntoSlot -> NoteDestination ran on the executor
+// while the main thread was in the same game-side buffer path. D3D's critical section is
+// per-buffer, so two threads working on two different buffers reach the shared state here at
+// once. Unsynchronized that corrupted `PendingDstRanges`' red-black tree, and the next
+// `emplace` walked a cycle in it at 100% CPU **while still holding D3D's section for its own
+// buffer** - so the main thread blocked on that section forever. A livelock, not a fault: no
+// exception is ever raised, so no crash handler can catch it and the game simply stops
+// responding with one core pegged.
+//
+// **Recursive on purpose.** This is retrofitted onto a module written single-threaded, and its
+// entry points already call one another - UploadIntoSlot and UploadIntoTextureImage both reach
+// FlushPendingNow through AllocateStaging, and FlushUploads calls it directly. A plain mutex
+// would turn each of those into a self-deadlock, which is a worse hang than the one being fixed.
+//
+// **The lock order is one-way and must stay that way.** The game takes D3D's per-buffer section
+// and then calls in here, so [D3D section] -> [ResourceLock] is the only order that exists
+// today. Nothing in this file may call back out into the game, or into a wrapped D3D object,
+// while holding it - that would create the inverse order and deadlock the two against each
+// other.
+std::recursive_mutex ResourceLock;
+using ResourceGuard = std::lock_guard<std::recursive_mutex>;
 
 struct PendingCopy {
   VkBuffer dst = VK_NULL_HANDLE;
@@ -547,7 +575,10 @@ void WaitForLiveFrames() {
     return;
   }
   const uint64_t started = NowMicros();
-  vkDeviceWaitIdle(GetDevice());
+  {
+    QueueGuard queue_guard(QueueMutex());
+    vkDeviceWaitIdle(GetDevice());
+  }
   for (bool &live : Ring.frame_live) {
     live = false;
   }
@@ -1017,6 +1048,7 @@ bool StartResources() {
 bool ResourcesReady() { return Ready; }
 
 BufferSlot AllocateSlot(uint32_t bytes, bool vertex) {
+  ResourceGuard guard(ResourceLock);
   BufferSlot slot;
   if (!Ready || bytes == 0) {
     return slot;
@@ -1035,6 +1067,7 @@ BufferSlot AllocateSlot(uint32_t bytes, bool vertex) {
 }
 
 void FreeSlot(const BufferSlot &slot) {
+  ResourceGuard guard(ResourceLock);
   if (!Ready || !slot.valid) {
     return;
   }
@@ -1082,6 +1115,7 @@ bool NoteDestination(bool vertex, VkDeviceSize offset, VkDeviceSize bytes) {
 
 bool UploadIntoSlot(const BufferSlot &slot, uint32_t offset_in_slot, const void *data,
                     uint32_t bytes) {
+  ResourceGuard guard(ResourceLock);
   if (!Ready || !slot.valid || data == nullptr || bytes == 0) {
     return false;
   }
@@ -1127,6 +1161,7 @@ bool TextureFormatBlock(uint32_t d3d_format, uint32_t &block, uint32_t &block_by
 
 bool CreateTextureImage(TextureImage &image, uint32_t width, uint32_t height, uint32_t levels,
                         uint32_t d3d_format) {
+  ResourceGuard guard(ResourceLock);
   image = TextureImage();
   FormatMapping mapping;
   if (!Ready || width == 0 || height == 0) {
@@ -1224,6 +1259,7 @@ bool CreateTextureImage(TextureImage &image, uint32_t width, uint32_t height, ui
 }
 
 void DestroyTextureImage(TextureImage &image) {
+  ResourceGuard guard(ResourceLock);
   if (!Ready || !image.valid || image.index >= Images.size()) {
     image = TextureImage();
     return;
@@ -1233,7 +1269,10 @@ void DestroyTextureImage(TextureImage &image) {
     // The image may still be referenced by a copy this frame recorded but has not submitted,
     // and by the frame in flight before it. Waiting is heavy-handed but this happens at level
     // teardown, not per frame - level01 destroys 65 images in one burst and then none.
-    vkDeviceWaitIdle(GetDevice());
+    {
+      QueueGuard queue_guard(QueueMutex());
+      vkDeviceWaitIdle(GetDevice());
+    }
     // Anything still queued for this image would now write a destroyed handle.
     for (size_t i = PendingImages.size(); i-- > 0;) {
       if (PendingImages[i].index == image.index) {
@@ -1259,6 +1298,7 @@ void DestroyTextureImage(TextureImage &image) {
 
 uint32_t AcquireSampler(uint32_t mag_filter, uint32_t min_filter, uint32_t mip_filter,
                         uint32_t address_u, uint32_t address_v) {
+  ResourceGuard guard(ResourceLock);
   const SamplerKey key{mag_filter, min_filter, mip_filter, address_u, address_v};
   const auto found = SamplerIndices.find(key);
   if (found != SamplerIndices.end()) {
@@ -1327,6 +1367,8 @@ uint32_t MippedSamplerFor(uint32_t sampler_index) {
 }
 
 void RotateFrameScratch() {
+  // Rewrites base/head for all seven slices; AllocateScratch reads both. See the note there.
+  ResourceGuard guard(ResourceLock);
   if (!Ready) {
     return;
   }
@@ -1340,6 +1382,7 @@ void RotateFrameScratch() {
 }
 
 void ResetFrameScratch() {
+  ResourceGuard guard(ResourceLock); // see RotateFrameScratch
   if (!Ready) {
     return;
   }
@@ -1356,6 +1399,19 @@ namespace {
 // offset can be in elements - which is what both a vertex index and a first-index want.
 ScratchAlloc AllocateScratch(Scratch &scratch, uint32_t count, uint32_t element,
                              uint64_t &peak) {
+  // Guarded HERE rather than in the seven public wrappers, which is the one place in this file
+  // that departs from "public entry points lock, internals assume held": this is the single
+  // choke point all seven pass through, so one guard covers them and an eighth allocator added
+  // later gets it for free. The lock is recursive, so a wrapper that also took it would be fine.
+  //
+  // It needs a lock at all because "the draw path is main-thread only" is false, which is the
+  // same premise section 4.72 removed and section 4.73 removed again: `UploadVersionToScratch`
+  // (D3D8CaptureInternal.h) calls AllocateScratchVertices/Indices from `UploadLocked`, which was
+  // measured on the executor thread. Every other caller really is main-thread draw path.
+  // Unguarded, the read-modify-write of `scratch.head` below (read at the align, stored after)
+  // hands two threads the SAME region: each writes its own vertices over the other's and both
+  // draws read a blend of the two, with `scratch_exhausted` still reading 0.
+  ResourceGuard guard(ResourceLock);
   ScratchAlloc out;
   if (!Ready || scratch.mapped == nullptr || count == 0) {
     return out;
@@ -1554,6 +1610,7 @@ uint64_t BindlessDescriptorSetLayout() {
 }
 
 void NameTextureImage(const TextureImage &image, const std::string &name) {
+  ResourceGuard guard(ResourceLock);
   if (Ready && image.valid && image.index < Images.size() && Images[image.index].live) {
     Images[image.index].name = name;
     ++ImageRegistryGeneration;
@@ -1585,6 +1642,7 @@ std::vector<TextureImageInfo> TextureImages() {
 bool UploadIntoTextureImage(const TextureImage &image, uint32_t level, int32_t x, int32_t y,
                             uint32_t width, uint32_t height, const void *data,
                             uint32_t pitch) {
+  ResourceGuard guard(ResourceLock);
   if (!Ready || !image.valid || image.index >= Images.size() || data == nullptr ||
       width == 0 || height == 0) {
     return false;
@@ -1643,6 +1701,7 @@ bool UploadIntoTextureImage(const TextureImage &image, uint32_t level, int32_t x
 }
 
 void FlushUploads() {
+  ResourceGuard guard(ResourceLock);
   if (Ready) {
     FlushPendingNow();
   }
@@ -1736,7 +1795,7 @@ bool VerifyImageLevel(const TextureImage &image, uint32_t level, const void *dat
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd;
     vkResetFences(GetDevice(), 1, &UploadFence);
-    if (vkQueueSubmit(GetGraphicsQueue(), 1, &submit, UploadFence) == VK_SUCCESS) {
+    if (SubmitToQueue(submit, UploadFence) == VK_SUCCESS) {
       vkWaitForFences(GetDevice(), 1, &UploadFence, VK_TRUE, UINT64_MAX);
       std::vector<uint8_t> expected(static_cast<size_t>(total));
       PackLevel(map, data, pitch, blocks_across, rows, expected.data());
@@ -1823,7 +1882,7 @@ bool CopyOutOfArena(bool vertex, uint64_t offset, uint32_t bytes, void *out) {
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd;
     vkResetFences(GetDevice(), 1, &UploadFence);
-    if (vkQueueSubmit(GetGraphicsQueue(), 1, &submit, UploadFence) == VK_SUCCESS) {
+    if (SubmitToQueue(submit, UploadFence) == VK_SUCCESS) {
       vkWaitForFences(GetDevice(), 1, &UploadFence, VK_TRUE, UINT64_MAX);
       std::memcpy(out, readback_info.pMappedData, bytes);
       ok = true;
@@ -1884,7 +1943,7 @@ bool VerifySlot(const BufferSlot &slot, const void *expected, uint32_t bytes,
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd;
     vkResetFences(GetDevice(), 1, &UploadFence);
-    if (vkQueueSubmit(GetGraphicsQueue(), 1, &submit, UploadFence) == VK_SUCCESS) {
+    if (SubmitToQueue(submit, UploadFence) == VK_SUCCESS) {
       vkWaitForFences(GetDevice(), 1, &UploadFence, VK_TRUE, UINT64_MAX);
       const auto *got = static_cast<const uint8_t *>(readback_info.pMappedData);
       const auto *want = static_cast<const uint8_t *>(expected);
@@ -1925,6 +1984,7 @@ bool VerifySlot(const BufferSlot &slot, const void *expected, uint32_t bytes,
 const std::string &StagingWatchLog() { return WatchLog; }
 
 void RecordUploads(void *command_buffer, uint32_t frame_index) {
+  ResourceGuard guard(ResourceLock);
   if (!Ready || (Pending.empty() && PendingImages.empty())) {
     return;
   }
@@ -1937,6 +1997,7 @@ void RecordUploads(void *command_buffer, uint32_t frame_index) {
 }
 
 void ReleaseFrameStaging(uint32_t frame_index) {
+  ResourceGuard guard(ResourceLock);
   // Called once the renderer has waited on this slot's fence, so everything it staged has been
   // read and the ring may hand those bytes back.
   if (Ready && frame_index < kFramesInFlight) {
@@ -2113,7 +2174,7 @@ bool FlushPendingNow() {
   submit.pCommandBuffers = &cmd;
   vkResetFences(GetDevice(), 1, &UploadFence);
   const bool ok =
-      vkQueueSubmit(GetGraphicsQueue(), 1, &submit, UploadFence) == VK_SUCCESS;
+      SubmitToQueue(submit, UploadFence) == VK_SUCCESS;
   if (ok) {
     vkWaitForFences(GetDevice(), 1, &UploadFence, VK_TRUE, UINT64_MAX);
   }
@@ -2232,7 +2293,10 @@ void ShutdownResources() {
   if (Allocator == VK_NULL_HANDLE) {
     return;
   }
-  vkDeviceWaitIdle(GetDevice());
+  {
+    QueueGuard queue_guard(QueueMutex());
+    vkDeviceWaitIdle(GetDevice());
+  }
   Pending.clear();
   PendingImages.clear();
   PendingImageLevels.clear();

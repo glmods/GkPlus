@@ -25,6 +25,7 @@
 // take those definitions with it.
 
 #include <cstdint>
+#include <atomic>
 #include <map>
 #include <set>
 #include <string>
@@ -36,8 +37,14 @@ struct IDirect3DDevice9;
 namespace gk {
 namespace d3d8 {
 
-// What Phase 0b is measuring. Everything here is main-thread (the renderer does no work on
-// the executor thread), so none of it is synchronised.
+// What Phase 0b is measuring.
+//
+// This used to say "everything here is main-thread (the renderer does no work on the executor
+// thread), so none of it is synchronised". The parenthesis is false and was never checked -
+// the executor creates, locks and releases vertex buffers, which is what
+// vulkan_renderer_notes.md sections 4.72 and 4.73 are about. The counters are raced and stay
+// that way deliberately; see the note on the four `live_*` fields for where the line is drawn
+// and why. What is NOT left racy is any *container* on that path - see CaptureDiagLock.
 struct CaptureStats {
   // Per-draw observations. The FVF set is what decides whether the "one canonical vertex
   // format" simplification in vulkan_renderer_notes.md section 2 is safe.
@@ -82,10 +89,20 @@ struct CaptureStats {
   // The number that sizes the Vulkan vertex/index arenas, and the reason the buffer objects
   // are wrapped at all: creation is visible from CreateVertexBuffer, but only Release
   // reaching zero says when it stops being live.
-  uint64_t live_vertex_buffers = 0;
-  uint64_t live_index_buffers = 0;
-  uint64_t live_vertex_bytes = 0;
-  uint64_t live_index_bytes = 0;
+  // **Atomic, unlike every other counter here**, and the difference is not fussiness. The
+  // executor thread creates and releases vertex buffers (vulkan_renderer_notes.md section 4.73),
+  // so these four are incremented in the wrapper constructor and DECREMENTED in its destructor
+  // from two threads. Every other field in this struct only ever goes up, its high dword stays
+  // zero for a session, and a lost increment costs one count in a diagnostic nothing reads to
+  // decide anything - so they are deliberately left plain. A lost *decrement* is different: it
+  // never comes back, it accumulates for the whole session, and what it corrupts is the
+  // residency figure section 4.8 sized the arenas from.
+  //
+  // Relaxed ordering is right - these order nothing, they only need to not lose an update.
+  std::atomic<uint64_t> live_vertex_buffers{0};
+  std::atomic<uint64_t> live_index_buffers{0};
+  std::atomic<uint64_t> live_vertex_bytes{0};
+  std::atomic<uint64_t> live_index_bytes{0};
   uint64_t peak_live_vertex_bytes = 0;
   uint64_t peak_live_index_bytes = 0;
   uint64_t peak_live_buffers = 0;

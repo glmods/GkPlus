@@ -203,6 +203,18 @@ Cheats *GetCheats() {
   return p;
 }
 
+void SuspendExecutor() {
+  StdCall<void> f;
+  GetObjectAtOffset(f, 0x00505290);
+  f();
+}
+
+void ResumeExecutor() {
+  StdCall<void> f;
+  GetObjectAtOffset(f, 0x005052d0);
+  f();
+}
+
 const char *GameModeName(int mode) {
   static constexpr std::array<const char *, 6> names = {
       "single_player", "cooperative", "last_man_standing",

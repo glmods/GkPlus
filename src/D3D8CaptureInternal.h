@@ -22,7 +22,9 @@
 
 #include <d3d8to9.hpp>
 
+#include <atomic>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -119,6 +121,20 @@ extern std::vector<std::string> OutOfRangeDraws;
 extern std::vector<std::string> RefusedDraws;
 extern std::map<uint64_t, uint64_t> UnslottedVertexBuffers;
 extern std::map<uint64_t, uint64_t> RewriteLocks;
+
+// Guards the diagnostic CONTAINERS that a hook on the executor-reachable path mutates -
+// currently `RewriteLocks`, written by NoteRewrite from BufferWrapper::UploadLocked and read by
+// the report TU's histogram walk.
+//
+// Deliberately NOT extended to the scalar counters in `TheStats`. Those are also raced, and are
+// left that way on purpose: each is a monotonically increasing uint64_t whose high dword stays
+// zero for a session, so a lost increment costs a count in a diagnostic and nothing reads one to
+// decide anything. A container is different in kind - losing an insert is not the failure, the
+// tree corrupting is. The four `live_*` fields are the exception among the scalars and are
+// atomic, because they are the only ones DECREMENTED: a lost decrement accumulates for the whole
+// session and skews the residency figure section 4.8 sized the arenas from.
+inline std::mutex CaptureDiagLock;
+using CaptureDiagGuard = std::lock_guard<std::mutex>;
 
 // `render.ref_range` / `render.ref_hide`: the bisect windows for the runtime this layer
 // FORWARDS to, which is what makes the ORIGINAL bisectable (§4.42).
@@ -401,7 +417,11 @@ template <typename Interface> struct Wrapper : Interface {
   Interface *inner_ = nullptr;
 
 private:
-  ULONG refs_ = 1;
+  // Atomic because a COM refcount must be: the executor thread creates and releases vertex
+  // buffers (see the note above LiveWrapperLock), so a plain `++`/`--` here is a read-modify-write
+  // race whose lost decrement leaks the wrapper and whose lost increment frees it early - a
+  // use-after-free on an object the renderer dereferences every draw.
+  std::atomic<ULONG> refs_{1};
 };
 
 struct CaptureDevice;
@@ -596,9 +616,23 @@ template <typename Interface> struct BufferWrapper : Wrapper<Interface> {
     if (count == 0) {
       return;
     }
-    // One scratch buffer for the process: conversion is main-thread and immediately
-    // consumed by the staging copy, so there is nothing to keep per buffer.
-    static std::vector<vulkan::CanonicalVertex> scratch;
+    // One scratch buffer PER THREAD, kept across calls so the allocation amortizes.
+    //
+    // It was `static` - one for the process - on the reasoning that "conversion is
+    // main-thread". It is not, and this is the same wrong assumption vulkan_renderer_notes.md
+    // section 4.72 removed from VkResources.h, three lines below where it was written: the
+    // executor thread reaches here through CaptureVertexBuffer::Unlock -> UploadLocked, which
+    // is literally the stack that was sampled off the hung build. Shared, the `resize` below
+    // can free the block the other thread is mid-`ConvertVertices` into - a wild write of
+    // sizeof(CanonicalVertex) per vertex through a dangling pointer, on the UCRT heap this DLL
+    // owns rather than the game's pool. And with no reallocation at all the two conversions
+    // simply interleave in one buffer, so each thread stages the other's vertices: wrong
+    // geometry with every counter in TheStats reading clean.
+    //
+    // `ResourceLock` cannot cover this. It is taken inside vulkan::UploadIntoSlot, which is
+    // reached at the END of this function - by then the pointer has already been prepared, and
+    // it is passed in as an argument. The race is entirely upstream of the lock.
+    thread_local std::vector<vulkan::CanonicalVertex> scratch;
     scratch.resize(count);
     if (!vulkan::ConvertVertices(fvf_, locked_, count, scratch.data())) {
       ++TheStats.failed_uploads;
@@ -709,17 +743,73 @@ template <typename Interface> struct BufferWrapper : Wrapper<Interface> {
 
 // Declared before the wrappers so their constructors can register themselves; defined with
 // Unwrap, which is where the reason they exist is written up.
+//
+// **Both game threads mutate these**, which is why they have a lock. The executor thread
+// creates and destroys vertex buffers: a Ghidra reachability closure from ExecutorThreadProc
+// @ 0x00509050 (452 functions) intersected with the 66 functions that reference
+// `direct3d_device` @ 0x007c121c yields exactly one - `VertexBufferSet_Create` @ 0x005a2e40,
+// the sole caller of the device's CreateVertexBuffer - and it is reached as
+// ExecutorThreadProc -> SpawnProjectileActor -> ... -> Renderable_CtorFromShape ->
+// MakeBoxCorners -> SharedVB_AddEntry -> SharedVB_Rebuild, which destroys the old
+// VertexBufferSet before creating the new one. So a `std::set` insert and erase run on the
+// executor while the main thread walks the same tree thousands of times a frame through
+// Unwrap and EmitDraw. That is the exact failure of vulkan_renderer_notes.md section 4.72 -
+// a red-black tree mutated under a walk gives a cycle and a non-terminating lookup, with no
+// exception raised.
+//
+// Recursive for the same reason ResourceLock is: a guarded walk that ends up releasing a
+// wrapper would re-enter through the destructor, and a plain mutex would self-deadlock there.
+// The lock is held only across set operations - never across a call back into D3D or the game.
+inline std::recursive_mutex LiveWrapperLock;
+using LiveWrapperGuard = std::lock_guard<std::recursive_mutex>;
 inline std::set<const void *> LiveVertexWrappers;
 inline std::set<const void *> LiveIndexWrappers;
+
+// The membership test every reader wants, with the lock taken for it. A bare `.count()` on
+// either set from outside this pair of functions is a bug - see the note above.
+inline bool IsLiveVertexWrapper(const void *p) {
+  if (p == nullptr) {
+    return false;
+  }
+  LiveWrapperGuard guard(LiveWrapperLock);
+  return LiveVertexWrappers.count(p) != 0;
+}
+
+inline bool IsLiveIndexWrapper(const void *p) {
+  if (p == nullptr) {
+    return false;
+  }
+  LiveWrapperGuard guard(LiveWrapperLock);
+  return LiveIndexWrappers.count(p) != 0;
+}
+
+// Clears `TheCaptureDevice`'s borrowed `stream0_` / `indices_` if either still names `wrapper`.
+//
+// A free function, and defined in D3D8Capture.cpp, because the wrapper destructors below run
+// before CaptureDevice is a complete type here.
+//
+// The device stores the WRAPPER raw when the game calls SetStreamSource/SetIndices - borrowed,
+// with the device's own reference held on `inner_` instead - and nothing used to clear it when
+// the wrapper died. The executor destroys vertex buffers (see LiveWrapperLock above), so the
+// device could be left naming a freed object that `EmitDraw` then casts and dereferences.
+// `IsLiveVertexWrapper` usually catches it and the draw is skipped, but "usually" is doing real
+// work there: the pointer can also be reused by a NEW wrapper at the same address, which passes
+// the liveness test and draws the wrong geometry. Clearing at the source removes both.
+void ForgetBoundBuffer(const void *wrapper);
 
 struct CaptureVertexBuffer final : BufferWrapper<IDirect3DVertexBuffer8> {
   CaptureVertexBuffer(IDirect3DVertexBuffer8 *inner, uint32_t length, uint32_t fvf,
                       uint32_t pool)
       : BufferWrapper(inner, length, true, fvf) {
     pool_ = pool;
+    LiveWrapperGuard guard(LiveWrapperLock);
     LiveVertexWrappers.insert(this);
   }
-  ~CaptureVertexBuffer() override { LiveVertexWrappers.erase(this); }
+  ~CaptureVertexBuffer() override {
+    ForgetBoundBuffer(this);
+    LiveWrapperGuard guard(LiveWrapperLock);
+    LiveVertexWrappers.erase(this);
+  }
 
   HRESULT LockForRead(BYTE **data) override {
     return inner_->Lock(0, 0, data, D3DLOCK_READONLY);
@@ -741,9 +831,14 @@ struct CaptureIndexBuffer final : BufferWrapper<IDirect3DIndexBuffer8> {
       : BufferWrapper(inner, length, false, 0) {
     index_stride_ = format == 102 ? 4 : 2;
     pool_ = pool;
+    LiveWrapperGuard guard(LiveWrapperLock);
     LiveIndexWrappers.insert(this);
   }
-  ~CaptureIndexBuffer() override { LiveIndexWrappers.erase(this); }
+  ~CaptureIndexBuffer() override {
+    ForgetBoundBuffer(this);
+    LiveWrapperGuard guard(LiveWrapperLock);
+    LiveIndexWrappers.erase(this);
+  }
 
   HRESULT LockForRead(BYTE **data) override {
     return inner_->Lock(0, 0, data, D3DLOCK_READONLY);

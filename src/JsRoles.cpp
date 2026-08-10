@@ -2,6 +2,7 @@
 
 #include "Actors.h"
 #include "JsBindings.h"
+#include "Misc.h"
 
 #include <cstdio>
 #include <iterator>
@@ -491,8 +492,16 @@ JSValue RoleSpawn(JSContext *ctx, JSValueConst self, int argc,
     return JS_EXCEPTION;
   }
 
-  int id = SpawnRole(team, r, &position, &orientation, owner);
-  Actor *spawned = GetActorById(id);
+  // Spawning inserts into the actors hash the executor is walking; the lookup that
+  // follows walks it too. See gk::ExecutorPause in Misc.h - this is what the engine's
+  // own CommandGiveRole @ 0x00449d40 does around exactly this pair of operations.
+  int id;
+  Actor *spawned;
+  {
+    ExecutorPause pause;
+    id = SpawnRole(team, r, &position, &orientation, owner);
+    spawned = GetActorById(id);
+  }
   return spawned ? NewActorWrapper(ctx, spawned) : JS_NULL;
 }
 

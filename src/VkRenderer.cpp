@@ -371,7 +371,10 @@ bool ReconcileRenderTarget() {
       want.height == RenderExtent.height) {
     return true;
   }
-  vkDeviceWaitIdle(GetDevice());
+  {
+    QueueGuard queue_guard(QueueMutex());
+    vkDeviceWaitIdle(GetDevice());
+  }
   RenderExtent = want;
   if (want_offscreen) {
     if (!CreateOffscreen(want)) {
@@ -872,7 +875,10 @@ void DrawFrame() {
   submit.pCommandBufferInfos = &cmd;
   submit.signalSemaphoreInfoCount = 1;
   submit.pSignalSemaphoreInfos = &signal;
-  vkQueueSubmit2(GetGraphicsQueue(), 1, &submit, frame.in_flight);
+  {
+    QueueGuard queue_guard(QueueMutex());
+    vkQueueSubmit2(GetGraphicsQueue(), 1, &submit, frame.in_flight);
+  }
 
   VkPresentInfoKHR present = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
   present.waitSemaphoreCount = 1;
@@ -881,7 +887,14 @@ void DrawFrame() {
   present.pSwapchains = &Swapchain;
   present.pImageIndices = &image_index;
 
-  const VkResult presented = vkQueuePresentKHR(GetGraphicsQueue(), &present);
+  // Separate scope from the submit above rather than one spanning both: the present already
+  // waits on RenderFinished, so an upload submitted between the two is harmless, and a shorter
+  // hold keeps the executor's staging path from queueing behind a whole present.
+  VkResult presented;
+  {
+    QueueGuard queue_guard(QueueMutex());
+    presented = vkQueuePresentKHR(GetGraphicsQueue(), &present);
+  }
   // After present, so the capture contains a complete frame from acquire to present rather
   // than one that stops short of the thing RenderDoc uses to delimit them.
   EndFrameCaptureIfArmed();
@@ -902,7 +915,10 @@ void ShutdownRenderer() {
   if (GetDevice() == VK_NULL_HANDLE) {
     return;
   }
-  vkDeviceWaitIdle(GetDevice());
+  {
+    QueueGuard queue_guard(QueueMutex());
+    vkDeviceWaitIdle(GetDevice());
+  }
   // Before ShutdownResources: the pipeline layout references the bindless set layout that
   // owns, and destroying a layout still referenced by a live pipeline is undefined.
   ShutdownDraw();

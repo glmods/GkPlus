@@ -1,6 +1,7 @@
 #include "Actors.h"
 
 #include "JsBindings.h"
+#include "Misc.h"
 #include "Roles.h"
 #include "ScriptQueue.h"
 #include "Tokens.h"
@@ -27,11 +28,12 @@ namespace {
 // subclass-only. `a instanceof actors.classes.MobileActor` works too.
 //
 // What it does NOT buy is safety. The prototype is chosen once, at wrap time,
-// from what the pointer pointed at then; the wrapper holds a raw pointer into
-// pool memory the game can free and recycle underneath us, and a recycled
-// pointer can land on a different subclass. So the checked downcasts further
-// down still re-run the RTTI predicate on every call. The chain is ergonomics
-// and documentation; the downcast is the guard.
+// from what the pointer pointed at then, and the actor it was chosen for can be
+// destroyed by the executor at any moment afterwards. `Resolve` is what makes
+// that survivable - it re-derives from the id on every access and refuses a
+// destroyed or id-reused actor - but it cannot re-pick a prototype, so the
+// checked downcasts further down still re-run the RTTI predicate on every call.
+// The chain is ergonomics and documentation; the downcast is the guard.
 
 enum ActorClassIndex {
   ActorClassIndex_Actor,
@@ -73,16 +75,20 @@ const char *const ActorKindNames[ActorClassIndex_Count] = {
 JSClassID ActorClassIds[ActorClassIndex_Count];
 JSClassID ActorsClassId;
 
-// The wrapper holds the raw Actor*, per the design decision. `id` is a snapshot
-// taken at wrap time and is never read back through `ptr`, which is what makes
-// `valid` safe to ask on a wrapper whose actor is already gone: it consults our
-// own copy of the id and the actor hash, never the actor itself.
+// `id` is the identity; `ptr` is only a cache of the last lookup.
 //
-// The trade-off this accepts: every other accessor dereferences `ptr` directly.
-// The game frees actors (slots 64/65, and wholesale on level unload) with no
-// notification, and pool_free recycles the page (Memory.h), so a wrapper kept
-// across frames can end up aliasing an unrelated object. frag()/remove() null
-// `ptr` because those are the two destructions we can actually see.
+// It used to be the other way round - `ptr` was the identity and every accessor
+// dereferenced it - and that was a use-after-free, not merely a stale read. The
+// **executor thread** frees actors (slots 64/65, and wholesale on level unload)
+// with no notification, and `pool_free` recycles the page (Memory.h), so a
+// wrapper a script held across a single frame could be pointing at an unrelated
+// object of a different class by the time the next property was read. Nulling
+// `ptr` in frag()/remove() covered only the two destructions initiated from JS,
+// which are the two that were never the problem.
+//
+// So `Resolve` re-derives from the id on every access (see below). Keeping the
+// pointer at all is worth it for one thing: it is the evidence that the id has
+// not been *reused*, which the id alone cannot tell you.
 struct ActorWrapper {
   Actor *ptr;
   int id;
@@ -126,6 +132,22 @@ ActorWrapper *WrapperOf(JSContext *ctx, JSValueConst self) {
   return static_cast<ActorWrapper *>(opaque);
 }
 
+// Re-derives the actor from its id on EVERY access, rather than handing back the
+// pointer captured at wrap time.
+//
+// This is the whole safety property of the binding. `GetActorById` consults the
+// game's live actors hash, so an actor the executor destroyed resolves to null
+// and the script gets a TypeError - where before it got a dereference of a
+// recycled pool page. The cost is a hash lookup per property read, which is
+// nothing next to the JS call around it.
+//
+// Residual risk, stated rather than hidden: the lookup walks a bucket chain the
+// executor can be relinking at that instant, so a single access is narrowed from
+// "reads freed memory" to "may read a chain mid-relink". Closing that too would
+// mean an ExecutorPause per property read - a thread round trip each time, which
+// would make iterating a level's actors from the REPL unusable. The bulk paths
+// that CAN afford it (CollectActorKeys/CountActors) take one, and the mutating
+// ones take one, so what is left uncovered is the single-field read.
 Actor *Resolve(JSContext *ctx, JSValueConst self) {
   ActorWrapper *w = WrapperOf(ctx, self);
   if (!w) {
@@ -135,7 +157,24 @@ Actor *Resolve(JSContext *ctx, JSValueConst self) {
     JS_ThrowTypeError(ctx, "actor %d has been destroyed", w->id);
     return nullptr;
   }
-  return w->ptr;
+  Actor *const live = GetActorById(w->id);
+  if (!live) {
+    // Gone. Latch it so a later access says the same thing without another
+    // lookup, and so `valid` keeps answering off our own copy of the id.
+    w->ptr = nullptr;
+    JS_ThrowTypeError(ctx, "actor %d has been destroyed", w->id);
+    return nullptr;
+  }
+  if (live != w->ptr) {
+    // The id resolves, but to a different object than the one this wrapper was
+    // made from: the id was recycled onto a new actor. Refusing is the honest
+    // answer - silently retargeting would let a script that captured a corpse
+    // start driving whatever inherited its id.
+    w->ptr = nullptr;
+    JS_ThrowTypeError(ctx, "actor %d has been destroyed (its id was reused)", w->id);
+    return nullptr;
+  }
+  return live;
 }
 
 // The manual-RTTI slots 36-50 are inherited, so IsMobile() is true for a turret
@@ -471,7 +510,13 @@ JSValue ActorFrag(JSContext *ctx, JSValueConst self, int, JSValueConst *) {
   if (!a) {
     return JS_EXCEPTION;
   }
-  a->Frag(); // slot 64
+  {
+    // Destroying an actor from the main thread while the simulation is live is exactly
+    // what the engine's own Command* handlers bracket in this handshake - the executor is
+    // mid-tick over the same actors table and the same pool pages.
+    ExecutorPause pause;
+    a->Frag(); // slot 64
+  }
   w->ptr = nullptr;
   return JS_UNDEFINED;
 }
@@ -484,7 +529,10 @@ JSValue ActorRemove(JSContext *ctx, JSValueConst self, int, JSValueConst *) {
   }
   // The flag gates the 0x49 broadcast; every game call site passes 1, and a
   // removal the other players never hear about is not what remove() means.
-  a->Delete(true); // slot 65
+  {
+    ExecutorPause pause; // see frag(), above
+    a->Delete(true); // slot 65
+  }
   w->ptr = nullptr;
   return JS_UNDEFINED;
 }
@@ -665,7 +713,10 @@ JSValue ActorDie(JSContext *ctx, JSValueConst self, int, JSValueConst *) {
   if (!m) {
     return JS_EXCEPTION;
   }
-  m->Die(); // slot 89 - ends in slots 82 and 64, so the actor is gone
+  {
+    ExecutorPause pause; // see frag(), above
+    m->Die(); // slot 89 - ends in slots 82 and 64, so the actor is gone
+  }
   w->ptr = nullptr;
   return JS_UNDEFINED;
 }
@@ -992,6 +1043,12 @@ JSValue LookupActorByName(JSContext *ctx, const char *name) {
 // are an access convenience on top and are deliberately not enumerated - a token
 // only names some actors, and listing both would double up.
 void CollectActorKeys(std::vector<std::string> *out) {
+  // The whole walk under one pause. This iterates the game's actors hash node by
+  // node, and the executor inserts and removes from it (CreateActor / the slot
+  // 64/65 destructions) - a chain relinked mid-walk gives a cycle or a freed
+  // node, the same failure shape as vulkan_renderer_notes.md section 4.72. A
+  // bulk operation can afford the thread round trip that a per-field read cannot.
+  ExecutorPause pause;
   Actors *table = GetActorsTable();
   if (!table) {
     return;
@@ -1007,6 +1064,7 @@ void CollectActorKeys(std::vector<std::string> *out) {
 }
 
 unsigned CountActors() {
+  ExecutorPause pause; // reads the table's own count while the executor may be adjusting it
   Actors *table = GetActorsTable();
   return table ? table->size() : 0;
 }

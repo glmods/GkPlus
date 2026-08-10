@@ -6897,6 +6897,239 @@ validation if the bake ever becomes a suspect.
   with no new structure. It is a separate feature with a much worse crack problem and should be
   measured on its own.
 
+## 4.72 The upload path is reached from both game threads, and the map it shared hung the game
+
+`VkResources.cpp` was written single-threaded, and `VkResources.h` said so above
+`UploadIntoSlot`: *"Safe to call at any time from the main thread."* That was never a description
+of the callers - it was an assumption, and it is wrong.
+
+### What was measured
+
+A Vulkan run stopped responding with one core pegged and no crash. cdb was attached with `av`,
+`sbo`, `ii` and `dz` armed and **caught nothing**, which is the first thing to understand about
+this failure: no exception is ever raised, so no handler and no WER dump can see it. Windows'
+"not responding" plus climbing CPU is the only outward sign, and §"Debugging Gunlok" already
+warns that reads as a hang either way.
+
+Two threads, sampled non-invasively with `cdb -pv` (which works fine alongside the attached
+debugger, and unlike the live-attach failures in `game_defects_notes.md` it walked every stack):
+
+- **The executor thread** (outermost `gl` frame inside `ExecutorThreadProc` @ 0x00509050, frames
+  below it in the AI module's 0x0044f300-0x0045c800), inside
+  `CaptureVertexBuffer::Unlock` -> `UploadLocked` -> `UploadConvertedVertices` -> `UploadIntoSlot`
+  -> `NoteDestination` -> `std::map::_Insert_node`, **spinning**.
+- **The main thread**, in `HookedApplyUpdateMessage` -> the game's own buffer path -> blocked in
+  `RtlEnterCriticalSection`.
+
+`!cs` closed it: the section the main thread wanted reported `OwningThread = 0x9c30`, the
+spinning thread, `RecursionCount = 1`. Two samples a minute apart showed the same thread at the
+same stack with **byte-identical ESP**, having burned ~229 seconds of CPU inside one
+`std::map::emplace` - an operation that costs nanoseconds. A non-terminating red-black insert
+means a **cycle in the tree**, the standard result of mutating a `std::map` from two threads.
+
+So: the executor thread corrupted `PendingDstRanges`, then looped in it forever **while holding
+D3D's per-buffer critical section**, and the main thread blocked on that section. A livelock
+built out of one unsynchronized container.
+
+### Why two threads reach it at all
+
+D3D's critical section is **per buffer**. It serializes two threads on the *same* buffer and does
+nothing for two threads on two different ones - and both then land in this file's process-global
+state: the arenas, the staging ring, `Pending`, `PendingDstRanges`, `PendingImages`, the image
+registry and `WatchLog`. `PendingDstRanges` is only the container that failed loudest;
+`Pending.push_back` racing would corrupt the heap outright rather than spin.
+
+### The fix, and the three things it rests on
+
+One `std::recursive_mutex ResourceLock` taken by every entry point that mutates that state -
+`AllocateSlot`, `FreeSlot`, `UploadIntoSlot`, `CreateTextureImage`, `DestroyTextureImage`,
+`NameTextureImage`, `UploadIntoTextureImage`, `AcquireSampler`, `FlushUploads`, `RecordUploads`,
+`ReleaseFrameStaging`. Producers and drain both, so a batch cannot be recorded while another
+thread appends to it.
+
+- **Recursive is not laziness.** The entry points already call one another: `UploadIntoSlot` and
+  `UploadIntoTextureImage` both reach `FlushPendingNow` through `AllocateStaging`, and
+  `FlushUploads` calls it directly. A plain mutex makes each of those a self-deadlock - a worse
+  hang than the one being fixed.
+- **The internal helpers stay unlocked** and assume the lock is held. That is what keeps the
+  recursion shallow enough to reason about.
+- **The lock order is one-way, and is a standing constraint.** The game takes D3D's section and
+  *then* calls in here, so `[D3D section] -> [ResourceLock]` is the only order that exists.
+  Nothing in this file may call back out into the game or into a wrapped D3D object while holding
+  it; that would create the inverse order and deadlock the two against each other.
+
+### What this does and does not prove
+
+level02 under the fixed build: 178 actors / 294 roles with the executor thread live, **577,308
+uploads** through the guarded path at ~1,900/s, `dropped: 0`, `arena full: 0`, `stalls: 0`,
+`unsupported/unaligned/dropped` images all 0, `scratch exhausted: 0`, descriptors out of range 0,
+and `ordered_overlapping_copies` at 320,770 - i.e. `NoteDestination`, the function that was
+corrupting, running constantly and returning sane collision verdicts.
+
+That is exercise, **not a repro**. The race needs both threads on different buffers in the same
+instant, and it was never reproduced on demand - so "it did not hang again" is weaker evidence
+than the stack that identified it. The stack, the `!cs` owner and the two identical samples are
+what pin this section; the counters only say the lock did not break anything.
+
+## 4.73 The rest of the audit: three more races on the same path, and what the executor really touches
+
+§4.72 fixed one container. A twelve-agent audit of `src/` for the same shape then found that the
+fix was **incomplete**, and that the assumption behind it was wider than one file.
+
+### The one that matters most: the fix had a hole three lines above it
+
+`UploadConvertedVertices` (`D3D8CaptureInternal.h`) converted into a
+`static std::vector<CanonicalVertex> scratch` - one for the process - under a comment saying
+"conversion is main-thread". It sits in the *same call chain* §4.72 sampled, immediately above
+`UploadIntoSlot`, and `ResourceLock` cannot cover it: the pointer is prepared before the call and
+passed in as an argument, so the whole conversion is upstream of the lock.
+
+Shared, `resize()` frees the block the other thread is mid-conversion into - a wild write of
+48 bytes per vertex through a dangling pointer, on **this DLL's UCRT heap** rather than the game's
+pool. With no reallocation the two conversions simply interleave and each thread stages the
+other's vertices: wrong geometry with every counter clean. Now `thread_local`, which keeps the
+amortized allocation and removes the sharing.
+
+The lesson is not "we missed one". It is that a lock placed at the point the *corruption*
+surfaced did not cover the path that *reaches* it, and the comment three lines above the fix
+still asserted the thing that had just been disproved.
+
+### The executor thread creates D3D vertex buffers, and this is now proven
+
+Not inferred from a stack this time - derived. A forward reachability closure from
+`ExecutorThreadProc` @ 0x00509050 is 452 functions; intersected with the 66 functions that
+reference `direct3d_device` @ 0x007c121c it yields **exactly one**: `VertexBufferSet_Create`
+@ 0x005a2e40, the sole caller of the device's `CreateVertexBuffer`. It is reached as
+`ExecutorThreadProc -> SpawnProjectileActor -> ... -> Renderable_CtorFromShape -> MakeBoxCorners
+-> SharedVB_AddEntry -> SharedVB_Rebuild`, which destroys the old set before creating the new one.
+
+So `LiveVertexWrappers` / `LiveIndexWrappers` - `std::set`s the main thread walks thousands of
+times a frame through `Unwrap` and `EmitDraw` - take an insert and an erase from the executor.
+That is §4.72's failure again, on a different container. They now have `LiveWrapperLock`, and the
+membership test is `IsLiveVertexWrapper` / `IsLiveIndexWrapper` so a bare `.count()` is visibly
+wrong. `Wrapper::refs_` became `std::atomic<ULONG>` in the same pass: a COM refcount
+read-modify-written from two threads drops a decrement (leak) or an increment (early free).
+
+### The queue was never externally synchronized
+
+Vulkan **requires** host access to a `VkQueue` to be externally synchronized, and to every queue
+for `vkDeviceWaitIdle`. The main thread submits and presents (`VkRenderer.cpp`); the executor
+reaches `AllocateStaging`, which under ring pressure calls `WaitForLiveFrames`
+(`vkDeviceWaitIdle`) or `FlushPendingNow` (`vkQueueSubmit`). `ResourceLock` cannot serve - it is
+file-local to `VkResources.cpp`, and the other submitter cannot see it. `QueueMutex()` in
+`VkInternal.h` now covers all fourteen queue operations, with `SubmitToQueue` for the four in
+expression position. **Order is `ResourceLock -> QueueMutex`**, kept true by making every scope
+tight around the call itself.
+
+This one is worth separating from the others: it is undefined behaviour in the *driver's* state,
+so its symptom is a device loss or a hang inside the ICD, nowhere near this codebase.
+
+### What the audit ruled out, which is worth as much
+
+- **`file_io_notes.md` section 1 holds, and can be stated more strongly.** A sweep of all 2,569
+  instructions in `ExecutorThreadProc` against the nine IAT slots `FileHookSystem` patches hits
+  exactly one - `CloseHandle`, on the events `StartExecutorThread` created. Eight I/O slots,
+  `_fopen`/`_freopen`, and the whole `SetCurrentDirectoryA` group: never.
+- **There is no third GkPlus thread.** `CreateThread`/`std::thread`/`_beginthreadex` appear
+  nowhere in `src/`, and the REPL is non-blocking sockets drained by `PumpRepl` on the main
+  thread - `StartRepl` creates a listening socket, not a listener thread. Every `Js*` binding and
+  every `Repl.cpp` global is therefore single-threaded, and this note previously implied otherwise.
+- **`Font.h`'s lock-free text queue is safe**: the claimed executor path into `Font_QueueText`
+  does not exist.
+- **Not ours:** the game's own pool allocator guards its free lists with a critical section
+  @ 0x007c0670 gated on a byte @ 0x007c066c **that nothing ever sets**. `pool_alloc`/`pool_free`
+  are not thread-safe in vanilla Gunlok. Everything GkPlus allocates from the pool inherits that.
+
+### Verified
+
+level02, Vulkan, executor live: 452,704 uploads at ~1,790/s with `dropped`/`arena full`/`stalls`
+at 0, images `unsupported`/`unaligned`/`dropped` 0, scratch `exhausted` 0, descriptors out of
+range 0, and **`render.verify_buffers` reporting 2953/2953 buffers matching with 0 overlapping
+live slots** - which is the check that would catch a mis-converted vertex, so it is the one that
+speaks to the `thread_local` fix rather than merely to the plumbing. A destroyed actor's JS
+wrapper throws `actor N has been destroyed` instead of reading a recycled pool page.
+
+Same caveat as §4.72 and it should not be skipped: **none of these four was reproduced on
+demand.** The Ghidra closures and the sampled stack are the evidence; the counters only say
+nothing broke.
+
+### The medium set, and where the audit's recommended fix was wrong
+
+Four more, fixed in the same pass:
+
+- **The per-frame scratch allocators** now take `ResourceLock`, guarded in `AllocateScratch`
+  itself rather than in the seven public wrappers - the one deliberate departure from "entry
+  points lock, internals assume held", because it is the single choke point all seven pass
+  through and an eighth added later gets it free. The executor reaches them through
+  `UploadVersionToScratch`. This was the weakest of the five findings (the verifier reduced it to
+  "likely": it needs the executor to refill a buffer the main thread already drew from *this*
+  frame, which could not be proved from source) and it was fixed anyway, because a recursive
+  acquisition on a path that already does a staging allocation costs nothing.
+- **`ForgetBoundBuffer`** nulls `CaptureDevice::stream0_` / `indices_` from the wrapper
+  destructors. Those are borrowed raw pointers the device never cleared, and `IsLiveVertexWrapper`
+  only *usually* caught the result - the address can be reused by a new wrapper, which passes the
+  liveness test and draws the wrong geometry.
+- **The vulnerability sweep** (`ScriptQueue.cpp`) takes an `ExecutorPause`. The walk is the lesser
+  half: `EncodeVulnerability` does `script.reset(fresh)`, freeing a `pool_string`, while
+  `CharacterActor` slot 70 @ 0x0053d8d0 reads that same field, hands it to `QueueScriptExecution`
+  and then pool-frees it and nulls the field. A genuine **double free** of one pointer, into an
+  allocator with no lock of its own.
+- **GkPlus's world mutators** take one too: `SpawnRole`+`GetActorById` (JsRoles), `MapSpawn`
+  (JsLevels), `MakeRole` (JsMake) and `RegisterTriggers` (JsTriggers).
+
+Two places the audit's own recommendation was not followed, both deliberate:
+
+- It named `CustomLevel.cpp:472` as the site to bracket. That line **invokes a script callback**,
+  and holding the pause across arbitrary JS trades a race for a simulation stall. The engine
+  brackets the *mutation*, not the caller - `CommandGiveRole` @ 0x00449d40 is the model - so the
+  four mutators above are bracketed instead, which is what the callback can reach anyway.
+- It implied `ScriptQueue.cpp`'s `HookedMultiplayerRespawnRole` wanted one. That runs **on** the
+  executor, where `SuspendExecutor` is a no-op by thread-id test, so a pause there would be
+  decoration.
+
+Verified on level02 with the executor live: `role.spawn` produced a live actor (count 178 -> 179)
+through the paused path, `console.execute("VULNERABILITY")` ran the swept hook, `triggers.create`
+registered, `render.verify_buffers` went 2953/2953 -> **2955/2955** as the spawn's two buffers
+joined, 464,227 uploads at ~1,850/s, and every must-be-zero counter stayed zero. The pause is now
+exercised at nine distinct call sites without a deadlock, which was its one real risk - a bad
+handshake parks the simulation forever.
+
+### The low set contained one the audit under-rated, because it read the wrong noun
+
+The remaining findings were all "a racy diagnostic counter", correctly rated low and mostly left
+alone. One of them was not a counter.
+
+`NoteRewrite` does `++RewriteLocks[key]`, and `RewriteLocks` is a **`std::map`** - so that line
+is a red-black tree insert, not an increment. Its only caller is
+`BufferWrapper::UploadLocked`, which is the executor stack §4.72 was sampled on. It is §4.72's
+failure exactly, on a third container, and it had been sitting inside a finding titled "the
+process-global capture counter block" whose verdict was "leave it". The lesson generalises:
+**when auditing a block of shared state, the type of each member decides its severity, not the
+block's label** - a `uint64_t` losing an increment and a `std::map` losing its invariants are not
+the same finding. `NoteRewrite` and the report's histogram walk now share `CaptureDiagLock`.
+
+Where the line was drawn on the rest:
+
+- **The scalar counters stay racy on purpose.** Each is a monotonically increasing `uint64_t`
+  whose high dword stays zero for a session, so a lost increment costs a count in a diagnostic
+  nothing reads to decide anything, and tearing is unobservable.
+- **The four `live_*` fields are the exception and are now `std::atomic`**, because they are the
+  only ones *decremented* - a lost decrement never comes back, accumulates all session, and what
+  it corrupts is the residency figure §4.8 sized the arenas from. That deletes the struct's
+  implicit copy-assignment, so `ResetStats` reconstructs in place rather than assigning; the
+  alternative, a hand-written assignment over ~50 fields, is a list that goes stale the next time
+  someone adds one. Verified: across `render.reset()` the live figures carry exactly
+  (333 VB / 6176 KB, 2701 IB / 593 KB before and after) while the peaks reseed, which is what
+  that function documents.
+- `EncodedPayload` is `thread_local`, `VkCapture`'s RenderDoc state has a small mutex, and the
+  header comment claiming this struct is "all main-thread, so none of it is synchronised" - which
+  is where this whole line of investigation started - is gone.
+- **The pool allocator is not ours and is not fixed**; it is written up as
+  `game_defects_notes.md` §11. Its critical section @ 0x007c0670 is gated on a byte @ 0x007c066c
+  with four references in the binary, all reads, so it is never entered. A lock inside
+  `gk::pool_alloc` would be theatre - the game's own call sites, which are nearly all of them,
+  would walk past it. The mitigation available to a caller is `ExecutorPause`.
+
 ---
 
 GkPlus is a modding framework with a JS layer, a VFS and a REPL; the renderer should join that

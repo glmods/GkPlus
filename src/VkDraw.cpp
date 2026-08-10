@@ -3855,7 +3855,10 @@ void SetMapShadowIndirect(bool enabled) {
   MapShadowIndirect = want;
   // The pipeline is in flight for as long as a frame is; waiting is the honest way to swap it,
   // and this is a diagnostic that runs once, not a per-frame path.
-  vkDeviceWaitIdle(GetDevice());
+  {
+    QueueGuard queue_guard(QueueMutex());
+    vkDeviceWaitIdle(GetDevice());
+  }
   vkDestroyPipeline(GetDevice(), MapShadowPipeline, nullptr);
   MapShadowPipeline = VK_NULL_HANDLE;
   MapShadowReady = CreateMapShadowPipeline();
@@ -4999,7 +5002,10 @@ void ShutdownDraw() {
   if (!Ready) {
     return;
   }
-  vkDeviceWaitIdle(GetDevice());
+  {
+    QueueGuard queue_guard(QueueMutex());
+    vkDeviceWaitIdle(GetDevice());
+  }
   // Before the resources go, and from here rather than from the renderer: these are images this
   // side created, and nothing outside the draw path knows they exist.
   ShutdownLightingMaps();

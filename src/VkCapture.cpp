@@ -4,6 +4,7 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <mutex>
 
 #include "Core.h"
 #include <renderdoc_app.h>
@@ -21,6 +22,12 @@ uint32_t Captures = 0;
 uint32_t WantedBatch = UINT32_MAX;
 bool BatchCapturing = false;
 void *BatchDevice = nullptr;
+// The frame-capture pair runs on the main thread (DrawFrame) and the batch pair on
+// whichever thread reaches AllocateStaging / FlushPendingNow - the executor included.
+// They share `Capturing`, so an unsynchronised read of it hands RenderDoc unbalanced
+// Start/EndFrameCapture calls. Low consequence (only live while capturing, which is a
+// deliberate act) but free to remove.
+std::mutex CaptureLock;
 std::string Status = "not loaded";
 std::string CapturePath = "(renderdoc's own)";
 
@@ -125,6 +132,7 @@ bool TriggerCapture() {
 }
 
 void BeginFrameCaptureIfArmed() {
+  std::lock_guard<std::mutex> guard(CaptureLock);
   if (Api == nullptr || !Armed || Capturing) {
     return;
   }
@@ -137,6 +145,7 @@ void BeginFrameCaptureIfArmed() {
 }
 
 void EndFrameCaptureIfArmed() {
+  std::lock_guard<std::mutex> guard(CaptureLock);
   if (Api == nullptr || !Capturing) {
     return;
   }
@@ -149,6 +158,7 @@ void EndFrameCaptureIfArmed() {
 void CaptureStagingBatch(uint32_t batch) { WantedBatch = batch; }
 
 void BeginBatchCaptureIfArmed(uint32_t batch, void *vk_instance) {
+  std::lock_guard<std::mutex> guard(CaptureLock);
   if (Api == nullptr || batch != WantedBatch || BatchCapturing || Capturing) {
     return;
   }
@@ -164,6 +174,7 @@ void BeginBatchCaptureIfArmed(uint32_t batch, void *vk_instance) {
 }
 
 void EndBatchCaptureIfArmed(uint32_t batch) {
+  std::lock_guard<std::mutex> guard(CaptureLock);
   if (Api == nullptr || !BatchCapturing || batch != WantedBatch) {
     return;
   }

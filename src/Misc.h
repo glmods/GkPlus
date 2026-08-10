@@ -118,6 +118,34 @@ void DoSpawn(int team, int amount);
 // so spawning locally there produces a ghost the host knows nothing about.
 bool IsSimulationRunning();
 
+// The pause handshake, and the RAII guard that is how GkPlus should use it.
+//
+// `SuspendExecutor` @ 0x00505290 / `ResumeExecutor` @ 0x005052d0. Despite the shape, not a
+// critical section: a recursion-counted event handshake (threading_model_notes.md, "Pause
+// handshake"). On the main thread the first Suspend sets the pause-request event and blocks
+// until the executor acknowledges; the last Resume releases it. **On the executor thread both
+// are no-ops**, tested by thread id - which is what makes the guard safe to take from a hook
+// without first knowing which thread it is on.
+//
+// This is the engine's own answer to the two-thread split, used by 97 of the 249 Command*
+// handlers before they touch the world, and it is the right tool for two jobs GkPlus has:
+// mutating actors/roles from the main thread while the simulation is live, and reading a
+// *consistent* multi-field or multi-object view of state the executor is mutating - walking
+// the actors hash, or a list of live buffer wrappers, without it being relinked underneath.
+//
+// Cost is a thread round trip, so it belongs around a whole operation, never inside a loop.
+void SuspendExecutor();
+void ResumeExecutor();
+
+// Scope guard. Prefer this to the bare pair: an early return between them would otherwise
+// leave the executor parked forever, which presents as a total game freeze.
+struct ExecutorPause {
+  ExecutorPause() { SuspendExecutor(); }
+  ~ExecutorPause() { ResumeExecutor(); }
+  ExecutorPause(const ExecutorPause &) = delete;
+  ExecutorPause &operator=(const ExecutorPause &) = delete;
+};
+
 Actor *GetActorUnderCursor();   // 0x007b68e8
 GLKeysSettings *GetSettings();  // 0x006abdd0
 Cheats *GetCheats();            // 0x007b9c70

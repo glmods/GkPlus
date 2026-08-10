@@ -3,6 +3,7 @@
 #include "GLS.h"
 #include "Js.h"
 #include "JsBindings.h"
+#include "Misc.h"
 #include "Roles.h"
 
 #include <cstdio>
@@ -717,7 +718,14 @@ JSValue MakeRoleJs(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
   d.interface_beam_script =
       beam_script.empty() ? nullptr : beam_script.c_str();
 
-  Role *role = MakeRole(d);
+  // CreateRole does a bucket-head insert into the roles hash (@ 0x007b48f0) plus two
+  // pool_allocs, and the executor reads that table from ExecutorThreadProc itself as well
+  // as from EvaluateTriggers and every AiThink_*. See gk::ExecutorPause in Misc.h.
+  Role *role;
+  {
+    ExecutorPause pause;
+    role = MakeRole(d);
+  }
   if (!role) {
     return JS_ThrowInternalError(ctx, "the role could not be created");
   }

@@ -676,6 +676,47 @@ directives or they vanish with no error.
 
 ---
 
+## 11. The pool allocator has a critical section, gated on a flag nothing ever sets
+
+`pool_alloc` @ 0x00571470 and `pool_free` @ 0x005715b0 are the game's page sub-allocator, and
+**everything** goes through them: `malloc`, `free` and `strdup` are JMP thunks into this, so
+every actor, role, list node, hash node and string in the process comes from here.
+
+It has a lock and does not use it. At 0x00571473 the prologue is
+`CMP byte ptr [0x007c066c], 0x0` / `JZ`, which skips the `EnterCriticalSection(0x007c0670)` at
+0x00571487. That byte has **exactly four references in the whole binary and all four are
+reads** - 0x00571473, 0x0057158e, 0x005715bf, 0x00571659, i.e. the same test at the top of each
+of the four entry points. Nothing writes it, so it is zero for the life of the process and the
+critical section is never entered. The per-size free lists @ 0x007ba668 and the page headers are
+therefore **unsynchronised**.
+
+This matters because the allocator is genuinely reached from both threads. The executor calls
+`SpawnRole` @ 0x00503710 from `Frag`, `DropItem`, `AiThink_Node`, `OnPrePhysics`,
+`MobileActor::Update` and `MultiplayerRespawnRole`, and `Actor::Ctor` @ 0x0052d1f0 ends in an
+inlined hash insert that `pool_alloc`s its node - while the main thread allocates from the same
+lists for its own work.
+
+**It is presumably why the flag exists**: someone built the lock, gated it on a "are we
+threaded?" byte, and never set the byte. Whether it is *actually* harmful in the shipped game is
+not established here - Gunlok has shipped like this for 25 years - and it is listed as a trap
+rather than as a crash with a repro.
+
+What it means for GkPlus is the part worth acting on: **a lock inside `gk::pool_alloc` /
+`gk::pool_free` would be theatre.** Our wrappers are not the allocator, and the game's own call
+sites - which are almost all of them - would walk straight past it. So `src/Memory.cpp` is
+deliberately left unsynchronised, and the mitigation available to a caller is the one the engine
+itself uses for world mutation: park the other thread with the `SuspendExecutor` /
+`ResumeExecutor` handshake (`gk::ExecutorPause`, see `src/Misc.h`) around anything that allocates
+or frees pool memory while the simulation is live. That is what the GkPlus paths in
+`vulkan_renderer_notes.md` §4.73 now do.
+
+The only fix that would cover every caller is to `InitializeCriticalSection(0x007c0670)` at load
+and then set 0x007c066c to 1 - turning on the lock the developers wrote. Not done: it changes the
+behaviour of every allocation in the process to fix a hazard nothing has yet been shown to hit,
+and the critical section's own initialisation state is unknown.
+
+---
+
 ## Debugging Gunlok: what actually works
 
 - **cdb is at** `C:\Users\franc\AppData\Roaming\Binary Ninja\dbgeng\Windows Kits\10\Debuggers\x86\cdb.exe`.

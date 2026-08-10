@@ -431,7 +431,12 @@ JSValue LevelSpawn(JSContext *ctx, JSValueConst self, int argc,
     }
   }
 
-  int id = MapSpawn(role, team, &position, &orientation);
+  // Inserts into the actors hash while the executor walks it - see gk::ExecutorPause.
+  int id;
+  {
+    ExecutorPause pause;
+    id = MapSpawn(role, team, &position, &orientation);
+  }
 
   // The `as "<token>"` clause: a token holding the new actor's id as a float,
   // which is how the engine names actors (see Tokens.h).

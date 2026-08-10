@@ -62,7 +62,15 @@ ScriptMessageHandler Handler = nullptr;
 
 // --- provenance of a script-name write -------------------------------------------
 
-bool EncodedPayload = false;
+// `thread_local`: the write side (EncodedPayloadScope, from JsTriggers/JsActors) is main
+// thread, but the READ side is not - HookedRegisterTriggers runs wherever
+// AddTriggerToGlobalList @ 0x0043e240 is called from, and one of its three callers is
+// `Frag` @ 0x0052e220, an executor-side Actor vtable slot. Per-thread makes the flag mean
+// what its name says: "the payload *this* call stack already encoded". A shared bool
+// cannot tear and there is only one writer, so nothing was observed to go wrong - but a
+// stale `true` seen on the executor would skip an encode that was owed, and the storage
+// class states the intent for free.
+thread_local bool EncodedPayload = false;
 
 void Note(const char *what, const char *detail) {
   char buf[512];
@@ -425,6 +433,29 @@ void EncodeVulnerability(Vulnerability *vuln) {
 
 void __fastcall HookedCommandVulnerability(int length, char *args) {
   CommandVulnerability(length, args);
+
+  // The whole sweep under one pause, which the trampoline above does NOT provide.
+  // `CommandVulnerability` @ 0x0044a600 takes its own SuspendExecutor/ResumeExecutor
+  // bracket (0x0044a8c0 / 0x0044a9ed) around its own walk - and that bracket has
+  // already been released by the time it returns to us, so this sweep runs
+  // completely unprotected.
+  //
+  // Two things go wrong without it, and neither raises anything. The walk itself is
+  // a raw pointer chase - HashTable.h's iterator follows `node_->next`, List.h's
+  // follows `->next` to a 0xc-byte sentinel - over nodes the executor allocates and
+  // frees: it creates actors from ExecutorThreadProc through SpawnRole -> CreateActor
+  // (whose inlined insert relinks a bucket head) and destroys them through
+  // Actor::Delete -> HashTable_Remove. And the payload is worse than the walk:
+  // `EncodeVulnerability` does `script.reset(fresh)`, freeing the old pool_string,
+  // while CharacterActor slot 70 @ 0x0053d8d0 - dispatched from ExecutorActorTick -
+  // reads that same `Vulnerability+0x10`, hands it to QueueScriptExecution and then
+  // pool_frees it and nulls the field. Two frees of one pointer, and the game's pool
+  // allocator has no lock of its own to catch it (its critical section @ 0x007c0670
+  // is gated on a byte nothing ever sets).
+  //
+  // Copying the engine's own discipline here rather than inventing one: this is the
+  // same handshake CommandVulnerability uses, over the same tables.
+  ExecutorPause pause;
 
   // Both lists, because a role-scoped vulnerability lives in the role's list and
   // is aliased into every actor of that role, while an actor-scoped one is only

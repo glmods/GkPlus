@@ -455,9 +455,26 @@ VkPhysicalDevice GetPhysicalDevice() { return PhysicalDevice; }
 VkDevice GetDevice() { return Device; }
 VkQueue GetGraphicsQueue() { return GraphicsQueue; }
 
+std::recursive_mutex &QueueMutex() {
+  // Function-local static rather than a namespace-scope object: this is reached from both game
+  // threads and from DllMain-adjacent teardown, and a function-local has guaranteed
+  // thread-safe initialization where a namespace-scope one across TUs does not have a
+  // guaranteed order.
+  static std::recursive_mutex mutex;
+  return mutex;
+}
+
+VkResult SubmitToQueue(const VkSubmitInfo &submit, VkFence fence) {
+  QueueGuard guard(QueueMutex());
+  return vkQueueSubmit(GraphicsQueue, 1, &submit, fence);
+}
+
 void Shutdown() {
   if (Device != VK_NULL_HANDLE) {
-    vkDeviceWaitIdle(Device);
+    {
+      QueueGuard queue_guard(QueueMutex());
+      vkDeviceWaitIdle(Device);
+    }
     vkDestroyDevice(Device, nullptr);
     Device = VK_NULL_HANDLE;
   }

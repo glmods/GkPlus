@@ -220,9 +220,23 @@ Three consequences worth knowing:
   a whole prototype chain reading every property is safe. Under the previous flat prototype
   `turret_enabled` sat on the *base*, so merely reading it on a character raised.
 - **The chain does not replace the checked downcasts.** The prototype is chosen once, at wrap time,
-  but the wrapper holds a raw pointer the game can free and recycle onto a different subclass, so
+  and the actor it was chosen for can be destroyed afterwards, so
   `ResolveMobile`/`ResolveCharacter`/`ResolvePickup`/`ResolveTurret` still re-run the predicate on
   every call. A borrowed method (`MobileActor.prototype.goto.call(pickup, …)`) still throws.
+- **`Resolve` re-derives the actor from its id on every access; the stored `Actor *` is only a
+  cache.** It used to be the identity, and that was a **use-after-free rather than a stale read**:
+  the *executor thread* frees actors with no notification and `pool_free` recycles the page, so a
+  wrapper held across one frame could be pointing at an unrelated object of a different class by
+  the next property read. Nulling `ptr` in `frag()`/`remove()` covered only the destructions
+  initiated from JS - the two that were never the problem. `GetActorById(w->id)` now gates every
+  access, and an id that resolves to a *different* object than the wrapper was made from is
+  refused too, so a script that captured a corpse cannot start driving whatever inherited its id.
+  `valid` already worked this way; every other accessor now agrees with it.
+  Residual, stated rather than hidden: that lookup walks a bucket chain the executor can relink,
+  so a single read is narrowed from "reads freed memory" to "may read a chain mid-relink".
+  Closing it would cost an `ExecutorPause` - a thread round trip - per property read. The paths
+  that can afford one take it: `CollectActorKeys`, `CountActors`, and the three mutators
+  `frag`/`remove`/`die`, which is also what the engine's own `Command*` handlers do.
 - **One ordering rule drives everything**, and `JsActors.cpp` `static_assert`s it: every class is
   listed **before its own base**. The predicates are inherited (`IsMobile()` is true for a turret),
   so the ladder must test most-derived first; the chain is built by walking the list backwards,

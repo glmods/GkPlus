@@ -27,6 +27,7 @@
 #include <string>
 
 #include "Core.h"
+#include "Misc.h"
 
 namespace gk {
 namespace d3d8 {
@@ -718,10 +719,10 @@ void MaybeVerifyStateForDraw(CaptureDevice *capture, const vulkan::DrawItem &ite
   VerifyDrawGeometry.item = item;
   VerifyDrawGeometry.vertex_bias = vertex_bias;
   VerifyDrawGeometry.vertices =
-      LiveVertexWrappers.count(capture->stream0_) != 0
+      IsLiveVertexWrapper(capture->stream0_)
           ? static_cast<CaptureVertexBuffer *>(capture->stream0_)
           : nullptr;
-  VerifyDrawGeometry.indices = LiveIndexWrappers.count(capture->indices_) != 0
+  VerifyDrawGeometry.indices = IsLiveIndexWrapper(capture->indices_)
                                    ? static_cast<CaptureIndexBuffer *>(capture->indices_)
                                    : nullptr;
 
@@ -795,7 +796,7 @@ void MaybeVerifyStateForDraw(CaptureDevice *capture, const vulkan::DrawItem &ite
 void CaptureDevice::NoteIndexedRange(D3DPRIMITIVETYPE type, UINT min_index, UINT num_vertices,
                                      UINT start_index, UINT primitive_count) {
   if (stream0_ == nullptr || indices_ == nullptr || stream0_stride_ == 0 ||
-      LiveVertexWrappers.count(stream0_) == 0 || LiveIndexWrappers.count(indices_) == 0) {
+      !IsLiveVertexWrapper(stream0_) || !IsLiveIndexWrapper(indices_)) {
     return;
   }
   const auto &vertex_buffer = *static_cast<CaptureVertexBuffer *>(stream0_);
@@ -1464,6 +1465,18 @@ std::string VerifyTextureImages() {
 // index is the loudest form of it: one triangle reaching a vertex from an unrelated mesh
 // megabytes away, which draws as a wedge across half the screen.
 std::string VerifyBufferSlots() {
+  // Park the executor for the whole check. It walks LiveVertexWrappers / LiveIndexWrappers four
+  // times and D3D-Locks each buffer it finds, and the executor creates and destroys vertex
+  // buffers (see the note above LiveWrapperLock in D3D8CaptureInternal.h) - so without this the
+  // walk can be relinked underneath, and a wrapper can be freed between being read out of the
+  // set and being dereferenced.
+  //
+  // `LiveWrapperLock` deliberately does NOT appear here. Holding it across `LockForRead` would
+  // put a D3D call inside it and create the [our lock] -> [D3D section] order that is the
+  // inverse of the one the game already establishes - the deadlock section 4.72 warns about.
+  // Pausing the executor removes the writer instead of excluding it, so no lock is needed at
+  // all. Cost is one thread round trip on a REPL diagnostic that already submits and waits.
+  ExecutorPause pause;
   vulkan::FlushUploads();
   uint32_t checked = 0;
   uint32_t matched = 0;
@@ -1679,9 +1692,14 @@ std::string FormatStats() {
       (unsigned long long)s.overlapping_rewrites_after_draw,
       (unsigned long long)s.buffer_versions_in_scratch,
       (unsigned long long)s.unversioned_rewrites);
-  for (const auto &entry : RewriteLocks) {
-    add("  lock flags 0x%04x %-10s %llu\n", (unsigned)(entry.first >> 1),
-        (entry.first & 1) ? "overlapping" : "disjoint", (unsigned long long)entry.second);
+  {
+    // The executor writes this map through NoteRewrite; walking it unlocked is the read half
+    // of the same race. Scoped tightly - `add` only appends to a local string.
+    CaptureDiagGuard guard(CaptureDiagLock);
+    for (const auto &entry : RewriteLocks) {
+      add("  lock flags 0x%04x %-10s %llu\n", (unsigned)(entry.first >> 1),
+          (entry.first & 1) ? "overlapping" : "disjoint", (unsigned long long)entry.second);
+    }
   }
 
   out += "FVF / vertex shader handles:\n";

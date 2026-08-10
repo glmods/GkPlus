@@ -1,6 +1,7 @@
 #include "Triggers.h"
 
 #include "JsBindings.h"
+#include "Misc.h"
 #include "ScriptQueue.h"
 
 #include <iterator>
@@ -187,6 +188,10 @@ JSValue TriggersCreate(JSContext *ctx, JSValueConst, int argc,
     // ToScriptPayload has already encoded it, so the RegisterTriggers hook must
     // not quote it a second time.
     EncodedPayloadScope encoded;
+    // Trigger registration appends to the lists EvaluateTriggers walks on the
+    // executor thread, so it takes the pause the engine's own handlers take. See
+    // gk::ExecutorPause in Misc.h.
+    ExecutorPause pause;
     RegisterTriggers(static_cast<TriggerKind>(kind), coords, value, targets,
                      has_script ? reinterpret_cast<const unsigned char *>(
                                       script.c_str())

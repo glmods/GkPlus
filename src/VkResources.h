@@ -178,7 +178,11 @@ BufferSlot AllocateSlot(uint32_t bytes, bool vertex);
 void FreeSlot(const BufferSlot &slot);
 
 // Copies `bytes` from `data` into the staging ring and queues a copy into `slot`. Safe to
-// call at any time from the main thread; nothing is recorded into a command buffer here. The
+// call at any time from **either game thread** - see ResourceLock in the .cpp. This used to say
+// "from the main thread", which was not a description of the callers but an assumption, and a
+// wrong one: the executor thread unlocks vertex buffers too, and the unsynchronized
+// `PendingDstRanges` it shared with the main thread corrupted into a cycle that hung the game
+// with no exception to catch. Nothing is recorded into a command buffer here. The
 // data is copied immediately, so the caller's pointer need not outlive the call - which
 // matters because it is a buffer the game is about to unlock.
 // `offset_in_slot` is where the data lands inside the slot, which is how a partial

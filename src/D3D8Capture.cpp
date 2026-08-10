@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <new>
 #include <map>
 #include <set>
 #include <vector>
@@ -516,6 +517,18 @@ std::map<uint64_t, uint64_t> UnslottedVertexBuffers;
 std::map<uint64_t, uint64_t> RewriteLocks;
 
 void NoteRewrite(uint32_t flags, bool overlaps) {
+  // Locked, and this is NOT the "a racy diagnostic counter is harmless" case the rest of
+  // TheStats is. `operator[]` on a std::map is an INSERT: a red-black tree rebalance, and
+  // this runs on both game threads because its only caller is `BufferWrapper::UploadLocked`,
+  // which is the executor stack vulkan_renderer_notes.md section 4.72 was sampled on. Two
+  // threads rebalancing one tree is exactly how that section's hang happened - a cycle, then
+  // a later insert or walk that never terminates, at 100% CPU with no exception raised.
+  //
+  // The audit that found this rated `TheStats` low on the grounds that its counters are
+  // diagnostics nothing reads for control, which is true and is why they are left alone. It
+  // did not separate out this one, which is not a counter increment but a container mutation
+  // sitting on the same executor-reachable path.
+  CaptureDiagGuard guard(CaptureDiagLock);
   ++RewriteLocks[(uint64_t(flags) << 1) | (overlaps ? 1u : 0u)];
 }
 
@@ -1008,7 +1021,7 @@ IDirect3DVertexBuffer8 *Unwrap(IDirect3DVertexBuffer8 *buffer) {
   if (buffer == nullptr) {
     return nullptr;
   }
-  if (LiveVertexWrappers.count(buffer) == 0) {
+  if (!IsLiveVertexWrapper(buffer)) {
     ++TheStats.foreign_buffers;
     return buffer;
   }
@@ -1019,7 +1032,7 @@ IDirect3DIndexBuffer8 *Unwrap(IDirect3DIndexBuffer8 *buffer) {
   if (buffer == nullptr) {
     return nullptr;
   }
-  if (LiveIndexWrappers.count(buffer) == 0) {
+  if (!IsLiveIndexWrapper(buffer)) {
     ++TheStats.foreign_buffers;
     return buffer;
   }
@@ -1031,6 +1044,23 @@ IDirect3DIndexBuffer8 *Unwrap(IDirect3DIndexBuffer8 *buffer) {
 // wrapper rather than d3d8to9's object; borrowed, not owned, and never AddRef'd on our own
 // account, because a self-reference would keep the device alive for its own lifetime.
 CaptureDevice *TheCaptureDevice = nullptr;
+
+// Declared in D3D8CaptureInternal.h beside the wrapper registries, where the reasoning is.
+// Defined here because it needs CaptureDevice to be a complete type, and the wrapper
+// destructors that call it are inline in the header above the struct.
+void ForgetBoundBuffer(const void *wrapper) {
+  if (TheCaptureDevice == nullptr || wrapper == nullptr) {
+    return;
+  }
+  // Compared as the stored pointer, not cast: the point is to stop naming this address at all.
+  if (TheCaptureDevice->stream0_ == wrapper) {
+    TheCaptureDevice->stream0_ = nullptr;
+    TheCaptureDevice->stream0_stride_ = 0;
+  }
+  if (TheCaptureDevice->indices_ == wrapper) {
+    TheCaptureDevice->indices_ = nullptr;
+  }
+}
 
 bool TryGetCaptureDevice(IDirect3DDevice8 **ppDevice) {
   if (TheCaptureDevice == nullptr) {
@@ -2450,8 +2480,8 @@ void CaptureDevice::EmitDraw(D3DPRIMITIVETYPE type, UINT start_index, UINT primi
   // has to be for an indexed draw: `DrawPrimitive` reads none, and the game is entitled to leave
   // a stale one bound - requiring it here would drop every non-indexed draw whose last
   // SetIndices happened to name a buffer this layer never wrapped.
-  if (stream0_ == nullptr || LiveVertexWrappers.count(stream0_) == 0 ||
-      (indexed && (indices_ == nullptr || LiveIndexWrappers.count(indices_) == 0))) {
+  if (!IsLiveVertexWrapper(stream0_) ||
+      (indexed && !IsLiveIndexWrapper(indices_))) {
     ++vulkan::MutableDrawStats().skipped_no_slot;
     ++vulkan::MutableDrawStats().skipped_foreign_stream;
     return;
@@ -2854,7 +2884,13 @@ void ResetStats() {
   const uint64_t live_vb_bytes = TheStats.live_vertex_bytes;
   const uint64_t live_ib_bytes = TheStats.live_index_bytes;
 
-  TheStats = CaptureStats();
+  // Destroy and re-construct in place rather than `TheStats = CaptureStats()`. The four
+  // `live_*` counters are `std::atomic` (see the note on them in D3D8Capture.h), which deletes
+  // the struct's implicit copy-assignment - and the alternative, hand-writing an assignment
+  // over ~50 fields, is a list that would silently go stale the next time one is added. This
+  // resets everything by construction, which is what the assignment was for.
+  TheStats.~CaptureStats();
+  ::new (&TheStats) CaptureStats();
 
   TheStats.live_vertex_buffers = live_vb;
   TheStats.live_index_buffers = live_ib;
