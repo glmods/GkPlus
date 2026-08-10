@@ -108,6 +108,7 @@ void QueryDevice(VkPhysicalDevice device, DeviceCaps &caps) {
   caps.max_push_constants = props.properties.limits.maxPushConstantsSize;
   caps.max_bindless_textures =
       indexing_props.maxDescriptorSetUpdateAfterBindSampledImages;
+  caps.max_tessellation_level = props.properties.limits.maxTessellationGenerationLevel;
 
   caps.descriptor_indexing = features12.descriptorIndexing != 0;
   caps.runtime_descriptor_array = features12.runtimeDescriptorArray != 0;
@@ -123,6 +124,7 @@ void QueryDevice(VkPhysicalDevice device, DeviceCaps &caps) {
   caps.synchronization2 = features13.synchronization2 != 0;
   caps.depth_clamp = features.features.depthClamp != 0;
   caps.multi_draw_indirect = features.features.multiDrawIndirect != 0;
+  caps.tessellation_shader = features.features.tessellationShader != 0;
 
   VkPhysicalDeviceMemoryProperties memory = {};
   vkGetPhysicalDeviceMemoryProperties(device, &memory);
@@ -315,6 +317,10 @@ InitResult DoInitialize() {
   // shadow bake issues a draw call per caster per face instead of one command per face, which
   // produces the same atlas more slowly (§4.62).
   features.features.multiDrawIndirect = TheCaps.multi_draw_indirect ? VK_TRUE : VK_FALSE;
+  // And again for the two tessellation stages (§4.71). Without it CreatePipelineFor never builds
+  // a tessellated variant and every draw takes the ordinary one, so a device that lacks it draws
+  // the frame this renderer drew before the feature existed rather than failing to start.
+  features.features.tessellationShader = TheCaps.tessellation_shader ? VK_TRUE : VK_FALSE;
 
   const float priority = 1.0f;
   VkDeviceQueueCreateInfo queue = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};

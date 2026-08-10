@@ -157,7 +157,30 @@ struct GpuFrameData {
     uint map_shadow_texture;
     uint map_shadow_sampler;
     float map_shadow_offset; // along the normal, in atlas texels at the fragment's own distance
-    uint light_flags;        // kLocalLightsOn
+    // The per-frame atlas (§4.66). Its own bias because its face is 128 texels where the static
+    // one's is 64, so one texel is half the world distance.
+    uint dyn_shadow_texture;
+    uint dyn_shadow_sampler;
+    float dyn_shadow_offset;
+    // The PCF radius for D3D's point and spot lights, in texels: 0 a single tap, 1 a 3x3, 2 a 5x5
+    // (§4.69). It applies to whichever atlas serves them, which is why it is not named for either.
+    // **This was `pad1`**, so it costs no size change and `cascades` stays on its boundary.
+    uint local_shadow_taps;
+    // The PN-triangle amplification pass (§4.71). Eight scalars, the last two padding, because
+    // `cascades` has to stay on a 16-byte boundary - see the header for why six became eight.
+    float tess_edge_pixels;
+    float tess_max;
+    float tess_min;
+    float pn_strength;
+    float pn_flat_threshold;
+    float target_width;
+    float target_height;
+    float pad_tess;
+    // **Last, and it has to stay last** - the header's `offsetof` asserts pin `cascades` to 176
+    // and nothing pins a field before it. This block sat above `dyn_shadow_texture` here while
+    // the header had it below `pad1`, and the two disagreed for four fields with no diagnostic
+    // (§4.67): a permutation preserves the size, so `sizeof(GpuFrameData) == 272` still held.
+    uint light_flags;        // kLocalLightsOn / kMapShadowsOn / kLocalShadowsOn
     // Per cascade: xy the box's snapped centre in light space, z the reciprocal of its
     // half-extent, w its depth bias already converted out of texels.
     float4 cascades[kMaxShadowCascades];
@@ -197,6 +220,12 @@ static const uint kLocalLightsOn = 0x1u;
 // with separate knobs, so each asks about itself.
 static const uint kMapShadowsOn = 0x2u;
 static const uint kLocalShadowsOn = 0x4u;
+// `render.local_light_window`, on by default. Off restores D3D8's hard cutoff at Range, so the
+// windowed tail can be A/B'd inside ONE PAUSED FRAME rather than across two launches - which is
+// the only way to read this change, because §4.30 measured that two settles of level02 drift by
+// the objectives text's fade and the units' animation phase and nothing separates that from a
+// renderer difference in a whole-frame number.
+static const uint kLocalLightWindowOn = 0x8u;
 
 [[vk::push_constant]]
 ConstantBuffer<Push> pc;
@@ -305,6 +334,56 @@ static const float3 kFaceUp[6] = {float3(0, 1, 0),  float3(0, 1, 0), float3(0, 0
 static const float kMapShadowFace = 64.0;
 static const float kMapShadowTilesPerRow = 64.0;
 static const float kMapShadowNear = 1.0 / 64.0;
+// The per-frame atlas (§4.66). kDynShadowFace / kDynShadowAtlas in src/VkDraw.h - **256-texel
+// faces where the static atlas has 64**, because there are 42 slots here against 682 and the
+// blockiness is what a bigger face buys. The 4096² atlas is what keeps all 42 at that size
+// (§4.69); at 2048² a 256-texel face would leave ten.
+static const float kDynShadowFace = 256.0;
+static const float kDynShadowTilesPerRow = 16.0;
+
+// One cube in one atlas, as the lookup needs to see it. Passing these rather than reading them
+// from `frame` is what lets the static and the per-frame atlas share the body below: they differ
+// only in the image, the face size and the bias, and a second copy of that projection is a second
+// place for it to disagree with the bake.
+struct ShadowAtlas {
+    uint texture;
+    uint sampler_index;
+    float face;          // texels across one cube face
+    float tiles_per_row;
+    float offset;        // the normal offset, in texels at the fragment's own distance
+    // The PCF kernel's radius in texels: 0 is a single tap, 1 is 3x3, 2 is 5x5. **Not a property
+    // of the image** - the same atlas is read once per fragment by a D3D point light, which needs
+    // filtering, and eleven times by the map lights, which do not (§4.69). So the builders below
+    // leave it at the caller's default and each call site sets what it wants.
+    float radius;
+};
+
+// The two atlases, each built from the frame block once at the point of use. `kNoTexture` in
+// `texture` is what every caller tests, and it means "off", "could not be created" and "nothing in
+// it this frame" alike.
+// `radius` 0 - a single tap - is the default both builders return, because it is what the map
+// lights want and they are by far the heaviest reader. A D3D light's call site widens it.
+ShadowAtlas static_atlas() {
+    ShadowAtlas out;
+    out.texture = pc.frame[0].map_shadow_texture;
+    out.sampler_index = pc.frame[0].map_shadow_sampler;
+    out.face = kMapShadowFace;
+    out.tiles_per_row = kMapShadowTilesPerRow;
+    out.offset = pc.frame[0].map_shadow_offset;
+    out.radius = 0.0;
+    return out;
+}
+
+ShadowAtlas dynamic_atlas() {
+    ShadowAtlas out;
+    out.texture = pc.frame[0].dyn_shadow_texture;
+    out.sampler_index = pc.frame[0].dyn_shadow_sampler;
+    out.face = kDynShadowFace;
+    out.tiles_per_row = kDynShadowTilesPerRow;
+    out.offset = pc.frame[0].dyn_shadow_offset;
+    out.radius = 0.0;
+    return out;
+}
 
 // How lit `world_position` is by one light with a cube in the static atlas, 0 to 1. `slot` is
 // which cube.
@@ -321,14 +400,13 @@ static const float kMapShadowNear = 1.0 / 64.0;
 // texel or two cancels exactly that. A depth offset large enough to do the same job here would
 // detach every shadow from its caster by metres.
 float cube_shadow_visibility(float3 world_position, float3 normal, float3 light_position,
-                             float light_range, uint slot) {
-    const GpuFrameData frame = pc.frame[0];
+                             float light_range, uint slot, ShadowAtlas atlas) {
     const float range = max(light_range, 1e-3);
     float3 delta = world_position - light_position;
-    // The offset is in texels *at this distance*, and a face is 90 degrees across
-    // `kMapShadowFace` of them, so one texel spans `2 * distance / kMapShadowFace` world units.
-    const float texel = 2.0 * length(delta) / kMapShadowFace;
-    delta += normal * (frame.map_shadow_offset * texel);
+    // The offset is in texels *at this distance*, and a face is 90 degrees across `atlas.face` of
+    // them, so one texel spans `2 * distance / atlas.face` world units.
+    const float texel = 2.0 * length(delta) / atlas.face;
+    delta += normal * (atlas.offset * texel);
 
     const float3 a = abs(delta);
     uint face;
@@ -354,20 +432,37 @@ float cube_shadow_visibility(float3 world_position, float3 normal, float3 light_
     const float scale = range / (range - near_plane);
     const float reference = scale * (1.0 - near_plane / z);
 
-    // Half a texel in from the tile's own edge, for §4.59's reason one atlas up: a filtered fetch
-    // at a boundary would otherwise blend in the neighbouring tile, which here is a different
-    // light's cube face rather than merely a different scale.
-    const float2 tile = float2(float(slot * 6u + face) % kMapShadowTilesPerRow,
-                               floor(float(slot * 6u + face) / kMapShadowTilesPerRow));
-    const float2 uv = clamp(local * 0.5 + 0.5, 0.5 / kMapShadowFace, 1.0 - 0.5 / kMapShadowFace);
-    const float2 atlas = (tile + uv) / kMapShadowTilesPerRow;
-    // One tap, not nine. The map lights are a *sum* - a fragment on level02 is in range of a mean
-    // of 11.5 of them (§4.54) - so the filtering the sun's map needs from PCF is already there in
-    // the average, and nine taps a light would be a hundred a fragment.
-    const float depth = textures[frame.map_shadow_texture]
-                            .SampleLevel(samplers[frame.map_shadow_sampler], atlas, 0.0)
-                            .r;
-    return reference <= depth ? 1.0 : 0.0;
+    const float2 tile = float2(float(slot * 6u + face) % atlas.tiles_per_row,
+                               floor(float(slot * 6u + face) / atlas.tiles_per_row));
+    const float2 centre = local * 0.5 + 0.5;
+    // **`radius` taps a side, and it is the CALLER's** (§4.69). One tap is right for the map
+    // lights and wrong for D3D's: this body is shared, and the "one tap, not nine" it used to hard-
+    // code is a measurement about the STDLIGHT rig - a fragment on level02 is in range of a mean of
+    // 11.5 of them (§4.54), so the averaging PCF would buy is already in the sum, and nine taps a
+    // light there would be a hundred a fragment. A point light from an explosion has NOTHING
+    // averaging it: one or two reach a fragment, so the hard 0/1 compare is the visible edge, and
+    // it is what play reported as jagged.
+    //
+    // Half a texel in from the tile's own edge, clamped per tap rather than once, for §4.59's
+    // reason one atlas up: a tap at the boundary reads the neighbouring tile, which here is a
+    // different light's cube face rather than merely a different scale.
+    const float2 lo = float2(0.5, 0.5) / atlas.face;
+    const float2 hi = float2(1.0, 1.0) - lo;
+    const int r = int(atlas.radius);
+    float lit = 0.0;
+    float taps = 0.0;
+    for (int y = -r; y <= r; ++y) {
+        for (int x = -r; x <= r; ++x) {
+            const float2 uv = clamp(centre + float2(float(x), float(y)) / atlas.face, lo, hi);
+            // SampleLevel, not Sample: this runs under a branch on the material, where an
+            // implicit-derivative fetch is undefined - the same rule sun_visibility follows.
+            const float depth = textures[atlas.texture].SampleLevel(
+                samplers[atlas.sampler_index], (tile + uv) / atlas.tiles_per_row, 0.0).r;
+            lit += reference <= depth ? 1.0 : 0.0;
+            taps += 1.0;
+        }
+    }
+    return lit / taps;
 }
 
 // One light's geometry: the direction to it and the attenuation-times-spot factor D3D calls k,
@@ -428,6 +523,31 @@ LightGeometry light_geometry(GpuLight light, float3 world_position, float3 norma
     const float denominator = light.attenuation.x + light.attenuation.y * distance +
                               light.attenuation.z * distance * distance;
     out.k = denominator > 0.0 ? 1.0 / denominator : 1.0;
+    // **The range cutoff, windowed** - §4.64's defect in the path §4.64 did not cover.
+    //
+    // D3D8 switches a light off HARD at Range while `1/(a0 + a1 d + a2 d^2)` is still well above
+    // zero there. Measured off `render.frame_lights` on level02, the two fires are range 6,
+    // attenuation 0.959/0.0333/0.16666 and diffuse 4.0, so k at the boundary is **0.140** and the
+    // term it scales is 0.56 before N.L - cut to nothing across one pixel. That is a step in the
+    // VALUE, where the map lights' rim was only a kink in its slope.
+    //
+    // It is faithful to the original and was invisible there for §4.64's reason: D3D8 evaluated
+    // this per VERTEX, so the step landed inside a triangle and interpolation destroyed it. Moving
+    // the sum per pixel (§4.55) is what exposed it, exactly as it exposed the other one.
+    //
+    // **A window, not a replacement.** The map lights multiply by `(1 - t)(1 - t^4)` because there
+    // the linear `(1 - t)` *is* the fitted attenuation; here the attenuation is D3D's own curve and
+    // has to survive, so this only pulls its tail down. `(1 - t^4)^2` is zero in both value and
+    // first derivative at t = 1 - §4.64's criterion - and is within 1% of 1.0 out to a quarter of
+    // the range, so the near field, where the quadratic dominates anyway, is untouched.
+    //
+    // There is no bake to refit against: these are D3D lights, not `SHPVTINT`, so the only
+    // instrument is an A/B against `GKPLUS_RENDERER=d3d8` and the residual is expected to RISE.
+    if ((pc.frame[0].light_flags & kLocalLightWindowOn) != 0u) {
+        const float t = distance / max(light.attenuation.w, 1e-6);
+        const float window = saturate(1.0 - t * t * t * t);
+        out.k *= window * window;
+    }
     if (type >= 1.5) {
         // Spot. rho is measured along the cone axis, so it needs the direction from the light to
         // the vertex - the opposite of the vector the diffuse term wants.
@@ -443,18 +563,36 @@ LightGeometry light_geometry(GpuLight light, float3 world_position, float3 norma
                          light.spot.z);
         }
     }
-    // **The static shadow, last** - after the range test and the cone test have each already
-    // returned, exactly as the map lights' lookup sits behind theirs (§4.61). A light this
-    // fragment cannot see costs no texture fetch at all.
+    // **The shadow, last** - after the range test and the cone test have each already returned,
+    // exactly as the map lights' lookup sits behind theirs (§4.61). A light this fragment cannot
+    // see costs no texture fetch at all.
     //
-    // `direction.w` is this light's cube in the atlas, or -1 - which is the answer for a light
-    // that moves, one the sixteen reserved slots had no room for, and one whose cube has not been
-    // baked yet. All three are "unshadowed", which is where every D3D light was before §4.65.
-    const int slot = int(light.direction.w);
-    if (slot >= 0 && (pc.frame[0].light_flags & kLocalShadowsOn) != 0u &&
-        pc.frame[0].map_shadow_texture != kNoTexture) {
+    // **Two atlases, and the per-frame one wins.** `position.w` is this light's cube in the
+    // per-frame atlas (§4.66) and `direction.w` its cube in the static one (§4.65), each -1 for a
+    // light that has none. The per-frame cube is strictly the better answer where it exists - it
+    // was rasterised this frame from this frame's casters, so it holds the units and props the
+    // static one cannot and it holds a light that moved - so the static slot is a fallback for a
+    // light the 42 per-frame slots had no room for, and only that.
+    // **Both D3D paths filter** (§4.69). One or two of these reach a fragment, so nothing averages
+    // the 0/1 compare the way the map lights' sum does, and a single tap is a stair-stepped edge.
+    // The radius is a knob (`render.local_shadow_taps`) because it is the one thing here that
+    // trades frame time for the artefact play reported.
+    const float radius = float(pc.frame[0].local_shadow_taps);
+    const int dynamic_slot = int(light.position.w);
+    ShadowAtlas dyn = dynamic_atlas();
+    dyn.radius = radius;
+    if (dynamic_slot >= 0 && dyn.texture != kNoTexture) {
         out.shadow = cube_shadow_visibility(world_position, normal, light.position.xyz,
-                                            light.attenuation.w, uint(slot));
+                                            light.attenuation.w, uint(dynamic_slot), dyn);
+        return out;
+    }
+    const int slot = int(light.direction.w);
+    ShadowAtlas fixed = static_atlas();
+    fixed.radius = radius;
+    if (slot >= 0 && (pc.frame[0].light_flags & kLocalShadowsOn) != 0u &&
+        fixed.texture != kNoTexture) {
+        out.shadow = cube_shadow_visibility(world_position, normal, light.position.xyz,
+                                            light.attenuation.w, uint(slot), fixed);
     }
     return out;
 }
@@ -740,7 +878,7 @@ float3 map_light_sum(float3 world_position, float3 normal) {
         const int shadow_slot = int(light.axis.w);
         if (shadow_slot >= 0 && frame_shadow_texture != kNoTexture && map_shadows_on) {
             atten *= cube_shadow_visibility(world_position, normal, light.position.xyz,
-                                            light.position.w, uint(shadow_slot));
+                                            light.position.w, uint(shadow_slot), static_atlas());
             if (atten <= 0.0) {
                 continue;
             }
@@ -755,8 +893,14 @@ float3 map_light_sum(float3 world_position, float3 normal) {
 
 // The body, with the flat copies left to the entry point below. Two exits, and a third would be
 // easy to add - so nothing here writes `color_flat`.
-VertexOut shade_vertex(uint vertex_id) {
-    Vertex v = pc.vertices[pc.base_vertex + vertex_id];
+//
+// **Takes a surface point rather than a vertex id** so that the domain shader (§4.71) can hand it
+// a point on a PN patch instead of a pulled vertex. Everything downstream - the two non-lighting
+// paths, the per-pixel exit, `D3DRS_NORMALIZENORMALS`, the whole per-vertex light sum - is then
+// shared rather than written twice, which is what keeps the tessellated and untessellated paths
+// from drifting apart. `local_pos` and `local_normal` are OBJECT space, exactly as the canonical
+// vertex stores them.
+VertexOut shade_surface(float3 local_pos, float3 local_normal, float4 uv, float4 vertex_colour) {
     GpuDrawRecord draw = pc.draws[pc.record];
 
     VertexOut output;
@@ -767,17 +911,16 @@ VertexOut shade_vertex(uint vertex_id) {
     // `mul(v, M)` and not `mul(M, v)`: that is D3D's row-vector convention, and combined with
     // -matrix-layout-row-major it means the CPU can upload world*view*proj exactly as the game
     // composes it, with no transpose step to get backwards.
-    const float4 local = float4(v.pos.xyz, 1.0);
+    const float4 local = float4(local_pos, 1.0);
     output.position =
         mul(local, rows_to_matrix(draw.mvp[0], draw.mvp[1], draw.mvp[2], draw.mvp[3]));
-    output.uv = v.uv;
+    output.uv = uv;
     output.specular = float4(0, 0, 0, 0);
     // Written before either exit below, because Slang requires every output to be assigned on
     // every path and the fragment shader reads these only on the lit one.
     output.world_position = float3(0, 0, 0);
     output.world_normal = float3(0, 0, 1);
 
-    const float4 vertex_colour = unpack_colour(asuint(v.normal_and_color.w));
     if ((draw.lighting & kLightSum) == 0u) {
         // Two non-lighting paths. kLitCollapse is the previous build's behaviour, kept so the
         // two can be compared on one paused frame rather than across two launches - which is
@@ -794,7 +937,7 @@ VertexOut shade_vertex(uint vertex_id) {
     // The inverse transpose, so a non-uniform scale in the world matrix does not tilt the
     // normal. Normalised only under D3DRS_NORMALIZENORMALS, because D3D does not do it
     // otherwise and the resulting length change is a real difference in brightness.
-    float3 normal = mul(v.normal_and_color.xyz,
+    float3 normal = mul(local_normal,
                         float3x3(draw.normal_transform[0].xyz, draw.normal_transform[1].xyz,
                                  draw.normal_transform[2].xyz));
     if ((draw.lighting & kNormaliseNormals) != 0u) {
@@ -828,10 +971,200 @@ VertexOut shade_vertex(uint vertex_id) {
 
 [shader("vertex")]
 VertexOut vertex_main(uint vertex_id: SV_VertexID) {
-    VertexOut output = shade_vertex(vertex_id);
+    Vertex v = pc.vertices[pc.base_vertex + vertex_id];
+    VertexOut output = shade_surface(v.pos.xyz, v.normal_and_color.xyz, v.uv,
+                                     unpack_colour(asuint(v.normal_and_color.w)));
     // The same values, differing only in how they are interpolated. Mirrored here, at the one
     // exit there is, rather than at each exit of the body above - which is the whole reason the
     // body is a separate function.
+    output.color_flat = output.color;
+    output.specular_flat = output.specular;
+    return output;
+}
+
+// --- PN-triangle amplification (§4.71) --------------------------------------------------------
+//
+// Vlachos et al.'s curved point-normal triangle: a cubic Bezier patch fitted to three corner
+// positions and three corner normals. The whole reason it is the right construction for THIS game
+// is one property of its edge control point,
+//
+//     b210 = (2*P1 + P2 - dot(P2 - P1, N1) * N1) / 3
+//
+// which collapses to the linear `(2*P1 + P2)/3` exactly when `N1` is perpendicular to the edge -
+// i.e. when the corner's normal is its face normal. A flat-shaded wall therefore reproduces
+// itself bit for bit at any tessellation factor, with no threshold and no per-material opt-in,
+// while a smooth-normalled pipe curves. Hard edges cost nothing because the mathematics, not a
+// heuristic, leaves them alone.
+//
+// The same expression is why the patch is **watertight across a shared edge**: `b210` and `b120`
+// for edge (P1,P2) are functions of P1, P2, N1 and N2 alone, so two triangles sharing that edge
+// build the same boundary curve. Everything below preserves that invariant, and the one thing
+// that would break it is a term computed from the triangle's centroid or its third vertex - which
+// is why the tessellation factors are per-edge and `pn_flat_threshold` tests a per-edge quantity.
+//
+// Everything here is in OBJECT space, so `shade_surface`'s own `mvp` projects the result and no
+// extra matrix is needed anywhere.
+
+// What the vertex stage hands the tessellator: the canonical vertex, unpacked and untransformed.
+struct ControlPoint {
+    float3 pos;
+    float3 normal;
+    float4 uv;
+    float4 colour;
+};
+
+struct PatchConstants {
+    float edges[3]  : SV_TessFactor;
+    float inner     : SV_InsideTessFactor;
+};
+
+[shader("vertex")]
+ControlPoint tess_vertex_main(uint vertex_id: SV_VertexID) {
+    Vertex v = pc.vertices[pc.base_vertex + vertex_id];
+    ControlPoint cp;
+    cp.pos = v.pos.xyz;
+    cp.normal = v.normal_and_color.xyz;
+    cp.uv = v.uv;
+    // Unpacked here rather than in the domain shader because the tessellator interpolates it: a
+    // packed D3DCOLOR cannot be blended as an integer, and unpacking after interpolation would
+    // mean interpolating the *bits*.
+    cp.colour = unpack_colour(asuint(v.normal_and_color.w));
+    return cp;
+}
+
+// One patch edge's factor, in the target's own pixels.
+//
+// **A function of its two endpoints and nothing else.** That is the watertight rule, and it is
+// why this takes two clip positions rather than the patch: a factor derived from the centroid, or
+// from the triangle's area, differs between the two triangles sharing an edge and tears a seam
+// open along it. `length(a - b)` is symmetric, so the two also agree bit for bit rather than
+// merely closely.
+float edge_factor(float4 a, float4 b) {
+    // `abs(w)` rather than a guard on the sign: a vertex behind the eye has a negative w, and the
+    // divide would otherwise mirror it to the far side of the screen and read as a short edge.
+    // The magnitude is meaningless there, but it is large and finite, so the clamp below takes it
+    // to `tess_max` - which is the right answer for something straddling the near plane.
+    const float wa = max(abs(a.w), 1e-4);
+    const float wb = max(abs(b.w), 1e-4);
+    const float2 half_target = float2(pc.frame[0].target_width, pc.frame[0].target_height) * 0.5;
+    const float2 pa = a.xy / wa * half_target;
+    const float2 pb = b.xy / wb * half_target;
+    const float pixels = length(pa - pb);
+    return clamp(pixels / max(pc.frame[0].tess_edge_pixels, 1.0), pc.frame[0].tess_min,
+                 pc.frame[0].tess_max);
+}
+
+PatchConstants hull_constants(InputPatch<ControlPoint, 3> patch) {
+    PatchConstants out;
+    const float4x4 mvp = rows_to_matrix(pc.draws[pc.record].mvp[0], pc.draws[pc.record].mvp[1],
+                                        pc.draws[pc.record].mvp[2], pc.draws[pc.record].mvp[3]);
+    const float4 c0 = mul(float4(patch[0].pos, 1.0), mvp);
+    const float4 c1 = mul(float4(patch[1].pos, 1.0), mvp);
+    const float4 c2 = mul(float4(patch[2].pos, 1.0), mvp);
+    // **Edge i is the one OPPOSITE control point i**, which is the domain's own convention: outer
+    // factor 0 governs the edge where the first barycentric coordinate is zero, and that edge
+    // joins control points 1 and 2. Assigning them in the obvious (0,1), (1,2), (2,0) order
+    // instead still produces a plausible picture and cracks along every shared edge, because the
+    // two triangles either side then apply their agreed factor to different edges.
+    out.edges[0] = edge_factor(c1, c2);
+    out.edges[1] = edge_factor(c2, c0);
+    out.edges[2] = edge_factor(c0, c1);
+    // The interior has no neighbour to agree with, so it is free to be the mean.
+    out.inner = (out.edges[0] + out.edges[1] + out.edges[2]) / 3.0;
+    return out;
+}
+
+[shader("hull")]
+[domain("tri")]
+[partitioning("fractional_odd")]
+[outputtopology("triangle_cw")]
+[outputcontrolpoints(3)]
+[patchconstantfunc("hull_constants")]
+ControlPoint hull_main(InputPatch<ControlPoint, 3> patch, uint id: SV_OutputControlPointID) {
+    return patch[id];
+}
+
+// The tangent term `dot(Pj - Pi, Ni)`, with the two knobs applied.
+//
+// The threshold is tested on the term divided by the edge's length - the same quantity
+// `render.normal_census` reports - so it means the same thing on a large triangle and a small
+// one. Both operations are functions of (Pi, Pj, Ni) alone, so the watertight property survives
+// them: the triangle on the other side of edge (i,j) computes, tests and snaps the identical
+// number.
+float pn_weight(float3 pi, float3 pj, float3 ni) {
+    const float3 edge = pj - pi;
+    const float length_sq = dot(edge, edge);
+    if (length_sq < 1e-18) {
+        return 0.0;
+    }
+    const float w = dot(edge, ni);
+    // `w * w` against `threshold^2 * length^2` rather than a square root on the hot path; the
+    // comparison is exact in the same places the rooted one would be.
+    const float threshold = pc.frame[0].pn_flat_threshold;
+    if (w * w <= threshold * threshold * length_sq) {
+        return 0.0; // near enough flat that the corner is made exactly flat
+    }
+    return w * pc.frame[0].pn_strength;
+}
+
+// **The spacing and the winding are repeated here on purpose.** In HLSL they are hull-shader
+// attributes, but SPIR-V carries the tessellation execution modes on the *evaluation* stage, and
+// Slang emits only what each entry point declares. Without these the domain shader defaults to
+// SpacingEqual and the two stages disagree - which Vulkan validation reports on every draw as
+// "the spacing specified in tessellation control shader does not match". Measured, not guessed.
+[shader("domain")]
+[domain("tri")]
+[partitioning("fractional_odd")]
+[outputtopology("triangle_cw")]
+VertexOut domain_main(PatchConstants constants, float3 bary: SV_DomainLocation,
+                      const OutputPatch<ControlPoint, 3> patch) {
+    const float3 p1 = patch[0].pos, p2 = patch[1].pos, p3 = patch[2].pos;
+    // Normalised here and not in the vertex stage: the construction's flatness property is about
+    // the *direction* of the normal, and an unnormalised one would scale the tangent offset by
+    // its length. `shade_surface` still receives the raw interpolated normal below, because
+    // whether D3D normalises is `D3DRS_NORMALIZENORMALS`'s business and not this pass's.
+    const float3 n1 = normalize(patch[0].normal);
+    const float3 n2 = normalize(patch[1].normal);
+    const float3 n3 = normalize(patch[2].normal);
+
+    // The six edge control points. Named for their barycentric exponents, as Vlachos does:
+    // b210 carries u^2*v, so it sits on edge 1->2, nearer corner 1.
+    const float3 b210 = (2.0 * p1 + p2 - pn_weight(p1, p2, n1) * n1) / 3.0;
+    const float3 b120 = (2.0 * p2 + p1 - pn_weight(p2, p1, n2) * n2) / 3.0;
+    const float3 b021 = (2.0 * p2 + p3 - pn_weight(p2, p3, n2) * n2) / 3.0;
+    const float3 b012 = (2.0 * p3 + p2 - pn_weight(p3, p2, n3) * n3) / 3.0;
+    const float3 b102 = (2.0 * p3 + p1 - pn_weight(p3, p1, n3) * n3) / 3.0;
+    const float3 b201 = (2.0 * p1 + p3 - pn_weight(p1, p3, n1) * n1) / 3.0;
+    // The interior point, pulled half again from the average of the six towards itself. This one
+    // IS a function of all three corners - which is allowed precisely because it only ever
+    // contributes where u, v and w are all non-zero, i.e. strictly inside the patch, and the
+    // watertight requirement is about the boundary.
+    const float3 e = (b210 + b120 + b021 + b012 + b102 + b201) / 6.0;
+    const float3 v = (p1 + p2 + p3) / 3.0;
+    const float3 b111 = e + (e - v) * 0.5;
+
+    const float u = bary.x, vv = bary.y, w = bary.z;
+    const float u2 = u * u, v2 = vv * vv, w2 = w * w;
+    const float3 position = p1 * (u2 * u) + p2 * (v2 * vv) + p3 * (w2 * w) +
+                            b210 * (3.0 * u2 * vv) + b120 * (3.0 * u * v2) +
+                            b201 * (3.0 * u2 * w) + b021 * (3.0 * v2 * w) +
+                            b102 * (3.0 * u * w2) + b012 * (3.0 * vv * w2) +
+                            b111 * (6.0 * u * vv * w);
+
+    // **Linearly interpolated, not Vlachos' quadratic normal field**, and deliberately: the
+    // per-pixel path (§4.52) already interpolates and normalises linearly across a triangle, so
+    // keeping it means a tessellated draw differs from an untessellated one ONLY in silhouette.
+    // That is what makes the A/B readable - a quadratic field would move the shading too, and the
+    // two effects could not be told apart in a difference image.
+    const float3 normal = patch[0].normal * u + patch[1].normal * vv + patch[2].normal * w;
+    const float4 uv = patch[0].uv * u + patch[1].uv * vv + patch[2].uv * w;
+    const float4 colour = patch[0].colour * u + patch[1].colour * vv + patch[2].colour * w;
+
+    VertexOut output = shade_surface(position, normal, uv, colour);
+    // Flat shading and tessellation do not compose - the provoking vertex of a GENERATED triangle
+    // is not the provoking vertex of the patch - but nothing tessellated here is flat-shaded:
+    // D3DRS_SHADEMODE is FLAT on 2% of draws and all of them are the stencil shadow (§4.31),
+    // which is not map geometry. Mirrored anyway so the varying is written on every path.
     output.color_flat = output.color;
     output.specular_flat = output.specular;
     return output;

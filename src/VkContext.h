@@ -79,8 +79,18 @@ struct DeviceCaps {
   // call per caster per face without it: slower to bake, identical atlas.
   bool multi_draw_indirect = false;
 
+  // Vulkan 1.0 core and optional. The two extra stages the PN-triangle amplification pass needs
+  // (§4.71). Not required, and deliberately not part of HasRequiredFeatures: without it the
+  // tessellated pipelines are simply never built and every draw takes the ordinary two-stage
+  // one, which is the same frame the renderer drew before the feature existed.
+  bool tessellation_shader = false;
+
   // Limits that size the design rather than merely describing the device.
   uint32_t max_bindless_textures = 0; // maxDescriptorSetUpdateAfterBindSampledImages
+  // maxTessellationGenerationLevel - the ceiling on a tess factor. 64 is the guaranteed
+  // minimum and every desktop device reports exactly that, so `render.tess_max` clamps to it
+  // rather than to a constant.
+  uint32_t max_tessellation_level = 0;
   uint32_t max_push_constants = 0;    // must fit FrameAddrs; 128 is the guaranteed minimum
   uint32_t graphics_queue_family = 0;
   uint64_t device_local_bytes = 0;

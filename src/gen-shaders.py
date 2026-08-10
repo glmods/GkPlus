@@ -54,6 +54,13 @@ OUTPUT = ROOT / "src" / "Shaders.gen.inc.h"
 ENTRY_POINTS = [
     ("world.slang", "vertex_main", "vertex"),
     ("world.slang", "fragment_main", "fragment"),
+    # The PN-triangle amplification pass (§4.71). A vertex stage of its own rather than a reuse of
+    # `vertex_main`: a tessellated pipeline's vertex shader outputs a control point, not a
+    # VertexOut, so leaving `vertex_main` untouched is what makes the untessellated path
+    # bit-identical by construction rather than by inspection.
+    ("world.slang", "tess_vertex_main", "vertex"),
+    ("world.slang", "hull_main", "hull"),
+    ("world.slang", "domain_main", "domain"),
     # The first compute entry point here. The `stage` string goes straight to `slangc -stage`, so
     # this list is all it took - nothing else in this script is stage-aware.
     ("lightgrid.slang", "build_grid", "compute"),
@@ -61,6 +68,12 @@ ENTRY_POINTS = [
     # The same pass driven by vkCmdDrawIndexedIndirect - the map lights' bake, which needs the
     # record out of a buffer rather than out of the push (§4.62).
     ("shadow.slang", "map_shadow_vertex", "vertex"),
+    # The tessellated twins (§4.71). Two vertex stages, because that is the only place the direct
+    # and indirect paths differ - one hull and one domain then serve all four shadow pipelines.
+    ("shadow.slang", "shadow_tess_vertex", "vertex"),
+    ("shadow.slang", "map_shadow_tess_vertex", "vertex"),
+    ("shadow.slang", "shadow_hull", "hull"),
+    ("shadow.slang", "shadow_domain", "domain"),
 ]
 
 SLANGC_ARGS = [

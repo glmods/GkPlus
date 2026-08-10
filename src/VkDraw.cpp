@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -90,6 +91,12 @@ VkFormat ColourFormat = VK_FORMAT_UNDEFINED;
 std::map<PipelineState, VkPipeline> Pipelines;
 VkShaderModule VertexModule = VK_NULL_HANDLE;
 VkShaderModule FragmentModule = VK_NULL_HANDLE;
+// The PN-triangle amplification pass (§4.71). All three stay VK_NULL_HANDLE on a device with no
+// `tessellationShader`, which is the one test `CreatePipelineFor` makes before building a
+// tessellated variant - so "this device cannot" and "nothing asked for it" are the same state.
+VkShaderModule TessVertexModule = VK_NULL_HANDLE;
+VkShaderModule HullModule = VK_NULL_HANDLE;
+VkShaderModule DomainModule = VK_NULL_HANDLE;
 
 VkImage Depth = VK_NULL_HANDLE;
 VkDeviceMemory DepthMemory = VK_NULL_HANDLE;
@@ -315,15 +322,41 @@ VkStencilOp ToStencilOp(uint32_t d3d) {
 }
 
 VkPipeline CreatePipelineFor(const PipelineState &state) {
+  // A state asking for tessellation on a device that has none, or before the modules exist, is a
+  // state that must not be built - PipelineFor caches the null and RecordDraws skips the draw,
+  // which would drop the level. `WantsTessellation` is what keeps that from happening: it clears
+  // the bit before the key is ever formed, so this is a belt-and-braces check rather than a path
+  // anything reaches.
+  const bool tessellate = state.tessellate != 0 && HullModule != VK_NULL_HANDLE &&
+                          DomainModule != VK_NULL_HANDLE &&
+                          TessVertexModule != VK_NULL_HANDLE;
+
   // The entry point names are the Slang ones, kept verbatim by -fvk-use-entrypoint-name rather
   // than being rewritten to "main". Worth the flag: two modules both called "main" is exactly
   // the sort of thing that goes unnoticed until the wrong stage is bound.
+  //
+  // The tessellated variant swaps the vertex stage as well as adding two: its vertex shader
+  // outputs a ControlPoint where the ordinary one outputs a finished VertexOut. That is what
+  // leaves `vertex_main` byte-for-byte the shader it was, so `render.tessellation = false` is
+  // bit-identical by construction rather than by inspection.
   const VkPipelineShaderStageCreateInfo stages[] = {
       {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
-       VK_SHADER_STAGE_VERTEX_BIT, VertexModule, "vertex_main", nullptr},
+       VK_SHADER_STAGE_VERTEX_BIT, tessellate ? TessVertexModule : VertexModule,
+       tessellate ? "tess_vertex_main" : "vertex_main", nullptr},
       {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
        VK_SHADER_STAGE_FRAGMENT_BIT, FragmentModule, "fragment_main", nullptr},
+      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+       VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, HullModule, "hull_main", nullptr},
+      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+       VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, DomainModule, "domain_main", nullptr},
   };
+
+  // Three control points, because a patch is a triangle. The index buffer is unchanged: a
+  // triangle list and a 3-control-point patch list consume indices identically, which is why
+  // this needs no second index layout and no re-upload.
+  VkPipelineTessellationStateCreateInfo tessellation = {
+      VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
+  tessellation.patchControlPoints = 3;
 
   // No vertex input state at all: the vertex shader pulls from the arena by address. This is
   // the whole reason a draw binds nothing.
@@ -332,7 +365,11 @@ VkPipeline CreatePipelineFor(const PipelineState &state) {
 
   VkPipelineInputAssemblyStateCreateInfo assembly = {
       VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-  assembly.topology = ToTopology(state.topology);
+  // PATCH_LIST and not the draw's own topology: with a tessellator in the pipeline the input
+  // assembler produces patches, and the primitive the rasteriser eventually sees is the domain
+  // shader's, not this one's. `WantsTessellation` has already required a triangle list, so this
+  // never silently reinterprets a strip.
+  assembly.topology = tessellate ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : ToTopology(state.topology);
 
   VkPipelineViewportStateCreateInfo viewport = {
       VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -430,8 +467,9 @@ VkPipeline CreatePipelineFor(const PipelineState &state) {
 
   VkGraphicsPipelineCreateInfo info = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
   info.pNext = &rendering;
-  info.stageCount = 2;
+  info.stageCount = tessellate ? 4 : 2;
   info.pStages = stages;
+  info.pTessellationState = tessellate ? &tessellation : nullptr;
   info.pVertexInputState = &vertex_input;
   info.pInputAssemblyState = &assembly;
   info.pViewportState = &viewport;
@@ -474,10 +512,25 @@ bool CreatePipelineLayout() {
   if (VertexModule == VK_NULL_HANDLE || FragmentModule == VK_NULL_HANDLE) {
     return Fail("could not create the shader modules");
   }
+  // Only where the device has the feature: a shader module for a stage the device cannot run is
+  // accepted by vkCreateShaderModule and rejected by vkCreateGraphicsPipelines, so gating here
+  // keeps the failure out of the per-draw path entirely rather than costing one attempt per
+  // pipeline state.
+  if (Caps().tessellation_shader) {
+    TessVertexModule = CreateModule(kTessVertexMainSpv, sizeof(kTessVertexMainSpv));
+    HullModule = CreateModule(kHullMainSpv, sizeof(kHullMainSpv));
+    DomainModule = CreateModule(kDomainMainSpv, sizeof(kDomainMainSpv));
+  }
 
   auto set_layout = reinterpret_cast<VkDescriptorSetLayout>(BindlessDescriptorSetLayout());
-  VkPushConstantRange range = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                               sizeof(PushConstants)};
+  // The two tessellation stages are in the range whether or not this device can run them: a push
+  // constant block must match across every stage of a pipeline, and a range naming a stage no
+  // pipeline uses costs nothing. Leaving them out would make every tessellated pipeline invalid
+  // in a way that only shows up as validation noise at draw time.
+  VkPushConstantRange range = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                                   VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                                   VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+                               0, sizeof(PushConstants)};
   VkPipelineLayoutCreateInfo layout = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
   layout.setLayoutCount = set_layout != VK_NULL_HANDLE ? 1 : 0;
   layout.pSetLayouts = &set_layout;
@@ -513,10 +566,22 @@ struct ShadowPushConstants {
   uint32_t record;      // the direct path only
   uint32_t base_vertex; // ... and so is this
   float light_matrix[16];
+  // The PN pass (§4.71). Only the two that shape the patch, plus one uniform factor - see
+  // shadow.slang for why the factors need not match the world pass's and the two knobs must.
+  float pn_strength;
+  float pn_flat_threshold;
+  float tess_factor;
+  // **Slang rounds the block up to its own alignment and this side must too.** The struct
+  // contains a float4 array, so its alignment is 16 and its size rounds to a multiple of 16 -
+  // 112, not the 108 the fields add up to. Caught by `src/gen-shader-abi.py`, which reported the
+  // Slang side as 112 bytes against this assert's 108; without it the range and the push would
+  // have disagreed with the shader's idea of the block by four bytes.
+  float pad_shadow;
 };
-// 96: three addresses, two words, and the matrix. Well inside the guaranteed 128, which this
-// block can afford because it is its own layout rather than a share of the world pass's.
-static_assert(sizeof(ShadowPushConstants) == 96);
+// 112: three addresses, two words, the matrix, the three PN scalars, and the pad above. Still
+// inside the guaranteed 128, which this block can afford because it is its own layout rather than
+// a share of the world pass's.
+static_assert(sizeof(ShadowPushConstants) == 112);
 
 VkImage ShadowImage = VK_NULL_HANDLE;
 VkFormat ShadowFormat = VK_FORMAT_UNDEFINED;
@@ -528,6 +593,69 @@ VkImageView ShadowSampleView = VK_NULL_HANDLE;     // depth only, for sampling
 VkPipelineLayout ShadowLayout = VK_NULL_HANDLE;
 VkPipeline ShadowPipeline = VK_NULL_HANDLE;
 VkShaderModule ShadowModule = VK_NULL_HANDLE;
+// The PN-triangle twins (§4.71). One hull and one domain serve all four shadow pipelines,
+// because the draw record rides in the control point and that is the only thing the direct and
+// indirect paths disagree about. All of these stay null on a device with no `tessellationShader`,
+// and `ShadowStages` then reports one stage - which is the untessellated pipeline exactly.
+VkShaderModule ShadowTessVertexModule = VK_NULL_HANDLE;
+VkShaderModule MapShadowTessVertexModule = VK_NULL_HANDLE;
+VkShaderModule ShadowHullModule = VK_NULL_HANDLE;
+VkShaderModule ShadowDomainModule = VK_NULL_HANDLE;
+VkPipeline ShadowPipelineTess = VK_NULL_HANDLE;
+
+// Whether a tessellated shadow pipeline can be built at all. Separate from the runtime knob: this
+// is about the device and the modules, and it is what makes every `*Tess` pipeline below simply
+// absent rather than a failed create.
+bool ShadowTessAvailable() {
+  return ShadowHullModule != VK_NULL_HANDLE && ShadowDomainModule != VK_NULL_HANDLE;
+}
+
+// The stage list for one shadow pipeline, tessellated or not. `stages` must hold 3.
+//
+// One place for all four pipelines, so a change to the tessellated stage set cannot reach three of
+// them and miss the fourth - which is exactly the shape of defect §4.67 cost two sections to find.
+uint32_t ShadowStages(VkPipelineShaderStageCreateInfo *stages, VkShaderModule vertex_module,
+                      const char *vertex_entry, bool tessellate) {
+  stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+               VK_SHADER_STAGE_VERTEX_BIT, vertex_module, vertex_entry, nullptr};
+  if (!tessellate) {
+    return 1;
+  }
+  stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+               VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, ShadowHullModule, "shadow_hull",
+               nullptr};
+  stages[2] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+               VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, ShadowDomainModule, "shadow_domain",
+               nullptr};
+  return 3;
+}
+
+// Every stage the shadow push range names. A push must cover the whole overlapping range and not
+// merely the stages that will read it, so this is one constant rather than a literal at each of
+// the five push sites - which is how the world pass's equivalent came to be wrong for a build.
+constexpr VkShaderStageFlags kShadowPushStages = VK_SHADER_STAGE_VERTEX_BIT |
+                                                 VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                                                 VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+
+// Whether the shadow passes take their tessellated pipelines this frame. Three conditions, and
+// `render.tess_shadows` is the separable one: the bake is where the cost is, so a frame-time
+// regression has to be attributable to one half of the feature rather than to the whole of it.
+bool ShadowTessellating() {
+  return TessellationEnabled() && TessellationShadows() && ShadowTessAvailable();
+}
+
+// The three PN fields every shadow push carries.
+//
+// **The two knobs are filled whether or not this pass is tessellating**, and the factor is what
+// switches: they have to be the ones the colour pass used, because the patch is a function of them
+// and the shadow has to be cast by the surface actually drawn. A factor of 1 makes the pass sample
+// that same patch at its corners, which is the untessellated triangle.
+void FillShadowTessPush(ShadowPushConstants &push) {
+  const TessellationParams &tess = TessParams();
+  push.pn_strength = tess.pn_strength;
+  push.pn_flat_threshold = tess.pn_flat_threshold;
+  push.tess_factor = tess.shadow_factor < 1.0f ? 1.0f : tess.shadow_factor;
+}
 bool ShadowReady = false;
 bool SunShadowsEnabled = true;
 // See SetStencilShadow in VkDraw.h. Draw the game's own blob shadow as well as the sun's map.
@@ -558,6 +686,13 @@ bool CreateShadowPass() {
   ShadowModule = CreateModule(kShadowVertexSpv, sizeof(kShadowVertexSpv));
   if (ShadowModule == VK_NULL_HANDLE) {
     return Fail("could not create the shadow shader module");
+  }
+  // The PN twins, only where the device can run them (§4.71). Not a failure if they are absent:
+  // the shadow passes then draw the untessellated caster set, which is what they did before.
+  if (Caps().tessellation_shader) {
+    ShadowTessVertexModule = CreateModule(kShadowTessVertexSpv, sizeof(kShadowTessVertexSpv));
+    ShadowHullModule = CreateModule(kShadowHullSpv, sizeof(kShadowHullSpv));
+    ShadowDomainModule = CreateModule(kShadowDomainSpv, sizeof(kShadowDomainSpv));
   }
 
   // **D32_SFLOAT where the device has it, not the world pass's format.** Nothing here reads a
@@ -634,7 +769,7 @@ bool CreateShadowPass() {
   }
   WriteBindlessView(kShadowMapSlot, reinterpret_cast<uint64_t>(ShadowSampleView));
 
-  VkPushConstantRange range = {VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(ShadowPushConstants)};
+  VkPushConstantRange range = {kShadowPushStages, 0, sizeof(ShadowPushConstants)};
   VkPipelineLayoutCreateInfo layout = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
   layout.pushConstantRangeCount = 1;
   layout.pPushConstantRanges = &range;
@@ -642,16 +777,16 @@ bool CreateShadowPass() {
     return Fail("could not create the shadow pipeline layout");
   }
 
-  VkPipelineShaderStageCreateInfo stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-  stage.stage = VK_SHADER_STAGE_VERTEX_BIT;
-  stage.module = ShadowModule;
-  stage.pName = "shadow_vertex";
+  VkPipelineShaderStageCreateInfo stages[3] = {};
 
   VkPipelineVertexInputStateCreateInfo vertex_input = {
       VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
   VkPipelineInputAssemblyStateCreateInfo assembly = {
       VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
   assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineTessellationStateCreateInfo tessellation = {
+      VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
+  tessellation.patchControlPoints = 3;
   VkPipelineViewportStateCreateInfo viewport = {
       VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
   viewport.viewportCount = 1;
@@ -689,10 +824,10 @@ bool CreateShadowPass() {
 
   VkGraphicsPipelineCreateInfo info = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
   info.pNext = &rendering;
-  // One stage and **no fragment shader at all**, which is legal with no colour attachment and is
-  // what makes this pass nearly free per fragment.
-  info.stageCount = 1;
-  info.pStages = &stage;
+  // **No fragment shader at all**, which is legal with no colour attachment and is what makes this
+  // pass nearly free per fragment. The tessellated twin adds two stages in front of that, not
+  // behind it.
+  info.pStages = stages;
   info.pVertexInputState = &vertex_input;
   info.pInputAssemblyState = &assembly;
   info.pViewportState = &viewport;
@@ -702,9 +837,25 @@ bool CreateShadowPass() {
   info.pColorBlendState = &blend;
   info.pDynamicState = &dynamic;
   info.layout = ShadowLayout;
+
+  info.stageCount = ShadowStages(stages, ShadowModule, "shadow_vertex", false);
   if (vkCreateGraphicsPipelines(GetDevice(), VK_NULL_HANDLE, 1, &info, nullptr, &ShadowPipeline) !=
       VK_SUCCESS) {
     return Fail("could not create the shadow pipeline");
+  }
+  // Built up front beside it rather than on demand, so `render.tess_shadows` is a knob that can be
+  // flipped mid-level without a pipeline compile inside a frame - the same reason the two
+  // per-frame bake pipelines are both built eagerly.
+  if (ShadowTessAvailable() && ShadowTessVertexModule != VK_NULL_HANDLE) {
+    assembly.topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+    info.pTessellationState = &tessellation;
+    info.stageCount = ShadowStages(stages, ShadowTessVertexModule, "shadow_tess_vertex", true);
+    if (vkCreateGraphicsPipelines(GetDevice(), VK_NULL_HANDLE, 1, &info, nullptr,
+                                  &ShadowPipelineTess) != VK_SUCCESS) {
+      // Not fatal, and deliberately: the untessellated pipeline above is already built, so the
+      // pass keeps working and only the knob becomes inert.
+      ShadowPipelineTess = VK_NULL_HANDLE;
+    }
   }
   ShadowReady = true;
   return true;
@@ -725,6 +876,7 @@ VkImage MapShadowImage = VK_NULL_HANDLE;
 VkDeviceMemory MapShadowMemory = VK_NULL_HANDLE;
 VkImageView MapShadowView = VK_NULL_HANDLE;
 VkPipeline MapShadowPipeline = VK_NULL_HANDLE;
+VkPipeline MapShadowPipelineTess = VK_NULL_HANDLE; // §4.71's twin
 VkFormat MapShadowFormat = VK_FORMAT_UNDEFINED;
 VkDeviceSize MapShadowBytes = 0;
 bool MapShadowReady = false;
@@ -737,12 +889,31 @@ bool MapShadowReady = false;
 // into the frame's own scratch, which rotates, so a buffer built once and reused across the
 // bake's hundred-odd frames would address the wrong records on all but the first. 213 casters is
 // 4.3 KB, written with `vkCmdUpdateBuffer` inline in the command buffer.
+//
+// **And because it is rewritten every bake frame, it is a RING** - the same defect §4.66 hit head
+// on, one section earlier and one object over. The write and the `vkCmdDrawIndexedIndirect` that
+// reads it are in the same command buffer, so with frames in flight a bake that spans more than
+// one frame has frame N+1's transfer landing on bytes frame N's indirect draws are still reading,
+// and a draw picks up a half-written `indexCount`. A single-frame bake never sees it - which is
+// why this was latent rather than observed: at `map_shadow_rate` 256 level02's 51 lights write
+// once, where level01's 686 take three frames and race exactly like this.
 constexpr uint32_t kMaxMapCasters = 2048;
 constexpr uint32_t kMapIndirectStride = 20; // sizeof(VkDrawIndexedIndirectCommand)
 constexpr uint32_t kMapParamOffset = kMaxMapCasters * kMapIndirectStride;
 static_assert(kMapIndirectStride * kMaxMapCasters <= 65536,
               "vkCmdUpdateBuffer takes at most 64 KB in one call");
 static_assert(kMapParamOffset % 16 == 0, "the parameter array is read as uint2 by address");
+// Commands then parameters, and the whole thing is one slice of the ring. Four slices against two
+// frames in flight, the same margin (and the same 56 KB a slice) the per-frame bake's ring takes.
+constexpr uint32_t kMapIndirectSlice = kMapParamOffset + kMaxMapCasters * 8;
+constexpr uint32_t kMapIndirectRing = 4;
+static_assert(kMapIndirectRing >= 2, "at least as many slices as there are frames in flight");
+static_assert(kMapIndirectSlice % 16 == 0,
+              "a slice must keep the parameter array's alignment, since it is read by address");
+// Advanced once per bake that writes the batch, so consecutive bakes write disjoint regions. It is
+// deliberately not the frame index: the local half (§4.65) can bake on a frame the map half does
+// not, and what has to be disjoint is consecutive *writes*, not consecutive frames.
+uint64_t MapRingSerial = 0;
 VkBuffer MapIndirectBuffer = VK_NULL_HANDLE;
 VkDeviceMemory MapIndirectMemory = VK_NULL_HANDLE;
 uint64_t MapIndirectAddress = 0;
@@ -762,6 +933,9 @@ uint32_t MapShadowLastCasters = 0;    // how many the last baked slice submitted
 // See SetLocalLights in VkDraw.h. A diagnostic, on by default: off drops D3D's point and spot
 // lights from the sum, which measures the ceiling on what shadowing them could ever be worth.
 bool LocalLightsEnabled = true;
+// See SetLocalLightWindow in VkDraw.h. On by default: off restores D3D8's hard cutoff at Range,
+// which is what this renderer did before §4.70.
+bool LocalLightWindowEnabled = true;
 
 bool MapShadowsEnabled = true;
 // In atlas texels at the fragment's own distance from the light. 1.0 is the larger of two knees
@@ -850,6 +1024,12 @@ std::vector<uint32_t> MapShadowLightForSlot;
 // `cursor == 0`, because two independent producers write into one image now: with the map half
 // switched off the local half would otherwise never clear, and with it on a local slice arriving
 // first would clear the map tiles out from under it.
+//
+// **Anything that sets this back to false owes BOTH halves a re-bake**, because the clear takes the
+// whole 4096x4096 image and a tile nobody re-queues keeps the clear value - depth 1, "nothing
+// occludes" - for the rest of the level. `MapShadowCursor = 0` is the map half's re-queue and
+// `RequeueLocalShadows()` is the local half's; the second was missing, and §4.62 records what that
+// cost.
 bool MapShadowAtlasCleared = false;
 // 0 is "nothing baked yet" and MapLightsGeneration() never returns it for a loaded set, so a
 // fresh process re-bakes rather than trusting an empty table.
@@ -873,6 +1053,150 @@ const float kFaceUp[6][3] = {{0, 1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}, {0, 1,
 // range 111 with this value - while geometry closer to the light than `range * fraction` is
 // clipped and stops occluding. **Also duplicated in world.slang.**
 constexpr float kMapShadowNear = 1.0f / 64.0f;
+
+// --- the per-frame atlas (§4.66) ---------------------------------------------------------------
+//
+// Everything §4.65 could not do, and it does it by giving up the thing that made §4.65 cheap: this
+// one is rebuilt from nothing every frame. No key held across frames, no stability gate and no
+// eviction - so a light that moves is not a special case, it is the only case.
+
+VkImage DynShadowImage[kDynShadowRing] = {};
+VkDeviceMemory DynShadowMemory[kDynShadowRing] = {};
+VkImageView DynShadowView[kDynShadowRing] = {};
+VkDeviceSize DynShadowBytes = 0; // per slice
+// **Its own pipelines, not `MapShadowPipeline`.** The three want the same format, but
+// `render.map_shadow_indirect` rebuilds that one to switch entry points (§4.62) - so sharing would
+// silently change which entry point this bake ran the moment that knob was touched. Both are built
+// up front rather than on demand, which is what makes `render.dynamic_shadow_indirect` a knob that
+// can be flipped mid-level without a pipeline compile inside a frame.
+VkPipeline DynShadowPipeline = VK_NULL_HANDLE;       // `map_shadow_vertex`, one batch per bucket
+VkPipeline DynShadowDirectPipeline = VK_NULL_HANDLE; // `shadow_vertex`, one draw per caster
+// §4.71's twins of both. Two axes - submission path, and whether the patch is amplified.
+VkPipeline DynShadowPipelineTess = VK_NULL_HANDLE;
+VkPipeline DynShadowDirectPipelineTess = VK_NULL_HANDLE;
+VkBuffer DynIndirectBuffer = VK_NULL_HANDLE;
+VkDeviceMemory DynIndirectMemory = VK_NULL_HANDLE;
+uint64_t DynIndirectAddress = 0;
+// **The batch is a RING, and that is not an optimisation.**
+//
+// This bake rewrites its commands every frame with `vkCmdUpdateBuffer` and reads them back with
+// `vkCmdDrawIndexedIndirect` in the same command buffer. With frames in flight, frame N+1's
+// transfer executes while frame N's indirect draws are still reading the same bytes - so a draw
+// picks up a half-written `indexCount`, which is the classic way to lose a device on an indirect
+// draw.
+//
+// **It was never observed doing so, and the comment here used to say it was.** The device loss
+// this ring was written to fix was §4.67's field permutation (see `DynamicShadowsEnabled` below),
+// and adding the ring left that failure completely unchanged - which was recorded at the time and
+// read as "the hazard was real but not the one biting". Only the second half of that is
+// established: the hazard is real by construction and the ring is kept for it, but nothing here
+// has ever seen it fire. Do not cite it as measured.
+//
+// §4.61's map bake has the same shape and got away with it by accident: at `map_shadow_rate` 256
+// a level of 51 lights bakes in one frame, so there is only ever one write. Level01's 686 take
+// three frames and raced exactly like this - which is where this ring came from, and it now has
+// one of its own (`kMapIndirectRing`).
+//
+// Four slices against two frames in flight, because the cost is 56 KB a slice and the failure is
+// a hung GPU.
+constexpr uint32_t kDynIndirectRing = 4;
+constexpr uint32_t kDynIndirectSlice = kMapIndirectSlice;
+// One counter for both rings, advanced once per bake: the batch's slice is `% kDynIndirectRing`
+// and the atlas image's is `% kDynShadowRing`. Two rings rather than one depth because they guard
+// different hazards - the batch against an in-flight *indirect read*, the image against an
+// in-flight *sample* - and only the second is bounded by frames in flight.
+uint64_t DynRingSerial = 0;
+uint32_t DynImageSlot = 0; // which atlas slice the last bake wrote, for the frame block to publish
+// A bisect, not a design decision: restrict the caster set to arena-sourced draws, so the
+// user-pointer half (§4.18) can be taken out of the pass. `render.dynamic_shadow_arena_only`.
+// **It is not the test for "is a unit a caster"** - a unit draws from the arena as often as not
+// (level02's fires: 154 casters, one bucket, all arena), so this separates by *storage* and not by
+// what a caster is. `map_only` below is that test.
+bool DynCasterArenaOnly = false;
+// `render.dynamic_shadow_map_only` - restrict the caster set to `IsMapGeometry`, which is §4.65's
+// exactly. The A/B against it is what the props and the units are worth, and it is the measurement
+// `arena_only` cannot make: the two tests differ in what a caster *is*, not in where it is stored.
+bool DynCasterMapOnly = false;
+// Bake the atlas but never advertise it, so the world pass cannot sample it.
+// `render.dynamic_shadow_sample`.
+//
+// **This knob was broken for the whole of the section it was written for, and its clean negative
+// result is what sent §4.66 chasing the bake.** It clears `dyn_shadow_texture` - and under §4.67's
+// field permutation the shader read *that* word as `light_flags` and took its own
+// `dyn_shadow_texture` from `dyn_shadow_sampler`, which is never `kNoTexture`. So the gate it aims
+// at passed every frame and the sampling never stopped. A bisect knob is code, and it can be
+// disabled by the defect it is bisecting for; the guard is to check it changes something
+// observable before believing what it says.
+bool DynShadowSample = true;
+bool DynShadowReady = false;
+// The bisect caps (§4.66). 0 is "no cap" on all three, which is the shipped configuration; they
+// exist to walk the bake DOWN to something that survives, since a capture of the failing frame
+// cannot be taken. Applied at submission and not at collection, so the report and the range check
+// keep describing the whole set.
+int DynMaxLights = 0;
+int DynMaxFaces = 0;
+int DynMaxCasters = 0;
+// One `vkCmdDrawIndexed` per caster per face instead of one indirect batch per bucket per face -
+// the fallback §4.61's map bake keeps for a device without `multiDrawIndirect`, and here the bisect
+// that splits the indirect machinery from the pass. The direct path touches no indirect buffer, no
+// device address for its parameters and no `SV_DrawIndex`.
+bool DynShadowIndirect = true;
+// **A feature, on by default.** It was off for one section (§4.66) because enabling it took the
+// device down - `VK_ERROR_DEVICE_LOST` within about four bakes, reproducibly - and every hypothesis
+// in that section was aimed at this bake.
+//
+// **The bake was never at fault.** It was §4.67's field permutation: `GpuFrameData` had
+// `light_flags` in a different place in `src/VkDraw.h` and in `world.slang`, so the fragment
+// shader's `dyn_shadow_sampler` read the word the CPU fills with `dyn_shadow_offset` - a *float*,
+// `DynShadowBiasValue` 1.0f, which is 0x3f800000 = **1,065,353,216** - and used it to index the
+// bindless `samplers[]` array, which holds five. An unbounded descriptor read is a GPU page fault,
+// which is a lost device.
+//
+// Two things about that are worth keeping, because they are why the bake looked guilty for a whole
+// section. The shader's gate is `light.position.w >= 0`, the per-frame slot, and
+// `RegisterDynamicShadowLight` returns -1 whenever this flag is false - so the control was clean by
+// construction and enabling the feature was what armed the fault. And
+// `render.dynamic_shadow_sample`, the knob written specifically to split "the bake hangs" from
+// "sampling hangs", sets `dyn_shadow_texture`, which under the same permutation was read as
+// `light_flags` - so it never stopped the sampling at all, and the measurement that appeared to
+// prove "not the sampling" was defeated by the very permutation being hunted.
+bool DynamicShadowsEnabled = true;
+// In atlas texels at the fragment's distance. Its own knob because the face is 256 texels where
+// the static atlas's is 64, so one texel is a quarter of the world distance.
+float DynShadowBiasValue = 1.0f;
+// The PCF radius for D3D's point and spot lights: 0 a single tap, 1 a 3x3, 2 a 5x5.
+// `render.local_shadow_taps`.
+//
+// **1 by default, and the map lights deliberately stay at 0.** The single tap this replaces was a
+// measurement about the STDLIGHT rig, where a fragment is in range of a mean of 11.5 lights
+// (§4.54) and the sum does the filtering - so nine taps there would be a hundred a fragment for
+// nothing. One or two D3D lights reach a fragment, nothing averages them, and the hard 0/1 compare
+// is what play reported as jagged (§4.69). Same body, different callers, so the radius rides in
+// `GpuFrameData` rather than in either atlas.
+int LocalShadowTapsValue = 1;
+
+// This frame's lights, in registration order; the slot IS the index. Cleared when the frame moves
+// on, which is the only bookkeeping the whole design needs.
+std::vector<LocalShadowKey> DynLights;
+std::map<LocalShadowKey, int32_t> DynLightSlots;
+uint64_t DynFrame = UINT64_MAX;      // the frame `DynLights` describes
+uint64_t DynBakedFrame = UINT64_MAX; // ... and the last one actually baked
+uint32_t DynRefused = 0;             // lights past the 42 slots, last frame
+uint32_t DynCasters = 0;             // casters submitted, last frame
+uint32_t DynCastersDropped = 0;      // past the cap, or of an index width their bucket cannot take
+uint32_t DynBuckets = 0;             // distinct (vertex source, index source, index width) groups
+uint64_t DynIndirectCommands = 0;    // cumulative, so the submission cost is visible
+// The batch's own arithmetic, checked on the CPU because a capture of this bake cannot exist -
+// the device is lost before RenderDoc can write the file.
+struct DynSampleEntry {
+  uint32_t index_count, first_index, vertex_offset, record, base_vertex, stride;
+  bool arena;
+};
+std::vector<DynSampleEntry> DynSample;
+uint64_t DynCalls = 0;          // BakeDynamicShadows entered
+uint64_t DynSkipped = 0;        // ... and returned early because nothing was new
+uint32_t DynBadRanges = 0;      // commands whose index range runs past the arena
+uint64_t DynWorstIndexEnd = 0;  // the furthest byte any command reads, for comparison with it
 
 bool CreateMapShadowPipeline();
 
@@ -947,7 +1271,7 @@ bool CreateMapShadowAtlas() {
   // BUFFER_DEVICE_ADDRESS as well as INDIRECT_BUFFER, because the parameter half is reached by
   // address from the vertex shader rather than bound.
   VkBufferCreateInfo buffer = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-  buffer.size = kMapParamOffset + kMaxMapCasters * 8;
+  buffer.size = static_cast<VkDeviceSize>(kMapIndirectSlice) * kMapIndirectRing;
   buffer.usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
   buffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -989,6 +1313,10 @@ bool CreateMapShadowAtlas() {
   if (MapShadowModule == VK_NULL_HANDLE) {
     return Fail("could not create the map shadow shader module");
   }
+  if (Caps().tessellation_shader) {
+    MapShadowTessVertexModule =
+        CreateModule(kMapShadowTessVertexSpv, sizeof(kMapShadowTessVertexSpv));
+  }
   return CreateMapShadowPipeline();
 }
 
@@ -997,16 +1325,25 @@ bool CreateMapShadowAtlas() {
 // point, and having both reachable at run time is what makes "the atlas is the same either way"
 // a measurement rather than an assertion (§4.62).
 bool CreateMapShadowPipeline() {
-  VkPipelineShaderStageCreateInfo stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-  stage.stage = VK_SHADER_STAGE_VERTEX_BIT;
-  stage.module = MapShadowIndirect ? MapShadowModule : ShadowModule;
-  stage.pName = MapShadowIndirect ? "map_shadow_vertex" : "shadow_vertex";
+  VkPipelineShaderStageCreateInfo stages[3] = {};
+  // The two submission paths take different entry points, and so do their tessellated twins - so
+  // this is a pair of choices, not one. Getting it wrong would bake the atlas with the direct
+  // path's record while the indirect path's parameters were bound.
+  VkShaderModule vertex_module = MapShadowIndirect ? MapShadowModule : ShadowModule;
+  const char *vertex_entry = MapShadowIndirect ? "map_shadow_vertex" : "shadow_vertex";
+  VkShaderModule tess_vertex_module =
+      MapShadowIndirect ? MapShadowTessVertexModule : ShadowTessVertexModule;
+  const char *tess_vertex_entry =
+      MapShadowIndirect ? "map_shadow_tess_vertex" : "shadow_tess_vertex";
 
   VkPipelineVertexInputStateCreateInfo vertex_input = {
       VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
   VkPipelineInputAssemblyStateCreateInfo assembly = {
       VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
   assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineTessellationStateCreateInfo tessellation = {
+      VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
+  tessellation.patchControlPoints = 3;
   VkPipelineViewportStateCreateInfo viewport = {
       VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
   viewport.viewportCount = 1;
@@ -1041,8 +1378,7 @@ bool CreateMapShadowPipeline() {
 
   VkGraphicsPipelineCreateInfo info = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
   info.pNext = &rendering;
-  info.stageCount = 1;
-  info.pStages = &stage;
+  info.pStages = stages;
   info.pVertexInputState = &vertex_input;
   info.pInputAssemblyState = &assembly;
   info.pViewportState = &viewport;
@@ -1052,12 +1388,269 @@ bool CreateMapShadowPipeline() {
   info.pColorBlendState = &blend;
   info.pDynamicState = &dynamic;
   info.layout = ShadowLayout;
+
+  info.stageCount = ShadowStages(stages, vertex_module, vertex_entry, false);
   if (vkCreateGraphicsPipelines(GetDevice(), VK_NULL_HANDLE, 1, &info, nullptr,
                                 &MapShadowPipeline) != VK_SUCCESS) {
     return Fail("could not create the map shadow pipeline");
   }
+  // Rebuilt from scratch by `render.map_shadow_indirect`, so the twin is cleared first: this
+  // function runs again on that knob, and a stale handle from the previous entry point would bake
+  // the atlas through the wrong parameter source.
+  if (MapShadowPipelineTess != VK_NULL_HANDLE) {
+    vkDestroyPipeline(GetDevice(), MapShadowPipelineTess, nullptr);
+    MapShadowPipelineTess = VK_NULL_HANDLE;
+  }
+  if (ShadowTessAvailable() && tess_vertex_module != VK_NULL_HANDLE) {
+    assembly.topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+    info.pTessellationState = &tessellation;
+    info.stageCount = ShadowStages(stages, tess_vertex_module, tess_vertex_entry, true);
+    if (vkCreateGraphicsPipelines(GetDevice(), VK_NULL_HANDLE, 1, &info, nullptr,
+                                  &MapShadowPipelineTess) != VK_SUCCESS) {
+      MapShadowPipelineTess = VK_NULL_HANDLE;
+    }
+  }
   MapShadowReady = true;
   return true;
+}
+
+// A device-local allocation of the right memory type, which both atlases and both indirect buffers
+// want and which was open-coded four times before this existed.
+bool AllocateDeviceLocal(const VkMemoryRequirements &requirements, bool device_address,
+                         VkDeviceMemory *out) {
+  VkPhysicalDeviceMemoryProperties memory = {};
+  vkGetPhysicalDeviceMemoryProperties(GetPhysicalDevice(), &memory);
+  uint32_t type = UINT32_MAX;
+  for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+    if ((requirements.memoryTypeBits & (1u << i)) != 0 &&
+        (memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+      type = i;
+      break;
+    }
+  }
+  if (type == UINT32_MAX) {
+    return false;
+  }
+  VkMemoryAllocateFlagsInfo flags = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+  flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+  VkMemoryAllocateInfo allocate = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                   device_address ? &flags : nullptr};
+  allocate.allocationSize = requirements.size;
+  allocate.memoryTypeIndex = type;
+  return vkAllocateMemory(GetDevice(), &allocate, nullptr, out) == VK_SUCCESS;
+}
+
+// The per-frame atlas. Built beside the static one and gated on the same two things: `D16_UNORM`
+// being sampleable, and `multiDrawIndirect`.
+//
+// **`multiDrawIndirect` is a hard requirement here where it is only a preference there.** The
+// static atlas has a direct fallback because it bakes once per level and can afford a draw call
+// per caster per face; this one would need one every frame - 9 lights x 6 faces x 180 casters is
+// ~9,700 calls a frame, which at §4.62's measured ~2.4 us a call is 23 ms. So without the feature
+// the atlas is simply not created and every local light falls back to the static one.
+bool CreateDynShadowAtlas() {
+  if (!Caps().multi_draw_indirect) {
+    DebugWrite("gkplus: no multiDrawIndirect, the per-frame shadow atlas is off\n");
+    return false;
+  }
+  VkFormatProperties properties = {};
+  vkGetPhysicalDeviceFormatProperties(GetPhysicalDevice(), VK_FORMAT_D16_UNORM, &properties);
+  constexpr VkFormatFeatureFlags kNeeded = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                           VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+  if ((properties.optimalTilingFeatures & kNeeded) != kNeeded) {
+    return Fail("no D16_UNORM depth format for the per-frame shadow atlas");
+  }
+
+  VkImageCreateInfo image = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  image.imageType = VK_IMAGE_TYPE_2D;
+  image.format = VK_FORMAT_D16_UNORM;
+  image.extent = {kDynShadowAtlas, kDynShadowAtlas, 1};
+  image.mipLevels = 1;
+  image.arrayLayers = 1;
+  image.samples = VK_SAMPLE_COUNT_1_BIT;
+  image.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  image.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  image.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  // One image per ring slice, each with its own bindless slot counting down from
+  // `kDynShadowMapSlot`. That is the whole cost of the ring on this side, and it is zero on the
+  // shader's: the frame block publishes whichever index the bake last wrote.
+  for (uint32_t i = 0; i < kDynShadowRing; ++i) {
+    if (vkCreateImage(GetDevice(), &image, nullptr, &DynShadowImage[i]) != VK_SUCCESS) {
+      return Fail("could not create the per-frame shadow atlas");
+    }
+    VkMemoryRequirements requirements = {};
+    vkGetImageMemoryRequirements(GetDevice(), DynShadowImage[i], &requirements);
+    DynShadowBytes = requirements.size;
+    if (!AllocateDeviceLocal(requirements, false, &DynShadowMemory[i]) ||
+        vkBindImageMemory(GetDevice(), DynShadowImage[i], DynShadowMemory[i], 0) != VK_SUCCESS) {
+      return Fail("could not back the per-frame shadow atlas");
+    }
+
+    VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view.image = DynShadowImage[i];
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = VK_FORMAT_D16_UNORM;
+    view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    view.subresourceRange.levelCount = 1;
+    view.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(GetDevice(), &view, nullptr, &DynShadowView[i]) != VK_SUCCESS) {
+      return Fail("could not create the per-frame shadow atlas view");
+    }
+    WriteBindlessView(kDynShadowMapSlot - i, reinterpret_cast<uint64_t>(DynShadowView[i]));
+  }
+
+  // **Its own buffer as well as its own pipeline**, because both bakes can run in the same command
+  // buffer and `vkCmdUpdateBuffer` records its bytes in order - sharing one would have the map
+  // bake's slice overwrite this frame's batch, or the reverse, depending on which ran first.
+  VkBufferCreateInfo buffer = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  buffer.size = static_cast<VkDeviceSize>(kDynIndirectSlice) * kDynIndirectRing;
+  buffer.usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+  buffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  if (vkCreateBuffer(GetDevice(), &buffer, nullptr, &DynIndirectBuffer) != VK_SUCCESS) {
+    return Fail("could not create the per-frame shadow indirect buffer");
+  }
+  VkMemoryRequirements buffer_requirements = {};
+  vkGetBufferMemoryRequirements(GetDevice(), DynIndirectBuffer, &buffer_requirements);
+  if (!AllocateDeviceLocal(buffer_requirements, true, &DynIndirectMemory) ||
+      vkBindBufferMemory(GetDevice(), DynIndirectBuffer, DynIndirectMemory, 0) != VK_SUCCESS) {
+    return Fail("could not back the per-frame shadow indirect buffer");
+  }
+  VkBufferDeviceAddressInfo address = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+  address.buffer = DynIndirectBuffer;
+  DynIndirectAddress = vkGetBufferDeviceAddress(GetDevice(), &address);
+
+  VkPipelineShaderStageCreateInfo stages[3] = {};
+
+  VkPipelineVertexInputStateCreateInfo vertex_input = {
+      VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineInputAssemblyStateCreateInfo assembly = {
+      VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineTessellationStateCreateInfo tessellation = {
+      VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
+  tessellation.patchControlPoints = 3;
+  VkPipelineViewportStateCreateInfo viewport = {
+      VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  viewport.viewportCount = 1;
+  viewport.scissorCount = 1;
+  VkPipelineRasterizationStateCreateInfo raster = {
+      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  raster.polygonMode = VK_POLYGON_MODE_FILL;
+  // No culling, for §4.58's reason: Gunlok's geometry is neither closed nor consistently wound
+  // across the map object, its props and its units, so front-face culling would open holes in the
+  // caster set rather than hide acne. The bias is the knob.
+  raster.cullMode = VK_CULL_MODE_NONE;
+  raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  raster.lineWidth = 1.0f;
+  VkPipelineMultisampleStateCreateInfo multisample = {
+      VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineDepthStencilStateCreateInfo depth = {
+      VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+  depth.depthTestEnable = VK_TRUE;
+  depth.depthWriteEnable = VK_TRUE;
+  depth.depthCompareOp = VK_COMPARE_OP_LESS;
+  VkPipelineColorBlendStateCreateInfo blend = {
+      VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+  VkPipelineDynamicStateCreateInfo dynamic = {
+      VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+  dynamic.dynamicStateCount = 2;
+  dynamic.pDynamicStates = dynamic_states;
+  VkPipelineRenderingCreateInfo rendering = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+  rendering.depthAttachmentFormat = VK_FORMAT_D16_UNORM;
+
+  VkGraphicsPipelineCreateInfo info = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  info.pNext = &rendering;
+  info.pStages = stages;
+  info.pVertexInputState = &vertex_input;
+  info.pInputAssemblyState = &assembly;
+  info.pViewportState = &viewport;
+  info.pRasterizationState = &raster;
+  info.pMultisampleState = &multisample;
+  info.pDepthStencilState = &depth;
+  info.pColorBlendState = &blend;
+  info.pDynamicState = &dynamic;
+  info.layout = ShadowLayout;
+
+  info.stageCount = ShadowStages(stages, MapShadowModule, "map_shadow_vertex", false);
+  if (vkCreateGraphicsPipelines(GetDevice(), VK_NULL_HANDLE, 1, &info, nullptr,
+                                &DynShadowPipeline) != VK_SUCCESS) {
+    return Fail("could not create the per-frame shadow pipeline");
+  }
+  // The direct path's twin: the same state, the sun's own entry point. `render.dynamic_shadow_
+  // indirect` selects between them, which is the bisect that splits the indirect machinery from
+  // everything else in the pass.
+  info.stageCount = ShadowStages(stages, ShadowModule, "shadow_vertex", false);
+  if (vkCreateGraphicsPipelines(GetDevice(), VK_NULL_HANDLE, 1, &info, nullptr,
+                                &DynShadowDirectPipeline) != VK_SUCCESS) {
+    return Fail("could not create the per-frame shadow direct pipeline");
+  }
+  // ...and both again, tessellated (§4.71). Four pipelines for one pass looks like a lot and is
+  // the same two axes it already had: which submission path, and whether the patch is amplified.
+  if (ShadowTessAvailable() && MapShadowTessVertexModule != VK_NULL_HANDLE &&
+      ShadowTessVertexModule != VK_NULL_HANDLE) {
+    assembly.topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+    info.pTessellationState = &tessellation;
+    info.stageCount =
+        ShadowStages(stages, MapShadowTessVertexModule, "map_shadow_tess_vertex", true);
+    if (vkCreateGraphicsPipelines(GetDevice(), VK_NULL_HANDLE, 1, &info, nullptr,
+                                  &DynShadowPipelineTess) != VK_SUCCESS) {
+      DynShadowPipelineTess = VK_NULL_HANDLE;
+    }
+    info.stageCount = ShadowStages(stages, ShadowTessVertexModule, "shadow_tess_vertex", true);
+    if (vkCreateGraphicsPipelines(GetDevice(), VK_NULL_HANDLE, 1, &info, nullptr,
+                                  &DynShadowDirectPipelineTess) != VK_SUCCESS) {
+      DynShadowDirectPipelineTess = VK_NULL_HANDLE;
+    }
+  }
+  DynShadowReady = true;
+  return true;
+}
+
+void DestroyDynShadowAtlas() {
+  DynShadowReady = false;
+  if (DynShadowPipeline != VK_NULL_HANDLE) {
+    vkDestroyPipeline(GetDevice(), DynShadowPipeline, nullptr);
+    DynShadowPipeline = VK_NULL_HANDLE;
+  }
+  if (DynShadowPipelineTess != VK_NULL_HANDLE) {
+    vkDestroyPipeline(GetDevice(), DynShadowPipelineTess, nullptr);
+    DynShadowPipelineTess = VK_NULL_HANDLE;
+  }
+  if (DynShadowDirectPipelineTess != VK_NULL_HANDLE) {
+    vkDestroyPipeline(GetDevice(), DynShadowDirectPipelineTess, nullptr);
+    DynShadowDirectPipelineTess = VK_NULL_HANDLE;
+  }
+  if (DynShadowDirectPipeline != VK_NULL_HANDLE) {
+    vkDestroyPipeline(GetDevice(), DynShadowDirectPipeline, nullptr);
+    DynShadowDirectPipeline = VK_NULL_HANDLE;
+  }
+  if (DynIndirectBuffer != VK_NULL_HANDLE) {
+    vkDestroyBuffer(GetDevice(), DynIndirectBuffer, nullptr);
+    DynIndirectBuffer = VK_NULL_HANDLE;
+  }
+  if (DynIndirectMemory != VK_NULL_HANDLE) {
+    vkFreeMemory(GetDevice(), DynIndirectMemory, nullptr);
+    DynIndirectMemory = VK_NULL_HANDLE;
+  }
+  DynIndirectAddress = 0;
+  for (uint32_t i = 0; i < kDynShadowRing; ++i) {
+    if (DynShadowView[i] != VK_NULL_HANDLE) {
+      vkDestroyImageView(GetDevice(), DynShadowView[i], nullptr);
+      DynShadowView[i] = VK_NULL_HANDLE;
+    }
+    if (DynShadowImage[i] != VK_NULL_HANDLE) {
+      vkDestroyImage(GetDevice(), DynShadowImage[i], nullptr);
+      DynShadowImage[i] = VK_NULL_HANDLE;
+    }
+    if (DynShadowMemory[i] != VK_NULL_HANDLE) {
+      vkFreeMemory(GetDevice(), DynShadowMemory[i], nullptr);
+      DynShadowMemory[i] = VK_NULL_HANDLE;
+    }
+  }
 }
 
 void DestroyMapShadowAtlas() {
@@ -1066,9 +1659,22 @@ void DestroyMapShadowAtlas() {
     vkDestroyPipeline(GetDevice(), MapShadowPipeline, nullptr);
     MapShadowPipeline = VK_NULL_HANDLE;
   }
+  if (MapShadowPipelineTess != VK_NULL_HANDLE) {
+    vkDestroyPipeline(GetDevice(), MapShadowPipelineTess, nullptr);
+    MapShadowPipelineTess = VK_NULL_HANDLE;
+  }
   if (MapShadowModule != VK_NULL_HANDLE) {
     vkDestroyShaderModule(GetDevice(), MapShadowModule, nullptr);
     MapShadowModule = VK_NULL_HANDLE;
+  }
+  // §4.71's modules. Destroyed beside the ones they twin rather than in a block of their own, so
+  // a subsystem torn down without the others cannot leave one behind.
+  for (VkShaderModule *module : {&ShadowTessVertexModule, &MapShadowTessVertexModule,
+                                 &ShadowHullModule, &ShadowDomainModule}) {
+    if (*module != VK_NULL_HANDLE) {
+      vkDestroyShaderModule(GetDevice(), *module, nullptr);
+      *module = VK_NULL_HANDLE;
+    }
   }
   if (MapIndirectBuffer != VK_NULL_HANDLE) {
     vkDestroyBuffer(GetDevice(), MapIndirectBuffer, nullptr);
@@ -1098,6 +1704,10 @@ void DestroyShadowPass() {
   if (ShadowPipeline != VK_NULL_HANDLE) {
     vkDestroyPipeline(GetDevice(), ShadowPipeline, nullptr);
     ShadowPipeline = VK_NULL_HANDLE;
+  }
+  if (ShadowPipelineTess != VK_NULL_HANDLE) {
+    vkDestroyPipeline(GetDevice(), ShadowPipelineTess, nullptr);
+    ShadowPipelineTess = VK_NULL_HANDLE;
   }
   if (ShadowLayout != VK_NULL_HANDLE) {
     vkDestroyPipelineLayout(GetDevice(), ShadowLayout, nullptr);
@@ -1256,6 +1866,13 @@ void DestroyLightGridPipeline() {
     GridModule = VK_NULL_HANDLE;
   }
 }
+
+// **Every struct this file shares with a shader, checked against the shader's own declaration.**
+// Here rather than beside each struct because this is the one point where all three sources are in
+// scope - `src/VkDraw.h`, `src/VertexFormat.h`, and the three push blocks above, which are
+// file-local. Generated by `src/gen-shader-abi.py`; see §4.67 for the two sections it cost to not
+// have it.
+#include "ShaderAbi.gen.inc.h"
 
 } // namespace
 
@@ -1661,6 +2278,13 @@ bool StartDraw(uint32_t width, uint32_t height, uint32_t colour_format) {
     DebugWrite("gkplus: map shadow atlas unavailable, the map lights cast nothing\n");
     DestroyMapShadowAtlas();
   }
+  // After the map's, because it borrows `MapShadowModule` from it as well as the sun's layout.
+  // Not fatal: a device without `multiDrawIndirect` loses the per-frame atlas and every local
+  // light falls back to the static one, which is exactly what §4.65 shipped.
+  if (!DynShadowReady && !CreateDynShadowAtlas()) {
+    DebugWrite("gkplus: per-frame shadow atlas unavailable, local lights use the static one\n");
+    DestroyDynShadowAtlas();
+  }
   if (!CreateLightGridPipeline()) {
     DebugWrite("gkplus: light grid unavailable, map lighting will not be culled\n");
     DestroyLightGridPipeline();
@@ -1749,6 +2373,30 @@ void SetPerPixelLighting(bool enabled) {
 bool PerPixelLighting() { return PerPixelLightingEnabled(); }
 
 namespace {
+// **Off by default.** It changes the silhouette of the level rather than reproducing D3D, so the
+// renderer's own claim - that it draws what the original drew - has to survive a default run.
+bool TessellationOn = false;
+bool TessellationShadowsOn = true;
+TessSet TessellationWhich = TessSet::Map;
+TessellationParams TheTessParams;
+uint32_t TessDrawsThisFrame = 0;
+uint32_t TessPatchesThisFrame = 0;
+} // namespace
+
+void SetTessellationEnabled(bool enabled) { TessellationOn = enabled; }
+bool TessellationEnabled() { return TessellationOn && Caps().tessellation_shader; }
+void SetTessellationSet(TessSet set) { TessellationWhich = set; }
+TessSet TessellationSet() { return TessellationWhich; }
+void SetTessellationShadows(bool enabled) { TessellationShadowsOn = enabled; }
+bool TessellationShadows() { return TessellationShadowsOn; }
+const TessellationParams &TessParams() { return TheTessParams; }
+TessellationParams &MutableTessParams() { return TheTessParams; }
+void TessellationCounts(uint32_t &draws, uint32_t &patches) {
+  draws = TessDrawsThisFrame;
+  patches = TessPatchesThisFrame;
+}
+
+namespace {
 // Copy the level's light rig into this frame's scratch slice, premultiplied.
 //
 // Called once at the top of RecordDraws, **after** the addresses above are read and before any
@@ -1826,6 +2474,25 @@ void UploadFrameData() {
   frame->chrome_blur = lighting.chrome_blur;
   frame->chrome_texgen = lighting.chrome_texgen ? 1.0f : 0.0f;
   frame->per_pixel_lighting = PerPixelLightingEnabled() ? 1.0f : 0.0f;
+  // The tessellation knobs (§4.71). `max_factor` is clamped to the device's own ceiling here
+  // rather than in the shader: exceeding maxTessellationGenerationLevel is undefined behaviour,
+  // not a clamp the hardware performs, so a REPL sweep that overshoots must not reach it.
+  const TessellationParams &tess = TessParams();
+  const float device_max =
+      Caps().max_tessellation_level != 0 ? float(Caps().max_tessellation_level) : 64.0f;
+  // Ternaries and not std::min/std::max: <windows.h> is included here and defines both as macros.
+  const float wanted_max = tess.max_factor < 1.0f ? 1.0f : tess.max_factor;
+  const float wanted_min = tess.min_factor < 1.0f ? 1.0f : tess.min_factor;
+  frame->tess_edge_pixels = tess.edge_pixels;
+  frame->tess_max = wanted_max > device_max ? device_max : wanted_max;
+  frame->tess_min = wanted_min > frame->tess_max ? frame->tess_max : wanted_min;
+  frame->pn_strength = tess.pn_strength;
+  frame->pn_flat_threshold = tess.pn_flat_threshold;
+  // The offscreen target, which is what the world pass rasterises into (§4.38) - not the
+  // swapchain, whose 628x468 would make an edge read 2% short.
+  frame->target_width = float(ViewportWidth);
+  frame->target_height = float(ViewportHeight);
+  frame->pad_tess = 0.0f;
   frame->map_light_gain = MapLightGainValue;
   frame->map_ambience = FrameMapAmbience;
   frame->map_light_count = FrameMapLightCount;
@@ -1869,6 +2536,21 @@ void UploadFrameData() {
   // would read another light's cube face entirely.
   frame->map_shadow_sampler = AcquireSampler(2, 2, 0, 3, 3);
   frame->map_shadow_offset = MapShadowBiasValue;
+  // The per-frame atlas. Gated on it having actually been baked **this frame** as well as on the
+  // knob: a frame that registered no light leaves the image holding the previous frame's cubes,
+  // and a light whose slot is -1 would not read it - but one whose slot survived from a frame the
+  // bake skipped would, and would read another light's cube.
+  // **The slice the bake just wrote**, not a fixed slot: `UploadFrameData` runs inside RecordDraws,
+  // which is after BakeDynamicShadows in the frame, so `DynImageSlot` is this frame's answer.
+  frame->dyn_shadow_texture = (DynShadowReady && DynamicShadowsEnabled && DynShadowSample &&
+                               DynBakedFrame == DynFrame && !DynLights.empty())
+                                  ? kDynShadowMapSlot - DynImageSlot
+                                  : kNoTexture;
+  frame->dyn_shadow_sampler = AcquireSampler(2, 2, 0, 3, 3);
+  frame->dyn_shadow_offset = DynShadowBiasValue;
+  // Both D3D atlases, and NOT the map lights' own reads of the static one - which is the whole
+  // reason this is a frame field rather than a property of either image (§4.69).
+  frame->local_shadow_taps = static_cast<uint32_t>(LocalShadowTapsValue);
   frame->light_flags = 0;
   if (LocalLightsEnabled) {
     frame->light_flags |= 1u;
@@ -1878,6 +2560,9 @@ void UploadFrameData() {
   }
   if (LocalShadowsEnabled()) {
     frame->light_flags |= 4u;
+  }
+  if (LocalLightWindowEnabled) {
+    frame->light_flags |= 8u;
   }
   std::memcpy(frame->cascades, FrameCascade, sizeof(frame->cascades));
   std::memcpy(frame->sun_matrix, FrameSunMatrix, sizeof(frame->sun_matrix));
@@ -2068,10 +2753,17 @@ void RecordShadowPass(void *command_buffer) {
   rendering.layerCount = 1;
   rendering.pDepthAttachment = &attachment;
   vkCmdBeginRendering(cmd, &rendering);
-  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ShadowPipeline);
+  // The whole pass takes one pipeline or the other: this walk draws every caster, and the
+  // tessellated twin is a different pipeline rather than a per-draw state. See the note on
+  // `render.tess_set` in VkDraw.h for what that costs when the colour pass tessellates only the
+  // map - a prop's shadow follows a smoothed silhouette its geometry does not have.
+  const bool tessellating = ShadowTessellating() && ShadowPipelineTess != VK_NULL_HANDLE;
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    tessellating ? ShadowPipelineTess : ShadowPipeline);
 
   ShadowPushConstants push = {};
   push.draws = draw_records;
+  FillShadowTessPush(push);
 
   VkBuffer bound_index = VK_NULL_HANDLE;
   uint64_t casters = 0;
@@ -2112,7 +2804,7 @@ void RecordShadowPass(void *command_buffer) {
                              item.index_stride == 4 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
         bound_index = index_buffer;
       }
-      vkCmdPushConstants(cmd, ShadowLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
+      vkCmdPushConstants(cmd, ShadowLayout, kShadowPushStages, 0, sizeof(push), &push);
       vkCmdDrawIndexed(cmd, item.count, 1, item.first_index, item.vertex_offset, 0);
       ++casters;
     }
@@ -2214,6 +2906,34 @@ void ResetLocalShadows() {
   LocalShadowForgotten = 0;
   LocalShadowBakes = 0;
 }
+
+// Every local cube the atlas holds dies with the clear the caller is about to schedule, so no entry
+// may go on claiming to be baked. **This is the local half of `MapShadowCursor = 0`** - the map's
+// re-queue has been there since §4.61, and the absence of this one is what made a forced re-bake
+// lose the local cubes for the rest of the level: an entry already carrying `baked` is never pushed
+// back onto `LocalShadowPending` by the acquire path, which only queues a slot at the moment it is
+// claimed. Measured on level02 before this existed - the boot frame against a re-baked one differed
+// by 38,335 pixels at a max delta of 53, and `local_shadow_report` read "baked and sampled: 6"
+// against "cubes baked for this level: 6", i.e. not one cube after the clear. With this it is 0
+// pixels and 6 -> 12 cubes.
+//
+// **Keys are kept, not forgotten.** A re-bake is not a level change: the geometry these cubes hold
+// is the same geometry, and the lights are the same lights, so throwing the table away would make
+// each of them serve out the four-frame stability gate again for no reason. Only the *contents* of
+// the atlas are gone.
+//
+// The pending list is rebuilt rather than appended to, so a slot already queued is not baked twice.
+// Each slot appears at most once because an eviction clears the previous owner's `slot` before the
+// new one takes it.
+void RequeueLocalShadows() {
+  LocalShadowPending.clear();
+  for (auto &[key, entry] : LocalShadowKeys) {
+    entry.baked = false;
+    if (entry.slot >= 0) {
+      LocalShadowPending.push_back(static_cast<uint32_t>(entry.slot));
+    }
+  }
+}
 } // namespace
 
 // See VkDraw.h. Called once per distinct light run, from the capture layer's StoreLight - which is
@@ -2314,7 +3034,79 @@ int32_t AcquireLocalShadowSlot(const LocalShadowKey &key, uint64_t frame) {
   return -1; // unshadowed until the bake reaches it, which is one frame at the default rate
 }
 
+// See VkDraw.h. Called from the capture layer's StoreLight, once per distinct light run.
+//
+// **The whole per-frame design is these fifteen lines.** There is no identity to establish, so
+// there is nothing to get wrong about one: the table is this frame's, the slot is the index, and
+// the next frame starts empty.
+int32_t RegisterDynamicShadowLight(const LocalShadowKey &key, uint64_t frame) {
+  if (!Ready || !DynShadowReady || !DynamicShadowsEnabled) {
+    return -1;
+  }
+  float range = 0.0f;
+  std::memcpy(&range, &key.range, sizeof(range));
+  if (key.type == 3 /* D3DLIGHT_DIRECTIONAL */ || !(range > 1e-3f)) {
+    return -1; // the sun's cascades cover a directional, and it has no position to build a cube on
+  }
+  if (frame != DynFrame) {
+    DynFrame = frame;
+    DynLights.clear();
+    DynLightSlots.clear();
+    DynRefused = 0;
+  }
+  // Deduplicated **within the frame only**, which is all "the same light" has to mean here. The
+  // capture layer already dedups a light *run* by enable mask, but two runs can share a light and
+  // the same light must not get two cubes.
+  const auto found = DynLightSlots.find(key);
+  if (found != DynLightSlots.end()) {
+    return found->second;
+  }
+  if (DynLights.size() >= kDynShadowSlots) {
+    ++DynRefused; // it falls back to its static cube if it has one, and is unshadowed if not
+    return -1;
+  }
+  const auto slot = static_cast<int32_t>(DynLights.size());
+  DynLights.push_back(key);
+  DynLightSlots.emplace(key, slot);
+  return slot;
+}
+
 namespace {
+// One group of casters that can share a single indirect batch. **A batch has one bound index
+// buffer and one `vertices` address**, so a draw pulling its vertices from the frame's scratch
+// cannot join one pulling from the arena - and units do exactly that (§4.18). §4.61's map bake
+// sidestepped this by taking only arena-sourced map geometry; this one has to carry whatever the
+// frame holds, so it buckets instead of dropping.
+struct CasterBucket {
+  DrawSource vertex_source = DrawSource::Arena;
+  DrawSource index_source = DrawSource::Arena;
+  uint32_t index_stride = 2;
+  uint32_t first = 0; // where this bucket's commands and parameters start, in entries
+  uint32_t count = 0;
+};
+
+// **The same caster test the sun's pass uses**, and deliberately not `IsMapGeometry`: opaque,
+// depth-writing, indexed. That is what puts a unit and a barrel in the set - the thing §4.65 could
+// not do - and the shader rejects anything without `kLightSum` on top, which is the test the CPU
+// cannot make because the flag lives in the record.
+bool IsMapGeometry(const DrawItem &item);
+
+bool IsDynamicCaster(const DrawItem &item) {
+  if (DynCasterArenaOnly &&
+      (item.vertex_source != DrawSource::Arena || item.index_source != DrawSource::Arena)) {
+    return false;
+  }
+  // **`render.dynamic_shadow_map_only` narrows the set to §4.65's exactly**, which is what prices
+  // this feature's second half: the difference between the two is the props and the units, and
+  // nothing else. `arena_only` looks like it should answer the same question and does not - a unit
+  // draws from the arena as often as not (150 casters in ONE bucket at level02's fires), so it
+  // separates the user-pointer draws rather than the mobile things.
+  if (DynCasterMapOnly) {
+    return IsMapGeometry(item);
+  }
+  return item.indexed && !item.pipeline.blend_enable && item.pipeline.depth_write;
+}
+
 // **The map object, and not a prop or a unit.** The occluders for a level's own light rig are the
 // level's own geometry: a unit walks away from the shadow it baked, and a prop carries its own
 // file's rig anyway (§4.55). The marker is §4.51's - two texture stages, and stage 1 is not the
@@ -2340,6 +3132,32 @@ bool IsMapGeometry(const DrawItem &item) {
   }
   return !IsChromeTexture(item.stages[1].texture_index);
 }
+
+// Whether this draw takes the PN-triangle pipeline (§4.71).
+//
+// **The triangle-list requirement is not a formality**: a patch list consumes three indices per
+// patch, so reinterpreting a strip as one would draw a third of the triangles at arbitrary
+// corners. Nothing in either set is a strip today - `render.draws` reports 0 topology skips - and
+// this is what keeps that true if something ever is.
+//
+// The wider set spells its condition out rather than calling `IsDynamicCaster`, deliberately.
+// That predicate is gated on `render.dynamic_shadow_map_only` and `_arena_only`, which belong to
+// the per-frame shadow atlas; routing this through it would make a shadow knob silently change
+// which draws get tessellated, and an A/B on one feature would move the other.
+bool WantsTessellation(const DrawItem &item) {
+  if (!TessellationEnabled() || item.pipeline.topology != 4 /* D3DPT_TRIANGLELIST */) {
+    return false;
+  }
+  switch (TessellationSet()) {
+  case TessSet::Map:
+    return IsMapGeometry(item);
+  case TessSet::All:
+    return item.indexed && !item.pipeline.blend_enable && item.pipeline.depth_write;
+  case TessSet::Off:
+  default:
+    return false;
+  }
+}
 } // namespace
 
 void BakeMapShadows(void *command_buffer) {
@@ -2359,6 +3177,13 @@ void BakeMapShadows(void *command_buffer) {
     MapShadowCursor = 0;
     MapShadowDraws = 0;
     MapShadowAtlasCleared = false;
+    // **Both halves, or the clear below takes tiles nothing will redraw.** A level change reaches
+    // the local half through `AcquireLocalShadowSlot`'s own generation test as well, but the two
+    // knobs that force a re-bake - `map_shadow_indirect` and `map_shadow_rate`, both of which
+    // wind `MapShadowBuiltForGeneration` back to 0 without the generation moving - reach it only
+    // here. Before the bake's early-out, so a re-queued slot makes `local_work` true and the clear
+    // and the redraw land in one pass rather than leaving a frame of missing shadow between them.
+    RequeueLocalShadows();
   }
   // **Gated on the knob, and after the slot table above rather than before it.** Baking an atlas
   // nothing samples costs 1.9 seconds of GPU time on level01 (§4.61), so `off` has to mean off -
@@ -2410,7 +3235,14 @@ void BakeMapShadows(void *command_buffer) {
 
   // The batch and its parameters, rebuilt every slice because `record` indexes the frame's own
   // scratch and that rotates. Written straight into the command buffer - 213 casters is 4.3 KB.
+  //
+  // Into this bake's slice of the ring, so the transfer cannot land on bytes an in-flight frame's
+  // indirect draws are still reading. Read again below by the draw and by the push, which is why
+  // it outlives the block that computes it.
+  VkDeviceSize slice = 0;
   if (MapShadowIndirect) {
+    ++MapRingSerial;
+    slice = static_cast<VkDeviceSize>(MapRingSerial % kMapIndirectRing) * kMapIndirectSlice;
     std::vector<VkDrawIndexedIndirectCommand> commands(casters.size());
     std::vector<uint32_t> params(casters.size() * 2);
     for (size_t i = 0; i < casters.size(); ++i) {
@@ -2422,10 +3254,10 @@ void BakeMapShadows(void *command_buffer) {
       params[i * 2 + 0] = casters[i]->record;
       params[i * 2 + 1] = casters[i]->base_vertex;
     }
-    vkCmdUpdateBuffer(cmd, MapIndirectBuffer, 0,
+    vkCmdUpdateBuffer(cmd, MapIndirectBuffer, slice,
                       commands.size() * sizeof(VkDrawIndexedIndirectCommand), commands.data());
-    vkCmdUpdateBuffer(cmd, MapIndirectBuffer, kMapParamOffset, params.size() * sizeof(uint32_t),
-                      params.data());
+    vkCmdUpdateBuffer(cmd, MapIndirectBuffer, slice + kMapParamOffset,
+                      params.size() * sizeof(uint32_t), params.data());
     // Both halves, and they need different destinations: the commands are consumed by the
     // DRAW_INDIRECT stage and the parameters by the vertex shader reading them as an address.
     VkMemoryBarrier2 written = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
@@ -2481,12 +3313,15 @@ void BakeMapShadows(void *command_buffer) {
   rendering.layerCount = 1;
   rendering.pDepthAttachment = &attachment;
   vkCmdBeginRendering(cmd, &rendering);
-  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, MapShadowPipeline);
+  const bool tessellating = ShadowTessellating() && MapShadowPipelineTess != VK_NULL_HANDLE;
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    tessellating ? MapShadowPipelineTess : MapShadowPipeline);
 
   ShadowPushConstants push = {};
   push.draws = draw_records;
+  FillShadowTessPush(push);
   push.vertices = arena_vertices;
-  push.params = MapIndirectAddress + kMapParamOffset;
+  push.params = MapIndirectAddress + slice + kMapParamOffset;
   // Once for the whole slice, not once per draw: every caster is in the arena by construction
   // (IsMapGeometry), which is what makes an indirect batch possible at all.
   vkCmdBindIndexBuffer(cmd, index_buffer, 0, index_type);
@@ -2507,19 +3342,19 @@ void BakeMapShadows(void *command_buffer) {
       vkCmdSetScissor(cmd, 0, 1, &scissor);
       BuildCubeFaceMatrix(position, range, face, push.light_matrix);
 
-      vkCmdPushConstants(cmd, ShadowLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
+      vkCmdPushConstants(cmd, ShadowLayout, kShadowPushStages, 0, sizeof(push), &push);
       if (MapShadowIndirect) {
         // **One command for every caster on this face.** The whole optimisation: what was 213
         // `vkCmdDrawIndexed` calls is one, and the record each vertex needs comes out of
         // `params` at `SV_DrawIndex` instead of out of the push (§4.62).
-        vkCmdDrawIndexedIndirect(cmd, MapIndirectBuffer, 0,
+        vkCmdDrawIndexedIndirect(cmd, MapIndirectBuffer, slice,
                                  static_cast<uint32_t>(casters.size()), kMapIndirectStride);
         ++MapShadowDraws;
       } else {
         for (const DrawItem *item : casters) {
           push.record = item->record;
           push.base_vertex = item->base_vertex;
-          vkCmdPushConstants(cmd, ShadowLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push),
+          vkCmdPushConstants(cmd, ShadowLayout, kShadowPushStages, 0, sizeof(push),
                              &push);
           vkCmdDrawIndexed(cmd, item->count, 1, item->first_index, item->vertex_offset, 0);
           ++MapShadowDraws;
@@ -2574,6 +3409,301 @@ void BakeMapShadows(void *command_buffer) {
   to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   dependency.pImageMemoryBarriers = &to_read;
   vkCmdPipelineBarrier2(cmd, &dependency);
+}
+
+// The per-frame bake (§4.66). Every light this frame registered, six faces each, over every
+// opaque caster in the frame - map, props and units alike.
+void BakeDynamicShadows(void *command_buffer) {
+  auto cmd = static_cast<VkCommandBuffer>(command_buffer);
+  DynCasters = 0;
+  DynCastersDropped = 0;
+  DynBuckets = 0;
+  if (!Ready || !DynShadowReady || cmd == VK_NULL_HANDLE || !DynamicShadowsEnabled) {
+    return;
+  }
+  // Nothing new to bake. Not merely an optimisation: without it a frame that registers no light -
+  // a menu, a load - would re-bake the previous frame's set against the previous frame's records,
+  // which the scratch has since rotated out from under.
+  ++DynCalls;
+  if (DynLights.empty() || DynFrame == DynBakedFrame) {
+    ++DynSkipped;
+    return;
+  }
+  const uint64_t arena_vertices = VertexArenaAddress();
+  const uint64_t scratch_vertices = ScratchVertexAddress();
+  const uint64_t draw_records = ScratchDrawAddress();
+  if (draw_records == 0 || Items.empty()) {
+    return;
+  }
+
+  // Bucket the frame's casters. Four buckets are possible and one or two are what actually occur;
+  // the order within a bucket is the draw list's, so a command and its parameters stay paired.
+  std::vector<CasterBucket> buckets;
+  std::vector<const DrawItem *> ordered;
+  ordered.reserve(Items.size());
+  for (const DrawItem &item : Items) {
+    if (!IsDynamicCaster(item)) {
+      continue;
+    }
+    const uint64_t vertices =
+        item.vertex_source == DrawSource::Arena ? arena_vertices : scratch_vertices;
+    const VkBuffer index_buffer = item.index_source == DrawSource::Arena
+                                      ? reinterpret_cast<VkBuffer>(IndexArenaBuffer())
+                                      : reinterpret_cast<VkBuffer>(ScratchIndexBuffer());
+    if (vertices == 0 || index_buffer == VK_NULL_HANDLE) {
+      continue;
+    }
+    if (ordered.size() >= kMaxMapCasters) {
+      ++DynCastersDropped;
+      continue;
+    }
+    CasterBucket *bucket = nullptr;
+    for (CasterBucket &candidate : buckets) {
+      if (candidate.vertex_source == item.vertex_source &&
+          candidate.index_source == item.index_source &&
+          candidate.index_stride == item.index_stride) {
+        bucket = &candidate;
+        break;
+      }
+    }
+    if (bucket == nullptr) {
+      buckets.push_back({item.vertex_source, item.index_source, item.index_stride, 0, 0});
+      bucket = &buckets.back();
+    }
+    ++bucket->count;
+    ordered.push_back(&item);
+  }
+  if (ordered.empty()) {
+    return;
+  }
+
+  // Lay the buckets out contiguously and fill the batch in that order, so one `vkCmdUpdateBuffer`
+  // pair covers every bucket and each bucket is a contiguous range of commands.
+  uint32_t next = 0;
+  for (CasterBucket &bucket : buckets) {
+    bucket.first = next;
+    next += bucket.count;
+    bucket.count = 0; // refilled as the commands are written, so `first + count` stays the cursor
+  }
+  std::vector<VkDrawIndexedIndirectCommand> commands(ordered.size());
+  std::vector<uint32_t> params(ordered.size() * 2);
+  for (const DrawItem *item : ordered) {
+    CasterBucket *bucket = nullptr;
+    for (CasterBucket &candidate : buckets) {
+      if (candidate.vertex_source == item->vertex_source &&
+          candidate.index_source == item->index_source &&
+          candidate.index_stride == item->index_stride) {
+        bucket = &candidate;
+        break;
+      }
+    }
+    const uint32_t at = bucket->first + bucket->count++;
+    commands[at].indexCount = item->count;
+    commands[at].instanceCount = 1;
+    commands[at].firstIndex = item->first_index;
+    commands[at].vertexOffset = item->vertex_offset;
+    commands[at].firstInstance = 0;
+    params[at * 2 + 0] = item->record;
+    params[at * 2 + 1] = item->base_vertex;
+  }
+  // This frame's slice of the ring, so the transfer cannot land on bytes an in-flight frame's
+  // indirect draws are still reading.
+  ++DynRingSerial;
+  const VkDeviceSize slice =
+      static_cast<VkDeviceSize>(DynRingSerial % kDynIndirectRing) * kDynIndirectSlice;
+  // ... and the atlas image's own slice, which is the hazard the batch's ring does not cover:
+  // frame N's world pass is still SAMPLING the atlas when frame N+1's bake declares
+  // `oldLayout = UNDEFINED` on it.
+  DynImageSlot = static_cast<uint32_t>(DynRingSerial % kDynShadowRing);
+  // **Range-check the batch before it is ever submitted**, and keep the first few for the report.
+  //
+  // A RenderDoc capture cannot see this bake: the device is lost before `EndFrameCapture` can
+  // write the file, so the capture never exists. What a capture would have shown - a command with
+  // an index range past its buffer, which is the classic way to hang a GPU on an indirect draw -
+  // is computable here, at no risk, from the bytes about to be sent.
+  DynBadRanges = 0;
+  DynWorstIndexEnd = 0;
+  DynSample.clear();
+  {
+    const uint64_t index_capacity = Resources().index_arena_bytes;
+    for (const CasterBucket &bucket : buckets) {
+      for (uint32_t i = 0; i < bucket.count; ++i) {
+        const VkDrawIndexedIndirectCommand &c = commands[bucket.first + i];
+        const uint64_t end = static_cast<uint64_t>(c.firstIndex) + c.indexCount;
+        const uint64_t bytes = end * bucket.index_stride;
+        if (bucket.index_source == DrawSource::Arena && bytes > index_capacity) {
+          ++DynBadRanges;
+        }
+        if (bytes > DynWorstIndexEnd) {
+          DynWorstIndexEnd = bytes;
+        }
+        if (DynSample.size() < 12) {
+          DynSample.push_back({c.indexCount, c.firstIndex,
+                               static_cast<uint32_t>(c.vertexOffset),
+                               params[(bucket.first + i) * 2 + 0],
+                               params[(bucket.first + i) * 2 + 1], bucket.index_stride,
+                               bucket.index_source == DrawSource::Arena});
+        }
+      }
+    }
+  }
+
+  vkCmdUpdateBuffer(cmd, DynIndirectBuffer, slice,
+                    commands.size() * sizeof(VkDrawIndexedIndirectCommand), commands.data());
+  vkCmdUpdateBuffer(cmd, DynIndirectBuffer, slice + kMapParamOffset,
+                    params.size() * sizeof(uint32_t), params.data());
+  // Two destinations, as §4.62: the commands are read by DRAW_INDIRECT and the parameters by the
+  // vertex shader as an address, and only the first is what a transfer barrier assumes.
+  VkMemoryBarrier2 written = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+  written.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+  written.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+  written.dstStageMask =
+      VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+  written.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT;
+  VkDependencyInfo upload = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  upload.memoryBarrierCount = 1;
+  upload.pMemoryBarriers = &written;
+  vkCmdPipelineBarrier2(cmd, &upload);
+
+  VkImageMemoryBarrier2 to_attachment = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+  to_attachment.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  to_attachment.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT;
+  to_attachment.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+  // **UNDEFINED every frame**, where the static atlas may only say it on its first slice: this one
+  // is rebuilt whole, so the previous frame's contents are not ours to preserve and saying so lets
+  // the driver skip a decompress. It is the same reasoning as the offscreen target's (§4.38).
+  to_attachment.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  to_attachment.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  to_attachment.image = DynShadowImage[DynImageSlot];
+  to_attachment.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+  to_attachment.subresourceRange.levelCount = 1;
+  to_attachment.subresourceRange.layerCount = 1;
+  VkDependencyInfo dependency = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  dependency.imageMemoryBarrierCount = 1;
+  dependency.pImageMemoryBarriers = &to_attachment;
+  vkCmdPipelineBarrier2(cmd, &dependency);
+
+  VkRenderingAttachmentInfo attachment = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  attachment.imageView = DynShadowView[DynImageSlot];
+  attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  // CLEAR unconditionally, for the same reason the barrier says UNDEFINED - and it is what makes a
+  // slot no light claimed this frame read as depth 1, "nothing occludes", rather than as whatever
+  // light held it last frame.
+  attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  attachment.clearValue.depthStencil.depth = 1.0f;
+
+  VkRenderingInfo rendering = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+  rendering.renderArea.extent = {kDynShadowAtlas, kDynShadowAtlas};
+  rendering.layerCount = 1;
+  rendering.pDepthAttachment = &attachment;
+  vkCmdBeginRendering(cmd, &rendering);
+  // Two axes, so four pipelines: which submission path, and whether the patch is amplified. The
+  // tessellated twin is only taken when it actually built - a create failure there leaves the
+  // untessellated one bound rather than dropping the bake.
+  const bool tessellating =
+      ShadowTessellating() && (DynShadowIndirect ? DynShadowPipelineTess != VK_NULL_HANDLE
+                                                 : DynShadowDirectPipelineTess != VK_NULL_HANDLE);
+  VkPipeline dyn_pipeline =
+      tessellating ? (DynShadowIndirect ? DynShadowPipelineTess : DynShadowDirectPipelineTess)
+                   : (DynShadowIndirect ? DynShadowPipeline : DynShadowDirectPipeline);
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, dyn_pipeline);
+
+  ShadowPushConstants push = {};
+  push.draws = draw_records;
+  FillShadowTessPush(push);
+  VkBuffer bound_index = VK_NULL_HANDLE;
+  VkIndexType bound_type = VK_INDEX_TYPE_UINT16;
+
+  // The bisect caps (§4.66), applied here and not at collection: everything above still describes
+  // the whole set, so `dynamic_shadow_report` keeps saying what the frame *offered* while these say
+  // what was actually submitted. 0 is no cap.
+  const uint32_t light_limit =
+      DynMaxLights > 0 ? (std::min)(static_cast<uint32_t>(DynMaxLights),
+                                    static_cast<uint32_t>(DynLights.size()))
+                       : static_cast<uint32_t>(DynLights.size());
+  const uint32_t face_limit = DynMaxFaces > 0 ? (std::min)(static_cast<uint32_t>(DynMaxFaces), 6u)
+                                              : 6u;
+
+  for (uint32_t slot = 0; slot < light_limit; ++slot) {
+    Vec3 position = {};
+    float range = 0.0f;
+    std::memcpy(&position.x, DynLights[slot].position, sizeof(float) * 3);
+    std::memcpy(&range, &DynLights[slot].range, sizeof(range));
+    for (uint32_t face = 0; face < face_limit; ++face) {
+      const uint32_t tile = slot * 6 + face;
+      const float tx = static_cast<float>((tile % kDynShadowTilesPerRow) * kDynShadowFace);
+      const float ty = static_cast<float>((tile / kDynShadowTilesPerRow) * kDynShadowFace);
+      VkViewport viewport = {tx, ty, float(kDynShadowFace), float(kDynShadowFace), 0.0f, 1.0f};
+      VkRect2D scissor = {{int32_t(tx), int32_t(ty)}, {kDynShadowFace, kDynShadowFace}};
+      vkCmdSetViewport(cmd, 0, 1, &viewport);
+      vkCmdSetScissor(cmd, 0, 1, &scissor);
+      BuildCubeFaceMatrix(position, range, face, push.light_matrix);
+
+      for (const CasterBucket &bucket : buckets) {
+        if (bucket.count == 0) {
+          continue;
+        }
+        // The caster cap, per bucket: with one bucket it is exactly "the first N casters", and with
+        // more it takes the first N of each, which is what keeps every bucket represented while the
+        // set shrinks.
+        const uint32_t draw_count =
+            DynMaxCasters > 0
+                ? (std::min)(static_cast<uint32_t>(DynMaxCasters), bucket.count)
+                : bucket.count;
+        const VkBuffer index_buffer = bucket.index_source == DrawSource::Arena
+                                          ? reinterpret_cast<VkBuffer>(IndexArenaBuffer())
+                                          : reinterpret_cast<VkBuffer>(ScratchIndexBuffer());
+        const VkIndexType type =
+            bucket.index_stride == 4 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+        if (index_buffer != bound_index || type != bound_type) {
+          vkCmdBindIndexBuffer(cmd, index_buffer, 0, type);
+          bound_index = index_buffer;
+          bound_type = type;
+        }
+        push.vertices = bucket.vertex_source == DrawSource::Arena ? arena_vertices
+                                                                 : scratch_vertices;
+        if (!DynShadowIndirect) {
+          // The direct path: the record and the arena slot ride in the push, exactly as the sun's
+          // pass does it, and nothing reads the indirect buffer at all. Same atlas, same casters.
+          for (uint32_t i = 0; i < draw_count; ++i) {
+            const DrawItem *item = ordered[bucket.first + i];
+            push.record = item->record;
+            push.base_vertex = item->base_vertex;
+            vkCmdPushConstants(cmd, ShadowLayout, kShadowPushStages, 0, sizeof(push),
+                               &push);
+            vkCmdDrawIndexed(cmd, item->count, 1, item->first_index, item->vertex_offset, 0);
+            ++DynIndirectCommands;
+          }
+          continue;
+        }
+        // Each bucket's parameters start where its commands do, so `SV_DrawIndex` - which counts
+        // from 0 within one `vkCmdDrawIndexedIndirect` - indexes its own bucket's slice.
+        push.params = DynIndirectAddress + slice + kMapParamOffset + bucket.first * 8;
+        vkCmdPushConstants(cmd, ShadowLayout, kShadowPushStages, 0, sizeof(push), &push);
+        vkCmdDrawIndexedIndirect(cmd, DynIndirectBuffer,
+                                 slice + static_cast<VkDeviceSize>(bucket.first) *
+                                             kMapIndirectStride,
+                                 draw_count, kMapIndirectStride);
+        ++DynIndirectCommands;
+      }
+    }
+  }
+  vkCmdEndRendering(cmd);
+
+  VkImageMemoryBarrier2 to_read = to_attachment;
+  to_read.srcStageMask = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+  to_read.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+  to_read.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+  to_read.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  dependency.pImageMemoryBarriers = &to_read;
+  vkCmdPipelineBarrier2(cmd, &dependency);
+
+  DynBakedFrame = DynFrame;
+  DynCasters = static_cast<uint32_t>(ordered.size());
+  DynBuckets = static_cast<uint32_t>(buckets.size());
 }
 
 void BuildLightGrid(void *command_buffer) {
@@ -2786,6 +3916,103 @@ int ShadowCascades() { return ShadowCascadeCount; }
 
 void SetLocalLights(bool enabled) { LocalLightsEnabled = enabled; }
 bool LocalLights() { return LocalLightsEnabled; }
+
+void SetLocalLightWindow(bool enabled) { LocalLightWindowEnabled = enabled; }
+bool LocalLightWindow() { return LocalLightWindowEnabled; }
+
+void SetDynamicShadows(bool enabled) { DynamicShadowsEnabled = enabled; }
+void SetDynamicShadowArenaOnly(bool enabled) { DynCasterArenaOnly = enabled; }
+void SetDynamicShadowMapOnly(bool enabled) { DynCasterMapOnly = enabled; }
+bool DynamicShadowMapOnly() { return DynCasterMapOnly; }
+void SetDynamicShadowSample(bool enabled) { DynShadowSample = enabled; }
+bool DynamicShadowSample() { return DynShadowSample; }
+bool DynamicShadowArenaOnly() { return DynCasterArenaOnly; }
+bool DynamicShadows() { return DynamicShadowsEnabled; }
+void SetDynamicShadowBias(float texels) { DynShadowBiasValue = texels; }
+float DynamicShadowBias() { return DynShadowBiasValue; }
+
+// Clamped at 3 (a 7x7) because the kernel is quadratic and the loop is per light per fragment -
+// 4 would be 81 taps against 9, and the artefact this exists for is gone by 1.
+void SetLocalShadowTaps(int radius) {
+  LocalShadowTapsValue = radius < 0 ? 0 : (radius > 3 ? 3 : radius);
+}
+int LocalShadowTaps() { return LocalShadowTapsValue; }
+
+// The bisect caps. Clamped at 0 rather than rejected, because 0 is the meaningful "no cap" value
+// and a negative would otherwise read as an enormous unsigned one at the comparison.
+void SetDynamicShadowMaxLights(int lights) { DynMaxLights = lights < 0 ? 0 : lights; }
+int DynamicShadowMaxLights() { return DynMaxLights; }
+void SetDynamicShadowMaxFaces(int faces) { DynMaxFaces = faces < 0 ? 0 : faces; }
+int DynamicShadowMaxFaces() { return DynMaxFaces; }
+void SetDynamicShadowMaxCasters(int casters) { DynMaxCasters = casters < 0 ? 0 : casters; }
+int DynamicShadowMaxCasters() { return DynMaxCasters; }
+void SetDynamicShadowIndirect(bool enabled) { DynShadowIndirect = enabled; }
+bool DynamicShadowIndirect() { return DynShadowIndirect; }
+
+std::string DynamicShadowReport() {
+  std::string out;
+  char line[256];
+  const auto add = [&](const char *format, auto... args) {
+    std::snprintf(line, sizeof(line), format, args...);
+    out += line;
+  };
+  // **Three states and not two.** The first draft printed "UNAVAILABLE - no multiDrawIndirect"
+  // for every way of not being ready, and the atlas creation was then accidentally never called
+  // at all - which read as a device limitation on a card that plainly has the feature, and cost a
+  // diagnosis. `multiDrawIndirect` is now asked separately from whether the atlas exists.
+  add("per-frame shadow atlas: %s\n",
+      !DynamicShadowsEnabled
+          ? "OFF - render.dynamic_shadows"
+          : (DynShadowReady ? "on"
+                            : (Caps().multi_draw_indirect
+                                   ? "NOT CREATED - see the log; the device supports it"
+                                   : "UNAVAILABLE - this device has no multiDrawIndirect")));
+  add("atlas %ux%u (%u KB, D16) x%u ring, %u faces of %u: %u light slots\n", kDynShadowAtlas,
+      kDynShadowAtlas, (unsigned)(DynShadowBytes / 1024), kDynShadowRing,
+      kDynShadowTilesPerRow * kDynShadowTilesPerRow, kDynShadowFace, kDynShadowSlots);
+  add("last frame: %u lights (%u refused - no slot), %u casters in %u buckets (%u dropped)\n",
+      (unsigned)DynLights.size(), DynRefused, DynCasters, DynBuckets, DynCastersDropped);
+  // The count that says what this costs to submit: it is 6 x lights x buckets a frame, where the
+  // static atlas was 6 x lights once per level.
+  add("indirect commands issued: %llu cumulative, %u this frame\n",
+      (unsigned long long)DynIndirectCommands,
+      (unsigned)(DynLights.size() * 6 * (DynBuckets == 0 ? 0 : DynBuckets)));
+  add("normal offset %.2f texels\n", DynShadowBiasValue);
+  // The bisect state, printed unconditionally: a capped bake that survives looks exactly like a
+  // healthy one, so "which configuration was that?" has to be readable off the report itself.
+  add("submission: %s, caps lights %d faces %d casters %d (0 = no cap)\n",
+      DynShadowIndirect ? "vkCmdDrawIndexedIndirect, one batch a bucket a face"
+                        : "a draw call per caster per face (dynamic_shadow_indirect off)",
+      DynMaxLights, DynMaxFaces, DynMaxCasters);
+  // **The check a RenderDoc capture of this bake cannot supply**, because the device is lost
+  // before the file is written and so the capture never exists. An indirect command whose index
+  // range runs past its buffer is the classic way to hang a GPU on an indirect draw, and it is
+  // computable from the bytes about to be submitted - at no risk at all.
+  add("bake calls: %llu   skipped as nothing new: %llu   frame %llu, baked %llu\n",
+      (unsigned long long)DynCalls, (unsigned long long)DynSkipped,
+      (unsigned long long)DynFrame, (unsigned long long)DynBakedFrame);
+  add("index ranges past the arena: %u   furthest byte any command reads: %llu of %llu\n",
+      DynBadRanges, (unsigned long long)DynWorstIndexEnd,
+      (unsigned long long)Resources().index_arena_bytes);
+  if (!DynSample.empty()) {
+    out += "  the batch, first entries:  idxCount  firstIdx  vtxOffset  record  baseVtx  stride"
+           "  source\n";
+    for (const DynSampleEntry &e : DynSample) {
+      add("    %8u  %8u  %9u  %6u  %7u  %6u  %s\n", e.index_count, e.first_index, e.vertex_offset,
+          e.record, e.base_vertex, e.stride, e.arena ? "arena" : "scratch");
+    }
+  }
+  for (uint32_t slot = 0; slot < DynLights.size(); ++slot) {
+    float position[3] = {};
+    float range = 0.0f;
+    std::memcpy(position, DynLights[slot].position, sizeof(position));
+    std::memcpy(&range, &DynLights[slot].range, sizeof(range));
+    add("  slot %2u  %s  %.2f %.2f %.2f  range %.2f\n", slot,
+        DynLights[slot].type == 2 ? "spot " : "point", position[0], position[1], position[2],
+        range);
+  }
+  return out;
+}
 
 void SetLocalShadows(bool enabled) {
   if (LocalShadowsEnabled() == enabled) {
@@ -3048,6 +4275,11 @@ void ClearDraws() {
 }
 
 void RecordDraws(void *command_buffer) {
+  // Per frame, not cumulative: the question these answer is "what is the set predicate selecting
+  // right now", which a running total cannot say. Zeroed here rather than at the draw loop so an
+  // early return below reports 0 rather than the previous frame's figures.
+  TessDrawsThisFrame = 0;
+  TessPatchesThisFrame = 0;
   TheStats.items = Items.size();
   if (Items.size() > TheStats.max_items) {
     TheStats.max_items = Items.size();
@@ -3119,7 +4351,18 @@ void RecordDraws(void *command_buffer) {
     if (index >= DrawHideFirst && index <= DrawHideLast) {
       continue;
     }
-    const VkPipeline pipeline = PipelineFor(item.pipeline);
+    // The tessellation bit is set here, on a copy, rather than by the capture layer: which draws
+    // are the level mesh is this renderer's policy and not something D3D was asked for, and the
+    // predicates and the material table are both in this file. A draw that does not want it
+    // forms exactly the key it formed before the feature existed, which is what makes
+    // `render.tessellation = false` bit-identical rather than merely equivalent.
+    PipelineState key = item.pipeline;
+    if (WantsTessellation(item)) {
+      key.tessellate = 1;
+      ++TessDrawsThisFrame;
+      TessPatchesThisFrame += item.count / 3;
+    }
+    const VkPipeline pipeline = PipelineFor(key);
     if (pipeline == VK_NULL_HANDLE) {
       continue;
     }
@@ -3210,9 +4453,15 @@ void RecordDraws(void *command_buffer) {
     if (push.vertices == 0) {
       continue;
     }
+    // Every stage the range names, whether or not this draw's pipeline has them: the spec
+    // requires a push to cover the whole overlapping range, not just the stages that will read
+    // it, so naming only VERTEX|FRAGMENT here is invalid the moment the range gained the two
+    // tessellation bits. Measured - validation says so on every draw.
     vkCmdPushConstants(cmd, Layout,
-                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                       sizeof(push), &push);
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                           VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                           VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+                       0, sizeof(push), &push);
 
     if (item.indexed) {
       VkBuffer want =
@@ -3305,6 +4554,243 @@ std::string DescribeDraw(uint32_t index) {
   return line;
 }
 
+namespace {
+// One bucket of the normal census. `corners` is triangle corners, so three per triangle, and
+// every count below is over those unless it says otherwise.
+struct NormalCensus {
+  uint32_t draws = 0;
+  uint64_t triangles = 0;
+  uint64_t corners = 0;
+  // The four classes of the PN tangent term, `|dot(normalize(edge), normal)|`, taken as the worst
+  // of a corner's two edges. `flat` is the class PN triangles cannot move.
+  uint64_t flat = 0;    // < 1e-4  - exactly the linear control point, to float precision
+  uint64_t near_ = 0;   // < 0.01  - sub-texel bulge, invisible
+  uint64_t soft = 0;    // < 0.10
+  uint64_t curved = 0;  // >= 0.10 - a real curve, and what the feature exists for
+  uint64_t flat_triangles = 0; // all three corners flat: PN is a bit-exact identity on these
+  uint64_t degenerate = 0;     // zero-area, so there is no edge direction to test against
+  uint64_t no_normal = 0;      // a zero-length vertex normal - the unlit FVFs
+  double worst = 0.0;
+  double total = 0.0;
+
+  void Corner(double deviation) {
+    ++corners;
+    total += deviation;
+    worst = deviation > worst ? deviation : worst;
+    if (deviation < 1e-4) {
+      ++flat;
+    } else if (deviation < 0.01) {
+      ++near_;
+    } else if (deviation < 0.10) {
+      ++soft;
+    } else {
+      ++curved;
+    }
+  }
+};
+
+// `|dot(normalize(b - a), n)|` - the tangent term the PN construction divides by the edge
+// length. Zero when the normal is perpendicular to the edge, which is the flat case.
+//
+// `degenerate` distinguishes the two ways this returns zero, which are opposites and must not be
+// conflated: a zero-length edge has no direction to be perpendicular to, where a genuinely
+// perpendicular normal is the flat case the whole feature is built around.
+double TangentTerm(const float *a, const float *b, const float *n, double normal_length,
+                   bool &degenerate) {
+  const double e[3] = {double(b[0]) - a[0], double(b[1]) - a[1], double(b[2]) - a[2]};
+  const double length = std::sqrt(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]);
+  if (length < 1e-9 || normal_length < 1e-9) {
+    degenerate = true;
+    return 0.0;
+  }
+  const double dot = e[0] * n[0] + e[1] * n[1] + e[2] * n[2];
+  return std::fabs(dot / (length * normal_length));
+}
+
+// A percentage to one decimal, as TEXT - never handed to `%f`.
+//
+// **The CRT this DLL links truncates `%.1f` and signs its zero.** 104 of 1611 printed as `6.4%`
+// where the value is 6.456, and a zero percentage printed as `-0.0%`. Reproducing the identical
+// `snprintf` call argument-for-argument in a standalone 32-bit clang build prints `6.5` and `0.0`,
+// so it is the runtime rather than the arithmetic, the format string or an argument mismatch.
+//
+// **Rounding on this side first does not fix it and makes it worse**, which is worth stating
+// because it was tried: hand a truncating conversion the rounded 1.9 and it prints 1.8, since the
+// nearest double to 1.9 is 1.8999999999999999. The two errors compose instead of cancelling, and
+// seven of the eight percentages in a level02 census moved 0.1 the wrong way. Keeping the value
+// out of the float conversion entirely is the only robust form.
+//
+// No count is affected either way, and every conclusion in §4.71 rests on counts - but a
+// diagnostic whose printed ratio disagrees with its own numerator and denominator cannot be
+// checked by hand, which is most of what it is for.
+std::string Percent(uint64_t n, uint64_t d) {
+  if (d == 0) {
+    return "0.0";
+  }
+  const auto tenths = static_cast<uint64_t>(1000.0 * double(n) / double(d) + 0.5);
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%llu.%llu", (unsigned long long)(tenths / 10),
+                (unsigned long long)(tenths % 10));
+  return buf;
+}
+
+void CensusText(std::string &out, const char *what, const NormalCensus &c) {
+  char line[512];
+  auto pct = [&](uint64_t n) { return Percent(n, c.corners); };
+  std::snprintf(line, sizeof(line),
+                "  %s: %u draws, %llu triangles, %llu corners\n"
+                "    flat   (< 1e-4): %10llu  %5s%%   <- PN is an exact identity here\n"
+                "    near   (< 0.01): %10llu  %5s%%\n"
+                "    soft   (< 0.10): %10llu  %5s%%\n"
+                "    curved (>=0.10): %10llu  %5s%%   <- what tessellation can reach\n"
+                "    triangles with all three corners flat: %llu of %llu (%s%%)\n"
+                // `worst` and `mean` stay on %f: they are not ratios of two printed integers, so
+                // a reader cannot check them by hand anyway and a tenth at the end does not
+                // change what either is for.
+                "    worst %.4f   mean %.5f   %llu degenerate, %llu with no normal\n",
+                what, c.draws, (unsigned long long)c.triangles,
+                (unsigned long long)c.corners, (unsigned long long)c.flat, pct(c.flat).c_str(),
+                (unsigned long long)c.near_, pct(c.near_).c_str(), (unsigned long long)c.soft,
+                pct(c.soft).c_str(), (unsigned long long)c.curved, pct(c.curved).c_str(),
+                (unsigned long long)c.flat_triangles, (unsigned long long)c.triangles,
+                Percent(c.flat_triangles, c.triangles).c_str(),
+                c.worst, c.corners == 0 ? 0.0 : c.total / double(c.corners),
+                (unsigned long long)c.degenerate, (unsigned long long)c.no_normal);
+  out += line;
+}
+
+// Bounded rather than unbounded, and the report says how many it skipped: a silent cap would
+// read as "the whole frame is flat" when it means "most of the frame was never looked at".
+constexpr uint32_t kMaxCensusDraws = 512;
+} // namespace
+
+std::string DescribeNormalCensus() {
+  if (LastItems.empty()) {
+    return "no frame has been recorded yet\n";
+  }
+  NormalCensus map, other;
+  uint32_t skipped_source = 0, skipped_topology = 0, over_cap = 0, read_failures = 0;
+  uint32_t examined = 0;
+
+  std::vector<uint8_t> index_bytes;
+  std::vector<CanonicalVertex> vertices;
+  std::vector<uint32_t> indices;
+
+  for (const DrawItem &item : LastItems) {
+    // Both sources must be the arena: the scratch is a different buffer and rotates, and a
+    // non-indexed draw has no shared vertices for a normal to be averaged across in the first
+    // place - so neither can answer this question even in principle.
+    if (!item.indexed || item.vertex_source != DrawSource::Arena ||
+        item.index_source != DrawSource::Arena) {
+      ++skipped_source;
+      continue;
+    }
+    if (item.pipeline.topology != 4 /* D3DPT_TRIANGLELIST */ || item.count < 3) {
+      ++skipped_topology;
+      continue;
+    }
+    if (examined >= kMaxCensusDraws) {
+      ++over_cap;
+      continue;
+    }
+    ++examined;
+
+    const uint32_t stride = item.index_stride == 4 ? 4u : 2u;
+    index_bytes.assign(size_t(item.count) * stride, 0);
+    if (!ReadArena(false, uint64_t(item.first_index) * stride,
+                   uint32_t(index_bytes.size()), index_bytes.data())) {
+      ++read_failures;
+      continue;
+    }
+    indices.resize(item.count);
+    for (uint32_t i = 0; i < item.count; ++i) {
+      indices[i] = stride == 4 ? reinterpret_cast<const uint32_t *>(index_bytes.data())[i]
+                               : reinterpret_cast<const uint16_t *>(index_bytes.data())[i];
+    }
+
+    // One read for the whole draw rather than one per triangle: ReadArena submits and waits.
+    // The span is what the shader would address - `base_vertex + index + vertex_offset` - so it
+    // is derived from the indices rather than assumed to start at base_vertex.
+    int64_t lowest = INT64_MAX, highest = INT64_MIN;
+    for (const uint32_t index : indices) {
+      const int64_t v = int64_t(item.base_vertex) + int64_t(index) + item.vertex_offset;
+      lowest = v < lowest ? v : lowest;
+      highest = v > highest ? v : highest;
+    }
+    if (lowest < 0 || highest < lowest) {
+      ++read_failures;
+      continue;
+    }
+    const uint64_t span = uint64_t(highest - lowest) + 1;
+    vertices.assign(size_t(span), CanonicalVertex{});
+    if (!ReadArena(true, uint64_t(lowest) * sizeof(CanonicalVertex),
+                   uint32_t(span * sizeof(CanonicalVertex)), vertices.data())) {
+      ++read_failures;
+      continue;
+    }
+
+    NormalCensus &bucket = IsMapGeometry(item) ? map : other;
+    ++bucket.draws;
+    for (uint32_t t = 0; t + 2 < item.count; t += 3) {
+      const CanonicalVertex *corner[3];
+      for (uint32_t k = 0; k < 3; ++k) {
+        const int64_t v =
+            int64_t(item.base_vertex) + int64_t(indices[t + k]) + item.vertex_offset - lowest;
+        corner[k] = &vertices[size_t(v)];
+      }
+      ++bucket.triangles;
+      bool all_flat = true;
+      for (uint32_t k = 0; k < 3; ++k) {
+        const float *n = corner[k]->normal;
+        const double length = std::sqrt(double(n[0]) * n[0] + double(n[1]) * n[1] +
+                                        double(n[2]) * n[2]);
+        if (length < 1e-9) {
+          ++bucket.no_normal;
+          ++bucket.corners;
+          ++bucket.flat; // no normal is no curvature, and it must not read as one
+          continue;
+        }
+        // The worse of the corner's two outgoing edges: the control point on either one bulges,
+        // so a corner is only flat if both terms vanish.
+        bool degenerate_a = false, degenerate_b = false;
+        const double a =
+            TangentTerm(corner[k]->pos, corner[(k + 1) % 3]->pos, n, length, degenerate_a);
+        const double b =
+            TangentTerm(corner[k]->pos, corner[(k + 2) % 3]->pos, n, length, degenerate_b);
+        const double deviation = a > b ? a : b;
+        if (degenerate_a || degenerate_b) {
+          // A zero-length edge: the triangle has no extent at this corner, so there is nothing
+          // to be flat or curved about and the zero it contributes is not evidence of flatness.
+          // Counted apart for that reason - folding it into `flat` would make a sliver-heavy
+          // mesh read as a mesh that tessellation cannot change.
+          ++bucket.degenerate;
+        }
+        bucket.Corner(deviation);
+        all_flat = all_flat && deviation < 1e-4;
+      }
+      bucket.flat_triangles += all_flat ? 1 : 0;
+    }
+  }
+
+  std::string out;
+  char line[512];
+  std::snprintf(line, sizeof(line),
+                "normal census over %u draws of the last frame (%u examined)\n"
+                "  the metric is |dot(normalize(edge), normal)| - the PN tangent term over edge "
+                "length,\n"
+                "  so a corner reading d bulges its edge by about d * length / 3\n",
+                static_cast<unsigned>(LastItems.size()), examined);
+  out += line;
+  CensusText(out, "map geometry (IsMapGeometry)", map);
+  CensusText(out, "everything else (props, units, effects)", other);
+  std::snprintf(line, sizeof(line),
+                "  not examined: %u not arena-indexed, %u not a triangle list, %u over the %u "
+                "draw cap, %u arena read failures\n",
+                skipped_source, skipped_topology, over_cap, kMaxCensusDraws, read_failures);
+  out += line;
+  return out;
+}
+
 uint64_t DepthImageView() { return reinterpret_cast<uint64_t>(DepthView); }
 
 uint64_t DepthImage() { return reinterpret_cast<uint64_t>(Depth); }
@@ -3388,6 +4874,19 @@ std::string FormatDrawStats() {
   // original: a reader comparing a shot against real D3D8 has to know which equation ran, and
   // "no line" would read as "the fixed-function one" to anyone who had not been told otherwise.
   add("light sum: per %s\n", PerPixelLightingEnabled() ? "PIXEL" : "vertex (the original)");
+  // Only when it is on, for the reason the material overrides are: a `0 draws, 0 patches` on every
+  // report would read as an invariant of the renderer rather than as "nobody asked for it"
+  // (§4.44). A device with no `tessellationShader` therefore prints nothing whatever the knob
+  // says, which is the same statement.
+  if (TessellationEnabled()) {
+    add("tessellation: PN triangles over %s, %u draws / %u patches this frame\n"
+        "  edge %.0f px, factor %.1f..%.1f, pn strength %.2f, flat threshold %.3f%s\n",
+        TessellationSet() == TessSet::All ? "every opaque indexed draw" : "the map only",
+        TessDrawsThisFrame, TessPatchesThisFrame, TheTessParams.edge_pixels,
+        TheTessParams.min_factor, TheTessParams.max_factor, TheTessParams.pn_strength,
+        TheTessParams.pn_flat_threshold,
+        TessellationShadowsOn ? "" : "   (shadow passes NOT tessellated)");
+  }
   if (MapLightingEnabled) {
     // `grid builds` is the invariant here: the map's lights are static, so this is **once per
     // level**. A number that climbs with the frame count means the rebuild test has broken and
@@ -3448,6 +4947,12 @@ std::string FormatDrawStats() {
         LocalShadowsEnabled() ? "on" : "off", held, (unsigned)LocalShadowKeys.size(),
         kLocalShadowSlots, moving);
   }
+  // The per-frame atlas (§4.66). `casters` against the sun's is the reading: this one takes the
+  // same set the sun's pass does, so a large gap means something is being bucketed away.
+  add("per-frame light shadows: %s (%u lights x 6 faces, %u casters in %u buckets, %u refused, "
+      "%u dropped)\n",
+      !DynamicShadowsEnabled ? "off" : (DynShadowReady ? "on" : "UNAVAILABLE"),
+      (unsigned)DynLights.size(), DynCasters, DynBuckets, DynRefused, DynCastersDropped);
   add("viewport depth-slice changes: %llu\n", (unsigned long long)TheStats.viewport_sets);
   add("index binds: %llu   pipelines: %llu (%llu binds, %llu failures - must be 0)\n",
       (unsigned long long)TheStats.index_binds, (unsigned long long)TheStats.pipelines,
@@ -3484,8 +4989,10 @@ std::string FormatDrawStats() {
 }
 
 void ShutdownDraw() {
-  // Before the sun's, which owns the module and layout this one borrows - destroying a pipeline
-  // after its layout is legal, but the reverse order is the one that reads correctly.
+  // Reverse creation order: the per-frame atlas borrows the map's module, and the map's borrows
+  // the sun's module and layout. Destroying a pipeline after its layout is legal, but this is the
+  // order that reads correctly.
+  DestroyDynShadowAtlas();
   DestroyMapShadowAtlas();
   DestroyShadowPass();
   DestroyLightGridPipeline();
@@ -3503,7 +5010,8 @@ void ShutdownDraw() {
     }
   }
   Pipelines.clear();
-  for (VkShaderModule *module : {&VertexModule, &FragmentModule}) {
+  for (VkShaderModule *module :
+       {&VertexModule, &FragmentModule, &TessVertexModule, &HullModule, &DomainModule}) {
     if (*module != VK_NULL_HANDLE) {
       vkDestroyShaderModule(GetDevice(), *module, nullptr);
       *module = VK_NULL_HANDLE;

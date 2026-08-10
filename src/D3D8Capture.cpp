@@ -2171,6 +2171,7 @@ void StoreLight(vulkan::GpuLight &out, const D3DLIGHT8 &light, uint64_t frame) {
   // A directional light is the sun's business and never asks; everything else asks and mostly
   // gets -1 until its position has held still for a few frames.
   out.direction[3] = -1.0f;
+  out.position[3] = -1.0f;
   if (light.Type != D3DLIGHT_DIRECTIONAL) {
     const float cos_phi = light.Type == D3DLIGHT_SPOT ? std::cos(light.Phi * 0.5f) : 0.0f;
     vulkan::LocalShadowKey key;
@@ -2179,7 +2180,11 @@ void StoreLight(vulkan::GpuLight &out, const D3DLIGHT8 &light, uint64_t frame) {
     std::memcpy(key.direction, out.direction, sizeof(key.direction));
     std::memcpy(&key.cos_phi, &cos_phi, sizeof(key.cos_phi));
     key.type = static_cast<uint32_t>(light.Type);
+    // Both atlases are asked, and the per-frame one wins in the shader where both answer: its cube
+    // holds the units and props the static one cannot, so it is strictly the better shadow. The
+    // static slot is the fallback for a light the per-frame atlas had no room for.
     out.direction[3] = static_cast<float>(vulkan::AcquireLocalShadowSlot(key, frame));
+    out.position[3] = static_cast<float>(vulkan::RegisterDynamicShadowLight(key, frame));
   }
   StoreColour(out.diffuse, light.Diffuse);
   StoreColour(out.specular, light.Specular);

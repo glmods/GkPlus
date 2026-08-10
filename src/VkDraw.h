@@ -44,7 +44,11 @@ namespace vulkan {
 // 1 point, 2 spot, 3 directional - rather than a uint, so the whole struct is one kind of
 // component and the layout question does not arise a second time.
 struct GpuLight {
-  float position[4];    // xyz in world space
+  // xyz in world space. **w is this light's slot in the PER-FRAME atlas** (§4.66), or -1. It wins
+  // over `direction[3]` below where both are set, because the per-frame cube is strictly the
+  // better answer - it holds the units and props the static one cannot - and a light with only
+  // the static one falls back to it.
+  float position[4];
   // xyz in world space, already normalised. **w is this light's slot in the static shadow atlas**
   // (§4.65), or -1 for a light that has none - which is the normal case for a light that moves,
   // for one the atlas had no room for, and for every light before the bake reaches it. Carried as
@@ -113,6 +117,41 @@ constexpr uint32_t kMapShadowSlots = kMapShadowTilesPerRow * kMapShadowTilesPerR
 constexpr uint32_t kLocalShadowSlots = 16;
 constexpr uint32_t kMapShadowLightSlots = kMapShadowSlots - kLocalShadowSlots;
 
+// The **per-frame** atlas (§4.66), which is the other half of the same feature and the answer to
+// everything the static one above cannot do: a light that moves, and a caster that moves.
+//
+// It is rebuilt from scratch every frame out of the frame's own draw list, so it needs no identity
+// for a light and no test for whether one is static - which is the whole of §4.65's key table,
+// stability gate and eviction, gone. An explosion's light rides a particle and gets a cube; a unit
+// and a barrel are casters like anything else.
+//
+// **256-texel faces where the static atlas has 64**, because there are two orders of magnitude
+// fewer of them: 42 slots against 682, so the blockiness §4.61 lists as its first regret is
+// affordable to fix here. 16x16 tiles leaves 256 / 6 = 42 lights - against a measured frame peak
+// of 11 with every effect in the game firing at once.
+//
+// **4096² and not 2048²** (§4.69). It started at 2048² with 128-texel faces, which play reported
+// as low-res and jagged; the two halves of that are separate defects and this is the first - a
+// 90-degree face across 128 texels is coarse enough to see the texels. Keeping all 42 slots at
+// twice the face means four times the image, so 32 MB a slice against 8, and 64 MB for the ring
+// against the sun's own 66. The other half was the single-tap compare, and is `local_shadow_taps`.
+constexpr uint32_t kDynShadowFace = 256;
+constexpr uint32_t kDynShadowAtlas = 4096;
+constexpr uint32_t kDynShadowTilesPerRow = kDynShadowAtlas / kDynShadowFace;
+constexpr uint32_t kDynShadowSlots = kDynShadowTilesPerRow * kDynShadowTilesPerRow / 6;
+
+// **The atlas is RINGED, one image per frame in flight**, and that is the same defect the indirect
+// batch had one object over. This is the first thing in this renderer to write an image every
+// frame *and* sample it in the same frame: §4.61's atlas is written once per level and thereafter
+// only read, which is exactly why it never needed this. With one image, frame N+1's bake declares
+// `oldLayout = UNDEFINED` - it discards the contents - while frame N's world pass is still
+// sampling them.
+//
+// Two images rather than one taller one, because the ring then costs **nothing in the shader**:
+// each slice owns a bindless slot, and `GpuFrameData::dyn_shadow_texture` already carries whichever
+// index the bake just wrote. 8 MB a slice, against the sun's 66 MB.
+constexpr uint32_t kDynShadowRing = 2;
+
 // How many cascades the sun's shadow map is split into, and therefore how many tiles the atlas
 // carries. Four, in a 2x2 grid - the atlas is square either way, and a fifth would take it to a
 // 3x2 that wastes a third of the image. `render.shadow_cascades` selects how many are LIVE, from
@@ -175,15 +214,64 @@ struct GpuFrameData {
   // texel is `distance / 32` world units - so the depth error across one texel is dominated by
   // the surface's slope, which is exactly what an offset along the normal cancels.
   float map_shadow_offset;
+  // The per-frame atlas (§4.66). `kNoTexture` is "off", "could not be created" and "no local light
+  // in this frame" alike, which is the one test the shader makes - the same convention as the two
+  // above. Its bias is separate because its face is 128 texels where the static one's is 64, so
+  // one texel is half the world distance and the two knees do not have to coincide.
+  uint32_t dyn_shadow_texture;
+  uint32_t dyn_shadow_sampler;
+  float dyn_shadow_offset;
+  // The PCF radius for D3D's point and spot lights, in texels: 0 a single tap, 1 a 3x3, 2 a 5x5
+  // (§4.69). Not named for either atlas because it applies to whichever one serves them - the
+  // per-frame cube where a light has a slot in it, the static one where it does not.
+  // **This was `pad1`**, so it costs no size change and `cascades` stays on its 16-byte boundary.
+  uint32_t local_shadow_taps;
+  // --- the PN-triangle amplification pass (§4.71) ---------------------------------------------
+  //
+  // **Eight scalars, and two of them are padding on purpose.** `cascades` below has to start on a
+  // 16-byte boundary or its rows are not where any layout rule puts them, and 24 bytes of
+  // addresses plus thirty 4-byte scalars already reached exactly 144 - so anything added here
+  // comes in multiples of four. Six were wanted; eight is what keeps the array aligned.
+  float tess_edge_pixels;  // the screen-space edge length a factor aims for
+  float tess_max;          // the ceiling, clamped to maxTessellationGenerationLevel on the CPU
+  float tess_min;          // a floor, so a uniform factor can be forced for an A/B
+  // How much of the PN tangent term survives: 1 the full construction, 0 exactly linear (and so
+  // exactly the untessellated surface, however high the factors go). The A/B for the shape.
+  float pn_strength;
+  // A normalised tangent term below this is snapped to **exactly zero**, which makes its corner
+  // flat rather than nearly flat.
+  //
+  // The census measured why this is needed: on level02 only 6.4% of map triangles have all three
+  // corners flat, so the construction's free hard-edge identity covers far less of this game than
+  // it looks like it should, and a mean term of 0.094 domes a typical edge by ~3% of its length.
+  // Snapping restores the identity for the near-flat majority.
+  //
+  // **It stays watertight**, which is the reason it is a threshold on this quantity and not on
+  // anything else: the term depends only on `(Pi, Pj, Ni)`, so two triangles sharing an edge test
+  // and snap it identically. A threshold on, say, the triangle's own flatness would not.
+  float pn_flat_threshold;
+  // The render target, so the hull shader can turn an NDC edge into pixels. Frame-uniform because
+  // every draw this pass tessellates renders to the whole target - the one draw in the game that
+  // sets a sub-rectangle is the upgrade screen (§4.47), which is not map geometry.
+  float target_width;
+  float target_height;
+  float pad_tess;
   // Bit 0: D3D's point and spot lights are in the sum (`render.local_lights`, on by default).
   // Bit 1: the map lights sample the atlas above (`render.map_shadows`).
   // Bit 2: D3D's point and spot lights sample it too (`render.local_shadows`, §4.65).
   //
   // The last two are separate bits rather than two texture fields because they are two features
   // sharing one image, and this was the pad word - which the `offsetof` asserts below check rather
-  // than assume: 24 bytes of addresses plus twenty-five 4-byte scalars is 124, and both arrays
-  // that follow have to start on a 16-byte boundary or their rows are not where any layout rule
-  // puts them.
+  // than assume: 24 bytes of addresses plus thirty 4-byte scalars is 144, and both arrays that
+  // follow have to start on a 16-byte boundary or their rows are not where any layout rule puts
+  // them.
+  //
+  // **Its position is ABI, and the asserts below cannot see it.** §4.66 inserted the four
+  // `dyn_shadow_*` words above this one here but *below* it in `world.slang`, so for four fields
+  // the shader read the wrong word - `light_flags` came back as `dyn_shadow_texture`, which is
+  // `kNoTexture` while the per-frame atlas is off, so all three bits read set and all three knobs
+  // went inert (§4.67). A permutation preserves `sizeof`, so every assert here still passed.
+  // Anything added to this struct goes in the same place in both files, in the same commit.
   uint32_t light_flags;
   //
   // Per cascade, in light space: `x`/`y` the box's snapped centre, `z` the reciprocal of its
@@ -198,9 +286,9 @@ struct GpuFrameData {
   // would push every scalar above past an offset worth checking.
   float sun_matrix[16];
 };
-static_assert(sizeof(GpuFrameData) == 256, "the scratch stride is part of the shader ABI");
-static_assert(offsetof(GpuFrameData, cascades) == 128, "std430 puts a float4 array on 16");
-static_assert(offsetof(GpuFrameData, sun_matrix) == 192, "... and so does the matrix after it");
+static_assert(sizeof(GpuFrameData) == 304, "the scratch stride is part of the shader ABI");
+static_assert(offsetof(GpuFrameData, cascades) == 176, "std430 puts a float4 array on 16");
+static_assert(offsetof(GpuFrameData, sun_matrix) == 240, "... and so does the matrix after it");
 
 // GpuDrawRecord::lighting flags.
 //
@@ -400,6 +488,12 @@ struct PipelineState {
   // which is the case this bit decides. It must stay off for the 3D path, where D3D really does
   // clip at the near and far planes.
   uint32_t depth_clamp = 0;
+  // The PN-triangle amplification pass (§4.71). **Not set by the capture layer** - the recorder
+  // has neither the draw-set predicates nor the material table, and which draws are the level
+  // mesh is a renderer policy rather than something D3D was asked for. `RecordDraws` sets it on
+  // its own copy of the key just before the lookup, so a state that differs only in this forks
+  // one pipeline and nothing else about the frame moves.
+  uint32_t tessellate = 0;
 
   bool operator<(const PipelineState &other) const;
 };
@@ -741,6 +835,27 @@ int ShadowCascades();
 void SetLocalLights(bool enabled);
 bool LocalLights();
 
+// **The windowed range cutoff on D3D's point and spot lights** (§4.70). On by default; off
+// restores D3D8's own hard switch-off at Range.
+//
+// D3D8 cuts a light dead at Range while `1/(a0 + a1 d + a2 d^2)` is still well above zero there -
+// k = 0.140 for level02's fires, scaling a diffuse of 4.0 - so per pixel the boundary is a STEP in
+// the value. It was invisible in the original for §4.64's reason: D3D8 evaluated the sum per
+// vertex, so the step landed inside a triangle and interpolation destroyed it.
+//
+// **Not verified against a reported disc.** The step is real and removing it is measured (it only
+// ever darkens, worth up to 25/255 on ~1% of a fire-camera frame), but three level02 cameras all
+// had their local lights bounded by geometry silhouettes rather than by the range sphere, so
+// nothing here has yet reproduced a visible rim from THIS path the way §4.64 reproduced one from
+// the map lights'. Treat that as open.
+//
+// This exists as a knob rather than a bare change because it is the only way to read the result.
+// §4.30 measured that two settles of level02 drift by the objectives text's fade and the units'
+// animation phase, which no whole-frame number can separate from a renderer difference - so the
+// A/B has to happen inside one paused frame, and that needs a switch.
+void SetLocalLightWindow(bool enabled);
+bool LocalLightWindow();
+
 // --- shadows from D3D's own point and spot lights (§4.65) --------------------------------------
 
 // One D3D light reduced to **what decides its occlusion**, which is the key its atlas slot is
@@ -788,6 +903,92 @@ static_assert(std::has_unique_object_representations_v<LocalShadowKey>);
 // held still for one frame, not forty.
 int32_t AcquireLocalShadowSlot(const LocalShadowKey &key, uint64_t frame);
 
+// --- the per-frame atlas (§4.66) ---------------------------------------------------------------
+
+// Register one of this frame's D3D lights and get the slot its cube will occupy, or -1 when the
+// atlas is full or the feature is off. **No key, no cache and no stability gate**: the table is
+// emptied every frame, so "the same light" only has to mean "the same light within this frame",
+// which the key above answers exactly. That is what lets an explosion's light - which moves every
+// frame and therefore has no cross-frame identity at all - cast like anything else.
+//
+// Called from the capture layer's StoreLight, at the same point AcquireLocalShadowSlot is, and
+// **before** the bake: the slot has to be in the `GpuLight` the frame's draws already point at.
+int32_t RegisterDynamicShadowLight(const LocalShadowKey &key, uint64_t frame);
+
+// Bake every light registered this frame, from the frame's OWN caster list. Outside any render
+// pass and beside `BakeMapShadows`, for the same reason: it walks the draw list the world pass is
+// about to, and a caster is whatever that list holds - map geometry, a unit, or a barrel.
+void BakeDynamicShadows(void *command_buffer);
+
+// **A feature**, on by default. The per-frame atlas: shadows from every D3D point and spot light
+// in the frame, cast by every mobile thing in it.
+void SetDynamicShadows(bool enabled);
+bool DynamicShadows();
+
+// Its bias, in atlas texels at the fragment's own distance from the light. Separate from
+// `map_shadow_bias` because the face is 256 texels here and 64 there, so one texel is a quarter of
+// the world distance and the two knees need not coincide.
+void SetDynamicShadowBias(float texels);
+float DynamicShadowBias();
+
+// The PCF kernel's radius for **D3D's point and spot lights**, in atlas texels: 0 a single tap,
+// 1 a 3x3, 2 a 5x5, clamped at 3. `render.local_shadow_taps`, and it reaches whichever atlas
+// serves them - the per-frame cube where a light has a slot, the static one where it does not.
+//
+// **The map lights keep their single tap**, which is not an oversight: a fragment on level02 is in
+// range of a mean of 11.5 of them (§4.54) and the sum already filters, so a kernel there would be
+// a hundred taps a fragment for no visible change. One or two D3D lights reach a fragment and
+// nothing averages them, which is why the same body needs two answers (§4.69).
+void SetLocalShadowTaps(int radius);
+int LocalShadowTaps();
+
+// What the per-frame atlas did last frame: lights registered, how many the 42 slots refused,
+// casters submitted and how they bucketed. **Not optional reading** - a light with no slot and a
+// light with nothing to occlude look identical on screen.
+std::string DynamicShadowReport();
+
+// A bisect for the caster set: take only arena-sourced draws. Run-time so the two can be compared
+// inside one session. **It is not the test for "is a unit a caster"** - a unit draws from the arena
+// as often as not (level02's fires: 150 casters, one bucket, all arena), so this separates the
+// user-pointer draws and nothing else. `map_only` below is that test.
+void SetDynamicShadowArenaOnly(bool enabled);
+bool DynamicShadowArenaOnly();
+
+// Narrow the caster set to `IsMapGeometry` - **§4.65's set exactly**, so the A/B against it prices
+// the half of this feature the static atlas cannot do: the props and the units as casters. The two
+// tests differ in what a caster *is* rather than in where its vertices live, which is why
+// `arena_only` cannot answer the same question.
+void SetDynamicShadowMapOnly(bool enabled);
+bool DynamicShadowMapOnly();
+
+// Bake the atlas but never advertise it to the world pass, so it is rasterised and not sampled.
+// The bisect between "the bake hangs" and "sampling it hangs".
+void SetDynamicShadowSample(bool enabled);
+bool DynamicShadowSample();
+
+// --- the bisect knobs (§4.66) -------------------------------------------------------------------
+//
+// Four independent caps on how much of the bake actually runs, so the hang can be walked down to a
+// configuration that SURVIVES - which is the only route to a RenderDoc capture here, since the
+// failing frame can never write one (§4.66). **0 means "no cap" on all three counts.** They are
+// deliberately applied at the latest possible point, so the report, the range check and the batch
+// upload all still describe the whole set and only the submission shrinks.
+void SetDynamicShadowMaxLights(int lights);
+int DynamicShadowMaxLights();
+void SetDynamicShadowMaxFaces(int faces);
+int DynamicShadowMaxFaces();
+void SetDynamicShadowMaxCasters(int casters);
+int DynamicShadowMaxCasters();
+
+// Issue the bake as one `vkCmdDrawIndexed` per caster per face instead of one
+// `vkCmdDrawIndexedIndirect` per bucket per face - the same fallback §4.61's map bake keeps, and
+// the same atlas either way. **The bisect that splits the indirect machinery from the pass**: the
+// direct path reads no indirect buffer, takes no device address for its parameters and needs no
+// `SV_DrawIndex`, so if it survives where indirect hangs the fault is in the batch and not in the
+// caster set, the projection or the attachment.
+void SetDynamicShadowIndirect(bool enabled);
+bool DynamicShadowIndirect();
+
 // **A feature**, on by default. Whether D3D's point and spot lights sample that atlas. Independent
 // of `render.map_shadows`, because they are two different light systems sharing one image - but
 // the atlas is baked if *either* wants it.
@@ -825,6 +1026,26 @@ void GetDrawHide(uint32_t &first, uint32_t &last);
 // Everything the renderer knows about one draw of the last recorded frame, as text. Empty if
 // the index is past the end.
 std::string DescribeDraw(uint32_t index);
+
+// **Does this game's geometry carry smooth normals at all?** The measurement that decides whether
+// a PN-triangle tessellation stage can reach anything, taken before one is built.
+//
+// PN triangles curve a patch by exactly the tangent term `dot(Pj - Pi, Ni)`, so a corner whose
+// normal is perpendicular to both of its edges contributes nothing: every control point collapses
+// to the linear one and the patch **is** the flat triangle, bit for bit. That makes hard edges
+// free rather than a heuristic - and it also means a mesh whose vertex normals are all face
+// normals is one tessellation cannot change. This walks the last frame's triangles and reports
+// how much of it is in each class.
+//
+// The reported deviation is `|dot(normalize(Pj - Pi), Ni)|`, the tangent term normalised by edge
+// length. That is the quantity the construction actually uses, not a proxy for it: a corner
+// reading 0 is exactly flat, and one reading d bulges its edge by about `d * length / 3`.
+//
+// Bucketed by `IsMapGeometry` - the level mesh against everything else - because the two are
+// authored by different tools and the curvature is expected to live in the placed objects.
+//
+// A REPL diagnostic and nothing else: `ReadArena` submits and waits, twice per draw.
+std::string DescribeNormalCensus();
 
 // The converted vertices and indices one draw was actually given, which is the question no other
 // instrument here answers: `render.draws` counts what was skipped, `render.state` histograms what
@@ -898,6 +1119,75 @@ bool ShadeMode();
 // reproduction from the first frame.
 void SetPerPixelLighting(bool enabled);
 bool PerPixelLighting();
+
+// --- PN-triangle amplification (§4.71) --------------------------------------------------------
+//
+// Hardware tessellation over the level mesh, with the generated points placed on a cubic Bezier
+// patch fitted to the triangle's three corner positions and corner normals (Vlachos et al.).
+//
+// **The reason this construction and not displacement**: its edge control point,
+// `(2*P1 + P2 - dot(P2 - P1, N1) * N1) / 3`, collapses to the linear one exactly when the corner
+// normal is the face normal - so a flat-shaded wall reproduces itself bit for bit at any factor,
+// with no threshold and no per-material opt-in, while a smooth-normalled pipe curves. It is also
+// watertight across a shared edge by construction, where a height-map displacement cracks at
+// every material boundary. And it needs no new matrix and no change to the 48-byte vertex.
+//
+// **What the game actually has**, measured with `render.normal_census` before any of this was
+// built, on level02's settled camera: the level mesh is 1,611 triangles of which only **6.4%**
+// have all three corners flat, 27.7% of corners are genuinely curved, and the mean tangent term
+// is 0.094 - which domes a typical edge by about 3% of its length. So the free hard-edge identity
+// covers far less of this game than the construction's reputation suggests, and
+// `pn_flat_threshold` is what restores it for the near-flat majority. The props are a different
+// mesh entirely: strongly bimodal, 42% exactly flat and 53% curved.
+enum class TessSet : uint32_t {
+  Off = 0,
+  // `IsMapGeometry` - the level mesh, which is what `SubmitAndFlushMapGeometry` submits.
+  Map = 1,
+  // `IsDynamicCaster` - opaque, depth-writing, indexed - which adds the props and the units. The
+  // census says this is where more than half the curvature is, so it is not a debug-only setting.
+  All = 2,
+};
+
+struct TessellationParams {
+  // The screen-space edge length, in the render target's own pixels, that a factor aims for. A
+  // patch edge covering twice this gets a factor of 2.
+  float edge_pixels = 24.0f;
+  // The ceiling and the floor on a factor. `max` is clamped to the device's
+  // maxTessellationGenerationLevel; `min` above 1 forces uniform amplification, which is how the
+  // shape can be judged without the factors varying underneath it.
+  float max_factor = 8.0f;
+  float min_factor = 1.0f;
+  // How much of the PN tangent term survives: 1 the full construction, 0 exactly linear. At 0 the
+  // surface is the untessellated one however high the factors go, which makes it the A/B that
+  // separates "the amplification is wrong" from "the curvature is wrong".
+  float pn_strength = 1.0f;
+  // A normalised tangent term at or below this is snapped to exactly zero, making its corner
+  // flat. **Watertight**, because the term is a function of `(Pi, Pj, Ni)` alone and the triangle
+  // across the edge tests the identical number - which is why the threshold is on this quantity
+  // and not on, say, the triangle's own flatness.
+  float pn_flat_threshold = 0.02f;
+  // The shadow passes' factor, uniform over every edge - which makes those passes watertight for
+  // free, since a constant cannot disagree with itself across a shared edge. Lower than the
+  // colour pass's ceiling on purpose: a shadow map does not need silhouette detail the way a
+  // silhouette does, and this pass is where the cost is (§4.62's 4,092 indirect faces).
+  float shadow_factor = 3.0f;
+};
+
+void SetTessellationEnabled(bool enabled);
+bool TessellationEnabled();
+void SetTessellationSet(TessSet set);
+TessSet TessellationSet();
+// Whether the shadow passes tessellate too. Separable from the colour pass because the bake is
+// where the cost is (§4.62's 4,092 indirect faces), so a frame-time regression can be attributed
+// to one half rather than to the feature.
+void SetTessellationShadows(bool enabled);
+bool TessellationShadows();
+const TessellationParams &TessParams();
+TessellationParams &MutableTessParams();
+// How many draws the last frame tessellated, and how many patches that came to. The reading that
+// says the set predicate is selecting what it was meant to - a count that jumps when
+// `render.tess_set` changes to `all` and not otherwise.
+void TessellationCounts(uint32_t &draws, uint32_t &patches);
 
 // Runtime map lighting: replace the level's BAKED per-vertex colour with a per-pixel evaluation
 // of the `.rif`'s own light rig (src/MapLights.h, model fitted in §4.54).

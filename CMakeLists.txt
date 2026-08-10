@@ -202,6 +202,39 @@ else()
     add_dependencies(GkPlus gkplus_shaders)
 endif()
 
+# The shader ABI: one `offsetof` per field of every struct declared on both sides of the boundary,
+# derived from the SHADER's declaration (vulkan_renderer_notes.md §4.67). Its own generator and its
+# own edge, deliberately separate from the one above:
+#
+#   - it needs **no slangc**, only Python, so it runs on a machine that cannot compile a shader at
+#     all - which is where a drifting struct would otherwise be least likely to be noticed;
+#   - the SPIR-V is a build *product* and these asserts are a build *check*, and a check that only
+#     runs where the product can be rebuilt is not much of a check.
+#
+# Same shape otherwise: the header is an output so Ninja does not decide VkDraw.cpp is clean before
+# the generator has run, the stamp keeps the edge from re-running every build, and the generator
+# rewrites the header only on a real change.
+set(GKPLUS_ABI_GENERATOR "${CMAKE_CURRENT_SOURCE_DIR}/src/gen-shader-abi.py")
+if(Python3_Interpreter_FOUND)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" "${GKPLUS_ABI_GENERATOR}" --deps
+        OUTPUT_VARIABLE GKPLUS_ABI_SOURCES
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        COMMAND_ERROR_IS_FATAL ANY)
+    string(REPLACE "\n" ";" GKPLUS_ABI_SOURCES "${GKPLUS_ABI_SOURCES}")
+    add_custom_command(
+        OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/src/ShaderAbi.gen.inc.h"
+               "${CMAKE_CURRENT_BINARY_DIR}/shader-abi.stamp"
+        COMMAND "${Python3_EXECUTABLE}" "${GKPLUS_ABI_GENERATOR}"
+        COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/shader-abi.stamp"
+        DEPENDS ${GKPLUS_ABI_SOURCES} "${GKPLUS_ABI_GENERATOR}"
+        COMMENT "Deriving the shader ABI asserts"
+        VERBATIM)
+    add_custom_target(gkplus_shader_abi
+        DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/shader-abi.stamp")
+    add_dependencies(GkPlus gkplus_shader_abi)
+endif()
+
 add_library(huffman
     "${CMAKE_CURRENT_SOURCE_DIR}/huffman/huffman_compress.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/huffman/huffman_decompress.cpp")

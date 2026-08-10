@@ -17,11 +17,22 @@ Shoot-Settled -Renderer vulkan -Level level02 -Out vk.png
 |---|---|
 | `launch-gunlok.ps1` | `Start-Gunlok`, `Focus-Gunlok`, `Repl`. Answers the modal `-skipfmv` dialog that blocks *before* the REPL listener opens, waits for the port, and takes the window foreground — a level load sticks at `game.state 18` otherwise |
 | `shot-gunlok.ps1` | `Get-GunlokShot`. `PrintWindow` with flag **3**, and `SetProcessDPIAware()` in the capturing process |
-| `shoot-settled.ps1` | `Dismiss-Briefing`, `Wait-CameraRest`, `Shoot-Settled`. The whole procedure |
+| `shoot-settled.ps1` | `Dismiss-Briefing`, `Wait-World`, `Wait-CameraRest`, `Shoot-Settled`. The whole procedure |
 | `find-draw.ps1` | `Find-Draw -X -Y -Count`: binary-searches `render.draw_hide` for the draw that painted a pixel |
 | `harvest-draws.ps1` | `Seed-Harvest`, `Harvest-Level`, `Save-Harvest`. Accumulates `render.frame_draws()` across a whole session into a per-texture render-state profile, inside the game, over one kept-open socket. Consumed by `pbr` (`gkpbr.cli observed`); its own header is the list of things that waste a run |
 
-Four things they encode, each of which produced a wrong answer first:
+Five things they encode, each of which produced a wrong answer first:
+
+- **`actors.count` says the level started; the draw count says the world is on screen.** They are
+  not the same test. An overlay screen *replaces* the world submit rather than drawing over it
+  (`rendering_notes.md` §5), so the HUD, the objectives text and the pause indicator render over a
+  **black frame** — with 178 actors alive and the renderer at a healthy 16.6 ms/frame. Every A/B
+  taken in that state reads zero differing pixels, which looks exactly like the knob under test
+  being inert; it cost a session concluding that about a build where it was not
+  (`vulkan_renderer_notes.md` §4.67). `Wait-World` polls until this-frame draws are in the hundreds
+  — 16 against a 273 peak is the tell. It reads that count from **`render.frame_draws`**, which is
+  mirror-side: `render.draws` is the *Vulkan* renderer's own counter and reads 0 under `-Renderer
+  d3d8`, so polling it made every reference capture impossible (§4.70).
 
 - **Wait for the camera to stop, never a fixed delay.** The renderers run at different frame
   rates, so the same wall-clock delay lands at a different point in an intro sequence. junkyard at

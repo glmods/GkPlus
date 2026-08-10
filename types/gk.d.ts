@@ -2258,6 +2258,115 @@ declare module "gk" {
     readonly material_overrides: string;
     clear_material_overrides(): void;
 
+    /** How much of the last frame's geometry carries **smooth** normals, as text.
+     *
+     *  The measurement a tessellation stage has to be built against. PN triangles
+     *  curve a patch by exactly the term `dot(Pj - Pi, Ni)`, so a corner whose
+     *  normal is perpendicular to both of its edges contributes nothing at all:
+     *  every control point collapses to the linear one and the patch **is** the
+     *  flat triangle it started as. That makes a hard edge free rather than a
+     *  heuristic -- and it also means a mesh whose vertex normals are all face
+     *  normals is one tessellation cannot change.
+     *
+     *  The reported number is `|dot(normalize(edge), normal)|`, the tangent term
+     *  normalised by edge length, taken as the worse of a corner's two edges. It
+     *  is the quantity the construction actually uses rather than a proxy: a
+     *  corner reading `d` bulges its edge by about `d * length / 3`.
+     *
+     *  Bucketed into the level mesh and everything else, because the two are
+     *  authored by different tools. A REPL diagnostic only -- it reads the arena
+     *  back, which submits and waits twice per draw. */
+    normal_census(): string;
+
+    /** **PN-triangle amplification over the level mesh.** Off by default.
+     *
+     *  Hardware tessellation, with the generated points placed on a cubic
+     *  Bezier patch fitted to each triangle's three corner positions and corner
+     *  normals (Vlachos et al.). Its edge control point,
+     *  `(2*P1 + P2 - dot(P2 - P1, N1) * N1) / 3`, collapses to the linear one
+     *  exactly when the corner normal is the face normal -- so a flat-shaded
+     *  wall reproduces itself at any tessellation factor, with no threshold and
+     *  no per-material opt-in, while a smooth-normalled pipe or boulder curves.
+     *  Hard edges cost nothing because the arithmetic leaves them alone.
+     *
+     *  It is also watertight across a shared edge by construction: the two
+     *  control points on edge (P1,P2) are functions of P1, P2, N1 and N2 alone,
+     *  so the triangles either side build the same boundary curve.
+     *
+     *  Off by default because it changes the level's silhouette rather than
+     *  reproducing D3D. Reads back `false` on a device with no
+     *  `tessellationShader` even after being set -- the getter answers "is this
+     *  happening", not "was it asked for". */
+    tessellation: boolean;
+
+    /** Which draws are amplified: `"map"` (the level mesh, the default),
+     *  `"all"` (props and units too) or `"off"`.
+     *
+     *  **`"map"` is the right default, and that is measured rather than assumed.**
+     *  `render.normal_census()` across all sixteen shipped levels: the props and
+     *  units are **88.6% flat corners and 86.7% fully-flat triangles**, with only
+     *  7.6% genuinely curved and 77% of their corners carrying no normal at all.
+     *  `"all"` therefore amplifies ~9,450 prop triangles to change 7.6% of their
+     *  corners. The level mesh is where the curvature is: 30.6% curved corners
+     *  over 29,278 triangles.
+     *
+     *  Level02 alone says the opposite -- 53% of its props' corners are curved --
+     *  and it is the outlier, not the rule. */
+    tess_set: "map" | "all" | "off";
+
+    /** Whether the shadow passes amplify with the colour pass. On.
+     *
+     *  Separable because the bake is where the cost is, so a frame-time
+     *  regression can be pinned to one half. Note the shadow passes take one
+     *  pipeline for their whole caster set, so with `tess_set = "map"` a prop's
+     *  shadow follows a smoothed silhouette its geometry does not have. */
+    tess_shadows: boolean;
+
+    /** The screen-space edge length, in the render target's pixels, that a
+     *  tessellation factor aims for. An edge covering twice this gets 2. */
+    tess_edge_pixels: number;
+    /** The ceiling on a factor, clamped to the device's
+     *  `maxTessellationGenerationLevel`. */
+    tess_max: number;
+    /** The floor. Above 1 it forces uniform amplification, which is how the
+     *  shape can be judged without the factors varying underneath it. */
+    tess_min: number;
+    /** The shadow passes' factor, uniform over every edge -- which makes those
+     *  passes watertight for free, since a constant cannot disagree with itself
+     *  across a shared edge. */
+    tess_shadow_factor: number;
+
+    /** How much of the PN tangent term survives: 1 the full construction, 0
+     *  exactly linear.
+     *
+     *  At 0 the surface is the untessellated one however high the factors go,
+     *  which makes it the A/B that separates "the amplification is wrong" from
+     *  "the curvature is wrong". Measured on level02: `pn_strength = 0` with
+     *  tessellation on sits at 0.00928 MAD against an off-vs-off floor of
+     *  0.00795, so everything the feature does visibly comes from the curvature
+     *  rather than from subdividing. */
+    pn_strength: number;
+
+    /** A normalised tangent term at or below this is snapped to exactly zero,
+     *  making its corner flat.
+     *
+     *  The census is why this exists: only **6.5%** of level02's map triangles
+     *  have all three corners flat, so the construction's free hard-edge
+     *  identity covers far less of that level than its reputation suggests, and
+     *  a mean term of 0.094 domes a typical edge by ~3% of its length. This
+     *  restores the identity for the near-flat majority.
+     *
+     *  Across all sixteen levels the figure is **36.3%**, and the spread is
+     *  enormous -- 4.3% on level04 against 75.6% on level15. Level02 is near the
+     *  *curved* end, which makes it a pessimistic place to tune this and a safe
+     *  one to inherit a default from.
+     *
+     *  It stays watertight, which is why the threshold is on this quantity and
+     *  not on, say, the triangle's own flatness: the term is a function of
+     *  `(Pi, Pj, Ni)` alone, so the triangle across the edge tests and snaps the
+     *  identical number. */
+    pn_flat_threshold: number;
+
     /** D3D8's light sum, evaluated **per pixel** instead of per vertex.
      *
      *  On by default, and the first thing in this namespace that deliberately
@@ -2634,6 +2743,20 @@ declare module "gk" {
      *  level02's settled start, 2.34% at its fire camera and 0.63% on level04,
      *  against the sun's 17%. */
     local_lights: boolean;
+
+    /** Window the range cutoff on D3D's point and spot lights. On by default.
+     *
+     *  D3D8 switches a light off HARD at Range while its attenuation is still
+     *  well above zero there - 0.309 for level02's fires - so per pixel the
+     *  boundary is a step in the value, and the eye reads it as a disc. It was
+     *  invisible in the original because D3D8 lit per vertex and interpolation
+     *  destroyed the step; going per pixel exposed it, exactly as it exposed the
+     *  map lights' rim.
+     *
+     *  Off restores the hard cutoff, so the two can be compared inside one
+     *  paused frame - which is the only way to read it, since two settles of a
+     *  level drift by more than the change is worth. */
+    local_light_window: boolean;
 
     /** The last complete frame's D3D lights, deduplicated by **contents**, with how
      *  many draws each reached and how many frames it has survived.

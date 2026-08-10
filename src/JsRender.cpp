@@ -464,6 +464,89 @@ JSValue SetChromeTexgen(JSContext *ctx, JSValueConst, JSValueConst value) {
   return JS_UNDEFINED;
 }
 
+// --- PN-triangle amplification (§4.71) --------------------------------------------------------
+//
+// Its own knob macro rather than a reuse of GK_LIGHTING_KNOB: these are not lighting-map
+// parameters and filing them on LightingMapParams would have been convenient and wrong.
+#define GK_TESS_KNOB(js_name, member)                                                           \
+  JSValue Get##member(JSContext *ctx, JSValueConst) {                                           \
+    return JS_NewFloat64(ctx, vulkan::TessParams().member);                                     \
+  }                                                                                             \
+  JSValue Set##member##Value(JSContext *ctx, JSValueConst, JSValueConst value) {                \
+    double number = 0.0;                                                                        \
+    if (JS_ToFloat64(ctx, &number, value) != 0) {                                               \
+      return JS_EXCEPTION;                                                                      \
+    }                                                                                           \
+    vulkan::MutableTessParams().member = static_cast<float>(number);                            \
+    return JS_UNDEFINED;                                                                        \
+  }
+
+GK_TESS_KNOB("tess_edge_pixels", edge_pixels)
+GK_TESS_KNOB("tess_max", max_factor)
+GK_TESS_KNOB("tess_min", min_factor)
+GK_TESS_KNOB("pn_strength", pn_strength)
+GK_TESS_KNOB("pn_flat_threshold", pn_flat_threshold)
+GK_TESS_KNOB("tess_shadow_factor", shadow_factor)
+
+#undef GK_TESS_KNOB
+
+// `render.tessellation` - off by default, because it changes the level's silhouette rather than
+// reproducing D3D, and a default run has to keep the renderer's own claim true. Reads back
+// **false on a device with no `tessellationShader`** even after being set, which is deliberate:
+// the getter answers "is this happening" rather than "was it asked for".
+JSValue GetTessellation(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::TessellationEnabled());
+}
+
+JSValue SetTessellationValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetTessellationEnabled(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+// `render.tess_shadows` - whether the shadow passes tessellate with the colour pass. Separable
+// because the bake is where the cost is, so a frame-time regression can be pinned to one half.
+JSValue GetTessShadows(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::TessellationShadows());
+}
+
+JSValue SetTessShadowsValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetTessellationShadows(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+// `render.tess_set` - "map" (the level mesh), "all" (props and units too) or "off". A string
+// rather than a pair of booleans because the three are exclusive, and `render.normal_census` says
+// the choice is a real one: more than half the curvature in a frame is in the props.
+JSValue GetTessSet(JSContext *ctx, JSValueConst) {
+  switch (vulkan::TessellationSet()) {
+  case vulkan::TessSet::Map:
+    return JS_NewString(ctx, "map");
+  case vulkan::TessSet::All:
+    return JS_NewString(ctx, "all");
+  default:
+    return JS_NewString(ctx, "off");
+  }
+}
+
+JSValue SetTessSetValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  const char *text = JS_ToCString(ctx, value);
+  if (text == nullptr) {
+    return JS_EXCEPTION;
+  }
+  const std::string name = text;
+  JS_FreeCString(ctx, text);
+  if (name == "map") {
+    vulkan::SetTessellationSet(vulkan::TessSet::Map);
+  } else if (name == "all") {
+    vulkan::SetTessellationSet(vulkan::TessSet::All);
+  } else if (name == "off") {
+    vulkan::SetTessellationSet(vulkan::TessSet::Off);
+  } else {
+    return JS_ThrowTypeError(ctx, "render.tess_set takes \"map\", \"all\" or \"off\"");
+  }
+  return JS_UNDEFINED;
+}
+
 // `render.shade_mode` - honour D3DRS_SHADEMODE, or interpolate everything (VkDraw.h). Writable
 // for the same reason as the three above: on level02 it touches 2% of the draws and all of them
 // are the stencil shadow, so nothing coarser than two shots of one paused frame can see it.
@@ -573,6 +656,7 @@ GK_SHADOW_KNOB(shadow_bias, ShadowBias)
 GK_SHADOW_KNOB(shadow_strength, ShadowStrength)
 GK_SHADOW_KNOB(shadow_extent, ShadowExtent)
 GK_SHADOW_KNOB(map_shadow_bias, MapShadowBias)
+GK_SHADOW_KNOB(dynamic_shadow_bias, DynamicShadowBias)
 
 // `render.map_shadows` and its two knobs (VkDraw.h, §4.61) - the static shadow atlas for the
 // level's own STDLIGHT rig. Off by default, and the atlas is baked whether or not it is sampled,
@@ -836,6 +920,17 @@ JSValue SetLocalLightsValue(JSContext *ctx, JSValueConst, JSValueConst value) {
   return JS_UNDEFINED;
 }
 
+// `render.local_light_window` - on by default (§4.70). Off restores D3D8's hard cutoff at Range,
+// so the rim it draws round every point light can be A/B'd inside one paused frame.
+JSValue GetLocalLightWindow(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::LocalLightWindow());
+}
+
+JSValue SetLocalLightWindowValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetLocalLightWindow(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
 // `render.local_shadows` - a feature, on by default (§4.65). Shadows from D3D's own point and spot
 // lights, out of the same static atlas the map lights use. Independent of `render.map_shadows`
 // because they are two light systems sharing one image.
@@ -857,6 +952,99 @@ JSValue GetLocalShadowReport(JSContext *ctx, JSValueConst) {
   return JS_NewStringLen(ctx, report.c_str(), report.size());
 }
 
+// `render.dynamic_shadows` - a feature, on by default (§4.66). The per-frame atlas: every D3D
+// point and spot light in the frame gets a cube, cast by every opaque thing in the frame, so a
+// light that MOVES casts and a unit or a barrel is a caster. It supersedes `local_shadows` for any
+// light it has room for; that one is the fallback for the rest.
+JSValue GetDynamicShadows(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::DynamicShadows());
+}
+
+JSValue SetDynamicShadowsValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetDynamicShadows(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+JSValue GetDynArenaOnly(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::DynamicShadowArenaOnly());
+}
+
+JSValue SetDynArenaOnlyValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetDynamicShadowArenaOnly(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+// `render.local_shadow_taps` - the PCF radius for D3D's point and spot lights (§4.69). The one
+// knob here that trades frame time directly for the artefact play reported, so it is worth being
+// able to A/B in a session rather than only in a build.
+JSValue GetLocalShadowTaps(JSContext *ctx, JSValueConst) {
+  return JS_NewInt32(ctx, vulkan::LocalShadowTaps());
+}
+
+JSValue SetLocalShadowTapsValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  int32_t radius = 0;
+  if (JS_ToInt32(ctx, &radius, value) < 0) {
+    return JS_EXCEPTION;
+  }
+  vulkan::SetLocalShadowTaps(radius);
+  return JS_UNDEFINED;
+}
+
+JSValue GetDynMapOnly(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::DynamicShadowMapOnly());
+}
+
+JSValue SetDynMapOnlyValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetDynamicShadowMapOnly(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+JSValue GetDynSample(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::DynamicShadowSample());
+}
+
+JSValue SetDynSampleValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetDynamicShadowSample(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+JSValue GetDynamicShadowReport(JSContext *ctx, JSValueConst) {
+  const std::string report = vulkan::DynamicShadowReport();
+  return JS_NewStringLen(ctx, report.c_str(), report.size());
+}
+
+// Three of the four bisect knobs (§4.66), `dynamic_shadow_indirect` below being the fourth. A
+// capture of a bake that hangs cannot exist, so the route to one is to walk the bake DOWN until it
+// survives - and these are the axes it can be walked down. They are what proved the bake innocent:
+// all lights, all faces and ONE caster runs at the control's frame rate, which is the whole pass
+// structure with nothing in it. Kept because the next hang will want them.
+#define GK_DYN_CAP(name, setter)                                                                   \
+  JSValue Get##setter(JSContext *ctx, JSValueConst) {                                              \
+    return JS_NewInt32(ctx, vulkan::setter());                                                     \
+  }                                                                                                \
+  JSValue Set##setter##Value(JSContext *ctx, JSValueConst, JSValueConst value) {                   \
+    int32_t v = 0;                                                                                 \
+    if (JS_ToInt32(ctx, &v, value) < 0) {                                                          \
+      return JS_EXCEPTION;                                                                         \
+    }                                                                                              \
+    vulkan::Set##setter(v);                                                                        \
+    return JS_UNDEFINED;                                                                           \
+  }
+
+GK_DYN_CAP(dynamic_shadow_max_lights, DynamicShadowMaxLights)
+GK_DYN_CAP(dynamic_shadow_max_faces, DynamicShadowMaxFaces)
+GK_DYN_CAP(dynamic_shadow_max_casters, DynamicShadowMaxCasters)
+#undef GK_DYN_CAP
+
+JSValue GetDynIndirect(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::DynamicShadowIndirect());
+}
+
+JSValue SetDynIndirectValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetDynamicShadowIndirect(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
 JSValue DrawInfo(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
   uint32_t index = 0;
   if (argc < 1 || JS_ToUint32(ctx, &index, argv[0]) < 0) {
@@ -866,6 +1054,13 @@ JSValue DrawInfo(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
   if (text.empty()) {
     return JS_NULL;
   }
+  return JS_NewStringLen(ctx, text.data(), text.size());
+}
+
+// `render.normal_census()` - how much of the frame carries smooth normals, which is what decides
+// whether a PN-triangle stage can reach anything at all. See DescribeNormalCensus in VkDraw.h.
+JSValue NormalCensus(JSContext *ctx, JSValueConst, int, JSValueConst *) {
+  const std::string text = vulkan::DescribeNormalCensus();
   return JS_NewStringLen(ctx, text.data(), text.size());
 }
 
@@ -1241,6 +1436,16 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("offscreen", GetOffscreen, SetOffscreenValue),
     JS_CGETSET_DEF("present_linear", GetPresentLinear, SetPresentLinearValue),
     JS_CGETSET_DEF("shade_mode", GetShadeMode, SetShadeModeValue),
+    // The PN-triangle amplification pass (§4.71).
+    JS_CGETSET_DEF("tessellation", GetTessellation, SetTessellationValue),
+    JS_CGETSET_DEF("tess_shadows", GetTessShadows, SetTessShadowsValue),
+    JS_CGETSET_DEF("tess_set", GetTessSet, SetTessSetValue),
+    JS_CGETSET_DEF("tess_edge_pixels", Getedge_pixels, Setedge_pixelsValue),
+    JS_CGETSET_DEF("tess_max", Getmax_factor, Setmax_factorValue),
+    JS_CGETSET_DEF("tess_min", Getmin_factor, Setmin_factorValue),
+    JS_CGETSET_DEF("pn_strength", Getpn_strength, Setpn_strengthValue),
+    JS_CGETSET_DEF("pn_flat_threshold", Getpn_flat_threshold, Setpn_flat_thresholdValue),
+    JS_CGETSET_DEF("tess_shadow_factor", Getshadow_factor, Setshadow_factorValue),
     JS_CGETSET_DEF("per_pixel_lighting", GetPerPixelLighting, SetPerPixelLightingValue),
     JS_CGETSET_DEF("map_light_report", GetMapLightReport, nullptr),
     JS_CGETSET_DEF("map_lighting", GetMapLighting, SetMapLightingValue),
@@ -1282,10 +1487,27 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("ref_range", GetRefRange, SetRefRangeValue),
     JS_CGETSET_DEF("ref_hide", GetRefHide, SetRefHideValue),
     JS_CFUNC_DEF("draw_info", 1, DrawInfo),
+    JS_CFUNC_DEF("normal_census", 0, NormalCensus),
     JS_CFUNC_DEF("frame_draws", 2, FrameDraws),
     JS_CGETSET_DEF("frame_lights", GetFrameLights, nullptr),
     JS_CGETSET_DEF("local_lights", GetLocalLights, SetLocalLightsValue),
+    JS_CGETSET_DEF("local_light_window", GetLocalLightWindow,
+                   SetLocalLightWindowValue),
     JS_CGETSET_DEF("local_shadows", GetLocalShadows, SetLocalShadowsValue),
+    JS_CGETSET_DEF("dynamic_shadows", GetDynamicShadows, SetDynamicShadowsValue),
+    JS_CGETSET_DEF("dynamic_shadow_arena_only", GetDynArenaOnly, SetDynArenaOnlyValue),
+    JS_CGETSET_DEF("dynamic_shadow_map_only", GetDynMapOnly, SetDynMapOnlyValue),
+    JS_CGETSET_DEF("local_shadow_taps", GetLocalShadowTaps, SetLocalShadowTapsValue),
+    JS_CGETSET_DEF("dynamic_shadow_sample", GetDynSample, SetDynSampleValue),
+    JS_CGETSET_DEF("dynamic_shadow_bias", GetDynamicShadowBias, SetDynamicShadowBiasValue),
+    JS_CGETSET_DEF("dynamic_shadow_report", GetDynamicShadowReport, nullptr),
+    JS_CGETSET_DEF("dynamic_shadow_indirect", GetDynIndirect, SetDynIndirectValue),
+    JS_CGETSET_DEF("dynamic_shadow_max_lights", GetDynamicShadowMaxLights,
+                   SetDynamicShadowMaxLightsValue),
+    JS_CGETSET_DEF("dynamic_shadow_max_faces", GetDynamicShadowMaxFaces,
+                   SetDynamicShadowMaxFacesValue),
+    JS_CGETSET_DEF("dynamic_shadow_max_casters", GetDynamicShadowMaxCasters,
+                   SetDynamicShadowMaxCastersValue),
     JS_CGETSET_DEF("local_shadow_report", GetLocalShadowReport, nullptr),
     JS_CGETSET_DEF("draw_vertices", GetDrawVertices, SetDrawVerticesValue),
     JS_CGETSET_DEF("draw_state", GetDrawState, SetDrawStateValue),

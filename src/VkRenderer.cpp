@@ -683,6 +683,9 @@ void DrawFrame() {
   // frame. Usually a no-op: it bakes a few lights a frame until the level's set is done and then
   // stops until the next level (§4.61).
   BakeMapShadows(frame.cmd);
+  // ... and so does the per-frame atlas, for a stronger version of the same reason: its casters
+  // are the frame's units and props as well as its map, and those exist only as a draw list.
+  BakeDynamicShadows(frame.cmd);
 
   // Where the world pass draws: the offscreen target when it is up, the swapchain image when it
   // is not. UNDEFINED as the source layout in either case, on purpose - neither image's previous

@@ -254,6 +254,11 @@ uint32_t MippedSamplerFor(uint32_t sampler_index);
 // permanently clear of every path that walks the image list.
 constexpr uint32_t kShadowMapSlot = 4095;    // the sun's cascades (§4.59)
 constexpr uint32_t kMapShadowMapSlot = 4094; // the map lights' static atlas (§4.61)
+// The per-frame atlas (§4.66), and it takes **`kDynShadowRing` slots counting DOWN** - 4093 and
+// 4092 - because the atlas is ringed one image per frame in flight. Slice i is at
+// `kDynShadowMapSlot - i`, which is what lets the ring cost nothing in the shader: the frame block
+// carries whichever index the bake just wrote.
+constexpr uint32_t kDynShadowMapSlot = 4093;
 void WriteBindlessView(uint32_t index, uint64_t view);
 
 // The set and its layout, as opaque handles so this header keeps mentioning no Vulkan type

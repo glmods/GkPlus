@@ -828,6 +828,13 @@ unrelated, long after the call.
   a point another already hooks, have that hook call it, or find a different anchor — the DDS
   codec registers from `FileHookSystem`'s first intercepted open for exactly this reason
 - `static_assert` on struct sizes and offsets to catch layout mismatches
+- **A struct shared with a shader is checked by `src/gen-shader-abi.py`, not by hand.** It parses
+  the `src/shaders/*.slang` declarations and generates an `offsetof` per field plus a `sizeof` per
+  struct into `src/ShaderAbi.gen.inc.h`. Adding or reordering a field in either declaration and not
+  the other is then a compile error naming the field — which is what `vulkan_renderer_notes.md`
+  §4.67 did not have, and it cost two sections (three knobs silently stuck on, and a lost device).
+  A hand-written `offsetof` cannot replace it: a permutation preserves `sizeof` and every assert
+  that pins a field *after* the disturbance. New shared struct → add it to `PAIRS` in that script
 - Game vtables are modelled in `src/Actors.cpp` as **declaration-ordered pure virtuals**: the base
   `Actor` declares 83 (slot 0 is the destructor), and each subclass appends its own extension slots
   in vtable order. Adding a virtual there is how you record a new slot — it costs no object size

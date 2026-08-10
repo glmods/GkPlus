@@ -5542,6 +5542,95 @@ sun's cascades never used. **The sun's shadow is the regression test for that**,
 the same paused level04 frame it reads 16.409% of the frame at 1.620 MAD, against 16.407% / 1.620
 before any of this. `0 validation errors`, `unaccounted for: 0`, every must-be-0 counter at 0.
 
+### The batch is a ring, because the bake can span frames
+
+Found while building §4.66's per-frame atlas, which has the same shape and dies of it outright. The
+batch above is written with `vkCmdUpdateBuffer` and read back by `vkCmdDrawIndexedIndirect` in the
+**same command buffer**, so with two frames in flight a bake spanning more than one frame has frame
+N+1's transfer landing on the bytes frame N's indirect draws are still reading - and a draw picks up
+a half-written `indexCount`.
+
+**Never observed here, and that is exactly why it survived**: at `map_shadow_rate` 256 level02's 51
+lights write the batch once, and one write cannot race. Level01's 686 lights take three frames.
+
+It is now a **4-slice ring** indexed by a serial advanced once per bake - `kMapIndirectRing` /
+`kMapIndirectSlice` / `MapRingSerial`, the shape §4.66 gave its own batch, 56 KB a slice against two
+frames in flight. The serial is deliberately **not** the frame index: the local half (§4.65) can
+bake on a frame the map half does not, and what has to be disjoint is consecutive *writes*, not
+consecutive frames.
+
+The slice offset reaches **four** places, not one - both `vkCmdUpdateBuffer` calls, the
+`vkCmdDrawIndexedIndirect` offset, and `push.params`. Missing that last one is the quiet way to get
+this wrong: it would read one bake's parameters against another's commands, which is a wrong atlas
+rather than a hang.
+
+**The A/B above is what verifies it**, and it is unchanged. On a paused level02 frame:
+
+| | whole frame MAD | pixels differing |
+|---|---|---|
+| indirect vs direct | 0.00795 | 750 |
+| the same path twice, floor | 0.00795 | 750 |
+
+Both are §4.56's blinking "ACTIVE PAUSE" indicator and nothing else. Built without the ring and
+re-measured in a second session, the same three comparisons come out **identical to the pixel
+count**, and the two builds' frames differ by 0.01279 / 5,858 px - which is what any two *sessions*
+differ by at that camera, ring or no ring.
+
+And the case the ring exists for, on level01, paused: **a bake spanning 167 frames produces the same
+atlas as one spanning 3.** `map_shadow_rate` 4 against 256, both re-baked in the one session, is
+0.00788 MAD over 750 pixels - the floor, to the pixel. 666 of 686 lights slotted (20 refused, the
+atlas is full), 0 casters dropped, `render.validation` `[]`, 23.1 ms/frame against 23.9 before.
+
+### Two things this re-measurement turned up, both older than the ring
+
+Both were confirmed on a build with the ring stashed out, so neither is the fix's doing. They are
+recorded here because anyone re-running §4.62's regression test walks into them.
+
+- **`render.map_shadows` off vs on now reads the floor**, on level02 and level01 alike, where the
+  table above measured 6.87854 over 3,906,200 pixels. The atlas is *not* empty - see the next item,
+  which moves tens of thousands of pixels of genuine shadow - so it is the flag's path to the
+  shader, not the bake, that has gone inert. **Closed, and it was not the flag**: §4.66 put its
+  four new `GpuFrameData` words above `light_flags` in `src/VkDraw.h` and below it in
+  `world.slang`, so the shader read `dyn_shadow_texture` - `kNoTexture`, every bit set - as the
+  flags. §4.67 has the mechanism and the before/after. The knob is an instrument again.
+- **A forced re-bake loses the local half's cubes** (§4.65). Any of `map_shadow_indirect`,
+  `map_shadow_rate` or a level change resets `MapShadowBuiltForGeneration`, which clears the whole
+  atlas - but a `LocalShadowKey` that already carries `baked = true` is never re-queued, so those
+  tiles stay at the clear value for the rest of the level. It is visible and it is not subtle: on
+  level02 the boot frame and a re-baked frame differ by **38,335 pixels**, on level01 by 23,833, and
+  `local_shadow_report` says `baked and sampled: 6` while `cubes baked for this level: 6` - the six
+  from before the clear.
+
+  **Closed.** The branch that schedules the clear already winds the map half back with
+  `MapShadowCursor = 0`; it simply had no counterpart for the local half. `RequeueLocalShadows()`
+  is that counterpart - it clears `baked` on every entry and rebuilds `LocalShadowPending` from the
+  entries holding a slot - and it is called from the same
+  `MapShadowBuiltForGeneration != generation` branch, **before** the bake's early-out, so a
+  re-queued slot makes `local_work` true and the clear and the redraw land in one pass rather than
+  leaving a frame of missing shadow between them.
+
+  Two things it deliberately does not do. It **keeps the keys**: a re-bake is not a level change,
+  the geometry is the same geometry and the lights are the same lights, so forgetting them would
+  make each serve out the four-frame stability gate again for nothing. And it **rebuilds** the
+  pending list rather than appending to it, so a slot already queued is not baked twice.
+
+  Measured on level02 the same way the defect was, three paused settled shots either side of the
+  re-bake in one session. **The floor is not zero and has to be masked**: a paused Gunlok frame is
+  not a still frame - the two units keep running their idle loops, which alone moves 202,601 pixels
+  between two shots with nothing touched, six times the whole effect. Masking every pixel that
+  varies *within* either group leaves 4.95 M static pixels, and on those:
+
+  | build | `cubes baked` before -> after | static px changed | max delta |
+  |---|---|---|---|
+  | before the fix | 6 -> 6 | **38,335** | 53 |
+  | after the fix | 6 -> **12** | **0** | 0 |
+
+  38,335 reproduces the original number exactly, and the changed region is one coherent blob on the
+  overhead map geometry - a shadow, not noise. The other two paths read the same way: toggling
+  `map_shadow_indirect` off then on bakes six cubes each time (6 -> 12 -> 18), and a level change
+  to level01 resets the counter and rebuilds all six from nothing, which is `AcquireLocalShadowSlot`'s
+  own generation test doing the work it always did.
+
 ## 4.63 The staging ring: asking before blocking
 
 The oldest performance item on the list - the ring hands itself back with a `vkDeviceWaitIdle`
@@ -5944,6 +6033,16 @@ The map-light figure rises because §4.64 moved the default gain 1.20 -> 1.35 af
 it, not because sixteen slots went missing - level02 uses 51 of the 666 that remain. The sun's is
 §4.62's stated regression test for anything touching the shared shadow machinery.
 
+There is a third invariant, and this section shipped without it: **the two halves share one image,
+so anything that clears it owes BOTH of them a re-bake.** The map half's re-queue is
+`MapShadowCursor = 0` and the local half's is `RequeueLocalShadows()`, and they belong in the same
+branch. Missing the second cost every local cube on any forced re-bake - 38,335 pixels of real
+shadow on level02, gone for the rest of the level; §4.62's last subsection has the mechanism and
+the before/after. The thing that made it survive review is that the local half is *correct on a
+level change* by a different route entirely - `AcquireLocalShadowSlot`'s own generation test resets
+the table before the bake ever runs - so the only paths it was wrong on were the two knobs, which
+nothing routine touches.
+
 ### An unattributed display fault, and the switch it bought
 
 Partway through this section's testing the **whole display** corrupted - flickering and garbage
@@ -5996,6 +6095,807 @@ same however it was obtained.
 table above, which is why that row is trustworthy: the knob is known to move something elsewhere.
 "Explosions create no light" got none, and one would have been free - fire the effect where a
 light *is* known to appear and check the count moves at all.
+
+## 4.66 The per-frame atlas, and the hang that was never in the bake
+
+The design §4.65 set aside and the answer to both halves of what play reported - "lights from
+flares, explosions and projectiles still don't cast shadows against units and things like barrels".
+A second atlas, rebuilt from nothing every frame out of the frame's own draw list, so that a light
+that moves needs no identity and a unit or a barrel is a caster like anything else.
+
+**It is on.** For one section it was not: enabling it took the device down with
+`VK_ERROR_DEVICE_LOST` inside about four bakes, reproducibly, and everything below the shape was
+written as the record of a diagnosis that had not finished. **It had not finished because it was
+looking in the wrong place** - the bake was correct all along, and the fault was §4.67's field
+permutation putting a float's bit pattern into a bindless sampler index. The resolution is at the
+end of this section; the ruled-out list is kept because every entry in it is still true, and
+because the two measurements that misled it are worth more than the ones that did not.
+
+### The shape, which is the part that is right
+
+- **4096² of `D16_UNORM`, 32 MB, 16x16 tiles of 256 texels: 42 light slots.** (It was 2048²/128
+  through this section; §4.69 is why it is not.) Two orders of
+  magnitude fewer slots than §4.61's atlas, so the face is twice as wide and the blockiness
+  §4.61 names as its first regret is affordable to fix.
+- **No key, no cache, no stability gate.** `RegisterDynamicShadowLight` is fifteen lines: the
+  table is this frame's, the slot is the index, the next frame starts empty. Deduplicated within
+  the frame only, which is all "the same light" has to mean when nothing survives the frame.
+- **The caster test is the sun's** - opaque, depth-writing, indexed - and not `IsMapGeometry`.
+  That is the whole point: it is what puts a unit and a barrel in the set.
+- **Casters are bucketed by `(vertex source, index source, index width)`**, because a batch has one
+  bound index buffer and one `vertices` address and units draw from the frame's scratch where the
+  map draws from the arena (§4.18). §4.61 sidestepped this by taking only arena-sourced map
+  geometry; this one cannot, so it buckets rather than drops. In level02 it measures **1 bucket and
+  79 casters arena-only, against the sun's 171 a cascade** for the whole set.
+- **The per-frame atlas wins over the static one** where both have a slot, and `GpuLight` carries
+  both: `position.w` the per-frame cube, `direction.w` the static one. The static slot is the
+  fallback for a light the 42 had no room for, and only that.
+- `cube_shadow_visibility` is parameterised on a `ShadowAtlas` - image, sampler, face size, tiles
+  per row, bias - so the two atlases share one projection rather than having two that can drift
+  from the one bake.
+
+### What the failure looked like
+
+**`VK_ERROR_DEVICE_LOST`, reproducibly, within about three bakes.** Enabled from startup it dies
+before a level is up; switched on in level it completes three bakes - 90 indirect commands, 5
+lights, 79 casters - and then the counters freeze and every later `vkResetFences` reports the
+device gone.
+
+**"About three bakes" was itself a clue that went unread, and it says the FIRST bake hung.** The
+CPU may only run ahead of the GPU by the frames-in-flight depth before `vkWaitForFences` blocks, so
+a submission that never completes still lets three or four more frames be *recorded* before
+anything notices. A count that small is not a state that accumulates over bakes - it is the ring
+depth, and it means the fault is deterministic and present in a single bake. Every hypothesis in
+this section that needed a second frame to be wrong (all three rings) was therefore excluded before
+it was tested, and nobody did the arithmetic.
+
+What was established - all of it still true, and none of it the cause:
+
+| | |
+|---|---|
+| the bake is the cause | **wrong, and this is the entry that cost the section.** The control is clean - with `dynamic_shadows` false the session is healthy and `render.validation` reads `[]` - but "the control is clean" only localises the fault to *something the flag turns on*, and the flag turns on a shader path as well as a bake |
+| it is not the batch racing itself | one indirect buffer rewritten every frame *is* read by frames still in flight, and that is a real defect - it is fixed with a 4-slice ring - but the failure is **unchanged** |
+| it is not the scratch-sourced casters | `render.dynamic_shadow_arena_only` restricts the set to what §4.61's map bake takes; the failure is **unchanged** |
+| validation says nothing useful | it reports only the *consequences* - an acquire semaphore with pending operations, then fences in use - so the fault is a GPU hang rather than an API misuse it can see |
+
+**The ring is worth keeping whatever the real cause turns out to be**, and it pointed at the same
+defect one section back: §4.61's map bake has exactly the same shape and got away with it because
+at `map_shadow_rate` 256 a level of 51 lights bakes in a single frame, where level01's 686 take
+three. **That one is now closed** - it has a ring of its own, and §4.62 has the measurement.
+
+### The capture cannot be taken, and that is a fact about this class of bug
+
+The obvious next instrument was a RenderDoc capture. **It cannot be obtained.** RenderDoc writes
+the file at `EndFrameCapture`, which needs the captured frame's submission to *complete* - and the
+whole failure is that it does not. Armed with `render.capture()` and the bake enabled in the same
+REPL evaluation, so that the very first bake is the captured frame: the game dies, and there is no
+`.rdc` in the game directory or in RenderDoc's own temp. The one thing that would have shown the
+bake is destroyed by the bake.
+
+Worth knowing for the next time one *can* be taken: `renderdoccmd convert -c xml` turns a capture
+into a textual command stream, which is a headless way to read one on a machine whose replay has
+to be 32-bit anyway (§4.17).
+
+### So the check was done on the CPU instead, and the batch is clean
+
+Everything a capture would have been used to look at is computable from the bytes about to be
+submitted, at no risk at all. `render.dynamic_shadow_report` now range-checks the batch it just
+built and prints a sample of it:
+
+```
+last frame: 5 lights (0 refused), 171 casters in 2 buckets (0 dropped)
+index ranges past the arena: 0   furthest byte any command reads: 2131778 of 8388608
+  idxCount  firstIdx  vtxOffset  record  baseVtx  stride  source
+        12    247184          0       3   162699       2  arena
+         3    253608          0       4   163110       2  arena
+       306    254352          0       6   163124       2  arena
+```
+
+**Nothing is wrong with it.** No command's index range runs past its buffer, the furthest read is
+a quarter of the way into an 8 MB arena, the counts and offsets are ordinary, and the records are
+consecutive. The classic way to hang a GPU on an indirect draw is not what is happening here. The
+caster count also reconciles: **171 in 2 buckets, against the sun's own 171 a cascade.**
+
+### The hypothesis that was not dead: it WAS the sampling, and the knob that said otherwise was broken
+
+`render.dynamic_shadow_sample` bakes the atlas but never advertises it to the world pass, which was
+meant to split "the bake hangs" from "sampling the result hangs". **Bake-only hung too**, and that
+reading is what aimed the whole rest of the section at the bake.
+
+**The knob did not do what it says.** It sets `dyn_shadow_texture` to `kNoTexture`, and the shader
+*reads that word as `light_flags`* - the permutation §4.67 is about. The word the shader read as its
+own `dyn_shadow_texture` is the one the CPU fills with `dyn_shadow_sampler`, which is written
+unconditionally and is never `kNoTexture`. So `dyn.texture != kNoTexture` passed on every frame and
+the sampling never stopped.
+
+That is the sharpest thing in this section. **A bisect knob is code, and it can be broken by the
+same defect it is bisecting for** - here the knob and the fault were the same four fields, so the
+one instrument built to exonerate the shader was disabled by the shader bug. It read as a clean
+negative result, which is exactly what a broken instrument looks like from the outside. Nothing
+about "bake-only hangs too" was suspicious on its own; what would have caught it is checking that
+the knob *changed something observable* before trusting what it said - the same discipline
+§4.62 needed for `map_shadows`, one section earlier, for the same struct.
+
+That took two attempts even to get the wrong answer, because the first liveness test was not one -
+see below.
+
+### The atlas image was single-buffered too. Ringing it is right, and it is not the cause
+
+The batch was ringed and the image was not - the same hazard, one object over, and this bake is the
+first thing in the renderer to write an image every frame *and* sample it in the same frame.
+§4.61's atlas is written once per level and thereafter only read, which is exactly why it never
+needed a ring. With one image, frame N+1's bake declares `oldLayout = UNDEFINED` on it - discarding
+the contents - while frame N's world pass is still sampling them.
+
+It is now **one image per frame in flight, each with its own bindless slot** counting down from
+`kDynShadowMapSlot`, which is what makes the ring free on the shader's side: `GpuFrameData`
+already carries a texture index, so the frame block simply publishes whichever slice the bake just
+wrote. `UploadFrameData` runs inside `RecordDraws`, after the bake, so that index is available.
+
+**It is kept, and it does not fix the hang.** Paired windows on the renderer's own counter:
+
+| | |
+|---|---|
+| `dynamic_shadows = false` | **16.63 ms/frame** over 481 frames |
+| `dynamic_shadows = true` | **dead** - frames frozen after four bakes |
+
+Four bakes, then the device is gone, exactly as before the ring. So the ring closes a real defect
+that would have bitten later and is not what is biting now.
+
+### `render.stats.frames` is not a liveness test, and it cost a wrong conclusion inside this section
+
+The first run of the bake-only bisect read `render.stats.frames` advancing at ~87 a second and
+concluded the device was healthy. It was not. **That counter is the CAPTURE LAYER's `Present`
+count, and the capture layer keeps counting whether or not Vulkan is alive** - every call is still
+forwarded to d3d8to9, so the game runs on and the number climbs exactly as it always did.
+
+Measured on a session whose device was already lost:
+
+| | before | 4 s later |
+|---|---|---|
+| `render.stats.frames` (the capture layer's Presents) | 10,109 | **10,456** |
+| `render.vulkan.frames_presented` (the renderer's) | 1,716 | **1,716** |
+
+**`render.vulkan.frames_presented` is the liveness test.** The tell that something was wrong was
+in the report all along and was misread: `bake calls: 4` and `indirect commands issued: 180`
+against thousands of frames. A counter that stops while its neighbour keeps climbing is the shape
+of this, and it is worth checking for directly.
+
+**And the rule needed sharpening a second time, in the same session, after being written down.**
+The first reading of the ringed atlas took `frames_presented` **1573 → 1578 over eight seconds**
+and called it survival, because the number had moved. Five frames in eight seconds is 0.6 fps: a
+renderer being reset and restarted, not a healthy one. Against `false`'s 16.63 ms it is not close
+to a judgement call.
+
+So: **advancing is not the test, the RATE is.** Having just recorded "read the right counter", the
+next reading of that same counter was still wrong, because it asked whether the number changed
+rather than what it changed by. A liveness check needs a *baseline* - which is the same thing every
+other measurement in this file needs and gets, and it is easy to forget that a health check is a
+measurement too. `utils/rendertest`'s window helper now returns `DEAD` on a rate collapse rather
+than on a frozen counter, which is what makes the trap unrepeatable rather than merely documented.
+
+### The answer: a float's bit pattern used as a bindless sampler index
+
+**It was §4.67, and §4.67's own fix closed it.** The two were diagnosed as separate problems
+because the permutation's visible symptom - three knobs going inert - and its fatal one look
+nothing alike.
+
+The pre-fix layout has `light_flags` above `dyn_shadow_texture` in `world.slang` and below `pad1`
+in `src/VkDraw.h`, so for four fields the shader reads the word to its left:
+
+| the shader's field | the word it actually read | and with the atlas ON, that is |
+|---|---|---|
+| `light_flags` | `dyn_shadow_texture` | `kNoTexture` - every gate bit set |
+| `dyn_shadow_texture` | `dyn_shadow_sampler` | a live sampler index, small, **never `kNoTexture`** |
+| `dyn_shadow_sampler` | `dyn_shadow_offset` | `DynShadowBiasValue`, a **float** - 1.0f is `0x3f800000` = **1,065,353,216** |
+
+and `cube_shadow_visibility` ends in
+
+```slang
+textures[atlas.texture].SampleLevel(samplers[atlas.sampler_index], at, 0.0).r
+```
+
+where `samplers[]` is an unbounded bindless array holding **five** (`render.vulkan.samplers_live`).
+Indexing it at a billion is an out-of-bounds descriptor read, which is a GPU page fault, which is a
+lost device - on the first fragment that reaches it, in the first bake, exactly as the frames-in-
+flight arithmetic above says.
+
+**Why the control was clean, and it is not the reason it was read as.** The lookup's gate is
+`light.position.w >= 0` - this light's per-frame slot - and `RegisterDynamicShadowLight` returns -1
+unconditionally while `dynamic_shadows` is false. So with the feature off no fragment ever reaches
+the bad index. The flag was not exonerating the shader; it was **arming** it. "The control is clean,
+therefore the thing the flag switches on is at fault" was right, and the thing the flag switches on
+is a bake *and* a shader path, which is the step that got skipped.
+
+Everything else in the section follows. The rings, `arena_only` and the CPU range check were all
+aimed at a batch that was always correct - which is precisely what the range check kept reporting,
+every time, and it was read as "the fault is subtler" rather than as "the batch is not the fault".
+Validation reported only consequences because a descriptor index computed in a shader is invisible
+to it without GPU-assisted validation.
+
+### What that costs to look for next time
+
+Three things generalise, and the third is the one worth carrying.
+
+- **A shared struct with no compile-time link between its two declarations will drift, and the
+  second symptom will not look like the first.** §4.67 caught the permutation from an inert knob and
+  fixed it; nothing connected that to a lost device four fields away, because a permutation's
+  consequences are unrelated to each other by construction. **Closed** - see §4.68.
+- **A bisect knob has to be shown to do something before its negative result is worth anything.**
+  See the sampling subsection above.
+- **"It dies after N frames" is arithmetic, not a symptom.** N at or below the frames-in-flight
+  depth means the *first* submission hung and the CPU merely ran ahead; it is not a state that
+  accumulates. That single reading would have excluded all three rings before any of them was
+  written.
+
+### It was found by walking the bake down, which is still the right procedure
+
+The route in was the one this section recommended - cap the bake until it survives, then widen -
+and it is worth keeping even though the answer was elsewhere, because it is what proved the bake
+innocent by measurement rather than by argument. Four caps, all run-time
+(`render.dynamic_shadow_max_lights` / `_max_faces` / `_max_casters`, 0 for no cap, and
+`render.dynamic_shadow_indirect` for one `vkCmdDrawIndexed` per caster instead of the batch). All
+on level02, all against `Measure-Frame`, one session:
+
+| | ms/frame |
+|---|---|
+| off (control) | 16.63 |
+| 1 light, 1 face, 1 caster | 16.60 |
+| **all lights, all faces, 1 caster** - the whole pass structure, 30 viewports and 60 indirect draws | **16.60** |
+| all, 16 casters | 16.60 |
+| all, 64 / 72 / 80 / 88 / 96 casters | 16.63 / 16.57 / 16.67 / 16.62 / 20.34 |
+| **all lights, all faces, all casters** | **16.65 over 1,201 frames**, 10,692 bakes, `render.validation` `[]` |
+| the direct path (`dynamic_shadow_indirect` off) | 16.60 |
+
+The third row is the one that killed the leading hypothesis on its own: the pass structure this
+section blamed - a 2048² D16 attachment written in 30 viewport slices inside one
+`vkCmdBeginRendering`, the push block re-pushed between them - runs at the control's frame rate
+with one caster in it. Nothing after that widened it into a hang either, on a build that only
+differs from the failing one by §4.67.
+
+A RenderDoc capture was never needed and was never taken. The fact that it *cannot* be taken here
+stands, and so does the reason.
+
+### What the feature is worth
+
+`render.dynamic_shadow_map_only` was added for this: it narrows the caster set to `IsMapGeometry`,
+which is **§4.65's set exactly**, so the A/B against it prices the half the static atlas cannot do.
+It is the measurement `dynamic_shadow_arena_only` cannot make - a unit draws from the arena as often
+as not (level02's fires: 154 casters, one bucket, all arena), so that knob separates the
+user-pointer draws and not the mobile things.
+
+**level02's scene will not hold still, so every number here is a per-pixel median over an
+interleaved sweep** - 4 to 6 frames a state, states alternating, with each state's own odd-vs-even
+split-half as the floor. A single-frame A/B at these cameras is worthless: the first one taken gave
+an off-vs-off floor *larger* than the off-vs-on signal.
+
+At the camera §4.65 named - `position (-15, -1.7, 8.6)`, `roll 45`, `distance 18`, `pitch -20`,
+6 lights, 154 casters:
+
+| | MAD | px changed by >8 |
+|---|---|---|
+| floor (split-half, each state) | 0.0131 - 0.0135 | 750 |
+| **the whole feature**, off vs all casters | **0.02622** | **14,127** |
+| §4.65's caster set only, off vs `map_only` | 0.02447 | 14,127 |
+| the props and units, `map_only` vs all | 0.00204 | 1 |
+
+So at that camera the feature is worth 19x the floor and **all of it is the moving-light half** -
+the fires ride particles, get no static slot, and cast nothing at all under §4.65. The mobile-caster
+half measures zero there for a reason that is worth writing down: **level02's D3D point lights sit
+at y ≈ -1.75 and its units at y ≈ 4.5, a different floor of the map.** At rest there is no unit
+near a light on this level, which is why §4.65's report ("units and things like barrels") came from
+play and not from a settled camera.
+
+Putting one there is one line - `light.add({...}, 1, 0.7, 0.4)` beside Gunlok, which registers as
+an ordinary per-frame light (7 lights, 220 casters, 2 buckets). Camera on the unit, frame frozen:
+
+| | MAD | px changed by >8 |
+|---|---|---|
+| floor (split-half, each state) | 0.0065 - 0.0135 | 871 - 2,021 |
+| the whole feature, off vs all casters | 0.83799 | 140,937 |
+| §4.65's caster set only, off vs `map_only` | 0.24438 | 61,313 |
+| **the props and units as casters**, `map_only` vs all | **0.60222** | **81,276** |
+
+**Beside a light, the mobile casters are worth more than the map geometry** - 0.602 against 0.244 -
+and the difference image is Gunlok's own self-shadowing plus his cast shadow stretching away across
+the ground. That is the half §4.65 could not do, and it is the larger half where it applies.
+
+**What it costs: nothing measurable.** 16.64 ms/frame with it on and 16.64 with it off, over
+720-frame windows in one session, and 16.67 switching back. That is the FIFO cap
+(`render.vulkan.present_mode` 2) rather than a headroom measurement - there is no timestamp query
+on this side, so what this says is that the bake does not cost a frame at 60 Hz on an RX 7600 XT,
+not how much GPU time it takes. With validation layers loaded it is 20.24, and `render.validation`
+reads `[]` on the shipped default.
+
+## 4.67 One word in the wrong place, three knobs that stopped working - and the lost device
+
+§4.62's re-measurement recorded that `render.map_shadows` had gone inert - the A/B reads its own
+floor where the table there measured 6.87854 MAD over 74% of the frame. **It is `GpuFrameData`'s
+field order**, and the flag never had anything to do with it.
+
+**This is also §4.66's hang, which is not obvious from anything below and was not noticed for a
+whole section.** The permutation has two consequences that look unrelated: with the per-frame atlas
+*off* it makes three switches read permanently on, which is what the rest of this section is about;
+with it *on* it puts `dyn_shadow_offset` - a float - into the shader's `dyn_shadow_sampler` and
+indexes a five-entry bindless array at 1,065,353,216. §4.66 has the mechanism and the measurements
+that closed it. **One permutation, two symptoms with nothing in common**, which is the general
+hazard: the consequences of a reordering are unrelated to each other by construction, so fixing it
+from one symptom tells you nothing about how many others you just fixed.
+
+§4.66 added four words to that struct - `dyn_shadow_texture`, `dyn_shadow_sampler`,
+`dyn_shadow_offset`, `pad1` - and put them in **different places in the two files**: above
+`light_flags` in `src/VkDraw.h`, below it in `src/shaders/world.slang`. From `map_shadow_offset`
+onward the two disagree by one slot, and the shader's `light_flags` reads byte 124, which the CPU
+fills with `dyn_shadow_texture`:
+
+| the shader's field | the word it actually read |
+|---|---|
+| `light_flags` | `dyn_shadow_texture` |
+| `dyn_shadow_texture` | `dyn_shadow_sampler` |
+| `dyn_shadow_sampler` | `dyn_shadow_offset` |
+| `dyn_shadow_offset` | `pad1` |
+| `pad1` | `light_flags` |
+
+The per-frame atlas was off while this was live, so `dyn_shadow_texture` is `kNoTexture` on every
+frame - **0xffffffff, every bit set**. So all three of `kLocalLightsOn`, `kMapShadowsOn` and
+`kLocalShadowsOn` read as permanently on, and the three knobs behind them stopped doing anything.
+(Turning the atlas on is what made the *other* half of the permutation fatal, which is §4.66.)
+`map_shadow_texture` is a separate field and stayed correct, which is why the shadows themselves
+kept working perfectly and only the *switch* was dead - and why a re-bake still moved pixels, which
+is what made the bake look innocent and the flag look guilty.
+
+**Nothing caught it and nothing could have.** A permutation preserves the size, so
+`sizeof(GpuFrameData) == 272` still held, and so did both `offsetof` asserts - they pin `cascades`
+and `sun_matrix`, which are *after* the disturbance and were still in the right place. There is no
+compile-time link between the header and the shader at all. The fix is to put `light_flags` back
+last on the shader side; both files now carry a comment saying the position is ABI and that the
+asserts cannot see it.
+
+Measured on level02, paused at the settled camera, one session per build, `Shoot-Settled`'s
+procedure with the extra gate below:
+
+| build | `render.map_shadows` on vs off | that session's own floor |
+|---|---|---|
+| before | 0.00733 MAD / 3,332 px | 0.01761 / 3,535 |
+| after | **7.06544 MAD / 3,908,856 px** | 0.01990 / 4,148 |
+
+Before the fix the knob moves **less than the blinking pause indicator does**. After it, 74% of the
+frame, which is §4.62's 6.87854 over 3,906,200 recovered - a different window size and a different
+session, so the small difference is the two sessions, not the flag. A second run of the fixed build
+gives 7.06891 / 3,909,511.
+
+The other two bits, same session, fixed build: `render.local_shadows` moves 0.08730 / 42,511 px,
+and `render.local_lights` sits at its floor (0.01693 / 4,195 against 0.01411 / 3,333). The second
+is **not evidence that it is still broken** - this camera simply has no D3D point or spot light in
+frame, which is §4.65's ceiling being near zero here. It needs a view that has one.
+
+### The gate that makes this measurable, and the session it wasted first
+
+`Dismiss-Briefing` tests `actors.count > 0`, which says the level *started*. It does not say the
+world is on screen: an overlay screen replaces the world submit rather than drawing over it
+(`rendering_notes.md` §5), so the HUD, the objectives text and the pause indicator all render over
+a **black frame**. That photographs exactly like a renderer drawing nothing, and every A/B taken in
+it reads 0 - which is indistinguishable from "the knob is inert" and produced a confident wrong
+conclusion that the fix had not worked, on a build where it had.
+
+The tell is `render.draws`: **16 this frame against a 273 peak**. So the procedure needs one more
+wait after `Dismiss-Briefing` - poll until this-frame draws are in the hundreds, not until the
+level exists. `actors.count` was 178 throughout, and `frames_presented` was a healthy 16.6
+ms/frame, so neither of the checks already in the harness sees this.
+
+## 4.68 The shader ABI, checked by the compiler
+
+§4.67 was fixed twice - once as three inert knobs, once as a lost device (§4.66) - and the second
+fix took a section because nothing connects the two declarations of a struct. `src/gen-shader-abi.py`
+connects them: it parses the **Slang** structs, computes every field's byte offset, and emits
+`src/ShaderAbi.gen.inc.h` - one `offsetof` assert per field and one `sizeof` assert per struct,
+against the C++ counterpart. Included at the end of `VkDraw.cpp`'s anonymous namespace, the one
+point where `src/VkDraw.h`, `src/VertexFormat.h` and that file's three push blocks are all in scope.
+
+**Twelve pairs, not one**, which is the argument for doing it this way at all:
+
+| | |
+|---|---|
+| `world.slang` | `GpuFrameData`, `GpuLight`, `GpuDrawRecord`, `GpuMaterial`, `GpuMapLight`, `Vertex`, `Push` |
+| `shadow.slang` | `Vertex`, `GpuDrawRecord`, `ShadowPush` |
+| `lightgrid.slang` | `GpuMapLight`, `GridPush` |
+
+`Vertex` and `GpuDrawRecord` are each declared **three** times - `shadow.slang`'s copy carries its
+own warning that getting the stride wrong makes every draw past the first read the wrong matrix -
+and each copy is now checked separately.
+
+**The direction is deliberate and the obvious one is wrong.** Generating the *Slang* from the C++
+header was the plan this closes, and it does not survive contact: the shader declares
+`ConstBufferPointer<GpuMapLight>` where the header has `uint64_t`, so a mechanical translation
+loses the types the shader dereferences through, and it would cover only the struct it was written
+for. Asserts cover all twelve, need no type mapping, and leave both sides their own comments -
+which differ on purpose, the shader's explaining shader semantics.
+
+**It needs no slangc**, unlike `gen-shaders.py`, because it reads the `.slang` text rather than
+compiling it. That is why it is a separate CMake edge: a machine that cannot build shaders is
+exactly where a drifting struct would otherwise be least likely to be caught, and a check that only
+runs where the product can be rebuilt is not much of a check.
+
+**One extra check falls out for free, and it enforces a rule the sources already state.** Offsets
+are computed twice, under scalar and under std430 rules, and a struct where the two disagree is a
+build failure. `world.slang`'s own comment on `Vertex` says why - three float4s land at 0/16/32
+under every rule there is, "so the agreement is structural instead of a bet" - and Slang does not
+say which layout it picked for a `ConstBufferPointer<T>`. All twelve agree today; the check is what
+stops the next `float3` from quietly making one of them a bet.
+
+**Verified by reintroducing the defect**, which is the only test worth anything here: moving
+`light_flags` back above `dyn_shadow_texture` in `world.slang` and rebuilding gives **five errors
+naming exactly the five fields §4.67's table lists** -
+
+```
+error: static assertion failed due to requirement
+'__builtin_offsetof(gk::vulkan::GpuFrameData, light_flags) == 124':
+GpuFrameData::light_flags moved away from world.slang's GpuFrameData
+```
+
+- and 124 is the byte §4.67 measured the shader reading as the flags. The generator reproduces that
+arithmetic from the shader source alone, having been told nothing about the bug.
+
+It also checks the **constants** declared on both sides - `kDynShadowFace`, `kMapShadowFace`, their
+tiles-per-row, `kMaxShadowCascades`, `kNoTexture`. Same hazard one level down and a worse failure
+mode: a struct that drifts moves a field, where `kDynShadowFace` drifting would put every cube
+lookup in the wrong tile with no size to preserve and nothing at all to catch it. §4.69 changed that
+constant on both sides the day after, which is as good a demonstration of the need as a test.
+
+## 4.69 Low-res and jagged: two defects, and the second was a measurement worn out of date
+
+Play, on the per-frame atlas the section before: *"the lights projected by spot/point lights look
+very low-res and jagged"*. Two separate causes, and the interesting one is the second.
+
+### The resolution: 128-texel faces were not enough
+
+A 90-degree cube face across 128 texels is coarse enough to see the texels, which is the "low-res"
+half. **256 now**, and the atlas goes 2048² to 4096² to keep all 42 slots at that size - at 2048²
+a 256-texel face would leave ten, and a light with no slot is a worse artefact than a blocky one.
+32 MB a slice, 64 MB for the ring, against the sun's own 66 MB. The bias is unchanged and stays
+correct by construction: it is in *texels*, and the depth error across a texel halves with the
+texel.
+
+### The jaggedness: a single hard tap, from a measurement that did not transfer
+
+`cube_shadow_visibility` ended in one tap and a binary compare, with this comment on it:
+
+> One tap, not nine. The map lights are a *sum* - a fragment on level02 is in range of a mean of
+> 11.5 of them (§4.54) - so the filtering the sun's map needs from PCF is already there in the
+> average, and nine taps a light would be a hundred a fragment.
+
+**Every word of that is true, and it is about the wrong lights.** It was written for §4.61's map
+lights, where the reasoning is exact. §4.65 and §4.66 then pointed *D3D's own point and spot lights*
+at the same body - and one or two of those reach a fragment, so there is no sum, nothing averages
+the 0/1 compare, and the edge is a staircase. The measurement did not stop being true; the code
+under it acquired a second caller the measurement had never seen.
+
+So the tap radius is **the caller's**, not the atlas's: `ShadowAtlas` carries it, both builders
+default it to 0, and only the two D3D call sites widen it. The map lights keep their single tap and
+their measured cost exactly. The radius rides in `GpuFrameData` as `render.local_shadow_taps` -
+0 a single tap, 1 a 3x3, 2 a 5x5, clamped at 3 - and it took `pad1`'s word, so the struct is the
+same size and §4.68's asserts confirmed both sides of the rename.
+
+### What it costs, which is almost nothing
+
+On the staged frame - a `light.add` beside Gunlok, 7 lights, 212 casters, camera close enough that
+the scene is off the vsync cap and a difference can be seen at all:
+
+| | ms/frame |
+|---|---|
+| `dynamic_shadows` off | 21.19 |
+| on | **21.60** |
+
+**0.4 ms for the whole feature** at the new resolution, and it is the first cost figure for it that
+is not just the FIFO cap - §4.66's 16.64-both-ways said only that it fit in a 60 Hz frame. The tap
+radius itself is below the noise: 21.92 / 21.74 / 21.56 / 21.51 ms at radius 0 / 1 / 2 / 3, which
+is a *decreasing* sequence and therefore measuring something other than the kernel. So the default
+is 1 because 2 buys nothing visible, not because 2 is unaffordable.
+
+### The before and after
+
+Same level, same staging, same camera, one build apart - and the staging reproduces exactly, which
+is worth knowing: `Wait-CameraRest` on a fresh level02 puts Gunlok at `-9.91, 4.51, 2.48` to the
+centimetre across sessions, so `light.add` at a fixed offset from him is a repeatable rig for
+anything shadow-shaped.
+
+Whole-frame difference between the two builds is **1.22699 MAD over 977,238 px**. What that is, at
+1:1, is the staircase on the ground halving in step size and softening, and a hard jagged bite out
+of Gunlok's torso - the self-shadow edge - becoming a smooth curve.
+
+## 4.70 §4.64's defect in the path §4.64 did not cover - fixed, and NOT shown to fix the symptom
+
+Prompted by a play report that point lights *still* look like discs after §4.64. They do, and the
+report is worth taking at face value: §4.64 windowed the falloff in `map_light_sum`, which is the
+level's baked `STDLIGHT` rig, and left `light_geometry` - **D3D's own point and spot lights, which
+is what a fire in level02 is** - exactly as it was.
+
+That path had the worse discontinuity of the two. D3D8 switches a light off hard at Range while
+`1/(a0 + a1 d + a2 d^2)` is still well above zero there: `render.frame_lights` says level02's fires
+are range 6, attenuation `0.959/0.0333/0.16666`, diffuse 4.0, so **k at the boundary is 0.140** and
+the term it scales is 0.56 before N.L. Where the map lights' rim was a kink in the *slope* with the
+value already at zero, this is a step in the value itself.
+
+It was invisible in the original for §4.64's reason, which is worth stating as a general result now
+that it has held twice: **D3D8 evaluated the light sum per vertex, so the step landed inside a
+triangle and interpolation destroyed it.** Every per-pixel evaluation of a per-vertex model inherits
+every discontinuity the interpolation was hiding. §4.55 moved this sum per pixel; §4.64 found the
+first consequence; this is the second, and there is no reason to believe it is the last.
+
+### The fix, and why it is not the same expression
+
+`out.k *= (1 - t^4)^2`, zero in both value and first derivative at `t = 1`.
+
+**Not** the map lights' `(1 - t)(1 - t^4)`. There the linear term *is* the fitted attenuation
+(§4.54), so the window replaces the model; here D3D's quadratic *is* the model and has to survive,
+so this only pulls its tail down. `(1 - t^4)^2` is within 1% of 1.0 out to a quarter of the range
+and 0.88 at the half, so the near field - where the quadratic dominates anyway - is untouched.
+
+There is no bake to refit against: these are D3D lights, not `SHPVTINT`, so §4.64's route of
+scoring a candidate against `fit_bake.py` does not exist here.
+
+### `render.local_light_window`, and why the knob is the whole measurement
+
+Two launches cannot read this. The first attempt scored 15.80 MAD against a d3d8 reference and
+15.70 after, which says nothing at all: §4.30 already measured that two settles of level02 differ
+by the objectives text's fade and the units' animation phase, and at 3060x1716 that swamps a change
+worth 25/255 on 1% of the frame. The difference image was the two units and one particle.
+
+So the knob exists to put both frames in **one paused session**, and with it the floor is
+bit-identical - `0.000000` MAD over the 99.9% of pixels the fires' own particles do not touch.
+Level02, the §4.42 fire camera:
+
+| | window on vs off |
+|---|---:|
+| stable pixels changed | 24,476 (0.47%) |
+| mean delta over those | 9.30/255 |
+| max delta | 25/255 |
+| darker / brighter | 24,427 / **49** |
+
+The 49 are all exactly +1/255 - rounding, not a brightening. That check is the one worth keeping:
+a window multiplies `k` by a factor in [0,1], so **any** pixel getting materially brighter would
+mean it had been wired somewhere it does not belong. A top-down camera read the same way, 0.94% and
+the same 25/255 ceiling. `render.validation` empty throughout.
+
+### What this section does NOT establish
+
+**The reported disc was never reproduced, so the fix is not shown to address it.** At three level02
+cameras the local lights' visible boundaries are geometry silhouettes - the ledge edge - and not the
+range sphere; the amplified contribution images before and after are nearly indistinguishable, and
+the "step at the outer edge" statistic moved only 18.08 -> 16.94 because it is measuring occlusion
+edges, not the cutoff. Range 6 against a camera distance of 22-45 puts the whole sphere inside a
+small, heavily occluded patch.
+
+So: a real discontinuity, correctly removed, measured to only ever darken - and an open question
+about whether it is the one being seen. The next candidates, neither examined:
+
+- **the map lights' saturation boundary.** `map_light_sum` returns `saturate(acc * gain)`, and gain
+  went 1.2 -> 1.35 in §4.64. A region that clips at 1.0 has a flat top and a slope break at its
+  edge, which is a Mach band of exactly the kind §4.64 is about and which windowing the *falloff*
+  does nothing to. §4.64 did rule saturation out for the rim it was chasing - the edge did not move
+  across gain 0.6/1.2/2.4 - but that was a different edge on a different path.
+- **the per-frame shadow cubes** (§4.69), whose whole subject is the shape of a point light's
+  projection.
+
+### A harness bug this turned up, which was hiding worse than it looks
+
+`Wait-World` polled `render.draws`. That is `vulkan::FormatDrawStats()` - the **Vulkan** renderer's
+own counter - so under `-Renderer d3d8` or `-Renderer d3d9` it reads `world pipeline: down / draws:
+0 this frame` forever and the function always threw. **Every reference capture the harness exists to
+take was unreachable**, which is why the first A/B above was attempted the expensive way at all.
+
+It now reads `render.frame_draws`, which is mirror-side and identical in all three modes. The
+failure is a special case of the trap that function's own comment is about: a counter reading zero
+because the thing counting is switched off is indistinguishable from a renderer drawing nothing.
+
+## 4.71 Geometry amplification: PN triangles over the level mesh
+
+The first thing this renderer adds to the *geometry* rather than to the shading. Hardware
+tessellation, with the generated points placed on a cubic Bézier patch fitted to each triangle's
+three corner positions and corner normals (Vlachos et al., 2001).
+
+### Why this construction, and not displacement
+
+The brief was "tessellate the level mesh", and the refinement that shaped it was a question:
+**can the places that want smoothing get it while hard edges stay hard?** PN triangles answer that
+exactly, and the answer is arithmetic rather than a heuristic. The edge control point is
+
+```
+b210 = (2*P1 + P2 - dot(P2 - P1, N1) * N1) / 3
+```
+
+and when `N1` is the triangle's own plane normal, `dot(P2 - P1, N1)` is **zero**: `b210` collapses
+to the linear `(2*P1 + P2)/3`. All six edge points collapse, `b111` collapses to the centroid, and
+the patch *is* the flat triangle. A flat-shaded wall reproduces itself at any factor, with no
+threshold, no classification pass and no per-material opt-in. The baked vertex normals are the
+signal, and reading them is free.
+
+Two further properties decided it over the height-map displacement that was proposed first:
+
+- **It is watertight across a shared edge by construction.** `b210` and `b120` for edge (P1,P2)
+  are functions of P1, P2, N1 and N2 alone, so the two triangles sharing it build the same boundary
+  curve. Displacement driven by §4.48's height field has no such guarantee and cracks at every
+  material boundary, because the two sides sample different textures.
+- **It needs no new matrix and no change to the 48-byte vertex.** The control net is built in
+  object space from the vertices the shader already pulls, and the existing `mvp` projects the
+  result. `GpuDrawRecord` and `GpuMaterial` are untouched.
+
+### The measurement that had to come first, and what it corrected
+
+**Gunlok's level mesh could have been entirely faceted**, in which case this feature is an exact
+identity over the whole level and does nothing. `render.normal_census()` was written before any of
+it: it walks the last frame's arena triangles on the CPU and reports
+`|dot(normalize(edge), normal)|` - the tangent term normalised by edge length, which is the
+quantity the construction actually uses rather than a proxy for it. A corner reading `d` bulges its
+edge by about `d * length / 3`.
+
+Level02, settled camera:
+
+| | level mesh (`IsMapGeometry`) | props, units, effects |
+|---|---|---|
+| draws / triangles | 65 / 1,611 | 22 / 245 |
+| flat corners (`< 1e-4`) | 16.6% | 42.4% |
+| **curved (`>= 0.10`)** | **27.7%** | **53.1%** |
+| **triangles with all three corners flat** | **6.4%** | 39.5% |
+| mean term / worst | 0.094 / 0.970 | 0.245 / 0.894 |
+| degenerate / no normal | 0 / 0 | 0 / 36 |
+
+Two things follow, and the second corrected the plan:
+
+- **The feature is not a no-op.** The level mesh genuinely carries smooth normals. The props'
+  strongly bimodal split - 42% exactly flat, 53% curved - is independent evidence the instrument
+  reads real structure rather than noise, and `0 degenerate` says none of it is sliver triangles.
+- **The free hard-edge identity protects only 6.4% of level-mesh triangles**, not most of them. A
+  mean term of 0.094 domes a typical edge by ~3% of its length, which on a large floor triangle is
+  a visible dome. That is what `render.pn_flat_threshold` exists for: a normalised term at or below
+  it is snapped to exactly zero. **It stays watertight**, and that is why the threshold is on this
+  quantity and not on the triangle's own flatness - the term is a function of `(Pi, Pj, Ni)` alone,
+  so the triangle across the edge tests and snaps the identical number.
+
+### All sixteen levels, and level02 is not representative of any of it
+
+One launch per level - `utils/rendertest/census-levels.ps1` - settling the camera where it settles
+and reading the census once. 16/16, no failures. `railway` is not in the list for §4.60's reason.
+
+| level | examined | map tris | flat | curved | all-3-flat | mean | props tris | props curved | props all-3-flat |
+|---|---|---|---|---|---|---|---|---|---|
+| `level01` | 208 | 2804 | 32.7% | **37.0%** | **25.1%** | 0.131 | 1727 | 10.9% | 77.8% |
+| `level02` | 87 | 1611 | 16.6% | **27.7%** | **6.5%** | 0.094 | 245 | 53.2% | 39.6% |
+| `level03` | 84 | 3216 | 12.9% | **45.6%** | **4.4%** | 0.165 | 1026 | 0.5% | 99.2% |
+| `level04` | 39 | 740 | 7.5% | **58.7%** | **4.3%** | 0.214 | 36 | 14.8% | 77.8% |
+| `level05` | 57 | 1421 | 57.0% | **25.9%** | **50.1%** | 0.100 | 1068 | 0.5% | 99.3% |
+| `level06` | 147 | 3510 | 68.3% | **18.9%** | **62.6%** | 0.086 | 116 | 38.8% | 50.0% |
+| `level07` | 131 | 2352 | 67.1% | **23.0%** | **58.9%** | 0.081 | 506 | 9.9% | 61.5% |
+| `level09` | 109 | 2032 | 73.9% | **17.8%** | **67.5%** | 0.089 | 44 | 12.1% | 81.8% |
+| `level10` | 22 | 464 | 47.9% | **31.7%** | **47.0%** | 0.172 | 394 | 34.5% | 55.3% |
+| `level11` | 76 | 1743 | 60.5% | **16.4%** | **47.4%** | 0.073 | 1068 | 0.5% | 99.3% |
+| `level12` | 30 | 1082 | 36.2% | **33.1%** | **28.3%** | 0.087 | 704 | 0.8% | 98.9% |
+| `level15` | 23 | 991 | 84.7% | **4.5%** | **75.6%** | 0.034 | 1270 | 5.7% | 88.1% |
+| `prison` | 64 | 1451 | 37.6% | **62.0%** | **37.1%** | 0.243 | 28 | 19.0% | 71.4% |
+| `junkyard` | 101 | 1962 | 27.3% | **29.6%** | **16.3%** | 0.150 | 644 | 7.6% | 89.1% |
+| `cityruins` | 77 | 2844 | 40.0% | **28.1%** | **32.9%** | 0.137 | 554 | 1.0% | 98.6% |
+| `Training_Level` | 56 | 1055 | 15.1% | **51.2%** | **7.9%** | 0.283 | 20 | 26.7% | 60.0% |
+| **all** | | **29,278** | **43.8%** | **30.6%** | **36.3%** | | **9,450** | **7.6%** | **86.7%** |
+
+**`tess_set = "all"` was documented backwards, on level02's evidence alone.** That level's props are
+53.2% curved corners against a map mesh at 27.7%, which is why §4.71 first shipped saying "more than
+half a frame's curvature is outside the map object" and calling `"all"` not a debug setting. Over
+sixteen levels the props are **88.6% flat corners, 86.7% fully-flat triangles, 7.6% curved**, and
+**77% of their corners carry no normal at all** (21,838 of 28,350 - the unlit FVFs). `"all"` would
+amplify 9,450 prop triangles to move 7.6% of their corners. `"map"` is the right default and now it
+is measured; the `.d.ts` and the plan carried the wrong claim for one commit.
+
+**Level02 is near the *curved* end, not the flat end.** Its 6.5% fully-flat triangles is the
+third-lowest of sixteen, against a 36.3% aggregate and a 75.6% high on level15. That is the
+opposite of what four levels suggested mid-sweep, and it is the useful direction: the level
+everything was tuned on is a **pessimistic** place to set `pn_flat_threshold`, so a default that
+behaves there should be safe elsewhere rather than the reverse.
+
+**The spread is the headline.** All-three-corners-flat runs 4.3% (`level04`) to 75.6% (`level15`),
+and the mean tangent term 0.034 to 0.283 - an eightfold range. There is no single "Gunlok level
+mesh" character to tune against, and `level15` is a level this feature can do almost nothing to.
+`prison`, `level04` and `Training_Level` are where to look at it.
+
+**Zero degenerate corners in 87,834**, on every level. Whatever else is true of this geometry, it
+carries no sliver triangles - which is what rules out "the curved fraction is sliver noise" for the
+whole game rather than for one camera.
+
+**The sampling caveat is real and is not small.** The census reads one frame, so a level's row is
+the geometry that camera happened to see: `examined` runs from 22 draws (`level10`) to 208
+(`level01`), and `level15`'s row rests on 8 map draws. The aggregate is the more trustworthy figure
+and is itself weighted by what was on screen. A cumulative census across a session - §4.60's trick
+for the pipeline histogram - is what would remove this, and nothing needs it yet.
+
+**One counter in the census was mislabelled and would have misled later.** `TangentTerm` returned
+0.0 both for a zero-length edge and for a genuinely perpendicular normal, and `degenerate` counted
+the latter - so it read 155 and 144 when the true answer is 0 and 0. Those are opposites: a sliver
+contributes a zero that is not evidence of flatness. Fixed before the reading above was taken, and
+the corrected `0 degenerate` is what rules out "the 27.7% is sliver noise".
+
+**And a second formatting defect in the same function, found while checking the sweep by hand.**
+The CRT this DLL links **truncates** `%.1f` and signs its zero: 104 of 1611 printed as `6.4%` where
+the value is 6.456, and a zero percentage printed as `-0.0%`. Confirmed by reproducing the identical
+`snprintf` call, argument for argument, in a standalone 32-bit clang build - which prints `6.5` and
+`0.0` - so it is the runtime and not the arithmetic, the format string or an argument mismatch. No
+count moves and every conclusion here rests on counts, but a diagnostic whose printed ratio
+disagrees with its own numerator and denominator cannot be checked by hand, which is most of what it
+is for.
+
+**The obvious fix made it worse, and that is the part worth carrying.** Rounding on this side and
+still printing through `%.1f` moved *seven of the eight* percentages in a level02 census 0.1 the
+wrong way — `flat` went 16.6 → 16.5, having been right by luck before. The two errors compose
+rather than cancel: hand a truncating conversion the rounded `1.9` and it prints `1.8`, because the
+nearest double to 1.9 is 1.8999999999999999. Only keeping the value out of the float conversion
+altogether is robust, so `Percent()` formats integer tenths as `%llu.%llu` and the format string
+takes `%s`. Verified against an independent recomputation from the counts: all ten percentages in a
+level02 census now agree exactly. The sixteen-level table above is computed from the counts either
+way.
+
+### What is measured
+
+Level02, settled camera, all against a stated floor.
+
+| reading | value | floor |
+|---|---|---|
+| tessellation off vs on | **1.667 MAD over 51.5% of the frame** | 0.008 |
+| `pn_strength = 0` (amplify, patch stays linear) vs off | 0.00928 | 0.00795 |
+| the shadow half (`tess_shadows` off vs on, both re-baked) | 0.02692 over 0.58% | 0.01495 |
+| **tessellation off vs the pre-change build** | **0.05701 over 1.50%** | **0.04213 cross-launch** |
+| frame time, off / colour only / both halves | 16.67 / 16.63 / 16.63 ms | 16.6 is the FIFO cap |
+
+Three of those are worth reading carefully.
+
+**`pn_strength = 0` is the structural check.** A linear patch subdivided is the same surface, so
+this isolates the amplification machinery - patch list, index consumption, tessellator winding,
+varying interpolation - from the curvature. At 0.00928 against a 0.00795 floor it is
+floating-point rounding in the Bézier evaluation and nothing else, which says the machinery is
+correct and **everything the feature does visibly comes from the curvature rather than from
+subdividing**.
+
+**The off-state is at the cross-launch floor, and it is NOT bit-identical.** The plan claimed it
+would be "bit-identical by construction" because `vertex_main` is untouched. That was wrong, and
+the SPIR-V says so: `GpuFrameData` gained eight scalars and `ShadowPush` four, so every offset
+below them shifted and *all four* pre-existing entry points changed - `vertex_main` 6317 → 6419
+words, `fragment_main` 15076 → 15240, `shadow_vertex` 1213 → 1251, `map_shadow_vertex` 1268 →
+1306. The claim had to become an empirical one, and the honest floor is a **cross-launch** one
+rather than the same-session 0.00795: two launches of the same build differ by 0.04213 over 1.68%
+of the frame, in the bounding box (366,694)-(1817,1533). HEAD against the new build with the
+feature off reads 0.05701 over 1.50% **in the identical box** - which is §4.38's finding again, the
+two characters idle-animating, not a renderer difference.
+
+**Frame time says nothing, because 16.6 ms is the FIFO cap.** The only reading with headroom in it
+was taken under validation, where the whole frame is slower: 19.75 ms with the feature off against
+20.25 with both halves on. That ~0.5 ms is the shadow half, and it is the number to re-take without
+validation if the bake ever becomes a suspect.
+
+### Three things the implementation had to get right, all found by validation
+
+- **The domain shader carries the spacing and the winding too.** In HLSL `[partitioning]` and
+  `[outputtopology]` are hull-shader attributes; in SPIR-V the tessellation execution modes live on
+  the *evaluation* stage, and Slang emits only what each entry point declares. Without them the
+  domain shader defaults to `SpacingEqual` and validation reports a mismatch on every draw.
+- **A push must name every stage in the overlapping range**, not just the stages that will read it.
+  Adding the two tessellation bits to a `VkPushConstantRange` makes every existing
+  `vkCmdPushConstants` against that layout invalid until it is updated - five sites on the shadow
+  layout, which is why they now share one `kShadowPushStages` constant.
+- **Slang rounds a push block up to its own alignment and this side must too.** `ShadowPush`
+  contains a `float4` array, so its alignment is 16 and its size rounds to 112, not the 108 its
+  fields add up to. Caught by `src/gen-shader-abi.py` - §4.68's generator earning its keep on a
+  case §4.67 could not have caught, since this is a *size* disagreement rather than a permutation.
+
+### What is deliberately not solved
+
+- **The crease case.** A triangle with two smooth corner normals and one flat one - a pipe meeting
+  a flange - curves into the flat region, and where the two sides are separate vertices the curved
+  boundary pulls away from the straight one. PN keeps the corners exact so the gap is bounded by
+  the mid-edge deviation, but it is real; `pn_strength` is the dial, not a fix.
+- **The shadow passes tessellate their whole caster set or none of it.** One pipeline serves the
+  batch, and the indirect path cannot select per draw. With `tess_set = "map"` a prop's shadow
+  therefore follows a smoothed silhouette its geometry does not have. Bounded by the size of the
+  effect itself.
+- **Displacement.** §4.48's R channel *is* a height field and slots into the same domain shader
+  with no new structure. It is a separate feature with a much worse crack problem and should be
+  measured on its own.
 
 ---
 

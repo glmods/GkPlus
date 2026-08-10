@@ -257,6 +257,63 @@ export function draw_render_panel(ImGui) {
     ImGui.TreePop();
   }
 
+  // --- PN-triangle amplification ---------------------------------------------
+  if (ImGui.TreeNode("Tessellation")) {
+    ImGui.TextWrapped(
+      "PN triangles over the level mesh. A corner whose normal is its face normal " +
+        "contributes nothing to the patch, so hard edges stay hard by arithmetic " +
+        "rather than by a heuristic - and a boulder or a pipe rounds off."
+    );
+    const on = toggle(ImGui, "tessellation", "tessellation",
+      "Off by default: it changes the level's silhouette rather than reproducing D3D. " +
+        "Reads back false on a device with no tessellationShader whatever you set.");
+    ImGui.BeginDisabled(!on);
+    // A combo would be tidier; three buttons keep this to the write-on-changed rule
+    // without a selection index to track.
+    /** @type {Array<"map" | "all" | "off">} */
+    const sets = ["map", "all", "off"];
+    for (const set of sets) {
+      if (set !== "map") {
+        ImGui.SameLine();
+      }
+      if (ImGui.RadioButton(set, render.tess_set === set) && render.tess_set !== set) {
+        render.tess_set = set;
+      }
+    }
+    ImGui.SetItemTooltip(
+      "Which draws are amplified. 'all' is not a debug setting: render.normal_census() " +
+        "measures more than half a frame's curvature outside the map object."
+    );
+    slider(ImGui, "tess_edge_pixels", "tess_edge_pixels", 4, 128,
+      "The screen-space edge length a factor aims for.", "%.0f");
+    slider(ImGui, "tess_max", "tess_max", 1, 32,
+      "Clamped to the device's maxTessellationGenerationLevel.", "%.0f");
+    slider(ImGui, "tess_min", "tess_min", 1, 32,
+      "Above 1 this forces uniform amplification, which is how the shape can be " +
+        "judged without the factors varying underneath it.", "%.0f");
+    slider(ImGui, "pn_strength", "pn_strength", 0, 1,
+      "0 is exactly linear - the untessellated surface however high the factors go. " +
+        "That is the A/B separating 'the amplification is wrong' from 'the curve is'.",
+      "%.2f");
+    slider(ImGui, "pn_flat_threshold", "pn_flat_threshold", 0, 0.2,
+      "Snap a near-flat corner to exactly flat. Only 6.4% of level02's map triangles " +
+        "are fully flat on their own, so this is what keeps walls from doming.",
+      "%.3f");
+    toggle(ImGui, "tess_shadows", "tess_shadows",
+      "Amplify in the shadow passes too. Separable because the bake is where the " +
+        "cost is - and re-baking is what makes a change here visible in the atlas.");
+    slider(ImGui, "tess_shadow_factor", "tess_shadow_factor", 1, 16,
+      "Uniform over every edge, which makes those passes watertight for free.",
+      "%.0f");
+    readoutButton(ImGui, "normal_census", () => render.normal_census());
+    ImGui.SetItemTooltip(
+      "How much of the frame carries smooth normals at all - which is the ceiling on " +
+        "what this feature can reach. Reads the arena back; do not call it per frame."
+    );
+    ImGui.EndDisabled();
+    ImGui.TreePop();
+  }
+
   // --- fidelity against the original -----------------------------------------
   if (ImGui.TreeNode("Fidelity switches")) {
     ImGui.TextWrapped(
