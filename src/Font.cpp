@@ -50,7 +50,13 @@ bool VersionTextEnabled = true;
 // renderer is not resolved until Direct3DCreate8 runs, which is long after DllMain -
 // asking at hook-install time would always answer "d3d9".
 const char *VersionText() {
-  static const std::string text = std::string("GkPlus - ") + d3d8::RendererName();
+#ifndef NDEBUG
+#define IS_DEBUG_STR + " (Debug)"
+#else
+#define IS_DEBUG_STR
+#endif
+  static const std::string text = std::string("GkPlus - ") + d3d8::RendererName() IS_DEBUG_STR;
+#undef IS_DEBUG_STR
   return text.c_str();
 }
 
