@@ -575,6 +575,12 @@ template <typename Interface> struct BufferWrapper : Wrapper<Interface> {
         return false;
       }
       version_offset_ = alloc.offset;
+      // The box for the shadow bakes' cull, taken here because this is the only moment the
+      // whole version is readable: `alloc.mapped` is write-combined from now on, and the arena
+      // slot this buffer owns keeps the OLDER contents by construction. From `locked_`, the
+      // game's own bytes, rather than from the converted copy - same reason.
+      version_bounds_ =
+          vulkan::PositionBounds(fvf_, locked_, count, version_min_, version_max_);
     } else {
       // A 32-bit index buffer is refused by EmitDraw anyway, so a version of one would never
       // be read; refusing here keeps it out of the scratch as well.
@@ -684,6 +690,11 @@ template <typename Interface> struct BufferWrapper : Wrapper<Interface> {
   // after that, so it expires on its own and there is nothing to clear.
   uint64_t version_frame_ = UINT64_MAX;
   uint32_t version_offset_ = 0;
+  // The object-space box of the version above, for the shadow bakes' cull. Scoped to the same
+  // frame `version_frame_` is, since it describes the same bytes.
+  bool version_bounds_ = false;
+  float version_min_[3] = {0, 0, 0};
+  float version_max_[3] = {0, 0, 0};
   // 2 or 4. Lives here rather than on CaptureIndexBuffer because UploadVersionToScratch needs
   // it, and is left at 2 for a vertex buffer, where nothing reads it.
   uint32_t index_stride_ = 2;
@@ -986,8 +997,19 @@ struct CaptureDevice final : Wrapper<IDirect3DDevice8> {
                         UINT start_index, UINT primitive_count);
   // Both buffered draw entry points. `indexed` false is DrawPrimitive, which reads no index
   // buffer at all and counts its vertices from `start_vertex`.
+  //
+  // `min_index` and `num_vertices` are DrawIndexedPrimitive's own, and they are here for the
+  // shadow bakes' culling: D3D makes the caller state the vertex range its indices reach into,
+  // which is the only thing that turns an index range into a box. Ignored when `indexed` is
+  // false, where the range is `start_vertex` for as many vertices as the topology implies.
   void EmitDraw(D3DPRIMITIVETYPE type, UINT start_index, UINT primitive_count, bool indexed,
-                UINT start_vertex);
+                UINT start_vertex, UINT min_index = 0, UINT num_vertices = 0);
+  // Fills `item`'s world-space box from whichever source can supply one, or leaves it unbounded.
+  void StoreDrawBounds(vulkan::DrawItem &item, UINT min_index, UINT num_vertices,
+                       uint32_t elements);
+  // Transforms an object-space box by the current world matrix onto the item. Split out because
+  // three call sites reach it from three different vertex sources.
+  void StoreWorldBounds(vulkan::DrawItem &item, const float *lo, const float *hi);
   // The synthetic quad probe (§4.35). Issued through this device's OWN methods rather than
   // through `inner_`, which is the entire point: the states and the draw go down both paths at
   // once, so the reference and this renderer are handed the same geometry, the same texture and

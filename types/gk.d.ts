@@ -2367,6 +2367,28 @@ declare module "gk" {
      *  identical number. */
     pn_flat_threshold: number;
 
+    /** The ceiling `pn_flat_threshold`'s floor cannot reach: how far, in world
+     *  units, a control point may sit off its chord. Default 0.08.
+     *
+     *  The bulge is `term * length / 3`, and `pn_flat_threshold` is normalised by
+     *  the edge length on purpose - so it means the same thing at every scale, and
+     *  for that same reason it cannot bound an absolute distance. Gunlok builds
+     *  round objects from few, long segments, so level02's map mesh reaches a
+     *  **1.104-unit** control-point offset against a 1.952-unit mean edge.
+     *
+     *  **It is not the cure for the inflated-pipe look, and the sweep says so**
+     *  (§4.74). At 0.08 it caps 10.7% of level02's map half-edges and takes 23.6%
+     *  of the frame's displacement, for 0.41 MAD of a 2.83 total; the picture only
+     *  really moves at 0.03-0.05, by which point it has removed most of the
+     *  tessellation everywhere. The rounding and the inflation are the same
+     *  displacement. `pn_strength` is the knob that trades them off - 0.5 sits at
+     *  2.19 MAD against 2.83.
+     *
+     *  Clamped rather than zeroed, so a bulge that merely overshoots becomes
+     *  exactly the cap instead of snapping flat, and watertight for the same
+     *  reason the floor is: a function of `(Pi, Pj, Ni)` alone. */
+    pn_max_offset: number;
+
     /** D3D8's light sum, evaluated **per pixel** instead of per vertex.
      *
      *  On by default, and the first thing in this namespace that deliberately

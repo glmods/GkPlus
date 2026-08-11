@@ -538,7 +538,9 @@ sentinel skipped, filtered by vslot 71. There is no separate "player character" 
 Every selection mutator opens with `CMP byte ptr [0x007b3f51],0` → `FUN_004a17b0(CL=0)`, which is
 presumably "close the open command wheel"; that was not confirmed.
 
-**No box/marquee select was found.** `FUN_004976d0` (the world-click order handler) and
+**No box/marquee select was found.** `ToggleReconMode` @ 0x004976d0 (was `FUN_004976d0`, and was
+described here as "the world-click order handler", which it is not — it is the Recon Mode toggle
+of line 103, and the master gate on the cone renderer; see `ai_behaviour_notes.md` §7) and
 `FUN_00497ca0` (the per-frame cursor update called from `RunInGameFrame`) contain no rectangle
 test and no repeated `AddToSelection`. The only entry points into the table are the single-unit
 click path, `SelectAllCharacters`, next/previous and the five character keys — which is consistent

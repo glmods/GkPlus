@@ -15,6 +15,7 @@
 #define VMA_IMPLEMENTATION
 #include <vk_mem_alloc.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -122,6 +123,89 @@ struct Arena {
 
 Arena VertexArena;
 Arena IndexArena;
+
+// --- object-space bounds, one box per block of arena vertices ---------------------------------
+//
+// See VertexRangeBounds in the header for why these exist and what the block granularity costs.
+// 32 MB of arena is 699,050 canonical vertices, so at 64 to a block this is ~10,900 entries and
+// 262 KB - which is the whole reason the granularity is a fixed block rather than a per-draw
+// record: there is no draw here to key one on, only the upload.
+struct BlockBounds {
+  float min[3] = {0, 0, 0};
+  float max[3] = {0, 0, 0};
+  bool valid = false;
+};
+std::vector<BlockBounds> VertexBlocks;
+
+// Fold `bytes` of canonical vertices landing at `arena_offset` into the block boxes.
+//
+// Three cases, and the difference between them is the difference between a conservative answer
+// and a wrong one:
+//
+// - A block the write covers **entirely** is recomputed from scratch. Exact.
+// - A block the write covers **in part** is unioned with what it already held. That is a
+//   superset of the truth - the old box covers the half this write did not touch, whatever else
+//   it also covers - so a cull built on it can only ever be too cautious. It is not exact
+//   because the untouched half's vertices are gone: staging is write-combined and the arena is
+//   never mapped, so there is nothing left to re-read.
+// - Anything this function cannot account for **invalidates** every block it touches, which
+//   reads back as "unknown" and disables culling for the draws that use them. Staleness is the
+//   one failure that would be silent AND wrong: a box that no longer covers its vertices culls
+//   a caster that should have drawn, and the symptom is a shadow missing from one face.
+void NoteVertexBounds(uint32_t arena_offset, const void *data, uint32_t bytes) {
+  if (VertexBlocks.empty()) {
+    return;
+  }
+  constexpr uint32_t kStride = static_cast<uint32_t>(sizeof(CanonicalVertex));
+  const uint32_t first_vertex = arena_offset / kStride;
+  const uint32_t count = bytes / kStride;
+  const uint32_t first_block = first_vertex / kBoundsBlockVertices;
+  const uint32_t last_block =
+      count == 0 ? first_block : (first_vertex + count - 1) / kBoundsBlockVertices;
+  if (last_block >= VertexBlocks.size()) {
+    return;
+  }
+  // A write that is not whole vertices on a whole-vertex boundary cannot be interpreted at all,
+  // so every block it lands in loses its box rather than keeping a stale one.
+  if (arena_offset % kStride != 0 || bytes % kStride != 0 || count == 0) {
+    for (uint32_t b = first_block; b <= last_block; ++b) {
+      VertexBlocks[b].valid = false;
+    }
+    return;
+  }
+  const auto *vertices = static_cast<const CanonicalVertex *>(data);
+  for (uint32_t b = first_block; b <= last_block; ++b) {
+    const uint32_t block_first = b * kBoundsBlockVertices;
+    const uint32_t block_last = block_first + kBoundsBlockVertices - 1;
+    const uint32_t lo = (std::max)(block_first, first_vertex);
+    const uint32_t hi = (std::min)(block_last, first_vertex + count - 1);
+    BlockBounds &block = VertexBlocks[b];
+    const bool whole = lo == block_first && hi == block_last;
+    // A partial write into a block that has no box cannot produce one: the half it does not
+    // touch is unknown, and a box drawn around this half alone would not cover it. Leaving it
+    // invalid costs nothing but a caster that is never culled until a whole-block write lands.
+    if (!whole && !block.valid) {
+      continue;
+    }
+    bool started = !whole; // a partial write unions into the box already there
+    block.valid = false;   // until the loop below finishes
+    for (uint32_t v = lo; v <= hi; ++v) {
+      const float *p = vertices[v - first_vertex].pos;
+      if (!started) {
+        block.min[0] = block.max[0] = p[0];
+        block.min[1] = block.max[1] = p[1];
+        block.min[2] = block.max[2] = p[2];
+        started = true;
+        continue;
+      }
+      for (int i = 0; i < 3; ++i) {
+        block.min[i] = (std::min)(block.min[i], p[i]);
+        block.max[i] = (std::max)(block.max[i], p[i]);
+      }
+    }
+    block.valid = started;
+  }
+}
 
 // Host-visible, permanently mapped, and small. This is the ONLY mapping in the renderer.
 struct Staging {
@@ -1026,6 +1110,13 @@ bool StartResources() {
   TheStats.ready = true;
   TheStats.vertex_arena_bytes = vertex_arena;
   TheStats.index_arena_bytes = index_arena;
+  // One box per block of the whole arena, allocated once: a slot's blocks are wherever its
+  // offset puts them, so indexing by absolute arena vertex needs no per-slot bookkeeping at all
+  // and a freed slot leaves nothing behind to invalidate.
+  VertexBlocks.assign(static_cast<size_t>(vertex_arena / sizeof(CanonicalVertex) /
+                                          kBoundsBlockVertices) +
+                          1,
+                      BlockBounds());
   {
     char watch[32] = {};
     if (::GetEnvironmentVariableA("GKPLUS_VK_WATCH_DST", watch, sizeof(watch)) != 0) {
@@ -1132,6 +1223,12 @@ bool UploadIntoSlot(const BufferSlot &slot, uint32_t offset_in_slot, const void 
     return false;
   }
   std::memcpy(Ring.mapped + staging_offset, data, bytes);
+  // Before the copy is queued rather than after, so the box and the bytes are updated under one
+  // hold of ResourceLock - both game threads unlock vertex buffers, and a reader on the render
+  // thread must never see a box from one upload against vertices from another.
+  if (slot.vertex) {
+    NoteVertexBounds(slot.offset + offset_in_slot, data, bytes);
+  }
   const bool needs_barrier =
       NoteDestination(slot.vertex, slot.offset + offset_in_slot, bytes);
   if (slot.vertex && slot.offset == WatchDst) {
@@ -1147,6 +1244,36 @@ bool UploadIntoSlot(const BufferSlot &slot, uint32_t offset_in_slot, const void 
   ++TheStats.uploads;
   TheStats.uploaded_bytes += bytes;
   return true;
+}
+
+bool VertexRangeBounds(uint32_t first_vertex, uint32_t count, float out_min[3],
+                       float out_max[3]) {
+  ResourceGuard guard(ResourceLock);
+  if (!Ready || count == 0 || VertexBlocks.empty()) {
+    return false;
+  }
+  const uint32_t first_block = first_vertex / kBoundsBlockVertices;
+  const uint32_t last_block = (first_vertex + count - 1) / kBoundsBlockVertices;
+  // Past the arena is not a bounds question - it is a draw addressing vertices that are not
+  // there - so it answers "unknown" rather than clamping into whatever the last block holds.
+  if (last_block >= VertexBlocks.size() || last_block < first_block) {
+    return false;
+  }
+  bool started = false;
+  for (uint32_t b = first_block; b <= last_block; ++b) {
+    const BlockBounds &block = VertexBlocks[b];
+    // One unknown block makes the whole range unknown. A union that skipped it would be a box
+    // that does not cover the draw, which is exactly the answer that culls something visible.
+    if (!block.valid) {
+      return false;
+    }
+    for (int i = 0; i < 3; ++i) {
+      out_min[i] = started ? (std::min)(out_min[i], block.min[i]) : block.min[i];
+      out_max[i] = started ? (std::max)(out_max[i], block.max[i]) : block.max[i];
+    }
+    started = true;
+  }
+  return started;
 }
 
 bool TextureFormatBlock(uint32_t d3d_format, uint32_t &block, uint32_t &block_bytes) {
@@ -2300,6 +2427,7 @@ void ShutdownResources() {
   Pending.clear();
   PendingImages.clear();
   PendingImageLevels.clear();
+  VertexBlocks.clear();
   for (auto &ranges : PendingDstRanges) {
     ranges.clear();
   }

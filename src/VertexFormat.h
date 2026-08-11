@@ -61,5 +61,19 @@ bool FvfSupported(uint32_t fvf);
 bool ConvertVertices(uint32_t fvf, const void *src, uint32_t count, CanonicalVertex *dst,
                      uint32_t src_stride = 0);
 
+// The object-space box `count` vertices of `src` occupy, without converting them.
+//
+// Position is the first 12 bytes of every layout ConvertVertices accepts, so this needs only the
+// stride - which is why it can run over the game's own vertices rather than over the converted
+// copy. That matters where it is used: both callers have already written their canonical copy
+// into mapped **write-combined** scratch, where reading a position back costs far more than
+// walking the source again.
+//
+// **Refuses a pre-transformed layout by name.** An XYZRHW vertex is already in screen space, so
+// its box is not in any world the shadow bakes project from, and the only safe answer is none.
+// `src_stride` means what it does above.
+bool PositionBounds(uint32_t fvf, const void *src, uint32_t count, float out_min[3],
+                    float out_max[3], uint32_t src_stride = 0);
+
 } // namespace vulkan
 } // namespace gk

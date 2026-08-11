@@ -486,6 +486,7 @@ GK_TESS_KNOB("tess_max", max_factor)
 GK_TESS_KNOB("tess_min", min_factor)
 GK_TESS_KNOB("pn_strength", pn_strength)
 GK_TESS_KNOB("pn_flat_threshold", pn_flat_threshold)
+GK_TESS_KNOB("pn_max_offset", pn_max_offset)
 GK_TESS_KNOB("tess_shadow_factor", shadow_factor)
 
 #undef GK_TESS_KNOB
@@ -1045,6 +1046,38 @@ JSValue SetDynIndirectValue(JSContext *ctx, JSValueConst, JSValueConst value) {
   return JS_UNDEFINED;
 }
 
+JSValue GetSunCull(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::SunShadowCull());
+}
+
+JSValue SetSunCullValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetSunShadowCull(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+JSValue GetSunIndirect(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::SunShadowIndirect());
+}
+
+JSValue SetSunIndirectValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetSunShadowIndirect(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+JSValue GetSunShadowReport(JSContext *ctx, JSValueConst) {
+  const std::string report = vulkan::SunShadowReport();
+  return JS_NewStringLen(ctx, report.c_str(), report.size());
+}
+
+JSValue GetDynCull(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::DynamicShadowCull());
+}
+
+JSValue SetDynCullValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetDynamicShadowCull(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
 JSValue DrawInfo(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
   uint32_t index = 0;
   if (argc < 1 || JS_ToUint32(ctx, &index, argv[0]) < 0) {
@@ -1445,6 +1478,7 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("tess_min", Getmin_factor, Setmin_factorValue),
     JS_CGETSET_DEF("pn_strength", Getpn_strength, Setpn_strengthValue),
     JS_CGETSET_DEF("pn_flat_threshold", Getpn_flat_threshold, Setpn_flat_thresholdValue),
+    JS_CGETSET_DEF("pn_max_offset", Getpn_max_offset, Setpn_max_offsetValue),
     JS_CGETSET_DEF("tess_shadow_factor", Getshadow_factor, Setshadow_factorValue),
     JS_CGETSET_DEF("per_pixel_lighting", GetPerPixelLighting, SetPerPixelLightingValue),
     JS_CGETSET_DEF("map_light_report", GetMapLightReport, nullptr),
@@ -1502,6 +1536,10 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("dynamic_shadow_bias", GetDynamicShadowBias, SetDynamicShadowBiasValue),
     JS_CGETSET_DEF("dynamic_shadow_report", GetDynamicShadowReport, nullptr),
     JS_CGETSET_DEF("dynamic_shadow_indirect", GetDynIndirect, SetDynIndirectValue),
+    JS_CGETSET_DEF("dynamic_shadow_cull", GetDynCull, SetDynCullValue),
+    JS_CGETSET_DEF("sun_shadow_cull", GetSunCull, SetSunCullValue),
+    JS_CGETSET_DEF("sun_shadow_indirect", GetSunIndirect, SetSunIndirectValue),
+    JS_CGETSET_DEF("sun_shadow_report", GetSunShadowReport, nullptr),
     JS_CGETSET_DEF("dynamic_shadow_max_lights", GetDynamicShadowMaxLights,
                    SetDynamicShadowMaxLightsValue),
     JS_CGETSET_DEF("dynamic_shadow_max_faces", GetDynamicShadowMaxFaces,

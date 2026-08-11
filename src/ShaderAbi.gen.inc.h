@@ -10,8 +10,8 @@
 // Included from VkDraw.cpp, inside its anonymous namespace - the one point where
 // src/VkDraw.h, src/VertexFormat.h and that file's three push blocks are all in scope.
 // recipe-hash: a9cc25a55f9d9af550c8bf75e4654da2e3aad969760d22732ffa704a843139f4
-// source-hash: src/shaders/world.slang 25a7763f558cae4ac390e447add7fc2f580eb2f7184db2f28c98eb3eff8bf389
-// source-hash: src/shaders/shadow.slang 2da144a4ca92f2fd22b25f8d04fc327fed8b31fad619d3a78313c0b7ad87c75d
+// source-hash: src/shaders/world.slang 21046e18a4b8bdb2897d477cbac688dd1c460f973550c0fcdd4b3d231ced695e
+// source-hash: src/shaders/shadow.slang b325b3a5b737846cc8af68c3c9aa6a8ad7b67e01d1baa16d2196d8342fa9fa59
 // source-hash: src/shaders/lightgrid.slang ff7a10915c25b2d2a2a2d60a06decb9fa459a327c1cfe0e04f1655221fc1fa8b
 #pragma once
 
@@ -96,8 +96,8 @@ static_assert(offsetof(GpuFrameData, target_width) == 160,
               "GpuFrameData::target_width moved away from world.slang's GpuFrameData");
 static_assert(offsetof(GpuFrameData, target_height) == 164,
               "GpuFrameData::target_height moved away from world.slang's GpuFrameData");
-static_assert(offsetof(GpuFrameData, pad_tess) == 168,
-              "GpuFrameData::pad_tess moved away from world.slang's GpuFrameData");
+static_assert(offsetof(GpuFrameData, pn_max_offset) == 168,
+              "GpuFrameData::pn_max_offset moved away from world.slang's GpuFrameData");
 static_assert(offsetof(GpuFrameData, light_flags) == 172,
               "GpuFrameData::light_flags moved away from world.slang's GpuFrameData");
 static_assert(offsetof(GpuFrameData, cascades) == 176,
@@ -294,7 +294,9 @@ static_assert(offsetof(ShadowPushConstants, pn_strength) == 96,
               "ShadowPushConstants::pn_strength moved away from shadow.slang's ShadowPush");
 static_assert(offsetof(ShadowPushConstants, pn_flat_threshold) == 100,
               "ShadowPushConstants::pn_flat_threshold moved away from shadow.slang's ShadowPush");
-static_assert(offsetof(ShadowPushConstants, tess_factor) == 104,
+static_assert(offsetof(ShadowPushConstants, pn_max_offset) == 104,
+              "ShadowPushConstants::pn_max_offset moved away from shadow.slang's ShadowPush");
+static_assert(offsetof(ShadowPushConstants, tess_factor) == 108,
               "ShadowPushConstants::tess_factor moved away from shadow.slang's ShadowPush");
 static_assert(sizeof(ShadowPushConstants) == 112,
               "ShadowPushConstants is not the size ShadowPush declares");

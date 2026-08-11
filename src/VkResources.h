@@ -191,6 +191,31 @@ void FreeSlot(const BufferSlot &slot);
 bool UploadIntoSlot(const BufferSlot &slot, uint32_t offset_in_slot, const void *data,
                     uint32_t bytes);
 
+// --- object-space bounds ---------------------------------------------------------------------
+//
+// The box a range of arena vertices occupies, in the model space the vertices are stored in.
+// `first_vertex` is absolute - in canonical vertices into the whole vertex arena, which is
+// exactly what `DrawItem::base_vertex` already is for an arena-sourced draw.
+//
+// **This exists because the shadow bakes have to cull, and nothing else here can tell them
+// where a caster is.** The arena is device-local and never mapped (see the header comment), so
+// no consumer can read a position back; and the only moment the CPU holds a vertex is the
+// instant before it is staged. So the bounds are accumulated *there*, in UploadIntoSlot, and
+// this reads them back.
+//
+// Bounds are kept per fixed block of `kBoundsBlockVertices` vertices rather than per buffer,
+// because a draw is a sub-range of a buffer and Gunlok shares one vertex buffer across many
+// index buffers - level01 holds 417 vertex buffers against 3,131 index buffers, so per-buffer
+// bounds would be the whole level for every map draw. The block is the granularity, so the
+// answer is a superset of the truth by up to `kBoundsBlockVertices - 1` vertices at each end.
+//
+// Returns false when any block in the range has no bounds - a partially-written block whose
+// untouched half this layer keeps no copy of, or a range never uploaded at all. **False means
+// "unknown", and a caller must treat it as "do not cull"**, never as an empty box.
+constexpr uint32_t kBoundsBlockVertices = 8;
+bool VertexRangeBounds(uint32_t first_vertex, uint32_t count, float out_min[3],
+                       float out_max[3]);
+
 // --- textures ------------------------------------------------------------------------------
 //
 // Images are created lazily, on the first blit into a texture, because a texture may exist

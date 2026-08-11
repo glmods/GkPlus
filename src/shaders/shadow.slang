@@ -58,6 +58,10 @@ struct ShadowPush {
     // uniform factor here instead of the world pass's screen-space rule.
     float pn_strength;
     float pn_flat_threshold;
+    // ... and the world-unit ceiling on a control point's offset, which shapes the patch too and
+    // therefore has to be here for the same reason the other two are. **This was `pad_shadow`**,
+    // so the block is still 112.
+    float pn_max_offset;
     // Uniform over every edge of every patch, which makes this pass watertight for free: the
     // adaptive rule is what needs care about shared edges, and a constant cannot disagree with
     // itself. A shadow map does not need adaptive density the way a silhouette does.
@@ -181,9 +185,11 @@ ShadowControlPoint shadow_hull(InputPatch<ShadowControlPoint, 3> patch,
     return patch[id];
 }
 
-// The same tangent term, the same two knobs, the same watertight property: a function of
+// The same tangent term, the same three knobs, the same watertight property: a function of
 // (Pi, Pj, Ni) alone. See world.slang's `pn_weight`, which this must agree with exactly - if the
-// two ever differ, the shadow is cast by a surface the colour pass does not draw.
+// two ever differ, the shadow is cast by a surface the colour pass does not draw. **The ceiling
+// belongs here as much as the floor does**, and leaving it out would be that defect: the colour
+// pass would draw a rounded pipe that still cast the shadow of an inflated one.
 float shadow_pn_weight(float3 pi, float3 pj, float3 ni) {
     const float3 edge = pj - pi;
     const float length_sq = dot(edge, edge);
@@ -194,7 +200,8 @@ float shadow_pn_weight(float3 pi, float3 pj, float3 ni) {
     if (w * w <= pc.pn_flat_threshold * pc.pn_flat_threshold * length_sq) {
         return 0.0;
     }
-    return w * pc.pn_strength;
+    const float limit = 3.0 * pc.pn_max_offset;
+    return clamp(w, -limit, limit) * pc.pn_strength;
 }
 
 [shader("domain")]

@@ -131,7 +131,64 @@ VkSurfaceFormatKHR ChooseFormat(const std::vector<VkSurfaceFormatKHR> &formats) 
 // preferred where present because the game runs far above refresh (measured ~300 fps in
 // level) and FIFO would otherwise throttle the whole engine loop to the monitor - which
 // would change game timing, not just presentation.
+//
+// **On this machine MAILBOX is not offered and the fallback is what runs**, which is worth
+// stating plainly because of what it does to every measurement taken here: FIFO on a 60 Hz
+// display puts a 16.67 ms floor under the frame, and a frame marginally over that floor beats
+// between one interval and two and averages ~23 ms. That is the "23 ms" a whole session of
+// A/Bs was measured against, and it is why work removed from a pass showed up as nothing
+// (§4.79). `GKPLUS_VK_PRESENT_MODE` is the override that makes a frame-time A/B mean something:
+// `immediate` presents without waiting at all, so the number is the frame's own cost.
+//
+// It is deliberately launch-time only and deliberately not the default. IMMEDIATE tears, and
+// the comment above is the reason FIFO is not simply replaced: unthrottling the loop changes
+// the game's own timing, not just what reaches the screen.
+const char *PresentModeName(VkPresentModeKHR mode) {
+  switch (mode) {
+    case VK_PRESENT_MODE_IMMEDIATE_KHR: return "immediate";
+    case VK_PRESENT_MODE_MAILBOX_KHR: return "mailbox";
+    case VK_PRESENT_MODE_FIFO_KHR: return "fifo";
+    case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "fifo-relaxed";
+    default: return "other";
+  }
+}
+
+std::string PresentModesOffered;
+
 VkPresentModeKHR ChoosePresentMode(const std::vector<VkPresentModeKHR> &modes) {
+  PresentModesOffered.clear();
+  for (VkPresentModeKHR mode : modes) {
+    if (!PresentModesOffered.empty()) {
+      PresentModesOffered += ", ";
+    }
+    PresentModesOffered += PresentModeName(mode);
+  }
+  const auto offered = [&modes](VkPresentModeKHR want) {
+    for (VkPresentModeKHR mode : modes) {
+      if (mode == want) {
+        return true;
+      }
+    }
+    return false;
+  };
+  char wanted[32] = {};
+  if (::GetEnvironmentVariableA("GKPLUS_VK_PRESENT_MODE", wanted, sizeof(wanted)) != 0) {
+    const std::string name = wanted;
+    // Asking for a mode the surface does not offer is refused rather than approximated: the
+    // whole point of the variable is to know which mode ran.
+    if (name == "immediate" && offered(VK_PRESENT_MODE_IMMEDIATE_KHR)) {
+      return VK_PRESENT_MODE_IMMEDIATE_KHR;
+    }
+    if (name == "mailbox" && offered(VK_PRESENT_MODE_MAILBOX_KHR)) {
+      return VK_PRESENT_MODE_MAILBOX_KHR;
+    }
+    if (name == "fifo") {
+      return VK_PRESENT_MODE_FIFO_KHR;
+    }
+    DebugWrite("gkplus: GKPLUS_VK_PRESENT_MODE=%s is not offered by this surface, using the "
+               "default\n",
+               wanted);
+  }
   for (VkPresentModeKHR mode : modes) {
     if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
       return mode;
@@ -991,8 +1048,15 @@ std::string FormatStats() {
     out += "error: " + Error + "\n";
   }
   if (Ready) {
-    add("swapchain: %ux%u, %u images, format %u, present mode %u\n", TheStats.width,
-        TheStats.height, TheStats.image_count, TheStats.format, TheStats.present_mode);
+    // **The present mode by name, and what the surface offered**, because it is the ceiling
+    // under every frame-time measurement taken here and it was not readable before: `fifo` on a
+    // 60 Hz display is a 16.67 ms floor, and a frame marginally over it beats between one
+    // interval and two and averages ~23. `GKPLUS_VK_PRESENT_MODE=immediate` is the override.
+    add("swapchain: %ux%u, %u images, format %u, present mode %u (%s; offered: %s)\n",
+        TheStats.width, TheStats.height, TheStats.image_count, TheStats.format,
+        TheStats.present_mode, PresentModeName(static_cast<VkPresentModeKHR>(
+                                   TheStats.present_mode)),
+        PresentModesOffered.empty() ? "?" : PresentModesOffered.c_str());
     // The two sizes and what closes the gap. They differ by design - the game rasterises into a
     // 640x480 backbuffer and the window's client area is 628x468 - and the whole of §4.37 is
     // that rasterising at the second resamples every 2D draw.

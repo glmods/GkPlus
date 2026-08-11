@@ -8,6 +8,7 @@
 #include <d3d8to9.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <new>
 #include <map>
@@ -2465,8 +2466,79 @@ void ResolveStages(vulkan::DrawItem &item) {
 // to all of them. `draws_buffered` counts what the game issued and `DrawStats::items` counts
 // what was submitted; the two disagreeing is the only signal that would have shown this, and
 // nothing compared them.
+// The world-space box `item`'s vertices occupy, or nothing at all.
+//
+// Nothing here is allowed to guess. Every path that cannot produce a box that provably covers
+// the draw leaves `has_bounds` false, because the consumer is a cull: a box that is a superset
+// of the truth costs a caster that could have been skipped, and a box that is not costs a shadow.
+void CaptureDevice::StoreWorldBounds(vulkan::DrawItem &item, const float *lo, const float *hi) {
+  // Object space to world, in centre/extent form: a rotated box's corners are covered by
+  // scaling each extent by the absolute value of the column it feeds. D3D is row-vector, so
+  // `world.m[i][j]` multiplies component i into component j, and row 3 is the translation.
+  //
+  // This assumes the world matrix is affine - that its fourth column is (0,0,0,1). Gunlok's
+  // world matrices are rotations, translations and uniform scales; a projective one would need
+  // the corners divided through, and would come out of this too small.
+  const D3DMATRIX identity = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  const D3DMATRIX &world = State.have_world ? State.world : identity;
+  const float centre[3] = {(lo[0] + hi[0]) * 0.5f, (lo[1] + hi[1]) * 0.5f,
+                           (lo[2] + hi[2]) * 0.5f};
+  const float extent[3] = {(hi[0] - lo[0]) * 0.5f, (hi[1] - lo[1]) * 0.5f,
+                           (hi[2] - lo[2]) * 0.5f};
+  for (int j = 0; j < 3; ++j) {
+    float c = world.m[3][j];
+    float e = 0.0f;
+    for (int i = 0; i < 3; ++i) {
+      c += centre[i] * world.m[i][j];
+      e += extent[i] * std::fabs(world.m[i][j]);
+    }
+    item.bounds_min[j] = c - e;
+    item.bounds_max[j] = c + e;
+  }
+  item.has_bounds = true;
+}
+
+void CaptureDevice::StoreDrawBounds(vulkan::DrawItem &item, UINT min_index, UINT num_vertices,
+                                    uint32_t elements) {
+  item.has_bounds = false;
+  // A pre-transformed vertex is already in screen space and no world matrix applies to it - the
+  // same reason BuildDrawRecord returns early for one. It is not a caster in practice either;
+  // this is here so that it could never become one silently.
+  constexpr uint32_t kXyzRhw = 0x004;
+  if ((State.fvf & kXyzRhw) == kXyzRhw) {
+    return;
+  }
+  float lo[3] = {};
+  float hi[3] = {};
+  if (item.vertex_source == vulkan::DrawSource::Scratch) {
+    // A buffer refilled after an earlier draw this frame has its later version parked in the
+    // scratch (§4.23), and the box for it was taken when that version was written. **Whole
+    // buffer, not this draw's range**: the version is stored once and read by several draws at
+    // offsets of their own, so the only box that holds for all of them is the one around all of
+    // it. Coarser than the arena's blocks, and correct, which is the order that matters.
+    if (!stream0_ || !IsLiveVertexWrapper(stream0_)) {
+      return;
+    }
+    const auto &buffer = *static_cast<CaptureVertexBuffer *>(stream0_);
+    if (buffer.version_frame_ != TheStats.frames || !buffer.version_bounds_) {
+      return;
+    }
+    std::memcpy(lo, buffer.version_min_, sizeof(lo));
+    std::memcpy(hi, buffer.version_max_, sizeof(hi));
+    StoreWorldBounds(item, lo, hi);
+    return;
+  }
+  const uint32_t first = item.base_vertex + (item.indexed ? min_index : 0u);
+  const uint32_t count = item.indexed ? num_vertices : elements;
+  if (count == 0 || !vulkan::VertexRangeBounds(first, count, lo, hi)) {
+    return;
+  }
+  StoreWorldBounds(item, lo, hi);
+}
+
 void CaptureDevice::EmitDraw(D3DPRIMITIVETYPE type, UINT start_index, UINT primitive_count,
-                             bool indexed, UINT start_vertex) {
+                             bool indexed, UINT start_vertex, UINT min_index,
+                             UINT num_vertices) {
   if (!vulkan::DrawReady()) {
     return;
   }
@@ -2577,6 +2649,9 @@ void CaptureDevice::EmitDraw(D3DPRIMITIVETYPE type, UINT start_index, UINT primi
   item.vertex_offset = 0;
   ResolveStages(item);
   ResolvePipeline(item, type);
+  // After `base_vertex` and `vertex_source`, which are what say where to look, and before the
+  // record, which is the only thing below that can still reject the draw.
+  StoreDrawBounds(item, min_index, num_vertices, elements);
   const uint32_t watched_bias = vertex_bias;
   // Last, so a draw that is going to be skipped for any other reason does not consume a record.
   if (!BuildDrawRecord(item, mvp, TheStats.frames)) {
@@ -2663,6 +2738,17 @@ void CaptureDevice::EmitDrawUP(D3DPRIMITIVETYPE type, UINT primitive_count,
 
   ResolveStages(item);
   ResolvePipeline(item, type);
+  // The box, from the game's own vertices rather than from the canonical copy just written: that
+  // copy is in mapped write-combined scratch, where reading a position back costs far more than
+  // walking the source again. Exact for this draw - a user-pointer draw's vertices are its own,
+  // so there is no whole-buffer coarseness here the way there is for a parked version.
+  {
+    float lo[3] = {};
+    float hi[3] = {};
+    if (vulkan::PositionBounds(State.fvf, vertex_data, vertices, lo, hi, vertex_stride)) {
+      StoreWorldBounds(item, lo, hi);
+    }
+  }
   if (!BuildDrawRecord(item, mvp, TheStats.frames)) {
     ++vulkan::MutableDrawStats().skipped_no_record;
     return;
@@ -2706,7 +2792,7 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::DrawIndexedPrimitive(
     UINT PrimitiveCount) {
   CountDraw(PrimitiveType, false, PrimitiveCount);
   NoteIndexedRange(PrimitiveType, MinIndex, NumVertices, StartIndex, PrimitiveCount);
-  EmitDraw(PrimitiveType, StartIndex, PrimitiveCount, true, 0);
+  EmitDraw(PrimitiveType, StartIndex, PrimitiveCount, true, 0, MinIndex, NumVertices);
   if (!ForwardThisDraw()) {
     return D3D_OK;
   }

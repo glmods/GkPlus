@@ -570,13 +570,17 @@ struct ShadowPushConstants {
   // shadow.slang for why the factors need not match the world pass's and the two knobs must.
   float pn_strength;
   float pn_flat_threshold;
+  // The world-unit ceiling on a control point's offset (§4.74) shapes the patch, so it has to
+  // travel with the two above - a shadow cast by a surface the colour pass no longer draws is the
+  // same defect as the two knobs disagreeing. **This was `pad_shadow`**, the slot the alignment
+  // note below created.
+  float pn_max_offset;
   float tess_factor;
   // **Slang rounds the block up to its own alignment and this side must too.** The struct
   // contains a float4 array, so its alignment is 16 and its size rounds to a multiple of 16 -
-  // 112, not the 108 the fields add up to. Caught by `src/gen-shader-abi.py`, which reported the
-  // Slang side as 112 bytes against this assert's 108; without it the range and the push would
-  // have disagreed with the shader's idea of the block by four bytes.
-  float pad_shadow;
+  // 112, not the 108 the fields once added up to. Caught by `src/gen-shader-abi.py`, which
+  // reported the Slang side as 112 bytes against a 108-byte assert; without it the range and the
+  // push would have disagreed with the shader's idea of the block by four bytes.
 };
 // 112: three addresses, two words, the matrix, the three PN scalars, and the pad above. Still
 // inside the guaranteed 128, which this block can afford because it is its own layout rather than
@@ -598,10 +602,43 @@ VkShaderModule ShadowModule = VK_NULL_HANDLE;
 // indirect paths disagree about. All of these stay null on a device with no `tessellationShader`,
 // and `ShadowStages` then reports one stage - which is the untessellated pipeline exactly.
 VkShaderModule ShadowTessVertexModule = VK_NULL_HANDLE;
+// The indirect entry points' modules. Declared with the sun's rather than with the map bake's,
+// because all three passes that submit indirectly take them and the sun's is the one that comes
+// up first - it must not depend on an atlas that may never be created.
+VkShaderModule MapShadowModule = VK_NULL_HANDLE;
 VkShaderModule MapShadowTessVertexModule = VK_NULL_HANDLE;
 VkShaderModule ShadowHullModule = VK_NULL_HANDLE;
 VkShaderModule ShadowDomainModule = VK_NULL_HANDLE;
 VkPipeline ShadowPipelineTess = VK_NULL_HANDLE;
+// The indirect twins (§4.77), taking `map_shadow_vertex` / `map_shadow_tess_vertex` against the
+// sun's own D32 format. Its own pipelines rather than the per-frame bake's for exactly the reason
+// that one has its own rather than the map bake's: the attachment format differs, and under
+// dynamic rendering that is part of the pipeline.
+VkPipeline ShadowPipelineIndirect = VK_NULL_HANDLE;
+VkPipeline ShadowPipelineIndirectTess = VK_NULL_HANDLE;
+// ... and its own batch buffer, because the sun's pass and the two bakes all record into one
+// command buffer and `vkCmdUpdateBuffer` writes its bytes in order - sharing a slice would have
+// whichever ran second overwrite the first.
+VkBuffer SunIndirectBuffer = VK_NULL_HANDLE;
+VkDeviceMemory SunIndirectMemory = VK_NULL_HANDLE;
+uint64_t SunIndirectAddress = 0;
+uint64_t SunRingSerial = 0;
+
+// **A feature, on**: cull the caster set per cascade, and submit what survives as one indirect
+// command run per (cascade, bucket) instead of a draw call per caster per cascade.
+bool SunCullEnabled = true;
+bool SunIndirectEnabled = true;
+uint32_t SunCasterCount = 0;      // distinct casters the frame offered, last pass
+uint32_t SunBucketCount = 0;
+uint32_t SunCastersDropped = 0;   // past the cap
+uint32_t SunCascadeSubmits = 0;   // (caster, cascade) pairs drawn
+uint32_t SunCascadeCulled = 0;    // ... rejected by the cascade's own box
+uint32_t SunUnbounded = 0;        // casters with no world box, drawn into every cascade
+uint32_t SunCommandsDropped = 0;  // (caster, cascade) pairs past kShadowMaxCommands
+uint32_t SunDrawCalls = 0;        // what actually reached the command buffer, last pass
+// Per cascade, so the halving is visible rather than inferred: cascade 0 is the sharp near box
+// and should keep almost nothing on a level of any size.
+uint32_t SunCascadeDrawn[kMaxShadowCascades] = {};
 
 // Whether a tessellated shadow pipeline can be built at all. Separate from the runtime knob: this
 // is about the device and the modules, and it is what makes every `*Tess` pipeline below simply
@@ -644,7 +681,7 @@ bool ShadowTessellating() {
   return TessellationEnabled() && TessellationShadows() && ShadowTessAvailable();
 }
 
-// The three PN fields every shadow push carries.
+// The four PN fields every shadow push carries.
 //
 // **The two knobs are filled whether or not this pass is tessellating**, and the factor is what
 // switches: they have to be the ones the colour pass used, because the patch is a function of them
@@ -654,6 +691,9 @@ void FillShadowTessPush(ShadowPushConstants &push) {
   const TessellationParams &tess = TessParams();
   push.pn_strength = tess.pn_strength;
   push.pn_flat_threshold = tess.pn_flat_threshold;
+  // Negative would flip the clamp's own bounds and make it return the wrong endpoint, so it is
+  // floored here rather than trusted from the knob.
+  push.pn_max_offset = tess.pn_max_offset < 0.0f ? 0.0f : tess.pn_max_offset;
   push.tess_factor = tess.shadow_factor < 1.0f ? 1.0f : tess.shadow_factor;
 }
 bool ShadowReady = false;
@@ -681,6 +721,149 @@ float FrameSunZNear = 0.0f;
 float FrameSunZSpan = 1.0f;
 uint32_t FrameCascadeCount = 0;
 bool FrameSunValid = false;
+
+// --- the geometry every shadow pass culls with -------------------------------------------------
+//
+// Shared by the sun's cascades and by the per-frame cube atlas, which is the point: both project
+// with a row-vector matrix whose clip z runs 0..w, so one plane extraction serves both and the
+// two cannot drift into disagreeing about a projection.
+
+// The six clip planes of a projection matrix, in world space, as `dot(n, p) + d >= 0` for a point
+// inside.
+//
+// Gribb-Hartmann: `clip.j` is `dot(v, column(j)) + m[12 + j]`, so `w + x >= 0` is the left plane
+// and the rest follow. **The z column alone is the near plane** because these projections put
+// clip z in 0..w, not -w..w - the same convention the shader depends on, and the one thing here
+// that would be wrong if it were copied from an OpenGL derivation.
+//
+// Extracted from the matrix rather than rebuilt from the light's axes, deliberately: whatever
+// BuildCubeFaceMatrix or BuildSunCascades does, the cull and the rasteriser then cannot disagree
+// about it. For a cube face that includes kMapShadowNear, which clips geometry closer to the
+// light than `range / 64`; for a cascade it includes the deliberately generous near and far,
+// which is what makes the plane test *exact* there rather than an approximation - a caster behind
+// the box along the light direction is inside the z range by construction, so there is no
+// "occluder outside the frustum still casts into it" case to handle.
+//
+// The planes come out unnormalised. Nothing below divides by their length, so it does not matter.
+void BuildFrustumPlanes(const float *m, float planes[6][4]) {
+  float column[4][4];
+  for (int j = 0; j < 4; ++j) {
+    for (int i = 0; i < 4; ++i) {
+      column[j][i] = m[i * 4 + j];
+    }
+  }
+  for (int i = 0; i < 4; ++i) {
+    planes[0][i] = column[3][i] + column[0][i]; // left
+    planes[1][i] = column[3][i] - column[0][i]; // right
+    planes[2][i] = column[3][i] + column[1][i]; // bottom
+    planes[3][i] = column[3][i] - column[1][i]; // top
+    planes[4][i] = column[2][i];                // near
+    planes[5][i] = column[3][i] - column[2][i]; // far
+  }
+}
+
+// Whether a box lies entirely outside one of the planes, which is the only thing a cull may act
+// on. A box that fails no plane may still miss the frustum - the classic corner case - and
+// drawing it is the conservative answer, so this returns false there and costs one caster.
+bool BoxOutsideFrustum(const float planes[6][4], const float *lo, const float *hi) {
+  for (int p = 0; p < 6; ++p) {
+    const float *n = planes[p];
+    // The corner furthest along the plane's normal. If even that one is behind the plane, all
+    // eight are, and no part of the box can be inside.
+    const float x = n[0] >= 0.0f ? hi[0] : lo[0];
+    const float y = n[1] >= 0.0f ? hi[1] : lo[1];
+    const float z = n[2] >= 0.0f ? hi[2] : lo[2];
+    if (n[0] * x + n[1] * y + n[2] * z + n[3] < 0.0f) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Box against a light's sphere of influence, by the closest point on the box to the centre.
+// Cheaper than six planes and it answers for all six cube faces at once, which is why the
+// per-frame bake runs it first. The sun has no such test - a directional light reaches
+// everything, and its cascade box is the whole of its extent.
+bool BoxOutsideSphere(const float *lo, const float *hi, const Vec3 &centre, float radius) {
+  const float c[3] = {centre.x, centre.y, centre.z};
+  float distance_squared = 0.0f;
+  for (int i = 0; i < 3; ++i) {
+    const float away = c[i] < lo[i] ? lo[i] - c[i] : (c[i] > hi[i] ? c[i] - hi[i] : 0.0f);
+    distance_squared += away * away;
+  }
+  return distance_squared > radius * radius;
+}
+
+// `vkCmdUpdateBuffer` takes at most 64 KB in one call, and both culled batches are deliberately
+// allowed to be larger - so they go in pieces. Every offset and every size stays a multiple of 4,
+// which the API requires too: 65536 is one, and both arrays are a whole number of 20- or 8-byte
+// records.
+void UpdateBufferChunked(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset,
+                         const void *data, size_t bytes) {
+  constexpr size_t kChunk = 65536;
+  const auto *src = static_cast<const uint8_t *>(data);
+  while (bytes > 0) {
+    const size_t take = bytes < kChunk ? bytes : kChunk;
+    vkCmdUpdateBuffer(cmd, buffer, offset, take, src);
+    offset += take;
+    src += take;
+    bytes -= take;
+  }
+}
+
+// The indirect batch's shape, shared by the two passes that build one per frame. 8192 commands is
+// 160 KB of commands and 64 KB of parameters; four slices against two frames in flight, for the
+// hazard `kMapIndirectRing` documents.
+constexpr uint32_t kShadowIndirectStride = 20; // sizeof(VkDrawIndexedIndirectCommand)
+constexpr uint32_t kShadowMaxCommands = 8192;
+constexpr uint32_t kShadowParamOffset = kShadowMaxCommands * kShadowIndirectStride;
+static_assert(kShadowParamOffset % 16 == 0, "the parameter array is read as uint2 by address");
+constexpr uint32_t kShadowIndirectSlice = kShadowParamOffset + kShadowMaxCommands * 8;
+static_assert(kShadowIndirectSlice % 16 == 0,
+              "a slice must keep the parameter array's alignment, since it is read by address");
+constexpr uint32_t kShadowIndirectRing = 4;
+
+// --- the caster set, collected once and shared -------------------------------------------------
+//
+// One group of casters that can share a single indirect batch. **A batch has one bound index
+// buffer and one `vertices` address**, so a draw pulling its vertices from the frame's scratch
+// cannot join one pulling from the arena - and units do exactly that (§4.18). §4.61's map bake
+// sidesteps this by taking only arena-sourced map geometry; the two per-frame passes have to
+// carry whatever the frame holds, so they bucket instead of dropping.
+struct CasterBucket {
+  DrawSource vertex_source = DrawSource::Arena;
+  DrawSource index_source = DrawSource::Arena;
+  uint32_t index_stride = 2;
+  uint32_t first = 0; // where this bucket's casters start, in entries into `ordered`
+  uint32_t count = 0;
+};
+
+// **Opaque, depth-writing, indexed geometry.** A blended draw is an effect layer or a decal and
+// would cast a solid shadow it does not have; a draw that does not write depth is by the game's
+// own account not part of the scene's occlusion. The shader rejects anything that is not a lit 3D
+// draw as well, which is the test the CPU cannot make - the flags live in the record.
+//
+// **One definition for both passes**, which they did not have: the sun's pass spelled the test out
+// inline and the per-frame bake reached it through `IsDynamicCaster`. Identical, and nothing said
+// so or would have caught them drifting.
+bool IsShadowCaster(const DrawItem &item) {
+  return item.indexed && !item.pipeline.blend_enable && item.pipeline.depth_write;
+}
+
+// Collects the frame's casters into `ordered`, **sorted so that a bucket is a contiguous run of
+// it**, and describes the runs in `buckets`. `dropped` counts what the cap refused.
+//
+// The sort is the thing to be careful about. It reorders the draws, which is only safe because
+// this feeds a depth-only pass: the result is the minimum depth over the set and a minimum does
+// not care what order it was taken in. Nothing here may be reused for a colour pass on that
+// basis.
+void CollectCasters(bool (*accept)(const DrawItem &), uint32_t limit,
+                    std::vector<const DrawItem *> &ordered, std::vector<CasterBucket> &buckets,
+                    uint32_t &dropped);
+
+// Defined beside the per-frame atlas, where the memory helper it needs lives, and called from
+// CreateShadowPass - which runs first and must not depend on that atlas existing.
+bool CreateSunIndirectBuffer();
 
 bool CreateShadowPass() {
   ShadowModule = CreateModule(kShadowVertexSpv, sizeof(kShadowVertexSpv));
@@ -857,6 +1040,45 @@ bool CreateShadowPass() {
       ShadowPipelineTess = VK_NULL_HANDLE;
     }
   }
+
+  // The indirect twins (§4.77). Built here and not on demand, and **built whether or not the
+  // device has `multiDrawIndirect`** - one `vkCmdDrawIndexedIndirect` of N commands is what needs
+  // that feature, so a device without it simply keeps `render.sun_shadow_indirect` false and
+  // takes the direct path, which is the same pass over the same culled set.
+  //
+  // The modules are the map bake's entry points, created here rather than there so the sun's pass
+  // never depends on an atlas that may not exist.
+  if (MapShadowModule == VK_NULL_HANDLE) {
+    MapShadowModule = CreateModule(kMapShadowVertexSpv, sizeof(kMapShadowVertexSpv));
+  }
+  if (Caps().tessellation_shader && MapShadowTessVertexModule == VK_NULL_HANDLE) {
+    MapShadowTessVertexModule =
+        CreateModule(kMapShadowTessVertexSpv, sizeof(kMapShadowTessVertexSpv));
+  }
+  if (Caps().multi_draw_indirect && MapShadowModule != VK_NULL_HANDLE &&
+      CreateSunIndirectBuffer()) {
+    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    info.pTessellationState = nullptr;
+    info.stageCount = ShadowStages(stages, MapShadowModule, "map_shadow_vertex", false);
+    if (vkCreateGraphicsPipelines(GetDevice(), VK_NULL_HANDLE, 1, &info, nullptr,
+                                  &ShadowPipelineIndirect) != VK_SUCCESS) {
+      ShadowPipelineIndirect = VK_NULL_HANDLE;
+    }
+    if (ShadowPipelineIndirect != VK_NULL_HANDLE && ShadowTessAvailable() &&
+        MapShadowTessVertexModule != VK_NULL_HANDLE) {
+      assembly.topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+      info.pTessellationState = &tessellation;
+      info.stageCount =
+          ShadowStages(stages, MapShadowTessVertexModule, "map_shadow_tess_vertex", true);
+      if (vkCreateGraphicsPipelines(GetDevice(), VK_NULL_HANDLE, 1, &info, nullptr,
+                                    &ShadowPipelineIndirectTess) != VK_SUCCESS) {
+        ShadowPipelineIndirectTess = VK_NULL_HANDLE;
+      }
+    }
+  }
+  // Read back rather than assumed, for the same reason `map_shadow_indirect` is: the two paths
+  // produce the same atlas, so nothing on screen would ever say which one ran.
+  SunIndirectEnabled = ShadowPipelineIndirect != VK_NULL_HANDLE;
   ShadowReady = true;
   return true;
 }
@@ -917,7 +1139,6 @@ uint64_t MapRingSerial = 0;
 VkBuffer MapIndirectBuffer = VK_NULL_HANDLE;
 VkDeviceMemory MapIndirectMemory = VK_NULL_HANDLE;
 uint64_t MapIndirectAddress = 0;
-VkShaderModule MapShadowModule = VK_NULL_HANDLE;
 // Whether the bake is issuing one command per face or one draw call per caster per face. Read
 // back rather than assumed, because the fallback is a device feature away and produces the same
 // atlas - so nothing on screen would ever say which ran.
@@ -1097,10 +1318,23 @@ uint64_t DynIndirectAddress = 0;
 // three frames and raced exactly like this - which is where this ring came from, and it now has
 // one of its own (`kMapIndirectRing`).
 //
-// Four slices against two frames in flight, because the cost is 56 KB a slice and the failure is
+// Four slices against two frames in flight, because the cost is 224 KB a slice and the failure is
 // a hung GPU.
-constexpr uint32_t kDynIndirectRing = 4;
-constexpr uint32_t kDynIndirectSlice = kMapIndirectSlice;
+// **The batch is per (light, face, bucket), not per caster** - which is what culling costs and
+// what it buys. `vkCmdDrawIndexedIndirect` reads a CONTIGUOUS run of commands, and the survivors
+// of a cull are a different subset on every face, so a caster that survives on four of a light's
+// six faces is emitted four times. Unculled, that would be casters x faces: 304 x 54 = 16,416 on
+// the frame this was written against. Culled, it is the number that actually reaches an atlas
+// tile.
+//
+// The cap is `kShadowMaxCommands`, shared with the sun's pass, and a frame that hits it is one
+// where the cull found nothing to remove - so `dynamic_shadow_report` states the drop outright
+// rather than leaving it to be read off a frame time. It is not sized to hold the unculled worst
+// case on purpose: a batch that large is the thing this exists to prevent.
+constexpr uint32_t kDynMaxCommands = kShadowMaxCommands;
+constexpr uint32_t kDynParamOffset = kShadowParamOffset;
+constexpr uint32_t kDynIndirectSlice = kShadowIndirectSlice;
+constexpr uint32_t kDynIndirectRing = kShadowIndirectRing;
 // One counter for both rings, advanced once per bake: the batch's slice is `% kDynIndirectRing`
 // and the atlas image's is `% kDynShadowRing`. Two rings rather than one depth because they guard
 // different hazards - the batch against an in-flight *indirect read*, the image against an
@@ -1197,6 +1431,32 @@ uint64_t DynCalls = 0;          // BakeDynamicShadows entered
 uint64_t DynSkipped = 0;        // ... and returned early because nothing was new
 uint32_t DynBadRanges = 0;      // commands whose index range runs past the arena
 uint64_t DynWorstIndexEnd = 0;  // the furthest byte any command reads, for comparison with it
+
+// --- the cull (see BakeDynamicShadows) --------------------------------------------------------
+//
+// **A feature, on.** Everything below is counted in *(caster, face)* pairs rather than in casters,
+// because that is the unit the bake's cost is actually in: the same caster is a separate piece of
+// work on every one of a light's six faces, and what the cull removes is pairs.
+bool DynCullEnabled = true;
+uint32_t DynFaceSubmits = 0;       // (caster, face) pairs that reached a tile, last bake
+uint32_t DynFaceCulledRange = 0;   // ... dropped because the light's sphere does not reach them
+uint32_t DynFaceCulledFrustum = 0; // ... dropped because the face's frustum does not contain them
+// Casters with no world box at all, which are drawn on every face of every light because there is
+// nothing to test them with. **The number to watch**: it is the part of the frame the cull cannot
+// see, and it moving is how a change upstream in DrawItem::has_bounds would show up here rather
+// than as an unexplained frame time. Counted in casters, not pairs.
+uint32_t DynUnbounded = 0;
+uint32_t DynCommandsDropped = 0; // (caster, face) pairs past kDynMaxCommands
+// Where the unbounded casters actually are, per bucket, because "93 of 171 have no box" is not
+// actionable and "the scratch bucket is all of them" is. Rebuilt every bake.
+struct DynBucketReport {
+  bool vertex_arena = true;
+  bool index_arena = true;
+  uint32_t stride = 2;
+  uint32_t count = 0;
+  uint32_t unbounded = 0;
+};
+std::vector<DynBucketReport> DynBucketReports;
 
 bool CreateMapShadowPipeline();
 
@@ -1309,11 +1569,16 @@ bool CreateMapShadowAtlas() {
   // having it. The fallback issues a draw call per caster per face and produces the same atlas.
   MapShadowIndirect = Caps().multi_draw_indirect;
   MapShadowRateValue = MapShadowIndirect ? 256 : 4;
-  MapShadowModule = CreateModule(kMapShadowVertexSpv, sizeof(kMapShadowVertexSpv));
+  // Guarded, because `CreateShadowPass` already creates these for the sun's own indirect
+  // pipelines and runs first. Creating them twice would leak the first pair - the teardown holds
+  // one handle each - and the second pair would be identical, so nothing would ever show it.
+  if (MapShadowModule == VK_NULL_HANDLE) {
+    MapShadowModule = CreateModule(kMapShadowVertexSpv, sizeof(kMapShadowVertexSpv));
+  }
   if (MapShadowModule == VK_NULL_HANDLE) {
     return Fail("could not create the map shadow shader module");
   }
-  if (Caps().tessellation_shader) {
+  if (Caps().tessellation_shader && MapShadowTessVertexModule == VK_NULL_HANDLE) {
     MapShadowTessVertexModule =
         CreateModule(kMapShadowTessVertexSpv, sizeof(kMapShadowTessVertexSpv));
   }
@@ -1438,6 +1703,35 @@ bool AllocateDeviceLocal(const VkMemoryRequirements &requirements, bool device_a
   allocate.allocationSize = requirements.size;
   allocate.memoryTypeIndex = type;
   return vkAllocateMemory(GetDevice(), &allocate, nullptr, out) == VK_SUCCESS;
+}
+
+// The sun pass's indirect batch (§4.77). Declared before CreateShadowPass and defined here, where
+// AllocateDeviceLocal is - the only reason it is not written inline up there.
+bool CreateSunIndirectBuffer() {
+  if (SunIndirectBuffer != VK_NULL_HANDLE) {
+    return true;
+  }
+  VkBufferCreateInfo buffer = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  buffer.size = static_cast<VkDeviceSize>(kShadowIndirectSlice) * kShadowIndirectRing;
+  buffer.usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+  buffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  if (vkCreateBuffer(GetDevice(), &buffer, nullptr, &SunIndirectBuffer) != VK_SUCCESS) {
+    SunIndirectBuffer = VK_NULL_HANDLE;
+    return false;
+  }
+  VkMemoryRequirements requirements = {};
+  vkGetBufferMemoryRequirements(GetDevice(), SunIndirectBuffer, &requirements);
+  if (!AllocateDeviceLocal(requirements, true, &SunIndirectMemory) ||
+      vkBindBufferMemory(GetDevice(), SunIndirectBuffer, SunIndirectMemory, 0) != VK_SUCCESS) {
+    vkDestroyBuffer(GetDevice(), SunIndirectBuffer, nullptr);
+    SunIndirectBuffer = VK_NULL_HANDLE;
+    return false;
+  }
+  VkBufferDeviceAddressInfo address = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+  address.buffer = SunIndirectBuffer;
+  SunIndirectAddress = vkGetBufferDeviceAddress(GetDevice(), &address);
+  return true;
 }
 
 // The per-frame atlas. Built beside the static one and gated on the same two things: `D16_UNORM`
@@ -1709,6 +2003,23 @@ void DestroyShadowPass() {
     vkDestroyPipeline(GetDevice(), ShadowPipelineTess, nullptr);
     ShadowPipelineTess = VK_NULL_HANDLE;
   }
+  if (ShadowPipelineIndirect != VK_NULL_HANDLE) {
+    vkDestroyPipeline(GetDevice(), ShadowPipelineIndirect, nullptr);
+    ShadowPipelineIndirect = VK_NULL_HANDLE;
+  }
+  if (ShadowPipelineIndirectTess != VK_NULL_HANDLE) {
+    vkDestroyPipeline(GetDevice(), ShadowPipelineIndirectTess, nullptr);
+    ShadowPipelineIndirectTess = VK_NULL_HANDLE;
+  }
+  if (SunIndirectBuffer != VK_NULL_HANDLE) {
+    vkDestroyBuffer(GetDevice(), SunIndirectBuffer, nullptr);
+    SunIndirectBuffer = VK_NULL_HANDLE;
+  }
+  if (SunIndirectMemory != VK_NULL_HANDLE) {
+    vkFreeMemory(GetDevice(), SunIndirectMemory, nullptr);
+    SunIndirectMemory = VK_NULL_HANDLE;
+  }
+  SunIndirectAddress = 0;
   if (ShadowLayout != VK_NULL_HANDLE) {
     vkDestroyPipelineLayout(GetDevice(), ShadowLayout, nullptr);
     ShadowLayout = VK_NULL_HANDLE;
@@ -2492,7 +2803,7 @@ void UploadFrameData() {
   // swapchain, whose 628x468 would make an edge read 2% short.
   frame->target_width = float(ViewportWidth);
   frame->target_height = float(ViewportHeight);
-  frame->pad_tess = 0.0f;
+  frame->pn_max_offset = tess.pn_max_offset < 0.0f ? 0.0f : tess.pn_max_offset;
   frame->map_light_gain = MapLightGainValue;
   frame->map_ambience = FrameMapAmbience;
   frame->map_light_count = FrameMapLightCount;
@@ -2722,6 +3033,134 @@ void RecordShadowPass(void *command_buffer) {
     return;
   }
 
+  // --- the caster set, culled per cascade (§4.77) ----------------------------------------------
+  //
+  // Nothing rejected a caster before this: every caster went into every cascade, so the pass was
+  // `casters x cascades` however far apart they were. The four cascades differ **only in their
+  // x/y half-extent** - 8.75 / 17.5 / 35 / 70 by default, cascade 0 being the sharp near one -
+  // while `FrameSunZNear` and `FrameSunZSpan` are shared and deliberately generous, "far enough
+  // back that the box always contains the geometry casting into it". That is what makes a plain
+  // plane test *exact* here rather than the usual approximation: there is no occluder that is
+  // outside the box along the light direction and still casts into it, because the depth range
+  // already spans everything.
+  //
+  // Cascade 0's box is 17.5 world units across on a level spanning well over a hundred, so most
+  // of the set cannot touch it. The per-cascade counts in `sun_shadow_report` are that halving,
+  // measured rather than assumed.
+  std::vector<CasterBucket> buckets;
+  std::vector<const DrawItem *> ordered;
+  CollectCasters(IsShadowCaster, kShadowMaxCommands, ordered, buckets, SunCastersDropped);
+  SunCasterCount = static_cast<uint32_t>(ordered.size());
+  SunBucketCount = static_cast<uint32_t>(buckets.size());
+  if (ordered.empty()) {
+    return;
+  }
+
+  // One run per (cascade, bucket), and the arrays behind them. Function-static for the reason the
+  // per-frame bake's are: at 8192 commands this is 224 KB and it runs every frame.
+  struct SunRun {
+    uint32_t first = 0;
+    uint32_t count = 0;
+  };
+  static std::vector<VkDrawIndexedIndirectCommand> commands;
+  static std::vector<uint32_t> params;
+  static std::vector<const DrawItem *> survivors;
+  static std::vector<SunRun> runs;
+  commands.clear();
+  params.clear();
+  survivors.clear();
+  runs.clear();
+  runs.resize(static_cast<size_t>(FrameCascadeCount) * buckets.size());
+  SunCascadeSubmits = 0;
+  SunCascadeCulled = 0;
+  SunCommandsDropped = 0;
+  SunUnbounded = 0;
+  for (const DrawItem *item : ordered) {
+    if (!item->has_bounds) {
+      ++SunUnbounded;
+    }
+  }
+  for (uint32_t i = 0; i < kMaxShadowCascades; ++i) {
+    SunCascadeDrawn[i] = 0;
+  }
+  // `multiDrawIndirect` and a pipeline are what make the indirect path possible; the knob is what
+  // makes it chosen. Resolved once here so the build below and the walk above cannot disagree.
+  const bool indirect = SunIndirectEnabled && ShadowPipelineIndirect != VK_NULL_HANDLE &&
+                        SunIndirectBuffer != VK_NULL_HANDLE;
+  for (uint32_t cascade = 0; cascade < FrameCascadeCount; ++cascade) {
+    float planes[6][4];
+    BuildFrustumPlanes(FrameCascadeMatrix[cascade], planes);
+    for (size_t b = 0; b < buckets.size(); ++b) {
+      const CasterBucket &bucket = buckets[b];
+      SunRun &run = runs[cascade * buckets.size() + b];
+      run.first = static_cast<uint32_t>(survivors.size());
+      run.count = 0;
+      for (uint32_t i = 0; i < bucket.count; ++i) {
+        const DrawItem *item = ordered[bucket.first + i];
+        // A caster with no world box is drawn into every cascade, unconditionally. That is the
+        // only safe reading of "unknown", and `SunUnbounded` is what says how much of the frame
+        // is in that state.
+        if (SunCullEnabled && item->has_bounds &&
+            BoxOutsideFrustum(planes, item->bounds_min, item->bounds_max)) {
+          ++SunCascadeCulled;
+          continue;
+        }
+        if (survivors.size() >= kShadowMaxCommands) {
+          ++SunCommandsDropped;
+          continue;
+        }
+        if (indirect) {
+          VkDrawIndexedIndirectCommand command = {};
+          command.indexCount = item->count;
+          command.instanceCount = 1;
+          command.firstIndex = item->first_index;
+          command.vertexOffset = item->vertex_offset;
+          command.firstInstance = 0;
+          commands.push_back(command);
+          params.push_back(item->record);
+          params.push_back(item->base_vertex);
+        }
+        survivors.push_back(item);
+        ++run.count;
+        ++SunCascadeSubmits;
+        if (cascade < kMaxShadowCascades) {
+          ++SunCascadeDrawn[cascade];
+        }
+      }
+    }
+  }
+  if (survivors.empty()) {
+    // Legal: a camera whose whole caster set is outside every cascade. The atlas still has to be
+    // cleared, or it keeps the previous frame's cascades and the world pass samples them - so the
+    // pass below runs and only the batch is skipped.
+    FrameSunValid = true;
+  }
+
+  // This frame's slice of the ring, so the transfer cannot land on bytes an in-flight frame's
+  // indirect draws are still reading - the hazard `kMapIndirectRing` documents.
+  ++SunRingSerial;
+  const VkDeviceSize slice =
+      static_cast<VkDeviceSize>(SunRingSerial % kShadowIndirectRing) * kShadowIndirectSlice;
+  if (indirect && !commands.empty()) {
+    // Chunked, because the batch is allowed past the 64 KB one `vkCmdUpdateBuffer` takes.
+    UpdateBufferChunked(cmd, SunIndirectBuffer, slice, commands.data(),
+                        commands.size() * sizeof(VkDrawIndexedIndirectCommand));
+    UpdateBufferChunked(cmd, SunIndirectBuffer, slice + kShadowParamOffset, params.data(),
+                        params.size() * sizeof(uint32_t));
+    // Two destinations, as §4.62: the commands are read by DRAW_INDIRECT and the parameters by
+    // the vertex shader as an address, and only the first is what a transfer barrier assumes.
+    VkMemoryBarrier2 written = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    written.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    written.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    written.dstStageMask =
+        VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+    written.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT;
+    VkDependencyInfo upload = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    upload.memoryBarrierCount = 1;
+    upload.pMemoryBarriers = &written;
+    vkCmdPipelineBarrier2(cmd, &upload);
+  }
+
   VkImageMemoryBarrier2 to_attachment = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
   to_attachment.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
   to_attachment.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT;
@@ -2757,9 +3196,16 @@ void RecordShadowPass(void *command_buffer) {
   // tessellated twin is a different pipeline rather than a per-draw state. See the note on
   // `render.tess_set` in VkDraw.h for what that costs when the colour pass tessellates only the
   // map - a prop's shadow follows a smoothed silhouette its geometry does not have.
-  const bool tessellating = ShadowTessellating() && ShadowPipelineTess != VK_NULL_HANDLE;
+  // Two axes, so four pipelines: which submission path, and whether the patch is amplified. The
+  // tessellated twin is only taken when it actually built - a create failure there leaves the
+  // untessellated one of the same path bound rather than dropping the pass or, worse, crossing
+  // the two paths' entry points.
+  const bool tessellating =
+      ShadowTessellating() && (indirect ? ShadowPipelineIndirectTess != VK_NULL_HANDLE
+                                        : ShadowPipelineTess != VK_NULL_HANDLE);
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                    tessellating ? ShadowPipelineTess : ShadowPipeline);
+                    tessellating ? (indirect ? ShadowPipelineIndirectTess : ShadowPipelineTess)
+                                 : (indirect ? ShadowPipelineIndirect : ShadowPipeline));
 
   ShadowPushConstants push = {};
   push.draws = draw_records;
@@ -2767,6 +3213,7 @@ void RecordShadowPass(void *command_buffer) {
 
   VkBuffer bound_index = VK_NULL_HANDLE;
   uint64_t casters = 0;
+  SunDrawCalls = 0;
   for (uint32_t cascade = 0; cascade < FrameCascadeCount; ++cascade) {
     // The 2x2 tile this cascade owns. Must agree with the shader's atlas offset, which derives it
     // the same way from the same index - see `sun_visibility` in world.slang.
@@ -2778,40 +3225,51 @@ void RecordShadowPass(void *command_buffer) {
     vkCmdSetScissor(cmd, 0, 1, &scissor);
     std::memcpy(push.light_matrix, FrameCascadeMatrix[cascade], sizeof(push.light_matrix));
 
-    for (const DrawItem &item : Items) {
-      // **Opaque, depth-writing, indexed geometry only.** A blended draw is an effect layer or a
-      // decal and would cast a solid shadow it does not have; a draw that does not write depth is
-      // by the game's own account not part of the scene's occlusion. The shader rejects anything
-      // that is not a lit 3D draw as well, which is the test the CPU cannot make - the flags live
-      // in the record.
-      if (!item.indexed || item.pipeline.blend_enable || !item.pipeline.depth_write) {
+    for (size_t b = 0; b < buckets.size(); ++b) {
+      const CasterBucket &bucket = buckets[b];
+      const SunRun &run = runs[cascade * buckets.size() + b];
+      if (run.count == 0) {
         continue;
       }
-      push.vertices = item.vertex_source == DrawSource::Arena ? arena_vertices : scratch_vertices;
-      if (push.vertices == 0) {
-        continue;
-      }
-      push.record = item.record;
-      push.base_vertex = item.base_vertex;
-      VkBuffer index_buffer = item.index_source == DrawSource::Arena
-                                  ? reinterpret_cast<VkBuffer>(IndexArenaBuffer())
-                                  : reinterpret_cast<VkBuffer>(ScratchIndexBuffer());
-      if (index_buffer == VK_NULL_HANDLE) {
-        continue;
-      }
+      const VkBuffer index_buffer = bucket.index_source == DrawSource::Arena
+                                        ? reinterpret_cast<VkBuffer>(IndexArenaBuffer())
+                                        : reinterpret_cast<VkBuffer>(ScratchIndexBuffer());
+      const VkIndexType type =
+          bucket.index_stride == 4 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
       if (index_buffer != bound_index) {
-        vkCmdBindIndexBuffer(cmd, index_buffer, 0,
-                             item.index_stride == 4 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
+        vkCmdBindIndexBuffer(cmd, index_buffer, 0, type);
         bound_index = index_buffer;
       }
+      push.vertices =
+          bucket.vertex_source == DrawSource::Arena ? arena_vertices : scratch_vertices;
+      casters += run.count;
+      if (!indirect) {
+        // The direct path, unchanged in what it draws: the record and the arena slot ride in the
+        // push. It walks `survivors`, which is index-parallel to `commands`, so the two paths
+        // submit the same set by construction rather than by two copies of the cull agreeing.
+        for (uint32_t i = 0; i < run.count; ++i) {
+          const DrawItem *item = survivors[run.first + i];
+          push.record = item->record;
+          push.base_vertex = item->base_vertex;
+          vkCmdPushConstants(cmd, ShadowLayout, kShadowPushStages, 0, sizeof(push), &push);
+          vkCmdDrawIndexed(cmd, item->count, 1, item->first_index, item->vertex_offset, 0);
+          ++SunDrawCalls;
+        }
+        continue;
+      }
+      // Each run's parameters start where its commands do, so `SV_DrawIndex` - which counts from
+      // 0 within one `vkCmdDrawIndexedIndirect` - indexes its own run's slice.
+      push.params = SunIndirectAddress + slice + kShadowParamOffset + run.first * 8;
       vkCmdPushConstants(cmd, ShadowLayout, kShadowPushStages, 0, sizeof(push), &push);
-      vkCmdDrawIndexed(cmd, item.count, 1, item.first_index, item.vertex_offset, 0);
-      ++casters;
+      vkCmdDrawIndexedIndirect(cmd, SunIndirectBuffer,
+                               slice + static_cast<VkDeviceSize>(run.first) * kShadowIndirectStride,
+                               run.count, kShadowIndirectStride);
+      ++SunDrawCalls;
     }
   }
   vkCmdEndRendering(cmd);
   // Across every cascade, so it is the pass's cost rather than the scene's caster count - divide
-  // by the live cascade count for the latter.
+  // by the live cascade count for the latter, or read `sun_shadow_report`, which now splits it.
   TheStats.shadow_casters = casters;
 
   VkImageMemoryBarrier2 to_read = to_attachment;
@@ -3072,24 +3530,82 @@ int32_t RegisterDynamicShadowLight(const LocalShadowKey &key, uint64_t frame) {
 }
 
 namespace {
-// One group of casters that can share a single indirect batch. **A batch has one bound index
-// buffer and one `vertices` address**, so a draw pulling its vertices from the frame's scratch
-// cannot join one pulling from the arena - and units do exactly that (§4.18). §4.61's map bake
-// sidestepped this by taking only arena-sourced map geometry; this one has to carry whatever the
-// frame holds, so it buckets instead of dropping.
-struct CasterBucket {
-  DrawSource vertex_source = DrawSource::Arena;
-  DrawSource index_source = DrawSource::Arena;
-  uint32_t index_stride = 2;
-  uint32_t first = 0; // where this bucket's commands and parameters start, in entries
-  uint32_t count = 0;
-};
-
-// **The same caster test the sun's pass uses**, and deliberately not `IsMapGeometry`: opaque,
-// depth-writing, indexed. That is what puts a unit and a barrel in the set - the thing §4.65 could
-// not do - and the shader rejects anything without `kLightSum` on top, which is the test the CPU
-// cannot make because the flag lives in the record.
+// **The map object, and not a prop or a unit** - declared here, defined below.
 bool IsMapGeometry(const DrawItem &item);
+
+// See the declaration above CreateShadowPass for what the sort is and why it is only safe for a
+// depth-only pass.
+//
+// A source that is not resident is skipped rather than dropped: `vertices == 0` or a null index
+// buffer means the arena or the scratch is not up, which is a state the whole pass is about to
+// find out about anyway - it is not a caster that could not be carried, so it does not count
+// against the cap or the drop counter.
+void CollectCasters(bool (*accept)(const DrawItem &), uint32_t limit,
+                    std::vector<const DrawItem *> &ordered, std::vector<CasterBucket> &buckets,
+                    uint32_t &dropped) {
+  const uint64_t arena_vertices = VertexArenaAddress();
+  const uint64_t scratch_vertices = ScratchVertexAddress();
+  buckets.clear();
+  ordered.clear();
+  ordered.reserve(Items.size());
+  dropped = 0;
+  const auto find_bucket = [&buckets](const DrawItem &item) -> CasterBucket * {
+    for (CasterBucket &candidate : buckets) {
+      if (candidate.vertex_source == item.vertex_source &&
+          candidate.index_source == item.index_source &&
+          candidate.index_stride == item.index_stride) {
+        return &candidate;
+      }
+    }
+    return nullptr;
+  };
+  for (const DrawItem &item : Items) {
+    if (!accept(item)) {
+      continue;
+    }
+    const uint64_t vertices =
+        item.vertex_source == DrawSource::Arena ? arena_vertices : scratch_vertices;
+    const VkBuffer index_buffer = item.index_source == DrawSource::Arena
+                                      ? reinterpret_cast<VkBuffer>(IndexArenaBuffer())
+                                      : reinterpret_cast<VkBuffer>(ScratchIndexBuffer());
+    if (vertices == 0 || index_buffer == VK_NULL_HANDLE) {
+      continue;
+    }
+    if (ordered.size() >= limit) {
+      ++dropped;
+      continue;
+    }
+    CasterBucket *bucket = find_bucket(item);
+    if (bucket == nullptr) {
+      buckets.push_back({item.vertex_source, item.index_source, item.index_stride, 0, 0});
+      bucket = &buckets.back();
+    }
+    ++bucket->count;
+    ordered.push_back(&item);
+  }
+  if (ordered.empty()) {
+    return;
+  }
+  // Lay the buckets out contiguously and **reorder `ordered` to match**, so a bucket is a
+  // contiguous run of it and `ordered[bucket.first + i]` means what it reads as.
+  //
+  // It did not, before, and the per-frame bake's direct path drew the wrong geometry for it: the
+  // commands were placed at `bucket.first + bucket.count++` while `ordered` stayed in draw-list
+  // order, and `!DynShadowIndirect` indexed `ordered` by the bucket layout anyway. Every counter
+  // read correctly, because the *number* of draws was right.
+  uint32_t next = 0;
+  for (CasterBucket &bucket : buckets) {
+    bucket.first = next;
+    next += bucket.count;
+    bucket.count = 0; // refilled as the casters are placed, so `first + count` stays the cursor
+  }
+  std::vector<const DrawItem *> by_bucket(ordered.size());
+  for (const DrawItem *item : ordered) {
+    CasterBucket *bucket = find_bucket(*item);
+    by_bucket[bucket->first + bucket->count++] = item;
+  }
+  ordered.swap(by_bucket);
+}
 
 bool IsDynamicCaster(const DrawItem &item) {
   if (DynCasterArenaOnly &&
@@ -3104,7 +3620,7 @@ bool IsDynamicCaster(const DrawItem &item) {
   if (DynCasterMapOnly) {
     return IsMapGeometry(item);
   }
-  return item.indexed && !item.pipeline.blend_enable && item.pipeline.depth_write;
+  return IsShadowCaster(item);
 }
 
 // **The map object, and not a prop or a unit.** The occluders for a level's own light rig are the
@@ -3418,6 +3934,11 @@ void BakeDynamicShadows(void *command_buffer) {
   DynCasters = 0;
   DynCastersDropped = 0;
   DynBuckets = 0;
+  DynFaceSubmits = 0;
+  DynFaceCulledRange = 0;
+  DynFaceCulledFrustum = 0;
+  DynCommandsDropped = 0;
+  DynUnbounded = 0;
   if (!Ready || !DynShadowReady || cmd == VK_NULL_HANDLE || !DynamicShadowsEnabled) {
     return;
   }
@@ -3436,76 +3957,182 @@ void BakeDynamicShadows(void *command_buffer) {
     return;
   }
 
-  // Bucket the frame's casters. Four buckets are possible and one or two are what actually occur;
-  // the order within a bucket is the draw list's, so a command and its parameters stay paired.
   std::vector<CasterBucket> buckets;
   std::vector<const DrawItem *> ordered;
-  ordered.reserve(Items.size());
-  for (const DrawItem &item : Items) {
-    if (!IsDynamicCaster(item)) {
-      continue;
-    }
-    const uint64_t vertices =
-        item.vertex_source == DrawSource::Arena ? arena_vertices : scratch_vertices;
-    const VkBuffer index_buffer = item.index_source == DrawSource::Arena
-                                      ? reinterpret_cast<VkBuffer>(IndexArenaBuffer())
-                                      : reinterpret_cast<VkBuffer>(ScratchIndexBuffer());
-    if (vertices == 0 || index_buffer == VK_NULL_HANDLE) {
-      continue;
-    }
-    if (ordered.size() >= kMaxMapCasters) {
-      ++DynCastersDropped;
-      continue;
-    }
-    CasterBucket *bucket = nullptr;
-    for (CasterBucket &candidate : buckets) {
-      if (candidate.vertex_source == item.vertex_source &&
-          candidate.index_source == item.index_source &&
-          candidate.index_stride == item.index_stride) {
-        bucket = &candidate;
-        break;
-      }
-    }
-    if (bucket == nullptr) {
-      buckets.push_back({item.vertex_source, item.index_source, item.index_stride, 0, 0});
-      bucket = &buckets.back();
-    }
-    ++bucket->count;
-    ordered.push_back(&item);
-  }
+  CollectCasters(IsDynamicCaster, kMaxMapCasters, ordered, buckets, DynCastersDropped);
   if (ordered.empty()) {
     return;
   }
 
-  // Lay the buckets out contiguously and fill the batch in that order, so one `vkCmdUpdateBuffer`
-  // pair covers every bucket and each bucket is a contiguous range of commands.
-  uint32_t next = 0;
-  for (CasterBucket &bucket : buckets) {
-    bucket.first = next;
-    next += bucket.count;
-    bucket.count = 0; // refilled as the commands are written, so `first + count` stays the cursor
-  }
-  std::vector<VkDrawIndexedIndirectCommand> commands(ordered.size());
-  std::vector<uint32_t> params(ordered.size() * 2);
-  for (const DrawItem *item : ordered) {
-    CasterBucket *bucket = nullptr;
-    for (CasterBucket &candidate : buckets) {
-      if (candidate.vertex_source == item->vertex_source &&
-          candidate.index_source == item->index_source &&
-          candidate.index_stride == item->index_stride) {
-        bucket = &candidate;
-        break;
+  // **Range-check the casters before anything is submitted**, and keep the first few for the
+  // report.
+  //
+  // A RenderDoc capture cannot see this bake: the device is lost before `EndFrameCapture` can
+  // write the file, so the capture never exists. What a capture would have shown - a command with
+  // an index range past its buffer, which is the classic way to hang a GPU on an indirect draw -
+  // is computable here, at no risk, from the values about to be sent.
+  //
+  // Per caster rather than per emitted command, which it used to be. A command is a copy of its
+  // caster's index range, so the set of distinct ranges is the same either way - and the cull
+  // below emits a caster once per face it survives, which would otherwise count one bad range
+  // several times and fill the sample with one draw.
+  DynBadRanges = 0;
+  DynWorstIndexEnd = 0;
+  DynSample.clear();
+  {
+    const uint64_t index_capacity = Resources().index_arena_bytes;
+    for (const CasterBucket &bucket : buckets) {
+      for (uint32_t i = 0; i < bucket.count; ++i) {
+        const DrawItem *item = ordered[bucket.first + i];
+        const uint64_t end = static_cast<uint64_t>(item->first_index) + item->count;
+        const uint64_t bytes = end * bucket.index_stride;
+        if (bucket.index_source == DrawSource::Arena && bytes > index_capacity) {
+          ++DynBadRanges;
+        }
+        if (bytes > DynWorstIndexEnd) {
+          DynWorstIndexEnd = bytes;
+        }
+        if (DynSample.size() < 12) {
+          DynSample.push_back({item->count, item->first_index,
+                               static_cast<uint32_t>(item->vertex_offset), item->record,
+                               item->base_vertex, bucket.index_stride,
+                               bucket.index_source == DrawSource::Arena});
+        }
       }
     }
-    const uint32_t at = bucket->first + bucket->count++;
-    commands[at].indexCount = item->count;
-    commands[at].instanceCount = 1;
-    commands[at].firstIndex = item->first_index;
-    commands[at].vertexOffset = item->vertex_offset;
-    commands[at].firstInstance = 0;
-    params[at * 2 + 0] = item->record;
-    params[at * 2 + 1] = item->base_vertex;
   }
+
+  // The bisect caps (§4.66), read here rather than at the draw loop because the batch below is
+  // built per (light, face) and has to know how many of each there will be. Everything above
+  // still describes the whole set, so `dynamic_shadow_report` keeps saying what the frame
+  // *offered* while these say what was actually submitted. 0 is no cap.
+  const uint32_t light_limit =
+      DynMaxLights > 0 ? (std::min)(static_cast<uint32_t>(DynMaxLights),
+                                    static_cast<uint32_t>(DynLights.size()))
+                       : static_cast<uint32_t>(DynLights.size());
+  const uint32_t face_limit = DynMaxFaces > 0 ? (std::min)(static_cast<uint32_t>(DynMaxFaces), 6u)
+                                              : 6u;
+
+  // --- the cull ---------------------------------------------------------------------------
+  //
+  // Nothing rejected a caster before this: the whole list went to all six faces of every light,
+  // so the bake was `casters x lights x 6` however far apart any of them were. On the frame this
+  // was written against that is 304 x 9 x 6 = 16,416 pieces of geometry against the world pass's
+  // 367 - the level's own mesh redrawn into every 256-texel tile and thrown away by the scissor.
+  //
+  // Two tests, cheapest first, and they are not the same test at different strengths:
+  //
+  // - the light's **sphere**, which answers for all six faces at once and is where the bulk of a
+  //   level goes. A caster it rejects cannot be lit by this light at all.
+  // - the face's **frustum**, which is the 90-degree pyramid the tile actually rasterises. Its
+  //   far plane is the light's range and its near plane is `range / 64`, so it subsumes the
+  //   sphere - the sphere is kept because it runs once per light instead of six times.
+  //
+  // A caster with no world box (`has_bounds` false) is drawn on every face, unconditionally.
+  // That is the only safe reading of "unknown", and `DynUnbounded` is what says how much of the
+  // frame is in that state.
+  //
+  // The four vectors are function-static rather than local: at 8192 commands the batch is 224 KB
+  // and this runs every frame, so keeping the capacity is worth more than the tidiness. Only the
+  // render thread reaches here.
+  static std::vector<VkDrawIndexedIndirectCommand> commands;
+  static std::vector<uint32_t> params;
+  static std::vector<const DrawItem *> survivors;
+  static std::vector<uint8_t> in_range;
+  // One run per (light, face, bucket), in that nesting order - a contiguous range of the arrays
+  // above, which is what `vkCmdDrawIndexedIndirect` needs and what the direct path walks.
+  struct FaceRun {
+    uint32_t first = 0;
+    uint32_t count = 0;
+  };
+  static std::vector<FaceRun> runs;
+  commands.clear();
+  params.clear();
+  survivors.clear();
+  runs.clear();
+  runs.resize(static_cast<size_t>(light_limit) * face_limit * buckets.size());
+  DynBucketReports.clear();
+  for (const CasterBucket &bucket : buckets) {
+    DynBucketReport report;
+    report.vertex_arena = bucket.vertex_source == DrawSource::Arena;
+    report.index_arena = bucket.index_source == DrawSource::Arena;
+    report.stride = bucket.index_stride;
+    report.count = bucket.count;
+    for (uint32_t i = 0; i < bucket.count; ++i) {
+      if (!ordered[bucket.first + i]->has_bounds) {
+        ++report.unbounded;
+        ++DynUnbounded;
+      }
+    }
+    DynBucketReports.push_back(report);
+  }
+  in_range.assign(ordered.size(), 1);
+  for (uint32_t slot = 0; slot < light_limit; ++slot) {
+    Vec3 position = {};
+    float range = 0.0f;
+    std::memcpy(&position.x, DynLights[slot].position, sizeof(float) * 3);
+    std::memcpy(&range, &DynLights[slot].range, sizeof(range));
+    for (size_t i = 0; i < ordered.size(); ++i) {
+      const DrawItem *item = ordered[i];
+      in_range[i] = !(DynCullEnabled && item->has_bounds &&
+                      BoxOutsideSphere(item->bounds_min, item->bounds_max, position, range));
+    }
+    for (uint32_t face = 0; face < face_limit; ++face) {
+      float matrix[16];
+      BuildCubeFaceMatrix(position, range, face, matrix);
+      float planes[6][4];
+      BuildFrustumPlanes(matrix, planes);
+      for (size_t b = 0; b < buckets.size(); ++b) {
+        const CasterBucket &bucket = buckets[b];
+        FaceRun &run = runs[(static_cast<size_t>(slot) * face_limit + face) * buckets.size() + b];
+        run.first = static_cast<uint32_t>(survivors.size());
+        run.count = 0;
+        // The caster cap, per bucket: with one bucket it is exactly "the first N casters", and
+        // with more it takes the first N of each, which is what keeps every bucket represented
+        // while the set shrinks. Applied to the bucket's casters, not to its survivors, so the
+        // cap selects the same geometry whether the cull is on or off.
+        const uint32_t draw_count =
+            DynMaxCasters > 0 ? (std::min)(static_cast<uint32_t>(DynMaxCasters), bucket.count)
+                              : bucket.count;
+        for (uint32_t i = 0; i < draw_count; ++i) {
+          const uint32_t at = bucket.first + i;
+          const DrawItem *item = ordered[at];
+          if (DynCullEnabled && item->has_bounds) {
+            if (!in_range[at]) {
+              ++DynFaceCulledRange;
+              continue;
+            }
+            if (BoxOutsideFrustum(planes, item->bounds_min, item->bounds_max)) {
+              ++DynFaceCulledFrustum;
+              continue;
+            }
+          }
+          if (survivors.size() >= kDynMaxCommands) {
+            ++DynCommandsDropped;
+            continue;
+          }
+          VkDrawIndexedIndirectCommand command = {};
+          command.indexCount = item->count;
+          command.instanceCount = 1;
+          command.firstIndex = item->first_index;
+          command.vertexOffset = item->vertex_offset;
+          command.firstInstance = 0;
+          commands.push_back(command);
+          params.push_back(item->record);
+          params.push_back(item->base_vertex);
+          survivors.push_back(item);
+          ++run.count;
+          ++DynFaceSubmits;
+        }
+      }
+    }
+  }
+  // Every light's every face lost its whole caster list, which is a legal frame - a light with
+  // nothing near it - and there is then no batch to upload and nothing to draw. The atlas still
+  // has to be cleared, or its slots keep the previous frame's cubes, so the pass below runs
+  // anyway; only the transfer is skipped.
+  const bool have_batch = !commands.empty();
+
   // This frame's slice of the ring, so the transfer cannot land on bytes an in-flight frame's
   // indirect draws are still reading.
   ++DynRingSerial;
@@ -3515,55 +4142,27 @@ void BakeDynamicShadows(void *command_buffer) {
   // frame N's world pass is still SAMPLING the atlas when frame N+1's bake declares
   // `oldLayout = UNDEFINED` on it.
   DynImageSlot = static_cast<uint32_t>(DynRingSerial % kDynShadowRing);
-  // **Range-check the batch before it is ever submitted**, and keep the first few for the report.
-  //
-  // A RenderDoc capture cannot see this bake: the device is lost before `EndFrameCapture` can
-  // write the file, so the capture never exists. What a capture would have shown - a command with
-  // an index range past its buffer, which is the classic way to hang a GPU on an indirect draw -
-  // is computable here, at no risk, from the bytes about to be sent.
-  DynBadRanges = 0;
-  DynWorstIndexEnd = 0;
-  DynSample.clear();
-  {
-    const uint64_t index_capacity = Resources().index_arena_bytes;
-    for (const CasterBucket &bucket : buckets) {
-      for (uint32_t i = 0; i < bucket.count; ++i) {
-        const VkDrawIndexedIndirectCommand &c = commands[bucket.first + i];
-        const uint64_t end = static_cast<uint64_t>(c.firstIndex) + c.indexCount;
-        const uint64_t bytes = end * bucket.index_stride;
-        if (bucket.index_source == DrawSource::Arena && bytes > index_capacity) {
-          ++DynBadRanges;
-        }
-        if (bytes > DynWorstIndexEnd) {
-          DynWorstIndexEnd = bytes;
-        }
-        if (DynSample.size() < 12) {
-          DynSample.push_back({c.indexCount, c.firstIndex,
-                               static_cast<uint32_t>(c.vertexOffset),
-                               params[(bucket.first + i) * 2 + 0],
-                               params[(bucket.first + i) * 2 + 1], bucket.index_stride,
-                               bucket.index_source == DrawSource::Arena});
-        }
-      }
-    }
-  }
 
-  vkCmdUpdateBuffer(cmd, DynIndirectBuffer, slice,
-                    commands.size() * sizeof(VkDrawIndexedIndirectCommand), commands.data());
-  vkCmdUpdateBuffer(cmd, DynIndirectBuffer, slice + kMapParamOffset,
-                    params.size() * sizeof(uint32_t), params.data());
-  // Two destinations, as §4.62: the commands are read by DRAW_INDIRECT and the parameters by the
-  // vertex shader as an address, and only the first is what a transfer barrier assumes.
-  VkMemoryBarrier2 written = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-  written.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-  written.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  written.dstStageMask =
-      VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
-  written.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT;
-  VkDependencyInfo upload = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-  upload.memoryBarrierCount = 1;
-  upload.pMemoryBarriers = &written;
-  vkCmdPipelineBarrier2(cmd, &upload);
+  if (have_batch) {
+    // Chunked, because the batch is allowed past the 64 KB one `vkCmdUpdateBuffer` takes.
+    UpdateBufferChunked(cmd, DynIndirectBuffer, slice,
+                        commands.data(),
+                        commands.size() * sizeof(VkDrawIndexedIndirectCommand));
+    UpdateBufferChunked(cmd, DynIndirectBuffer, slice + kDynParamOffset, params.data(),
+                        params.size() * sizeof(uint32_t));
+    // Two destinations, as §4.62: the commands are read by DRAW_INDIRECT and the parameters by
+    // the vertex shader as an address, and only the first is what a transfer barrier assumes.
+    VkMemoryBarrier2 written = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    written.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    written.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    written.dstStageMask =
+        VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+    written.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT;
+    VkDependencyInfo upload = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    upload.memoryBarrierCount = 1;
+    upload.pMemoryBarriers = &written;
+    vkCmdPipelineBarrier2(cmd, &upload);
+  }
 
   VkImageMemoryBarrier2 to_attachment = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
   to_attachment.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
@@ -3615,16 +4214,9 @@ void BakeDynamicShadows(void *command_buffer) {
   VkBuffer bound_index = VK_NULL_HANDLE;
   VkIndexType bound_type = VK_INDEX_TYPE_UINT16;
 
-  // The bisect caps (§4.66), applied here and not at collection: everything above still describes
-  // the whole set, so `dynamic_shadow_report` keeps saying what the frame *offered* while these say
-  // what was actually submitted. 0 is no cap.
-  const uint32_t light_limit =
-      DynMaxLights > 0 ? (std::min)(static_cast<uint32_t>(DynMaxLights),
-                                    static_cast<uint32_t>(DynLights.size()))
-                       : static_cast<uint32_t>(DynLights.size());
-  const uint32_t face_limit = DynMaxFaces > 0 ? (std::min)(static_cast<uint32_t>(DynMaxFaces), 6u)
-                                              : 6u;
-
+  // One run per (light, face, bucket), already culled, in the nesting order this loop walks. A
+  // face whose run is empty costs a viewport and a matrix and nothing else - and a light with no
+  // caster near it costs six of those, against the whole list it used to redraw.
   for (uint32_t slot = 0; slot < light_limit; ++slot) {
     Vec3 position = {};
     float range = 0.0f;
@@ -3640,17 +4232,13 @@ void BakeDynamicShadows(void *command_buffer) {
       vkCmdSetScissor(cmd, 0, 1, &scissor);
       BuildCubeFaceMatrix(position, range, face, push.light_matrix);
 
-      for (const CasterBucket &bucket : buckets) {
-        if (bucket.count == 0) {
+      for (size_t b = 0; b < buckets.size(); ++b) {
+        const CasterBucket &bucket = buckets[b];
+        const FaceRun &run =
+            runs[(static_cast<size_t>(slot) * face_limit + face) * buckets.size() + b];
+        if (run.count == 0) {
           continue;
         }
-        // The caster cap, per bucket: with one bucket it is exactly "the first N casters", and with
-        // more it takes the first N of each, which is what keeps every bucket represented while the
-        // set shrinks.
-        const uint32_t draw_count =
-            DynMaxCasters > 0
-                ? (std::min)(static_cast<uint32_t>(DynMaxCasters), bucket.count)
-                : bucket.count;
         const VkBuffer index_buffer = bucket.index_source == DrawSource::Arena
                                           ? reinterpret_cast<VkBuffer>(IndexArenaBuffer())
                                           : reinterpret_cast<VkBuffer>(ScratchIndexBuffer());
@@ -3665,9 +4253,11 @@ void BakeDynamicShadows(void *command_buffer) {
                                                                  : scratch_vertices;
         if (!DynShadowIndirect) {
           // The direct path: the record and the arena slot ride in the push, exactly as the sun's
-          // pass does it, and nothing reads the indirect buffer at all. Same atlas, same casters.
-          for (uint32_t i = 0; i < draw_count; ++i) {
-            const DrawItem *item = ordered[bucket.first + i];
+          // pass does it, and nothing reads the indirect buffer at all. It walks `survivors`,
+          // which is index-parallel to `commands` - so the two paths draw the same set by
+          // construction rather than by two copies of the cull agreeing.
+          for (uint32_t i = 0; i < run.count; ++i) {
+            const DrawItem *item = survivors[run.first + i];
             push.record = item->record;
             push.base_vertex = item->base_vertex;
             vkCmdPushConstants(cmd, ShadowLayout, kShadowPushStages, 0, sizeof(push),
@@ -3677,14 +4267,14 @@ void BakeDynamicShadows(void *command_buffer) {
           }
           continue;
         }
-        // Each bucket's parameters start where its commands do, so `SV_DrawIndex` - which counts
-        // from 0 within one `vkCmdDrawIndexedIndirect` - indexes its own bucket's slice.
-        push.params = DynIndirectAddress + slice + kMapParamOffset + bucket.first * 8;
+        // Each run's parameters start where its commands do, so `SV_DrawIndex` - which counts
+        // from 0 within one `vkCmdDrawIndexedIndirect` - indexes its own run's slice.
+        push.params = DynIndirectAddress + slice + kDynParamOffset + run.first * 8;
         vkCmdPushConstants(cmd, ShadowLayout, kShadowPushStages, 0, sizeof(push), &push);
         vkCmdDrawIndexedIndirect(cmd, DynIndirectBuffer,
-                                 slice + static_cast<VkDeviceSize>(bucket.first) *
+                                 slice + static_cast<VkDeviceSize>(run.first) *
                                              kMapIndirectStride,
-                                 draw_count, kMapIndirectStride);
+                                 run.count, kMapIndirectStride);
         ++DynIndirectCommands;
       }
     }
@@ -3952,6 +4542,63 @@ int DynamicShadowMaxCasters() { return DynMaxCasters; }
 void SetDynamicShadowIndirect(bool enabled) { DynShadowIndirect = enabled; }
 bool DynamicShadowIndirect() { return DynShadowIndirect; }
 
+void SetDynamicShadowCull(bool enabled) { DynCullEnabled = enabled; }
+bool DynamicShadowCull() { return DynCullEnabled; }
+
+void SetSunShadowCull(bool enabled) { SunCullEnabled = enabled; }
+bool SunShadowCull() { return SunCullEnabled; }
+// Setting it on a device that cannot take it does nothing and reads back false, exactly as
+// `map_shadow_indirect` does - the pipeline is what decides, not the knob.
+void SetSunShadowIndirect(bool enabled) {
+  SunIndirectEnabled = enabled && ShadowPipelineIndirect != VK_NULL_HANDLE;
+}
+bool SunShadowIndirect() { return SunIndirectEnabled; }
+
+std::string SunShadowReport() {
+  std::string out;
+  char line[256];
+  const auto add = [&](const char *format, auto... args) {
+    std::snprintf(line, sizeof(line), format, args...);
+    out += line;
+  };
+  add("sun shadow pass: %s\n",
+      !SunShadowsEnabled ? "OFF - render.sun_shadows"
+                         : (!ShadowReady ? "NO PIPELINE" : (FrameSunValid ? "on" : "no sun")));
+  add("atlas %ux%u, %u tiles of %u: %u cascades live, extent %.0f\n", kShadowAtlas, kShadowAtlas,
+      kMaxShadowCascades, kShadowTile, FrameCascadeCount, ShadowExtentValue);
+  add("last pass: %u casters in %u buckets (%u dropped)\n", SunCasterCount, SunBucketCount,
+      SunCastersDropped);
+  // In (caster, cascade) pairs, because that is the unit of work: the same caster is separate
+  // geometry in every cascade it reaches. `offered` is what the pass would have drawn with the
+  // cull off, which is exactly what `render.sun_shadow_cull = false` produces.
+  {
+    const uint32_t offered = SunCascadeSubmits + SunCascadeCulled + SunCommandsDropped;
+    add("cull: %s - %u of %u caster-cascades drawn (%.1f%%), %u outside the cascade box\n",
+        SunCullEnabled ? "on" : "OFF - render.sun_shadow_cull", SunCascadeSubmits, offered,
+        offered == 0 ? 0.0 : 100.0 * SunCascadeSubmits / offered, SunCascadeCulled);
+    add("  no bounds (drawn in every cascade): %u of %u casters   batch cap %u, %u dropped\n",
+        SunUnbounded, SunCasterCount, kShadowMaxCommands, SunCommandsDropped);
+  }
+  // The halving, measured. Cascade 0 is the sharp near box and should keep almost nothing on a
+  // level of any size; cascade `live - 1` is `shadow_extent` and should keep nearly everything.
+  float extent = ShadowExtentValue;
+  for (uint32_t i = 1; i < FrameCascadeCount; ++i) {
+    extent *= 0.5f;
+  }
+  for (uint32_t i = 0; i < FrameCascadeCount && i < kMaxShadowCascades; ++i) {
+    add("  cascade %u: half-extent %7.2f   %u casters drawn\n", i, extent, SunCascadeDrawn[i]);
+    extent *= 2.0f;
+  }
+  add("submission: %s - %u calls this pass, against %u casters x %u cascades unculled\n",
+      SunIndirectEnabled
+          ? "vkCmdDrawIndexedIndirect, one run a bucket a cascade"
+          : (ShadowPipelineIndirect == VK_NULL_HANDLE
+                 ? "a draw call per caster per cascade (no indirect pipeline on this device)"
+                 : "a draw call per caster per cascade (sun_shadow_indirect off)"),
+      SunDrawCalls, SunCasterCount, FrameCascadeCount);
+  return out;
+}
+
 std::string DynamicShadowReport() {
   std::string out;
   char line[256];
@@ -3975,11 +4622,37 @@ std::string DynamicShadowReport() {
       kDynShadowTilesPerRow * kDynShadowTilesPerRow, kDynShadowFace, kDynShadowSlots);
   add("last frame: %u lights (%u refused - no slot), %u casters in %u buckets (%u dropped)\n",
       (unsigned)DynLights.size(), DynRefused, DynCasters, DynBuckets, DynCastersDropped);
-  // The count that says what this costs to submit: it is 6 x lights x buckets a frame, where the
-  // static atlas was 6 x lights once per level.
-  add("indirect commands issued: %llu cumulative, %u this frame\n",
+  // The count that says what this costs to submit: at most 6 x lights x buckets a frame, where
+  // the static atlas was 6 x lights once per level - and fewer than that once the cull starts
+  // emptying faces, since an empty run is not submitted at all.
+  add("indirect commands issued: %llu cumulative, up to %u this frame\n",
       (unsigned long long)DynIndirectCommands,
       (unsigned)(DynLights.size() * 6 * (DynBuckets == 0 ? 0 : DynBuckets)));
+  // **The reading that prices the pass**, and it is in (caster, face) pairs rather than casters,
+  // because that is the unit of work: the same caster is separate geometry on every face it
+  // reaches. `offered` is what the bake would have drawn with the cull off, which is exactly what
+  // `render.dynamic_shadow_cull = false` produces - so the two numbers are an A/B that needs no
+  // second run.
+  {
+    const uint32_t offered = DynFaceSubmits + DynFaceCulledRange + DynFaceCulledFrustum +
+                             DynCommandsDropped;
+    add("cull: %s - %u of %u caster-faces drawn (%.1f%%), %u out of range, %u outside the face\n",
+        DynCullEnabled ? "on" : "OFF - render.dynamic_shadow_cull", DynFaceSubmits, offered,
+        offered == 0 ? 0.0 : 100.0 * DynFaceSubmits / offered, DynFaceCulledRange,
+        DynFaceCulledFrustum);
+    // The part of the frame the cull cannot see. A caster with no world box is drawn into every
+    // face of every light, so this number is a ceiling on what is left to win - and it moving is
+    // how a regression in DrawItem::has_bounds surfaces as something other than a frame time.
+    add("  no bounds (drawn on every face): %u of %u casters   batch cap %u, %u dropped\n",
+        DynUnbounded, DynCasters, kDynMaxCommands, DynCommandsDropped);
+    for (size_t b = 0; b < DynBucketReports.size(); ++b) {
+      const DynBucketReport &report = DynBucketReports[b];
+      add("    bucket %u: %s vertices, %s indices x%u - %u casters, %u with no bounds\n",
+          (unsigned)b, report.vertex_arena ? "arena  " : "scratch",
+          report.index_arena ? "arena  " : "scratch", report.stride, report.count,
+          report.unbounded);
+    }
+  }
   add("normal offset %.2f texels\n", DynShadowBiasValue);
   // The bisect state, printed unconditionally: a capped bake that survives looks exactly like a
   // healthy one, so "which configuration was that?" has to be readable off the report itself.
@@ -4343,6 +5016,27 @@ void RecordDraws(void *command_buffer) {
   int32_t set_x = INT32_MIN, set_y = INT32_MIN;
   uint32_t set_width = 0, set_height = 0;
   const float origin = ViewportOrigin();
+  // The batching census (DrawStats::batch_runs). Nothing here changes what is submitted - it
+  // counts what an indirect world pass could merge, which is the question that decides whether
+  // one is worth writing at all.
+  TheStats.batch_runs = 0;
+  TheStats.batch_longest = 0;
+  TheStats.batch_draws = 0;
+  uint64_t run_length = 0;
+  VkPipeline run_pipeline = VK_NULL_HANDLE;
+  uint32_t run_ref = UINT32_MAX, run_mask = 0, run_write_mask = 0;
+  float run_min_depth = -1.0f, run_max_depth = -1.0f;
+  int32_t run_x = INT32_MIN, run_y = INT32_MIN;
+  uint32_t run_width = 0, run_height = 0;
+  VkBuffer run_indices = VK_NULL_HANDLE;
+  VkIndexType run_index_type = VK_INDEX_TYPE_MAX_ENUM;
+  DrawSource run_vertex_source = DrawSource::Arena;
+  bool run_open = false;
+  const auto close_run = [&]() {
+    if (run_open && run_length > TheStats.batch_longest) {
+      TheStats.batch_longest = run_length;
+    }
+  };
 
   for (size_t index = 0; index < Items.size(); ++index) {
     const DrawItem &item = Items[index];
@@ -4489,7 +5183,41 @@ void RecordDraws(void *command_buffer) {
       vkCmdDraw(cmd, item.count, 1, 0, 0);
     }
     ++TheStats.drawn;
+
+    // The census, taken after the draw so it sees exactly the state the draw went out with. A
+    // non-indexed draw ends the run whatever else matches: `vkCmdDrawIndexedIndirect` cannot
+    // carry one.
+    const bool same_run =
+        run_open && item.indexed && pipeline == run_pipeline && item.stencil_ref == run_ref &&
+        item.stencil_mask == run_mask && item.stencil_write_mask == run_write_mask &&
+        item.min_depth == run_min_depth && item.max_depth == run_max_depth &&
+        item_x == run_x && item_y == run_y && item_width == run_width &&
+        item_height == run_height && bound_indices == run_indices &&
+        bound_type == run_index_type && item.vertex_source == run_vertex_source;
+    ++TheStats.batch_draws;
+    if (same_run) {
+      ++run_length;
+    } else {
+      close_run();
+      ++TheStats.batch_runs;
+      run_length = 1;
+      run_open = true;
+      run_pipeline = pipeline;
+      run_ref = item.stencil_ref;
+      run_mask = item.stencil_mask;
+      run_write_mask = item.stencil_write_mask;
+      run_min_depth = item.min_depth;
+      run_max_depth = item.max_depth;
+      run_x = item_x;
+      run_y = item_y;
+      run_width = item_width;
+      run_height = item_height;
+      run_indices = bound_indices;
+      run_index_type = bound_type;
+      run_vertex_source = item.vertex_source;
+    }
   }
+  close_run();
   // Kept rather than dropped, so `render.draw_info(i)` can describe the frame that was just
   // recorded. A swap rather than a copy: the buffers trade places and neither allocates.
   LastItems.swap(Items);
@@ -4576,6 +5304,52 @@ struct NormalCensus {
   double worst = 0.0;
   double total = 0.0;
 
+  // **The same term again, un-normalised** - `|dot(Pj - Pi, Ni)| / 3`, which is how far b210
+  // actually moves off the chord, in the level's own units. The classes above deliberately divide
+  // by the edge length so that they mean the same thing on a large triangle and a small one, and
+  // that is exactly what hides the failure mode: a modest term on a long edge is a large bulge.
+  // A 0.7 term is 3% of a 0.15-unit edge and 23% of a 30-unit pipe.
+  uint64_t half_edges = 0;
+  double edge_total = 0.0;
+  double offset_total = 0.0;
+  double offset_worst = 0.0;
+  // Split by how far the edge's two endpoint normals disagree, because that is the quantity that
+  // separates "a coarsely-facetted smooth surface" from "a crease whose normals were averaged for
+  // lighting". Both produce a large term; only the second is wrong to curve. A 6-sided pipe's
+  // cross-section edge lands at 60 degrees, an axial edge whose ends were averaged into the end
+  // caps lands at 90.
+  static constexpr double kCreaseBounds[4] = {30.0, 60.0, 90.0, 1e9};
+  uint64_t crease_edges[4] = {};
+  double crease_offset_total[4] = {};
+  double crease_offset_worst[4] = {};
+
+  // What §4.74's ceiling takes away at the knob's current setting - so the census says what the
+  // cap does to this frame rather than only what the defect costs it.
+  uint64_t capped = 0;
+  double capped_removed = 0.0;
+
+  void HalfEdge(double length, double offset, double disagreement_degrees, double cap) {
+    if (offset > cap) {
+      ++capped;
+      capped_removed += offset - cap;
+    }
+    ++half_edges;
+    edge_total += length;
+    offset_total += offset;
+    offset_worst = offset > offset_worst ? offset : offset_worst;
+    uint32_t klass = 3;
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (disagreement_degrees < kCreaseBounds[i]) {
+        klass = i;
+        break;
+      }
+    }
+    ++crease_edges[klass];
+    crease_offset_total[klass] += offset;
+    crease_offset_worst[klass] =
+        offset > crease_offset_worst[klass] ? offset : crease_offset_worst[klass];
+  }
+
   void Corner(double deviation) {
     ++corners;
     total += deviation;
@@ -4608,6 +5382,38 @@ double TangentTerm(const float *a, const float *b, const float *n, double normal
   }
   const double dot = e[0] * n[0] + e[1] * n[1] + e[2] * n[2];
   return std::fabs(dot / (length * normal_length));
+}
+
+// The world-unit half of the same construction: `|dot(Pj - Pi, Ni)| / (3 * |Ni|)` is exactly how
+// far `b210` sits off the chord, in the units the level is authored in. Also reports how far the
+// two endpoint normals disagree, in degrees, which is the crease test.
+//
+// False when either end carries no normal or the edge is degenerate - there is nothing to displace
+// in either case, and averaging a zero in would read as "this mesh barely bulges".
+// `term_a` and `term_b` come back SIGNED and in the shader's own convention - `dot(Pb - Pa, Na)`
+// and `dot(Pa - Pb, Nb)`. The census only ever reports their magnitudes, but the signs are what
+// tell a genuine arc (they agree) from normals demanding an S-bend inside one edge (they do not),
+// which is the reading §4.74 rests on - so they are not thrown away here.
+bool EdgeBulge(const CanonicalVertex &a, const CanonicalVertex &b, double &length,
+               double &term_a, double &term_b, double &disagreement_degrees) {
+  const double e[3] = {double(b.pos[0]) - a.pos[0], double(b.pos[1]) - a.pos[1],
+                       double(b.pos[2]) - a.pos[2]};
+  length = std::sqrt(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]);
+  const double la = std::sqrt(double(a.normal[0]) * a.normal[0] + double(a.normal[1]) * a.normal[1] +
+                              double(a.normal[2]) * a.normal[2]);
+  const double lb = std::sqrt(double(b.normal[0]) * b.normal[0] + double(b.normal[1]) * b.normal[1] +
+                              double(b.normal[2]) * b.normal[2]);
+  if (length < 1e-9 || la < 1e-9 || lb < 1e-9) {
+    return false;
+  }
+  term_a = (e[0] * a.normal[0] + e[1] * a.normal[1] + e[2] * a.normal[2]) / la;
+  term_b = -(e[0] * b.normal[0] + e[1] * b.normal[1] + e[2] * b.normal[2]) / lb;
+  const double cosine = (double(a.normal[0]) * b.normal[0] + double(a.normal[1]) * b.normal[1] +
+                         double(a.normal[2]) * b.normal[2]) /
+                        (la * lb);
+  disagreement_degrees =
+      std::acos(cosine < -1.0 ? -1.0 : (cosine > 1.0 ? 1.0 : cosine)) * (180.0 / 3.14159265358979323846);
+  return true;
 }
 
 // A percentage to one decimal, as TEXT - never handed to `%f`.
@@ -4660,6 +5466,37 @@ void CensusText(std::string &out, const char *what, const NormalCensus &c) {
                 c.worst, c.corners == 0 ? 0.0 : c.total / double(c.corners),
                 (unsigned long long)c.degenerate, (unsigned long long)c.no_normal);
   out += line;
+  if (c.half_edges == 0) {
+    return;
+  }
+  const auto mean = [](double total, uint64_t n) { return n == 0 ? 0.0 : total / double(n); };
+  std::snprintf(line, sizeof(line),
+                "    control-point offset, WORLD UNITS (how far b210 leaves the chord):\n"
+                "      %llu half-edges, mean edge %.3f, mean offset %.4f, worst %.4f\n"
+                "      by how far the edge's two normals disagree:\n"
+                "        <30 deg : %8llu  mean %.4f  worst %.4f\n"
+                "        30-60   : %8llu  mean %.4f  worst %.4f\n"
+                "        60-90   : %8llu  mean %.4f  worst %.4f\n"
+                "        >=90    : %8llu  mean %.4f  worst %.4f   <- a crease, not a curve\n",
+                (unsigned long long)c.half_edges, mean(c.edge_total, c.half_edges),
+                mean(c.offset_total, c.half_edges), c.offset_worst,
+                (unsigned long long)c.crease_edges[0],
+                mean(c.crease_offset_total[0], c.crease_edges[0]), c.crease_offset_worst[0],
+                (unsigned long long)c.crease_edges[1],
+                mean(c.crease_offset_total[1], c.crease_edges[1]), c.crease_offset_worst[1],
+                (unsigned long long)c.crease_edges[2],
+                mean(c.crease_offset_total[2], c.crease_edges[2]), c.crease_offset_worst[2],
+                (unsigned long long)c.crease_edges[3],
+                mean(c.crease_offset_total[3], c.crease_edges[3]), c.crease_offset_worst[3]);
+  out += line;
+  std::snprintf(line, sizeof(line),
+                "      the ceiling at the current pn_max_offset: %llu half-edges over it (%s%%), "
+                "%.2f of %.2f total offset removed (%s%%)\n",
+                (unsigned long long)c.capped, Percent(c.capped, c.half_edges).c_str(),
+                c.capped_removed, c.offset_total,
+                Percent(uint64_t(c.capped_removed * 1000.0), uint64_t(c.offset_total * 1000.0))
+                    .c_str());
+  out += line;
 }
 
 // Bounded rather than unbounded, and the report says how many it skipped: a silent cap would
@@ -4672,6 +5509,9 @@ std::string DescribeNormalCensus() {
     return "no frame has been recorded yet\n";
   }
   NormalCensus map, other;
+  // Read from the live knob rather than hard-coded, so the cap row below answers "what does the
+  // current setting do to this frame" - which is what makes a REPL sweep of it readable.
+  const double cap = double(TessParams().pn_max_offset);
   uint32_t skipped_source = 0, skipped_topology = 0, over_cap = 0, read_failures = 0;
   uint32_t examined = 0;
 
@@ -4772,6 +5612,16 @@ std::string DescribeNormalCensus() {
         all_flat = all_flat && deviation < 1e-4;
       }
       bucket.flat_triangles += all_flat ? 1 : 0;
+      // A second pass over the same triangle, per EDGE rather than per corner, because the two
+      // questions the un-normalised metric answers are both edge-shaped: how far the control point
+      // moves in world units, and how far the edge's two normals disagree.
+      for (uint32_t k = 0; k < 3; ++k) {
+        double length = 0.0, term_a = 0.0, term_b = 0.0, disagreement = 0.0;
+        if (EdgeBulge(*corner[k], *corner[(k + 1) % 3], length, term_a, term_b, disagreement)) {
+          bucket.HalfEdge(length, std::fabs(term_a) / 3.0, disagreement, cap);
+          bucket.HalfEdge(length, std::fabs(term_b) / 3.0, disagreement, cap);
+        }
+      }
     }
   }
 
@@ -4961,6 +5811,15 @@ std::string FormatDrawStats() {
       (unsigned long long)TheStats.index_binds, (unsigned long long)TheStats.pipelines,
       (unsigned long long)TheStats.pipeline_binds,
       (unsigned long long)TheStats.pipeline_failures);
+  // **What an indirect world pass could merge, and nothing more.** See DrawStats::batch_runs:
+  // runs are consecutive only, because the game's order is what makes blending come out right.
+  // `drawn / runs` is the ceiling on the draw calls one would remove.
+  add("batchable runs: %llu over %llu draws (mean %.2f, longest %llu)\n",
+      (unsigned long long)TheStats.batch_runs, (unsigned long long)TheStats.batch_draws,
+      TheStats.batch_runs == 0
+          ? 0.0
+          : static_cast<double>(TheStats.batch_draws) / TheStats.batch_runs,
+      (unsigned long long)TheStats.batch_longest);
   add("stages: %llu draws name an unimplemented op, %llu need more than two, "
       "%llu bound textures unresolved (must be 0)\n",
       (unsigned long long)TheStats.unsupported_stage_op,

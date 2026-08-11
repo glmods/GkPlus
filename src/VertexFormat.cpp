@@ -71,6 +71,37 @@ bool FvfSupported(uint32_t fvf) {
   return ((fvf & kTexCountMask) >> kTexCountShift) <= 2;
 }
 
+bool PositionBounds(uint32_t fvf, const void *src, uint32_t count, float out_min[3],
+                    float out_max[3], uint32_t src_stride) {
+  const uint32_t implied = FvfStride(fvf);
+  if (implied == 0 || src == nullptr || count == 0) {
+    return false;
+  }
+  // No position at all, or one that is already in screen space. Either way there is nothing here
+  // a world-space consumer may use.
+  if ((fvf & kXyz) == 0 || (fvf & kXyzRhw) != 0) {
+    return false;
+  }
+  const uint32_t stride = src_stride != 0 ? src_stride : implied;
+  if (stride < implied) {
+    return false;
+  }
+  const auto *bytes = static_cast<const uint8_t *>(src);
+  for (uint32_t i = 0; i < count; ++i) {
+    float p[3];
+    std::memcpy(p, bytes + static_cast<size_t>(i) * stride, sizeof(p));
+    for (int j = 0; j < 3; ++j) {
+      if (i == 0) {
+        out_min[j] = out_max[j] = p[j];
+      } else {
+        out_min[j] = p[j] < out_min[j] ? p[j] : out_min[j];
+        out_max[j] = p[j] > out_max[j] ? p[j] : out_max[j];
+      }
+    }
+  }
+  return true;
+}
+
 bool ConvertVertices(uint32_t fvf, const void *src, uint32_t count, CanonicalVertex *dst,
                      uint32_t src_stride) {
   const uint32_t implied = FvfStride(fvf);

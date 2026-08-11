@@ -7142,3 +7142,513 @@ VFS is the loader.
 **Open product question, not a technical one:** whether Vulkan eventually becomes the only path. All
 in is simpler, but it makes a Vulkan-capable GPU a hard requirement for a mod to a 2000 game.
 Deferred until Phase 4.
+
+## 4.74 "The tube is inflated, not rounded" - and the two obvious causes it is not
+
+Reported from a screenshot: with `render.tessellation` on, a large pipe reads as **inflated** rather
+than as smoothed. Reproduced immediately on level02's settled camera - the pipe at the upper left
+balloons outward and its outer wall grows past the frame edge.
+
+Three candidate causes, in the order they were tested. Two of them are wrong, and both were wrong in
+a way that would have been easy to ship as a fix.
+
+### It is not a sign error
+
+`render.pn_strength = -1` pulls the surface **inward** and sharpens the bore's facets; `+1` pushes it
+out. Outward is the correct direction for a polygon whose vertices lie on the surface it
+approximates, so the construction's sign is right. Worth stating because "smoothing in the wrong
+direction" is the natural first reading, and because negating the normal cannot produce it either -
+the PN edge point is *quadratic* in `N`, so `-N` builds the identical control net.
+
+### It is not a crease, and it is not an inflection
+
+Both were implemented, measured and removed. Both were watertight and both were defensible:
+
+- **The crease guard** zeroes an edge whose two endpoint normals disagree by more than a limit, on
+  the argument that Gunlok has no smoothing groups so a rim's normals get averaged into the end cap.
+  Real, and negligible: 276 of 9,666 map half-edges at 60 degrees, and **zero pixels** different on
+  the pipe (MAD 0.0477 against the unguarded build, where tessellation's own effect is 2.83).
+- **The inflection guard** zeroes an edge whose two tangent terms carry opposite signs, i.e. where
+  the normals demand an S-bend inside one edge - which no arc does, and which a flat polygon carrying
+  uniformly-tilted corner normals always does. It fires on **4,764 of 9,666** half-edges on the CPU
+  and still changes nothing on screen, because `pn_flat_threshold` has already zeroed one side of
+  most of them and `0 * w` is not negative.
+
+The trap in both is the same: a count over the *normalised* term looks like a finding, and the census
+divides by edge length by design. Neither guard survives, and the plumbing that proved it is worth
+keeping - `render.pn_max_offset = 0` and `render.pn_strength = 0` both land at **0.0016** MAD against
+the untessellated frame, which is the identity floor and says the knob reaches the shader exactly.
+
+### What it actually is
+
+Sweeping `render.pn_flat_threshold` localises the pipe's whole contribution to normalised tangent
+terms of **0.2 to 0.35**:
+
+| `pn_flat_threshold` | 0.05 | 0.10 | 0.20 | 0.35 | 0.50 |
+|---|---|---|---|---|---|
+| MAD vs tessellation off | 2.818 | 2.755 | 1.817 | **0.004** | 0.002 |
+
+A term of `sin(θ/2)` means a turn of θ per edge, so 0.2-0.35 is **23 to 41 degrees** - exactly the
+cross-section of a ten- to sixteen-sided tube. The normals are asking for precisely the cylinder the
+artist approximated, and the patch is building it. Nothing is malfunctioning.
+
+**Why it reads as inflation is the viewing angle.** The pipe is seen almost tangentially - that is
+why its bore is visible at all - and near grazing incidence a displacement `δ` along the surface
+normal moves the *silhouette* by roughly `δ / sin(grazing angle)`. So a small, entirely legitimate
+bulge is amplified exactly where the eye reads an object's shape, and the surface that is 5% fatter
+in world space looks far more than 5% fatter on screen.
+
+### The ceiling, and the honest limit of it
+
+`pn_flat_threshold` is normalised by the edge length on purpose, so it means the same thing at every
+scale - and for that same reason it cannot bound an absolute distance. The census now reports the
+un-normalised quantity, which is the reading that was missing when §4.71 was written:
+
+```
+9666 half-edges, mean edge 1.952, mean offset 0.0261, worst 1.1040
+```
+
+A control point **1.104 world units** off its chord, against a 1.952-unit mean edge. So
+`render.pn_max_offset` caps `|w| / 3` in world units - clamped rather than zeroed, so an overshooting
+bulge becomes exactly the cap instead of snapping flat, and watertight for the reason the floor is: a
+function of `(Pi, Pj, Ni)` alone. It is in **both** shaders, because a colour pass that rounds a pipe
+while the shadow pass casts the inflated one is the same defect as the two knobs disagreeing.
+
+**It bounds the tail; it does not cure the complaint, and the sweep is why that claim is not made:**
+
+| `pn_max_offset` | 1000 | 0.30 | 0.20 | 0.12 | 0.08 | 0.05 | 0.03 |
+|---|---|---|---|---|---|---|---|
+| MAD vs tessellation off | 2.827 | 2.827 | 2.826 | 2.824 | 2.754 | 2.386 | 1.936 |
+| MAD vs uncapped | 0.000 | 0.000 | 0.001 | 0.016 | 0.409 | 1.873 | 2.363 |
+
+The picture only moves at 0.03-0.05, and by then most of the tessellation is gone everywhere. **The
+rounding and the inflation are the same displacement**, so no ceiling separates them. The default is
+0.08 - it caps 10.7% of level02's map half-edges and 23.6% of the frame's displacement for 0.41 MAD,
+which takes the 1.104-unit worst case off the table without visibly touching the rest.
+
+What actually trades the two off is the knob that was already there:
+
+| `pn_strength` | 1.00 | 0.75 | 0.50 | 0.35 |
+|---|---|---|---|---|
+| MAD vs tessellation off | 2.827 | 2.554 | 2.190 | 1.870 |
+
+### The instrument
+
+`render.normal_census` gained the whole un-normalised half of the reading - mean edge length, mean
+and worst control-point offset in world units, a split by how far the edge's two endpoint normals
+disagree, and what the current `pn_max_offset` would remove. That split is what killed the crease
+hypothesis in one run rather than in one build-and-look:
+
+| disagreement | half-edges | mean offset | worst |
+|---|---|---|---|
+| `<30 deg` | 8,820 | 0.0200 | 0.5322 |
+| `30-60` | 570 | 0.0786 | **1.1040** |
+| `60-90` | 266 | 0.0968 | 0.4943 |
+| `>=90` | 10 | 0.4747 | 0.6778 |
+
+**91% of the displacement is on edges whose normals agree within 30 degrees**, and the single worst
+offset in the frame is not in the crease classes at all. A guard aimed at the tail of that table can
+only ever move a few percent of the picture, which is what it measured.
+
+### What would actually fix it
+
+Nothing local. The normals describe a smooth cylinder, the mesh is an inscribed approximation of it,
+and PN triangles interpolate the former - correctly. The three real options are to accept it, to turn
+`pn_strength` down as a matter of taste, or to abandon interpolation for a scheme that preserves the
+authored silhouette instead of circumscribing it. None of those is a bug fix, and the reported
+symptom should be read as the feature working rather than as it failing.
+
+## 4.75 The lighting map's highlight was the one thing the fog of war could not hide
+
+A play report: **objects shine their specular colour even when in the fog of war.** The mechanism is
+structural and was in the shader from §4.48, so it is worth stating before any measurement.
+
+The fog of war is a **texture stage** (§4.51), not a D3D fog and not a pass of its own: stage 1 on
+the map's own draws, `BLENDTEXTUREALPHA(TEXTURE, CURRENT)` over a 256x256 `D3DFMT_A8` grid, which
+is `lerp(current, black, a)` - a darkening toward black by a per-texel amount. Everything the
+cascade consumes is therefore fogged for free, including the runtime map lighting of §4.55, which
+*replaces* the vertex colour the stages then modulate.
+
+The lighting map's highlight is not in the cascade. It is a specular term, so §4.48 added it after
+the stages, beside `D3DRS_SPECULARENABLE`'s own colour and after the alpha test:
+
+```
+current.rgb + specular_in + map_specular
+```
+
+which is exactly where D3D adds a specular - and so exactly where the fog cannot reach it. A
+surface the fog has taken to black keeps its full highlight, and unexplored ground is picked out in
+gloss.
+
+### The fix, and why it is not a knob
+
+The stage loop reads the mask out as it goes past, and the specular add is multiplied by it:
+
+```
+if (colour op == BLENDTEXTUREALPHA && arg1 == TEXTURE && arg2 == CURRENT)
+    fog_visibility *= 1.0 - tex.a;
+...
+current.rgb + specular_in + map_specular * fog_visibility
+```
+
+Three things about that, each a decision rather than a detail:
+
+- **The args are compared whole, not masked with `D3DTA_SELECTMASK`**, so a complemented or
+  alpha-replicated argument does not match and leaves `fog_visibility` at 1. §4.51 tallied every
+  stage-1 configuration in a level02 frame into three groups - the fog (71 draws), the chrome pass
+  (90), and none (112) - so that op with those two args names the fog and nothing else. Being
+  conservative here fails toward the previous behaviour rather than toward masking a highlight that
+  nothing is hiding.
+- **`specular_in` is left alone.** It is the fixed function's, and reproducing D3D means adding it
+  where D3D does, fog included. The highlight is ours, the fog stage is a visibility mask rather
+  than shading, and a term the game never authored has no business being the one thing that
+  survives it. (In practice `specular_in` is zero on every draw of this kind anyway: `LightSet_Ctor`
+  memsets the material, so a `LightSet`-driven draw has `Specular = 0`.)
+- **No `render.*` knob.** `render.lighting_maps = false` already A/Bs the whole feature and is still
+  bit-identical with this in, and `GpuFrameData` has no spare scalar - a fourth would cost sixteen
+  bytes to keep `cascades` on its boundary (§4.67). A bug/no-bug switch does not earn that.
+
+`fog_visibility` is 1 on every draw with no fog stage - every unit, every effect, the whole HUD -
+so this multiplies nothing outside the map's own geometry and nothing at all where the fog is off.
+
+### What was measured, which is less than the argument deserves
+
+Both builds, level02, fresh boot, settled start camera, paused, identical procedure. The start
+camera is normally **entirely unfogged** - everything on screen is inside the player units' own
+sight - so the fog was closed over it by clearing the three units' defogger flags
+(`units.clear_defogger`), which takes the frame's mean from **28.6 to 15.4**.
+
+| | |
+|---|---|
+| fixed vs unfixed, lighting maps ON, same fogged scene | **MAD 0.393 over 3.01% of the frame** |
+| the same two builds with lighting maps OFF - identical code, so this is the floor | **MAD 0.343 over 118,178 px** |
+
+So the change is worth about **0.05 MAD above the cross-launch floor** in the one fogged scene that
+could be constructed here, which is not a demonstration of the reported symptom. Two reasons it is
+kept anyway: the arithmetic above is not in question, and the scene understates it - Gunlok's
+`FOGVALUE` is **0.67**, so a third of the surface survives even where the fog is fully closed, and
+`world.fog.value = 1.0` was measured to change the frame by **nothing at all** (15.44 mean at both
+0.67 and 1.0), so the fully-black case this is really about was not reachable from the REPL.
+
+Three things that wasted a run here and are worth carrying:
+
+- **`world.fog.enabled = false` does not take.** The setter reaches `0x00472230` and `GetFogMode()`
+  keeps reading non-zero, on a paused game and a running one alike. §4.51's causal test ("fog off
+  takes that draw from 2 stages to 1") could not be reproduced through the JS accessor.
+- **The fog grid is only regenerated while the simulation runs** (`FOGUPDATE`, 10/s). Every fog
+  setting applied to a paused game reads back correctly and changes no pixel, which looks exactly
+  like a knob that does nothing.
+- **Nothing at level02's start camera is fogged**, so an A/B taken there measures the feature
+  against itself. `units.clear_defogger` on the three player characters is the cheapest way to make
+  a fogged frame, because the player units are the only defoggers.
+
+## 4.76 The per-frame shadow bake culls, and the bounds to do it with did not exist
+
+A RenderDoc capture of a played frame had **four render passes and one of them was almost all of
+the time**: the second depth-only pass, 4096², 54 viewports of 256² and 108 indirect commands.
+That is `BakeDynamicShadows` — 9 lights x 6 cube faces, and each of those 54 faces re-submitting
+the frame's whole caster list. 304 casters x 54 = **16,416 pieces of geometry**, against the sun
+pass's 1,216 and the world pass's 367. The level's own mesh, redrawn into every tile and thrown
+away by the scissor.
+
+Nothing rejected a caster. The bake built one command list and drew all of it into every face,
+whatever the distance and whatever the direction. Two tests fix that, and they are not the same
+test at two strengths:
+
+- the light's **sphere**, which answers for all six faces at once;
+- the face's **frustum**, extracted from `BuildCubeFaceMatrix`'s own matrix by Gribb-Hartmann so
+  the cull and the rasteriser cannot disagree about the projection. Its far plane is the range and
+  its near plane is `range / 64`, so it subsumes the sphere; the sphere is kept because it runs
+  once per light instead of six times.
+
+### What it cost to have a box at all
+
+**There was no per-draw geometry bound anywhere in the renderer**, and no obvious place to get
+one. The vertex arena is device-local and never mapped (§2c-i), so nothing downstream can read a
+position back; the frame's scratch is host-visible but **write-combined**, where a read-back costs
+more than the cull saves. The only moment a vertex is legible is the instant before it is staged.
+
+So the boxes are accumulated at every write, and read at draw submission:
+
+- **arena** — `VkResources` keeps one box per fixed block of 64 canonical vertices over the whole
+  arena, updated in `UploadIntoSlot`. 32 MB of arena is ~10,900 blocks and 262 KB. Per *block*
+  and not per buffer because level01 holds 417 vertex buffers against 3,131 index buffers: a draw
+  is a sub-range of a buffer, and a per-buffer box would be the whole level for every map draw.
+  `DrawIndexedPrimitive`'s own `MinIndex`/`NumVertices` is what turns an index range into a vertex
+  range, so it is now plumbed through `EmitDraw`.
+- **scratch, user-pointer** — taken in `EmitDrawUP` from the game's own vertices. Exact.
+- **scratch, a version parked mid-frame (§4.23)** — taken in `UploadVersionToScratch`, whole
+  buffer, because one version is read by several draws at offsets of their own.
+
+Position is the first 12 bytes of every layout `ConvertVertices` accepts, so `PositionBounds`
+needs only a stride and can walk the source instead of the converted copy. It refuses an XYZRHW
+layout by name: a pre-transformed vertex is in screen space and its box is not in any world the
+bake projects from.
+
+**Three ways of not knowing, all of which must read as "draw it".** A partially-written block
+whose untouched half this layer keeps no copy of, a layout with no usable position, and a range
+never uploaded. A box that is a superset of the truth costs a caster that could have been skipped;
+a box that is not costs a shadow, on one face of one light, which reads as a shadow bug rather
+than as a bounds bug. `dynamic_shadow_report` counts the unbounded casters per bucket for exactly
+that reason — and it earned it immediately (below).
+
+### Measured, level02's settled start, 5 lights and 171 casters
+
+| | caster-faces drawn | frame |
+|---|---|---|
+| pass off entirely | — | 23.04 / 23.26 ms |
+| cull on | **689 of 5,130 (13.4%)** | 23.42 / 23.42 ms |
+| cull off | 5,130 of 5,130 | 24.10 ms |
+
+~~So the pass is **0.95 ms unculled and 0.27 ms culled**~~ — **wrong, and §4.79 is why.**
+Those readings were taken on a frame sitting against a 60 Hz FIFO vsync ceiling, where 23.4 ms
+is the beat of a frame marginally over one 16.67 ms interval rather than a measurement of the
+work in it. Unthrottled, turning this whole pass off moves the frame by nothing at all.
+**The caster-face counts above stand** — they count what was submitted — but no millisecond
+figure may be read off that table. The capture that started this had 9 lights and 304 casters, 3.2x the caster-faces.
+
+**The picture is unchanged**, which is the only acceptable result: cull on against cull off is
+0.035% of pixels at a MAD of 0.0010, against a **repeat floor of 0.055% and 0.0103** — the same
+state shot twice differs by more. That comparison is `render.dynamic_shadow_cull`, and it is the
+whole A/B: this is not a fidelity knob and there is nothing to weigh.
+
+### Two things the counters caught that nothing else would have
+
+- **The first build culled 67.2%, not 13.4%**, because 93 of 171 casters had no box. The
+  per-bucket line said where they were in one read: `bucket 1: scratch vertices, scratch indices
+  - 92 casters, 92 with no bounds`. The arena half was working (78 of 79 bounded) and the entire
+  gap was the scratch path. "93 of 171 have no box" is not actionable; "the scratch bucket is all
+  of them" is, and it is the difference between removing a third of the work and removing seven
+  eighths.
+- **The direct path had been drawing the wrong geometry since §4.66**, on any frame with more than
+  one bucket. Commands were placed at `bucket.first + bucket.count++` while `ordered` stayed in
+  draw-list order, and `!DynShadowIndirect` indexed `ordered` by the bucket layout — so each
+  command's geometry was drawn against another bucket's index buffer and vertex address. Every
+  counter read correctly, because the *number* of draws was right. It survived because nothing
+  takes that path unless a device lacks `multiDrawIndirect`. `ordered` is now sorted into bucket
+  order and both paths walk one `survivors` array, so they draw the same set by construction
+  rather than by two copies of the cull agreeing. Direct against indirect is now 0.062% at a MAD
+  of 0.0110, i.e. the repeat floor.
+
+### The batch is per (light, face, bucket) now
+
+`vkCmdDrawIndexedIndirect` reads a **contiguous** run, and the survivors of a cull are a different
+subset on every face — so a caster that survives on four faces is four commands. The slice grew
+to `kDynMaxCommands` = 8192 (224 KB, x4 ring) and the upload is chunked, since one
+`vkCmdUpdateBuffer` takes at most 64 KB. It is deliberately **not** sized for the unculled worst
+case: a batch that large is the thing this exists to prevent, and `dynamic_shadow_report` states
+the drop rather than leaving it to be read off a frame time. An empty run is not submitted at all,
+so a light with nothing near it costs six viewports and no draws.
+
+**§4.61's static map atlas has the same shape and is not culled.** It bakes once per level rather
+than once per frame, so it costs nothing steady-state — but the same two tests would apply to it
+unchanged if a level ever made that bake long enough to notice.
+
+## 4.77 The sun's pass: one caster list for both, a cull per cascade, and an indirect batch
+
+§4.76 left the *first* depth-only pass in the capture untouched: 1,216 `vkCmdPushConstants` +
+`vkCmdDrawIndexed` pairs, 304 casters into each of four cascades, nothing rejected. Three changes,
+and the one that was asked for is not the one that paid.
+
+### One caster list
+
+The sun's pass spelled its caster test out inline; the per-frame bake reached the identical test
+through `IsDynamicCaster`. Nothing said they were the same and nothing would have caught them
+drifting. Both now call `IsShadowCaster` through one `CollectCasters`, which also does the bucket
+layout and the sort into bucket order that §4.76 added.
+
+**The sort reorders the draws, and that is only safe because these are depth-only passes**: the
+result is the minimum depth over the set, and a minimum does not care what order it was taken in.
+Nothing here may be reused for a colour pass on that basis.
+
+### The cull is exact here, and finds almost nothing
+
+The four cascades differ **only in x/y half-extent** - 8.75 / 17.5 / 35 / 70 by default, cascade 0
+being the sharp near one - while `FrameSunZNear` and `FrameSunZSpan` are shared and deliberately
+generous ("far enough back that the box always contains the geometry casting into it"). That
+removes the thing that usually makes caster culling wrong: there is no occluder outside the box
+along the light direction that still casts into it, because the depth range already spans
+everything. So `BuildFrustumPlanes` + `BoxOutsideFrustum` apply unchanged and the test is exact
+rather than approximate.
+
+And on level02's settled start it rejects **5 of 684**. Cascade 0's box is 17.5 world units across
+and still contains 166 of 171 casters. That is the scene, not a defect, and the sweep is what says
+so - the response is monotonic all the way down:
+
+| `shadow_extent` | cascade 0 half-extent | caster-cascades drawn |
+|---|---|---|
+| 70 (default) | 8.75 | 679 of 684 (99.2%) |
+| 20 | 2.50 | 617 (90.2%) |
+| 5 | 0.62 | 456 (66.6%) |
+| 2 | 0.25 | 284 (41.5%) |
+
+Level02's start is a dense interior and the camera sits in the middle of it. **A cull is worth what
+the scene's spread makes it worth**, and a directional light's cascade around the camera is the
+worst case for one: everything the camera can see is, by construction, near the camera.
+
+### Indirect submission: 684 draw calls to 8
+
+The shader needed nothing - `map_shadow_vertex` and `map_shadow_tess_vertex` already exist for the
+two bakes, and take the record and the arena slot from a parameter array indexed by `SV_DrawIndex`.
+The sun's pass gets its own pipelines against its own D32 format (dynamic rendering makes the
+attachment format part of the pipeline) and its own ring buffer (all three passes record into one
+command buffer, and `vkCmdUpdateBuffer` writes its bytes in order, so a shared slice would have
+whichever ran second overwrite the first).
+
+`sun_shadow_report` prints both counts, so "8 calls this pass, against 171 casters x 4 cascades
+unculled" is readable rather than inferred.
+
+### The bounds block went from 64 vertices to 8
+
+Culling at `shadow_extent = 2` still drew 66 of 171 casters into a **0.5-unit** box. That is not
+geometry; that is §4.76's block granularity. The arena's boxes are the union of fixed blocks, and
+at 64 vertices a block spans far more of a level than any one draw does.
+
+At 8 vertices - 2.1 MB of boxes for a 32 MB arena, against 262 KB - the same frame reads 46 rather
+than 66, and **the per-frame bake goes from 13.4% of caster-faces to 8.1%**. That is the larger
+result of this section, and it landed on the pass §4.76 had already optimised rather than on the
+one being worked on. A smaller block can never make a box smaller than the truth, so the
+conservatism argument is unchanged.
+
+### Measured, level02's settled start
+
+| | frame |
+|---|---|
+| both shadow passes off | 22.83 ms |
+| both on, cull on | 23.26 / 23.31 ms |
+| both on, cull off | 23.81 ms |
+
+~~The sun pass alone is ~0.35 ms of that~~ — **wrong for the reason §4.79 gives**: every row of
+that table is a vsync-limited frame, and unthrottled none of these knobs moves it. Which is why
+neither the cull nor the indirect batch shows up in a frame time on this scene - the pass was
+never the expensive one. §4.76's was.
+
+**The picture does not change**, which is the whole safety argument, and all four combinations
+were checked: cull on against off is 0.064% of pixels at 0.0025 MAD and indirect against direct is
+0.051% at 0.0019, against a **repeat floor of 0.066% and 0.0059**. Two knobs, four states, nothing
+above the noise of shooting the same state twice.
+
+A first attempt at that comparison read a repeat floor of **3.988%** and was thrown away. The
+camera had not settled - `Wait-CameraRest`'s three stable reads can be satisfied by a pause in an
+intro move. When the floor is the same order as the effect, the run says nothing, and the floor is
+the thing to read first.
+
+## 4.78 Could the world pass go indirect? The batching census says yes, and the frame says don't
+
+The two shadow passes went indirect because they are one pipeline, one viewport per tile and
+order-independent. The world pass is none of those, so the question is not "can a batch be built"
+but "how long is a batch allowed to be".
+
+**Runs must be consecutive.** `RecordDraws` records the list in the order the game issued it,
+because `RenderQueue_Flush` has already state-sorted the opaque draws and put the back-to-front
+list last (`rendering_notes.md` §4). Reordering to lengthen a run would break blending. So a run
+is a maximal *consecutive* stretch sharing everything one `vkCmdDrawIndexedIndirect` cannot vary:
+the pipeline, the three dynamic stencil values, the viewport and scissor, the index buffer and its
+type, and which buffer the vertices come from.
+
+`DrawStats::batch_runs` counts exactly that, and it changes nothing about what is submitted.
+Measured:
+
+| | draws | runs | mean | longest |
+|---|---|---|---|---|
+| level02, settled start | 268 | **11** | 24.4 | 92 |
+| level02, again | 267 | 10 | 26.7 | 92 |
+| level04 | 301 | **7** | 43.0 | 132 |
+
+So the world pass batches *very* well - 268 draw calls would become 11 - and it batches well for
+the reason the comment in `RecordDraws` already gives: the game state-sorted the list before we
+ever saw it. A renderer that sorted by pipeline itself could not do better without breaking
+blending, and this one does not have to.
+
+### And it is still not worth doing
+
+**§4.77 is the argument.** The sun's pass went from 684 draw calls to 8 - a bigger absolute
+reduction than the world pass's 268 to 11 - and moved **nothing measurable** in frame time. This
+frame is not submission-bound. Doing it again for a smaller saving buys the same nothing.
+
+Against that, the cost is much higher than either shadow pass's was:
+
+- **The fragment shader is involved.** `SV_DrawIndex` exists only in the vertex stage, and the
+  world's fragment shader reads `pc.material`. An indirect world pass has to carry the material
+  index across as a `nointerpolation` varying - and through the control point and domain on the
+  tessellated path, exactly as `shadow.slang` carries `record`. That is a change to the stage
+  every one of the renderer's ~30 measured features runs through.
+- **The pipeline set doubles.** `PipelineFor` would need an `indirect` bit in the key, taking
+  level04 from 10 pipelines to 20, or a hard switch with no fallback to A/B against.
+- The params array grows to three words - `record`, `material`, `base_vertex` - where the shadow
+  passes' is two.
+
+The census is kept because it is the thing that would change the answer: a scene whose runs
+average 1 would rule this out permanently, and one with several thousand draws on a CPU-bound
+frame would make it worth the shader change. Neither is level02 or level04 today.
+
+## 4.79 The 23 ms was vsync, and every frame-time A/B in §4.76-4.78 was taken against it
+
+Three sections of work removed thousands of pieces of geometry and hundreds of draw calls and
+moved the frame time by nothing. That is not a result about the work; it is a result about the
+instrument, and it should have been checked first.
+
+### What the 23 ms is
+
+`render.vulkan_report` said `present mode 2` and nobody read it. The surface on this machine
+offers **`immediate, fifo, other, fifo-relaxed` - and no MAILBOX**, so `ChoosePresentMode` takes
+its fallback, and its own comment says what that costs: "the game runs far above refresh
+(measured ~300 fps in level) and FIFO would otherwise throttle the whole engine loop to the
+monitor". The display is 60 Hz. So the frame has a **16.67 ms floor**, and a frame marginally over
+it beats between one interval and two and averages ~23. Every "23.4 ms" in §4.76 and §4.77 is that
+beat.
+
+`GKPLUS_VK_PRESENT_MODE=immediate|mailbox|fifo` is the override, launch-time only and not the
+default: IMMEDIATE tears, and unthrottling the loop changes the game's own timing rather than only
+what reaches the screen. The report now prints the mode by name and the modes the surface offered,
+because "present mode 2" is not a thing anyone reads.
+
+### What is under it
+
+Unthrottled, on level02's settled start, **nothing in the renderer is measurable**:
+
+| | ms/frame |
+|---|---|
+| baseline, everything on | 5.19 |
+| sun shadow pass off | 5.19 |
+| per-frame bake off | 5.19 |
+| both culls off | 5.13 |
+| sun indirect off | 5.19 |
+| per-pixel lighting off | 5.14 |
+| ... and 51 map lights off | 5.10 |
+| ... and lighting maps off | 5.12 |
+| ... and every shadow system off | 5.12 |
+
+**And `render.draw_hide` over the whole list - no world draws at all - reads the same as the
+baseline.** A frame that draws nothing costs what a frame that draws everything costs, so the
+renderer's GPU work is not the frame's cost on this scene at all.
+
+### Which leaves the CPU, and a gap worth chasing
+
+| | menu, no level | level02, settled |
+|---|---|---|
+| `GKPLUS_RENDERER=d3d8` | 19.75 ms | **4.25 / 4.26 ms** |
+| `GKPLUS_RENDERER=vulkan` | 19.75 ms | 5.1 - 23 ms, drifting |
+
+The **menu is identical in both**, which is the useful control: 19.75 ms with no level loaded is
+the game's own front-end loop and has nothing to do with either renderer.
+
+In level the two diverge, and the Vulkan side is not steady - one run settled at 5.13 ms, another
+sat at 17.39 after 45 s, and a third drifted from 23.2 to 11.4 over five consecutive eight-second
+windows with no knob touched. The staging ring is not the cause: 0 stalls and 0 flushes across all
+of it, with uploads tracking the game's own buffer churn at 30-38 a frame and 270-470 MB/s.
+
+The one thing the Vulkan path adds that **no knob turns off** is that upload path - `ConvertVertices`
+over every locked buffer, every frame, into the staging ring. It is the leading suspect and it is
+not yet measured. Whatever it is, it is CPU-side and it is not the renderer's drawing.
+
+### What this invalidates
+
+**The millisecond figures in §4.76 and §4.77 do not hold**, and they are corrected there rather
+than left standing. The *counts* in both sections are unaffected - a caster-face either was
+submitted or was not, and the cull removes 86.6% and 91.9% of them as measured. What cannot be
+claimed is that this bought 0.68 ms, or 0.95 against 0.27, or any other number read off a frame
+that was waiting for a vertical blank.
+
+The rule this earns: **read the present mode before quoting a frame time.** A frame-time A/B is
+only an instrument when the frame is free to get faster, and on this machine it was not.

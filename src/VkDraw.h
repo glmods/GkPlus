@@ -255,7 +255,11 @@ struct GpuFrameData {
   // sets a sub-rectangle is the upgrade screen (§4.47), which is not map geometry.
   float target_width;
   float target_height;
-  float pad_tess;
+  // How far a PN control point may leave its chord, in world units (§4.74) - the ceiling that
+  // stops a legitimate curve over a very long edge from reading as inflation.
+  // **This was `pad_tess`**: the cap needed a slot and this block is fixed at eight scalars,
+  // so it costs no size change and `cascades` stays on its 16-byte boundary.
+  float pn_max_offset;
   // Bit 0: D3D's point and spot lights are in the sum (`render.local_lights`, on by default).
   // Bit 1: the map lights sample the atlas above (`render.map_shadows`).
   // Bit 2: D3D's point and spot lights sample it too (`render.local_shadows`, §4.65).
@@ -557,6 +561,23 @@ struct DrawItem {
   DrawSource index_source = DrawSource::Arena;
   bool indexed = true;     // DrawPrimitiveUP has no indices at all
   uint8_t index_stride = 2; // 2 or 4, for the index type to bind
+  // The world-space box this draw's vertices occupy, for the shadow bakes to cull against.
+  //
+  // **`has_bounds == false` means "unknown", and every consumer must read it as "draw this"** -
+  // never as an empty box. Three things produce it and none of them is an error: a
+  // pre-transformed draw (whose vertices are in screen space, so a world box is meaningless), a
+  // draw whose vertices live in the frame's scratch rather than the arena (nothing accumulates
+  // boxes there), and an arena range whose blocks were only ever written in part. The bakes
+  // count what they could not bound, which is what keeps a coverage regression visible rather
+  // than merely slow.
+  //
+  // World space and not object space because the world matrix is only at hand in the capture
+  // layer: it lives in this draw's GpuDrawRecord, which is in the frame's scratch - host-visible
+  // and write-combined - and reading a matrix back out of that per caster per frame would cost
+  // more than the cull saves.
+  bool has_bounds = false;
+  float bounds_min[3] = {0, 0, 0};
+  float bounds_max[3] = {0, 0, 0};
 };
 
 struct DrawStats {
@@ -673,6 +694,22 @@ struct DrawStats {
   // How many draws cast into the sun's shadow map on the last frame that rendered one.
   uint64_t shadow_casters = 0;        // distinct pipeline states seen, i.e. VkPipelines created
   uint64_t pipeline_binds = 0;   // how often the bound pipeline changed within a frame
+  // How many CONSECUTIVE runs the frame's draws fall into, where a run is a maximal stretch
+  // sharing everything one `vkCmdDrawIndexedIndirect` would have to fix: the pipeline, the three
+  // dynamic stencil values, the viewport and scissor, the index buffer and its type, and which
+  // buffer the vertices come from.
+  //
+  // **This is the whole feasibility question for an indirect world pass**, and it is a
+  // measurement rather than an argument. Runs may only be consecutive here: the list is recorded
+  // in the order the game issued it because `RenderQueue_Flush` has already state-sorted the
+  // opaque draws and put the back-to-front list last, so reordering to lengthen a run would
+  // break blending. `runs` against `items` is the ceiling on what indirect submission could
+  // remove - a frame whose runs average 1 would pay indirect's overhead for nothing.
+  uint64_t batch_runs = 0;
+  uint64_t batch_longest = 0;    // the longest single run, for the shape of the distribution
+  // The draws those runs cover, THIS frame. Not `drawn`, which is cumulative - dividing a
+  // cumulative total by a per-frame count is the kind of ratio that looks plausible forever.
+  uint64_t batch_draws = 0;
   uint64_t pipeline_failures = 0; // must be 0: a state whose pipeline would not build
   uint64_t dropped_over_capacity = 0; // must be 0
 };
@@ -966,6 +1003,43 @@ bool DynamicShadowMapOnly();
 void SetDynamicShadowSample(bool enabled);
 bool DynamicShadowSample();
 
+// **A feature, on by default**: reject a caster the light cannot reach, and then one the cube face
+// does not contain, instead of drawing every caster into every face.
+//
+// Off is the build before it, and the pair is what prices it - the atlas must come out
+// **bit-identical** either way, because a cull that changes the picture is a cull that is wrong.
+// That is the whole A/B: this is not a fidelity knob and there is nothing to weigh, only a cost.
+//
+// It is a knob at all because the *bounds* it tests can be wrong in a way nothing else here would
+// show. A box that does not cover its geometry culls a caster that should have drawn, and the
+// symptom is one shadow missing from one face of one light - which reads as a shadow bug rather
+// than as a bounds bug. `off` is how that hypothesis gets tested in one command.
+void SetDynamicShadowCull(bool enabled);
+bool DynamicShadowCull();
+
+// --- the sun pass's own two (§4.77) -------------------------------------------------------------
+//
+// **Features, both on by default**, and the same rule as `dynamic_shadow_cull`: the atlas must
+// come out bit-identical whichever way either is set, so these are cost knobs with nothing to
+// weigh.
+//
+// `sun_shadow_cull` rejects a caster the cascade's box does not contain. The four cascades differ
+// only in x/y half-extent and share a deliberately generous depth range, which is what makes the
+// plane test exact rather than approximate - there is no occluder outside the box along the light
+// direction that still casts into it.
+//
+// `sun_shadow_indirect` submits the survivors as one `vkCmdDrawIndexedIndirect` per (cascade,
+// bucket) instead of a `vkCmdPushConstants` + `vkCmdDrawIndexed` pair per caster per cascade. It
+// reads back false on a device with no `multiDrawIndirect`, or if the pipeline could not be built,
+// and the direct path then draws the same culled set.
+void SetSunShadowCull(bool enabled);
+bool SunShadowCull();
+void SetSunShadowIndirect(bool enabled);
+bool SunShadowIndirect();
+// What the last pass offered, culled and submitted - including the per-cascade split, which is
+// where the halving of the cascade boxes becomes visible rather than assumed.
+std::string SunShadowReport();
+
 // --- the bisect knobs (§4.66) -------------------------------------------------------------------
 //
 // Four independent caps on how much of the bake actually runs, so the hang can be walked down to a
@@ -1166,6 +1240,17 @@ struct TessellationParams {
   // across the edge tests the identical number - which is why the threshold is on this quantity
   // and not on, say, the triangle's own flatness.
   float pn_flat_threshold = 0.02f;
+  // **The ceiling the flat threshold's floor could not reach** (§4.74): how far, in world units, a
+  // control point may sit off its chord. `pn_flat_threshold` is normalised by the edge length on
+  // purpose, so it means the same thing at every scale - and that is exactly why it cannot bound
+  // this. The bulge is `term * length / 3`, and Gunlok builds its round objects from very few,
+  // very long segments, so an entirely legitimate 0.3 term on a 3-unit pipe segment moves the
+  // surface half a unit and the pipe reads as inflated rather than rounded.
+  //
+  // In world units and not a fraction of the edge, because what it bounds is a distance on screen.
+  // A large number disables it; the A/B against `pn_strength = 0` is what separates "the ceiling
+  // is wrong" from "the curvature is wrong".
+  float pn_max_offset = 0.08f;
   // The shadow passes' factor, uniform over every edge - which makes those passes watertight for
   // free, since a constant cannot disagree with itself across a shared edge. Lower than the
   // colour pass's ceiling on purpose: a shadow map does not need silhouette detail the way a

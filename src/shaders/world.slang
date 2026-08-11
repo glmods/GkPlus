@@ -175,7 +175,9 @@ struct GpuFrameData {
     float pn_flat_threshold;
     float target_width;
     float target_height;
-    float pad_tess;
+    // The ceiling on how far a control point may leave its chord, in world units (§4.74).
+    // **This was `pad_tess`**, so it costs no size change and `cascades` stays on its boundary.
+    float pn_max_offset;
     // **Last, and it has to stay last** - the header's `offsetof` asserts pin `cascades` to 176
     // and nothing pins a field before it. This block sat above `dyn_shadow_texture` here while
     // the header had it below `pad1`, and the two disagreed for four fields with no diagnostic
@@ -1084,13 +1086,25 @@ ControlPoint hull_main(InputPatch<ControlPoint, 3> patch, uint id: SV_OutputCont
     return patch[id];
 }
 
-// The tangent term `dot(Pj - Pi, Ni)`, with the two knobs applied.
+// The tangent term `dot(Pj - Pi, Ni)`, with the floor, the ceiling and the strength applied.
 //
-// The threshold is tested on the term divided by the edge's length - the same quantity
-// `render.normal_census` reports - so it means the same thing on a large triangle and a small
-// one. Both operations are functions of (Pi, Pj, Ni) alone, so the watertight property survives
-// them: the triangle on the other side of edge (i,j) computes, tests and snaps the identical
-// number.
+// The floor is tested on the term divided by the edge's length - the same quantity
+// `render.normal_census` reports - so it means the same thing on a large triangle and a small one.
+// The ceiling is the opposite: it is in WORLD UNITS and deliberately does not scale with the edge,
+// because what it exists to bound is a distance on screen.
+//
+// **Why a ceiling is needed at all** (§4.74). The construction is not wrong here and the normals
+// are not creases: on level02's pipe the tangent terms measure 0.2 to 0.35, which is a 23 to 41
+// degree turn per edge - exactly the cross-section of a ten- to sixteen-sided tube, and the
+// normals are asking for precisely the cylinder the artist approximated. The trouble is that
+// `w * length / 3` has no bound: Gunlok builds its round objects from very few, very long
+// segments, so honouring a legitimate 0.3 term over a 3-unit edge moves the surface half a unit
+// and the pipe reads as inflated rather than as rounded. `pn_flat_threshold` cannot reach this -
+// it is a floor, and this is a failure at the ceiling.
+//
+// Every operation is a function of (Pi, Pj, Ni) alone, so the watertight property survives all
+// three: the triangle on the other side of edge (i,j) computes, tests, snaps and clamps the
+// identical number.
 float pn_weight(float3 pi, float3 pj, float3 ni) {
     const float3 edge = pj - pi;
     const float length_sq = dot(edge, edge);
@@ -1104,7 +1118,11 @@ float pn_weight(float3 pi, float3 pj, float3 ni) {
     if (w * w <= threshold * threshold * length_sq) {
         return 0.0; // near enough flat that the corner is made exactly flat
     }
-    return w * pc.frame[0].pn_strength;
+    // Clamped and not zeroed: a bulge that merely overshoots the cap becomes exactly the cap, so
+    // the surface stays continuous as an object grows across the limit instead of snapping flat.
+    // The control point moves `|w| / 3`, so the cap on `w` is three times the cap on the distance.
+    const float limit = 3.0 * pc.frame[0].pn_max_offset;
+    return clamp(w, -limit, limit) * pc.frame[0].pn_strength;
 }
 
 // **The spacing and the winding are repeated here on purpose.** In HLSL they are hull-shader
@@ -1540,6 +1558,18 @@ float4 fragment_main(VertexOut input) : SV_Target {
     // bound at stage 0, because the old path keyed off the binding rather than off COLOROP.
     float4 current = diffuse;
 
+    // How much of the surface the FOG OF WAR leaves visible, 1 fully discovered and 0 fully
+    // hidden. It is not a knob and not a second sampler: the fog is a texture stage, and this is
+    // read out of the cascade as it runs (§4.51 measured every stage-1 configuration in a level02
+    // frame into three groups - the fog, the chrome pass, and none - so `BLENDTEXTUREALPHA` with
+    // `(TEXTURE, CURRENT)` names the fog and nothing else). The grid is `D3DFMT_A8`, so the
+    // stage is `lerp(current, black, tex.a)` and `1 - tex.a` is exactly what survived.
+    //
+    // What it is FOR is below, at the specular add: the lighting map's highlight is added after
+    // the stages, so without this it is the one part of the surface the fog cannot hide, and a
+    // player sees unexplored ground picked out in gloss.
+    float fog_visibility = 1.0;
+
     for (uint i = 0u; i < material.stage_count && i < 2u; ++i) {
         const Stage s = stage_at(material, i);
         // The chrome pass's reflect layer, which is always stage 1 - the unit's own texture is
@@ -1575,6 +1605,16 @@ float4 fragment_main(VertexOut input) : SV_Target {
                              ? textures[s.texture].SampleBias(samplers[s.sampler_index], uv,
                                                               chrome_lod)
                              : textures[s.texture].Sample(samplers[s.sampler_index], uv));
+        }
+
+        // The fog of war, read as it goes past: `BLENDTEXTUREALPHA(TEXTURE, CURRENT)` on an
+        // alpha-only grid. The args are compared whole rather than masked with D3DTA_SELECTMASK,
+        // so a complemented or alpha-replicated argument does NOT match and leaves this at 1 -
+        // the fog stage names neither, and treating some other blend as the fog would mask a
+        // highlight that nothing is hiding.
+        if ((s.color & 0xffu) == 13u && ((s.color >> 8) & 0xffu) == 2u &&
+            ((s.color >> 16) & 0xffu) == 1u) {
+            fog_visibility *= 1.0 - tex.a;
         }
 
         // Colour and alpha both read the state from BEFORE this stage, so `current` is
@@ -1629,7 +1669,20 @@ float4 fragment_main(VertexOut input) : SV_Target {
     // ... and the lighting map's highlight rides beside it, in the same place and for the same
     // reason: it is a specular term, so it is added after the stages rather than modulated by
     // them, and after the alpha test so it cannot change which fragments survive.
-    const float4 lit = float4(current.rgb + specular_in + map_specular, current.a);
+    //
+    // **But it is masked by the fog of war, where D3D's own specular would not be.** That is not
+    // an inconsistency: `specular_in` is the fixed function's, and reproducing it means adding it
+    // exactly where D3D does - after every stage, fog included. The highlight is OURS, and the
+    // fog stage is a visibility mask rather than shading, so a term the game never authored has
+    // no business being the one thing that survives it. Left unmasked it draws the unexplored
+    // parts of a level in gloss, which is what a play report described as objects shining
+    // through the fog of war.
+    //
+    // `fog_visibility` is 1 on every draw with no fog stage - which is every unit, every effect
+    // and the whole HUD - so this multiply changes nothing outside the map's own geometry, and
+    // nothing at all on a level whose fog is off.
+    const float4 lit =
+        float4(current.rgb + specular_in + map_specular * fog_visibility, current.a);
 
     // The material override's tint, last: after the stages, after the alpha test and after the
     // specular add. It is the only thing in this shader the game did not ask for, and it is

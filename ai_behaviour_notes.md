@@ -353,7 +353,28 @@ hears further**. A stimulus inside range with the right bearing sets `ai_state =
 ## 7. The cone renderer and the colour map
 
 Drawn from `DrawOrderMenu` @ 0x00498610 (a 0x3c21-byte function that is far more than a menu).
-Two gates first:
+It is called **every frame, unconditionally**, from `RunInGameFrame` @ 0x0046e8ca — the name is
+misleading — and it walks the client Units table **twice**. The cones and circles are in the
+*second* walk, and that whole walk is gated on one global that none of the rest of this section
+mentions:
+
+- **`ReconModeActive` @ 0x007b9ca1 must be non-zero.** Tested at 0x0049a063; a zero jumps clean
+  over the second walk to the epilogue, so **no cone or range circle is ever drawn outside Recon
+  Mode**. It is `.bss`, so it starts at 0, and the only way to set it is the key bound to
+  "Toggle Recon Mode on/off" (default **ENTER**, DIK 28) -> `ToggleReconMode` @ 0x004976d0.
+  **No console command reaches it**, and `LoadGame` @ 0x00505b28 restores it from a save.
+  `EnterCutsceneMode` @ 0x00487f3f forces it on. That the flag means *recon* rather than *normal*
+  is settled by the GLS wait-condition table: the records at 0x0066a1ec (`NORMAL VIEW MODE`) and
+  0x0066a200 (`RECON VIEW MODE`) share the predicate 0x0056fe40 and differ only in the expected
+  value, 0 and 1.
+
+  Measured in the running game: pressing the bound key with **nothing selected does nothing**, and
+  with a character selected it takes level02's start frame from 278 draws to 147 and moves the
+  camera to the overhead green view. So a selection is a further precondition somewhere on
+  `ToggleReconMode`'s path; where was not chased.
+
+`orders_notes.md` line 103 already listed that binding; nothing had connected it to the cone
+renderer. Then two more gates:
 
 - **`VisionConesEnabled` @ 0x007b4708** — a byte, console `VISION on|off`
   (`CommandVision` @ 0x00442e00 -> `SetVisionConesEnabled` @ 0x004a0eb0, getter 0x004a0ec0).
@@ -399,7 +420,11 @@ set the flags, 75 set both to `no` and 3 set both to `yes`.
 
 `DrawOrderMenu` also runs a second block at 0x0049b4c0-0x0049b684 which finds the nearest unit
 (within `2500.0` @ 0x006a5b4c) whose vision or hearing is drawn — the HUD "you are being
-scanned" indicator — and an unidentified second gate `DAT_006a373e` at 0x0049b34e / 0x0049baca.
+scanned" indicator — and **`ShowRangeRingsToggle` @ 0x006a373e** at 0x0049b34e / 0x0049baca. That
+byte is the key bound to "Toggle vision cones on/off" (default DIK 83, numpad `.`, binding
+`KeyBinding_ToggleVisionCones` @ 0x007b74c0); it lives in `.data` and **its initial value is 1**,
+so it is on until the player turns it off. The read at 0x0049b34e is not itself a gate — it only
+clears `Unit+0x154` when the toggle is off; 0x0049baca and 0x0049bc72 are the gates.
 
 ---
 
@@ -498,7 +523,9 @@ are `Character` bools, and `src/Roles.h` already mirrors them correctly at 0x81/
   measurement.
 - **`DAT_007ba058`**, the list `PostAiStimulus` walks to wake listeners, is not identified; it
   is a `List<Actor*>` but its membership rule was not read.
-- **`DAT_006a373e`**, the second gate in the cone renderer, is unidentified.
+- The **selection precondition on Recon Mode** is not located. Pressing the bound key with nothing
+  selected leaves `ReconModeActive` clear (measured in the running game); which of
+  `ToggleReconMode`'s six callers or which test inside it enforces that was not read.
 - **`IsWithinElevationLimit` @ 0x005420a0 has no xrefs at all** — not a vtable slot in any of
   the five Actor vtables checked, and no call site. It may be dead.
 - The **behaviour dispatch table at 0x00455250** (nine handlers) was not decompiled; the
