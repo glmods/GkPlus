@@ -7821,3 +7821,70 @@ The next step is therefore a measurement, not a guess: count the FVFs that reach
 case and expose them beside `fvfs`. Worth ~0.3 ms of a 5.58 ms frame. Adding plausible-looking
 layouts to the switch without that census would be guessing, and the existing census is the reason
 to distrust the guess.
+
+## 4.83 The layout census, the 66% nobody had counted, and a specialization that did nothing
+
+§4.82 left the **generic** conversion loop as the hottest function in the profile, larger than
+every specialization together, with the cause unexplained and one wrong guess already spent on it
+(masking the FVF, which changed nothing). The way out was to stop guessing: count what
+`ConvertVertices` is handed, since nothing did.
+
+`render.stats.converted_layouts` is that census. It is counted **inside** the converter rather than
+at its call sites, so no caller can be forgotten, and it reports calls, vertices, and whether the
+layout has a dispatch of its own. Level02, settled:
+
+| layout | | calls | vertices | v/call | specialized |
+|---|---|---|---|---|---|
+| 0x004 | XYZRHW alone | 49,277 | **222,207,392** | 4,509 | **no** |
+| 0x1c4 | XYZRHW\|DIFFUSE\|SPECULAR\|1uv | 26,834 | 37,067,935 | 1,381 | yes |
+| 0x252 | XYZ\|NORMAL\|DIFFUSE\|2uv | 629,159 | 28,464,688 | 45 | yes |
+| 0x002 | XYZ | 5,941 | 12,848,715 | 2,163 | yes |
+| 0x152 | XYZ\|NORMAL\|DIFFUSE\|1uv | 3,652 | 10,238,967 | 2,804 | yes |
+| 0x112 | XYZ\|NORMAL\|1uv | 13,899 | 4,249,718 | 306 | yes |
+| 0x142 | XYZ\|DIFFUSE\|1uv | 3,558 | 1,821,696 | 512 | **no** |
+| 0x212 | XYZ\|NORMAL\|2uv | 6,911 | 161,324 | 23 | yes |
+
+**0x004 is 66% of every vertex this renderer converts, and it had never been on any list.** §4.1
+enumerated the FVFs *by draw*, where 0x252 is 10.8M of 12.6M and 0x004 does not appear at all -
+it is 49K calls against 629K. By vertices it is eight times 0x252, because it arrives in
+4,500-vertex batches. A per-draw census cannot see this, and `render.stats.fvfs` cannot either:
+that one is keyed on the `SetVertexShader` handle, while the buffered path converts with the FVF
+`CreateVertexBuffer` was given, which nothing counted.
+
+### The specialization was the obvious fix and it did nothing
+
+Adding 0x004 and 0x142 to the dispatch is a two-line change and the measurement refuses it:
+
+| | medians | mean |
+|---|---|---|
+| census, 6 specializations | 5.72, 5.81, 5.71 | 5.75 |
+| census, 8 specializations | 5.72, 5.71 | 5.72 |
+
+The distributions overlap; there is no effect to see. (A first reading of this called the
+specialization *slower*, which was wrong - it compared an 8-specialization build against a
+6-specialization build **from before the census existed**, so it was measuring the census.
+Two changes, one comparison. The like-for-like rows above are what the pairs cost.)
+
+So the generic loop's cost was never the branching, which is the assumption §4.82 carried in and
+this section retires. For 0x004 the body reads 16 bytes and writes 48, of which 32 are constants,
+into write-combined scratch - and a ninth instantiation cannot make a byte move faster. **The
+remaining cost of `ConvertVertices` is data movement, and the only thing that would shift it is
+converting fewer vertices.** 222M of them for untextured, uncoloured, already-screen-space
+geometry is the number worth being suspicious of; what submits it, and whether the canonical
+48-byte vertex is the right destination for a layout carrying 16 bytes of information, is the
+next question - and it is a design question, not a loop.
+
+### What the census itself costs
+
+As `std::atomic` with relaxed adds it cost about 0.15 ms of a 5.7 ms frame. `ConvertVertices` runs
+on both game threads (§4.72), so two `lock xadd`s land on the same two lines from two cores and
+the cost is cache-line ping-pong, not the instructions. Plain `uint64_t` counters recover most of
+it - 5.68, 5.67, 5.72 against the atomic 5.71-5.81 - and are the same trade `CaptureDiagLock`'s
+comment already draws for `TheStats`: a lost increment costs a count in a diagnostic and nothing
+reads one to decide anything, while the failure a lock prevents (a container corrupting) cannot
+happen to a fixed 64-entry array that never allocates or rebalances.
+
+The honest residual is that the no-census build was measured once, at 5.58, against three plain
+census runs averaging 5.69. That gap is roughly one measurement's worth of spread and is not
+firmly established; the census is kept because it is the only thing that will catch this class of
+mistake again, on a level whose layout mix differs.

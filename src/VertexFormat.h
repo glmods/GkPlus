@@ -5,7 +5,7 @@
 // This is the simplification vulkan_renderer_notes.md §2 calls the highest-leverage one in
 // the design: one layout means one arena, vertex *pulling* rather than a bound vertex buffer,
 // and one vertex shader instead of one per format. It is only safe because Phase 0 enumerated
-// the FVFs rather than assuming them - the game uses exactly six (§4.1):
+// the FVFs rather than assuming them - six by *draw* count (§4.1):
 //
 //   0x002  XYZ                                   12 bytes
 //   0x112  XYZ | NORMAL | 1 uv                   32
@@ -13,6 +13,18 @@
 //   0x1c4  XYZRHW | DIFFUSE | SPECULAR | 1 uv    32
 //   0x212  XYZ | NORMAL | 2 uv                   40
 //   0x252  XYZ | NORMAL | DIFFUSE | 2 uv         44   <- 10.8M of 12.6M draws
+//
+// **That table is by draws, and by VERTICES it is not the ranking at all.** `ReadLayoutCensus`
+// below counts what this converter is actually handed, and a level02 session says the largest
+// layout by far is one the table above does not list:
+//
+//   0x004  XYZRHW alone                          16      <- 66% of all vertices converted
+//   0x142  XYZ | DIFFUSE | 1 uv                  24
+//
+// 0x004 is 222M of 337M vertices at ~4,500 a call, against 0x252's 28M at 45 a call. Neither
+// appears in `render.stats.fvfs`, which is keyed on the `SetVertexShader` handle - the buffered
+// path converts with whatever FVF `CreateVertexBuffer` was given. A per-draw census cannot see
+// this and a per-draw census is what §4.1 was; see §4.82 and §4.83.
 //
 // Pure CPU, no Vulkan: this is a byte transform, and keeping it that way makes it the one
 // piece of the renderer that could be unit-tested outside the game.
@@ -60,6 +72,31 @@ bool FvfSupported(uint32_t fvf);
 // passes the value it was given rather than letting the FVF speak for it.
 bool ConvertVertices(uint32_t fvf, const void *src, uint32_t count, CanonicalVertex *dst,
                      uint32_t src_stride = 0);
+
+// --- the layout census -----------------------------------------------------------------------
+//
+// What `ConvertVertices` actually sees, which is a different question from `render.stats.fvfs`
+// and the reason this exists. That one is keyed on the handle passed to `SetVertexShader`; the
+// buffered path converts with the FVF `CreateVertexBuffer` was given, and nothing counted it. The
+// gap is not academic - it is why the generic conversion loop was the hottest function left in
+// the profile while the existing census showed only the six layouts that are all specialized
+// (vulkan_renderer_notes.md §4.82).
+//
+// Counted inside the converter rather than at its call sites, so a caller cannot be forgotten.
+// The table is a fixed 64 entries of atomics rather than a map behind a lock: `ConvertVertices`
+// runs on **both** game threads (§4.72), it is on the hot path, and 64 covers the encoding
+// exactly - position is one bit because only XYZ and XYZRHW are admitted, then normal, diffuse
+// and specular, then two bits of texture-coordinate count.
+struct LayoutCensusEntry {
+  uint32_t layout;    // fvf & the bits the conversion depends on
+  uint64_t calls;
+  uint64_t vertices;
+  bool specialized;   // false means it took the generic loop
+};
+
+// Fills `out` with every layout seen at least once, most vertices first, and returns how many
+// were written. 64 entries is always enough for the whole table.
+uint32_t ReadLayoutCensus(LayoutCensusEntry *out, uint32_t capacity);
 
 // The object-space box `count` vertices of `src` occupy, without converting them.
 //

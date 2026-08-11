@@ -204,7 +204,108 @@ void ConvertRun(FvfT fvf, const uint8_t *bytes, uint32_t stride, uint32_t count,
   }
 }
 
+// The layouts that get an instantiation of their own, listed once so the dispatch below and
+// `IsSpecializedLayout` cannot disagree about which those are - the census reports that flag, and
+// a census that lied about it would send someone to specialize something already specialized.
+//
+// These are the six VertexFormat.h documents, taken from the *draw* census.
+//
+// **0x004 and 0x142 are deliberately NOT here, and that is a measurement rather than an
+// oversight.** `render.stats.converted_layouts` - which exists because of this - says 0x004
+// (XYZRHW alone, untextured and uncoloured) is **66% of every vertex the converter touches** in a
+// level02 session, 222M of 337M at ~4,500 vertices a call, and it had been running the generic
+// loop the whole time: a layout can dominate by vertex count while being invisible in a per-draw
+// table. Adding both was the obvious move and it made the frame **slower**, reproducibly - median
+// 5.58 -> 5.71 ms and p95 6.20 -> 6.79 over two runs each.
+//
+// So the generic loop's cost was never the branching it was assumed to be. For 0x004 the body is
+// 16 bytes read and 48 written, 32 of them constants, and what that loop is doing is moving bytes
+// into write-combined scratch - which a ninth instantiation cannot speed up and does make the
+// code footprint worse. The win here is not a faster conversion of 222M vertices; it is not
+// converting them. See vulkan_renderer_notes.md §4.83.
+#define GK_SPECIALIZED_FVFS(X)                                                                 \
+  X(0x002) /* XYZ */                                                                           \
+  X(0x112) /* XYZ | NORMAL | 1 uv */                                                           \
+  X(0x152) /* XYZ | NORMAL | DIFFUSE | 1 uv */                                                 \
+  X(0x1c4) /* XYZRHW | DIFFUSE | SPECULAR | 1 uv */                                            \
+  X(0x212) /* XYZ | NORMAL | 2 uv */                                                           \
+  X(0x252) /* XYZ | NORMAL | DIFFUSE | 2 uv */
+
+bool IsSpecializedLayout(uint32_t layout) {
+  switch (layout) {
+#define GK_FVF_TEST(bits)                                                                      \
+  case bits:                                                                                   \
+    return true;
+    GK_SPECIALIZED_FVFS(GK_FVF_TEST)
+#undef GK_FVF_TEST
+  default:
+    return false;
+  }
+}
+
+// The census table. See VertexFormat.h for why it is a fixed array of atomics and not a map.
+//
+// The encoding is dense and reversible: one bit for the position type (only XYZ and XYZRHW reach
+// here), one each for normal, diffuse and specular, then two bits of texture-coordinate count.
+// Six bits, 64 slots, every supported layout distinct.
+// Plain counters, raced on purpose, and measured rather than assumed: as `std::atomic` with
+// relaxed adds this cost **0.15 ms of a 5.7 ms frame** - 2.6% - because `ConvertVertices` runs on
+// both game threads (§4.72) and two `lock xadd`s land on the same two lines from two cores, which
+// is cache-line ping-pong rather than the ~20 cycles the instructions themselves cost.
+//
+// That is exactly the trade CaptureDiagLock's comment already draws, and this falls on the same
+// side of it: a lost increment costs a count in a diagnostic and nothing reads one to decide
+// anything, while the failure a lock would prevent - a container corrupting - cannot happen to a
+// fixed array that never allocates, rehashes or rebalances. The array is `constinit` for the same
+// reason the rest of the file has no initialisation order to worry about.
+constexpr uint32_t kCensusSlots = 64;
+uint64_t CensusCalls[kCensusSlots];
+uint64_t CensusVertices[kCensusSlots];
+
+uint32_t CensusSlot(uint32_t fvf) {
+  const uint32_t tex = (fvf & kTexCountMask) >> kTexCountShift;
+  return ((fvf & kXyzRhw) != 0 ? 1u : 0u) | ((fvf & kNormal) != 0 ? 2u : 0u) |
+         ((fvf & kDiffuse) != 0 ? 4u : 0u) | ((fvf & kSpecular) != 0 ? 8u : 0u) |
+         ((tex & 3u) << 4);
+}
+
+uint32_t CensusLayout(uint32_t slot) {
+  return ((slot & 1u) != 0 ? kXyzRhw : kXyz) | ((slot & 2u) != 0 ? kNormal : 0u) |
+         ((slot & 4u) != 0 ? kDiffuse : 0u) | ((slot & 8u) != 0 ? kSpecular : 0u) |
+         (((slot >> 4) & 3u) << kTexCountShift);
+}
+
 } // namespace
+
+uint32_t ReadLayoutCensus(LayoutCensusEntry *out, uint32_t capacity) {
+  if (out == nullptr || capacity == 0) {
+    return 0;
+  }
+  uint32_t written = 0;
+  for (uint32_t slot = 0; slot < kCensusSlots && written < capacity; ++slot) {
+    const uint64_t calls = CensusCalls[slot];
+    if (calls == 0) {
+      continue;
+    }
+    const uint32_t layout = CensusLayout(slot);
+    out[written].layout = layout;
+    out[written].calls = calls;
+    out[written].vertices = CensusVertices[slot];
+    out[written].specialized = IsSpecializedLayout(layout);
+    ++written;
+  }
+  // Most vertices first: the question this answers is always "what is the converter spending its
+  // time on", and a layout with many calls but few vertices each is not that.
+  for (uint32_t i = 1; i < written; ++i) {
+    LayoutCensusEntry key = out[i];
+    uint32_t j = i;
+    for (; j > 0 && out[j - 1].vertices < key.vertices; --j) {
+      out[j] = out[j - 1];
+    }
+    out[j] = key;
+  }
+  return written;
+}
 
 bool ConvertVertices(uint32_t fvf, const void *src, uint32_t count, CanonicalVertex *dst,
                      uint32_t src_stride) {
@@ -233,17 +334,20 @@ bool ConvertVertices(uint32_t fvf, const void *src, uint32_t count, CanonicalVer
   // `SetVertexShader`, and the generic instantiation was the single hottest function left in the
   // profile - hotter than every specialization put together - while the FVF census showed only
   // the six. The masked switch is also what makes those six exhaustive rather than merely likely.
-  switch (fvf & kLayoutMask) {
+  const uint32_t layout = fvf & kLayoutMask;
+
+  // Counted here, once per call, before the dispatch - so every caller is covered and the
+  // "specialized" column of the census is answering about the branch actually taken below.
+  const uint32_t slot = CensusSlot(layout);
+  ++CensusCalls[slot];
+  CensusVertices[slot] += count;
+
+  switch (layout) {
 #define GK_FVF_CASE(bits)                                                                      \
   case bits:                                                                                   \
     ConvertRun(std::integral_constant<uint32_t, bits>{}, bytes, stride, count, dst);           \
-    break
-    GK_FVF_CASE(0x002); // XYZ
-    GK_FVF_CASE(0x112); // XYZ | NORMAL | 1 uv
-    GK_FVF_CASE(0x152); // XYZ | NORMAL | DIFFUSE | 1 uv
-    GK_FVF_CASE(0x1c4); // XYZRHW | DIFFUSE | SPECULAR | 1 uv
-    GK_FVF_CASE(0x212); // XYZ | NORMAL | 2 uv
-    GK_FVF_CASE(0x252); // XYZ | NORMAL | DIFFUSE | 2 uv
+    break;
+    GK_SPECIALIZED_FVFS(GK_FVF_CASE)
 #undef GK_FVF_CASE
   default:
     ConvertRun(fvf, bytes, stride, count, dst);

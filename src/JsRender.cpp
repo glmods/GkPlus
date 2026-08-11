@@ -16,12 +16,44 @@
 #include "VkLighting.h"
 #include "VkRenderer.h"
 #include "MapLights.h"
+#include "VertexFormat.h"
 #include "VkResources.h"
 
 #include <iterator>
 
 namespace gk::js {
 namespace {
+
+// The vertex converter's layout census as an array of {layout, calls, vertices, specialized},
+// most vertices first. An array rather than an object keyed by layout because the ORDER is the
+// answer here - the top row is what the converter spends its time on.
+JSValue LayoutCensusToArray(JSContext *ctx) {
+  vulkan::LayoutCensusEntry entries[64];
+  const uint32_t count =
+      vulkan::ReadLayoutCensus(entries, static_cast<uint32_t>(std::size(entries)));
+  JSValue array = JS_NewArray(ctx);
+  if (JS_IsException(array)) {
+    return array;
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    JSValue row = JS_NewObject(ctx);
+    if (JS_IsException(row)) {
+      JS_FreeValue(ctx, array);
+      return JS_EXCEPTION;
+    }
+    JS_SetPropertyStr(ctx, row, "layout", JS_NewUint32(ctx, entries[i].layout));
+    JS_SetPropertyStr(ctx, row, "calls",
+                      JS_NewInt64(ctx, static_cast<int64_t>(entries[i].calls)));
+    JS_SetPropertyStr(ctx, row, "vertices",
+                      JS_NewInt64(ctx, static_cast<int64_t>(entries[i].vertices)));
+    JS_SetPropertyStr(ctx, row, "specialized", JS_NewBool(ctx, entries[i].specialized));
+    if (JS_SetPropertyUint32(ctx, array, i, row) < 0) {
+      JS_FreeValue(ctx, array);
+      return JS_EXCEPTION;
+    }
+  }
+  return array;
+}
 
 // A std::map<uint32_t, T> as a JS object keyed by the decimal number. Keys are D3D enum
 // values, so they stay numbers rather than being decoded to names - the whole point of the
@@ -1199,6 +1231,11 @@ JSValue GetStats(JSContext *ctx, JSValueConst) {
   // fvfs and primitive_types map value -> how many draws used it; the state maps go to the
   // COUNT of distinct values seen, which is what says whether a state is a constant.
   put("fvfs", MapToObject(ctx, s.fvf_counts, CountValue));
+  // `fvfs` above is keyed on the SetVertexShader handle. `converted_layouts` is what the vertex
+  // converter was actually handed, which is a different set - the buffered path converts with
+  // the FVF CreateVertexBuffer was given - and `specialized` says whether that layout has a
+  // dispatch of its own or fell to the generic loop. See vulkan_renderer_notes.md §4.82.
+  put("converted_layouts", LayoutCensusToArray(ctx));
   put("primitive_types", MapToObject(ctx, s.primitive_type_counts, CountValue));
   put("texture_formats", MapToObject(ctx, s.texture_formats, CountValue));
   put("texture_pools", MapToObject(ctx, s.texture_pools, CountValue));
