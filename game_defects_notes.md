@@ -20,6 +20,8 @@ Gunlok*, which is an appendix and not a defect — and never renumber an existin
 | 8 | `Font_QueueText` dereferences null when its node allocation fails | out-of-memory |
 | 9 | `ToRole` dereferences a null `Hierarchy` for a missing `.rif` | a role whose `.rif` is absent |
 | 10 | ambient sound volume (`V` in a `DUMOBJTX`) is parsed and discarded | every level in the game |
+| 11 | the pool allocator's critical section is gated on a flag nothing sets | every allocation |
+| 12 | the HUD's meters and item icons are drawn under the world's depth slice | every frame of every level |
 
 ---
 
@@ -714,6 +716,115 @@ The only fix that would cover every caller is to `InitializeCriticalSection(0x00
 and then set 0x007c066c to 1 - turning on the lock the developers wrote. Not done: it changes the
 behaviour of every allocation in the process to fix a hazard nothing has yet been shown to hit,
 and the critical section's own initialisation state is unknown.
+
+---
+
+## 12. The HUD's meters and item icons are drawn under the world's depth slice
+
+**Status:** fixed in GkPlus by `HudFixSystem` (`src/HudFix.cpp`). `GKPLUS_HUD_FIX=raw` restores
+the game's own behaviour.
+
+**Severity:** cosmetic, but total — in the shipped game **no character's health meter, armour
+meter or item icons are ever visible**, in any level, for the whole game. The panel plate behind
+them is drawn opaquely on top, so the meter troughs and the item slots read as empty decoration.
+
+**Reproduces without GkPlus.** `d3d8.dll` renamed aside, version stamp back to the stock
+"v1.3 DX8", Single Player → Training Level → Area 1: the Gunlok panel shows empty troughs and
+empty item slots. Nothing of ours is in the process.
+
+### The two halves of the HUD take different paths to D3D
+
+`rendering_notes.md` §4.4 has the layering mechanism; the part that matters here is that the two
+halves of one panel are drawn by different machinery:
+
+- the **panel plate** is a retained render-queue item. All 11 `RenderQueue_Submit` sites in
+  `HudItem_DrawByKind` @ 0x0055fbd0 pass `Camera_Hud` @ 0x007b4e40, so it is drawn under that
+  camera's viewport slice, `MinZ 0.03 .. MaxZ 0.04`.
+- the **meters and icons** never reach the queue. `Hud2D_DrawQuad` @ 0x005695c0 appends them as
+  pre-transformed quads to a shared immediate-mode batch, with an authored **`z = 0.03f`** —
+  exactly `Camera_Hud`'s `MinZ`, the front of the HUD slice. A batch carries no camera; it is
+  drawn under whatever viewport is current at its single flush.
+
+The authored `0.03f` is the whole of the intent: the meters were meant to be at the front of the
+HUD slice, in front of the plates.
+
+### The bug is one instruction's worth of frame order
+
+In `RunInGameFrame` @ 0x0046e6c0:
+
+```
+0046e8b8  CALL Hud2D_BeginBatch     ; 0x005695a0, opens the batch
+0046e8c1  CALL RenderHudItems       ; 0x0055fb20, makes Camera_Hud current, emits the meter quads
+0046e8ca  CALL DrawOrderMenu        ; 0x00498610, makes Camera_World current again   <-- the culprit
+0046e8cf  CALL Hud2D_FlushBatch     ; 0x00569ed0, one DrawIndexedPrimitive, viewport 0.10..1.00
+...       RenderQueue_Flush         ; 0x00574c7b, and only now the plates, under Camera_Hud
+```
+
+`vulkan_renderer_notes.md` §4.45 measured, with a probe against the real D3D8, that D3D does not
+run the viewport transform over a pre-transformed vertex — it **clamps**:
+`depth = clamp(z, MinZ, MaxZ)`, no scale and no bias. So under the world viewport the authored
+`0.03` is clamped **up to 0.1**, behind the entire HUD slice. Both the depth test and the paint
+order then go to the plate, and it is opaque (`D3DRS_ALPHABLENDENABLE` off) with z-write on.
+
+`HudItem_DrawByKind` itself is innocent: in its own source order it submits the plate *before* it
+emits the meter quads, which is exactly the "meters on top of plate" intent.
+
+**§4.45 has a paragraph about this bar and read it the wrong way round.** Its first cut used
+viewport 0..1 for pre-transformed draws, which made the bar render bright green, and it recorded
+that as a regression against a bit-exact region — "that bar authors a z *below* its slice, so D3D
+clamps it up to `MinZ` and the panel that should cover it wins". The clamp reasoning is right and
+the conclusion is not: the panel was never supposed to cover it. It is the standing hazard that
+`vulkan_renderer_notes.md` §4.28 and §4.86 name — the reference can be the wrong one — showing up
+in the one place nobody re-examined, because matching d3d8 exactly *is* the renderer's goal.
+
+### What was measured
+
+Level02 under `GKPLUS_RENDERER=d3d8`, camera settled and paused, 178 actors. Three consecutive
+logged draws, all sampling `units\plates 2 1024.rim`:
+
+```
+idx  prims  fvf                                  blend  z zw  viewport MinZ..MaxZ
+ 65     12  0x1c4 XYZRHW|DIFFUSE|SPECULAR|TEX1    off   on on  0.1000 .. 1.0000
+ 66      2  0x112 XYZ|NORMAL|TEX1                 off   on on  0.0299 .. 0.0399
+ 67      2  0x112 XYZ|NORMAL|TEX1                 off   on on  0.0299 .. 0.0399
+```
+
+(The printed 0.0299/0.0399 are `%.4f`-truncated `0.03f`/`0.04f`.) `render.ref_hide = [66, 67]`
+makes both character panels vanish and reveals filled green meter bars and the item icons
+underneath; `ref_hide = [65, 67]` removes those too. That pair is what identifies each draw — draw
+65 is the meters and icons, 66/67 are the plates.
+
+### The fix, and why it splits the batch rather than re-pointing the flush
+
+`HudFixSystem` detours `RenderHudItems` @ 0x0055fb20, calls the original, then flushes the batch
+and opens a fresh one while `Camera_Hud` is still current. Draw 65 then goes out under
+0.0299..0.0399 and clamps to 0.03, in front of the plates. Verified under both `d3d8` and
+`vulkan`; outside the HUD panel the frame is unchanged (two large regions bit-identical across
+launches, the rest at the cross-launch drift floor of `vulkan_renderer_notes.md` §4.30).
+
+Forcing `Camera_Hud` over the *whole* flush would have been one line shorter and would have moved
+a second thing: **`DrawOrderMenu` appends to the same batch**, one more meter bar via
+`Hud2D_DrawMeterBar` @ 0x0049b322 with `z = 0.1f`, authored for `Camera_World` — it is a unit's
+health bar floating over the world, not a panel element. One flush is one `DrawIndexedPrimitive`
+under one viewport, so the batch has to be cut in two for the two depth intents to survive.
+Cutting it is a transition the engine already performs itself: `Hud2D_DrawQuad` does exactly
+`RenderBatch_End` / `Draw` / `Begin` at 0x005695e6 when the vertex buffer fills.
+
+Two facts make the seam safe, both measured rather than assumed. `RenderHudItems` has **exactly
+one call site** (0x0046e8c1) and **zero literal occurrences** of its address anywhere in
+`.text`/`.rdata`/`.data` under an unaligned byte-by-byte scan — so it is in no vtable and no
+callback table, and it is always reached inside an open `Hud2D_BeginBatch` window (0x0046e87a on
+the inventory branch, 0x0046e8b8 on the in-level one). `Hud2D_FlushBatch` is the same: one call
+site, no literal references. And an empty batch is free — `RenderBatch_Draw` opens with
+`CMP dword ptr [ESI+0x50], 0` and returns — so the frames where `HudItemList` is empty, on which
+the original returns before making `Camera_Hud` current, cost a lock/unlock pair and nothing else.
+
+One thing this does **not** settle: `Camera_Hud`'s ZFUNC is `D3DCMP_LESSEQUAL`, so a plate whose
+NDC z were exactly 0 would tie at 0.03 and, being drawn later, would still win. It evidently is
+not — the meters render — but the margin is unmeasured. If a future change makes them flicker,
+the tie-proof variant is to write a degenerate range (`cam+0x264 = cam+0x268 = 0.029f`) into
+`Camera_Hud`'s viewport for the batch draw only; `Camera_UpdateDepthState` rewrites both from
+`+0x19c`/`+0x1a0` on the next change, so a missed restore self-heals.
 
 ---
 

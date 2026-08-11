@@ -514,14 +514,14 @@ placement rule as a spawned object. Fallback (0x00481358):
 - 0.5 * [0x128].y`. **Written the other way round here until the two fields were found to be
 named backwards** (see the offset table above); the offsets are what this says, and only the
 names moved.
-`FUN_004af4d0` (called from `WinMain` and early in `LoadLevel`) presets
+`InitRenderCameras` @ 0x004af4d0 (called from `WinMain` and early in `LoadLevel`) presets
 `point = normal = (0,0,1)`.
 
 `MapCameraPlane` @ 0x007b4e18 is `{Vec3 point, Vec3 normal}`, 0x18 bytes, and **has no
 readers**. Checked three ways: Ghidra references to each of the six dwords (writes only);
 every scalar operand in `.text` landing in `[0x7b4d80, 0x7b4ec0]`; and every initialised
 dword in the image matching one of the six addresses. The only hits are the eight writes
-in `ToMap` and `FUN_004af4d0`. The near misses are the backwards-`Vec3` idiom
+in `ToMap` and `InitRenderCameras`. The near misses are the backwards-`Vec3` idiom
 (`XOR EAX,EAX` / `SUB EAX,4` / `[EAX + <end+4>]`) walking `CameraCoords` @ 0x007b4e0c —
 `FUN_00484e40` at 0x0048703b and 0x004872bb, and `WaitCond_IsScreenScrolled` at 0x0056fd67.
 Contrast the sibling fields `Min`/`MaxCameraFocusHeight`, which the camera update genuinely

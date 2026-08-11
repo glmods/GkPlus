@@ -75,6 +75,30 @@ at the settled camera; the one that covered a quarter of the frame was fourth on
 Kill `WerFault.exe` as well as `gl.exe` before rebuilding — WER holds the crashed process's handle
 to `d3d8.dll`, so `--target copy` fails with "Permission denied" long after the game is gone.
 
+## Comparing against **stock** Gunlok, with no GkPlus in the process
+
+The A/B between `d3d8` and `vulkan` tells you whether a defect is our renderer's. It does not tell
+you whether it is ours at all — `GKPLUS_RENDERER=d3d8` still has every hook installed. The test for
+"is this the game's own bug", which `game_defects_notes.md` requires before anything is filed
+there, is to rename `d3d8.dll` aside and reach a level with no REPL at all:
+
+- **The `-skipfmv` dialog still has to be answered**, exactly as `launch-gunlok.ps1` does it
+  (`FindDialog` for class `#32770`, `PostMessage WM_COMMAND` with IDYES for windowed). That part of
+  the harness works unchanged; only `Repl` and everything built on it are gone.
+- **Navigate with the mouse, not the keyboard.** The front end is mouse-driven and the cursor runs
+  on Raw Input, so `SetCursorPos` + `mouse_event` reaches it; synthesising clicks at client
+  coordinates read off a `Get-GunlokShot` capture works first time. `ClientToScreen` on the main
+  window converts, and the clicking process needs `SetProcessDPIAware()` for the same reason the
+  capture does.
+- **Single Player → Training Level → Area 1 is the cheapest level to reach**, at three clicks and
+  ~60 s. "New Game" costs the `first contact` cutscene on top. The training areas have one
+  character rather than four, which is enough for anything about the HUD, a unit, or a shader.
+- **The version stamp is the check that you actually got stock.** Bottom left reads `v1.3 DX8`
+  with GkPlus absent and `GkPlus - <renderer>` with it present, so it is in every screenshot
+  already — worth confirming before believing a negative result.
+- Put `d3d8.dll` back the moment you are done. A rename left in place makes every later run in the
+  session silently stock, and the symptom is that a fix you just built "does nothing".
+
 ## From an SSH session: none of this works in session 0
 
 `sshd` is a Windows service, so **every process launched from an SSH shell is in session 0** — its

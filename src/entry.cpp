@@ -12,6 +12,7 @@
 #include "Font.h"
 #include "GLS.h"
 #include "GUI.h"
+#include "HudFix.h"
 #include "InputFix.h"
 #include "MapLights.h"
 #include "Music.h"
@@ -41,6 +42,9 @@ struct Subsystems {
   DebugSystem debug;       // DebugPrint* -> OutputDebugString
   GUISystem gui;           // ImGui/D3D overlay
   InputFixSystem inputfix; // suppress the vestigial DirectInput keyboard acquire
+  // Independent of everything else here: it hooks RenderHudItems, which nothing
+  // else touches, and reads no state any other subsystem owns.
+  HudFixSystem hud; // draw the HUD's meters in front of their panel, not behind
   // Also patches an import gl.exe uses during WinMain, but unlike FileHookSystem
   // it needs no particular position here: everything in this aggregate is built
   // from DllMain, which runs before WinMain does.

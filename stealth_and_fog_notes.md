@@ -425,7 +425,7 @@ flares"). What was *not* found is code linking the flare projectile or its light
 
 **Rendering and effects only.** `FogOfWar_SampleTotal` @ 0x00468770 has 31 call sites and
 every one is a client draw or effect-spawn path: `Unit_Draw` (x4), `DrawWorldEffects` (x6),
-`SpawnSparks`, `DrawHud`-adjacent `FUN_004a4130`, the world-effect updaters
+`SpawnSparks`, `HudItem_DrawByKind`-adjacent `FUN_004a4130`, the world-effect updaters
 `FUN_00513xxx`-`FUN_00515xxx`, `FUN_00488400`, `FUN_00558d30`, and four effect-spawn cases
 in `ApplyUpdateMessage`. `FogOfWar_SampleCurrent` @ 0x00468830 has exactly one caller,
 `FUN_004b68c0`, which picks between the two based on `Unit+0x118` bits 0x10 / 0x8 and is

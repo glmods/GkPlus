@@ -35,8 +35,11 @@ instead) does:
 3. **the submit phase** — every producer pushes into the one global `RenderQueue` @ 0x00803e98
    through `RenderQueue_Submit` @ 0x0059d760. Nothing is drawn. The producers are
    `FUN_005201c0` (world effects), `FUN_004720a0` (the map, only when `TheMap` is set),
-   `FUN_0049f4f0`, `FUN_0055fb20` (HUD), `FUN_00498610`, `FUN_005695a0` (in-game menu),
-   `FUN_004d5060` (console).
+   `FUN_0049f4f0`, `RenderHudItems` @ 0x0055fb20 (HUD), `DrawOrderMenu` @ 0x00498610,
+   `Hud2D_BeginBatch` @ 0x005695a0, `FUN_004d5060` (console).
+
+   `Hud2D_BeginBatch` is not a producer and was mislabelled "(in-game menu)" here: it opens the
+   **immediate-mode 2D batch**, a second path that bypasses the queue entirely. See §4.3.
 4. `RunGameFrame` @ 0x0046d410 — which submits ~22 UI sprites of its own first — then
    `RenderSceneAndPresent` @ 0x00574c50 → `RenderQueue_Flush` @ 0x005a90c0, where the queue is
    state-sorted and drawn.
@@ -257,7 +260,8 @@ Aw_DrawIndexedPrimitiveUP 0x005a3ed0   user pointer + FVF + indices <- no D3D bu
  │    0x00582d10  particle renderer
  │    Font_FlushQueuedText 0x00578180 / Font_RenderTextItem 0x00578a00 /
  │    Font_EmitGlyphQuad   0x005792d0            text, see 4.2
- │    0x005695c0 / 0x00569b10 / 0x00569ed0  in-game menu widgets
+ │    Hud2D_DrawQuad 0x005695c0 / 0x00569b10 /
+ │    Hud2D_FlushBatch 0x00569ed0            the HUD's 2D quads, see 4.4
  │    0x00496df0
  │
  └─ IMMEDIATE — shadows and world effects
@@ -375,6 +379,61 @@ Three things about it are worth knowing before hooking anything on the buffer pa
   flags are the only thing that distinguishes them. `vulkan_renderer_notes.md` §4.84 is the whole
   story, and `address_map.md` has the scratch-set globals and the `VertexBufferSet` API.
 
+## 4.4 2D layer order is a camera per depth slice, and the HUD's meters miss theirs
+
+**There is no per-draw "layer" anywhere in the render queue.** What decides whether a 2D element
+lands in front of another is *which camera it was drawn with*. Every camera owns a `D3DVIEWPORT8`
+at `+0x254`, and `InitRenderCameras` @ 0x004af4d0 (called from `WinMain` and from `LoadLevel`)
+carves the depth range into slices, one camera per slice:
+
+| camera | global | MinZ..MaxZ | near/far |
+|---|---|---|---|
+| `Camera_Menu2D` | 0x007f5c10 | 0.00 .. 0.02 | — |
+| `Camera_Text` | 0x007b5800 | 0.02 .. 0.04 | 0 / 10 |
+| `Camera_Hud` | 0x007b4e40 | **0.03 .. 0.04** | 0 / 10 |
+| (unidentified) | 0x007b4930 | 0.06 .. 0.30 | 0 / 10 |
+| (unidentified) | 0x007b5320 | 0.02 .. 0.03 | 0 / 10 |
+| `Camera_World` | 0x007b4ba0 | **0.10 .. 1.00** | 1 / 200 |
+| the sky/backdrop camera | 0x007b5a70 | 1.00 .. 1.00 | 1 / 1000 |
+| (unidentified) | 0x007b50b0 | 0.02 .. 0.04 | 0 / 10 |
+| (unidentified) | 0x007b5590 | 0.04 .. 0.06 | 0 / 10 |
+
+`Camera_SetDeviceViewport` @ 0x00577490 is the **only** `SetViewport` in the binary. The canonical
+four-step switch — used verbatim by `RenderHudItems`, `DrawOrderMenu`, `RenderSceneAndPresent` and
+`DrawItemList_Render` @ 0x005a875f — is: write `CurrentCamera` @ 0x007c146c; call
+`Camera_ApplyViewportAndZFunc` @ 0x00577550 (the viewport, plus `D3DRS_ZFUNC` from `cam+0x1d0`);
+copy `cam+0x250` into `CurrentCameraIsPerspective` @ 0x007c1470; call `Camera_Apply` @ 0x005774c0
+(the three `SetTransform`s, nothing else). `DrawItemList_Render` runs it whenever the next
+`DrawItem`'s camera (`DrawItem+0x18`) differs from the current one, which is what makes the queue's
+sort respect the slices.
+
+**Every camera's ZFUNC is `D3DCMP_LESSEQUAL`** (`Camera_Ctor` @ 0x00576470 writes 4 to `+0x1cc` and
+`+0x1d0`; `Camera_SetZFunc` @ 0x00576b50 has zero call sites and nothing else writes them). So a
+depth *tie* goes to whichever draw is issued **later**, which matters whenever two 2D elements are
+authored at the same z.
+
+All the HUD cameras are **orthographic** — `InitRenderCameras` passes every one of them except
+`Camera_World` and the sky camera through `Camera_SetOrthographic` @ 0x004b04e0, which clears
+`+0x250`. That is what makes §4.2's glyph emitter take its `z = 0` branch: `Font_EmitGlyphQuad`
+only computes `MinZ + t * (MaxZ - MinZ)` for a perspective camera, and otherwise emits `z = 0`,
+`rhw = 1`, which D3D then clamps up to the slice's `MinZ`.
+
+### The HUD's meters are drawn under the world's slice
+
+`game_defects_notes.md` §12 is the defect; the part worth carrying here is the shape of it, because
+it is what the two paths cost. The HUD's panel plates are *retained* — all 11 `RenderQueue_Submit`
+sites in `HudItem_DrawByKind` @ 0x0055fbd0 pass `Camera_Hud`, so they get the 0.03..0.04 slice for
+free when the queue drains. The meters and item icons are *immediate*: `Hud2D_DrawQuad` @ 0x005695c0
+appends them to the shared batch with an authored `z = 0.03f`, and a batch has no camera — it is
+drawn under whatever viewport happens to be current at the single `Hud2D_FlushBatch`
+@ 0x00569ed0, which `RunInGameFrame` reaches one instruction after `DrawOrderMenu` has switched
+back to `Camera_World`.
+
+**So a batch's depth is decided by frame position, not by the values in it**, and the two halves of
+one HUD element can end up in different slices without anything in either path looking wrong. It
+is the same hazard §4.2 records for text and §4.1 for the shadow draws: a path that bypasses the
+queue also bypasses the queue's only mechanism for ordering.
+
 ## 5. The producers
 
 All 31 of them, with what they draw. The evidence for the UI ones is the **localized string ids they
@@ -386,7 +445,7 @@ out of the DLL's `RT_STRING` resources; string *id* N lives in block `N/16 + 1` 
 |---|---|---:|---|
 | `UpdateAndDrawMenuScreen` | 0x004ea8e0 | 29 | the front-end frame `FUN_0046eae0` |
 | `DrawWorldEffects` | 0x005201c0 | 15 | `RunInGameFrame` **and** `ScenePass_WorldEffects` |
-| `DrawHud` | 0x0055fbd0 | 11 | `FUN_0056a7b0` |
+| `HudItem_DrawByKind` | 0x0055fbd0 | 11 | `HudItem_Draw` @ 0x0056a7b0 |
 | `DrawInventoryScreen` | 0x0049f4f0 | 6 | `RunInGameFrame` |
 | `Unit_Draw` | 0x004b6ae0 | 4 | Unit vtable slot 68 |
 | `DrawInventoryItemPanel` | 0x004a7890 | 3 | `DrawInventoryScreen` |

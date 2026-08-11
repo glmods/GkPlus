@@ -3796,6 +3796,17 @@ raw it landed in front of everything. A regression in a region that was previous
 the cheapest possible signal that a rule is half-right, and it is the reason the HUD is in the
 region list at all.
 
+> **The clamp above is right; "the panel that should cover it" is not.** That bar is the
+> character's *health meter*, and the panel was never meant to cover it — the game authors it at
+> `z = 0.03f`, which is `Camera_Hud`'s `MinZ`, the **front** of the HUD slice, and then flushes
+> the batch one instruction after `DrawOrderMenu` has switched back to `Camera_World`. So in
+> stock Gunlok no health meter, armour meter or item icon is ever visible, in any level. It is
+> `game_defects_notes.md` §12, it reproduces with `d3d8.dll` renamed aside, and `HudFixSystem`
+> now fixes it. Nothing about §4.45's rule or its arithmetic changes — the bright-green bar was
+> the *right pixels for the wrong reason*, and reading it as a regression is §4.28's and §4.86's
+> "the reference can be the wrong one" landing in the one place nobody re-examined, because
+> matching `d3d8` exactly is this renderer's whole goal.
+
 ### What it is worth
 
 Level02, camera pinned at `position (-19.02, -0.785, 12.96) roll 341.33 pitch 586.36

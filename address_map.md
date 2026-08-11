@@ -212,7 +212,7 @@ CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84
 | 0x007c1268 / 0x007c126c | int* | GameWindowX / GameWindowY — the client area's **origin** in screen space, filled by `WinMain` from `ClientToScreen(GameWindow, {0,0})` and maintained by the `WM_MOVE` bookkeeper. Nothing repositions the window from them: the one reader passes them to a `SWP_NOMOVE` `SetWindowPos`, which discards them |
 | 0x007c1270 / 0x007c1274 | int* | ClientRight / ClientBottom — the client rect's **far corner**, `GameWindowX + width` / `GameWindowY + height`. Named `OrigX`/`OrigY` in the DB until the arithmetic was read; every consumer subtracts the origin back off to recover the size |
 | 0x007c1278 | RECT | DesktopRect — `GetClientRect(GetDesktopWindow())` when windowed, `{0, 0, width, height}` otherwise. Its one reader takes only the width and height from it |
-| 0x007c1288 / 0x007c128c | int* | ClientWidth / ClientHeight (18 readers, all pixel comparisons — `DrawHud`, `DrawInventoryItemPanel`, `ApplyShadowQuality`) |
+| 0x007c1288 / 0x007c128c | int* | ClientWidth / ClientHeight (18 readers, all pixel comparisons — `HudItem_DrawByKind`, `DrawInventoryItemPanel`, `ApplyShadowQuality`) |
 
 ### Key Function Addresses (offsets from base)
 
@@ -370,6 +370,44 @@ linked-list chases over the game's own pool heap, touching no D3D object)
 | 0x00803c80 / 0x00803c84 | List* / int* | SubMeshList and its count |
 | 0x00803d44 | int* | VertexBufferCreateCount |
 | 0x00803d4c / 0x00803d50 | int* | IndexBufferCreateCount / IndexBufferReleaseCount — **+4 per frame** on a settled camera, which with the 2,701 above is the whole of that 1.89% |
+
+**HUD and the 2D depth slices:** (see `rendering_notes.md` §4.4 and `game_defects_notes.md` §12;
+`src/HudFix.cpp` hooks the first of these)
+
+| Offset | Signature | Name |
+|--------|-----------|------|
+| 0x0055fb20 | CDecl<void> | RenderHudItems — walks `HudItemList` @ 0x007ba250, makes `Camera_Hud` current, calls slot 2 on each item. **Exactly one call site** (0x0046e8c1) and zero literal references anywhere in the image. Was `FUN_0055fb20` |
+| 0x0055fbd0 | ThisCall<void, HudItem*, int, int> | HudItem_DrawByKind — draws **one** HUD element, dispatched on `this->kind` (`+0x60`, 0..0x43; index table 0x00563928, jump table 0x005638f8). 11 `RenderQueue_Submit` sites, **all passing `Camera_Hud`**, then a run of immediate 2D quads. Was `DrawHud`, which described the caller rather than this |
+| 0x0056a7b0 | ThisCall<void, HudItem*, int, int> | HudItem_Draw — vtable slot 2 of the vtable at 0x006697a4; forwards to the above. Was `FUN_0056a7b0` |
+| 0x005695a0 | CDecl<void> | Hud2D_BeginBatch — `RenderBatch_Begin` + bind `HudPlatesTexture`. 2 call sites, both in `RunInGameFrame` (0x0046e87a inventory / 0x0046e8b8 in-level) |
+| 0x005695c0 | FastCall<void, float*, float*, uint, float> | Hud2D_DrawQuad — `(rect_px, uv, diffuse, z)`; 4 verts (stride 0x20) + 6 indices into `ImmediateBatch`. Writes the caller's `z` **verbatim** and `rhw = 1/z`. Wrappers: `Hud2D_DrawQuadNormalized` 0x00569e00, `Hud2D_DrawMeterBar` 0x00569ef0, `Hud2D_DrawNumber` 0x0056d390 |
+| 0x00569ed0 | CDecl<void> | Hud2D_FlushBatch — `RenderBatch_End` + `RenderBatch_Draw(D3DPT_TRIANGLELIST, indexed)`. One call site (0x0046e8cf), no literal references |
+| 0x00803d94 | RenderBatch* | ImmediateBatch — shared by the HUD 2D quads and `ParticleSystem_Render`. Was `ParticleRenderBatch`; the name understated who uses it |
+| 0x007ba2b0 | void* | HudPlatesTexture — `units\plates 2 1024.rim`, the atlas holding both the panel plates and the meter/icon art |
+| 0x007ba250 / 0x007ba254 | List / int* | HudItemList and its count |
+| 0x004af4d0 | CDecl<void> | InitRenderCameras — carves the depth range into per-camera slices. Called from `WinMain` and `LoadLevel`. Was `FUN_004af4d0` |
+| 0x00577490 | ThisCall<void, Camera*> | Camera_SetDeviceViewport — `SetViewport(this + 0x254)`. **The only `SetViewport` in the binary** |
+| 0x00577550 | ThisCall<void, Camera*> | Camera_ApplyViewportAndZFunc — the above, plus `D3DRS_ZFUNC` from `this->+0x1d0`. Returns the previous ZFUNC in EAX; no caller reads it |
+| 0x005774c0 | ThisCall<void, Camera*> | Camera_Apply — the three `SetTransform`s (world `+0xc4`, view `+0x84`, projection `+0x44`) and nothing else. **One** parameter: the DB had a second, which was an uninitialised-register artefact |
+| 0x00576470 | ThisCall<Camera*, Camera*> | Camera_Ctor — vptr 0x0066cc9c, `sizeof(base Camera) == 0x26c`. Writes ZFUNC `D3DCMP_LESSEQUAL` to `+0x1cc`/`+0x1d0`, which nothing ever changes |
+| 0x004b04e0 | ThisCall<void, Camera*, float*, float*> | Camera_SetOrthographic — clears `+0x250` (`is_perspective`) and fills `+0x240`..`+0x24c`. `InitRenderCameras` runs it over every camera except `Camera_World` and the sky camera |
+| 0x004b0190 / 0x004b0450 | ThisCall | CameraData_Ctor / _Dtor — the derived class, vptr 0x006644a0, `sizeof == 0x2a0`. **Reached only from a CRT static-initialiser table sitting as undefined bytes**, so neither has an xref |
+| 0x007c146c / 0x007c1470 | Camera** / bool* | CurrentCamera / CurrentCameraIsPerspective |
+
+Camera globals and their depth slices — the object lives *at* the address (the HUD submits push it
+as the camera pointer), and a `D3DVIEWPORT8` sits at `+0x254` with `MinZ` at `+0x264`:
+
+| Global | Name | MinZ..MaxZ | near/far |
+|--------|------|------------|----------|
+| 0x007f5c10 | Camera_Menu2D | 0.00 .. 0.02 | — |
+| 0x007b5800 | Camera_Text | 0.02 .. 0.04 | 0 / 10 |
+| 0x007b4e40 | Camera_Hud | 0.03 .. 0.04 | 0 / 10 |
+| 0x007b4930 | (unidentified) | 0.06 .. 0.30 | 0 / 10 |
+| 0x007b5320 | (unidentified) | 0.02 .. 0.03 | 0 / 10 |
+| 0x007b4ba0 | Camera_World | 0.10 .. 1.00 | 1 / 200 |
+| 0x007b5a70 | the sky/backdrop camera | 1.00 .. 1.00 | 1 / 1000 |
+| 0x007b50b0 | (unidentified) | 0.02 .. 0.04 | 0 / 10 |
+| 0x007b5590 | (unidentified) | 0.04 .. 0.06 | 0 / 10 |
 
 **Text rendering:** (see `rendering_notes.md` §4.2 — text is its own queue, not the render queue)
 

@@ -350,7 +350,7 @@ them is movement, AI, pathing or order-issuing code:
 
 | Reader | What it does with the value |
 |---|---|
-| `DrawHud` @ 0x0055fbd0, read @ 0x00560af0 | picks one of three adjacent 33/512-wide U-spans in a sprite atlas — the formation **icon** |
+| `HudItem_DrawByKind` @ 0x0055fbd0, read @ 0x00560af0 | picks one of three adjacent 33/512-wide U-spans in a sprite atlas — the formation **icon** |
 | `WaitCond_FriendliesUseAbreastFormation` @ 0x00570840, read @ 0x00570858 | `== 1`; a `WAIT FOR` script predicate, table entry @ 0x0066a40c |
 | `0x004d3280` (vtable 0x006664c4 slot 17), read @ 0x004d32d5 | the order menu's "is this order currently in effect?" query |
 

@@ -60,6 +60,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Font.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/GLS.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/GUI.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/HudFix.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ImageCodec.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/InputFix.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsActors.cpp"

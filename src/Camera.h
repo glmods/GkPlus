@@ -10,18 +10,39 @@ namespace gk {
 // only the angles are modelled - the rest is opaque and must not be touched by
 // hand.
 //
-// The engine's object is **0x23e** bytes: two more flag bytes at 0x23c/0x23d
-// that the three angle setters raise. They are deliberately left off the mirror,
-// because only those setters ever write them and including them would push the
-// struct to 0x240 under 4-byte alignment - a size assert that no longer matches
-// anything real. The three offset asserts are what pin the layout here.
+// **This mirror is deliberately truncated, and it used to claim it was not.** The
+// comment here read "the engine's object is 0x23e bytes: two more flag bytes at
+// 0x23c/0x23d that the three angle setters raise". The flag bytes are real; the
+// size was an undercount by 0x62 bytes, and it stopped just short of the block
+// the renderer work needs. The real layout, from CameraData_Ctor @ 0x004b0190
+// (which has no xrefs - it is reached from a CRT static-initialiser table sitting
+// as undefined bytes, exactly CLAUDE.md's function-pointer trap):
+//
+//   base Camera, sizeof 0x26c, vptr 0x0066cc9c, ctor 0x00576470
+//     +0x044 / +0x084 / +0x0c4  projection / view / world matrix
+//     +0x19c / +0x1a0           MinZ / MaxZ, the camera's slice of the depth range
+//     +0x1cc / +0x1d0           base / effective D3DCMPFUNC, both D3DCMP_LESSEQUAL
+//     +0x230 / +0x234 / +0x238  yaw / roll / pitch, the three below
+//     +0x240 .. +0x24c          ortho width, height, 2/w, -2/h
+//     +0x250                    is_perspective (0 for every HUD camera)
+//     +0x254                    D3DVIEWPORT8, MinZ at +0x264, MaxZ at +0x268
+//   derived CameraData, sizeof 0x2a0, vptr 0x006644a0
+//     +0x26c  CameraCoords    <- 0x007b4e0c, a MEMBER, not the separate global
+//     +0x278  MapCameraPlane     the address map used to call it
+//     +0x284, +0x290 CameraDistance2
+//
+// The arithmetic is its own check: 0x007b4ba0 + 0x26c is exactly the 0x007b4e0c
+// this file's own CameraCoords accessors read, and the next camera in the run,
+// Camera_Hud @ 0x007b4e40, is at +0x2a0. `rendering_notes.md` §4.4 has the slice
+// table; the offsets past 0x23c stay unmodelled because nothing here reads them.
 struct CameraData {
   unsigned char opaque[0x230];
   float yaw;   // 0x230, degrees - the setter converts to BAM to index SinTable
   float roll;  // 0x234, degrees
   float pitch; // 0x238, degrees
+  unsigned char opaque_tail[0x64]; // 0x23c..0x2a0, see above
 };
-static_assert(sizeof(CameraData) == 0x23c);
+static_assert(sizeof(CameraData) == 0x2a0);
 static_assert(offsetof(CameraData, yaw) == 0x230);
 static_assert(offsetof(CameraData, roll) == 0x234);
 static_assert(offsetof(CameraData, pitch) == 0x238);
@@ -33,7 +54,10 @@ static_assert(offsetof(CameraData, pitch) == 0x238);
 // rebuilds its quaternion off the sin/cos tables and raises the dirty flags.
 CameraData *GetCameraData();
 
-// CameraCoords @ 0x007b4e0c. Setting it calls UpdateCameraMatrix, which is what
+// CameraCoords @ 0x007b4e0c - which is `CameraData + 0x26c`, a member of the
+// object above rather than a global of its own (see the layout note there); it
+// is addressed absolutely here because that is how the engine's own code reads
+// it. Setting it calls UpdateCameraMatrix, which is what
 // `SET CAMERA POS` does - writing the global alone leaves the view matrix stale
 // until something else happens to rebuild it.
 Vec3 GetCameraPosition();

@@ -43,7 +43,7 @@ independent dispatches agree, and each one pins a different id:
 
 - The **role-name switch** at `MobileActor::EquipObject?` 0x0053730e maps 0..4 to the literals
   `"mine"`, `"remote_mine"`, `"timed_mine"`, `"decoy"`, `"EMP_mine"` (jump table 0x00537d90).
-  Two more copies of the same table exist: `DrawHud` @ 0x0055fbd0 (0x005636a0) and
+  Two more copies of the same table exist: `HudItem_DrawByKind` @ 0x0055fbd0 (0x005636a0) and
   `FUN_004bd670` (0x004bd8c0, table 0x004bd8c0).
 - The compare is `CMP EAX,0x4 / JA` with **no subtraction**, at all three sites, so the values
   really are 0..4 rather than 33..37 or 34..38.
