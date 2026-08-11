@@ -332,7 +332,8 @@ but ids 7, 8 and 10 have no console keyword. 7 and 8 share an identical sprite r
 neighbours, not unused slots.
 
 **Next levers:** the per-tick update `FUN_00581180` (single caller `FUN_00580460`) and the
-renderer `FUN_00582d10` (single caller `FUN_00574c50`) are the only remaining consumers;
+renderer `ParticleSystem_Render` @ 0x00582d10 (single caller `RenderSceneAndPresent`
+@ 0x00574c50) are the only remaining consumers;
 between them they should settle `turbulence`, `field0xa4`, `field0xa0` and the emitter's
 own 0x104-byte layout. Both now decompile against named `ParticleTypeInfo` fields.
 

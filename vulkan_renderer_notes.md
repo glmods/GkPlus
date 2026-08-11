@@ -7888,3 +7888,375 @@ The honest residual is that the no-census build was measured once, at 5.58, agai
 census runs averaging 5.69. That gap is roughly one measurement's worth of spread and is not
 firmly established; the census is kept because it is the only thing that will catch this class of
 mistake again, on a level whose layout mix differs.
+
+## 4.84 The 66% was a read: `ProcessVertices` output, locked read-only, converted anyway
+
+§4.83 left one number and no explanation for it. 0x004 - `D3DFVF_XYZRHW` alone, untextured and
+uncoloured - was 66% of every vertex this renderer converts, arriving in ~4,500-vertex runs at
+~28 calls a frame on a settled level02 camera with nothing moving, and both of the obvious readings
+had been tried and refused: specializing the loop did nothing (§4.83), and the frame is CPU-bound
+so culling is downstream of a cost paid before anything reaches the GPU (§4.79). What was left was
+to find out *what the geometry was*, and the note ended by saying that was the next question.
+
+It is not geometry the game draws. It is geometry the game **reads**.
+
+### Three measurements, in the order that made each one necessary
+
+**Which path.** The layout census counts by layout and cannot say by which call site, so
+`ConvertSource` was added to it - `buffered` / `version` / `user_pointer` / `other`, counted inside
+the converter so no caller can be forgotten. 0x004 is **100% `buffered`**: `UploadConvertedVertices`,
+the slot upload on `Unlock`. Not a user-pointer draw, which mattered because the two have opposite
+fixes - a `DrawPrimitiveUP` produces its vertices fresh every frame and there is nothing to reuse.
+
+**Whether the bytes change.** They do. A content hash over the locked range, compared against the
+hash of what was last converted into the slot, hit on **8%** of vertices. Generalising the cache
+from one range to eight disjoint ones - on the theory that the engine appends into a dynamic buffer
+as a ring, so consecutive locks name different ranges and a single record compares each against the
+wrong neighbour - moved it to 9%. That theory was wrong and the hash was a dead end; see "What was
+built and thrown away" below.
+
+**Whether anything reads the result.** This is the one that broke it open, and it needed a
+diagnostic that did not exist: `render.vertex_buffer_load`, a per-buffer view carrying converted
+and skipped vertex counts, unlocks, pool, usage, the flags of the last lock, whether any draw has
+ever named the buffer as its stream source, and - through `prof::Describe` and the Ghidra symbol
+map - the game function that locked it.
+
+```
+333 live vertex buffers, 300707049 vertices converted,
+  300649761 of them (99.9%) into a buffer NO draw has ever read
+  fvf 0x004    65536 bytes   251396096 converted    64807 unlocks  drawn: NO
+      pool SYSTEMMEM  usage 0x0020  last lock flags 0x0810 READONLY   ProcessVertices DESTINATION
+  fvf 0x004   160000 bytes    49100000 converted     4910 unlocks  drawn: NO
+      pool SYSTEMMEM  usage 0x0020  last lock flags 0x0810 READONLY   ProcessVertices DESTINATION
+```
+
+Two buffers. `D3DPOOL_SYSTEMMEM`, **no `D3DUSAGE_WRITEONLY`**, `D3DLOCK_READONLY`, destinations of
+`IDirect3DDevice8::ProcessVertices`, and **not once in a session named as a stream source by any
+draw**. `render.stats.process_vertices` and `readonly_unlocks` come out **exactly equal** - 170,375
+each over one settled session - which is the mechanism stated as an identity: one read-back lock per
+transform.
+
+So Gunlok hands geometry to `ProcessVertices` to have the driver transform it into screen space,
+then locks the destination read-only to consume the transformed vertices itself. XYZRHW is what
+comes back out of a transform, which is why the layout is XYZRHW and why it carries no colour and no
+texture coordinate - and why **0x004 never appears in `render.stats.fvfs`**, the `SetVertexShader`
+census, a fact that had been sitting in §4.83's table unremarked. Only the *source* of a
+`ProcessVertices` is ever bound with `SetStreamSource`; the destination never is.
+
+From inside the capture layer that read is `Lock`, then `Unlock`, which is byte for byte what a
+refill looks like. So every one of them converted ~4,500 vertices to the canonical 48-byte layout,
+staged them, and copied them to the GPU.
+
+### What the geometry is: the mouse cursor
+
+Recovered from the binary rather than guessed, which is the discipline §4.83 asked for after one
+wrong guess. The two buffers are AWAPI's software-transform scratch, created once by
+`AwScratchVB_CreateAll` @ **0x005a1f30** from `CreateDirect3D`, and they are **Gunlok's mouse-picking
+hit test** - the "what is the cursor over" query behind unit selection:
+
+| global | engine's own debug name | vertices | FVF | bytes |
+|---|---|---|---|---|
+| `AwScratchVB_Transform` @ 0x00803d98 | `"transform"` | 4,096 | 0x004 | 65,536 |
+| `AwScratchVB_HitTest` @ 0x00803dfc | `"hit test"` | 10,000 | 0x004 | 160,000 |
+| `AwScratchVB_Particle` @ 0x00803dd0 | `"particle"` | 4,096 | 0x002 | 49,152 |
+
+Two passes. **Coarse**: `Picking_TestNodeBoundingBox` @ 0x005a7930 projects a node's 8 bounding-box
+corners into the `"transform"` set, once per drawn item out of `DrawItem_RenderGeometry`, and
+`Picking_PointInProjectedBox` @ 0x005a73c0 tests the cursor pixel against the six resulting quads.
+**Fine**: if any picker survives, `SceneMesh_Render` projects the *whole* mesh - up to 10,000
+vertices - into the `"hit test"` set and tests the cursor per triangle. The cursor itself is
+`MousePicker` @ 0x006ac62c, whose +0x14/+0x18 `RunInGameFrame` overwrites with the mouse position
+each frame, and the whole path is gated on `MousePickingEnabled` @ 0x006ac628, which ships as 1.
+
+That explains the shape of the measurement exactly: ~28 calls a frame at ~4,500 vertices is the
+per-item coarse pass plus the occasional whole-mesh fine pass, and it runs at full rate on a settled
+camera **because the camera being still does not make the cursor stop being somewhere**. The
+"nothing is moving" in this section's opening was true of the scene and false of the query.
+
+The lock flags are constant for the process lifetime: `VertexBufferSet_SetLockMode` @ 0x005a30c0 is
+called once per set from `AwScratchVB_CreateAll` and never again, and mode 1 stores
+`D3DLOCK_NOSYSLOCK | D3DLOCK_READONLY` = 0x810. So the skip is not sampling a flag that might vary.
+
+### The fix is D3D8's own contract, and it is three lines
+
+`BufferWrapper::UploadLocked` returns early when `locked_flags_` carries `D3DLOCK_READONLY`. The
+application has declared it will not write to the buffer; the bytes at `Unlock` are therefore the
+bytes already in the arena slot, and there is nothing to upload.
+
+That is deliberately *not* a heuristic about which buffers look unused - not "never drawn from", not
+"contents unchanged". Both of those were available and both are inferences about the game. This is
+the runtime's and every driver's own precondition, an app that broke it would corrupt far more than
+this, and `render.vertex_buffer_load` prints the flags so a buffer arriving here read-only stays a
+visible fact rather than an assumption.
+
+Returning **before** the rewrite bookkeeping is part of the fix, not tidiness. A read is not a
+rewrite: counting one inflates `draws_reading_rewritten_buffers`, and - much worse - a read arriving
+after a draw this frame would take the `rewritten_after_draw` branch and park a *whole-buffer*
+version in the frame's scratch (§4.23), which converts the entire buffer rather than the locked
+range. The read-back would have cost more than the refill it is not.
+
+### Measured
+
+`render.skip_readonly_unlocks` flips it at run time, so this is one session, one camera, 178 actors,
+with nothing else moving between the two states - two passes of two 120-frame windows each,
+unthrottled:
+
+| | medians | mean | p95 |
+|---|---|---|---|
+| off (the previous behaviour) | 5.822, 5.788, 5.836, 5.837 | 5.86 | 6.34-6.57 |
+| **on** | **4.853, 4.882, 4.956, 4.899** | **4.95** | **5.38-5.59** |
+
+**5.83 -> 4.89 ms, -16%**, and the distributions do not overlap at all - the slowest `on` window is
+faster than the fastest `off` one. p95 moves further than the median again.
+
+Per-frame vertex conversion, from the census deltas over 1,208 frames:
+
+| layout | before | after |
+|---|---|---|
+| 0x004 XYZRHW | 126,614 | **0** |
+| 0x252 | 15,166 | 15,152 |
+| 0x1c4 | 13,335 | 13,339 |
+| 0x002 | 4,100 | 4,096 |
+| 0x112 | 2,462 | 2,460 |
+| 0x142 | 1,025 | 1,024 |
+| 0x212 | 93 | 93 |
+| **total** | **162,795** | **36,164** |
+
+**-78% of all per-frame vertex conversion**, and every other layout reproduces §4.83's table to
+within a vertex, which is the check that nothing else moved.
+
+### It is invisible, and that was measured rather than argued
+
+A pure optimization should be bit-identical on screen, and the first comparison said it was not:
+0.017/255 mean against a 0.006 floor, with the "Active Pause" caption present in one shot and absent
+in the other. That caption **blinks**. Sampling the region across six frames in each state gives
+exactly two values, 1004478 and 1098110, and **both states produce both** - so the difference was
+the blink phase, not the knob. Comparing blink-phase-matched frames:
+
+| | mean | max | differing pixels |
+|---|---|---|---|
+| off vs off, same phase (the floor) | 0.0000 | 0 | **0** |
+| off vs **on**, same phase | 0.0000 | 0 | **0** |
+
+Bit-identical, at a zero noise floor. Worth recording as a procedure as much as a result: an
+animated HUD element makes a *screenshot* A/B lie in whichever direction its phase happens to fall,
+and the way out is to find a quantity that separates phase from state before believing either.
+
+### What was built and thrown away
+
+The content hash - eight 32-bit lanes over a 32-byte block, a per-buffer set of disjoint
+(offset, bytes, hash) records, `render.skip_unchanged_uploads` to A/B it - was written, measured and
+**removed**. In the four-way comparison it is the two rows that do nothing:
+
+| | medians |
+|---|---|
+| both off | 6.223, 6.234 |
+| read-only skip only | 5.009, 5.031 |
+| both | 4.904, 5.091 |
+| **hash skip only** | **6.136, 6.269** |
+
+The hash alone is indistinguishable from doing nothing, and adding it to the read-only skip is
+indistinguishable from the read-only skip alone. It was not free either - the "both off" row here is
+0.4 ms above the 5.83 the same state measures without the hashing compiled in. Keeping a mechanism
+that costs something and buys nothing because it *might* help on another level is exactly the move
+§4.83 exists to warn about, so it went. If it is ever wanted back, the number to beat is in this
+table.
+
+### What the picking still costs, and the one thing left to do about it
+
+The skip removes our *amplification* of the picking, not the picking. `game/ProcessVertices` is a
+zone now, because nothing could otherwise see it: it is the D3D9 runtime's software transform
+running on our thread inside a call we forward, so it lands in a sampled profile as `d3d9.dll` with
+no attribution. Level02, settled, 4.81 ms median frame, 300 frames:
+
+| zone | self ms/frame | calls/frame |
+|---|---|---|
+| `vulkan/record` | 0.213 | 1 |
+| **`game/ProcessVertices`** | **0.188** | **28** |
+| `upload/UploadLocked` | 0.106 | 37 |
+| `vulkan/present` | 0.098 | 1 |
+
+Second-largest zone in the frame, **3.9%**, and every sample inside it is in `d3d9.dll`.
+
+The number that says what to do about it is **20.3 vertices per call** - `process_vertices_vertices`
+over `process_vertices`. Against 4,517 vertices per read-only unlock, that is a **222x
+amplification**: the game transforms a node's 8 bounding-box corners and then locks the whole
+4,096-vertex buffer to read them back, which is why §4.84's cost was so far out of proportion to the
+work being done. It also means 6.7 us a call is buying ~20 vertices of transform - about 330 ns a
+vertex, which is not arithmetic, it is d3d9's per-call software-vertex-processing setup.
+
+So the remaining move is **to do the transform ourselves in `CaptureDevice::ProcessVertices` and
+never call D3D9**. It is tractable rather than speculative: `Aw_ProcessVertices` forces
+`D3DRS_LIGHTING` and `D3DRS_CLIPPING` off, so it is a pure transform; the destination is XYZRHW-only,
+so the output is x/y/z/rhw and nothing else; the source contributes only its position, which is the
+first 12 bytes of every layout `ConvertVertices` accepts; and the state is all already mirrored -
+`State.world`/`view`/`projection` with `MultiplyMatrix`, and the viewport including `MinZ`/`MaxZ`
+(`BuildMvp` uses all of it). 28 calls x 20 vertices is ~570 transforms a frame, single-digit
+microseconds against 188. **The available win is close to the whole 0.188 ms.**
+
+Two things would have to come with it, and neither is optional: picking correctness is user-visible
+(the wrong unit gets selected, silently), so it wants the `VerifyBufferSlots` treatment - compute
+both, compare, report the max delta - and a knob, so the A/B is an in-session flip like every other
+number in this section.
+
+What is **not** available is the call rate. 28 a frame is `Picking_TestNodeBoundingBox` running once
+per drawn item, which is the game's own logic. And caching on unchanged inputs is a trap worth
+naming: it would hit almost always on a still camera and almost never on a moving one, so it
+optimizes the benchmark rather than the game - the same shape as the content hash this section
+already threw away, for the same reason.
+
+### What is left, and what to distrust
+
+- **0x252 at ~15,000 vertices a frame in ~364 calls** is now the largest per-frame layout, at 41
+  vertices a call. That is small-batch user-pointer work - text, particles, the in-game menus - and
+  its cost is per *call*, not per vertex, so it is a different problem from this one.
+- **The 0x002 buffer is still there and it is not a grid.** 4,096 vertices in exactly one call a
+  frame looked like 64x64; it is `AwScratchVB_Particle`, the third scratch set, and 4,096 is just
+  its capacity. `SYSTEMMEM | WRITEONLY | SOFTWAREPROCESSING`, lock mode 2 = `NOSYSLOCK` with no
+  `READONLY`, so this one really is a CPU **write** - `ParticleSystem_Render` fills it with particle
+  world positions - and the read-only rule correctly does not reach it. It is nonetheless converted
+  for nothing, because it is only ever a `ProcessVertices` **source** and never a draw's stream
+  source, which is why it too reads `drawn: NO`. At 4,096 vertices a frame, 2.5% of the original
+  total, it was not worth a second mechanism; skipping a buffer that has only ever been a
+  ProcessVertices source is the shape that would get it.
+- **The 12,288-byte FVF 0x142 buffer also read `drawn: NO`, and that one is a session property,
+  not a fact about the binary.** It is the spark effect's buffer (`Spark_CreateVertexBuffer`
+  @ 0x00558cf0, `D3DPOOL_MANAGED`, `WRITEONLY`), and it reaches `Aw_DrawIndexedPrimitive` from two
+  sites, one of them gated on the shadow-quality setting. Nothing here skips it - its locks are not
+  read-only - but it is the standing warning against ever building a skip on `drawn_ever_` alone.
+- **Run-to-run spread across launches is ~0.5 ms, not the ~0.1 ms §4.83 assumed.** Two "identical"
+  states measured 5.70 and 6.22 in different launches of the same binary. Every number above is
+  from an in-session knob flip for that reason, and any future comparison across two launches needs
+  to clear half a millisecond before it means anything.
+- `render.stats.converted_layouts` is cumulative and is **not** cleared by `render.reset()`. Take
+  two snapshots and divide by the delta in `prof.frames(1)[0].index`; the absolute totals are
+  session-wide and include the level load.
+
+The general rule, which is the sibling of §4.81's "never read a field back out of a scratch
+allocation": **a capture layer sees `Lock`/`Unlock`, not intent, and the flags are where the intent
+is.** Everything in this section followed from noticing that one of those flags was `READONLY`, and
+nothing in three sections of profiling could have found it, because the work was real work, done
+correctly, on data nobody wanted.
+
+## 4.85 Doing the picking transform ourselves, and the two things the profile could not see
+
+§4.84 removed this layer's *amplification* of the mouse picking and left the picking itself: a
+`game/ProcessVertices` zone at **0.188 ms of a 4.81 ms frame**, second only to `vulkan/record`, and
+every sample inside it in `d3d9.dll`.
+
+The number that said what to do was **20.3 vertices per call** (`process_vertices_vertices` over
+`process_vertices`). 28 calls a frame at 6.7 us each, for twenty vertices: that is not arithmetic,
+it is the D3D9 runtime setting up and tearing down its software vertex pipeline to project eight
+bounding-box corners. So the move was to stop forwarding it.
+
+### Why it is a narrow case rather than an emulator
+
+Re-implementing D3D's fixed-function vertex pipeline would be a bad idea. Re-implementing the one
+call Gunlok actually makes is not, and the difference is entirely in what `ResolveProcessVertices`
+refuses:
+
+- `Aw_ProcessVertices` @ 0x005a3fa0 forces `D3DRS_LIGHTING` and `D3DRS_CLIPPING` **off** around
+  every call, so this is a pure transform - no lighting, no clip flags, no `D3DCLIPSTATUS8`.
+- The destination must be `D3DFVF_XYZRHW` **and nothing else**, so the output is four floats and
+  there is no other channel to copy. Anything else forwards.
+- The source contributes only its position, which is the first 12 bytes of every layout
+  `ConvertVertices` accepts - the same fact `PositionBounds` already rests on.
+- The transform state is already mirrored: `State.world`/`view`/`projection`, and the viewport with
+  `MinZ`/`MaxZ`. Nothing new had to be captured.
+
+Coverage on level02, measured rather than hoped for: **96.5% of calls and 100% of vertices**. The
+1,699 forwarded calls in that sample carry **zero** vertices between them - `VertexCount == 0`,
+declined and correctly so.
+
+### The verifier, and the 0.75 pixels it found
+
+This is the first thing in this renderer whose errors are *invisible*: a wrong screen position
+selects the wrong unit, and nothing on screen says so. So `render.verify_process_vertices` runs
+D3D9, **leaves D3D9's result in the buffer**, and only compares ours against it. It is
+non-destructive by construction and can be left armed for a whole session - the same discipline as
+`VerifyBufferSlots` and `CompareShadowToDevice`, and the reason it can be trusted is that arming it
+cannot change what the game reads.
+
+It immediately earned its place. The first implementation concatenated and transformed in float and
+agreed with D3D9 to **2.4e-06 relative on rhw** - float epsilon, exactly as expected - but to only
+**0.75 pixels** on screen position. Those two numbers cannot both be rounding at the end: if `cw`
+agrees to 1e-6 then a 1520-pixel-wide viewport should put x within ~0.002 px. The error was in the
+middle, where a world coordinate far from the origin loses most of a float mantissa in
+`world * view` and the projection then multiplies what is left by half the viewport width.
+
+Concatenating and transforming in **double**, rounding to float only on the way out:
+
+| | xy | z | rhw |
+|---|---|---|---|
+| float throughout | 0.75 pixels | - | 2.4e-06 relative |
+| **double intermediate** | **0.0625 pixels** | **3.6e-07 depth** | **2.0e-07 relative** |
+
+0.0625 is exactly 1/16, and it does not move with the camera or with three million more vertices -
+which makes it a **quantization step in D3D9's output**, four fractional bits, rather than an error
+in ours. Ours is the exact value. For a hit test whose coarse pass is a deliberately conservative
+bounding box, a sixteenth of a pixel is nothing.
+
+The verifier was also wrong once and worth fixing: it first reported one maximum over x, y **and z**
+together. Those are not the same quantity - 0.06 is nothing across a 1520-pixel viewport and would
+be enormous across a 0..1 depth range - so a single number over both cannot be interpreted at all.
+They are separate now, which is what turned "0.0625" from an ambiguous figure into a conclusion.
+
+### Measured
+
+`render.software_process_vertices`, in-session knob flips, one camera, 178 actors, two passes of two
+120-frame windows each, unthrottled:
+
+| | medians | p95 |
+|---|---|---|
+| off (forwarded to d3d9) | 4.808, 4.793, 4.809, 4.803 | 5.46-5.71 |
+| **on** | **4.589, 4.586, 4.572, 4.533** | **5.28-5.53** |
+
+**4.80 -> 4.57 ms, -4.8%**, distributions separated - the slowest `on` window beats the fastest
+`off` one. The zone itself goes **0.188 -> 0.029 ms/frame**, so ~1.0 us a call against 6.7, the
+remainder being the two Lock/Unlock pairs the software path still needs (read the source, write the
+destination).
+
+Cumulatively with §4.84, on the same camera: **5.83 -> 4.57 ms, -22%.**
+
+### The other hot thing in that neighbourhood, and why it is not ours
+
+`FUN_005a3330+0x43` was 1.89% of samples and `FUN_005a1440+0x17` another 1.14% - together bigger
+than the picking transform, and in the same AWAPI address range, which made them look related. They
+are not, and the answer is worth recording so nobody spends the profile on it twice.
+
+`FUN_005a3330` is **`IndexBufferSet::~IndexBufferSet`**, and `+0x43` is the branch immediately after
+`CMP dword ptr [ECX+0xc], ESI` - a linear scan of the global `IndexBufferSetList` @ 0x00803e34 to
+unregister itself. `FUN_005a1440` is `List<T>::delete_entry` (`List_RemoveEntry`), the identical
+instruction on two more lists. `ECX+0xc` is `List_Member<T>::data` and `ECX+0x8` is `next`, exactly
+`src/List.h`'s layout: it is a **cache-missing pointer chase over the game's own pool heap**. The
+hot instruction touches no D3D object, no locked buffer and no runtime call.
+
+The cascade is `SceneGraphNode_Release -> SceneMesh_DeletingDtor -> SceneMesh_Dtor -> SubMesh_Dtor
+-> IndexBufferSet_Dtor`, and it is quadratic by construction: `SceneMesh_Dtor` runs `SubMesh_Dtor`
+once per submesh, and each of those costs two O(n) list scans.
+
+What the binary could not say was how often that runs, and the counters answer it directly. Over
+1,279 frames on a settled camera:
+
+- `vertex_buffers` created: **delta 0**, `live_vertex_buffers` flat at 333. So the
+  `SharedVBPool_RecreateBuffer` Release+Create-per-submesh that looked like the translation-layer
+  exposure **never fires here**. Worth knowing it exists; it is not costing anything on this camera.
+- `index_buffers` created: **+5,112, i.e. 4.0 per frame**, with `live_index_buffers` flat at 2,701.
+
+Four teardowns a frame, each scanning a 2,701-entry list, is ~10,800 dependent cache-missing loads a
+frame - which is the whole of that 1.89% and needs no other explanation. **It is the game's own
+work, over the game's own memory, and there is nothing a renderer layer can do about it.** The only
+seam is `SceneGraphNode_Release` @ 0x00599110, which would say *what* is being destroyed on a still
+camera; that is a gameplay question, not a rendering one.
+
+### What is left
+
+- The software path still costs ~1.0 us a call, and about half of that is the two `Lock`/`Unlock`
+  pairs. The source read lock could be avoided for a buffer whose bytes this layer already has, but
+  it does not keep them (§4.84 removed the machinery that would have), and 0.029 ms is no longer a
+  target worth a mechanism.
+- `MultiplyTransform` is forwarded but **not mirrored**. Nothing here depends on that being unused
+  and nothing observed suggests it is used - `BuildMvp` reads the same mirror and the whole-frame
+  residual is 0.13/255 - but a game that started calling it would put both this and every draw's
+  transform quietly out of date. It is the one assumption in this section with no measurement
+  behind it.

@@ -47,6 +47,28 @@ JSValue LayoutCensusToArray(JSContext *ctx) {
     JS_SetPropertyStr(ctx, row, "vertices",
                       JS_NewInt64(ctx, static_cast<int64_t>(entries[i].vertices)));
     JS_SetPropertyStr(ctx, row, "specialized", JS_NewBool(ctx, entries[i].specialized));
+    // Which call path produced them. Four fixed names rather than an array, because the answer
+    // this column exists for is read by a person: "buffered" and "user_pointer" have opposite
+    // fixes, and an index into an enum nobody has open is not a measurement anyone acts on.
+    static const char *const kSources[] = {"buffered", "version", "user_pointer", "other"};
+    JSValue by_source = JS_NewObject(ctx);
+    if (JS_IsException(by_source)) {
+      JS_FreeValue(ctx, row);
+      JS_FreeValue(ctx, array);
+      return JS_EXCEPTION;
+    }
+    for (uint32_t s = 0; s < 4; ++s) {
+      if (entries[i].calls_by_source[s] == 0) {
+        continue;
+      }
+      JSValue pair = JS_NewObject(ctx);
+      JS_SetPropertyStr(ctx, pair, "calls",
+                        JS_NewInt64(ctx, static_cast<int64_t>(entries[i].calls_by_source[s])));
+      JS_SetPropertyStr(ctx, pair, "vertices",
+                        JS_NewInt64(ctx, static_cast<int64_t>(entries[i].vertices_by_source[s])));
+      JS_SetPropertyStr(ctx, by_source, kSources[s], pair);
+    }
+    JS_SetPropertyStr(ctx, row, "by_source", by_source);
     if (JS_SetPropertyUint32(ctx, array, i, row) < 0) {
       JS_FreeValue(ctx, array);
       return JS_EXCEPTION;
@@ -128,6 +150,47 @@ JSValue GetLighting(JSContext *ctx, JSValueConst) {
 JSValue SetLighting(JSContext *ctx, JSValueConst, JSValueConst value) {
   d3d8::SetLightSum(JS_ToBool(ctx, value) != 0);
   return JS_UNDEFINED;
+}
+
+// `render.skip_readonly_unlocks` - §4.84. See D3D8Capture.h.
+//
+// Writable for a reason the other knobs here do not have: this one is supposed to be *invisible*.
+// A read-only lock changed nothing, so the two states differ only in work avoided - which makes
+// flipping it mid-session both the A/B for the frame time and the check that it is sound, since a
+// difference on screen would mean something is writing through a lock it declared read-only.
+JSValue GetSkipReadOnlyUnlocks(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, d3d8::SkipReadOnlyUnlocks());
+}
+
+JSValue SetSkipReadOnlyUnlocksValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  d3d8::SetSkipReadOnlyUnlocks(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+// `render.software_process_vertices` and `render.verify_process_vertices` - §4.85. See
+// D3D8Capture.h for both, and read the verification report before trusting the first one.
+JSValue GetSoftwareProcessVertices(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, d3d8::SoftwareProcessVertices());
+}
+
+JSValue SetSoftwareProcessVerticesValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  d3d8::SetSoftwareProcessVertices(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+JSValue GetVerifyProcessVertices(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, d3d8::VerifyProcessVertices());
+}
+
+JSValue SetVerifyProcessVerticesValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  d3d8::SetVerifyProcessVertices(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+// The readback. A getter and not a call: it formats counters and touches no D3D.
+JSValue GetProcessVerticesReport(JSContext *ctx, JSValueConst) {
+  const std::string report = d3d8::FormatProcessVerticesVerification();
+  return JS_NewStringLen(ctx, report.c_str(), report.size());
 }
 
 // `render.specular` - the specular term of that sum on its own. The mirror image of
@@ -1200,6 +1263,14 @@ JSValue GetStats(JSContext *ctx, JSValueConst) {
   put("failed_uploads", JS_NewInt64(ctx, static_cast<int64_t>(s.failed_uploads)));
   put("unconvertible_buffers",
       JS_NewInt64(ctx, static_cast<int64_t>(s.unconvertible_buffers)));
+  // §4.84. `readonly_unlock_vertices` is the one to read - these arrive in thousand-vertex runs,
+  // so a count of unlocks understates what the skip avoids by three orders of magnitude.
+  put("process_vertices", JS_NewInt64(ctx, static_cast<int64_t>(s.process_vertices)));
+  put("process_vertices_vertices",
+      JS_NewInt64(ctx, static_cast<int64_t>(s.process_vertices_vertices)));
+  put("readonly_unlocks", JS_NewInt64(ctx, static_cast<int64_t>(s.readonly_unlocks)));
+  put("readonly_unlock_vertices",
+      JS_NewInt64(ctx, static_cast<int64_t>(s.readonly_unlock_vertices)));
 
   // The texture pixel path. The last three are the Phase 2c-iv question: each is a way
   // pixels reach a texture without IDirect3DTexture8::LockRect seeing them, so all three
@@ -1303,6 +1374,13 @@ JSValue GetTextures(JSContext *ctx, JSValueConst) {
 
 // The only check that the texture images hold the RIGHT bytes rather than merely holding
 // bytes. Stalls the GPU once per mip level, so it is deliberately a call rather than a getter.
+// `render.vertex_buffer_load` - see D3D8Capture.h. A getter rather than a call: it walks the live
+// wrapper set and touches no D3D, so it is cheap enough to read from a panel.
+JSValue GetVertexBufferLoad(JSContext *ctx, JSValueConst) {
+  const std::string report = d3d8::FormatVertexBufferLoad(16);
+  return JS_NewStringLen(ctx, report.c_str(), report.size());
+}
+
 JSValue GetDrawReport(JSContext *ctx, JSValueConst) {
   const std::string report = vulkan::FormatDrawStats();
   return JS_NewStringLen(ctx, report.c_str(), report.size());
@@ -1499,6 +1577,13 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("state", GetShadowState, nullptr),
     JS_CGETSET_DEF("topologies", GetTopologies, SetTopologies),
     JS_CGETSET_DEF("lighting", GetLighting, SetLighting),
+    JS_CGETSET_DEF("skip_readonly_unlocks", GetSkipReadOnlyUnlocks,
+                   SetSkipReadOnlyUnlocksValue),
+    JS_CGETSET_DEF("software_process_vertices", GetSoftwareProcessVertices,
+                   SetSoftwareProcessVerticesValue),
+    JS_CGETSET_DEF("verify_process_vertices", GetVerifyProcessVertices,
+                   SetVerifyProcessVerticesValue),
+    JS_CGETSET_DEF("process_vertices_report", GetProcessVerticesReport, nullptr),
     JS_CGETSET_DEF("specular", GetSpecularValue, SetSpecularValue),
     JS_CGETSET_DEF("half_pixel", GetHalfPixel, SetHalfPixelValue),
     JS_CGETSET_DEF("rhw_depth_raw", GetRhwDepthRaw, SetRhwDepthRawValue),
@@ -1593,6 +1678,7 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("validation", GetValidationMessages, nullptr),
     JS_CGETSET_DEF("textures", GetTextures, nullptr),
     JS_CGETSET_DEF("draws", GetDrawReport, nullptr),
+    JS_CGETSET_DEF("vertex_buffer_load", GetVertexBufferLoad, nullptr),
     JS_CFUNC_DEF("reset", 0, Reset),
     JS_CFUNC_DEF("clear_validation", 0, ClearValidation),
     JS_CFUNC_DEF("verify_textures", 0, VerifyTextures),

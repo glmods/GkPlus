@@ -348,6 +348,33 @@ all modelled in the Ghidra DB (enum `TextFlags`, struct `TextDrawItem`) with pla
 functions. The one defect on this path is `Font_QueueText`'s unbounded copy of the caller's string
 into a 1028-byte frame buffer — `game_defects_notes.md` §1.
 
+## 4.3 A fourth path that draws nothing at all: the software transform, and mouse picking
+
+There is one more way geometry reaches D3D, and it is the odd one out because **nothing is ever
+drawn from it**. `Aw_ProcessVertices` @ 0x005a3fa0 turns `D3DRS_SOFTWAREVERTEXPROCESSING` on, binds
+a source vertex buffer, and calls the device's `ProcessVertices` to have the runtime transform the
+vertices into screen space (`D3DFVF_XYZRHW`) in a **`D3DPOOL_SYSTEMMEM`** destination. The game then
+locks that destination `D3DLOCK_READONLY` and reads the transformed positions back with the CPU.
+
+It is the **mouse-picking hit test** — the "what is the cursor over" query behind unit selection.
+Two passes: `Picking_TestNodeBoundingBox` @ 0x005a7930 projects a node's 8 bounding-box corners once
+per drawn item, and if any picker survives `Picking_PointInProjectedBox` @ 0x005a73c0, `SceneMesh_Render`
+projects the entire mesh — up to 10,000 vertices — for a per-triangle test. `ParticleSystem_Render`
+uses the same machinery to project particle positions.
+
+Three things about it are worth knowing before hooking anything on the buffer path:
+
+- **A `SetStreamSource` from this path is never followed by a `Draw*`.** Only the *source* of a
+  `ProcessVertices` is bound; the destination is passed as `pDestBuffer` and nothing else. That is
+  why the FVF census over `SetVertexShader` contains 0x002/0x112/0x152/0x1c4/0x212/0x252 and
+  **never 0x004** — a layout that exists only as transform output.
+- **It runs at full rate on a completely still camera**, because the camera not moving does not stop
+  the cursor being somewhere. On level02 that is ~28 read-back locks a frame, ~126,600 vertices.
+- **From a `Lock`/`Unlock` hook, a read is indistinguishable from a refill.** The Vulkan renderer's
+  capture layer converted and uploaded all of it for three sections before anyone asked why; the
+  flags are the only thing that distinguishes them. `vulkan_renderer_notes.md` §4.84 is the whole
+  story, and `address_map.md` has the scratch-set globals and the `VertexBufferSet` API.
+
 ## 5. The producers
 
 All 31 of them, with what they draw. The evidence for the UI ones is the **localized string ids they

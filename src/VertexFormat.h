@@ -15,16 +15,24 @@
 //   0x252  XYZ | NORMAL | DIFFUSE | 2 uv         44   <- 10.8M of 12.6M draws
 //
 // **That table is by draws, and by VERTICES it is not the ranking at all.** `ReadLayoutCensus`
-// below counts what this converter is actually handed, and a level02 session says the largest
-// layout by far is one the table above does not list:
+// below counts what this converter is actually handed, and a level02 session found the largest
+// layout by far to be one the table above does not list:
 //
-//   0x004  XYZRHW alone                          16      <- 66% of all vertices converted
+//   0x004  XYZRHW alone                          16      <- was 66% of all vertices converted
 //   0x142  XYZ | DIFFUSE | 1 uv                  24
 //
-// 0x004 is 222M of 337M vertices at ~4,500 a call, against 0x252's 28M at 45 a call. Neither
+// 0x004 was 222M of 337M vertices at ~4,500 a call, against 0x252's 28M at 45 a call. Neither
 // appears in `render.stats.fvfs`, which is keyed on the `SetVertexShader` handle - the buffered
 // path converts with whatever FVF `CreateVertexBuffer` was given. A per-draw census cannot see
 // this and a per-draw census is what §4.1 was; see §4.82 and §4.83.
+//
+// **0x004 is now zero per frame, and the fix was not in this file** (§4.84). Those vertices were
+// `ProcessVertices` output that the game locks `D3DLOCK_READONLY` to read back: the capture layer
+// could not tell that read from a refill and converted the whole buffer on its unlock, for two
+// SYSTEMMEM buffers no draw ever names. `BufferWrapper::UploadLocked` returns early on a
+// read-only lock now. The layout left standing is 0x252 at ~15,000 vertices a frame, and the
+// lesson worth keeping is that the census answers "which layout", never "why at all" - it took
+// `render.vertex_buffer_load` to ask the second question.
 //
 // Pure CPU, no Vulkan: this is a byte transform, and keeping it that way makes it the one
 // piece of the renderer that could be unit-tested outside the game.
@@ -63,6 +71,20 @@ uint32_t FvfStride(uint32_t fvf);
 // Gunlok emits - the point is to refuse rather than to silently mis-decode.
 bool FvfSupported(uint32_t fvf);
 
+// Which call path handed the converter a run. "Which layout" and "which path" are different
+// questions and only the second one decides what a fix can look like: a user-pointer draw's
+// vertices are produced fresh on the CPU every frame and there is nothing to reuse, while a
+// buffered upload is a lock/unlock of an object that persists and may well be re-sent unchanged.
+// §4.83 left the largest layout unattributed and those two readings have opposite fixes, so this
+// is counted rather than inferred from call rates.
+enum class ConvertSource : uint32_t {
+  Buffered = 0,    // BufferWrapper::UploadConvertedVertices - into the buffer's own arena slot
+  Version = 1,     // BufferWrapper::UploadVersionToScratch - a refill parked in the frame's scratch
+  UserPointer = 2, // CaptureDevice::EmitDrawUP - DrawPrimitiveUP / DrawIndexedPrimitiveUP
+  Other = 3,       // the report and verify paths, and anything that does not say
+  Count = 4,
+};
+
 // Converts `count` vertices from `src` into `dst`. Missing fields take neutral defaults:
 // w = 1, normal = (0,0,0), colour = opaque white, uvs = 0. Returns false without writing
 // anything if the layout is unsupported.
@@ -71,7 +93,7 @@ bool FvfSupported(uint32_t fvf);
 // user-pointer draw states its stride explicitly in the call and is entitled to pad, so it
 // passes the value it was given rather than letting the FVF speak for it.
 bool ConvertVertices(uint32_t fvf, const void *src, uint32_t count, CanonicalVertex *dst,
-                     uint32_t src_stride = 0);
+                     uint32_t src_stride = 0, ConvertSource source = ConvertSource::Other);
 
 // --- the layout census -----------------------------------------------------------------------
 //
@@ -92,6 +114,9 @@ struct LayoutCensusEntry {
   uint64_t calls;
   uint64_t vertices;
   bool specialized;   // false means it took the generic loop
+  // The same two totals split by ConvertSource, indexed by its numeric value.
+  uint64_t calls_by_source[static_cast<uint32_t>(ConvertSource::Count)];
+  uint64_t vertices_by_source[static_cast<uint32_t>(ConvertSource::Count)];
 };
 
 // Fills `out` with every layout seen at least once, most vertices first, and returns how many

@@ -131,6 +131,46 @@ struct CaptureStats {
   // so anything here is a layout the enumeration missed.
   uint64_t unconvertible_buffers = 0;
 
+  // ProcessVertices calls. The destination is a vertex buffer the DRIVER fills, so its contents
+  // arrive with no Lock this layer can observe - which makes it the one buffer kind whose arena
+  // slot can never be trusted, and worth counting rather than assuming absent.
+  uint64_t process_vertices = 0;
+  // ... and how many vertices they asked to transform. The call count says almost nothing here:
+  // the picking system's coarse pass transforms 8 corners and its fine pass up to 10,000.
+  uint64_t process_vertices_vertices = 0;
+
+  // --- §4.85: ProcessVertices computed here rather than forwarded to D3D9 -------------------
+  //
+  // `software` vs `forwarded` is the coverage figure and the one to read: the software path
+  // refuses anything it cannot vouch for, so a large `forwarded` means the narrow case it handles
+  // is not the case the game is asking for, and the win is not being taken.
+  uint64_t process_vertices_software = 0;
+  uint64_t process_vertices_software_vertices = 0;
+  uint64_t process_vertices_forwarded = 0;
+
+  // The verifier (`render.verify_process_vertices`). It runs D3D9 as the authority, leaves ITS
+  // result in the buffer, and only compares - so these say how much has been checked and what the
+  // worst disagreement was, and nothing here is ever used to decide anything.
+  //
+  // Position in pixels, rhw relative to D3D9's own value: they are different quantities and one
+  // tolerance over both would mean nothing. `unresolved` counts calls the software path would have
+  // declined, which is not an error but is the other half of the coverage figure.
+  uint64_t process_vertices_verified = 0;
+  uint64_t process_vertices_verified_vertices = 0;
+  uint64_t process_vertices_verify_skipped = 0;
+  uint64_t process_vertices_unresolved = 0;
+  double process_vertices_max_xy_delta = 0.0; // screen pixels
+  double process_vertices_max_z_delta = 0.0;  // depth units, MinZ..MaxZ
+  double process_vertices_max_rhw_delta = 0.0;
+
+  // Unlocks of a D3DLOCK_READONLY lock, which by contract changed nothing and so upload nothing.
+  // Very nearly one per `process_vertices` on a settled level02 camera: the game reads its
+  // transformed vertices back out of the destination buffer, and until §4.84 every one of those
+  // reads was being converted and uploaded as if it were a refill.
+  uint64_t readonly_unlocks = 0;
+  uint64_t readonly_unlock_vertices = 0;
+
+
   // --- Phase 2c-iii: how the pixels actually arrive -------------------------------------
   //
   // D3D8 offers two ways into a texture's bits: IDirect3DTexture8::LockRect, and
@@ -304,6 +344,42 @@ std::string FormatShadowState();
 // screen, without the rest of the session in the sample.
 void ResetStats();
 
+// `render.skip_readonly_unlocks` - whether the unlock of a D3DLOCK_READONLY lock skips the upload
+// path entirely (§4.84). On by default, and worth **1.2 ms of a 6.2 ms level02 frame**.
+//
+// Run-time rather than an environment variable for the reason `SetTopologies` gives below and one
+// more of its own: this is a **pure** optimization - a read-only lock changed nothing, so the
+// upload it skips would have written the bytes already there - which makes flipping it inside one
+// session an A/B whose only difference is the work avoided, with the scene, the camera and the
+// actor set held fixed. Two launches would not have that, and a launch-to-launch spread of ~0.5 ms
+// was measured while establishing this, against the 0.1 ms §4.83 assumed.
+void SetSkipReadOnlyUnlocks(bool enabled);
+bool SkipReadOnlyUnlocks();
+
+// `render.software_process_vertices` - whether `IDirect3DDevice8::ProcessVertices` is computed in
+// this layer instead of being forwarded to D3D9's software vertex pipeline (§4.85).
+//
+// Gunlok uses it only for mouse picking, at ~20 vertices a call and ~28 calls a frame, where
+// forwarding costs 0.188 ms of a 4.81 ms frame - almost all of it d3d9 setting up and tearing down
+// a pipeline for eight bounding-box corners. The transform itself is microseconds.
+//
+// It handles a deliberately narrow case (XYZRHW destination, mirrored transform, readable source)
+// and forwards everything else, so `render.stats.process_vertices_forwarded` is the coverage
+// figure. Off restores forwarding, which is both the A/B and the way out if it is ever wrong.
+void SetSoftwareProcessVertices(bool enabled);
+bool SoftwareProcessVertices();
+
+// `render.verify_process_vertices` - check every ProcessVertices against D3D9's own answer.
+//
+// **Non-destructive by construction**: it runs D3D9, leaves D3D9's result in the buffer, and only
+// compares ours against it. So it can be left armed for a whole session without the software path
+// ever being installed, which matters because this is the one computation here whose errors are
+// invisible - a wrong screen position selects the wrong unit and nothing on screen says so. The
+// same discipline as `VerifyBufferSlots` and `CompareShadowToDevice`.
+void SetVerifyProcessVertices(bool armed);
+bool VerifyProcessVertices();
+std::string FormatProcessVerticesVerification();
+
 // Which non-triangle-list topologies the Vulkan path draws, switchable at run time.
 //
 // Run time and not just an environment variable, because comparing two launches does not
@@ -378,6 +454,11 @@ std::string VerifyTextureImages();
 // addresses the arena by offset rather than by binding - it simply draws the wrong thing.
 // `render.verify_buffers()`.
 std::string VerifyBufferSlots();
+
+// `render.vertex_buffer_load` - the per-buffer view of what the vertex converter is spending its
+// time on, and whether anything draws the result. The layout census cannot answer either. `limit`
+// caps the listed rows; 0 lists all.
+std::string FormatVertexBufferLoad(uint32_t limit);
 
 // Reads the fixed-function state back off the device and diffs it against the shadow mirror.
 // Returns "<matched>/<checked> states match the device" plus a line per mismatch.

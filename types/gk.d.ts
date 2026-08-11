@@ -2573,6 +2573,80 @@ declare module "gk" {
      *  On by default. */
     specular: boolean;
 
+    /** Skip the upload path entirely when a vertex or index buffer is unlocked
+     *  from a `D3DLOCK_READONLY` lock, which by contract changed nothing (§4.84).
+     *
+     *  **Worth 1.2 ms of a 6.2 ms level02 frame**, because Gunlok uses
+     *  `ProcessVertices` to have the driver transform geometry into screen space
+     *  and then locks the destination buffer read-only to read the result back.
+     *  From the capture layer that read looks exactly like a refill, so the whole
+     *  64 KB was being converted to canonical vertices, staged and copied to the
+     *  GPU on the unlock of a *read* - 126,600 `D3DFVF_XYZRHW` vertices a frame,
+     *  84% of all per-frame vertex conversion, for two SYSTEMMEM buffers no draw
+     *  has ever named as its stream source.
+     *
+     *  On by default. Off restores the previous behaviour, which is how to A/B it
+     *  inside one session - and the two states are **bit-identical** on screen,
+     *  measured on blink-phase-matched frames, since a read-only lock cannot have
+     *  changed what the skipped upload would have written. */
+    skip_readonly_unlocks: boolean;
+
+    /** Compute `IDirect3DDevice8::ProcessVertices` in the capture layer instead of
+     *  forwarding it to D3D9's software vertex pipeline (§4.85).
+     *
+     *  **Worth 0.23 ms of a 4.80 ms level02 frame.** Gunlok uses ProcessVertices
+     *  only for mouse picking - projecting a node's 8 bounding-box corners, then
+     *  the whole mesh if the cursor is inside one - at ~20 vertices a call and
+     *  ~28 calls a frame. Forwarded, that was 6.7 us a call, almost all of it
+     *  d3d9 setting up and tearing down a pipeline for eight corners; the
+     *  transform itself is microseconds.
+     *
+     *  Handles a deliberately narrow case (XYZRHW destination, mirrored
+     *  transform, readable source) and forwards anything else, so
+     *  `render.stats.process_vertices_forwarded` is the coverage figure - 96.5%
+     *  of calls and 100% of vertices are handled on level02, the remainder being
+     *  calls with no vertices at all.
+     *
+     *  On by default. Off restores forwarding, which is both the A/B and the way
+     *  out if it is ever wrong. Check it with `verify_process_vertices` first. */
+    software_process_vertices: boolean;
+
+    /** Check every ProcessVertices against D3D9's own answer (§4.85).
+     *
+     *  **Non-destructive by construction**: it runs D3D9, leaves D3D9's result in
+     *  the buffer, and only compares ours against it - so the software path is
+     *  never installed while this is armed, and it is safe to leave on for a
+     *  whole session. That matters because this is the one computation in the
+     *  capture layer whose errors are invisible: a wrong screen position selects
+     *  the wrong unit and nothing on screen says so.
+     *
+     *  Measured over 3.4M vertices and several camera distances, the worst
+     *  disagreement is **1/16 pixel** in x and y - a subpixel quantization step,
+     *  so it is D3D9 rounding its output and ours that is exact - with z at
+     *  3.6e-07 depth and rhw at 2.0e-07 relative. Read the result with
+     *  `process_vertices_report`. */
+    verify_process_vertices: boolean;
+
+    /** ProcessVertices call counts, how many took the software path against how
+     *  many were forwarded, and the worst disagreement the verifier has seen.
+     *  The coverage line is the one to read: the software path refuses anything
+     *  it cannot vouch for, so a large forwarded share means the win is not being
+     *  taken. */
+    readonly process_vertices_report: string;
+
+    /** Which vertex buffers the converter is spending its time on, and whether
+     *  anything draws the result, as text.
+     *
+     *  `render.stats.converted_layouts` counts by *layout* and that is one
+     *  question short: it cannot say whether 28 calls a frame are one buffer
+     *  refilled 28 times or 28 buffers refilled once, and it cannot say whether
+     *  the result is ever read. Each row carries the FVF, size, converted and
+     *  skipped vertex counts, unlock count, pool, usage, the flags of the last
+     *  lock, whether it has been a `ProcessVertices` destination, and the game
+     *  function that locked it - symbolized through the Ghidra map, so it names a
+     *  producer rather than an address. This is the report §4.84 was found in. */
+    readonly vertex_buffer_load: string;
+
     /** Take a pre-transformed (`D3DFVF_XYZRHW`) vertex's `z` as the depth value,
      *  clamped to the viewport's `MinZ..MaxZ`, instead of running the viewport's
      *  depth range over it. That is what D3D does, measured with `depth_probe`;

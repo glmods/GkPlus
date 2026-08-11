@@ -211,18 +211,22 @@ void ConvertRun(FvfT fvf, const uint8_t *bytes, uint32_t stride, uint32_t count,
 // These are the six VertexFormat.h documents, taken from the *draw* census.
 //
 // **0x004 and 0x142 are deliberately NOT here, and that is a measurement rather than an
-// oversight.** `render.stats.converted_layouts` - which exists because of this - says 0x004
-// (XYZRHW alone, untextured and uncoloured) is **66% of every vertex the converter touches** in a
-// level02 session, 222M of 337M at ~4,500 vertices a call, and it had been running the generic
-// loop the whole time: a layout can dominate by vertex count while being invisible in a per-draw
-// table. Adding both was the obvious move and it made the frame **slower**, reproducibly - median
-// 5.58 -> 5.71 ms and p95 6.20 -> 6.79 over two runs each.
+// oversight.** `render.stats.converted_layouts` - which exists because of this - said 0x004
+// (XYZRHW alone, untextured and uncoloured) was **66% of every vertex the converter touches** in a
+// level02 session, 222M of 337M at ~4,500 vertices a call, running the generic loop the whole
+// time: a layout can dominate by vertex count while being invisible in a per-draw table. Adding
+// both was the obvious move and the measurement refuses it - medians 5.72/5.71 with against
+// 5.72/5.81/5.71 without, distributions fully overlapping, no effect to see.
 //
 // So the generic loop's cost was never the branching it was assumed to be. For 0x004 the body is
 // 16 bytes read and 48 written, 32 of them constants, and what that loop is doing is moving bytes
-// into write-combined scratch - which a ninth instantiation cannot speed up and does make the
-// code footprint worse. The win here is not a faster conversion of 222M vertices; it is not
-// converting them. See vulkan_renderer_notes.md §4.83.
+// - which a ninth instantiation cannot speed up and does make the code footprint worse. The win
+// was never a faster conversion of 222M vertices; it was **not converting them**, and §4.84 found
+// where: they were `ProcessVertices` output being read back through a `D3DLOCK_READONLY` lock,
+// and `BufferWrapper::UploadLocked` now returns early on one. 0x004 reaches this function zero
+// times per frame, so the case that motivated specializing it does not exist any more.
+//
+// See vulkan_renderer_notes.md §4.83 and §4.84.
 #define GK_SPECIALIZED_FVFS(X)                                                                 \
   X(0x002) /* XYZ */                                                                           \
   X(0x112) /* XYZ | NORMAL | 1 uv */                                                           \
@@ -259,8 +263,9 @@ bool IsSpecializedLayout(uint32_t layout) {
 // fixed array that never allocates, rehashes or rebalances. The array is `constinit` for the same
 // reason the rest of the file has no initialisation order to worry about.
 constexpr uint32_t kCensusSlots = 64;
-uint64_t CensusCalls[kCensusSlots];
-uint64_t CensusVertices[kCensusSlots];
+constexpr uint32_t kCensusSources = static_cast<uint32_t>(ConvertSource::Count);
+uint64_t CensusCalls[kCensusSlots][kCensusSources];
+uint64_t CensusVertices[kCensusSlots][kCensusSources];
 
 uint32_t CensusSlot(uint32_t fvf) {
   const uint32_t tex = (fvf & kTexCountMask) >> kTexCountShift;
@@ -283,15 +288,24 @@ uint32_t ReadLayoutCensus(LayoutCensusEntry *out, uint32_t capacity) {
   }
   uint32_t written = 0;
   for (uint32_t slot = 0; slot < kCensusSlots && written < capacity; ++slot) {
-    const uint64_t calls = CensusCalls[slot];
+    uint64_t calls = 0;
+    uint64_t vertices = 0;
+    for (uint32_t s = 0; s < kCensusSources; ++s) {
+      calls += CensusCalls[slot][s];
+      vertices += CensusVertices[slot][s];
+    }
     if (calls == 0) {
       continue;
     }
     const uint32_t layout = CensusLayout(slot);
     out[written].layout = layout;
     out[written].calls = calls;
-    out[written].vertices = CensusVertices[slot];
+    out[written].vertices = vertices;
     out[written].specialized = IsSpecializedLayout(layout);
+    for (uint32_t s = 0; s < kCensusSources; ++s) {
+      out[written].calls_by_source[s] = CensusCalls[slot][s];
+      out[written].vertices_by_source[s] = CensusVertices[slot][s];
+    }
     ++written;
   }
   // Most vertices first: the question this answers is always "what is the converter spending its
@@ -308,7 +322,7 @@ uint32_t ReadLayoutCensus(LayoutCensusEntry *out, uint32_t capacity) {
 }
 
 bool ConvertVertices(uint32_t fvf, const void *src, uint32_t count, CanonicalVertex *dst,
-                     uint32_t src_stride) {
+                     uint32_t src_stride, ConvertSource source) {
   const uint32_t implied = FvfStride(fvf);
   if (implied == 0 || src == nullptr || dst == nullptr) {
     return false;
@@ -339,8 +353,10 @@ bool ConvertVertices(uint32_t fvf, const void *src, uint32_t count, CanonicalVer
   // Counted here, once per call, before the dispatch - so every caller is covered and the
   // "specialized" column of the census is answering about the branch actually taken below.
   const uint32_t slot = CensusSlot(layout);
-  ++CensusCalls[slot];
-  CensusVertices[slot] += count;
+  const uint32_t src_index =
+      static_cast<uint32_t>(source) < kCensusSources ? static_cast<uint32_t>(source) : 3u;
+  ++CensusCalls[slot][src_index];
+  CensusVertices[slot][src_index] += count;
 
   switch (layout) {
 #define GK_FVF_CASE(bits)                                                                      \

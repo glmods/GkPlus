@@ -28,6 +28,7 @@
 
 #include "Core.h"
 #include "Misc.h"
+#include "Profiler.h"
 
 namespace gk {
 namespace d3d8 {
@@ -1464,6 +1465,101 @@ std::string VerifyTextureImages() {
 // vertices are somewhere, the indices are somewhere, and the picture is merely wrong. A bad
 // index is the loudest form of it: one triangle reaching a vertex from an unrelated mesh
 // megabytes away, which draws as a wedge across half the screen.
+// Which vertex buffers the converter is actually spending its time on, and whether anything ever
+// draws them.
+//
+// `render.stats.converted_layouts` counts by *layout*, and that was one question short: it cannot
+// say whether 28 calls a frame of one layout are a single buffer refilled 28 times or 28 buffers
+// refilled once, and those have opposite fixes. Nor can it say whether the result is ever read -
+// which turned out to be the whole story for the largest of them (§4.84).
+//
+// The columns that matter are `converted` (vertices that reached the arena) and `drawn` (has any
+// draw ever named this buffer as its stream source). A buffer with a large `converted` and
+// `drawn: no` is pure waste.
+//
+// The executor pause and the absent `LiveWrapperLock` are `VerifyBufferSlots`'s, for its reasons -
+// this walk touches no D3D at all, so it is strictly the safer of the two.
+std::string FormatVertexBufferLoad(uint32_t limit) {
+  ExecutorPause pause;
+  struct Row {
+    uint32_t fvf;
+    uint32_t length;
+    uint64_t converted;
+    uint64_t skipped;
+    uint64_t unlocks;
+    bool drawn;
+    bool slotted;
+    uint32_t caller;
+    uint32_t pool;
+    uint32_t usage;
+    uint32_t lock_flags;
+    bool pv_dest;
+  };
+  std::vector<Row> rows;
+  uint64_t total_converted = 0;
+  uint64_t total_undrawn = 0;
+  for (const void *pointer : LiveVertexWrappers) {
+    const auto &buffer = *static_cast<const CaptureVertexBuffer *>(pointer);
+    total_converted += buffer.converted_vertices_;
+    if (!buffer.drawn_ever_) {
+      total_undrawn += buffer.converted_vertices_;
+    }
+    if (buffer.converted_vertices_ == 0 && buffer.skipped_vertices_ == 0) {
+      continue;
+    }
+    rows.push_back({buffer.fvf_, buffer.length_, buffer.converted_vertices_,
+                    buffer.skipped_vertices_, buffer.unlocks_, buffer.drawn_ever_,
+                    buffer.slot_.valid, buffer.lock_caller_, buffer.pool_, buffer.usage_,
+                    buffer.last_lock_flags_, buffer.process_vertices_dest_});
+  }
+  std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) {
+    return a.converted + a.skipped > b.converted + b.skipped;
+  });
+
+  std::string out;
+  char line[256];
+  std::snprintf(line, sizeof(line),
+                "%u live vertex buffers, %llu vertices converted, %llu of them (%.1f%%) into a "
+                "buffer NO draw has ever read\n",
+                (unsigned)LiveVertexWrappers.size(), (unsigned long long)total_converted,
+                (unsigned long long)total_undrawn,
+                total_converted == 0 ? 0.0
+                                     : 100.0 * double(total_undrawn) / double(total_converted));
+  out += line;
+  const uint32_t shown = limit == 0 || limit > rows.size() ? uint32_t(rows.size()) : limit;
+  for (uint32_t i = 0; i < shown; ++i) {
+    const Row &r = rows[i];
+    std::snprintf(line, sizeof(line),
+                  "  fvf 0x%03x %8u bytes  %10llu converted  %10llu skipped  %8llu unlocks  "
+                  "drawn: %-3s  slot: %s\n",
+                  r.fvf, r.length, (unsigned long long)r.converted,
+                  (unsigned long long)r.skipped, (unsigned long long)r.unlocks,
+                  r.drawn ? "yes" : "NO", r.slotted ? "yes" : "no");
+    out += line;
+    // Pool and usage decide whether this layer could ever read the buffer back, which is what a
+    // lazy conversion would need. 0 DEFAULT / 1 MANAGED / 2 SYSTEMMEM / 3 SCRATCH.
+    static const char *const kPools[] = {"DEFAULT", "MANAGED", "SYSTEMMEM", "SCRATCH"};
+    std::snprintf(line, sizeof(line),
+                  "      pool %s  usage 0x%04x%s%s  last lock flags 0x%04x%s%s%s%s\n",
+                  r.pool < 4 ? kPools[r.pool] : "?", r.usage,
+                  (r.usage & D3DUSAGE_DYNAMIC) != 0 ? " DYNAMIC" : "",
+                  (r.usage & D3DUSAGE_WRITEONLY) != 0 ? " WRITEONLY" : "", r.lock_flags,
+                  (r.lock_flags & D3DLOCK_READONLY) != 0 ? " READONLY" : "",
+                  (r.lock_flags & D3DLOCK_DISCARD) != 0 ? " DISCARD" : "",
+                  (r.lock_flags & D3DLOCK_NOOVERWRITE) != 0 ? " NOOVERWRITE" : "",
+                  r.pv_dest ? "   ProcessVertices DESTINATION" : "");
+    out += line;
+    if (r.caller != 0) {
+      out += "      locked by " + prof::Describe(r.caller) + "\n";
+    }
+  }
+  if (shown < rows.size()) {
+    std::snprintf(line, sizeof(line), "  ... and %u more\n", (unsigned)(rows.size() - shown));
+    out += line;
+  }
+  return out;
+}
+
 std::string VerifyBufferSlots() {
   // Park the executor for the whole check. It walks LiveVertexWrappers / LiveIndexWrappers four
   // times and D3D-Locks each buffer it finds, and the executor creates and destroys vertex

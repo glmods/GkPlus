@@ -689,7 +689,8 @@ HRESULT STDMETHODCALLTYPE CaptureVertexBuffer::Lock(UINT OffsetToLock, UINT Size
                                                      BYTE **ppbData, DWORD Flags) {
   const HRESULT hr = inner_->Lock(OffsetToLock, SizeToLock, ppbData, Flags);
   if (SUCCEEDED(hr)) {
-    NoteLock(OffsetToLock, SizeToLock, ppbData, Flags);
+    NoteLock(OffsetToLock, SizeToLock, ppbData, Flags,
+             reinterpret_cast<uint32_t>(_ReturnAddress()));
   }
   return hr;
 }
@@ -703,7 +704,8 @@ HRESULT STDMETHODCALLTYPE CaptureIndexBuffer::Lock(UINT OffsetToLock, UINT SizeT
                                                     BYTE **ppbData, DWORD Flags) {
   const HRESULT hr = inner_->Lock(OffsetToLock, SizeToLock, ppbData, Flags);
   if (SUCCEEDED(hr)) {
-    NoteLock(OffsetToLock, SizeToLock, ppbData, Flags);
+    NoteLock(OffsetToLock, SizeToLock, ppbData, Flags,
+             reinterpret_cast<uint32_t>(_ReturnAddress()));
   }
   return hr;
 }
@@ -1329,7 +1331,7 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::CreateVertexBuffer(
     return hr;
   }
   *ppVertexBuffer =
-      WrapVertexBuffers ? new CaptureVertexBuffer(buffer, Length, FVF, Pool) : buffer;
+      WrapVertexBuffers ? new CaptureVertexBuffer(buffer, Length, FVF, Pool, Usage) : buffer;
   return hr;
 }
 
@@ -1718,16 +1720,295 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::GetIndices(IDirect3DIndexBuffer8 **ppIn
   return D3D_OK;
 }
 
+// Row-major, row-vector, exactly as D3D composes them, because that is what the shader consumes
+// (see DrawItem). `a * b` here means "apply a, then b", which is D3D's reading order and the
+// opposite of the column-vector one.
+void MultiplyMatrix(const D3DMATRIX &a, const D3DMATRIX &b, float *out) {
+  for (int row = 0; row < 4; ++row) {
+    for (int col = 0; col < 4; ++col) {
+      float sum = 0.0f;
+      for (int k = 0; k < 4; ++k) {
+        sum += a.m[row][k] * b.m[k][col];
+      }
+      out[row * 4 + col] = sum;
+    }
+  }
+}
+
+// --- the software vertex transform behind ProcessVertices ------------------------------------
+//
+// Gunlok's mouse picking transforms geometry into screen space by asking D3D to do it and reading
+// the answer back (`Aw_ProcessVertices` @ 0x005a3fa0, `vulkan_renderer_notes.md` §4.84). Forwarded
+// to D3D9 that costs **0.188 ms of a 4.81 ms frame**, the second-largest zone in the profile - and
+// almost none of it is arithmetic: 28 calls a frame carrying an average of **20.3 vertices each**,
+// so 6.7 us a call is d3d9 setting up and tearing down its software vertex pipeline for eight
+// bounding-box corners.
+//
+// Doing it here instead is ~570 vertex transforms a frame, which is microseconds. It is only
+// tractable because the case is narrow and the state is already mirrored:
+//
+//   * `Aw_ProcessVertices` forces D3DRS_LIGHTING and D3DRS_CLIPPING **off** before every call and
+//     restores them after, so this is a pure transform - no lighting, no clip flags, no
+//     D3DCLIPSTATUS8 to produce.
+//   * The destination is `D3DFVF_XYZRHW` and nothing else, so the output is four floats and there
+//     is no other channel to copy. Anything else falls back to D3D9 rather than being guessed at.
+//   * The source contributes only its position, which is the first 12 bytes of every layout
+//     `ConvertVertices` accepts - the same fact `PositionBounds` already rests on.
+//
+// The arithmetic is D3D's own and is written out rather than folded into `BuildMvp`, because that
+// one bakes in Vulkan's clip conventions (it negates Y, and its XYZRHW branch undoes a viewport
+// transform Vulkan is about to apply). What is wanted here is D3D screen space exactly as the
+// game's own picking code expects to read it back.
+//
+// `render.verify_process_vertices` is how this is known to be right rather than believed to be:
+// see VerifySoftwareProcessVertices.
+// **In double, and that is a measurement rather than caution.** Concatenated and applied in float
+// this agreed with D3D9 to 2.4e-06 relative on rhw - float epsilon, as expected - but to only
+// **0.75 pixels** on screen position, which is far too big to be rounding at the end and is the
+// signature of it happening in the middle: a world-space coordinate tens of thousands of units from
+// the origin loses most of a float's mantissa in `world * view`, and the projection then multiplies
+// what is left by half the viewport width. Doubling the intermediate costs nothing at 570 vertices
+// a frame and takes the disagreement to where it belongs.
+//
+// `MultiplyMatrix` stays float because its other caller feeds a shader that is float anyway; this
+// path does its own concatenation for that reason.
+bool BuildProcessVerticesMatrix(double *out) {
+  if (!State.have_view || !State.have_projection) {
+    return false;
+  }
+  D3DMATRIX identity = {};
+  identity.m[0][0] = identity.m[1][1] = identity.m[2][2] = identity.m[3][3] = 1.0f;
+  // Unset world is identity, for the reason BuildMvp gives: the game leaves it alone for geometry
+  // already in world space.
+  const D3DMATRIX &world = State.have_world ? State.world : identity;
+  double wv[16];
+  for (int row = 0; row < 4; ++row) {
+    for (int col = 0; col < 4; ++col) {
+      double sum = 0.0;
+      for (int k = 0; k < 4; ++k) {
+        sum += double(world.m[row][k]) * double(State.view.m[k][col]);
+      }
+      wv[row * 4 + col] = sum;
+    }
+  }
+  for (int row = 0; row < 4; ++row) {
+    for (int col = 0; col < 4; ++col) {
+      double sum = 0.0;
+      for (int k = 0; k < 4; ++k) {
+        sum += wv[row * 4 + k] * double(State.projection.m[k][col]);
+      }
+      out[row * 4 + col] = sum;
+    }
+  }
+  return true;
+}
+
+// One vertex: model position -> D3D screen space, as four floats (x, y, z, rhw).
+//
+// Returns false for a vertex behind or on the eye plane. D3D9's own output there is not something
+// this reproduces by dividing anyway, and the caller forwards the whole call rather than writing
+// a vertex it cannot vouch for - a wrong screen position here selects the wrong unit, silently.
+bool TransformToScreen(const double *mvp, const float *pos, float *out) {
+  const double x = pos[0], y = pos[1], z = pos[2];
+  const double cx = x * mvp[0] + y * mvp[4] + z * mvp[8] + mvp[12];
+  const double cy = x * mvp[1] + y * mvp[5] + z * mvp[9] + mvp[13];
+  const double cz = x * mvp[2] + y * mvp[6] + z * mvp[10] + mvp[14];
+  const double cw = x * mvp[3] + y * mvp[7] + z * mvp[11] + mvp[15];
+  if (!(cw > 1e-6)) {
+    return false;
+  }
+  const double rhw = 1.0 / cw;
+  const double half_w = double(State.viewport_width) * 0.5;
+  const double half_h = double(State.viewport_height) * 0.5;
+  out[0] = float((cx * rhw + 1.0) * half_w + double(State.viewport_x));
+  // D3D screen space has Y growing downwards where NDC has it up, so this one is a subtraction.
+  out[1] = float((1.0 - cy * rhw) * half_h + double(State.viewport_y));
+  out[2] = float(cz * rhw * (double(State.viewport_max_z) - double(State.viewport_min_z)) +
+                 double(State.viewport_min_z));
+  out[3] = float(rhw);
+  return true;
+}
+
+// Gathers everything the software path needs, or returns false so the caller forwards.
+//
+// Every one of these is a real restriction rather than defensive padding, and each is the reason
+// D3D9 still has to be able to answer: an unmirrored transform, a destination layout with a
+// channel we do not produce, a source we cannot read, or a range that does not fit.
+bool CaptureDevice::ResolveProcessVertices(UINT SrcStartIndex, UINT DestIndex, UINT VertexCount,
+                                           IDirect3DVertexBuffer8 *pDestBuffer,
+                                           ProcessVerticesJob &job) {
+  constexpr uint32_t kXyzRhw = 0x004;
+  constexpr uint32_t kLayoutMask = 0x00eu | 0x010u | 0x040u | 0x080u | 0xf00u;
+  if (VertexCount == 0 || pDestBuffer == nullptr || stream0_ == nullptr) {
+    return false;
+  }
+  if (!IsLiveVertexWrapper(pDestBuffer) || !IsLiveVertexWrapper(stream0_)) {
+    return false;
+  }
+  job.dest = static_cast<CaptureVertexBuffer *>(pDestBuffer);
+  job.source = static_cast<CaptureVertexBuffer *>(stream0_);
+  // The destination must be XYZRHW and nothing else. A dest carrying a colour or a texture
+  // coordinate would need the rest of the fixed-function pipeline, which this is not.
+  if ((job.dest->fvf_ & kLayoutMask) != kXyzRhw) {
+    return false;
+  }
+  job.source_stride = stream0_stride_ != 0 ? stream0_stride_ : vulkan::FvfStride(job.source->fvf_);
+  if (job.source_stride < 12) {
+    return false;
+  }
+  // Both ranges must lie inside their buffers. The destination stride is 16 by the test above.
+  const uint64_t source_end =
+      (uint64_t(SrcStartIndex) + VertexCount) * uint64_t(job.source_stride);
+  const uint64_t dest_end = (uint64_t(DestIndex) + VertexCount) * 16ull;
+  if (source_end > job.source->length_ || dest_end > job.dest->length_) {
+    return false;
+  }
+  if (State.viewport_width == 0 || State.viewport_height == 0) {
+    return false;
+  }
+  job.source_offset = uint32_t(uint64_t(SrcStartIndex) * job.source_stride);
+  job.dest_offset = uint32_t(uint64_t(DestIndex) * 16ull);
+  job.bytes = uint32_t(uint64_t(VertexCount) * 16ull);
+  return BuildProcessVerticesMatrix(job.mvp);
+}
+
+// Transforms `VertexCount` vertices out of the bound stream into `out`, four floats each.
+// Returns false if the source could not be read or any vertex is behind the eye.
+bool CaptureDevice::RunSoftwareProcessVertices(const ProcessVerticesJob &job, UINT VertexCount,
+                                               float *out) {
+  BYTE *src = nullptr;
+  // READONLY so this cannot be mistaken for a refill by our own Unlock path, and so the runtime
+  // knows it need not dirty anything. Straight to `inner_` rather than through the wrapper: this
+  // is not the game locking its buffer and must not touch the wrapper's lock bookkeeping.
+  if (FAILED(job.source->inner_->Lock(job.source_offset, job.bytes / 16 * job.source_stride, &src,
+                                      D3DLOCK_READONLY)) ||
+      src == nullptr) {
+    return false;
+  }
+  bool ok = true;
+  for (UINT i = 0; i < VertexCount && ok; ++i) {
+    float pos[3];
+    std::memcpy(pos, src + size_t(i) * job.source_stride, sizeof(pos));
+    ok = TransformToScreen(job.mvp, pos, out + size_t(i) * 4);
+  }
+  job.source->inner_->Unlock();
+  return ok;
+}
+
 // THE crash of Phase 2b. It takes a destination vertex buffer among five parameters and
 // looks nothing like a resource call, so it sat in the forwarded list handing our wrapper
 // to d3d8to9 - which static_casts it to its own Direct3DVertexBuffer8 and reads a proxy
 // pointer out of the middle of our object. The result was an access violation in
 // d3d9!CD3DHal::ProcessVertices with a garbage pointer, three frames below anything of ours.
+//
+// It also writes its destination buffer's contents **entirely behind this layer's back** - the
+// bytes are produced by the driver's transform, not by any Lock the game makes - so a buffer that
+// has been one of these is one whose arena slot can never be authoritative. Marked, and counted,
+// because the buffers this names turned out to be 84% of all per-frame vertex conversion (§4.84).
+//
+// And, since §4.85, usually not forwarded at all: see BuildProcessVerticesMatrix.
 HRESULT STDMETHODCALLTYPE CaptureDevice::ProcessVertices(
     UINT SrcStartIndex, UINT DestIndex, UINT VertexCount,
     IDirect3DVertexBuffer8 *pDestBuffer, DWORD Flags) {
+  // Zoned because §4.84 left the question "and what does the picking itself cost" open, and
+  // nothing could answer it: this is the D3D9 runtime's software transform running on our thread,
+  // inside a call we forward, so it lands in the sampled profile as d3d9.dll with no attribution.
+  GK_ZONE("game/ProcessVertices", prof::Cat::Game);
+  ++TheStats.process_vertices;
+  TheStats.process_vertices_vertices += VertexCount;
+  if (IsLiveVertexWrapper(pDestBuffer)) {
+    static_cast<CaptureVertexBuffer *>(pDestBuffer)->process_vertices_dest_ = true;
+  }
+
+  ProcessVerticesJob job = {};
+  const bool resolved = ResolveProcessVertices(SrcStartIndex, DestIndex, VertexCount, pDestBuffer,
+                                               job);
+
+  // Verification runs D3D9 as the authority and leaves ITS result in the buffer, comparing ours
+  // against it without ever installing ours. That is what makes it safe to leave armed for a whole
+  // session, and it is the only honest way to check a computation whose errors are invisible: a
+  // wrong screen position here selects the wrong unit and nothing on screen says so.
+  if (VerifyProcessVerticesArmed) {
+    const HRESULT hr = inner_->ProcessVertices(SrcStartIndex, DestIndex, VertexCount,
+                                               Unwrap(pDestBuffer), Flags);
+    if (SUCCEEDED(hr) && resolved) {
+      VerifySoftwareProcessVertices(job, VertexCount);
+    } else if (!resolved) {
+      ++TheStats.process_vertices_unresolved;
+    }
+    return hr;
+  }
+
+  if (SoftwareProcessVerticesEnabled && resolved) {
+    // One scratch per thread, for the same reason UploadConvertedVertices has one: this is
+    // reachable from both game threads and a shared buffer would have them stage each other's
+    // vertices. Kept across calls so the allocation amortizes.
+    thread_local std::vector<float> transformed;
+    transformed.resize(size_t(VertexCount) * 4);
+    if (RunSoftwareProcessVertices(job, VertexCount, transformed.data())) {
+      BYTE *dst = nullptr;
+      if (SUCCEEDED(job.dest->inner_->Lock(job.dest_offset, job.bytes, &dst, 0)) &&
+          dst != nullptr) {
+        std::memcpy(dst, transformed.data(), job.bytes);
+        job.dest->inner_->Unlock();
+        ++TheStats.process_vertices_software;
+        TheStats.process_vertices_software_vertices += VertexCount;
+        return D3D_OK;
+      }
+    }
+  }
+  ++TheStats.process_vertices_forwarded;
   return inner_->ProcessVertices(SrcStartIndex, DestIndex, VertexCount,
                                  Unwrap(pDestBuffer), Flags);
+}
+
+// Compares what the software path would have written against what D3D9 actually wrote, which is
+// still in the buffer. Accumulates the worst disagreement seen, per component group, because a
+// mean over a million vertices hides the one that matters.
+//
+// Position is compared in pixels and rhw relatively: they are different quantities and a single
+// tolerance over both would be meaningless. Nothing here decides anything - it is read back
+// through `render.verify_process_vertices` and judged by a person.
+void CaptureDevice::VerifySoftwareProcessVertices(const ProcessVerticesJob &job,
+                                                  UINT VertexCount) {
+  thread_local std::vector<float> ours;
+  ours.resize(size_t(VertexCount) * 4);
+  if (!RunSoftwareProcessVertices(job, VertexCount, ours.data())) {
+    ++TheStats.process_vertices_verify_skipped;
+    return;
+  }
+  BYTE *dst = nullptr;
+  if (FAILED(job.dest->inner_->Lock(job.dest_offset, job.bytes, &dst, D3DLOCK_READONLY)) ||
+      dst == nullptr) {
+    ++TheStats.process_vertices_verify_skipped;
+    return;
+  }
+  for (UINT i = 0; i < VertexCount; ++i) {
+    float theirs[4];
+    std::memcpy(theirs, dst + size_t(i) * 16, sizeof(theirs));
+    const float *mine = ours.data() + size_t(i) * 4;
+    // x and y in pixels, z in depth units, kept apart because they are not the same quantity and
+    // a single maximum over both cannot be interpreted: 0.06 is nothing across a 1520-pixel
+    // viewport and would be a great deal across a 0..1 depth range.
+    for (int c = 0; c < 2; ++c) {
+      const double d = std::fabs(double(mine[c]) - double(theirs[c]));
+      if (d > TheStats.process_vertices_max_xy_delta) {
+        TheStats.process_vertices_max_xy_delta = d;
+      }
+    }
+    const double dz = std::fabs(double(mine[2]) - double(theirs[2]));
+    if (dz > TheStats.process_vertices_max_z_delta) {
+      TheStats.process_vertices_max_z_delta = dz;
+    }
+    const double scale = std::fabs(double(theirs[3]));
+    const double rd = std::fabs(double(mine[3]) - double(theirs[3])) / (scale > 0 ? scale : 1.0);
+    if (rd > TheStats.process_vertices_max_rhw_delta) {
+      TheStats.process_vertices_max_rhw_delta = rd;
+    }
+  }
+  job.dest->inner_->Unlock();
+  ++TheStats.process_vertices_verified;
+  TheStats.process_vertices_verified_vertices += VertexCount;
 }
 
 HRESULT STDMETHODCALLTYPE CaptureDevice::SetVertexShader(DWORD Handle) {
@@ -1815,21 +2096,6 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::DeleteStateBlock(DWORD Token) {
 
 // --- turning one of the game's draws into a DrawItem ---------------------------------------
 //
-// Row-major, row-vector, exactly as D3D composes them, because that is what the shader consumes
-// (see DrawItem). `a * b` here means "apply a, then b", which is D3D's reading order and the
-// opposite of the column-vector one.
-void MultiplyMatrix(const D3DMATRIX &a, const D3DMATRIX &b, float *out) {
-  for (int row = 0; row < 4; ++row) {
-    for (int col = 0; col < 4; ++col) {
-      float sum = 0.0f;
-      for (int k = 0; k < 4; ++k) {
-        sum += a.m[row][k] * b.m[k][col];
-      }
-      out[row * 4 + col] = sum;
-    }
-  }
-}
-
 // The transform for this draw, or false if there is nothing sensible to use.
 //
 // Two families, decided by the FVF rather than guessed at: an ordinary vertex goes through
@@ -2619,6 +2885,7 @@ void CaptureDevice::EmitDraw(D3DPRIMITIVETYPE type, UINT start_index, UINT primi
   // Noted for the rewrite test in UploadLocked: this draw reads whatever the slot holds at
   // Present, so a lock arriving after it is an aliasing hazard rather than an ordinary update.
   auto note_drawn = [](auto &buffer) {
+    buffer.drawn_ever_ = true;
     if (buffer.drawn_frame_ != TheStats.frames) {
       buffer.drawn_frame_ = TheStats.frames;
       buffer.draws_this_frame_ = 0;
@@ -2727,7 +2994,7 @@ void CaptureDevice::EmitDrawUP(D3DPRIMITIVETYPE type, UINT primitive_count,
   }
   if (!vulkan::ConvertVertices(State.fvf, vertex_data, vertices,
                                static_cast<vulkan::CanonicalVertex *>(vertex_scratch.mapped),
-                               vertex_stride)) {
+                               vertex_stride, vulkan::ConvertSource::UserPointer)) {
     ++vulkan::MutableDrawStats().skipped_unconvertible;
     return;
   }
@@ -2737,6 +3004,9 @@ void CaptureDevice::EmitDrawUP(D3DPRIMITIVETYPE type, UINT primitive_count,
   // number that only ever reaches a text report. Converting vertex 0 a second time into a stack
   // local produces the identical value out of cached memory instead; one extra vertex against a
   // draw that has just converted hundreds is not measurable.
+  // Left as the default `Other` source rather than tagged `UserPointer`: it is a diagnostic probe
+  // of one vertex, and counting it beside the draw's own run would double every user-pointer call
+  // count in the census for no gain.
   vulkan::CanonicalVertex first = {};
   if (vulkan::ConvertVertices(State.fvf, vertex_data, 1, &first, vertex_stride)) {
     ++FirstVertexColours[(uint64_t(State.fvf) << 32) | first.color];
@@ -2971,6 +3241,51 @@ bool GetSpecular() { return SpecularEnabled; }
 void SetLightSum(bool enabled) { DrawLightSum = enabled; }
 
 bool GetLightSum() { return DrawLightSum; }
+
+bool SkipReadOnlyUnlocksEnabled = true;
+
+void SetSkipReadOnlyUnlocks(bool enabled) { SkipReadOnlyUnlocksEnabled = enabled; }
+
+bool SkipReadOnlyUnlocks() { return SkipReadOnlyUnlocksEnabled; }
+
+bool SoftwareProcessVerticesEnabled = true;
+bool VerifyProcessVerticesArmed = false;
+
+void SetSoftwareProcessVertices(bool enabled) { SoftwareProcessVerticesEnabled = enabled; }
+
+bool SoftwareProcessVertices() { return SoftwareProcessVerticesEnabled; }
+
+void SetVerifyProcessVertices(bool armed) { VerifyProcessVerticesArmed = armed; }
+
+bool VerifyProcessVertices() { return VerifyProcessVerticesArmed; }
+
+std::string FormatProcessVerticesVerification() {
+  char line[512];
+  const uint64_t handled = TheStats.process_vertices_software + TheStats.process_vertices_forwarded;
+  std::snprintf(
+      line, sizeof(line),
+      "ProcessVertices: %llu calls, %llu vertices (%.1f per call)\n"
+      "  software: %llu calls / %llu vertices   forwarded to d3d9: %llu (%.1f%% of %llu)\n"
+      "  verify %s: %llu calls / %llu vertices checked, %llu skipped, %llu unresolved\n"
+      "  worst disagreement vs d3d9: xy %.6f pixels, z %.3g depth, rhw %.3g relative\n",
+      (unsigned long long)TheStats.process_vertices,
+      (unsigned long long)TheStats.process_vertices_vertices,
+      TheStats.process_vertices == 0
+          ? 0.0
+          : double(TheStats.process_vertices_vertices) / double(TheStats.process_vertices),
+      (unsigned long long)TheStats.process_vertices_software,
+      (unsigned long long)TheStats.process_vertices_software_vertices,
+      (unsigned long long)TheStats.process_vertices_forwarded,
+      handled == 0 ? 0.0 : 100.0 * double(TheStats.process_vertices_forwarded) / double(handled),
+      (unsigned long long)handled, VerifyProcessVerticesArmed ? "ARMED" : "off",
+      (unsigned long long)TheStats.process_vertices_verified,
+      (unsigned long long)TheStats.process_vertices_verified_vertices,
+      (unsigned long long)TheStats.process_vertices_verify_skipped,
+      (unsigned long long)TheStats.process_vertices_unresolved,
+      TheStats.process_vertices_max_xy_delta, TheStats.process_vertices_max_z_delta,
+      TheStats.process_vertices_max_rhw_delta);
+  return line;
+}
 
 bool DeviceCreated() { return HaveDevice; }
 

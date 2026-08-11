@@ -23,6 +23,7 @@
 #include <d3d8to9.hpp>
 
 #include <atomic>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <set>
@@ -427,6 +428,14 @@ private:
 
 struct CaptureDevice;
 
+// Whether the unlock of a read-only lock may skip the upload path.
+// `SetSkipReadOnlyUnlocks` is the setter; see D3D8Capture.h for why it is run-time.
+extern bool SkipReadOnlyUnlocksEnabled;
+// Whether ProcessVertices is computed here instead of being forwarded to D3D9, and whether every
+// call is additionally checked against D3D9's own answer. See D3D8Capture.h.
+extern bool SoftwareProcessVerticesEnabled;
+extern bool VerifyProcessVerticesArmed;
+
 // --- buffer wrappers ---------------------------------------------------------------------
 //
 // Wrapped so that Release reaching zero is observable. `Wrapper<T>` already owns exactly one
@@ -474,8 +483,17 @@ template <typename Interface> struct BufferWrapper : Wrapper<Interface> {
     }
   }
 
-  void NoteLock(uint32_t offset, uint32_t size, BYTE **data, uint32_t flags) {
+  // `caller` is the game address that called IDirect3DVertexBuffer8::Lock, taken by the wrapper
+  // with `_ReturnAddress()`. One dword, kept because it is the only thing on this path that can
+  // NAME a producer: a buffer is an anonymous 64 KB of bytes, the layout census knows only its
+  // FVF, and the sampler cannot help - it walks the stack of whatever thread it interrupted, not
+  // of the lock. `prof::Describe` turns it into a game function through the Ghidra symbol map
+  // (`utils/symdump/`). Overwritten each lock rather than accumulated: the buffers worth asking
+  // about are refilled from one site.
+  void NoteLock(uint32_t offset, uint32_t size, BYTE **data, uint32_t flags, uint32_t caller) {
     ++TheStats.locks;
+    lock_caller_ = caller;
+    last_lock_flags_ = flags;
     // A zero SizeToLock means "the whole buffer" in D3D8.
     locked_offset_ = offset;
     locked_bytes_ = size == 0 ? length_ - offset : size;
@@ -493,6 +511,42 @@ template <typename Interface> struct BufferWrapper : Wrapper<Interface> {
     // and was never measured; these three zones are what measure it.
     GK_ZONE("upload/UploadLocked", prof::Cat::Upload);
     ++unlocks_;
+    // A READ-ONLY lock cannot have changed anything, so there is nothing to re-upload - and this
+    // is not a micro-optimization, it was **84% of all per-frame vertex conversion** (§4.84).
+    //
+    // Gunlok uses `IDirect3DDevice8::ProcessVertices` to have the driver transform geometry into
+    // screen space, and then locks the destination buffer `D3DLOCK_READONLY` to read the
+    // transformed vertices back. From this layer that read is indistinguishable from a refill -
+    // Lock, then Unlock - so the whole 64 KB was being converted to canonical vertices, staged and
+    // copied to the GPU on the unlock of a read. On a settled level02 camera that was 126,600
+    // vertices a frame of D3DFVF_XYZRHW, ~6 MB of writes, for two SYSTEMMEM buffers that **no
+    // draw has ever named as its stream source**.
+    //
+    // The test is D3D8's own contract rather than anything inferred about those buffers ("the
+    // application will not write to the buffer"), which is why it sits here and not behind a
+    // heuristic about which buffers look unused: every consumer of a vertex buffer's contents in
+    // the runtime and the driver already depends on it, and an app that broke it would corrupt
+    // far more than this. `render.vertex_buffer_load` reports the flags, so a buffer arriving here
+    // read-only is visible rather than merely assumed.
+    //
+    // Returning *before* the rewrite bookkeeping is deliberate. A read is not a rewrite: counting
+    // one would inflate `draws_reading_rewritten_buffers`, and - much worse - could take the
+    // `rewritten_after_draw` branch and park a whole-buffer *version* of it in the frame's
+    // scratch, which converts the entire buffer rather than the locked range. That would make the
+    // read-back cost more than the refill it is not.
+    if ((locked_flags_ & D3DLOCK_READONLY) != 0) {
+      ++TheStats.readonly_unlocks;
+      if (locked_ != nullptr && vertex_) {
+        const uint32_t stride = vulkan::FvfStride(fvf_);
+        const uint32_t skipped = stride == 0 ? 0 : locked_bytes_ / stride;
+        TheStats.readonly_unlock_vertices += skipped;
+        skipped_vertices_ += skipped;
+      }
+      if (SkipReadOnlyUnlocksEnabled) {
+        locked_ = nullptr;
+        return;
+      }
+    }
     // Rewritten after this frame's draws already read it: the slot cannot hold both versions,
     // and the draw list is not recorded until Present, so those draws would read this one.
     //
@@ -576,7 +630,8 @@ template <typename Interface> struct BufferWrapper : Wrapper<Interface> {
       const vulkan::ScratchAlloc alloc = vulkan::AllocateScratchVertices(count);
       if (!alloc.valid ||
           !vulkan::ConvertVertices(fvf_, locked_, count,
-                                   static_cast<vulkan::CanonicalVertex *>(alloc.mapped))) {
+                                   static_cast<vulkan::CanonicalVertex *>(alloc.mapped), 0,
+                                   vulkan::ConvertSource::Version)) {
         return false;
       }
       version_offset_ = alloc.offset;
@@ -627,6 +682,7 @@ template <typename Interface> struct BufferWrapper : Wrapper<Interface> {
     if (count == 0) {
       return;
     }
+    converted_vertices_ += count;
     // One scratch buffer PER THREAD, kept across calls so the allocation amortizes.
     //
     // It was `static` - one for the process - on the reasoning that "conversion is
@@ -647,7 +703,8 @@ template <typename Interface> struct BufferWrapper : Wrapper<Interface> {
     scratch.resize(count);
     {
       GK_ZONE("upload/ConvertVertices", prof::Cat::Upload);
-      if (!vulkan::ConvertVertices(fvf_, locked_, count, scratch.data())) {
+      if (!vulkan::ConvertVertices(fvf_, locked_, count, scratch.data(), 0,
+                                   vulkan::ConvertSource::Buffered)) {
         ++TheStats.failed_uploads;
         return;
       }
@@ -713,6 +770,26 @@ template <typename Interface> struct BufferWrapper : Wrapper<Interface> {
   // a buffer that cannot be read costs one attempt rather than one per draw.
   bool seeded_ = false;
 
+  // Vertices this buffer has had converted into its slot, and vertices whose unlock skipped that
+  // because the lock was read-only. Per buffer rather than per layout, because the layout census
+  // cannot say whether 28 calls a frame are one buffer refilled 28 times or 28 buffers refilled
+  // once, nor whether anything reads the result - and those have different fixes. Read by
+  // `FormatVertexBufferLoad`, which is where §4.84 was found.
+  uint64_t converted_vertices_ = 0;
+  uint64_t skipped_vertices_ = 0;
+  // The game address that last locked this buffer, and the flags of that lock. See NoteLock.
+  uint32_t lock_caller_ = 0;
+  uint32_t last_lock_flags_ = 0;
+  // Set once this buffer has been the destination of IDirect3DDevice8::ProcessVertices, whose
+  // output the driver writes with no Lock this layer can see.
+  bool process_vertices_dest_ = false;
+
+  // Whether any draw has ever read this buffer. Distinguishes "converted and used" from
+  // "converted and never looked at" in the two counter pairs above - a buffer the game refills
+  // every frame and never draws from is work with no output at all, and nothing here could see
+  // that before.
+  bool drawn_ever_ = false;
+
   // Gives this buffer an arena slot from its OWN current contents, for a buffer whose only
   // Unlock happened before the renderer existed. Exactly the same shape, and the same
   // justification, as EnsureTextureImage: being drawn is the definition of needing to be
@@ -758,6 +835,10 @@ template <typename Interface> struct BufferWrapper : Wrapper<Interface> {
   virtual void UnlockAfterRead() = 0;
 
   uint32_t pool_ = D3DPOOL_MANAGED;
+  // The D3DUSAGE_* the buffer was created with. Reported beside the pool because the two together
+  // are what say whether this layer can ever read a buffer's contents back: MANAGED and SYSTEMMEM
+  // keep a system-memory copy by definition, DEFAULT + D3DUSAGE_DYNAMIC keeps nothing.
+  uint32_t usage_ = 0;
   // This buffer's own region of the arena, held for its whole lifetime and released in the
   // destructor. See BufferSlot in VkResources.h for why it is per-buffer and not per-upload.
   vulkan::BufferSlot slot_;
@@ -821,9 +902,10 @@ void ForgetBoundBuffer(const void *wrapper);
 
 struct CaptureVertexBuffer final : BufferWrapper<IDirect3DVertexBuffer8> {
   CaptureVertexBuffer(IDirect3DVertexBuffer8 *inner, uint32_t length, uint32_t fvf,
-                      uint32_t pool)
+                      uint32_t pool, uint32_t usage)
       : BufferWrapper(inner, length, true, fvf) {
     pool_ = pool;
+    usage_ = usage;
     LiveWrapperGuard guard(LiveWrapperLock);
     LiveVertexWrappers.insert(this);
   }
@@ -995,6 +1077,24 @@ struct CaptureDevice final : Wrapper<IDirect3DDevice8> {
   uint32_t stream0_stride_ = 0;
   IDirect3DIndexBuffer8 *indices_ = nullptr;
   uint32_t base_vertex_ = 0;
+
+  // Everything the software ProcessVertices path needs, resolved once per call so the transform,
+  // the verifier and the range checks all read the same values. See D3D8Capture.cpp, §4.85.
+  struct ProcessVerticesJob {
+    CaptureVertexBuffer *source;
+    CaptureVertexBuffer *dest;
+    uint32_t source_offset;
+    uint32_t source_stride;
+    uint32_t dest_offset;
+    uint32_t bytes;      // of the destination, always VertexCount * 16
+    // world x view x projection, in D3D's conventions, not Vulkan's. **Double**, and that is
+    // measured - see BuildProcessVerticesMatrix.
+    double mvp[16];
+  };
+  bool ResolveProcessVertices(UINT SrcStartIndex, UINT DestIndex, UINT VertexCount,
+                              IDirect3DVertexBuffer8 *pDestBuffer, ProcessVerticesJob &job);
+  bool RunSoftwareProcessVertices(const ProcessVerticesJob &job, UINT VertexCount, float *out);
+  void VerifySoftwareProcessVertices(const ProcessVerticesJob &job, UINT VertexCount);
 
   // Not a COM method - a helper that turns one of the game's draws into a vulkan::DrawItem.
   // A member because it needs the bound stream, indices and base vertex, which are the

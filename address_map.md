@@ -314,6 +314,63 @@ in the game can reposition or restyle the window after creation, and the non-cli
 hand-rolled (`SM_CXFRAME`x2 horizontally, `SM_CXFRAME`x2 + `SM_CYCAPTION` vertically, missing
 `SM_CXPADDEDBORDER`, which is where the undersized client area comes from).
 
+**The shared vertex-buffer pool, the software-transform scratch and mouse picking:**
+(see `vulkan_renderer_notes.md` §4.84 — this is where 84% of the Vulkan renderer's per-frame vertex
+conversion was going, and none of it is geometry the game draws)
+
+| Offset | Signature | Name |
+|--------|-----------|------|
+| 0x005a2e40 | ThisCall<int, VertexBufferSet*, int count, int fvf, int flags, bool force_sysmem> (RET 0x10) | VertexBufferSet_Create — the binary's **only** `CreateVertexBuffer` caller. Stride is computed inline from the FVF (`address_map` note: XYZ +12, XYZRHW +16, normal +12, diffuse/specular +4 each, ntex\*8), pool is `MANAGED` unless `force_sysmem` or `ForceSystemMemVertexBuffers` |
+| 0x005a2fc0 | ThisCall<int, VertexBufferSet*, void** out> (RET 0x4) | VertexBufferSet_Lock — locks the **whole** buffer with the flags fixed at creation. **Returns the cached pointer with no D3D call when `state == 1`**, so a re-entrant lock is invisible to any D3D-level hook |
+| 0x005a3050 | ThisCall<int, VertexBufferSet*> | VertexBufferSet_Unlock |
+| 0x005a30c0 | ThisCall<void, VertexBufferSet*, int mode> | VertexBufferSet_SetLockMode — jump table @ 0x005a3110; **mode 1 = `D3DLOCK_NOSYSLOCK\|D3DLOCK_READONLY` (0x810)**. Called once per set, from `AwScratchVB_CreateAll`, so the flags are constant for the process |
+| 0x005a3140 | ThisCall<void*, VertexBufferSet*> | VertexBufferSet_GetD3DBuffer — the only route from a set to its `IDirect3DVertexBuffer8`; **4 callers**, which is what bounds the draw analysis |
+| 0x005a31c0 | ThisCall<void, VertexBufferSet*, char*> | VertexBufferSet_SetDebugName — was `SetString?` in the DB, which described neither the argument nor the field |
+| 0x005a1f30 | StdCall<void> | AwScratchVB_CreateAll — called once, from `CreateDirect3D` @ 0x00574b60. Creates the three scratch sets below |
+| 0x005a3fa0 | FastCall<void, VertexBufferSet* dest, VertexBufferSet* src, int, int, int, int> | Aw_ProcessVertices — forces `D3DRS_SOFTWAREVERTEXPROCESSING` on and `LIGHTING`/`CLIPPING` off, binds **src** with SetStreamSource, calls `ProcessVertices` (device slot 74) into **dest**, restores. The dest is never a stream source, which is why FVF 0x004 appears in no draw |
+| 0x005a7930 | — | Picking_TestNodeBoundingBox — the coarse pass: projects 8 bbox corners, once per drawn item from `DrawItem_RenderGeometry`. Was `FUN_005a7930` |
+| 0x005a70a0 | — | Picking_SelectPickersForNode — the same, once per `SceneMesh_Render`. Was `FUN_005a70a0` |
+| 0x005a73c0 | — | Picking_PointInProjectedBox — cursor pixel against the six quads of a projected box |
+| 0x005998f0 | — | SceneMesh_BuildHitTestVB — the mesh's position-only picking copy |
+| 0x00582d10 | — | ParticleSystem_Render — writes `AwScratchVB_Particle`, the one scratch set the CPU fills. Was `FUN_00582d10` |
+| 0x00558cf0 | — | Spark_CreateVertexBuffer — the 512-vertex FVF 0x142 `"spark"` buffer, `MANAGED`+`WRITEONLY`, **drawn** from two sites (one gated on shadow quality) |
+
+| Offset | Type | Name |
+|--------|------|------|
+| 0x00803d98 | VertexBufferSet* | AwScratchVB_Transform — `"transform"`, 4,096 x FVF 0x004 = 65,536 B, SYSTEMMEM, `DONOTCLIP`, lock mode 1 (READONLY) |
+| 0x00803dfc | VertexBufferSet* | AwScratchVB_HitTest — `"hit test"`, 10,000 x FVF 0x004 = 160,000 B, same |
+| 0x00803dd0 | VertexBufferSet* | AwScratchVB_Particle — `"particle"`, 4,096 x FVF 0x002 = 49,152 B, SYSTEMMEM, `WRITEONLY\|SOFTWAREPROCESSING\|DONOTCLIP`, lock mode 2 (**not** read-only) |
+| 0x006ac62c | Picker* | MousePicker — +0x14/+0x18 the cursor pixel (`RunInGameFrame` @ 0x0046e839 writes it each frame), +0x1c the nearest hit, reset to `FLT_MAX` by `RunGameFrame` @ 0x0046e480 |
+| 0x006ac628 | int* | MousePickingEnabled — ships as **1**; `ToggleReconMode` @ 0x004976d0 and `MenuLoadGame` write it |
+| 0x00803e84 / 0x00803e88 | List* | PickerList / PickerCandidates |
+| 0x006ab980 | int* | ForceSystemMemVertexBuffers |
+
+**The mesh teardown cascade:** (see `vulkan_renderer_notes.md` §4.85 — ~3% of a settled level02
+frame, and **none of it reachable from a renderer layer**: the hot instructions are cache-missing
+linked-list chases over the game's own pool heap, touching no D3D object)
+
+| Offset | Signature | Name |
+|--------|-----------|------|
+| 0x00599110 | ThisCall<void, void*> | SceneGraphNode_Release — refcount at +0x90, releases ≤10 children from the array at +0x44, then vtable slot 0. **70+ call sites**, so it does not identify what is being destroyed; it is the seam to hook if that question ever matters |
+| 0x0059fee0 | ThisCall<void, SceneMesh*, int> | SceneMesh_DeletingDtor — vtable slot 0; `operator delete(p, 0x98)`, so **SceneMesh is 0x98** |
+| 0x00598d10 | ThisCall<void, SceneMesh*> | SceneMesh_Dtor — destroys every `SubMesh` in the `List<SubMesh*>` at +0x34, **one `SubMesh_Dtor` per submesh**, which is what makes the cascade quadratic |
+| 0x00595990 | ThisCall<void, SubMesh*> | SubMesh_Dtor — two O(n) list scans each: `List_RemoveEntry` on `SubMeshList`, and the `IndexBufferSet` unregister. `operator delete(p, 0x24)`, so **SubMesh is 0x24**. `SubMesh+0x08` is the shared per-FVF vertex-buffer pool (debug name `"AwSharedVB"`), which `rendering_notes.md` had left unidentified |
+| 0x005a1440 | ThisCall<void, List<T>*, void*> (RET 0x4) | List_RemoveEntry — AvP's `list_tem.hpp` `List<T>::delete_entry`. `+0x17` is the branch after `CMP [ECX+0xc],EAX`, i.e. the load of `List_Member<T>::data` |
+| 0x005a3330 | ThisCall<void, IndexBufferSet*> (bare RET) | IndexBufferSet_Dtor — `Release`s the D3D buffer, then linearly scans `IndexBufferSetList` for its own node. **`+0x43` is the branch after the `data` load**, and was 1.89% of all samples |
+| 0x005a4300 | ThisCall<void, IndexBufferSet*, int> (RET 0x4) | IndexBufferSet_DeletingDtor — vtable slot 0 of the 2-slot vtable at 0x0066db34 |
+| 0x005a3270 | ThisCall<void, IndexBufferSet*> (bare RET) | IndexBufferSet_Ctor — appends to `IndexBufferSetList` unconditionally, which is what makes the unregister O(n) |
+| 0x005a33e0 | ThisCall<int, IndexBufferSet*, int, int, bool> (RET 0xc) | IndexBufferSet_Create — `CreateIndexBuffer`, always `D3DFMT_INDEX16`, `MANAGED` unless `force_sysmem` |
+| 0x005a34d0 | ThisCall<void, IndexBufferSet*> (bare RET) | IndexBufferSet_Destroy |
+| 0x00595510 | ThisCall<void, SharedVBPool*, void*> | SharedVBPool_ReleaseEntry — **unconditionally** calls the below, so tearing down N submeshes that share one pool is N Release+Create pairs, not one. Measured at **0 per frame** on a settled level02 camera, so it is a hazard to know about rather than a live cost |
+| 0x00595550 | ThisCall<void, SharedVBPool*> | SharedVBPool_RecreateBuffer — destroys the pool's `IDirect3DVertexBuffer8` and creates a new one sized for the remaining vertices |
+
+| Offset | Type | Name |
+|--------|------|------|
+| 0x00803e34 / 0x00803e38 | List* / int* | IndexBufferSetList and its count — **2,701 live** on a settled level02 camera, which is the length of the scan above |
+| 0x00803c80 / 0x00803c84 | List* / int* | SubMeshList and its count |
+| 0x00803d44 | int* | VertexBufferCreateCount |
+| 0x00803d4c / 0x00803d50 | int* | IndexBufferCreateCount / IndexBufferReleaseCount — **+4 per frame** on a settled camera, which with the 2,701 above is the whole of that 1.89% |
+
 **Text rendering:** (see `rendering_notes.md` §4.2 — text is its own queue, not the render queue)
 
 | Offset | Signature | Name |
