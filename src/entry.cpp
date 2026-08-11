@@ -3,6 +3,7 @@
 
 #include <detours.h>
 
+#include "Core.h"
 #include "CustomLevel.h"
 #include "CustomMenu.h"
 #include "D3D8Capture.h"
@@ -18,7 +19,6 @@
 #include "ScriptQueue.h"
 #include "WindowPlacement.h"
 
-#include <cassert>
 #include <memory>
 
 namespace gk {
@@ -70,6 +70,26 @@ struct Subsystems {
   ScriptSystem script;      // QuickJS host; runs gkplus/main.mjs
 };
 
+// Commits the open Detours transaction, and says so when it fails.
+//
+// This is a function rather than the `assert(DetourTransactionCommit() == NO_ERROR)` it replaces
+// because that call is the whole point of the statement, and `assert` **discards its argument**
+// under NDEBUG - which every optimized configuration defines. The transaction was therefore begun
+// and never committed in RelWithDebInfo and Release: every subsystem's `DetourAttach` queued
+// normally, `Subsystems` constructed without complaint, and then not one hook was installed. The
+// symptom is not a crash but stock Gunlok with our DLL sitting loaded in the process - no version
+// stamp, no REPL listener, no file hooks, no D3D8 capture - which reads as "the build is broken"
+// rather than as a one-line defect. It is why only a Debug DLL was ever deployed.
+//
+// Nothing here may throw or fault: this runs under the loader lock, and on detach a failure to
+// unpatch leaves gl.exe running with detours into a DLL that is about to be unmapped.
+void Commit(const char *phase) {
+  const LONG error = DetourTransactionCommit();
+  if (error != NO_ERROR) {
+    DebugWrite("gkplus: Detours {} transaction failed to commit: {}\n", phase, error);
+  }
+}
+
 extern "C" BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID) {
   if (DetourIsHelperProcess()) {
     return TRUE;
@@ -80,13 +100,13 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID) {
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
     subsystems = std::make_unique<Subsystems>();
-    assert(DetourTransactionCommit() == NO_ERROR);
+    Commit("attach");
 
   } else if (reason == DLL_PROCESS_DETACH) {
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
     subsystems = nullptr;
-    assert(DetourTransactionCommit() == NO_ERROR);
+    Commit("detach");
   }
 
   return TRUE;

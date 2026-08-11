@@ -2411,9 +2411,20 @@ bool BuildDrawRecord(vulkan::DrawItem &item, const float *mvp, uint64_t frame) {
   }
   record.lighting = lighting;
 
-  ResolveLightRun(frame, record.light_offset, record.light_count);
+  // Resolved into locals and then stored, rather than resolved through references INTO the
+  // record: `record` lives in the frame's scratch, which is write-combined host-visible memory.
+  // A write there is cheap and a read is not - uncached, straight off the bus - and
+  // `if (record.light_count != 0)` was one, per lit draw, purely to move a census counter. That
+  // single reload was **18.8% of the whole frame** in the level02 profile, the largest cost in
+  // the process. It is the same rule StoreLight states three hundred lines up ("the scratch is
+  // host-visible memory the GPU reads and this side never does"); this was the site that broke it.
+  uint32_t light_offset = 0;
+  uint32_t light_count = 0;
+  ResolveLightRun(frame, light_offset, light_count);
+  record.light_offset = light_offset;
+  record.light_count = light_count;
   ++vulkan::MutableDrawStats().lit_draws;
-  if (record.light_count != 0) {
+  if (light_count != 0) {
     ++vulkan::MutableDrawStats().lit_draws_with_lights;
   }
   return true;
@@ -2720,9 +2731,16 @@ void CaptureDevice::EmitDrawUP(D3DPRIMITIVETYPE type, UINT primitive_count,
     ++vulkan::MutableDrawStats().skipped_unconvertible;
     return;
   }
-  ++FirstVertexColours[(uint64_t(State.fvf) << 32) |
-                       static_cast<const vulkan::CanonicalVertex *>(vertex_scratch.mapped)
-                           ->color];
+  // The census wants the first CONVERTED vertex's colour, and the conversion above has just
+  // written it - but it wrote it into `vertex_scratch.mapped`, which is write-combined. Reading
+  // one dword back out of it cost **12.1% of the whole frame** in the level02 profile, for a
+  // number that only ever reaches a text report. Converting vertex 0 a second time into a stack
+  // local produces the identical value out of cached memory instead; one extra vertex against a
+  // draw that has just converted hundreds is not measurable.
+  vulkan::CanonicalVertex first = {};
+  if (vulkan::ConvertVertices(State.fvf, vertex_data, 1, &first, vertex_stride)) {
+    ++FirstVertexColours[(uint64_t(State.fvf) << 32) | first.color];
+  }
   item.base_vertex = vertex_scratch.offset;
   item.count = indices;
 

@@ -7695,3 +7695,62 @@ per-vertex bounds accumulation look like.
 None of this is a claim about the original d3d8 build - these zones do not exist on that path,
 and the same session measured it at a steady 4.25 ms. What it does say is that the difference
 §4.79 could not account for is **ours**, it is CPU-side, and it is in two places rather than one.
+
+## 4.81 §4.80's per-draw path, in an optimized build: two reads of write-combined memory, 32% of the frame
+
+§4.80's profile was taken on a **Debug** build (`/Od /Ob0 /RTC1 -MDd`), because until now that was
+the only `d3d8.dll` that could be deployed at all - the optimized configs did not link, and after
+they did they installed no hooks (both causes are in CLAUDE.md, "Build"). Rebuilt RelWithDebInfo,
+the same settled level02 camera runs at **9.24 ms median** against 22.52 ms, and the ranking
+changes with the scale rather than merely shrinking: the upload path drops from 45% of wall clock
+to 13%, and the per-draw record path §4.80 could only see as a shadow becomes the whole story.
+
+Sampled, `GKPLUS_PROFILER=1`, 120 frames, unthrottled (`GKPLUS_VK_PRESENT_MODE=immediate`):
+
+| | share of all samples |
+|---|---|
+| `BuildDrawRecord` | 18.8% |
+| `EmitDrawUP` | 12.1% |
+| `ConvertVertices` | 7.2% |
+| `NoteVertexBounds` | 3.4% |
+| `ResolveLightRun` | 3.1% |
+| **all of `d3d8.dll`** | **52.1%** |
+
+The first two are one address each - 123 samples on a single `je`, 79 on a single `mov` - and
+disassembling them says what no line number could. Both are **reads back out of the frame's
+scratch**, which is write-combined host-visible memory: a write there is cheap and a read is
+uncached, straight off the bus.
+
+- `BuildDrawRecord` passed `record.light_offset` and `record.light_count` **by reference** into
+  `ResolveLightRun`, then tested `record.light_count != 0` to move a census counter. `record` is
+  `*static_cast<GpuDrawRecord *>(alloc.mapped)`. The hot instruction is the `je` on that reload.
+- `EmitDrawUP` read `->color` off the first *converted* vertex, in scratch, to key
+  `FirstVertexColours`. The hot instruction is the store immediately after the load, stalled on it.
+
+Neither number leaves the process: `lit_draws_with_lights` and `FirstVertexColours` are both text
+in a report. **31% of the frame was two dwords fetched from the GPU's memory to increment a
+counter.**
+
+The fix is to resolve into locals and store once - which is the rule `StoreLight` already states
+three hundred lines above `BuildDrawRecord` ("the scratch is host-visible memory the GPU reads and
+this side never does"); these were the two sites that broke it. `EmitDrawUP` converts vertex 0 a
+second time into a stack `CanonicalVertex` instead of reading the copy back, which is the identical
+value out of cached memory. `ResolveLightRun` opens by assigning both out-parameters
+unconditionally, so the locals version is equivalent on every path, including the two early returns.
+
+Measured on the same camera and the same 178 actors:
+
+| | median frame | our DLL's share of samples |
+|---|---|---|
+| before | 9.24 ms | 52.1% |
+| after | **6.24 ms** | **27.5%** |
+
+**-32% frame time for two lines**, and `BuildDrawRecord` and `EmitDrawUP` leave the profile
+entirely. The top cost is now `ConvertVertices` at 13.3%, with `NoteVertexBounds` at 4.3% - both
+per-vertex loops over cached memory, which is honest work rather than a defect, and the next thing
+to look at.
+
+The general rule this leaves behind: **never read a field back out of a scratch allocation.** It
+is not a style preference and it does not cost a little. The compiler cannot help - the pointer is
+ordinary memory as far as it knows - and the cost does not show up as a slow function, only as one
+stalled instruction somewhere near the load.

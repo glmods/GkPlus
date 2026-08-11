@@ -27,6 +27,29 @@ cmake --build build
 cmake --build build --target copy   # copies d3d8.dll to Gunlok's Steam directory
 ```
 
+The generator is **Ninja Multi-Config and the default config is Debug**, so a bare
+`cmake --build build` produces `/Od /Ob0 /RTC1 -MDd`. That is the right build for hook and
+correctness work, and the wrong one for any measurement: level02 runs at 22.5 ms/frame under it
+against 9.2 ms for the same code optimized, and the ranking inside a profile changes with it, not
+just the scale. **Profile RelWithDebInfo, and pass `--config` to the copy target too or you deploy
+the other one:**
+
+```
+cmake --build build --config RelWithDebInfo
+cmake --build build --target copy --config RelWithDebInfo
+```
+
+Two things had to be fixed before that build existed at all, and both failed in ways that do not
+look like themselves — if either regresses, this is the section to re-read:
+
+- `cmake/Finddetours.cmake` and `cmake/Findd3d8to9.cmake` are **config-aware on purpose**. vcpkg
+  ships a debug and a release build of each and they disagree about `_ITERATOR_DEBUG_LEVEL`; a
+  single `find_library` pins whichever it reaches first for *every* configuration, which resolved
+  to the debug one and made RelWithDebInfo fail to link with `/failifmismatch`. They set
+  `IMPORTED_LOCATION_DEBUG`/`_RELEASE` plus `MAP_IMPORTED_CONFIG_RELWITHDEBINFO`. The other
+  dependencies are safe because they are C (`qjs`, `physfs`) or emit no such directive (`imgui`).
+- `DllMain` must never wrap `DetourTransactionCommit()` in an `assert`. See Conventions.
+
 `cmake --build build` is incremental and quick. The `static_assert`s in `src/Actors.h` (and the
 other struct headers) are the check for any struct-layout or vtable edit — build after touching them
 rather than eyeballing.
@@ -875,6 +898,16 @@ unrelated, long after the call.
   puts `data` at 0x0c for a pointer but at 0x10 for an 8-aligned value type, which is exactly
   what makes `MenuListItem` 0x78 rather than 0x10
 - Detour hooks follow: resolve original -> attach in constructor -> detach in destructor
+- **Never put a call inside `assert`.** `NDEBUG` is defined in every optimized configuration and
+  `assert` then discards its argument *expression*, call and all. `entry.cpp` had
+  `assert(DetourTransactionCommit() == NO_ERROR)`, so RelWithDebInfo and Release **began a Detours
+  transaction and never committed it**: every subsystem's `DetourAttach` queued normally,
+  `Subsystems` constructed without complaint, and not one hook was installed. The symptom is not a
+  crash or a failed load - it is stock Gunlok with `d3d8.dll` sitting in the module list, no
+  version stamp, no REPL listener, no file hooks and no D3D8 capture, which reads as "the optimized
+  build is broken" rather than as one line. It is why only a Debug DLL was ever deployed. The commit
+  now goes through `Commit()`, which reports a non-zero result via `DebugWrite`. There are no other
+  `assert`s in the codebase; keep it that way, and prefer a real check to a debug-only one
 - **Two subsystems must never detour the same target.** `Subsystems` is constructed inside a
   single Detours transaction, and two `DetourAttach` calls against one address do not chain
   there — one hook silently stops running. Measured: adding a second `SetupMenus` detour
