@@ -17,6 +17,7 @@
 
 #include "Core.h"
 #include "ImageCodec.h"
+#include "Profiler.h"
 #include "D3D8Device.gen.inc.h"
 #include "DetourUtils.h"
 #include "Render.h"
@@ -1362,6 +1363,11 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::Present(const RECT *pSourceRect,
   // but it is the only thing that reaches here, so this counter measures rendered frames
   // rather than elapsed ones, which is what a draws-per-frame distribution wants.
   ++TheStats.frames;
+  // The profiler's frame boundary, for the same reason this counter is here and not on the
+  // game's PresentScene: it is the one point both renderers pass through. Before anything
+  // below, so the frame it closes contains the whole of the previous frame's work.
+  prof::FrameMark();
+  GK_ZONE("Present", prof::Cat::Frame);
   // Once a frame, because a cache record's D3D pointer is stored at an unpredictable point
   // after the texture is created and there is no event to hang this on. One pass over ~130
   // records; the work stops mattering as soon as everything is named.

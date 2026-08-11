@@ -8,7 +8,7 @@ and no TypeScript at runtime, since the game loads the `.mjs` as-is.
 | File | What it covers | Maintained |
 |------|----------------|------------|
 | `gk.d.ts` | the `"gk"` module: `camera`, `console`, `actors`, `roles`, `tokens`, `triggers`, `levels`, `make`, `gls`, plus the `setup_menus` / `draw_gui` / level-module contracts. `menus` is *not* an export - it is `setup_menus`' argument - and there is no global `console`: `log`/`info`/`warn`/`error`/`debug` are on the `console` this module exports | by hand, from `src/Js*.cpp` |
-| `imgui.d.ts` | the `ImGui` interface: 197 functions and 28 enums. A type only - there is no `"ImGui"` module and no global to call, because the calls are only valid inside `draw_gui` | **generated** - run `python3 types/gen-imgui-dts.py` |
+| `imgui.d.ts` | the `ImGui` interface: 199 functions and 28 enums. A type only - there is no `"ImGui"` module and no global to call, because the calls are only valid inside `draw_gui` | **generated** - run `python3 types/gen-imgui-dts.py` |
 
 ## Using them
 

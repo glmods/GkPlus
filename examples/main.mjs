@@ -15,6 +15,10 @@ import { actors, camera, console, fx, game, levels, light, tokens, world } from 
 // than everything else here put together, and because it is the piece most worth
 // copying into an entry module of your own.
 import { draw_render_panel } from "./render-panel.mjs";
+// The CPU profiler, as ImGui. Also its own module, and the same shape: it draws
+// into the caller's window. Needs GKPLUS_PROFILER=1 (or its own Arm button) to
+// have anything to show.
+import { draw_prof_panel } from "./prof-panel.mjs";
 // A level module is an ordinary module, imported the ordinary way. Its namespace
 // - `map` plus the hooks - is exactly the description `levels.add` wants, so
 // there is nothing else to unpack. Drop this line (and the add() below) if you
@@ -155,6 +159,11 @@ export function draw_gui(ImGui) {
     // this window rather than opening one of its own, so the order here is the
     // order on screen.
     draw_render_panel(ImGui);
+
+    // Where the frame's CPU time goes. Same rule as the panel above, for a
+    // different reason: the queries behind it are far too expensive to run
+    // every frame, so it refreshes on a cadence of its own.
+    draw_prof_panel(ImGui);
 
     const check = ImGui.Checkbox("Show the actor list", showActors);
     showActors = check.value;

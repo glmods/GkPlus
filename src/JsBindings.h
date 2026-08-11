@@ -230,6 +230,10 @@ JSValue NewModsNamespace(JSContext *ctx);
 // Vulkan work - see vulkan_renderer_notes.md. Read-only: the capture layer forwards every
 // D3D8 call unchanged, so nothing here can alter what is drawn.
 JSValue NewRenderNamespace(JSContext *ctx);
+// The CPU profiler (src/Profiler.h): instrumented zones and a sampling thread over both game
+// threads, read back a frame at a time. Read-only apart from `enabled`, `mask` and `configure`;
+// nothing here can change what the game does, only what is recorded about it.
+JSValue NewProfNamespace(JSContext *ctx);
 // The game's own text layer (src/Font.h). `text.draw` *queues* - the item is
 // rasterized by the per-frame overlay pass and then freed, so a string drawn once
 // lasts one frame. For a persistent panel use the ImGui object `draw_gui` is

@@ -11,6 +11,7 @@
 #include "Core.h"
 #include "D3D8Capture.h"
 #include "GUI.h"
+#include "Profiler.h"
 #include "VkCapture.h"
 #include "VkContext.h"
 #include "VkDraw.h"
@@ -307,6 +308,13 @@ bool CreateSwapchain() {
   TheStats.image_count = actual;
   TheStats.format = static_cast<uint32_t>(Format.format);
   TheStats.present_mode = static_cast<uint32_t>(PresentMode);
+  // Stamped onto every frame the profiler records from here on. FIFO and FIFO_RELAXED throttle
+  // the whole engine loop to the monitor, which puts a floor under the frame time and makes any
+  // A/B taken against it meaningless (§4.79) - so the profiler reports it beside every
+  // millisecond rather than leaving it to be remembered.
+  prof::NotePresentMode(PresentModeName(PresentMode),
+                        PresentMode == VK_PRESENT_MODE_FIFO_KHR ||
+                            PresentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR);
   ++TheStats.swapchain_rebuilds;
   NeedsRebuild = false;
   if (ImGuiReady) {
@@ -654,6 +662,11 @@ void DrawFrame() {
   if (!Ready) {
     return;
   }
+  // The four zones below are split the way they are so that "the renderer is slow" and "the
+  // renderer is waiting" cannot be confused again. Under FIFO the cost lands in `fence wait` and
+  // `present`, and `record` stays flat; that is the shape §4.79 had to be deduced from a present
+  // mode nobody had read.
+  GK_ZONE("vulkan/DrawFrame", prof::Cat::Render);
   VkDevice device = GetDevice();
 
   if (NeedsRebuild) {
@@ -678,7 +691,10 @@ void DrawFrame() {
   }
 
   Frame &frame = Frames[FrameIndex];
-  vkWaitForFences(device, 1, &frame.in_flight, VK_TRUE, UINT64_MAX);
+  {
+    GK_ZONE("vulkan/fence wait", prof::Cat::Render);
+    vkWaitForFences(device, 1, &frame.in_flight, VK_TRUE, UINT64_MAX);
+  }
   // The fence is the proof that everything this slot staged last time round has been read, so
   // the staging ring may hand those bytes back. It must be here rather than after Present:
   // without it the ring reuses memory a frame in flight is still copying from, which is what
@@ -692,8 +708,12 @@ void DrawFrame() {
   // on, is what proves the incoming slice is free.
 
   uint32_t image_index = 0;
-  VkResult acquired = vkAcquireNextImageKHR(device, Swapchain, UINT64_MAX, frame.acquired,
-                                            VK_NULL_HANDLE, &image_index);
+  VkResult acquired = VK_SUCCESS;
+  {
+    GK_ZONE("vulkan/acquire", prof::Cat::Render);
+    acquired = vkAcquireNextImageKHR(device, Swapchain, UINT64_MAX, frame.acquired,
+                                     VK_NULL_HANDLE, &image_index);
+  }
   if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
     // Do NOT reset the fence or advance the frame: nothing was submitted, so the fence is
     // still signalled from the last time round and the semaphore was never waited on.
@@ -728,6 +748,13 @@ void DrawFrame() {
   VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   vkBeginCommandBuffer(frame.cmd, &begin);
+
+  // The CPU cost of building the frame, and the one number no wait can inflate. If this is flat
+  // while the frame time moves, the renderer is not what moved it. Ended explicitly at
+  // vkEndCommandBuffer rather than by a scope, which would mean re-indenting the 180 lines it
+  // covers.
+  static const uint16_t record_site = prof::RegisterSite("vulkan/record", prof::Cat::Render);
+  prof::Zone record_zone(record_site, prof::Cat::Render);
 
   RecordUploads(frame.cmd, FrameIndex);
 
@@ -909,6 +936,7 @@ void DrawFrame() {
           VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, 0);
 
   vkEndCommandBuffer(frame.cmd);
+  record_zone.End();
 
   VkSemaphoreSubmitInfo wait = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
   wait.semaphore = frame.acquired;
@@ -933,6 +961,7 @@ void DrawFrame() {
   submit.signalSemaphoreInfoCount = 1;
   submit.pSignalSemaphoreInfos = &signal;
   {
+    GK_ZONE("vulkan/submit", prof::Cat::Render);
     QueueGuard queue_guard(QueueMutex());
     vkQueueSubmit2(GetGraphicsQueue(), 1, &submit, frame.in_flight);
   }
@@ -949,6 +978,7 @@ void DrawFrame() {
   // hold keeps the executor's staging path from queueing behind a whole present.
   VkResult presented;
   {
+    GK_ZONE("vulkan/present", prof::Cat::Render);
     QueueGuard queue_guard(QueueMutex());
     presented = vkQueuePresentKHR(GetGraphicsQueue(), &present);
   }

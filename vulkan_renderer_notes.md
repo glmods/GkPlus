@@ -7642,6 +7642,9 @@ The one thing the Vulkan path adds that **no knob turns off** is that upload pat
 over every locked buffer, every frame, into the staging ring. It is the leading suspect and it is
 not yet measured. Whatever it is, it is CPU-side and it is not the renderer's drawing.
 
+> **Measured in §4.80.** It is 8.4 ms of a 25.2 ms frame, and it is not alone: the capture
+> layer's per-draw record path is another fifth of the main thread's samples.
+
 ### What this invalidates
 
 **The millisecond figures in §4.76 and §4.77 do not hold**, and they are corrected there rather
@@ -7652,3 +7655,43 @@ that was waiting for a vertical blank.
 
 The rule this earns: **read the present mode before quoting a frame time.** A frame-time A/B is
 only an instrument when the frame is free to get faster, and on this machine it was not.
+
+## 4.80 The suspect, measured: the upload path is 8.4 ms of a 25.2 ms frame
+
+§4.79 ended by naming `ConvertVertices` the leading suspect and saying it was not measured. It is
+now, by the profiler built for the purpose - `profiler_notes.md`, and §7 there is the table.
+
+level02, settled, `GKPLUS_RENDERER=vulkan`, 120-frame window, still under FIFO (which the
+profiler now says on every frame it prints, so this cannot be forgotten again):
+
+| | self ms/frame |
+|---|---|
+| `upload/ConvertVertices` | 4.09 |
+| `upload/UploadIntoSlot` | 3.69 |
+| `upload/UploadLocked` (own) | 0.67 |
+| `vulkan/record` | 0.84 |
+| the whole rest of the Vulkan frame | ~0.35 |
+
+So the upload path is **8.4 ms** and everything the renderer does to build and submit a frame is
+**~1.2 ms**. `vulkan/fence wait` is 0.005 ms and `vulkan/present` 0.147 ms, so under FIFO the
+throttle is not landing in the renderer either - it lands in the game's own loop.
+
+The sampled half found a second cost that was on nobody's list. 60% of main-thread samples fall
+outside every zone, and the three biggest are all in the **capture layer's per-draw path**, which
+runs inside `EmitDraw` where nothing was instrumented:
+
+| | share of samples |
+|---|---|
+| `BuildDrawRecord` | 11.8% |
+| `ResolveLightRun` | 6.5% |
+| `EmitDrawUP` | 4.8% |
+
+Roughly **55% of main-thread samples are in GkPlus's own capture and upload layer** - about a
+third in the upload path already suspected, about a fifth in a per-draw record path that was not.
+Inside the upload zones the leaves are `ReadFloat` (`VertexFormat.cpp`), `NoteVertexBounds`
+(`VkResources.cpp`) and `std::max<float>`, which is what a per-vertex widening loop and a
+per-vertex bounds accumulation look like.
+
+None of this is a claim about the original d3d8 build - these zones do not exist on that path,
+and the same session measured it at a steady 4.25 ms. What it does say is that the difference
+§4.79 could not account for is **ours**, it is CPU-side, and it is in two places rather than one.

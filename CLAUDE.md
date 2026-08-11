@@ -118,8 +118,27 @@ script host and the REPL *can* be driven from a throwaway 32-bit harness with st
 `harness_testing_notes.md` has the recipe and the four traps that cost time the first time round.
 **Always add a deliberately-failing assertion once and confirm the harness reports it** - a harness
 that cannot fail proves nothing.
+
+A *script* module - an ImGui panel, a level module - needs none of that machinery: it imports
+`"gk"` and nothing else, so **Node plus a stub `gk` package and a recording ImGui object** drives
+it in-process. That is what checks the things a type-check cannot - Begin/End balance, the query
+cadence, which writes a widget performs - and an exception or a stray `TreePop` there disables
+`draw_gui` for a whole session, so it is worth checking. Same file, "Driving a script module under
+Node".
 ### Debugging the running game
 
+- **A Windows SSH shell runs in session 0, where the game cannot run at all.** `sshd` is a
+  service, so anything launched from one gets its own object namespace and no desktop:
+  `SteamAPI_Init` cannot see the session-1 Steam client, and `gl.exe` exits **-1 having written
+  nothing anywhere** — no crash dump, no WER event, no `d3d8.log` line and no `-skipfmv` dialog,
+  which reads exactly like a broken build. Rule the DLL out by renaming `d3d8.dll` aside; the real
+  message ("Steam must be running") reaches only **stdout**, via
+  `Start-Process -RedirectStandardOutput`. `PrintWindow` cannot cross sessions either, so no
+  screenshots from there however the game was started — the REPL is fine, being localhost TCP. Run
+  the whole procedure in the interactive session with `schtasks … /it` and have that script write
+  the PNG for you to read afterwards. **Never launch `steam.exe` from session 0**: it starts a
+  second client that displaces the user's logged-in one and then swallows every later launch
+  (`steam.exe -shutdown` closes it gracefully). `utils/rendertest/README.md` has the recipe.
 - **Automated testing loads `level02`, not `level01`.** `level01.gcs` ends in
   `PLAY CUTSCENE first contact`, so a scripted run lands in a scripted camera sequence rather
   than in the level — nothing is where a test expects it, and how far the cutscene has got
@@ -384,9 +403,41 @@ asked for. `GKPLUS_VERSION_TEXT=raw` restores the stock string.
 Pure struct + native-API over AWAPI's own classes - no detours of GkPlus's own. It is the second
 place in the codebase to use real multiple inheritance, and the vtable slot ordering is
 load-bearing. `rendering_notes.md` is the analysis and now carries the mirror's own section too.
+### The profiler (`src/Profiler`, `src/JsProf`)
+
+Where the frame's CPU time goes: **instrumented zones** (`GK_ZONE`) over our own code plus a
+**sampling thread** that suspends both game threads at ~1 kHz, joined into one profile because a
+sample records the zone the thread was inside. Read from JS as `prof`, armed with
+`GKPLUS_PROFILER=1`, and drawn by `examples/prof-panel.mjs`. Always compiled; a disabled zone is a
+load, a test and a not-taken branch.
+
+The sampler walks frame pointers too (`GKPLUS_PROFILER=stacks`), and **gl.exe keeps them** — a
+walk runs from our code through AWAPI into the game's scene graph and on to the thread entry
+point. `utils/symdump/` exports the Ghidra database as the symbol map that makes those chains
+readable.
+
+For a **stutter**, `prof.trigger` is the flight recorder: a frame past both an absolute floor and
+a multiple of the running median copies its surrounding window out of the rings before they can
+overwrite it, and `prof.zones({capture: n})` reads it back. Unthrottle first
+(`GKPLUS_VK_PRESENT_MODE=immediate`) — under FIFO the frame time is quantized to the refresh
+interval, so the threshold would be measuring the monitor. `profiler_notes.md` §8 has the ring
+arithmetic that says when you need it: the frame ring reaches ~27 minutes and the event ring
+~11 seconds unthrottled, which is the whole reason a trigger exists.
+
+**`profiler_notes.md` is the design record** and §7 is what it measured first — the upload path
+at 8.4 ms of a 25.2 ms level02 frame, and a per-draw record path nobody suspected at 22% of
+samples. Four things there are load-bearing and easy to get wrong later: every frame carries
+`throttled` (a frame time taken under FIFO measures the monitor — `vulkan_renderer_notes.md`
+§4.79); self time needs the enclosing zone to sort **first** on a `t_begin` tie or it underflows;
+a thread is only profiled once it *records* something, because a discovery pass that registered
+one from the game's own thread-id global broke the sampler's contexts; and the stack walk is
+fault-free **by construction**, reading only inside a `VirtualQuery`-confirmed committed region,
+because clang-cl's `__try`/`__except` does not catch an access violation on x86 (verified) and a
+fault inside a suspended-thread window would take the game down with its threads stopped.
+
 ### JavaScript bindings (`src/Js*`) and type definitions (`types/`)
 
-The `"gk"` QuickJS C module, 24 namespaces, built by `src/JsGk.cpp`'s `Namespaces` table; plus the
+The `"gk"` QuickJS C module, 25 namespaces, built by `src/JsGk.cpp`'s `Namespaces` table; plus the
 hand-written `.d.ts` that type-checks a plain `.mjs`. **`console_command_notes.md` is the map of
 what is still missing** - all 280 registrations classified against the JS surface, with no gaps
 left. `js_bindings_notes.md` has the collection scaffolding, the Actor prototype chain, the
@@ -434,6 +485,7 @@ reference. Test invocations are under "Running the test suites" above.
 | `src/MapLights.h/cpp` | `MapLightSystem` — the game-facing half of the above: where the level's `.rif` is, what scale it is in, and when to reload. **It has to be a hook**, because neither the path nor the rif object survives the load: `LoadLevel` frees the rif right after `ConvertParsedObjects` and `Map` retains only the *shadow* object's rif name. So it detours `LoadOrGetRifFile` @ 0x004ae960 — the one seam all three of `ToMap`'s routes pass through — records the path and the unit scale, and parses lazily on the first read after a level change. Deriving the path from the `.gls` name instead was measured and **fails on 4 of 32 shipped levels** |
 | `src/Vfs.h/cpp` | The mod filesystem: mount, case-folded index, lookup, read, `Materialize`. Pure lookup — touches no game memory, so it is the half a harness can exercise. See "Mod loading" above |
 | `src/FileHooks.h/cpp` | `FileHookSystem` — the nine IAT patches and the two static-CRT detours that make the engine consult `src/Vfs`, plus the virtual-handle table and the `mods.served`/`mods.recent` diagnostics |
+| `src/Profiler.h/cpp` | The CPU profiler: the per-thread event rings, the frame ring, the sampling thread and the Chrome-trace writer. **Touches no game memory** — it is clock, rings and Win32 thread APIs — so it is one of the few `src/` files a harness could exercise. See "The profiler" above |
 | `src/Repl.h/cpp` | The loopback JavaScript REPL: `StartRepl` / `PumpRepl` / `StopRepl`, owned by `BootScriptHost` rather than by `Subsystems` (it installs no detour). Off unless `GKPLUS_REPL_PORT` is set. See "The REPL channel" above |
 | `src/Session.h/cpp` | `StartLevel` / `QueueLevelStart` / `QueueReturnToMainMenu` — a level start with no menus and no briefing, deferred to the message loop. Installs no detour and has no `*System`: it registers `SetMessageLoopCallback` on first use. See "Starting a level programmatically" above |
 | `src/Font.h/cpp` | The engine's text layer: `GetFont` / `LineHeight` / `QueueText`, and `VersionTextSystem`. `Font` is deliberately left **incomplete** - its 0xb18 layout is measured but nothing here needs a field out of it, and an unchecked mirror would only go stale. See "The text queue and the version stamp" above |
@@ -441,9 +493,10 @@ reference. Test invocations are under "Running the test suites" above.
 | `src/WindowPlacement.h/cpp` | `WindowPlacementSystem` - hook-only. Patches one IAT slot (`user32!CreateWindowExA`) so the windowed-mode window is created at the monitor's **work area** origin instead of the hardcoded 0,0 it would otherwise sit at, under a left- or top-docked taskbar. `GKPLUS_WINDOW_PLACEMENT=raw` restores the stock behaviour. See "The game window and the taskbar" below |
 | `src/ActorClasses.inc.h` | X-macro listing the 15 Actor subclasses: `GK_ACTOR_CLASS(Name, Parent, Predicate, Kind)`. Drives the JS class table, `kind`, the RTTI ladder and the prototype chain. **Must list every class before its own base** |
 | `src/Menus.inc.h` | X-macro listing all 36 Gunlok menus: `GUNLOK_MENU(Name, Id, TitleResourceId, "English title")`. There are no gaps - ids 11 and 14-20 are identified in `menu_system_notes.md`. Also counted into `gk::MenuCount` |
-| `imgui-quickjs/` | Static library: the ImGui bindings, linked into `d3d8.dll`. **Not a QuickJS module** — `js_imgui_new_namespace(ctx)` builds a plain object the host passes to `draw_gui`, since an ImGui call outside that frame does not work. `JS_SetPropertyFunctionList` handles the whole export list, `JS_DEF_CGETSET` included (see the QuickJS conventions) |
+| `imgui-quickjs/` | Static library: the ImGui bindings, linked into `d3d8.dll`. **Not a QuickJS module** — `js_imgui_new_namespace(ctx)` builds a plain object the host passes to `draw_gui`, since an ImGui call outside that frame does not work. `JS_SetPropertyFunctionList` handles the whole export list, `JS_DEF_CGETSET` included (see the QuickJS conventions). **`types/imgui.d.ts` is generated from this file** — run `python3 types/gen-imgui-dts.py` after touching it and check the `any` count it prints is still 0, since it infers each parameter's type from the `JS_To*` the wrapper actually calls |
 | `examples/main.mjs` | A working entry module, JSDoc-annotated against `types/`. Install it as `<Gunlok>\gkplus\main.mjs`; `examples/jsconfig.json` is what type-checks it. **It imports `levels/` which imports `headers/`, so install all three** — a module the host cannot find takes the whole entry module with it and registers no hooks at all, so the symptom is that nothing happens rather than that one level is missing |
 | `examples/render-panel.mjs` | Every `render` knob as ImGui, in collapsing sections, drawn into the caller's window. Its own module because it is longer than the rest of the example put together and is the piece most worth copying. **Its one rule is write-on-`changed`**: `draw_gui` runs every frame, and `lighting_maps = true` re-reads every file while `map_shadow_rate` re-bakes the shadow atlas |
+| `examples/prof-panel.mjs` | The profiler as ImGui, in the same shape as `render-panel.mjs` — frame graph, zones, sampled profile, stacks, the trigger and its captures, and the ring configuration. **Its rule is query-on-a-cadence**: `zones`/`samples`/`stacks` build one JS object per row and reading them per frame would cost more than the frame they describe, invisibly — `overhead_ms` cannot see time spent on our side of the binding. So each section snapshots, and a collapsed one queries nothing. The other trap is the trigger: an options object with no `enabled` *arms* it, so every write passes the current value explicitly |
 | `examples/levels/arena.mjs` | A working level module for `levels.add` — `map` + `includes` + `define` + `populate` + `setup` |
 | `examples/headers/` | `bug.gsh` and part of `defaults.gsh` re-implemented with `gls`, as the worked example of translating a header |
 | `types/` | `.d.ts` for the `"gk"` module and the `ImGui` interface, the generator for the latter, and `typecheck.ts`. See "Type definitions" above |
@@ -452,6 +505,7 @@ reference. Test invocations are under "Running the test suites" above.
 | `lightmap/` | `gklightmap` — a second uv project, and **`pbr/` with the intelligence removed on purpose**: one `.RIM` in, three prompts to an image-editing model over **OpenRouter** (`OPENROUTER_API_KEY`, env or a file of that name at the repo root), one `<stem> lighting.dds` out. No segmentation, no classification, no gates, no cache. The three channels are `src/VkLighting.h`'s and two do not mean what their names mean elsewhere — R is a *height field*, G is highlight *intensity* (not a metal switch), B is highlight sharpness — so `gklightmap/prompts.py` spells all three out. Writes **uncompressed 24-bit + a full mip chain**, not DXT1: two channels are masks and a block's endpoints would smear them, and there is no S3TC compressor here. $0.20 a texture, measured. Design record in `lightmap/README.md` |
 | `huffman/`, `utils/rifutil` | The C++ REBCRIF1 codec and its CLI. The Python port in `blender/io_scene_rif/rif.py` is decode-only; this is the only compressor |
 | `utils/rendertest` | The PowerShell harness for driving Gunlok through the REPL and capturing frames — launch, dismiss the briefing, wait for the camera to come to rest, screenshot, and bisect `render.draw_hide` for the draw behind a pixel. What every renderer comparison should use; its README is the list of things that waste a run otherwise |
+| `utils/symdump` | `gl_symbols.py`, a Ghidra Jython script exporting the database's function names as a symbol map for the profiler (`<hex rva> <hex size> <name>`, RVAs so ASLR does not matter). 12,487 functions, 62% named. Installed at `<Gunlok>\gkplus\symbols\gl.exe.sym`, where `prof.Describe` finds it with no call — which is what makes a sampled stack read `Aw_DrawIndexedPrimitiveUP <- SubMesh_DrawIndexed <- SceneNode_Render` instead of hex. The map's `# file_size` is checked against the loaded module: a map from another build shifts every RVA and would be confidently wrong rather than absent |
 | `utils/rimutil` | `.RIM` <-> PNG CLI over spng + libsquish, both directions, both image forms. `compress` takes `--format dxt1\|dxt3\|body` (default **dxt3**) and `--raw`; **dxt5 is refused by name**, because `TextureFormatCandidates` @ 0x006ac348 lists only DXT1/DXT3 and `SurfaceDesc_SetCompressedFormat` @ 0x005c6820 drops any other fourcc *silently* — a DXT5 file renders with garbage alpha rather than failing. `body` is exactly lossless **on disk** and needs no DXT compressor, and `check_lossless` re-derives every pixel before writing — but **it is not lossless in the engine, and it refuses graded alpha for that reason**: Gunlok ignores the `ALPH` chunk a palettized image carries alpha in, so such a texture loads fully opaque (measured — see `rif_chunk_format.md`, "The engine does not honour an `ALPH` you write"). It picks `masking 2`, the one palettized alpha that works, when every transparent texel shares one RGB; a cut-out that cannot (several RGBs under transparency, so an `ALPH`) is warned about rather than refused, because that case is presumed broken and not measured. Format details in `rif_chunk_format.md`; tests in `utils/rimutil/tests` |
 
 ## Reverse Engineering Reference
@@ -464,11 +518,12 @@ code still live here under Conventions:
 
 - `address_map.md` - the binary's segment layout, every named global and function address, the Actor class hierarchy and subclass sizes, `TriggerKind`, and the `Role`/`Map` struct offsets
 - `script_host_notes.md` - the QuickJS host (`src/Script`) and the loopback REPL (`src/Repl`): boot point, the four facts that pin the design, the REPL protocol and its limits
-- `js_bindings_notes.md` - the `"gk"` module's 24 namespaces (`src/Js*`) and `types/`: the collection scaffolding, the Actor prototype chain, the native-vs-command-backed split, and the nine members that do not replicate
+- `js_bindings_notes.md` - the `"gk"` module's 25 namespaces (`src/Js*`) and `types/`: the collection scaffolding, the Actor prototype chain, the native-vs-command-backed split, and the nine members that do not replicate
 - `make_role_notes.md` - `src/MakeRole` and the `make` / `gls` namespaces: one `Make*` per GLS section, the five conversions that carry real risk, and what only the parser can answer
 - `script_queue_notes.md` - the `{kind, body}` envelope on both of Gunlok's queues, its ten hooks, and why the console queue is read through it but never written to it
 - `custom_levels_notes.md` - levels with no `.gls` and no `.gcs` (`src/CustomLevel`), and starting one with no menus (`src/Session`)
 - `mod_loading_notes.md` - the PhysicsFS VFS (`src/Vfs`) and the IAT patching that makes the engine consult it (`src/FileHooks`)
+- `profiler_notes.md` - the CPU profiler (`src/Profiler`, `src/JsProf`): instrumented zones plus a sampling thread over both game threads, why the frame rather than the session is the unit, the two self-checks that stop it lying (`throttled`, `overhead_ms`), the WOW64 stale-context trap that made every sample read one ntdll address, and the first measurements
 - `harness_testing_notes.md` - building a throwaway 32-bit harness so the script layers can be exercised outside Gunlok
 - `pbr/README.md` - the PBR map generator (`pbr/`, its own uv project, not part of `d3d8.dll`): why classification is per UV region, what the render-state profile harvested from the running game is and is not allowed to decide, what the stage-1 cache fingerprints and what it deliberately does not, how much baked lighting the set actually carries, and what a generated map looks like on screen
 

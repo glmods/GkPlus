@@ -1288,6 +1288,189 @@ static JSValue js_new_int_array(JSContext *ctx, const int *arr, int count) {
 }
 
 // ============================================================================
+// Plot Widgets
+// ============================================================================
+
+// ImGui::PlotLines(const char* label, const float* values, int values_count,
+// int values_offset = 0, const char* overlay_text = NULL, float scale_min =
+// FLT_MAX, float scale_max = FLT_MAX, ImVec2 graph_size = ImVec2(0, 0), int
+// stride = sizeof(float))
+// JS: PlotLines(label, values, options?) - an array of numbers as a line graph.
+//
+// No values_offset: a JS caller rotates its own array, and a ring index that
+// does not match the array it was taken from plots the wrong samples silently.
+// An omitted scale_min/scale_max stays FLT_MAX, which is ImGui's "fit to the
+// data" rather than a bound of zero.
+static JSValue js_ImGui_PlotLines(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv) {
+  if (argc < 2) {
+    return JS_ThrowTypeError(ctx,
+                             "PlotLines requires 2 arguments (label, values)");
+  }
+
+  const char *label = JS_ToCString(ctx, argv[0]);
+  if (!label) {
+    return JS_EXCEPTION;
+  }
+
+  if (!JS_IsArray(argv[1])) {
+    JS_FreeCString(ctx, label);
+    return JS_ThrowTypeError(ctx, "PlotLines: values must be an array");
+  }
+
+  JSValue length_val = JS_GetPropertyStr(ctx, argv[1], "length");
+  int32_t count = 0;
+  if (JS_ToInt32(ctx, &count, length_val) != 0) {
+    JS_FreeValue(ctx, length_val);
+    JS_FreeCString(ctx, label);
+    return JS_EXCEPTION;
+  }
+  JS_FreeValue(ctx, length_val);
+  if (count < 0) {
+    count = 0;
+  }
+
+  std::vector<float> values(static_cast<size_t>(count), 0.0f);
+  if (count > 0 && !js_get_float_array(ctx, argv[1], values.data(), count)) {
+    JS_FreeCString(ctx, label);
+    return JS_ThrowTypeError(ctx, "PlotLines: values must be numbers");
+  }
+
+  float scale_min = FLT_MAX;
+  float scale_max = FLT_MAX;
+  ImVec2 graph_size(0, 0);
+  const char *overlay = nullptr;
+
+  if (argc >= 3 && JS_IsObject(argv[2])) {
+    JSValue scale_min_val = JS_GetPropertyStr(ctx, argv[2], "scale_min");
+    if (!JS_IsUndefined(scale_min_val) && !JS_IsNull(scale_min_val)) {
+      double temp;
+      if (JS_ToFloat64(ctx, &temp, scale_min_val) == 0) {
+        scale_min = static_cast<float>(temp);
+      }
+    }
+    JS_FreeValue(ctx, scale_min_val);
+
+    JSValue scale_max_val = JS_GetPropertyStr(ctx, argv[2], "scale_max");
+    if (!JS_IsUndefined(scale_max_val) && !JS_IsNull(scale_max_val)) {
+      double temp;
+      if (JS_ToFloat64(ctx, &temp, scale_max_val) == 0) {
+        scale_max = static_cast<float>(temp);
+      }
+    }
+    JS_FreeValue(ctx, scale_max_val);
+
+    JSValue size_val = JS_GetPropertyStr(ctx, argv[2], "size");
+    if (!JS_IsUndefined(size_val)) {
+      graph_size = js_to_ImVec2(ctx, size_val, ImVec2(0, 0));
+    }
+    JS_FreeValue(ctx, size_val);
+
+    JSValue overlay_val = JS_GetPropertyStr(ctx, argv[2], "overlay");
+    if (!JS_IsUndefined(overlay_val) && !JS_IsNull(overlay_val)) {
+      overlay = JS_ToCString(ctx, overlay_val);
+    }
+    JS_FreeValue(ctx, overlay_val);
+  }
+
+  ImGui::PlotLines(label, values.data(), count, 0, overlay, scale_min,
+                   scale_max, graph_size);
+
+  if (overlay) {
+    JS_FreeCString(ctx, overlay);
+  }
+  JS_FreeCString(ctx, label);
+  return JS_UNDEFINED;
+}
+
+// ImGui::PlotHistogram(const char* label, const float* values, int
+// values_count, int values_offset = 0, const char* overlay_text = NULL, float
+// scale_min = FLT_MAX, float scale_max = FLT_MAX, ImVec2 graph_size = ImVec2(0,
+// 0), int stride = sizeof(float))
+// JS: PlotHistogram(label, values, options?) - the same data as bars.
+static JSValue js_ImGui_PlotHistogram(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv) {
+  if (argc < 2) {
+    return JS_ThrowTypeError(
+        ctx, "PlotHistogram requires 2 arguments (label, values)");
+  }
+
+  const char *label = JS_ToCString(ctx, argv[0]);
+  if (!label) {
+    return JS_EXCEPTION;
+  }
+
+  if (!JS_IsArray(argv[1])) {
+    JS_FreeCString(ctx, label);
+    return JS_ThrowTypeError(ctx, "PlotHistogram: values must be an array");
+  }
+
+  JSValue length_val = JS_GetPropertyStr(ctx, argv[1], "length");
+  int32_t count = 0;
+  if (JS_ToInt32(ctx, &count, length_val) != 0) {
+    JS_FreeValue(ctx, length_val);
+    JS_FreeCString(ctx, label);
+    return JS_EXCEPTION;
+  }
+  JS_FreeValue(ctx, length_val);
+  if (count < 0) {
+    count = 0;
+  }
+
+  std::vector<float> values(static_cast<size_t>(count), 0.0f);
+  if (count > 0 && !js_get_float_array(ctx, argv[1], values.data(), count)) {
+    JS_FreeCString(ctx, label);
+    return JS_ThrowTypeError(ctx, "PlotHistogram: values must be numbers");
+  }
+
+  float scale_min = FLT_MAX;
+  float scale_max = FLT_MAX;
+  ImVec2 graph_size(0, 0);
+  const char *overlay = nullptr;
+
+  if (argc >= 3 && JS_IsObject(argv[2])) {
+    JSValue scale_min_val = JS_GetPropertyStr(ctx, argv[2], "scale_min");
+    if (!JS_IsUndefined(scale_min_val) && !JS_IsNull(scale_min_val)) {
+      double temp;
+      if (JS_ToFloat64(ctx, &temp, scale_min_val) == 0) {
+        scale_min = static_cast<float>(temp);
+      }
+    }
+    JS_FreeValue(ctx, scale_min_val);
+
+    JSValue scale_max_val = JS_GetPropertyStr(ctx, argv[2], "scale_max");
+    if (!JS_IsUndefined(scale_max_val) && !JS_IsNull(scale_max_val)) {
+      double temp;
+      if (JS_ToFloat64(ctx, &temp, scale_max_val) == 0) {
+        scale_max = static_cast<float>(temp);
+      }
+    }
+    JS_FreeValue(ctx, scale_max_val);
+
+    JSValue size_val = JS_GetPropertyStr(ctx, argv[2], "size");
+    if (!JS_IsUndefined(size_val)) {
+      graph_size = js_to_ImVec2(ctx, size_val, ImVec2(0, 0));
+    }
+    JS_FreeValue(ctx, size_val);
+
+    JSValue overlay_val = JS_GetPropertyStr(ctx, argv[2], "overlay");
+    if (!JS_IsUndefined(overlay_val) && !JS_IsNull(overlay_val)) {
+      overlay = JS_ToCString(ctx, overlay_val);
+    }
+    JS_FreeValue(ctx, overlay_val);
+  }
+
+  ImGui::PlotHistogram(label, values.data(), count, 0, overlay, scale_min,
+                       scale_max, graph_size);
+
+  if (overlay) {
+    JS_FreeCString(ctx, overlay);
+  }
+  JS_FreeCString(ctx, label);
+  return JS_UNDEFINED;
+}
+
+// ============================================================================
 // Input Text Widgets
 // ============================================================================
 
@@ -6186,6 +6369,10 @@ const JSCFunctionListEntry js_imgui_funcs[] = {
     JS_CFUNC_DEF("Bullet", 0, js_ImGui_Bullet),
     JS_CFUNC_DEF("Image", 2, js_ImGui_Image),
     JS_CFUNC_DEF("ImageButton", 3, js_ImGui_ImageButton),
+
+    // Plot Widgets
+    JS_CFUNC_DEF("PlotLines", 2, js_ImGui_PlotLines),
+    JS_CFUNC_DEF("PlotHistogram", 2, js_ImGui_PlotHistogram),
 
     // Input Text Widgets
     JS_CFUNC_DEF("InputText", 2, js_ImGui_InputText),

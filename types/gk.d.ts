@@ -2793,8 +2793,293 @@ declare module "gk" {
     [key: string]: any;
   }
 
+  // --- the profiler ----------------------------------------------------------
+
+  /** One presented frame. `ms` is present-to-present wall clock. */
+  export interface ProfFrame {
+    readonly index: number;
+    readonly ms: number;
+    /** True when the frame was waiting for a vertical blank - FIFO, or a D3D
+     *  presentation interval. **A throttled frame time measures the monitor, not
+     *  the game**, so an A/B taken across one says nothing (see
+     *  `vulkan_renderer_notes.md` §4.79, where three sections of renderer work
+     *  were measured against exactly this and had to be struck out).
+     *  `GKPLUS_VK_PRESENT_MODE=immediate` is the way out. */
+    readonly throttled: boolean;
+    readonly present: string;
+    readonly events: number;
+    readonly samples: number;
+  }
+
+  /** One instrumented call site, aggregated over the queried window. */
+  export interface ProfZone {
+    readonly name: string;
+    /** Slot index into `prof.threads`. The same site recorded from both game
+     *  threads is two rows, never one - they are different work. */
+    readonly thread: number;
+    readonly calls: number;
+    readonly incl_ms: number;
+    /** Inclusive minus the direct children, exact rather than estimated. */
+    readonly self_ms: number;
+    /** The worst single call in the window. A mean hides a stutter; this does not. */
+    readonly max_ms: number;
+    /** `self_ms` divided by the window, which is the number that compares against
+     *  a frame time. */
+    readonly self_ms_per_frame: number;
+  }
+
+  /** One address in the flat sampled profile. */
+  export interface ProfSample {
+    /** `module+0xrva`, or a symbol name once `prof.symbols` has loaded a map for
+     *  that module. Resolve ours offline with
+     *  `llvm-symbolizer --obj=build/Debug/d3d8.dll --relative-address <rva>`. */
+    readonly name: string;
+    readonly address: number;
+    readonly samples: number;
+    /** The instrumented zone the thread was inside when it was sampled, or "".
+     *  This is what joins the two sources: it answers "of the time inside
+     *  ConvertVertices, where exactly does it go". */
+    readonly zone: string;
+    readonly thread: number;
+    readonly pct: number;
+  }
+
+  export interface ProfSampler {
+    readonly running: boolean;
+    /** What was asked for. */
+    readonly hz: number;
+    /** What was achieved - **read this one**. A periodic waitable timer does not
+     *  hold 1 kHz under load (1000 asked, 566 measured), and a flat profile only
+     *  stands for time if the sampling was uniform. */
+    readonly effective_hz: number;
+    readonly taken: number;
+    /** A suspend or GetThreadContext the OS refused. A few are normal; a rising
+     *  count means the profile is missing time rather than that there was none. */
+    readonly missed: number;
+    readonly skipped: number;
+    readonly ticks: number;
+    /** Frame-pointer walks attempted, and ones that yielded no caller. A few percent barren is
+     *  normal (a sample landing in a prologue); tens of percent means the walk is being
+     *  rejected rather than terminating. */
+    readonly walks: number;
+    readonly barren: number;
+    readonly drift_ms: number;
+  }
+
+  /** One distinct call stack and how often it was sampled. */
+  export interface ProfStack {
+    /** **Leaf first**: `stack[0]` is the sampled instruction, the rest are its callers
+     *  outwards, symbolized the same way `ProfSample.name` is. */
+    readonly stack: readonly string[];
+    readonly samples: number;
+    readonly zone: string;
+    readonly thread: number;
+    readonly pct: number;
+  }
+
+  /** Which frames a query covers. A plain number is `{last: n}`.
+   *
+   *  `around` is the one that matters for a stutter: `prof.worst()` will find a slow frame long
+   *  after it happened, and without this there was no way to narrow a query onto it — "the last
+   *  n frames" was the only expressible window, so a frame whose samples were still in the ring
+   *  could be seen and not profiled. */
+  export type ProfWindow =
+    | number
+    | { last?: number }
+    | { around: number; pre?: number; post?: number }
+    | { capture: number };
+
+  /** One window the trigger saved out of the rings before they could overwrite it. */
+  export interface ProfCapture {
+    /** Pass as `{capture: index}` to any query. */
+    readonly index: number;
+    /** The frame that fired the trigger. */
+    readonly frame_index: number;
+    readonly ms: number;
+    /** The median it was measured against. */
+    readonly baseline_ms: number;
+    /** Whether that frame was waiting for a vertical blank anyway — if so the trigger was
+     *  measuring the monitor and the capture is probably not what you wanted. */
+    readonly throttled: boolean;
+    readonly frames: number;
+    readonly events: number;
+    readonly samples: number;
+    /** The capture hit its fixed capacity and holds only part of the window. Raise
+     *  `capture_events` / `capture_samples`, or narrow `pre`/`post`. */
+    readonly truncated: boolean;
+  }
+
+  /** When the profiler should save a window out of the rings by itself. */
+  export interface ProfTrigger {
+    enabled: boolean;
+    /** A frame fires it when it exceeds **both** — an absolute floor so a fast steady game does
+     *  not trip on jitter, and a multiple of the running median so one number is not wrong for
+     *  every scene. */
+    min_ms: number;
+    multiple: number;
+    /** Frames of context kept either side. `post` is not padding: a stutter's cause often shows
+     *  in the recovery, so the snapshot is deferred that many frames rather than taken the
+     *  instant the trigger fires. */
+    pre: number;
+    post: number;
+    /** The median frame time it is currently comparing against. Read-only. */
+    readonly baseline_ms: number;
+  }
+
+  /** What `prof.symbols` reports about a map it loaded. */
+  export interface ProfSymbolLoad {
+    readonly entries: number;
+    /** The map's recorded file size disagrees with the module actually loaded, so every name it
+     *  produces is suspect — a different build shifts every RVA, which makes the names
+     *  confidently wrong rather than absent. It still loads; `note` says what happened. */
+    readonly stale: boolean;
+    readonly note: string;
+  }
+
+  /** How the rings are currently sized — the same keys `configure` takes. */
+  export interface ProfConfig {
+    readonly mask: number;
+    readonly events_per_thread: number;
+    readonly frames: number;
+    readonly sampler: boolean;
+    readonly sampler_hz: number;
+    readonly samples: number;
+    readonly stacks: boolean;
+    readonly stack_depth: number;
+    readonly captures: number;
+    readonly capture_events: number;
+    readonly capture_samples: number;
+  }
+
+  export interface ProfThread {
+    readonly slot: number;
+    readonly id: number;
+    /** "main", "executor", or "thread-<id>". */
+    readonly name: string;
+    readonly events: number;
+    /** Events overwritten before anything read them. Non-zero means the window
+     *  you are asking for may be incomplete - raise `events_per_thread`. */
+    readonly lost: number;
+  }
+
+  /** The CPU profiler (`src/Profiler.h`): instrumented zones plus a sampling
+   *  thread over both game threads, read back a frame at a time.
+   *
+   *  **Every query is over a window of recent frames, never the session.** The
+   *  thing worth finding is usually a frame that was 17 ms when its neighbours
+   *  were 5, and a running total is precisely the instrument that cannot see one.
+   *
+   *  Armed at boot with `GKPLUS_PROFILER=1` (`=zones` for no sampler,
+   *  `GKPLUS_PROFILER_HZ` for the rate), or at any time with `prof.enabled`. */
+  export interface Prof {
+    /** Allocates the rings and starts the sampler. The rings are **never freed** -
+     *  a recorder may be inside one on the other thread - so disabling stops
+     *  recording but keeps the memory. */
+    enabled: boolean;
+    /** Which categories record, as a bitmask of `prof.categories`. `draw` is off
+     *  by default: at ~60 ns a zone and ~700 draws a frame it is 0.04 ms, which is
+     *  1% of a level frame and therefore visible in what it measures. */
+    mask: number;
+    readonly categories: Readonly<Record<string, number>>;
+    /** What the rings are sized at now, which is not the documented defaults once
+     *  `GKPLUS_PROFILER_HZ` or an earlier `configure` has been through. */
+    readonly config: ProfConfig;
+    /** The frame that has just ended - the REPL and `draw_gui` both run at
+     *  Present - or null before the first one. */
+    readonly frame: ProfFrame | null;
+    /** What the profiler costs, priced from a zone cost calibrated at arm time
+     *  against what the last frame actually recorded. Read it before believing
+     *  anything else here. */
+    readonly overhead_ms: number;
+    readonly threads: readonly ProfThread[];
+    readonly sampler: ProfSampler;
+    /** Every site whose code has run at least once, armed or not. The answer to
+     *  "is this path instrumented". */
+    readonly sites: readonly { name: string; category: string }[];
+
+    /** Newest last; no argument means the whole ring. */
+    frames(count?: number): ProfFrame[];
+    /** The slowest frames in the ring, worst first. Where a stutter is — the frame ring is far
+     *  cheaper per entry than the event ring, so this reaches much further back than anything
+     *  that can still be profiled. Use the `frame_index` it reports with `{around: …}`. */
+    worst(count?: number): ProfFrame[];
+    /** Aggregated over `window` (default: the last 60 frames), sorted by self time. */
+    zones(window?: ProfWindow): ProfZone[];
+    /** The flat sampled profile over the same window, sorted by count. */
+    samples(window?: ProfWindow): ProfSample[];
+
+    /** The flight recorder. A stutter rarer than the event ring's reach — 10 to 60 seconds, and
+     *  shrinking the faster the game runs — cannot be caught by looking afterwards, because its
+     *  zones are overwritten before anyone notices. This watches for one and copies the
+     *  surrounding window somewhere the rings cannot reach.
+     *
+     *  **Unthrottle first.** Under FIFO the frame time is quantized to the refresh interval, so
+     *  a 6 ms hitch is absorbed entirely and a 20 ms one reads as one extra interval — both the
+     *  threshold and the baseline would be measuring the monitor.
+     *  `GKPLUS_VK_PRESENT_MODE=immediate`.
+     *
+     *  Assign a boolean to arm it with the current settings, or an options object (which arms
+     *  it unless `enabled: false` is given explicitly). */
+    trigger: boolean | Partial<Omit<ProfTrigger, "baseline_ms">> | ProfTrigger;
+    /** Windows the trigger has saved, oldest first. **`index` is the handle, not the array
+     *  position** — the ring drops the oldest, so the two diverge. Read one with
+     *  `{capture: c.index}`. */
+    readonly captures: readonly ProfCapture[];
+    clear_captures(): void;
+    /** Distinct call stacks over the same window, most frequent first. Empty unless the sampler
+     *  was armed with `stacks` (`GKPLUS_PROFILER=stacks`, or
+     *  `prof.configure({stacks: true})`). `limit` defaults to 40; 0 means all.
+     *
+     *  gl.exe keeps frame pointers, so a walk runs straight through the game — on level02 the
+     *  hot chain reads `BuildDrawRecord <- Aw_DrawIndexedPrimitiveUP <- SubMesh_DrawIndexed <-
+     *  SceneNode_Render`, and `SceneNode_Render` recursing down the scene graph is what
+     *  saturates the default depth of 12. */
+    stacks(window?: ProfWindow, limit?: number): ProfStack[];
+
+    /** A zero-duration event on the current thread's timeline. */
+    mark(name: string): void;
+    /** A named number plotted against the frame timeline rather than summed. */
+    count(name: string, value: number): void;
+    /** Times `fn` as a zone and returns whatever it returned. */
+    scope<T>(name: string, fn: () => T): T;
+
+    /** A Chrome-trace / Perfetto document - one track per thread, zones as
+     *  complete events, samples as instants, frames on their own track. Open it in
+     *  `chrome://tracing` or ui.perfetto.dev. Returns the path. */
+    trace(path: string, window?: ProfWindow): string;
+    /** Where a map is looked for automatically: `<game dir>\gkplus\symbols\`. The first time a
+     *  name is wanted for a module, `<module>.sym` is tried there once — so installing a map is
+     *  all it takes, with no call to `symbols()`. */
+    readonly symbol_dir: string;
+    /** Loads `<hex rva> <hex size> <name>` lines for one module, so a sampled profile reads in
+     *  names instead of RVAs. gl.exe ships no symbols but its Ghidra database is heavily named:
+     *  `utils/symdump/gl_symbols.py` exports it (12,487 functions, 62% named). Throws if the
+     *  file cannot be read or parses to nothing. */
+    symbols(module: string, path: string): ProfSymbolLoad;
+    /** Re-arms with new sizes. Rings grow and never shrink. */
+    configure(config: {
+      mask?: number;
+      events_per_thread?: number;
+      frames?: number;
+      sampler?: boolean;
+      sampler_hz?: number;
+      samples?: number;
+      stacks?: boolean;
+      /** Frames per sample, capped at 32. Each costs 4 bytes on every sample. */
+      stack_depth?: number;
+      /** The trigger's storage, reserved here so taking a capture is a memcpy rather than a
+       *  malloc in the middle of the frame after a stutter. */
+      captures?: number;
+      capture_events?: number;
+      capture_samples?: number;
+    }): void;
+    /** Empties the rings and the frame history. Does not disarm. */
+    reset(): void;
+  }
+
   // --- the module ------------------------------------------------------------
 
+  export const prof: Prof;
   export const render: Render;
   export const camera: Camera;
   export const console: Console;
@@ -2824,8 +3109,9 @@ declare module "gk" {
   // adding a front-end item is a boot-time act. Keep the argument if you need
   // it later.
 
-  /** The default export carries the same twenty-one objects: `gk.actors === actors`. */
+  /** The default export carries the same twenty-five objects: `gk.actors === actors`. */
   const gk: {
+    prof: Prof;
     render: Render;
     camera: Camera;
     console: Console;
@@ -2838,6 +3124,7 @@ declare module "gk" {
     gls: Gls;
     game: Game;
     world: World;
+    text: Text;
     mods: Mods;
     fx: Fx;
     light: Light;

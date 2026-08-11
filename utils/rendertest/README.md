@@ -75,6 +75,65 @@ at the settled camera; the one that covered a quarter of the frame was fourth on
 Kill `WerFault.exe` as well as `gl.exe` before rebuilding — WER holds the crashed process's handle
 to `d3d8.dll`, so `--target copy` fails with "Permission denied" long after the game is gone.
 
+## From an SSH session: none of this works in session 0
+
+`sshd` is a Windows service, so **every process launched from an SSH shell is in session 0** — its
+own named-object namespace, and no desktop. Two things follow, and both look like a broken build
+rather than a wrong shell:
+
+- `gl.exe` **exits -1 having touched no file at all**. No crash dump, no WER event, nothing added
+  to `d3d8.log`, and the `-skipfmv` dialog never appears, so every script here fails at "the
+  dialog never appeared". The cause is `SteamAPI_Init()` unable to see a Steam client in session 1,
+  and the message goes only to **stdout**, which `Start-Process` discards unless asked:
+  `-RedirectStandardOutput` prints *"Steam must be running to play this game"*. Rule the DLL out in
+  one step by renaming `d3d8.dll` aside — if it still exits -1, GkPlus is not involved.
+- `PrintWindow` cannot reach a session-1 window from session 0, so **screenshots are impossible**
+  however the game was started. The REPL is unaffected: localhost TCP is not session-bound.
+
+The fix is `schtasks /IT`, which runs in the logged-on user's interactive session with no stored
+password. Put the *whole* procedure in the script — launch, drive, capture — because the PNG has
+to be written by a process inside session 1; then read the file from the SSH side.
+
+```powershell
+schtasks /create /tn X /tr "powershell -NoProfile -ExecutionPolicy Bypass -File `"$dir\go.ps1`"" /sc once /st 00:00 /it /f
+schtasks /run /tn X          # verified: session 1, WinSta0, the console user
+schtasks /delete /tn X /f
+```
+
+`/ST` in the past warns and runs anyway under `/run`. A task's console goes nowhere, so
+`Start-Transcript` at the top of the script or you get no diagnosis when it fails.
+
+**Do not launch `steam.exe` from session 0.** It starts a *second* client there which takes over
+`HKCU\Software\Valve\Steam\ActiveProcess` (leaving `ActiveUser: 0`), displaces the user's
+logged-in one, and then swallows every later launch — a session-1 Steam hands off to it and exits.
+`steam.exe -shutdown` closes it gracefully in ~16 s; no force-kill needed. Start Steam through a
+task instead and it logs itself in when `AutoLoginUser`/`RememberPassword` are set;
+`ActiveUser != 0` with `(Get-Process steam).SessionId -eq 1` is the check that it is usable.
+
+## Photographing an ImGui panel
+
+A collapsed `CollapsingHeader` or `TreeNode` photographs as one line, and clicking through a panel
+by synthesising mouse events at computed coordinates is not worth the trouble. Wrap the ImGui
+object instead, from a **test-only** module that leaves the panel's own code untouched:
+
+```js
+const shim = new Proxy(ImGui, {
+  get(target, key) {
+    const value = target[key];
+    if (key === "CollapsingHeader" || key === "TreeNode") {
+      return (...args) => { target.SetNextItemOpen(true); return value.apply(target, args); };
+    }
+    return typeof value === "function" ? value.bind(target) : value;
+  },
+});
+```
+
+Then `ImGui.SetNextWindowSize` before the entry module's `Begin` so the whole thing has room, and
+crop the shot afterwards — the overlay renders at the swapchain's scale, so a panel is a few
+hundred pixels wide in a 3060x1716 capture and unreadable until cropped and scaled up
+(`System.Drawing`, `InterpolationMode = NearestNeighbor`). Remember to take the scaffolding back
+out of the installed `main.mjs`.
+
 ## Reaching a screen that is not the world
 
 Some things worth comparing are behind a key press rather than behind the REPL, and the upgrade

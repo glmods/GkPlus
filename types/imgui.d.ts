@@ -656,6 +656,13 @@ interface ImGui {
   /** ImGui::ImageButton(const char* str_id, ImTextureID user_texture_id, const */
   ImageButton(str_id: string, texture_id: number, image_size: ImGui.Vec2, options?: { uv0?: ImGui.Vec2; uv1?: ImGui.Vec2; bg_col?: ImGui.Vec4; tint_col?: ImGui.Vec4 }): boolean;
 
+  // --- Plot Widgets ------------------------------------------------
+
+  /** ImGui::PlotLines(const char* label, const float* values, int values_count, */
+  PlotLines(label: string, values: number[], options?: { scale_min?: number; scale_max?: number; size?: ImGui.Vec2; overlay?: string }): void;
+  /** ImGui::PlotHistogram(const char* label, const float* values, int */
+  PlotHistogram(label: string, values: number[], options?: { scale_min?: number; scale_max?: number; size?: ImGui.Vec2; overlay?: string }): void;
+
   // --- Input Text Widgets ------------------------------------------
 
   /** ImGui::InputText(const char* label, char* buf, size_t buf_size, */

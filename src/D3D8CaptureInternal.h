@@ -31,6 +31,7 @@
 
 #include "D3D8Capture.h"
 #include "D3D8Device.gen.inc.h"
+#include "Profiler.h"
 #include "Render.h"
 #include "VkDraw.h"
 #include "VkResources.h"
@@ -487,6 +488,10 @@ template <typename Interface> struct BufferWrapper : Wrapper<Interface> {
   // Lock and Unlock, so before Unlock is the only moment the data is both complete and still
   // mapped. Uploading here means the arenas see exactly what D3D9 sees.
   void UploadLocked() {
+    // The one thing the Vulkan path adds that no render knob turns off, and it runs on BOTH
+    // game threads (§4.72). It was the leading suspect for the frame-time divergence in §4.79
+    // and was never measured; these three zones are what measure it.
+    GK_ZONE("upload/UploadLocked", prof::Cat::Upload);
     ++unlocks_;
     // Rewritten after this frame's draws already read it: the slot cannot hold both versions,
     // and the draw list is not recorded until Present, so those draws would read this one.
@@ -640,14 +645,20 @@ template <typename Interface> struct BufferWrapper : Wrapper<Interface> {
     // it is passed in as an argument. The race is entirely upstream of the lock.
     thread_local std::vector<vulkan::CanonicalVertex> scratch;
     scratch.resize(count);
-    if (!vulkan::ConvertVertices(fvf_, locked_, count, scratch.data())) {
-      ++TheStats.failed_uploads;
-      return;
+    {
+      GK_ZONE("upload/ConvertVertices", prof::Cat::Upload);
+      if (!vulkan::ConvertVertices(fvf_, locked_, count, scratch.data())) {
+        ++TheStats.failed_uploads;
+        return;
+      }
     }
     const uint32_t dst_offset =
         (locked_offset_ / stride) * sizeof(vulkan::CanonicalVertex);
     const uint32_t bytes =
         count * static_cast<uint32_t>(sizeof(vulkan::CanonicalVertex));
+    // Split from the conversion above because they fail differently: this one can block on the
+    // staging ring, that one is pure arithmetic over the game's bytes.
+    GK_ZONE("upload/UploadIntoSlot", prof::Cat::Upload);
     if (!vulkan::UploadIntoSlot(slot_, dst_offset, scratch.data(), bytes)) {
       ++TheStats.failed_uploads;
     }
