@@ -7754,3 +7754,70 @@ The general rule this leaves behind: **never read a field back out of a scratch 
 is not a style preference and it does not cost a little. The compiler cannot help - the pointer is
 ordinary memory as far as it knows - and the cost does not show up as a slow function, only as one
 stalled instruction somewhere near the load.
+
+## 4.82 The two per-vertex loops §4.81 left at the top, and the one that is still not explained
+
+§4.81's fixes left `ConvertVertices` (13.3% of samples) and `NoteVertexBounds` (4.3%) as the
+largest costs. Both are honest per-vertex work rather than defects, so both were reshaped rather
+than removed.
+
+**`ConvertVertices`** re-tested six loop-invariant FVF flags per vertex, and zeroed all 48 bytes
+with `v = CanonicalVertex{}` before overwriting most of them. The loop body is now a template on
+the FVF, instantiated two ways from **one source**: with a `std::integral_constant` for each of
+the six layouts the game emits, where every field test folds into straight-line code, and with a
+plain `uint32_t` as the `default`, where the identical statements run with the tests live. Writing
+it once is the point - a hand-written fast path for 0x252 would be a second definition of what a
+layout means, free to drift from the first.
+
+The zero-fill is gone: every field is written exactly once in address order, with `else` branches
+supplying the same neutral defaults the fill used to. That matters beyond the memset, because for
+a user-pointer draw `dst` is write-combined scratch, where re-touching a line the WC buffer has
+already begun assembling is the pattern that forces it out early.
+
+The dispatch matches on `fvf & kLayoutMask` rather than on the raw value, since `ConvertRun` reads
+only those five bit-groups and `FvfStride` is computed from the same ones. That was aimed at a
+suspicion which **turned out to be wrong** - see below - but it is correct on its own terms and
+makes the six layouts exhaustive rather than merely likely.
+
+**`NoteVertexBounds`** min/max'd straight into `VertexBlocks[b]`. The vertex pointer and the block
+are both `float *`, so the compiler must assume they may alias and reloads all six components every
+iteration; accumulating in locals and storing once is the whole change.
+
+`src/VertexFormat.cpp` is pure - the header has always said it is the one piece of the renderer
+testable outside the game - so this was verified by a **differential test against the previous
+implementation**, kept in the session scratchpad: 48 supported layouts x4 strides (implied and
+three padded) x6 counts, plus the same 48 with unrelated bits set, plus the rejection and
+null-argument paths. 4,617 cases, `memcmp` rather than a float epsilon, 0 differences. Breaking one
+specialization on purpose produced 20 failures naming the exact FVF, so the harness can fail.
+
+Measured on the settled level02 camera, 178 actors, unthrottled, 120 frames each:
+
+| | median | mean | p95 |
+|---|---|---|---|
+| §4.80 baseline (Debug build) | 22.52 ms | 22.64 | 23.82 |
+| RelWithDebInfo, before §4.81 | 9.24 ms | 9.33 | 10.83 |
+| after §4.81's two scratch read-backs | 6.24 ms | 6.53 | 7.79 |
+| after the two loops above | 5.61 ms | 5.78 | 6.20 |
+| after the masked dispatch | **5.58 ms** | 5.68 | 6.20 |
+
+**9.24 -> 5.58 ms, and our DLL's share of samples 52.1% -> 22.1%.** The p95 moved further than the
+median (10.83 -> 6.20), so frame-to-frame consistency improved more than the average did.
+
+### What is still open, and what it is not
+
+The **generic** instantiation `ConvertRun<unsigned int>` is the largest remaining item at 5.8% of
+samples - larger than every specialization put together - and the masked dispatch did **not** move
+it (5.61 -> 5.58 is noise). So some layout genuinely reaches `default`, and it is not a matter of
+stray bits. Three things are already ruled out, so nobody repeats them:
+
+- It is not a missing specialization among the six: all seven instantiations are emitted and
+  distinct in the binary, at 0xa4d60-0xa55b0, sizes 128-264 bytes against the generic's 1120.
+- It is not extra bits on a known FVF: that is exactly what the mask handles, and it changed nothing.
+- `render.stats.fvfs` does **not** answer this and should not be used to. It is keyed on the
+  handle passed to `SetVertexShader`, and reports only the six - while the buffered path converts
+  with the FVF `CreateVertexBuffer` was given, which is a different value with no census at all.
+
+The next step is therefore a measurement, not a guess: count the FVFs that reach the `default`
+case and expose them beside `fvfs`. Worth ~0.3 ms of a 5.58 ms frame. Adding plausible-looking
+layouts to the switch without that census would be guessing, and the existing census is the reason
+to distrust the guess.

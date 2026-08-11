@@ -187,20 +187,38 @@ void NoteVertexBounds(uint32_t arena_offset, const void *data, uint32_t bytes) {
     if (!whole && !block.valid) {
       continue;
     }
+    // Accumulated in locals and stored once, rather than min/max'd straight into `block`.
+    // `p` points into the caller's vertices and `block` into `VertexBlocks`, and they never
+    // alias - but both are `float *`, so the compiler has to assume they might and reloads all
+    // six components on every vertex. Hoisting them is what turns the inner loop into registers.
     bool started = !whole; // a partial write unions into the box already there
-    block.valid = false;   // until the loop below finishes
+    float lo3[3];
+    float hi3[3];
+    if (started) {
+      for (int i = 0; i < 3; ++i) {
+        lo3[i] = block.min[i];
+        hi3[i] = block.max[i];
+      }
+    }
+    block.valid = false; // until the loop below finishes
     for (uint32_t v = lo; v <= hi; ++v) {
       const float *p = vertices[v - first_vertex].pos;
       if (!started) {
-        block.min[0] = block.max[0] = p[0];
-        block.min[1] = block.max[1] = p[1];
-        block.min[2] = block.max[2] = p[2];
+        lo3[0] = hi3[0] = p[0];
+        lo3[1] = hi3[1] = p[1];
+        lo3[2] = hi3[2] = p[2];
         started = true;
         continue;
       }
       for (int i = 0; i < 3; ++i) {
-        block.min[i] = (std::min)(block.min[i], p[i]);
-        block.max[i] = (std::max)(block.max[i], p[i]);
+        lo3[i] = (std::min)(lo3[i], p[i]);
+        hi3[i] = (std::max)(hi3[i], p[i]);
+      }
+    }
+    if (started) {
+      for (int i = 0; i < 3; ++i) {
+        block.min[i] = lo3[i];
+        block.max[i] = hi3[i];
       }
     }
     block.valid = started;
