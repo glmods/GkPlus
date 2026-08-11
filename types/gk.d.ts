@@ -1350,6 +1350,45 @@ declare module "gk" {
     readonly flags: TextFlags;
   }
 
+  /** The backchannel to whatever is connected to the REPL socket.
+   *
+   *  The REPL is a request/reply channel: a client sends source, the game sends
+   *  back a value. This is the direction that has no request. A poller can only
+   *  ever sample - it sees whichever frame its request landed in - so anything
+   *  that *happens* between two polls (a trigger fired, a role spawned, a
+   *  message arrived) is invisible unless the script says so. This is how it
+   *  says so.
+   *
+   *  The line a client receives is `{"event": …, "data": …}`, with no `ok` -
+   *  which is the whole rule for telling a notification from a reply.
+   *
+   *  **Off unless the game was launched with `GKPLUS_REPL_PORT`.** With the
+   *  channel closed every call is a branch and a 0, so notifications can be left
+   *  in shipped script. Main thread only. */
+  export interface Repl {
+    /** Queue `{event, data}` to every connected client, returning how many it
+     *  reached. 0 is the ordinary answer - the channel is usually closed, and
+     *  even open it may have nobody attached.
+     *
+     *  `data` is encoded with `JSON.stringify`, so it follows those rules: a
+     *  `Date` becomes its ISO string, `undefined` and functions vanish, and a
+     *  circular structure or a getter that raises **throws** rather than being
+     *  swallowed. It is omitted entirely when not passed.
+     *
+     *  Nothing is written to the socket here - the line goes out with the next
+     *  frame's pump, so this can never block on a client that stopped reading.
+     *  A client far enough behind (8 MiB of unread lines) is dropped, and does
+     *  not count towards the return value. */
+    notify(event: string, data?: unknown): number;
+    /** How many clients are connected right now. Test this before building a
+     *  payload that is expensive to construct - `notify` itself only skips the
+     *  encoding when the channel is *closed*, not when it is merely empty. */
+    readonly clients: number;
+    /** Whether the channel is listening at all, i.e. whether `GKPLUS_REPL_PORT`
+     *  named a port and the listener opened. Fixed for the process. */
+    readonly open: boolean;
+  }
+
   // --- script-queue messages -------------------------------------------------
 
   /** A message payload: anything `JSON.stringify` can encode **except a bare
@@ -3093,6 +3132,7 @@ declare module "gk" {
   export const game: Game;
   export const world: World;
   export const text: Text;
+  export const repl: Repl;
   export const mods: Mods;
   export const fx: Fx;
   export const light: Light;
@@ -3109,7 +3149,7 @@ declare module "gk" {
   // adding a front-end item is a boot-time act. Keep the argument if you need
   // it later.
 
-  /** The default export carries the same twenty-five objects: `gk.actors === actors`. */
+  /** The default export carries the same twenty-six objects: `gk.actors === actors`. */
   const gk: {
     prof: Prof;
     render: Render;
@@ -3125,6 +3165,7 @@ declare module "gk" {
     game: Game;
     world: World;
     text: Text;
+    repl: Repl;
     mods: Mods;
     fx: Fx;
     light: Light;

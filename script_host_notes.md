@@ -94,6 +94,7 @@ execution on whoever is playing. One line of NDJSON each way, UTF-8:
 -> {"code": "actors.count", "id": 7}       `id` optional, echoed back
 <- {"ok": true, "value": "37", "id": 7}
 <- {"ok": false, "error": "TypeError: ...", "stack": "..."}
+<- {"event": "spawned", "data": {"id": 12}}    unsolicited; see the backchannel
 ```
 
 #### Using it
@@ -121,7 +122,7 @@ object form, because a newline is the frame delimiter:
 {"code": "for (const a of actors) if (!a.alive) console.print(a.id);\nactors.count", "id": 3}
 ```
 
-Everything the `"gk"` module exports is already a global — all 22 namespaces,
+Everything the `"gk"` module exports is already a global — all 26 namespaces,
 enumerated at boot, plus the default export as `gk` — so there is nothing to
 import and no host object to reach for:
 
@@ -247,8 +248,65 @@ Five things pin the design:
 than returning `undefined`; the formatter needs both fallbacks, and a test
 asserting only `ok: true` passes on the error path too.
 
+#### The backchannel (`NotifyRepl`, `repl.notify`)
+
+The protocol above is request/reply, and that is a real limit rather than a
+stylistic one: **a client that can only ask can only sample.** It sees the state
+of whichever frame its request happened to land in, so anything that *happens*
+between two polls — a trigger fired, a role spawned, a message arrived on the
+script queue, a level finished loading — is invisible unless something inside
+the game says so at the moment it happens. `repl.notify(event, data)` is how it
+says so:
+
+```js
+import { repl, triggers } from "gk";
+triggers.add({ …, script: () => repl.notify("gate", { open: true }) });
+```
+
+```
+<- {"event": "gate", "data": {"open": true}}
+```
+
+Five things pin it, and four of them are consequences of the channel it rides on
+rather than fresh decisions:
+
+- **`event` and no `ok`.** A reply always carries `ok`; a notification never does
+  and always carries `event`. That one rule is the whole client-side change, and
+  it is why a notification is not just another `ok` shape — a client written
+  before this existed keeps working, because it can filter on `ok` and drop
+  everything else.
+- **Every connected client gets every notification.** No subscription, no
+  filtering: this is a debug channel with a hard cap of 4 connections, and a
+  subscribe verb would be protocol surface to maintain for a case nobody has.
+  `notify` returns the number of clients it reached, which is the only useful
+  answer to "did that go anywhere" and is usually `0`.
+- **Nothing is written to a socket from `notify`.** The line joins the same
+  per-connection buffer replies use and goes out on the next `PumpRepl`, which
+  keeps the existing invariant that no game-side call can block on a client that
+  has stopped reading. The 8 MiB backlog cap applies unchanged, so a script
+  notifying every frame at a client that never reads drops that client rather
+  than growing without bound.
+- **The caller's context does the encoding.** `NotifyRepl` takes a `JSContext *`
+  and stringifies `data` through it, so a value never crosses a context boundary
+  — `main.mjs`'s objects are encoded by the host context and the REPL's by the
+  REPL's, on the one runtime they share. A payload `JSON.stringify` refuses
+  throws at the caller, matching what `ToScriptPayload` does for the script queue
+  rather than silently sending a line with a field missing.
+- **The closed-channel test is the *channel*, not the client count.** With
+  `GKPLUS_REPL_PORT` unset — every ordinary launch — `notify` returns 0 before
+  encoding anything, so notifications can be left in shipped script. It
+  deliberately does **not** extend that shortcut to "open but nobody attached":
+  whether a payload encodes (and therefore whether a bad one throws) would then
+  depend on whether someone happened to be connected that second, which is the
+  worst possible way for an error to be intermittent. A script that wants to skip
+  building an expensive payload tests `repl.clients` itself.
+
 This is one of the layers that *can* be exercised outside Gunlok (see
 "Runtime-testing outside the game"): `Repl.cpp` reaches only `js::RegisterGkModule`,
 `Log`, `ReportException` and `ReleaseCallbacks`, so a harness supplying those four
 plus a one-namespace `"gk"` module drives the whole protocol over a real socket
-with `PumpRepl` standing in for the frame hook.
+with `PumpRepl` standing in for the frame hook. The backchannel was verified that
+way first — two real sockets, both receiving the same line, ordering, the
+newline-in-a-payload case, and every failure path — and then in the running game
+at the front-end menu (`game.state` 8), where two clients see the identical line
+and a disconnected one stops counting.

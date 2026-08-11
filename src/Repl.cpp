@@ -597,6 +597,65 @@ void PumpRepl() {
   Pumping = false;
 }
 
+int NotifyRepl(JSContext *ctx, const char *event, JSValueConst data) {
+  // Before anything is built: with no listener there is nobody to encode for,
+  // and this is the state every ordinary launch is in. See the header for why
+  // the test is the channel rather than the client count.
+  if (Listener == INVALID_SOCKET || !event) {
+    return 0;
+  }
+
+  JSValue line = JS_NewObject(ctx);
+  if (JS_IsException(line)) {
+    return -1;
+  }
+  JS_SetPropertyStr(ctx, line, "event", JS_NewString(ctx, event));
+  if (!JS_IsUndefined(data)) {
+    JS_SetPropertyStr(ctx, line, "data", JS_DupValue(ctx, data));
+  }
+
+  // Encoded in the caller's context, which is the only one `data` is safe to be
+  // read through, and which is also where a thrown getter has to surface. Same
+  // codec as everywhere else in this file, for the same reason: it escapes the
+  // newlines that would otherwise break the framing.
+  JSValue json = JS_JSONStringify(ctx, line, JS_UNDEFINED, JS_UNDEFINED);
+  JS_FreeValue(ctx, line);
+  if (JS_IsException(json)) {
+    return -1; // the exception is the caller's to propagate
+  }
+  const char *text = JS_ToCString(ctx, json);
+  JS_FreeValue(ctx, json);
+  if (!text) {
+    return -1;
+  }
+  std::string encoded = text;
+  JS_FreeCString(ctx, text);
+
+  int reached = 0;
+  for (Connection &connection : Connections) {
+    if (connection.socket == INVALID_SOCKET) {
+      continue; // dropped earlier this frame; PumpRepl erases it
+    }
+    Queue(connection, encoded);
+    if (connection.socket != INVALID_SOCKET) {
+      ++reached; // Queue hangs up on a client too far behind
+    }
+  }
+  return reached;
+}
+
+int ReplClientCount() {
+  int connected = 0;
+  for (const Connection &connection : Connections) {
+    if (connection.socket != INVALID_SOCKET) {
+      ++connected;
+    }
+  }
+  return connected;
+}
+
+bool ReplOpen() { return Listener != INVALID_SOCKET; }
+
 void StopRepl() {
   // KillTimer is a plain USER32 call, so this is safe from
   // DllMain(DLL_PROCESS_DETACH) - which is precisely why the wake-up is a

@@ -76,6 +76,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsMods.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsProf.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsRender.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/JsRepl.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsRoles.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsText.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsTokens.cpp"

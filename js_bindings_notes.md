@@ -95,11 +95,11 @@ the host's copy as well. It is an accessor on a namespace object rather than a p
 a C module's named exports are fixed at instantiation — a top-level `simulation_running` could only
 ever report what was true before any level existed.
 
-The `"gk"` QuickJS C module, exposing 25 namespaces to scripts. `src/Js.h` is the public surface
+The `"gk"` QuickJS C module, exposing 26 namespaces to scripts. `src/Js.h` is the public surface
 — `RegisterGkModule`, plus `Log` / `ReportException` / `ReleaseCallbacks` for the host — and
-`src/JsGk.cpp`'s `Namespaces` table builds them. Fifteen come one per translation unit —
+`src/JsGk.cpp`'s `Namespaces` table builds them. Sixteen come one per translation unit —
 `JsCamera`, `JsConsole`, `JsActors`, `JsRoles`, `JsTokens`, `JsTriggers`, `JsLevels`, `JsMake`,
-`JsGls`, `JsGame`, `JsWorld`, `JsMods`, `JsRender`, `JsText`, `JsProf` — and the remaining ten are the
+`JsGls`, `JsGame`, `JsWorld`, `JsMods`, `JsRender`, `JsText`, `JsProf`, `JsRepl` — and the remaining ten are the
 command-backed clusters
 `JsCommands.cpp` supplies (`fx`, `light`, `objectives`, `music`, `screen`, `units`, `inventory`,
 `tracks`, `demo`, `script`), over shared helpers in `src/JsBindings.h` / `src/JsCommon.cpp`.

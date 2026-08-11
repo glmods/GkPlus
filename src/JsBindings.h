@@ -234,6 +234,11 @@ JSValue NewRenderNamespace(JSContext *ctx);
 // threads, read back a frame at a time. Read-only apart from `enabled`, `mask` and `configure`;
 // nothing here can change what the game does, only what is recorded about it.
 JSValue NewProfNamespace(JSContext *ctx);
+// The REPL backchannel (src/Repl.h): `repl.notify` pushes an unsolicited line to
+// every client connected to the socket. The only namespace here that talks to
+// something outside the process, and the only one whose whole point is that it
+// is not answering a question the socket asked.
+JSValue NewReplNamespace(JSContext *ctx);
 // The game's own text layer (src/Font.h). `text.draw` *queues* - the item is
 // rasterized by the per-frame overlay pass and then freed, so a string drawn once
 // lasts one frame. For a persistent panel use the ImGui object `draw_gui` is

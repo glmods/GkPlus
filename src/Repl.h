@@ -39,6 +39,17 @@ namespace gk {
 // A line that is not an object with a string `code` is treated as source, so
 // `nc 127.0.0.1 <port>` works for a one-liner. Multi-line source has to travel
 // as {"code": "..."}, which is what the JSON escaping is for.
+//
+// The channel also carries **unsolicited** lines the other way - the backchannel
+// a script pushes notifications into (NotifyRepl, `repl.notify` in JS):
+//
+//   <- {"event": "spawned", "data": {"id": 12}}
+//
+// One rule tells the two apart, and it is the reason `event` is a distinct key
+// rather than another `ok` shape: **a reply always has `ok`, a notification
+// never does and always has `event`.** A client that only ever asked for
+// replies can keep reading them by testing for `ok`, so adding this breaks
+// nothing that was written before it existed.
 
 // Creates the REPL context and opens the listener. False means the channel is
 // closed - either GKPLUS_REPL_PORT is unset (silent, the normal case) or setup
@@ -54,4 +65,40 @@ void PumpRepl();
 // Closes every connection and frees the REPL context. Must run before the host's
 // runtime is freed, since the context lives on it.
 void StopRepl();
+
+// --- the backchannel ---------------------------------------------------------
+
+// Queues {"event": <event>, "data": <data>} to every connected client. `ctx` is
+// the *caller's* context - the host's, the REPL's, whichever ran the script -
+// and only has to be on the same runtime; it is what encodes `data`, so a value
+// never crosses a context boundary. Pass JS_UNDEFINED for `data` to send an
+// event with no payload, which omits the key rather than writing null.
+//
+// Returns how many clients it reached, or -1 with an exception pending on `ctx`
+// when `data` could not be encoded (a circular structure, a getter that throws).
+// Zero is the ordinary answer, not a failure: nobody is usually listening.
+//
+// Nothing is written to a socket here - the line joins the same per-connection
+// buffer replies use and goes out on the next PumpRepl, so a notification can
+// never block the frame on a client that has stopped reading. A client that has
+// stopped reading for long enough is dropped, exactly as it is for replies.
+//
+// **When the channel is closed (GKPLUS_REPL_PORT unset - the normal case) this
+// returns 0 without encoding anything**, so notifications left in shipped script
+// cost a call and a branch. That the check is on the *channel* and not on the
+// client count is deliberate: whether a payload encodes is then a property of
+// how the game was launched, not of whether someone happened to be attached at
+// that moment. A script that wants to skip building an expensive payload should
+// test ReplClientCount (`repl.clients`) itself.
+//
+// Main thread only, like everything else here: it touches the connection list
+// PumpRepl owns and no lock guards it.
+int NotifyRepl(JSContext *ctx, const char *event, JSValueConst data);
+
+// How many clients are connected. 0 when the channel is closed.
+int ReplClientCount();
+
+// Whether the listener is open at all - i.e. whether GKPLUS_REPL_PORT named a
+// port and setup succeeded.
+bool ReplOpen();
 } // namespace gk
