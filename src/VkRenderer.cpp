@@ -101,6 +101,36 @@ bool Fail(const std::string &message) {
   return false;
 }
 
+// Only the results this file can actually observe, by name. Worth the table because a bare
+// number sends you to the spec, and because the three failures
+// `vkGetPhysicalDeviceSurfaceCapabilitiesKHR` is *allowed* to return are three unrelated bugs:
+// SURFACE_LOST is a dead window, OUT_OF_HOST_MEMORY in a 32-bit process is usually exhausted
+// address space rather than exhausted RAM, and OUT_OF_DEVICE_MEMORY is the driver's own.
+// Reporting "failed" collapsed all three into one unactionable line.
+std::string ResultName(VkResult result) {
+  switch (result) {
+    case VK_SUCCESS: return "VK_SUCCESS";
+    case VK_NOT_READY: return "VK_NOT_READY";
+    case VK_TIMEOUT: return "VK_TIMEOUT";
+    case VK_INCOMPLETE: return "VK_INCOMPLETE";
+    case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+    case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+    case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
+    case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+    case VK_ERROR_MEMORY_MAP_FAILED: return "VK_ERROR_MEMORY_MAP_FAILED";
+    case VK_ERROR_EXTENSION_NOT_PRESENT: return "VK_ERROR_EXTENSION_NOT_PRESENT";
+    case VK_ERROR_FEATURE_NOT_PRESENT: return "VK_ERROR_FEATURE_NOT_PRESENT";
+    case VK_ERROR_FORMAT_NOT_SUPPORTED: return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+    case VK_ERROR_SURFACE_LOST_KHR: return "VK_ERROR_SURFACE_LOST_KHR";
+    case VK_ERROR_NATIVE_WINDOW_IN_USE_KHR: return "VK_ERROR_NATIVE_WINDOW_IN_USE_KHR";
+    case VK_SUBOPTIMAL_KHR: return "VK_SUBOPTIMAL_KHR";
+    case VK_ERROR_OUT_OF_DATE_KHR: return "VK_ERROR_OUT_OF_DATE_KHR";
+    case VK_ERROR_INCOMPATIBLE_DISPLAY_KHR: return "VK_ERROR_INCOMPATIBLE_DISPLAY_KHR";
+    case VK_ERROR_UNKNOWN: return "VK_ERROR_UNKNOWN";
+    default: return std::to_string(static_cast<int>(result));
+  }
+}
+
 void DestroySwapchainObjects() {
   VkDevice device = GetDevice();
   for (VkImageView view : Views) {
@@ -203,8 +233,13 @@ bool CreateSwapchain() {
   VkPhysicalDevice physical = GetPhysicalDevice();
 
   VkSurfaceCapabilitiesKHR caps = {};
-  if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, Surface, &caps) != VK_SUCCESS) {
-    return Fail("vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed");
+  const VkResult caps_result =
+      vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, Surface, &caps);
+  if (caps_result != VK_SUCCESS) {
+    return Fail("vkGetPhysicalDeviceSurfaceCapabilitiesKHR returned " +
+                ResultName(caps_result) + " after " +
+                std::to_string(TheStats.swapchain_rebuilds) + " rebuilds and " +
+                std::to_string(TheStats.frames_presented) + " frames");
   }
 
   // A zero-area surface is a minimized window, not an error. Leave the old swapchain alone
@@ -275,7 +310,7 @@ bool CreateSwapchain() {
     Swapchain = VK_NULL_HANDLE;
   }
   if (result != VK_SUCCESS) {
-    return Fail("vkCreateSwapchainKHR returned " + std::to_string(result));
+    return Fail("vkCreateSwapchainKHR returned " + ResultName(result));
   }
   Swapchain = created;
 
