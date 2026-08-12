@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace gk::json {
 namespace {
@@ -296,6 +297,233 @@ bool OpenEnvelope(const char *text, std::string *kind, std::string *body_json) {
     *body_json = std::move(body_out);
   }
   return true;
+}
+
+// --- Document ----------------------------------------------------------------
+
+namespace {
+
+// The path split, done once per operation. Empty for an empty or malformed path,
+// which every caller below treats as "no such value" rather than as the root -
+// addressing the root by "" would make an accidental empty string replace the
+// whole file.
+std::vector<std::string> SplitPath(const char *path) {
+  std::vector<std::string> steps;
+  if (!path || !*path) {
+    return steps;
+  }
+  const char *begin = path;
+  for (const char *p = path;; ++p) {
+    if (*p == '.' || *p == '\0') {
+      if (p == begin) { // "a..b" or a leading/trailing dot
+        return {};
+      }
+      steps.emplace_back(begin, static_cast<std::size_t>(p - begin));
+      if (*p == '\0') {
+        break;
+      }
+      begin = p + 1;
+    }
+  }
+  return steps;
+}
+
+// The container the last step lives in, or JS_UNDEFINED if any earlier step is
+// missing or is not an object. Borrowed - the caller must not free it.
+JSValue ParentOf(JSContext *ctx, JSValue root,
+                 const std::vector<std::string> &steps) {
+  JSValue node = root;
+  for (std::size_t i = 0; i + 1 < steps.size(); ++i) {
+    if (!JS_IsObject(node) || JS_IsArray(node)) {
+      return JS_UNDEFINED;
+    }
+    JSValue next = JS_GetPropertyStr(ctx, node, steps[i].c_str());
+    if (JS_IsException(next)) {
+      ClearException(ctx);
+      JS_FreeValue(ctx, next);
+      return JS_UNDEFINED;
+    }
+    // Borrowed, so the reference JS_GetPropertyStr took has to go back; the
+    // parent still holds one, and the parent is alive for the whole walk.
+    JS_FreeValue(ctx, next);
+    node = next;
+  }
+  return JS_IsObject(node) && !JS_IsArray(node) ? node : JS_UNDEFINED;
+}
+
+} // namespace
+
+Document::Document() : root_(nullptr) {
+  Locked locked;
+  JSContext *ctx = locked.ctx();
+  if (!ctx) {
+    return;
+  }
+  root_ = new JSValue(JS_NewObject(ctx));
+}
+
+Document::~Document() {
+  if (!root_) {
+    return;
+  }
+  Locked locked;
+  if (JSContext *ctx = locked.ctx()) {
+    JS_FreeValue(ctx, *static_cast<JSValue *>(root_));
+  }
+  delete static_cast<JSValue *>(root_);
+  root_ = nullptr;
+}
+
+bool Document::Parse(const char *text) {
+  Locked locked;
+  JSContext *ctx = locked.ctx();
+  if (!ctx || !root_) {
+    return false;
+  }
+  JSValue *root = static_cast<JSValue *>(root_);
+
+  JSValue parsed = text ? JS_ParseJSON(ctx, text, std::strlen(text), "<document>")
+                        : JS_EXCEPTION;
+  if (JS_IsException(parsed)) {
+    ClearException(ctx);
+    JS_FreeValue(ctx, parsed);
+    parsed = JS_UNDEFINED;
+  }
+  const bool ok = JS_IsObject(parsed) && !JS_IsArray(parsed);
+  if (!ok) {
+    JS_FreeValue(ctx, parsed);
+    parsed = JS_NewObject(ctx);
+  }
+  JS_FreeValue(ctx, *root);
+  *root = parsed;
+  return ok;
+}
+
+std::string Document::Stringify(bool pretty) const {
+  Locked locked;
+  JSContext *ctx = locked.ctx();
+  if (!ctx || !root_) {
+    return "{}";
+  }
+  JSValue space = pretty ? JS_NewString(ctx, "  ") : JS_UNDEFINED;
+  JSValue json = JS_JSONStringify(ctx, *static_cast<JSValue *>(root_),
+                                  JS_UNDEFINED, space);
+  // JS_JSONStringify takes its arguments as JSValueConst - it consumes none of
+  // them, root included, which is what makes this a const operation at all.
+  JS_FreeValue(ctx, space);
+  if (JS_IsException(json)) {
+    ClearException(ctx);
+    JS_FreeValue(ctx, json);
+    return "{}";
+  }
+  const char *text = JS_ToCString(ctx, json);
+  JS_FreeValue(ctx, json);
+  if (!text) {
+    ClearException(ctx);
+    return "{}";
+  }
+  std::string out = text;
+  JS_FreeCString(ctx, text);
+  return out;
+}
+
+std::string Document::Get(const char *path) const {
+  const std::vector<std::string> steps = SplitPath(path);
+  if (steps.empty()) {
+    return {};
+  }
+  Locked locked;
+  JSContext *ctx = locked.ctx();
+  if (!ctx || !root_) {
+    return {};
+  }
+  JSValue parent = ParentOf(ctx, *static_cast<JSValue *>(root_), steps);
+  if (JS_IsUndefined(parent)) {
+    return {};
+  }
+  JSValue leaf = JS_GetPropertyStr(ctx, parent, steps.back().c_str());
+  if (JS_IsException(leaf)) {
+    ClearException(ctx);
+    JS_FreeValue(ctx, leaf);
+    return {};
+  }
+  // JSON cannot express undefined, so this is exactly "no such key".
+  if (JS_IsUndefined(leaf)) {
+    JS_FreeValue(ctx, leaf);
+    return {};
+  }
+  return StringifyAndFree(ctx, leaf);
+}
+
+bool Document::Set(const char *path, const char *json) {
+  const std::vector<std::string> steps = SplitPath(path);
+  if (steps.empty() || !json) {
+    return false;
+  }
+  Locked locked;
+  JSContext *ctx = locked.ctx();
+  if (!ctx || !root_) {
+    return false;
+  }
+
+  JSValue value = JS_ParseJSON(ctx, json, std::strlen(json), "<value>");
+  if (JS_IsException(value)) {
+    ClearException(ctx);
+    JS_FreeValue(ctx, value);
+    return false;
+  }
+
+  // The walk creates as it goes, so it cannot use ParentOf.
+  JSValue node = *static_cast<JSValue *>(root_);
+  for (std::size_t i = 0; i + 1 < steps.size(); ++i) {
+    JSValue next = JS_GetPropertyStr(ctx, node, steps[i].c_str());
+    if (JS_IsException(next)) {
+      ClearException(ctx);
+      JS_FreeValue(ctx, next);
+      next = JS_UNDEFINED;
+    }
+    if (!JS_IsObject(next) || JS_IsArray(next)) {
+      JS_FreeValue(ctx, next);
+      next = JS_NewObject(ctx);
+      if (JS_IsException(next)) {
+        ClearException(ctx);
+        JS_FreeValue(ctx, next);
+        JS_FreeValue(ctx, value);
+        return false;
+      }
+      // Consumes one reference; JS_DupValue keeps ours for the next round.
+      JS_SetPropertyStr(ctx, node, steps[i].c_str(), JS_DupValue(ctx, next));
+    }
+    JS_FreeValue(ctx, next);
+    node = next; // borrowed: its parent holds it, and the parent outlives the walk
+  }
+
+  return JS_SetPropertyStr(ctx, node, steps.back().c_str(), value) >= 0;
+}
+
+bool Document::Remove(const char *path) {
+  const std::vector<std::string> steps = SplitPath(path);
+  if (steps.empty()) {
+    return false;
+  }
+  Locked locked;
+  JSContext *ctx = locked.ctx();
+  if (!ctx || !root_) {
+    return false;
+  }
+  JSValue parent = ParentOf(ctx, *static_cast<JSValue *>(root_), steps);
+  if (JS_IsUndefined(parent)) {
+    return false;
+  }
+  JSAtom key = JS_NewAtom(ctx, steps.back().c_str());
+  const int had = JS_HasProperty(ctx, parent, key);
+  const int deleted = had > 0 ? JS_DeleteProperty(ctx, parent, key, 0) : 0;
+  JS_FreeAtom(ctx, key);
+  if (had < 0 || deleted < 0) {
+    ClearException(ctx);
+    return false;
+  }
+  return had > 0;
 }
 
 } // namespace gk::json

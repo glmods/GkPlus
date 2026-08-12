@@ -283,7 +283,7 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 | `src/List.h` | `List<T>` / `List_Member<T>` / `List_Member_Base<T>` — layout mirror of AvP's `list_tem.hpp`, with sentinel-safe `begin()`/`end()` |
 | `src/HashTable.h` | `HashTableBase<T>` / `HashTable<T>` — layout mirror of AvP's `Hash_tem.hpp`, with bucket-walking `begin()`/`end()` |
 | `src/Memory.h/cpp` | `pool_alloc`/`pool_free` and the `pool_unique_ptr`/`pool_string` ownership markers |
-| `src/Json.h/cpp` | `gk::json::Classify` / `Quote` / `Envelope` / `OpenEnvelope` — the two queues' JSON. This file owns the `{kind, body}` envelope's *shape*; the vocabulary of kinds is `ScriptQueue.cpp`'s. **The codec is QuickJS** (`JS_ParseJSON` / `JS_JSONStringify`) on a **private `JSRuntime` behind a lock**, because this runs on both game threads and the host's runtime may only be used from one. No modules and no scripts in it, so nothing there is observable from a script. See the `JS_UpdateStackTop` rule in the QuickJS conventions — sharing the runtime across threads disarms its stack guard. Everything in it is UTF-8; codepages are `Encoding.h`'s job |
+| `src/Json.h/cpp` | `gk::json::Classify` / `Quote` / `Envelope` / `OpenEnvelope` — the two queues' JSON. This file owns the `{kind, body}` envelope's *shape*; the vocabulary of kinds is `ScriptQueue.cpp`'s. **The codec is QuickJS** (`JS_ParseJSON` / `JS_JSONStringify`) on a **private `JSRuntime` behind a lock**, because this runs on both game threads and the host's runtime may only be used from one. No modules and no scripts in it, so nothing there is observable from a script. See the `JS_UpdateStackTop` rule in the QuickJS conventions — sharing the runtime across threads disarms its stack guard. Everything in it is UTF-8; codepages are `Encoding.h`'s job. Also `json::Document`, a tree that can be read and written **by dotted path** — which the queues do not need and `src/Settings` does, because it has to update one key of a file whose other sections belong to somebody else's mod |
 | `src/Encoding.h/cpp` | `Utf8FromGameText` / `GameTextFromUtf8` — CP_ACP ↔ UTF-8 via `MultiByteToWideChar`/`WideCharToMultiByte`. **The script queue's edges.** Everything the engine holds in a `char *` is ANSI (a `.gls` is read as bytes; `fopen` reads the codepage) and JSON is UTF-8, so a name is transcoded on the way into a payload and back on the way to `ExecuteCommandFile`. A conversion that fails returns its input unchanged |
 | `src/Varint.h` | Variable-length integer encode/decode utility (currently no callers) |
 
@@ -401,8 +401,29 @@ one of the two, see Conventions), and hides itself entirely unless `d3d8::Render
 than `Msaa()`, since a write is only adopted at the top of the next frame and the effective value
 would lag one frame behind every click; and the tessellation row is absent without
 `DeviceCaps::tessellation_shader`, because the setting would otherwise read back off forever.
-Nothing is written to disk — the page edits the current session, and settings return to their
-`GKPLUS_*` defaults on the next launch.
+Every click is written through to `core.render.*` in `src/Settings` and saved immediately, so the
+page has no apply step. `ApplyStoredRenderSettings()` puts them back on the knobs from
+`FileHookSystem`'s **first intercepted open** — the same anchor the DDS codec uses, chosen here
+because it is inside `WinMain` and therefore ahead of the device, so the stored settings are in
+place before the renderer initialises rather than a frame or a menu later.
+
+### Settings (`src/Settings.h/cpp`, `src/JsSettings.cpp`)
+
+`<Gunlok>\gkplus\settings.json`, and it is a **shared repository, not GkPlus's own file**. The top
+level is one object per owner — GkPlus under `core`, a mod under a key of its own — and a write
+re-serialises the *parsed* document, so a section belonging to a mod this build has never heard of
+survives being rewritten by a build that only understands `core`. That requirement is the whole
+reason `json::Document` exists: a store that kept its own struct and re-serialised it would delete
+every key it did not know.
+
+**An environment variable outranks the file.** The `GKPLUS_*` overrides are launch-time
+instruments — the switch you reach for when the setting you need to change is the one keeping the
+game from starting — so `ApplyStoredRenderSettings` skips any knob whose companion variable is
+set. Two of the eight have one (`GKPLUS_VK_MSAA`, `GKPLUS_VK_PER_PIXEL_LIGHTING`); doing it in one
+place is what keeps the rule from depending on which setter happens to latch its own env-read flag.
+
+Loading is lazy and once, on first access. Saving writes a temporary and moves it over the target,
+because a half-written file would take every other owner's section with it.
 
 ### Building game objects (`src/MakeRole`, `src/JsMake.cpp`, `src/JsGls.cpp`)
 
@@ -510,7 +531,7 @@ fault inside a suspended-thread window would take the game down with its threads
 
 ### JavaScript bindings (`src/Js*`) and type definitions (`types/`)
 
-The `"gk"` QuickJS C module, 26 namespaces, built by `src/JsGk.cpp`'s `Namespaces` table; plus the
+The `"gk"` QuickJS C module, 27 namespaces, built by `src/JsGk.cpp`'s `Namespaces` table; plus the
 hand-written `.d.ts` that type-checks a plain `.mjs`. **`console_command_notes.md` is the map of
 what is still missing** - all 280 registrations classified against the JS surface, with no gaps
 left. `js_bindings_notes.md` has the collection scaffolding, the Actor prototype chain, the
@@ -578,6 +599,7 @@ reference. Test invocations are under "Running the test suites" above.
 | `src/FileHooks.h/cpp` | `FileHookSystem` — the nine IAT patches and the two static-CRT detours that make the engine consult `src/Vfs`, plus the virtual-handle table and the `mods.served`/`mods.recent` diagnostics |
 | `src/Profiler.h/cpp` | The CPU profiler: the per-thread event rings, the frame ring, the sampling thread and the Chrome-trace writer. **Touches no game memory** — it is clock, rings and Win32 thread APIs — so it is one of the few `src/` files a harness could exercise. See "The profiler" above |
 | `src/Repl.h/cpp` | The loopback JavaScript REPL: `StartRepl` / `PumpRepl` / `StopRepl`, owned by `BootScriptHost` rather than by `Subsystems` (it installs no detour). Off unless `GKPLUS_REPL_PORT` is set; `=0` binds an ephemeral port and publishes it to `GKPLUS_LAUNCHER_HWND`, which is how a launcher gets one without racing for it. Also `NotifyRepl` — the **backchannel**, an unsolicited `{event, data}` line a script pushes to every connected client (`repl.notify` in JS, `src/JsRepl.cpp`), which is what makes something that *happens between two polls* observable from outside. A reply always carries `ok` and a notification never does: that is the whole rule a client needs. See "The REPL channel" above |
+| `src/Settings.h/cpp` | `<Gunlok>\gkplus\settings.json` — the shared settings repository. Typed get/set over a dotted path, lazy load, atomic save. **Touches no game memory**, so it is harness-testable; the tree is `json::Document`, and unknown top-level sections survive a rewrite by design. See "Settings" above |
 | `src/Session.h/cpp` | `StartLevel` / `QueueLevelStart` / `QueueReturnToMainMenu` — a level start with no menus and no briefing, deferred to the message loop. Installs no detour and has no `*System`: it registers `SetMessageLoopCallback` on first use. See "Starting a level programmatically" above |
 | `src/Font.h/cpp` | The engine's text layer: `GetFont` / `LineHeight` / `QueueText`, and `VersionTextSystem`. `Font` is deliberately left **incomplete** - its 0xb18 layout is measured but nothing here needs a field out of it, and an unchecked mirror would only go stale. See "The text queue and the version stamp" above |
 | `src/InputFix.h/cpp` | `InputFixSystem` - hook-only. Detours `AcquireDInputDevice` to suppress the vestigial DirectInput keyboard acquire and its `WH_KEYBOARD_LL` hook (see `input_notes.md`) |
@@ -610,7 +632,7 @@ code still live here under Conventions:
 
 - `address_map.md` - the binary's segment layout, every named global and function address, the Actor class hierarchy and subclass sizes, `TriggerKind`, and the `Role`/`Map` struct offsets
 - `script_host_notes.md` - the QuickJS host (`src/Script`) and the loopback REPL (`src/Repl`): boot point, the four facts that pin the design, the REPL protocol and its limits
-- `js_bindings_notes.md` - the `"gk"` module's 26 namespaces (`src/Js*`) and `types/`: the collection scaffolding, the Actor prototype chain, the native-vs-command-backed split, and the nine members that do not replicate
+- `js_bindings_notes.md` - the `"gk"` module's 27 namespaces (`src/Js*`) and `types/`: the collection scaffolding, the Actor prototype chain, the native-vs-command-backed split, and the nine members that do not replicate
 - `make_role_notes.md` - `src/MakeRole` and the `make` / `gls` namespaces: one `Make*` per GLS section, the five conversions that carry real risk, and what only the parser can answer
 - `script_queue_notes.md` - the `{kind, body}` envelope on both of Gunlok's queues, its ten hooks, and why the console queue is read through it but never written to it
 - `custom_levels_notes.md` - levels with no `.gls` and no `.gcs` (`src/CustomLevel`), and starting one with no menus (`src/Session`)

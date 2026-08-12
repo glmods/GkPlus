@@ -226,6 +226,11 @@ JSValue NewMakeNamespace(JSContext *ctx);
 // provide. Read-only from script apart from mount(); the interception that makes
 // the engine consult it is installed long before any script runs.
 JSValue NewModsNamespace(JSContext *ctx);
+// The settings file (src/Settings.h): `<Gunlok>\gkplus\settings.json`, shared by
+// GkPlus (under `core`) and by whatever else wants a section of it. Values cross
+// as JSON, and `all` is a snapshot - the store's own tree lives in the codec's
+// private runtime and is never handed out.
+JSValue NewSettingsNamespace(JSContext *ctx);
 // The renderer (src/D3D8Capture.h). Currently the Phase 0b measurement surface for the
 // Vulkan work - see vulkan_renderer_notes.md. Read-only: the capture layer forwards every
 // D3D8 call unchanged, so nothing here can alter what is drawn.

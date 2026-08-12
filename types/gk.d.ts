@@ -2247,6 +2247,54 @@ declare module "gk" {
     readonly [name: string]: Mod | undefined;
   };
 
+  // --- settings ----------------------------------------------------------------
+
+  /** `<Gunlok>\gkplus\settings.json` - one JSON file for anything that has to
+   *  outlive a launch, **shared** rather than GkPlus's own.
+   *
+   *  The top level is one object per owner: GkPlus keeps its settings under
+   *  `core`, and a mod takes a key of its own beside it. Nothing knows anybody
+   *  else's schema, and a write re-serialises the parsed document, so a section
+   *  belonging to a mod this build has never heard of survives being rewritten.
+   *
+   *      {
+   *        "core":  { "render": { "msaa": 4, "ao": true } },
+   *        "mymod": { "anything": [1, 2, 3] }
+   *      }
+   *
+   *  Paths are dot-separated, so a key containing a dot cannot be addressed.
+   *  Values cross as JSON: anything `JSON.stringify` accepts can be stored, and
+   *  `undefined` is refused rather than silently doing nothing.
+   *
+   *  `set` is in memory; `save` is what reaches the disk, and it writes to a
+   *  temporary and moves it over the target so a failed write cannot take
+   *  another owner's section with it.
+   *
+   *      const w = settings.get("mymod.window", { x: 0, y: 0 });
+   *      settings.set("mymod.window", { x: 10, y: 20 });
+   *      settings.save();
+   */
+  export interface Settings {
+    /** The value at `path`, or `fallback` (undefined by default) when there is
+     *  nothing there. A fresh value each call - the store's own tree is never
+     *  handed out, so mutating the result changes nothing. */
+    get<T = unknown>(path: string): T | undefined;
+    get<T>(path: string, fallback: T): T;
+    /** Stores `value` at `path`, creating intermediate objects. In memory only;
+     *  call `save()` to write the file. Throws for a value with no JSON form. */
+    set(path: string, value: unknown): void;
+    /** Whether there was anything at `path` to remove. */
+    remove(path: string): boolean;
+    /** Writes the whole document out. False if the file could not be replaced. */
+    save(): boolean;
+    /** Re-reads from disk, discarding anything set since the last save. */
+    reload(): boolean;
+    /** The whole document, as a snapshot. Mutating it changes nothing. */
+    readonly all: Record<string, unknown>;
+    /** Where the file is, with forward slashes. `GKPLUS_SETTINGS` overrides it. */
+    readonly path: string;
+  }
+
   // --- the Vulkan renderer ---------------------------------------------------
 
   /** What a material override says about every draw that samples one texture.
@@ -3416,6 +3464,7 @@ declare module "gk" {
   export const text: Text;
   export const repl: Repl;
   export const mods: Mods;
+  export const settings: Settings;
   export const fx: Fx;
   export const light: Light;
   export const objectives: Objectives;
@@ -3431,7 +3480,7 @@ declare module "gk" {
   // adding a front-end item is a boot-time act. Keep the argument if you need
   // it later.
 
-  /** The default export carries the same twenty-six objects: `gk.actors === actors`. */
+  /** The default export carries the same twenty-seven objects: `gk.actors === actors`. */
   const gk: {
     prof: Prof;
     render: Render;
@@ -3449,6 +3498,7 @@ declare module "gk" {
     text: Text;
     repl: Repl;
     mods: Mods;
+    settings: Settings;
     fx: Fx;
     light: Light;
     objectives: Objectives;

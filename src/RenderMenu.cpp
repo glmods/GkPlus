@@ -3,9 +3,13 @@
 #include "CustomMenu.h"
 #include "D3D8Capture.h"
 #include "Menu.h"
+#include "Settings.h"
 #include "VkContext.h"
 #include "VkDraw.h"
 #include "VkLighting.h"
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -38,55 +42,67 @@ bool AvailableWithTessellation(void *) {
   return VulkanIsDrawing() && vulkan::Caps().tessellation_shader;
 }
 
+// Whether a `GKPLUS_*` companion is set, which is what makes the stored value
+// stand aside. See Settings.h: an environment override is the instrument you
+// reach for when the setting you need to change is the one keeping the game from
+// starting, so it cannot lose to a file.
+bool EnvOverridden(const char *name) {
+  if (!name) {
+    return false;
+  }
+  return ::GetEnvironmentVariableA(name, nullptr, 0) != 0;
+}
+
 // --- The boolean rows -------------------------------------------------------
-
-struct BoolKnob {
-  bool (*get)();
-  void (*set)(bool);
-};
-
-void BoolClicked(CustomMenuItem *item, void *user) {
-  // The dispatch has already flipped `value`; that flip is the request. Whether
-  // it took is not asserted here - the next refresh reads the knob back, so a
-  // setting that declined to change shows what it actually is.
-  static_cast<const BoolKnob *>(user)->set(item->value != 0);
-}
-
-void BoolRefresh(CustomMenuItem *item, void *user) {
-  item->value = static_cast<const BoolKnob *>(user)->get() ? 1 : 0;
-}
 
 struct BoolRow {
   const char *label;
-  BoolKnob knob;
+  const char *key; // under `core.render.`, named as the `render.*` knob is
+  const char *env; // the launch-time override that outranks the file, if any
+  bool (*get)();
+  void (*set)(bool);
   CustomMenuAvailable available;
 };
 
-// Non-const and at namespace scope: `&Rows[i].knob` is handed to the game side as
-// the item's `user` and is read on every click and every frame the page is up.
+// Non-const and at namespace scope: `&Rows[i]` is handed to the game side as the
+// item's `user` and is read on every click and every frame the page is up.
 BoolRow Rows[] = {
-    {"Tessellation",
-     {vulkan::TessellationEnabled, vulkan::SetTessellationEnabled},
+    {"Tessellation", "core.render.tessellation", nullptr,
+     vulkan::TessellationEnabled, vulkan::SetTessellationEnabled,
      AvailableWithTessellation},
-    {"Dynamic Shadows",
-     {vulkan::DynamicShadows, vulkan::SetDynamicShadows},
-     AvailableUnderVulkan},
-    {"Sun Shadows",
-     {vulkan::SunShadows, vulkan::SetSunShadows},
-     AvailableUnderVulkan},
-    {"Map Shadows",
-     {vulkan::MapShadows, vulkan::SetMapShadows},
-     AvailableUnderVulkan},
-    {"Ambient Occlusion",
-     {vulkan::AmbientOcclusion, vulkan::SetAmbientOcclusion},
-     AvailableUnderVulkan},
-    {"Per-Pixel Lighting",
-     {vulkan::PerPixelLighting, vulkan::SetPerPixelLighting},
-     AvailableUnderVulkan},
-    {"Lighting Maps",
-     {vulkan::LightingMaps, vulkan::SetLightingMaps},
-     AvailableUnderVulkan},
+    {"Dynamic Shadows", "core.render.dynamic_shadows", nullptr,
+     vulkan::DynamicShadows, vulkan::SetDynamicShadows, AvailableUnderVulkan},
+    {"Sun Shadows", "core.render.sun_shadows", nullptr, vulkan::SunShadows,
+     vulkan::SetSunShadows, AvailableUnderVulkan},
+    {"Map Shadows", "core.render.map_shadows", nullptr, vulkan::MapShadows,
+     vulkan::SetMapShadows, AvailableUnderVulkan},
+    {"Ambient Occlusion", "core.render.ao", nullptr, vulkan::AmbientOcclusion,
+     vulkan::SetAmbientOcclusion, AvailableUnderVulkan},
+    {"Per-Pixel Lighting", "core.render.per_pixel_lighting",
+     "GKPLUS_VK_PER_PIXEL_LIGHTING", vulkan::PerPixelLighting,
+     vulkan::SetPerPixelLighting, AvailableUnderVulkan},
+    {"Lighting Maps", "core.render.lighting_maps", nullptr, vulkan::LightingMaps,
+     vulkan::SetLightingMaps, AvailableUnderVulkan},
 };
+
+constexpr const char *MsaaKey = "core.render.msaa";
+constexpr const char *MsaaEnv = "GKPLUS_VK_MSAA";
+
+void BoolClicked(CustomMenuItem *item, void *user) {
+  const BoolRow *row = static_cast<const BoolRow *>(user);
+  // The dispatch has already flipped `value`; that flip is the request. Whether
+  // it took is not asserted here - the next refresh reads the knob back, so a
+  // setting that declined to change shows what it actually is.
+  row->set(item->value != 0);
+  // Stored as requested rather than as read back, for the same reason: a value
+  // the device refused this run may be the one wanted on a machine that can.
+  settings::SetBool(row->key, item->value != 0);
+  settings::Save();
+}
+
+void BoolRefresh(CustomMenuItem *item, void *user) {
+  item->value = static_cast<const BoolRow *>(user)->get() ? 1 : 0;
+}
 
 // --- Antialiasing -----------------------------------------------------------
 //
@@ -127,12 +143,38 @@ void MsaaClicked(CustomMenuItem *item, void *user) {
     }
   }
   vulkan::SetMsaa(next);
+  settings::SetNumber(MsaaKey, next);
+  settings::Save();
   MsaaRefresh(item, user);
 }
 
 void OpenPage(CustomMenuItem *, void *) { GoToMenu(PageMenu, true); }
 
 } // namespace
+
+void ApplyStoredRenderSettings() {
+  static bool applied = false;
+  if (applied) {
+    return;
+  }
+  applied = true;
+
+  for (const BoolRow &row : Rows) {
+    if (EnvOverridden(row.env) || !settings::Has(row.key)) {
+      continue;
+    }
+    row.set(settings::GetBool(row.key, false));
+  }
+
+  if (!EnvOverridden(MsaaEnv) && settings::Has(MsaaKey)) {
+    const double samples = settings::GetNumber(MsaaKey, 1.0);
+    // SetMsaa clamps to what the device offers, so a file naming a count this
+    // machine cannot do asks for the nearest one rather than being an error.
+    if (samples >= 1.0 && samples <= 64.0) {
+      vulkan::SetMsaa(static_cast<uint32_t>(samples));
+    }
+  }
+}
 
 void RegisterRenderMenu() {
   ClaimCustomMenuPage(PageMenu, PageTitle);
@@ -153,8 +195,7 @@ void RegisterRenderMenu() {
     // DllMain, long before there is a renderer to ask. BoolRefresh replaces it
     // on the reconcile that precedes the page's first draw.
     CustomMenuItem *item = AddCustomMenuToggle(
-        PageMenu, row.label, false, BoolClicked, &row.knob,
-        CustomMenuOwner::Native);
+        PageMenu, row.label, false, BoolClicked, &row, CustomMenuOwner::Native);
     SetCustomMenuRefresh(item, BoolRefresh);
     SetCustomMenuAvailable(item, row.available);
   }

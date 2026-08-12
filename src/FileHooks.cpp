@@ -2,6 +2,7 @@
 
 #include "Core.h"
 #include "ImageCodec.h"
+#include "RenderMenu.h"
 #include "Vfs.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -155,6 +156,11 @@ HANDLE WINAPI HookedCreateFileA(LPCSTR name, DWORD access, DWORD share,
   // first call it is a static bool test. See src/ImageCodec.h for why it is not a
   // detour of its own.
   image::RegisterDdsCodec();
+  // The same anchor, for a different half of the same argument: being inside
+  // WinMain puts this ahead of the device, so the stored renderer settings are on
+  // the knobs before the renderer initialises rather than a frame or a menu in.
+  // Also idempotent. See src/RenderMenu.h.
+  ApplyStoredRenderSettings();
 
   if (name && disposition == OPEN_EXISTING) {
     try {

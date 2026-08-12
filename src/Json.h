@@ -101,4 +101,48 @@ std::string Envelope(const char *kind, const char *body_json);
 // body is a JSON string the caller decodes with Classify. One rule for all three.
 bool OpenEnvelope(const char *text, std::string *kind, std::string *body_json);
 
+// --- a document that can be read and written by path --------------------------
+//
+// The queue needs no tree; `src/Settings` does - it has to *update* one key of a
+// file without disturbing the rest of it, because the rest of it belongs to
+// somebody else's mod. That is the whole reason this exists rather than the
+// settings store keeping its own struct and re-serialising it: a mod's section
+// has to survive a build that has never heard of it.
+//
+// The tree is a `JSValue` in the same private runtime, and every operation takes
+// the same lock, so the rules at the top of this file apply unchanged. The
+// interface is deliberately text in and text out: one representation for every
+// type, no variant to maintain here, and `Classify` already decodes the leaves.
+//
+// A path is dot-separated (`"core.render.msaa"`). A key containing a dot cannot
+// be addressed - which is a real limit, and the reason the key vocabulary is
+// ours rather than free-form.
+class Document {
+public:
+  Document();
+  ~Document();
+  Document(const Document &) = delete;
+  Document &operator=(const Document &) = delete;
+
+  // Replaces the contents. False - leaving an empty object - unless `text` is one
+  // complete JSON **object**: an array or a bare number is a document no path can
+  // address, and silently keeping it would make every later Get fail obscurely.
+  bool Parse(const char *text);
+  // The whole document. `pretty` indents by two spaces, which is what a file a
+  // human may edit wants.
+  std::string Stringify(bool pretty) const;
+
+  // The value at `path` as JSON text, or "" when any step of it is missing.
+  std::string Get(const char *path) const;
+  // `json` must be one complete JSON document. Intermediate steps that do not
+  // exist are created as objects, and one that exists but is not an object is
+  // replaced by one - a path always wins over whatever was in its way.
+  bool Set(const char *path, const char *json);
+  // False when the leaf was not there to begin with.
+  bool Remove(const char *path);
+
+private:
+  void *root_; // a JSValue, in the codec's runtime and freed under its lock
+};
+
 } // namespace gk::json
