@@ -330,6 +330,25 @@ One `JSRuntime`, one entry module (`<game dir>\gkplus\main.mjs`, booted from a d
 `SetupMenus`), plus an optional loopback JavaScript REPL behind `GKPLUS_REPL_PORT`. **The REPL is
 how you test anything in a running game** - see "Debugging the running game" above, and
 `script_host_notes.md` for the protocol, the boot sequence and the five facts that pin the design.
+
+**A launcher should not pick the port.** `GKPLUS_REPL_PORT=0` binds an ephemeral one and
+`GKPLUS_LAUNCHER_HWND` names a message-only window of class `GkPlusLauncher`, which is **posted**
+`RegisterWindowMessage("GkPlusReplPort")` - **pid in `wParam`, port in `lParam`** - once the
+listener is accepting, which is the readiness signal too. Choosing a number is a race: anything can
+take the port between the check and the game's bind, a number from the ephemeral range can hit a
+block Hyper-V reserved and fail `WSAEACCES` with nothing listening, and a fixed port can stay
+unbindable after a crash while `TIME_WAIT` runs out. **A `WM_COPYDATA` cannot do this job**: it
+cannot be posted at all (the window manager marshals its buffer during the *send*, so a posted one
+arrives as a pointer into the game's address space), and sending it would hang the game's main
+thread in `SetupMenus` on the launcher's message loop. Two parameters need no buffer. Three
+receiver-side rules, two of which fail *silently*: **pump messages** (a posted message reaches a
+wndproc only via `DispatchMessage`, so a launcher that never pumps never learns the port - though
+unlike a send, being slow costs the game nothing), call `ChangeWindowMessageFilterEx` on that id if
+the launcher outranks the game (UIPI drops it with no diagnostic), and check the `pid` against the
+process you spawned. Timing out is the launcher's job - a post is confirmed queued, not delivered.
+The class name is checked before we post, because a recycled handle would otherwise publish to a
+stranger. **It cannot cross a session or a desktop** - the port is logged either way. `repl.port`
+reads it from inside; `utils/rendertest/launch-gunlok.ps1` is a worked receiver.
 ### Custom menu items (`src/CustomMenu.h/cpp`)
 
 Front-end menu items owned by GkPlus. `CustomMenuSystem` hooks `UpdateAndDrawMenuScreen` and
@@ -518,7 +537,7 @@ reference. Test invocations are under "Running the test suites" above.
 | `src/Vfs.h/cpp` | The mod filesystem: mount, case-folded index, lookup, read, `Materialize`. Pure lookup — touches no game memory, so it is the half a harness can exercise. See "Mod loading" above |
 | `src/FileHooks.h/cpp` | `FileHookSystem` — the nine IAT patches and the two static-CRT detours that make the engine consult `src/Vfs`, plus the virtual-handle table and the `mods.served`/`mods.recent` diagnostics |
 | `src/Profiler.h/cpp` | The CPU profiler: the per-thread event rings, the frame ring, the sampling thread and the Chrome-trace writer. **Touches no game memory** — it is clock, rings and Win32 thread APIs — so it is one of the few `src/` files a harness could exercise. See "The profiler" above |
-| `src/Repl.h/cpp` | The loopback JavaScript REPL: `StartRepl` / `PumpRepl` / `StopRepl`, owned by `BootScriptHost` rather than by `Subsystems` (it installs no detour). Off unless `GKPLUS_REPL_PORT` is set. Also `NotifyRepl` — the **backchannel**, an unsolicited `{event, data}` line a script pushes to every connected client (`repl.notify` in JS, `src/JsRepl.cpp`), which is what makes something that *happens between two polls* observable from outside. A reply always carries `ok` and a notification never does: that is the whole rule a client needs. See "The REPL channel" above |
+| `src/Repl.h/cpp` | The loopback JavaScript REPL: `StartRepl` / `PumpRepl` / `StopRepl`, owned by `BootScriptHost` rather than by `Subsystems` (it installs no detour). Off unless `GKPLUS_REPL_PORT` is set; `=0` binds an ephemeral port and publishes it to `GKPLUS_LAUNCHER_HWND`, which is how a launcher gets one without racing for it. Also `NotifyRepl` — the **backchannel**, an unsolicited `{event, data}` line a script pushes to every connected client (`repl.notify` in JS, `src/JsRepl.cpp`), which is what makes something that *happens between two polls* observable from outside. A reply always carries `ok` and a notification never does: that is the whole rule a client needs. See "The REPL channel" above |
 | `src/Session.h/cpp` | `StartLevel` / `QueueLevelStart` / `QueueReturnToMainMenu` — a level start with no menus and no briefing, deferred to the message loop. Installs no detour and has no `*System`: it registers `SetMessageLoopCallback` on first use. See "Starting a level programmatically" above |
 | `src/Font.h/cpp` | The engine's text layer: `GetFont` / `LineHeight` / `QueueText`, and `VersionTextSystem`. `Font` is deliberately left **incomplete** - its 0xb18 layout is measured but nothing here needs a field out of it, and an unchecked mirror would only go stale. See "The text queue and the version stamp" above |
 | `src/InputFix.h/cpp` | `InputFixSystem` - hook-only. Detours `AcquireDInputDevice` to suppress the vestigial DirectInput keyboard acquire and its `WH_KEYBOARD_LL` hook (see `input_notes.md`) |

@@ -20,7 +20,7 @@ public static class Key {
 }
 '@ -ErrorAction SilentlyContinue
 
-function Get-Camera([int]$Port = 9222) {
+function Get-Camera([int]$Port = $global:GunlokReplPort) {
     return Repl 'JSON.stringify({p: camera.position, yaw: camera.yaw, pitch: camera.pitch, roll: camera.roll, d: camera.distance})' $Port
 }
 

@@ -60,10 +60,18 @@ JSValue GetOpenJs(JSContext *ctx, JSValueConst) {
   return JS_NewBool(ctx, ReplOpen());
 }
 
+// Worth exposing rather than leaving to whoever set the environment variable:
+// under GKPLUS_REPL_PORT=0 the port is the OS's choice, so this is the only
+// thing in the process that knows it.
+JSValue GetPortJs(JSContext *ctx, JSValueConst) {
+  return JS_NewInt32(ctx, ReplPort());
+}
+
 const JSCFunctionListEntry ReplProps[] = {
     JS_CFUNC_DEF("notify", 2, NotifyJs),
     JS_CGETSET_DEF("clients", GetClientsJs, nullptr),
     JS_CGETSET_DEF("open", GetOpenJs, nullptr),
+    JS_CGETSET_DEF("port", GetPortJs, nullptr),
 };
 
 } // namespace

@@ -1387,6 +1387,13 @@ declare module "gk" {
     /** Whether the channel is listening at all, i.e. whether `GKPLUS_REPL_PORT`
      *  named a port and the listener opened. Fixed for the process. */
     readonly open: boolean;
+    /** The port actually bound, or 0 with the channel closed.
+     *
+     *  Not necessarily the one `GKPLUS_REPL_PORT` asked for: `0` (or `auto`)
+     *  means the OS picks an ephemeral one, which is how a launcher avoids the
+     *  race in choosing a port itself. Read back from the socket, so this is
+     *  the truth either way. Fixed for the process. */
+    readonly port: number;
   }
 
   // --- script-queue messages -------------------------------------------------

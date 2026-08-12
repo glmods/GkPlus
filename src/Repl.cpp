@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -34,6 +35,17 @@ constexpr size_t kReadsPerFrame = 64;          // 256 KiB, then yield the frame
 constexpr int kValueChars = 64 * 1024;         // formatted result, before eliding
 constexpr uint64_t kEvalBudgetMs = 5000;
 
+// --- the launcher rendezvous -------------------------------------------------
+
+// The window class a launcher registers, and the message it is posted.
+//
+// The id comes from RegisterWindowMessage rather than being a WM_USER+n of our
+// choosing: it is allocated system-wide from the string, so both processes
+// compute the same number without agreeing on one, and it cannot collide with
+// whatever the receiving window already defines in its own WM_USER range.
+constexpr char kLauncherClass[] = "GkPlusLauncher";
+constexpr char kLauncherMessage[] = "GkPlusReplPort";
+
 // --- state -------------------------------------------------------------------
 
 struct Connection {
@@ -44,6 +56,9 @@ struct Connection {
 
 bool WinsockReady = false;
 SOCKET Listener = INVALID_SOCKET;
+// The port actually bound, which is not necessarily the one asked for - see
+// StartRepl. Only meaningful while Listener is open.
+int ListenPort = 0;
 std::vector<Connection> Connections;
 
 JSRuntime *Runtime = nullptr;
@@ -524,9 +539,98 @@ bool OpenListener(int port) {
     js::Log("repl: could not listen; the channel is closed");
     return false;
   }
+
+  // Read the port back rather than believing `port`: with 0 the OS chose it,
+  // and that choice is the whole point of the mode. Doing it unconditionally
+  // means one path produces the number everything downstream reports.
+  sockaddr_in actual{};
+  int actual_size = sizeof(actual);
+  if (::getsockname(Listener, reinterpret_cast<sockaddr *>(&actual),
+                    &actual_size) != 0) {
+    js::Log("repl: could not read back the bound port; the channel is closed");
+    return false;
+  }
+  ListenPort = ::ntohs(actual.sin_port);
+
   u_long nonblocking = 1;
   ::ioctlsocket(Listener, FIONBIO, &nonblocking);
   return true;
+}
+
+// Hands the bound port to the launcher named by GKPLUS_LAUNCHER_HWND: one
+// posted message carrying the pid in wParam and the port in lParam.
+//
+// This exists because **a launcher cannot pick the port itself without a race**.
+// Anything between "find a free port" and "the game binds it" is a window for
+// something else to take it, and a launcher guessing inside the ephemeral range
+// can also land on a block Hyper-V has reserved outright and get WSAEACCES with
+// nothing listening there. So the game binds 0, the OS picks under
+// SO_EXCLUSIVEADDRUSE - which cannot hand the same port to two binds - and the
+// number travels back here. There is no gap to lose.
+//
+// The pid rides along rather than being left to the launcher to derive from the
+// sender window, so it does not have to assume the game window is findable at
+// this moment, and so one message answers both "which port" and "which gl.exe" -
+// the second being what tells a live game from a leftover one.
+void PublishToLauncher() {
+  char configured[32]{};
+  DWORD len = GetEnvironmentVariableA("GKPLUS_LAUNCHER_HWND", configured,
+                                      sizeof(configured));
+  if (len == 0 || len >= sizeof(configured)) {
+    return; // no launcher listening, which is the normal case
+  }
+  char *end = nullptr;
+  unsigned long long parsed = std::strtoull(configured, &end, 0);
+  if (end == configured || *end != '\0' || parsed == 0) {
+    js::Log("repl: GKPLUS_LAUNCHER_HWND is not a window handle; not published");
+    return;
+  }
+  // A window handle is always 32-bit-safe, so a 64-bit launcher can hand its
+  // HWND to this 32-bit process as a plain number without truncating it.
+  HWND target = reinterpret_cast<HWND>(static_cast<UINT_PTR>(parsed));
+
+  // Handles are recycled and an environment variable outlives whatever set it,
+  // so a stale one would deliver the port to an unrelated window. The class name
+  // is what proves this is a launcher and not whoever inherited the number.
+  char klass[64]{};
+  if (!::IsWindow(target) ||
+      ::GetClassNameA(target, klass, sizeof(klass)) == 0 ||
+      std::strcmp(klass, kLauncherClass) != 0) {
+    js::Log("repl: GKPLUS_LAUNCHER_HWND does not name a launcher window; "
+            "not published");
+    return;
+  }
+
+  const UINT message = ::RegisterWindowMessageA(kLauncherMessage);
+  if (message == 0) {
+    js::Log("repl: could not register the launcher message; not published");
+    return;
+  }
+
+  // **Posted, not sent**, and the payload is small precisely so that it can be.
+  // A WM_COPYDATA would have to be *sent*: the window manager marshals its
+  // buffer into the receiver during the call, so a posted one arrives as a
+  // pointer into this process's address space - meaningless to the launcher,
+  // and in the usual 32-bit-game/64-bit-launcher pairing not even the same
+  // width. Sending it would put the game's main thread, inside SetupMenus, at
+  // the mercy of the launcher's message loop. A pid and a port fit in the two
+  // parameters with room to spare, so nothing here waits on the launcher at
+  // all.
+  //
+  // What that costs is knowing: a post is confirmed *queued*, not delivered, so
+  // a launcher that has died still looks like success from here. The failure is
+  // the launcher's to detect by timing out, which it must be able to do anyway -
+  // the game may simply not have got this far yet.
+  if (::PostMessageA(target, message,
+                     static_cast<WPARAM>(::GetCurrentProcessId()),
+                     static_cast<LPARAM>(ListenPort)) == 0) {
+    // Also what a UIPI drop looks like: a launcher at a higher integrity level
+    // has to allow this message id through with ChangeWindowMessageFilterEx, or
+    // it never arrives.
+    js::Log("repl: could not post the port to the launcher");
+    return;
+  }
+  js::Log("repl: published the port to the launcher");
 }
 
 } // namespace
@@ -538,11 +642,20 @@ bool StartRepl(JSRuntime *runtime) {
   if (len == 0 || len >= sizeof(configured)) {
     return false; // not configured, which is the normal case
   }
-  int port = std::atoi(configured);
-  if (port <= 0 || port > 65535) {
+  // "0" and "auto" both mean "let the OS choose", which is the mode a launcher
+  // should use: see PublishToLauncher for why picking a number is a race. The
+  // parse is strtol rather than atoi so that garbage still reports as garbage -
+  // atoi answers 0 for "banana", which would now read as a request for the
+  // ephemeral mode instead of as the mistake it is.
+  char *end = nullptr;
+  long parsed = std::strtol(configured, &end, 10);
+  const bool automatic = std::strcmp(configured, "auto") == 0;
+  if (!automatic &&
+      (end == configured || *end != '\0' || parsed < 0 || parsed > 65535)) {
     js::Log("repl: GKPLUS_REPL_PORT is not a port; the channel is closed");
     return false;
   }
+  int port = automatic ? 0 : static_cast<int>(parsed);
 
   // Not from DllMain: WSAStartup loads DLLs, so calling it under the loader lock
   // can deadlock. BootScriptHost runs from the game's SetupMenus, well past that.
@@ -569,7 +682,11 @@ bool StartRepl(JSRuntime *runtime) {
   // so a build with no REPL pays nothing.
   SetFrameWakeupEnabled(true);
 
-  js::Log(("repl: listening on 127.0.0.1:" + std::to_string(port)).c_str());
+  js::Log(("repl: listening on 127.0.0.1:" + std::to_string(ListenPort))
+              .c_str());
+  // Last, so that everything a client can reach is already in place: the
+  // launcher's next move is to connect.
+  PublishToLauncher();
   return true;
 }
 
@@ -656,6 +773,8 @@ int ReplClientCount() {
 
 bool ReplOpen() { return Listener != INVALID_SOCKET; }
 
+int ReplPort() { return Listener != INVALID_SOCKET ? ListenPort : 0; }
+
 void StopRepl() {
   // KillTimer is a plain USER32 call, so this is safe from
   // DllMain(DLL_PROCESS_DETACH) - which is precisely why the wake-up is a
@@ -670,6 +789,7 @@ void StopRepl() {
     ::closesocket(Listener);
     Listener = INVALID_SOCKET;
   }
+  ListenPort = 0;
   if (Context) {
     if (Runtime) {
       JS_SetInterruptHandler(Runtime, nullptr, nullptr);

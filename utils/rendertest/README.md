@@ -15,13 +15,13 @@ Shoot-Settled -Renderer vulkan -Level level02 -Out vk.png
 
 | script | what it is for |
 |---|---|
-| `launch-gunlok.ps1` | `Start-Gunlok`, `Focus-Gunlok`, `Repl`. Answers the modal `-skipfmv` dialog that blocks *before* the REPL listener opens, waits for the port, and takes the window foreground — a level load sticks at `game.state 18` otherwise |
+| `launch-gunlok.ps1` | `Start-Gunlok`, `Focus-Gunlok`, `Repl`, `GKPort`. Answers the modal `-skipfmv` dialog that blocks *before* the REPL listener opens, takes the port the game reports back (see below), and takes the window foreground — a level load sticks at `game.state 18` otherwise |
 | `shot-gunlok.ps1` | `Get-GunlokShot`. `PrintWindow` with flag **3**, and `SetProcessDPIAware()` in the capturing process |
 | `shoot-settled.ps1` | `Dismiss-Briefing`, `Wait-World`, `Wait-CameraRest`, `Shoot-Settled`. The whole procedure |
 | `find-draw.ps1` | `Find-Draw -X -Y -Count`: binary-searches `render.draw_hide` for the draw that painted a pixel |
 | `harvest-draws.ps1` | `Seed-Harvest`, `Harvest-Level`, `Save-Harvest`. Accumulates `render.frame_draws()` across a whole session into a per-texture render-state profile, inside the game, over one kept-open socket. Consumed by `pbr` (`gkpbr.cli observed`); its own header is the list of things that waste a run |
 
-Five things they encode, each of which produced a wrong answer first:
+Six things they encode, each of which produced a wrong answer first:
 
 - **`actors.count` says the level started; the draw count says the world is on screen.** They are
   not the same test. An overlay screen *replaces* the world submit rather than drawing over it
@@ -60,6 +60,19 @@ Five things they encode, each of which produced a wrong answer first:
   one that painted the pixel. `find-draw.ps1` also waits 900 ms between setting the range and
   capturing — at 300 ms the shot lags one step behind and the search converges neatly on the wrong
   draw.
+- **The harness does not choose the REPL port, and it has to pump messages to hear the one it
+  gets.** `Start-Gunlok` sets `GKPLUS_REPL_PORT=0` and hands the game the `HWND` of `GKPort`'s
+  message-only window; the game binds an ephemeral port and posts it back — pid in `wParam`, port
+  in `lParam` (`script_host_notes.md`, "Launching without choosing a port"). Picking a number here
+  was a race — anything could take the port between the check and the game's bind — and it is what
+  forced the old "kill every `gl.exe` and hope" preamble, since two runs could not share one
+  hardcoded 9222. The message is *posted*, so nothing on the game's side waits on this script; but
+  a posted message reaches a window procedure only through `DispatchMessage`, so the wait loop
+  calls `[GKPort]::Pump()` rather than only sleeping. A loop that just sleeps never sees the port,
+  which will be sitting in the queue the whole time. Timing out is this side's call — the game
+  cannot report that nothing is coming. `$global:GunlokReplPort` is where the answer lands, and it
+  is what every `-Port` in these scripts now defaults to. `Start-Gunlok -Port 9222` still pins one
+  if you want a fixed target to attach `nc` to.
 
 `level02` is the level to shoot: no cutscene, and all three renderers settle to bit-identical
 camera values and the same 178 actors. Use `level01` only to reproduce a level01 number.

@@ -1,5 +1,14 @@
 # Launch Gunlok for testing and get all the way to a usable REPL.
 #
+# The REPL port is not chosen here. GKPLUS_REPL_PORT=0 makes the game bind an
+# ephemeral port and post the result back to the message-only window GKPort
+# opens - see the contract in src/Repl.h. Picking a number instead is a
+# race (anything can take the port between the check and the game's bind) and it
+# is what forced the old "kill every gl.exe and hope" preamble, since two runs
+# could not share one hardcoded 9222. Concurrent instances are fine now, and the
+# `pid` in the reply is what proves the port belongs to the game just launched
+# rather than to a survivor.
+#
 # Handles the three things that otherwise waste a run:
 #   * -skipfmv skips the ~40 s intro FMV, during which Bink presents outside the D3D device
 #     so every frame counter reads zero and the renderer looks broken;
@@ -36,6 +45,97 @@ public static class GK {
     return found;
   }
 }
+
+// The receiving half of the rendezvous in src/Repl.h: a message-only window of
+// class "GkPlusLauncher" that takes one posted "GkPlusReplPort" message, pid in
+// wParam and port in lParam.
+public static class GKPort {
+  public delegate IntPtr WndProc(IntPtr h, uint m, IntPtr w, IntPtr l);
+
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+  struct WNDCLASSEX {
+    public uint cbSize, style;
+    public WndProc lpfnWndProc;
+    public int cbClsExtra, cbWndExtra;
+    public IntPtr hInstance, hIcon, hCursor, hbrBackground;
+    public string lpszMenuName, lpszClassName;
+    public IntPtr hIconSm;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  struct MSG {
+    public IntPtr hwnd; public uint message; public IntPtr wParam, lParam;
+    public uint time; public int x, y;
+  }
+
+  [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern ushort RegisterClassExW(ref WNDCLASSEX c);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern IntPtr CreateWindowExW(int ex, string cls, string name, int style,
+      int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr inst, IntPtr param);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+  static extern IntPtr DefWindowProcW(IntPtr h, uint m, IntPtr w, IntPtr l);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+  static extern uint RegisterWindowMessageW(string name);
+  [DllImport("user32.dll")] static extern bool DestroyWindow(IntPtr h);
+  [DllImport("user32.dll")] static extern bool PeekMessageW(out MSG m, IntPtr h, uint lo, uint hi, uint remove);
+  [DllImport("user32.dll")] static extern IntPtr DispatchMessageW(ref MSG m);
+  [DllImport("user32.dll")] static extern bool ChangeWindowMessageFilterEx(IntPtr h, uint msg, uint action, IntPtr change);
+
+  static readonly IntPtr HWND_MESSAGE = new IntPtr(-3);
+
+  // The delegate has to outlive the window: the class holds a raw pointer to it,
+  // so letting it be collected turns the first message into a call through freed
+  // memory. A static field is what keeps it rooted.
+  static WndProc Proc;
+  static uint PortMessage;
+  public static IntPtr Window = IntPtr.Zero;
+  public static int Port = 0;
+  public static int Pid = 0;
+
+  static IntPtr OnMessage(IntPtr h, uint msg, IntPtr w, IntPtr l) {
+    if (PortMessage != 0 && msg == PortMessage) {
+      // Zero-extended from the 32-bit game, so both fit; the double cast keeps
+      // the narrowing unchecked rather than risking an OverflowException.
+      Pid = (int)(long)w; Port = (int)(long)l;
+      return IntPtr.Zero;
+    }
+    return DefWindowProcW(h, msg, w, l);
+  }
+
+  public static IntPtr Open() {
+    Port = 0; Pid = 0;
+    if (Window != IntPtr.Zero) return Window;
+    Proc = OnMessage;
+    PortMessage = RegisterWindowMessageW("GkPlusReplPort");
+    var wc = new WNDCLASSEX();
+    wc.cbSize = (uint)Marshal.SizeOf(typeof(WNDCLASSEX));
+    wc.lpfnWndProc = Proc;
+    wc.lpszClassName = "GkPlusLauncher";
+    // 0 is ERROR_CLASS_ALREADY_EXISTS on a re-run in the same session, which is
+    // harmless - the class is still there and still points at Proc.
+    RegisterClassExW(ref wc);
+    Window = CreateWindowExW(0, "GkPlusLauncher", "GkPlusLauncher", 0,
+                             0, 0, 0, 0, HWND_MESSAGE, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+    // UIPI drops a registered message arriving from a lower integrity level and
+    // does it silently, so an elevated shell launching the game normally would
+    // just never see the port. MSGFLT_ALLOW = 1.
+    ChangeWindowMessageFilterEx(Window, PortMessage, 1, IntPtr.Zero);
+    return Window;
+  }
+
+  // A *posted* message reaches the window procedure only through DispatchMessage,
+  // so this is not optional - without it the port sits in the queue forever. It
+  // costs the game nothing to be late, though: nothing on its side is waiting.
+  public static void Pump() {
+    MSG m;
+    while (PeekMessageW(out m, IntPtr.Zero, 0, 0, 1 /* PM_REMOVE */)) DispatchMessageW(ref m);
+  }
+
+  public static void Close() {
+    if (Window != IntPtr.Zero) { DestroyWindow(Window); Window = IntPtr.Zero; }
+    Port = 0; Pid = 0;
+  }
+}
 '@
 
 $GunlokDir = "C:\Program Files (x86)\Steam\steamapps\common\Gunlok"
@@ -45,11 +145,12 @@ function Start-Gunlok {
         [string]$Renderer = "d3d9",      # "vulkan" or "d3d9"
         [switch]$Validation,
         [switch]$Fullscreen,             # answer No to the windowed prompt
-        [int]$Port = 9222
+        [int]$Port = 0                   # 0 = the OS picks it and the game reports it back
     )
     Stop-Process -Name gl -Force -ErrorAction SilentlyContinue
-    # A leftover instance keeps port 9222 bound, so the wait loop below would connect to the
-    # OLD process and every later query would read the wrong game.
+    # Not about the port any more - an ephemeral one cannot collide with a survivor. A
+    # leftover gl.exe still holds d3d8.dll against `cmake --build --target copy`, and
+    # Focus-Gunlok takes whichever process it finds first, so one at a time it is.
     $deadline = (Get-Date).AddSeconds(15)
     while ((Get-Process gl -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 500
@@ -58,6 +159,7 @@ function Start-Gunlok {
     Start-Sleep -Seconds 1
 
     $env:GKPLUS_REPL_PORT = "$Port"
+    $env:GKPLUS_LAUNCHER_HWND = [string][int64][GKPort]::Open()
     $env:GKPLUS_RENDERER = $Renderer
     $env:GKPLUS_RENDER_UNFOCUSED = "1"
     $env:GKPLUS_VK_VALIDATION = $(if ($Validation) { "1" } else { "0" })
@@ -86,13 +188,23 @@ function Start-Gunlok {
     $button = $(if ($Fullscreen) { 7 } else { 6 })
     [GK]::PostMessage($dlg, 0x0111, [IntPtr]$button, [GK]::GetDlgItem($dlg, $button)) | Out-Null
 
-    $deadline = (Get-Date).AddSeconds(90); $up = $null
-    while (-not $up -and (Get-Date) -lt $deadline) {
-        Start-Sleep -Seconds 2
-        try { $up = New-Object System.Net.Sockets.TcpClient('127.0.0.1', $Port) } catch {}
+    # The game publishes the port only once the listener is accepting, so this is the
+    # readiness signal as well as the number - there is no gap where a connect could
+    # arrive first, which the old "retry TcpClient until it succeeds" loop could not say.
+    # The message is posted, so giving up is entirely this side's call: the game cannot
+    # tell us that nothing is coming.
+    $deadline = (Get-Date).AddSeconds(90)
+    while (-not [GKPort]::Port -and (Get-Date) -lt $deadline) {
+        [GKPort]::Pump()
+        Start-Sleep -Milliseconds 200
     }
-    if (-not $up) { throw "the REPL listener never opened" }
-    $up.Close()
+    if (-not [GKPort]::Port) { throw "the REPL listener never reported a port" }
+    # A port from some other gl.exe is worse than no port: every later query would read
+    # the wrong game and nothing would look wrong.
+    if ([GKPort]::Pid -ne $proc.Id) {
+        throw "the port came from gl.exe $([GKPort]::Pid), not $($proc.Id)"
+    }
+    $global:GunlokReplPort = [GKPort]::Port
 
     Focus-Gunlok
     return $proc
@@ -113,7 +225,7 @@ function Focus-Gunlok {
     }
 }
 
-function Repl([string]$code, [int]$Port = 9222) {
+function Repl([string]$code, [int]$Port = $global:GunlokReplPort) {
     $c = New-Object System.Net.Sockets.TcpClient('127.0.0.1', $Port)
     $s = $c.GetStream(); $s.ReadTimeout = 120000
     $w = New-Object System.IO.StreamWriter($s); $w.NewLine = "`n"; $w.AutoFlush = $true
@@ -123,7 +235,7 @@ function Repl([string]$code, [int]$Port = 9222) {
 }
 
 # Unwraps the REPL's doubly-encoded reply for `JSON.stringify(...)` expressions.
-function ReplJson([string]$code, [int]$Port = 9222) {
+function ReplJson([string]$code, [int]$Port = $global:GunlokReplPort) {
     $v = (Repl $code $Port | ConvertFrom-Json).value
     return $v.Trim('"').Replace('\"', '"').Replace('\\', '\') | ConvertFrom-Json
 }

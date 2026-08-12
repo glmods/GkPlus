@@ -28,7 +28,7 @@ function Measure-Census {
     param(
         [string]$Out = "census",
         [string[]]$Levels = $CensusLevels,
-        [int]$Port = 9222
+        [int]$Port = 0   # 0 = a fresh ephemeral port per launch; $live is the one bound
     )
     New-Item -ItemType Directory -Force -Path $Out | Out-Null
     $failures = @()
@@ -37,7 +37,9 @@ function Measure-Census {
         Write-Host "=== $level ===" -ForegroundColor Cyan
         try {
             Start-Gunlok -Renderer vulkan -Port $Port | Out-Null
-            Repl "levels.start({script: `"$level.gls`", console: `"$level.gcs`"})" $Port | Out-Null
+            # Each launch binds its own port, so this has to be re-read per level.
+            $live = $global:GunlokReplPort
+            Repl "levels.start({script: `"$level.gls`", console: `"$level.gcs`"})" $live | Out-Null
 
             # Five of the fifteen campaign levels play no cutscene; the rest do, and a cutscene
             # camera never comes to rest. Both waits are therefore allowed to time out - a reading
@@ -47,8 +49,8 @@ function Measure-Census {
             try { Wait-World -TimeoutSeconds 90 | Out-Null } catch { Write-Host "  (world wait timed out)" }
             try { Wait-CameraRest -TimeoutSeconds 60 | Out-Null } catch { Write-Host "  (camera never settled - cutscene?)" }
 
-            $actors = ((Repl 'actors.count' $Port) | ConvertFrom-Json).value
-            $census = ((Repl 'render.normal_census()' $Port) | ConvertFrom-Json).value
+            $actors = ((Repl 'actors.count' $live) | ConvertFrom-Json).value
+            $census = ((Repl 'render.normal_census()' $live) | ConvertFrom-Json).value
             if (-not $census) { throw "the census returned nothing" }
             # ConvertFrom-Json already unescaped the JSON string; the REPL's own \n survive as two
             # characters, so they are turned back into real newlines for the parser.

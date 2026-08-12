@@ -18,7 +18,7 @@ function Get-Pixel([string]$Path, [int]$X, [int]$Y) {
 }
 
 function Find-Draw {
-    param([int]$X, [int]$Y, [int]$Count, [int]$Port = 9222)
+    param([int]$X, [int]$Y, [int]$Count, [int]$Port = $global:GunlokReplPort)
 
     Repl 'render.draw_hide = [1, 0]; 1' $Port | Out-Null
     Start-Sleep -Milliseconds 900

@@ -64,7 +64,7 @@ $script:HConn = $null
 $script:HWriter = $null
 $script:HReader = $null
 
-function Open-Repl([int]$Port = 9222) {
+function Open-Repl([int]$Port = $global:GunlokReplPort) {
     Close-Repl
     $script:HConn = New-Object System.Net.Sockets.TcpClient('127.0.0.1', $Port)
     $script:HConn.NoDelay = $true

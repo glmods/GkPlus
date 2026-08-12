@@ -114,6 +114,66 @@ TCP will do:
 printf 'actors.count\n' | nc 127.0.0.1 9222
 ```
 
+#### Launching without choosing a port
+
+`GKPLUS_REPL_PORT=0` (or `auto`) binds an **ephemeral** port instead, and
+`GKPLUS_LAUNCHER_HWND` says where to send the one the OS picked. The pair exists
+because **a launcher cannot pick the port itself without a race**: every gap
+between "find a free port" and "the game binds it" is a window for something else
+to take it. Binding 0 has no gap — the OS chooses under `SO_EXCLUSIVEADDRUSE`,
+which cannot hand one port to two binds — so the only thing left is telling the
+launcher what it got. It also sidesteps two things a fixed port hits: a number
+drawn from the ephemeral range can land in a block Hyper-V has reserved and fail
+with `WSAEACCES` while nothing is listening there, and a fixed port can stay
+unbindable after a crash while the previous run's connections sit in `TIME_WAIT`.
+
+`src/Repl.h` carries the receiving side's contract; the short version is a
+message-only window of class `GkPlusLauncher`, its `HWND` in the environment, and
+one **posted** `RegisterWindowMessage("GkPlusReplPort")` with the **pid in
+`wParam` and the port in `lParam`**.
+
+**A `WM_COPYDATA` was the obvious shape and is the wrong one.** It cannot be
+posted at all: the window manager marshals its buffer into the receiver *during
+the send*, so a posted one arrives as a pointer into the game's own address space
+— meaningless to the launcher, and in the usual 32-bit-game/64-bit-launcher
+pairing not even the same width. Sending it instead would put the game's main
+thread, inside `SetupMenus`, at the mercy of the launcher's message loop; a
+launcher sitting in a sleep would stall the game's startup until the send timed
+out. A pid and a port fit in the two message parameters with room to spare, so
+there is no buffer to marshal and nothing on the game's side ever waits.
+`SendMessageTimeout` with `SMTO_ABORTIFHUNG` would have bounded that risk; not
+having it is better than bounding it.
+
+Three details are load-bearing, and two of them fail *silently*:
+
+- **The class name is checked before anything is posted.** Window handles are
+  recycled and an environment variable outlives whatever set it, so a stale
+  `GKPLUS_LAUNCHER_HWND` would otherwise deliver the port to an unrelated window.
+  Measured against a live foreign window (`ConsoleWindowClass`), which is refused
+  by name.
+- **The launcher has to pump messages.** A posted message reaches a window
+  procedure only through `DispatchMessage`, so a launcher that never pumps never
+  learns the port — it will simply be sitting in the queue. Unlike the send this
+  replaced, being slow to pump costs the *game* nothing.
+- **UIPI drops the message with no diagnostic** when the launcher runs at a
+  higher integrity level than the game, which is what an elevated shell produces.
+  The receiver needs `ChangeWindowMessageFilterEx(hwnd, <that id>, MSGFLT_ALLOW,
+  nullptr)`; without it the failure looks exactly like the game never posting.
+
+The message goes out only once the listener is *accepting*, so its arrival is the
+readiness signal as well as the number — which retry-until-connect could not
+give. The `pid` is what tells a live game from a leftover one, so a launcher
+should check it against the process it spawned rather than trust the only message
+it got. **Giving up is the launcher's job**: a post is confirmed queued rather
+than delivered, so the game has no way to say that nothing is coming.
+`repl.port` reports the same number from inside the game.
+
+**A window message cannot cross a session or a desktop**, which rules this out
+for a session-0 shell driving a session-1 game (see `utils/rendertest/README.md`
+for the `schtasks /it` recipe). Nothing else depends on it: the port is logged
+either way, and a literal `GKPLUS_REPL_PORT` still behaves exactly as it did.
+`utils/rendertest/launch-gunlok.ps1` is a worked receiver.
+
 **A line that is not a JSON object with a string `code` is treated as source**, so
 one-liners work with no quoting ceremony. Multi-line source has to ride in the
 object form, because a newline is the frame delimiter:
