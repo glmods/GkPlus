@@ -2834,6 +2834,112 @@ declare module "gk" {
      *  screen. */
     readonly map_shadow_report: string;
 
+    /** Screen-space ambient occlusion, **with no blur pass**.
+     *
+     *  The kernel is one fixed Poisson disc shared by every pixel rather than a
+     *  randomised one, so the output is not noise and needs no blur to become
+     *  usable - which is what removes the halo around every silhouette that a
+     *  blurred AO carries. It matters more here than it would generally: Gunlok
+     *  renders 640x480, where a blur radius is a large fraction of a character.
+     *
+     *  Two passes. A prepass rasterises the frame's opaque geometry - the same
+     *  caster set the sun's shadow uses - and writes a **world position** and
+     *  normal per pixel; the resolve walks the disc in screen space, reconstructs
+     *  nothing, and counts how many taps land inside the half-ball at the centre
+     *  pixel. There is no matrix anywhere in it.
+     *
+     *  **Off.** The game never had ambient occlusion, so nothing here can be
+     *  measured as closer to D3D8 and off is bit-identical to the build before it
+     *  existed. Judge it on `ao_debug` and on a region, not on a whole-frame
+     *  number. */
+    ao: boolean;
+
+    /** The hemisphere's radius, in **world units** - what "near enough to
+     *  occlude" means. Level02's mean map edge is 1.952 units and the sun's sharp
+     *  cascade is 8.75 across, which is the scale to think in.
+     *
+     *  3, and that is a sweep: at level02's settled camera the occluded
+     *  fraction of the debug view goes 0.341 / 0.384 / 0.412 / 0.417 for 0.75 /
+     *  1.5 / 3 / 6, so 3 is the knee past which the disc binds instead and only
+     *  the over-darkening keeps growing. */
+    ao_radius: number;
+
+    /** The disc's radius, as a **fraction of the frame's height**, and
+     *  deliberately independent of `ao_radius`. Constant across the frame, which
+     *  is the technique's whole performance argument - every pixel walks the same
+     *  texel pattern, the friendliest case there is for the texture cache. A
+     *  value derived once per frame from the target size is still one constant,
+     *  so this costs that nothing.
+     *
+     *  Not a pixel count, because the render extent is not a constant: 640x480 on
+     *  the machine the notes' numbers come from, 3072x1728 on another. 0.07,
+     *  which is 34 pixels at 480 lines and 121 at 1728.
+     *
+     *  A constant screen radius is affordable here in a way it would not be
+     *  generally: Gunlok's camera is a fixed-height orbit, so one frame's depth
+     *  spread is narrow and a constant screen radius is very nearly a constant
+     *  world one. */
+    ao_screen_radius: number;
+
+    /** How far along the normal a tap has to be before it counts, in world units.
+     *  The self-occlusion knob: too low and a flat wall shades itself out of its
+     *  own quantisation, too high and a shallow crease stops registering. 0.05. */
+    ao_bias: number;
+
+    /** A scale on the occlusion before it leaves the resolve pass, so the target
+     *  already carries the artistic weight and the world shader stays a plain
+     *  multiply. 1. */
+    ao_strength: number;
+
+    /** How much the occlusion also scales **D3D's own** diffuse sum - the sun and
+     *  the level's dynamic lights. Not the map rig, which is occluded in full
+     *  whatever this says.
+     *
+     *  The split is what each set of lights *is*. The `STDLIGHT` rig is 51 static
+     *  lights on level02 whose whole job was to bake that level's vertex colours -
+     *  an environment, and exactly what occlusion is about. D3D's are few and
+     *  dynamic, and every one of them already has a shadow map answering "is this
+     *  light blocked" exactly, per light - so 0 here is the no-double-counting
+     *  setting rather than a taste one. 1 darkens them too, for a stylised look.
+     *
+     *  The specular is never occluded at any setting: a highlight is a mirror of
+     *  one light in one direction, and nearby geometry says nothing about whether
+     *  that particular path is clear. */
+    ao_direct: number;
+
+    /** How many of the 64-point disc to walk, 1..64. **All of them**, and this is
+     *  not a quality dial with a cheap end.
+     *
+     *  A fixed kernel cannot trade its artefact for noise the way a randomised one
+     *  does, so an under-sampled disc does not go grainy - it goes *structured*.
+     *  Each tap contributes a shifted copy of every occluder's silhouette, and at
+     *  32 points over a wide disc those copies are individually visible: measured
+     *  on level02, where each character left a fan of its own outlines. A blur
+     *  would hide that, and there is no blur here to hide it.
+     *
+     *  **32 is exactly the pattern the technique's author published** - a lattice
+     *  with each point nudged off its cell, not blue noise and not random. The
+     *  other 32 are the same lattice half a cell over. The whole set is
+     *  maximin-ordered, so any smaller count is still a well-spread subset.
+     *
+     *  The cost is linear in this and in nothing else. */
+    ao_taps: number;
+
+    /** Restrict the term to the map's own geometry. **On**, and it is the same
+     *  restriction runtime map lighting carries, for the same reason: a prop or a
+     *  unit is a separate `RBOBJECT` whose vertex colours were baked from its own
+     *  file's lights, and that bake already contains occlusion. Applying this on
+     *  top of it darkens the same crease twice. */
+    ao_map_only: boolean;
+
+    /** Replace the shaded frame with the occlusion term itself, as grey.
+     *
+     *  Not optional when tuning: `ao_radius` and `ao_taps` are close to invisible
+     *  in a shaded frame and obvious in the term. It ignores `ao_map_only` on
+     *  purpose - the buffer covers every opaque draw the prepass rasterised, and
+     *  seeing the half the restriction throws away is the point of looking. */
+    ao_debug: boolean;
+
     /** Shadows from **the game's own D3D point and spot lights** - level02's fires,
      *  and anything a `.gcs` adds with `ADD LIGHT`. A different light system from
      *  `map_shadows` above, sharing the same static atlas: sixteen of its 682

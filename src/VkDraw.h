@@ -289,10 +289,24 @@ struct GpuFrameData {
   // Row-vector, like every other matrix here. Last because it is 16 floats and putting it first
   // would push every scalar above past an offset worth checking.
   float sun_matrix[16];
+  // --- screen-space ambient occlusion (§4.86) --------------------------------------------------
+  //
+  // **Appended after `sun_matrix`, and that placement is deliberate.** Every field above it has a
+  // pinned offset - `cascades` at 176 and `sun_matrix` at 240 - and §4.67 is what happens when a
+  // block is inserted at a different height in the two declarations: a permutation preserves
+  // `sizeof`, so every assert here still passes while four fields read each other's words. The
+  // end of the struct is the one place a field can be added without moving anything, so that is
+  // where this went. It still has to be added in the same place in `world.slang`, in the same
+  // commit, and `src/gen-shader-abi.py` is what now checks that rather than this comment.
+  uint32_t ao_texture; // kNoTexture for "off", "not created" and "nothing drawn" alike
+  uint32_t ao_flags;   // kAoMapOnly | kAoDebug
+  float ao_direct;     // how much the occlusion scales the DIRECT sum; 0 is ambient only
+  float pad_ao;
 };
-static_assert(sizeof(GpuFrameData) == 304, "the scratch stride is part of the shader ABI");
+static_assert(sizeof(GpuFrameData) == 320, "the scratch stride is part of the shader ABI");
 static_assert(offsetof(GpuFrameData, cascades) == 176, "std430 puts a float4 array on 16");
 static_assert(offsetof(GpuFrameData, sun_matrix) == 240, "... and so does the matrix after it");
+static_assert(offsetof(GpuFrameData, ao_texture) == 304, "the AO block appends, it does not insert");
 
 // GpuDrawRecord::lighting flags.
 //
@@ -871,6 +885,86 @@ int ShadowCascades();
 // lighting maps' response alike, and `true` restores the frame bit-identically.
 void SetLocalLights(bool enabled);
 bool LocalLights();
+
+// --- screen-space ambient occlusion (§4.86) -----------------------------------------------------
+//
+// Two recorded passes: a camera-space prepass writing world position and normal per pixel, and a
+// full-screen resolve that walks one **fixed** Poisson disc over it. The kernel is deliberately not
+// randomised, which is what removes the blur pass every other screen-space AO needs - see
+// src/shaders/ao.slang for the technique and src/VkDraw.cpp for the resources.
+//
+// **Off by default**, and it is a fidelity call rather than a cost one: the game never had ambient
+// occlusion, so nothing here can be measured as closer to D3D8. Off is bit-identical to the build
+// before it existed.
+void SetAmbientOcclusion(bool enabled);
+bool AmbientOcclusion();
+
+// The hemisphere's radius, **in world units** - what "near enough to occlude" means. Level02's mean
+// map edge is 1.952 units and the sun's sharp cascade is 8.75 across, which is the scale to think
+// in. Default 3, and it is a sweep rather than a guess - see AoRadiusValue in src/VkDraw.cpp.
+void SetAoRadius(float radius);
+float AoRadius();
+
+// The disc's radius, **as a fraction of the frame's height**, and deliberately independent of the
+// one above. Constant across the frame, which is the technique's whole performance argument - every
+// pixel walks the same texel pattern - and a value derived once per frame from the target size is
+// still one constant, so expressing it this way costs that nothing.
+//
+// Not a pixel count, because Gunlok's render extent is not a constant: 640x480 on the machine the
+// notes' numbers come from and 3072x1728 on the one this was written on. Default 0.07, which is 34
+// pixels at 480 lines and 121 at 1728.
+//
+// A constant screen radius is affordable here in a way it would not be generally: Gunlok's camera
+// is a fixed-height orbit, so one frame's depth spread is narrow and a constant screen radius is
+// very nearly a constant world radius.
+void SetAoScreenRadius(float fraction);
+float AoScreenRadius();
+
+// How far along the normal a tap has to be before it counts, in world units. This is the
+// self-occlusion knob: too low and a flat wall shades itself out of its own quantisation, too high
+// and a shallow crease stops registering. Default 0.05.
+void SetAoBias(float bias);
+float AoBias();
+
+// A scale on the occlusion before it leaves the resolve pass, so the artistic weight is baked into
+// the target and the world shader stays a plain multiply. Default 1.
+void SetAoStrength(float strength);
+float AoStrength();
+
+// How much the occlusion also scales **D3D's own** diffuse sum - the sun and the level's dynamic
+// lights, not the map rig, which is occluded in full whatever this says.
+//
+// 0 by default, and that is the no-double-counting setting rather than a taste one: every one of
+// those lights already has a shadow map answering "is this light blocked" exactly, per light
+// (§4.58, §4.61, §4.65, §4.66). 1 darkens them too and is the stylised end. The specular is never
+// occluded at any setting.
+void SetAoDirect(float direct);
+float AoDirect();
+
+// How many of the 64-point disc to walk, 1..64, and it defaults to all of them.
+//
+// **Not a quality dial with a cheap end.** A fixed kernel cannot trade its artefact for noise
+// the way a randomised one does, so an under-sampled disc produces visible copies of every
+// occluder's silhouette rather than grain - which is what a blur would have hidden and what
+// there is no blur here to hide. The cost is linear in this and in nothing else.
+void SetAoTaps(int taps);
+int AoTaps();
+
+// Restrict the term to the map's own geometry, on by default - the same restriction runtime map
+// lighting carries and for the same reason (§4.55): a prop or a unit is a separate `RBOBJECT` whose
+// vertex colours were baked from its own file's lights, and that bake already contains occlusion.
+// Applying this on top of it darkens the same crease twice.
+void SetAoMapOnly(bool enabled);
+bool AoMapOnly();
+
+// Replace the shaded frame with the occlusion term itself, as grey. The only way to see what the
+// pass produced rather than what it did to a picture, which is what the radius and the tap count
+// have to be tuned against.
+void SetAoDebug(bool enabled);
+bool AoDebug();
+
+// Records the two passes. Outside any render pass, like the shadow bakes beside it.
+void RecordAoPass(void *command_buffer);
 
 // **The windowed range cutoff on D3D's point and spot lights** (§4.70). On by default; off
 // restores D3D8's own hard switch-off at Range.

@@ -808,6 +808,11 @@ void DrawFrame() {
   // ... and so does the per-frame atlas, for a stronger version of the same reason: its casters
   // are the frame's units and props as well as its map, and those exist only as a draw list.
   BakeDynamicShadows(frame.cmd);
+  // Ambient occlusion (§4.86), and it has to be **last of the pre-passes and before the world
+  // pass**: the world fragment shader reads its result, and `UploadFrameData` - which decides
+  // whether that read happens at all - runs inside RecordDraws below. Nothing here depends on the
+  // shadow passes; it is in this order because it is one more walk of the same draw list.
+  RecordAoPass(frame.cmd);
 
   // Where the world pass draws: the offscreen target when it is up, the swapchain image when it
   // is not. UNDEFINED as the source layout in either case, on purpose - neither image's previous

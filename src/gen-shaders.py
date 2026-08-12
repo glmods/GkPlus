@@ -74,6 +74,13 @@ ENTRY_POINTS = [
     ("shadow.slang", "map_shadow_tess_vertex", "vertex"),
     ("shadow.slang", "shadow_hull", "hull"),
     ("shadow.slang", "shadow_domain", "domain"),
+    # Screen-space ambient occlusion (§4.86). Two passes and therefore four entry points: a
+    # prepass that writes world position and normal per pixel, and a full-screen resolve that
+    # walks one fixed disc over the first's output.
+    ("ao.slang", "ao_prepass_vertex", "vertex"),
+    ("ao.slang", "ao_prepass_fragment", "fragment"),
+    ("ao.slang", "ao_fullscreen_vertex", "vertex"),
+    ("ao.slang", "ao_resolve_fragment", "fragment"),
 ]
 
 SLANGC_ARGS = [

@@ -189,6 +189,17 @@ struct GpuFrameData {
     // World -> **light space**: the sun's basis, no scale and no translation, so the result is in
     // world units and a cascade is a centre and a half-extent in it. One transform, four boxes.
     float4 sun_matrix[4];
+    // Screen-space ambient occlusion (§4.86), appended AFTER `sun_matrix` on purpose: everything
+    // above it has a pinned offset in src/VkDraw.h and the end is the one place a field can be
+    // added without moving any of them. `kNoTexture` is the single test again - "off", "the pass
+    // could not be created" and "this frame drew no occluder" are one state here as they are for
+    // the three shadow maps.
+    uint ao_texture;
+    uint ao_flags;   // kAoMapOnly / kAoDebug
+    // How much the occlusion also scales the DIRECT sum. 0 is ambient only, which is what
+    // occlusion means physically; 1 darkens everything and is the knob for a stylised look.
+    float ao_direct;
+    float pad_ao;
 };
 
 // **56 bytes of a guaranteed 128.** It reached exactly 128 with the light grid (§4.56), and
@@ -228,6 +239,15 @@ static const uint kLocalShadowsOn = 0x4u;
 // the objectives text's fade and the units' animation phase and nothing separates that from a
 // renderer difference in a whole-frame number.
 static const uint kLocalLightWindowOn = 0x8u;
+// GpuFrameData::ao_flags (§4.86). `kAoMapOnly` restricts the term to the map's own geometry, for
+// the reason the map-lighting substitution is restricted the same way: a prop or a unit is a
+// separate RBOBJECT whose vertex colours were BAKED from its own file's lights, and that bake
+// already contains occlusion - so applying this on top of it darkens the same crease twice.
+static const uint kAoMapOnly = 0x1u;
+// Replaces the shaded colour with the occlusion term itself, as grey. The only way to look at
+// what the pass produced rather than at what it did to a frame, which is what the radius and tap
+// count have to be tuned against.
+static const uint kAoDebug = 0x2u;
 
 [[vk::push_constant]]
 ConstantBuffer<Push> pc;
@@ -823,7 +843,25 @@ uint2 map_light_range(float3 world_position) {
 }
 
 
-float3 map_light_sum(float3 world_position, float3 normal) {
+// This pixel's ambient occlusion, or 1.0 wherever the pass did not run (§4.86).
+//
+// **`Load` and not a sample**, which is the whole reason this needs no sampler and no uv: the AO
+// target is the render target's own size and the prepass rasterised it through the same
+// half-pixel viewport origin (§4.28), so pixel (i,j) here IS pixel (i,j) there. A filtered
+// sample would only reintroduce the blur this technique exists to avoid.
+float ao_at(int2 pixel, bool map_geometry) {
+    if (pc.frame[0].ao_texture == kNoTexture) {
+        return 1.0;
+    }
+    if ((pc.frame[0].ao_flags & kAoMapOnly) != 0u && !map_geometry) {
+        return 1.0;
+    }
+    return textures[pc.frame[0].ao_texture].Load(int3(pixel, 0)).x;
+}
+
+// `ao` scales this rig's whole contribution - see the return statement for why the whole of it and
+// not just the ambience floor. Passing 1.0 leaves the function as it was, bit for bit.
+float3 map_light_sum(float3 world_position, float3 normal, float ao) {
     float3 acc = float3(0, 0, 0);
     const uint2 span = map_light_range(world_position);
     const bool culled = (pc.frame[0].map_flags & kMapLightingGrid) != 0u;
@@ -889,8 +927,20 @@ float3 map_light_sum(float3 world_position, float3 normal) {
     }
     // AMBIENCE is a per-channel max(), not an added term - AvP's own renderer clamps upward
     // against it, and adding it instead would lift a fully-lit surface past white.
-    return max(saturate(acc * pc.frame[0].map_light_gain), float3(pc.frame[0].map_ambience, pc.frame[0].map_ambience,
-                                                        pc.frame[0].map_ambience));
+    //
+    // **The occlusion scales the whole rig, floor included**, and that is a claim about what this
+    // rig IS rather than a convenience. Occlusion belongs on light that arrives from everywhere
+    // rather than along one ray, and the `STDLIGHT` set is exactly that here: 51 static lights on
+    // level02 whose whole job was to bake this level's vertex colours, standing in for an
+    // environment. D3D's own lights are the other kind - the sun and the fires, few and moving -
+    // and they are occluded by shadow maps instead, per light, which is why `ao_direct` defaults
+    // to leaving them alone.
+    //
+    // Putting it on the ambience floor alone was measured and is very nearly inert: `acc * gain`
+    // wins the max almost everywhere a level is lit at all, so AO reached 0.31% of the frame.
+    return ao * max(saturate(acc * pc.frame[0].map_light_gain),
+                    float3(pc.frame[0].map_ambience, pc.frame[0].map_ambience,
+                           pc.frame[0].map_ambience));
 }
 
 // The body, with the flat copies left to the entry point below. Two exits, and a third would be
@@ -1481,9 +1531,12 @@ float4 fragment_main(VertexOut input) : SV_Target {
         // "two stages and not chrome" is "this is the map", measured rather than assumed.
         // `map_lighting_all` turns the restriction off, which is how that claim stays checkable.
         const bool map_geometry = material.stage_count == 2u && material.chrome == 0u;
+        // Read once, here, and handed to both sums below. The pixel is the fragment's own
+        // framebuffer coordinate, which is what the prepass wrote.
+        const float ao = ao_at(int2(input.position.xy), map_geometry);
         if ((pc.frame[0].map_flags & kMapLightingOn) != 0u &&
             (map_geometry || (pc.frame[0].map_flags & kMapLightingAll) != 0u)) {
-            diffuse = float4(map_light_sum(input.world_position, normal), diffuse.a);
+            diffuse = float4(map_light_sum(input.world_position, normal, ao), diffuse.a);
         }
         const bool want_specular = (draw.lighting & kSpecularEnable) != 0u;
         // Per fragment, which is what D3DRS_LOCALVIEWER means taken literally. The vertex path
@@ -1493,9 +1546,23 @@ float4 fragment_main(VertexOut input) : SV_Target {
         // The sun's shadow rides INTO the loop rather than being applied to the result, so it
         // reaches the one light it describes - see light_sum. Per pixel only: the vertex path is
         // the fixed-function reproduction and this is a departure from it.
-        const LightSums sums = light_sum(draw, input.world_position, normal, want_specular,
-                                         to_eye, draw.material_specular.w,
-                                         sun_visibility(input.world_position));
+        LightSums sums = light_sum(draw, input.world_position, normal, want_specular,
+                                   to_eye, draw.material_specular.w,
+                                   sun_visibility(input.world_position));
+        // D3D's own sum, and it is occluded on **different** terms from the map rig above. These
+        // are the level's dynamic lights - the sun, level02's two fires - and each of them already
+        // has a shadow map answering "is this light blocked" exactly, per light, inside the loop.
+        // Multiplying them by a hemisphere's worth of nearby geometry as well is double-counting,
+        // so `ao_direct` defaults to 0 and leaves them alone.
+        //
+        // The ambient term is not in that argument and is always occluded: nothing shadows it, and
+        // it is by definition the light that did not arrive along one ray. It is usually zero in
+        // this game, which is why it is not where the visible occlusion comes from.
+        //
+        // The specular is untouched at every setting - a highlight is a mirror of one light in one
+        // direction, and nearby geometry says nothing about whether that particular path is clear.
+        sums.ambient *= ao;
+        sums.diffuse *= lerp(1.0, ao, pc.frame[0].ao_direct);
         const LitColour lit = resolve_lit_colour(draw, sums, diffuse, want_specular);
         diffuse = lit.color;
         specular_in = lit.specular;
@@ -1691,5 +1758,13 @@ float4 fragment_main(VertexOut input) : SV_Target {
     // 0xffffffff is exactly 1.0 per channel, so the un-overridden path is bit-identical.
     const float4 tint = float4(uint4(material.tint, material.tint >> 8, material.tint >> 16,
                                      material.tint >> 24) & 0xffu) * (1.0 / 255.0);
+    // The AO debug view, after everything, so what it shows is the pass's output and not the
+    // pass's output as some later stage happened to modulate it. It ignores `kAoMapOnly` on
+    // purpose: the buffer covers every opaque draw the prepass rasterised, and seeing what is in
+    // it - including the half the restriction is about to throw away - is the point of looking.
+    if ((pc.frame[0].ao_flags & kAoDebug) != 0u && pc.frame[0].ao_texture != kNoTexture) {
+        const float value = textures[pc.frame[0].ao_texture].Load(int3(int2(input.position.xy), 0)).x;
+        return float4(value, value, value, lit.a);
+    }
     return lit * tint;
 }

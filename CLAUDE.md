@@ -481,6 +481,14 @@ The one fact that shapes everything: **the seam is `Direct3DCreate8`, not the AW
 queue**, and the ground truth to compare against is `GKPLUS_RENDERER=d3d8` - the original runtime,
 still shipped in SysWOW64.
 
+It also draws **ambient occlusion with no blur pass** (`render.ao`, off by default): the sample
+offsets are generated in 2D from one fixed lattice disc shared by every pixel and the 3D position of
+the *tapped* pixel is what gets reconstructed, so the kernel needs no per-pixel randomisation and
+nothing has to blur the result. `src/shaders/ao.slang`. Three of its decisions are measurements -
+the pattern is a lattice rather than blue noise, an under-sampled fixed kernel produces visible
+copies of every silhouette rather than grain, and scaling the *ambient* term is inert in this game
+because Gunlok has none to occlude (`vulkan_renderer_notes.md` §4.86).
+
 It also draws two things the game never could, both keyed on a texture's `.rim` name:
 `render.material_override` retextures, tints or hides every draw sampling one asset, and
 **`src/VkLighting`** gives one a bump/metallic/roughness response from a companion

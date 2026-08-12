@@ -288,6 +288,12 @@ constexpr uint32_t kMapShadowMapSlot = 4094; // the map lights' static atlas (§
 // `kDynShadowMapSlot - i`, which is what lets the ring cost nothing in the shader: the frame block
 // carries whichever index the bake just wrote.
 constexpr uint32_t kDynShadowMapSlot = 4093;
+// ... which takes 4093 and 4092, so the AO pass's three images start below both (§4.86). Same
+// reasoning as above: none of them is a `TextureImage`, so the top of the array keeps them clear
+// of every path that walks the image list.
+constexpr uint32_t kAoResultSlot = 4091;   // what the world shader multiplies by
+constexpr uint32_t kAoPositionSlot = 4090; // world position per pixel, the resolve's input
+constexpr uint32_t kAoNormalSlot = 4089;   // ... and its normal
 void WriteBindlessView(uint32_t index, uint64_t view);
 
 // The set and its layout, as opaque handles so this header keeps mentioning no Vulkan type

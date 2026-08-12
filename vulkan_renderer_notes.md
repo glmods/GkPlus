@@ -8271,3 +8271,128 @@ camera; that is a gameplay question, not a rendering one.
   residual is 0.13/255 - but a game that started calling it would put both this and every draw's
   transform quietly out of date. It is the one assumption in this section with no measurement
   behind it.
+
+## 4.86 Ambient occlusion without a blur pass, and the two places the obvious design is wrong
+
+The technique is the one in <https://www.youtube.com/watch?v=vJU1PgGdH3k>, and its idea is to
+**reverse the sampling**. Textbook SSAO generates 3D offsets around the fragment, projects each one
+onto the depth buffer and compares; the offsets are randomised per pixel so the pattern does not
+band, which makes the result noise and forces a blur pass after it. Here the offsets are generated
+in **2D**, in screen space, from one disc shared by every pixel, and what gets reconstructed is the
+3D position *of the tapped pixel*. The hemisphere test then runs on real positions.
+
+The output is not noise, so there is no blur, so there is no halo across a depth discontinuity and
+no bleed around a silhouette. That matters more here than it would generally: Gunlok renders 640x480
+(§4.37), where a blur radius is a large fraction of a character.
+
+Two passes, `src/shaders/ao.slang` and the section of the same name in `src/VkDraw.cpp`. Knobs are
+`render.ao*`; off by default, and that is a fidelity call rather than a cost one - the game never
+had ambient occlusion, so nothing here can be measured as closer to D3D8.
+
+### There is no matrix in it, and that is what made it cheap to build
+
+The prepass writes **world position** per pixel rather than a depth, so the resolve inverts nothing.
+That is not a micro-optimisation, it is what makes the pass possible on this side at all:
+`BuildSunCascades` already records that the view and projection are folded into each draw's `mvp`
+and the frustum is not available as a per-frame quantity here. The world-space light grid was chosen
+for the same reason (§4.56).
+
+It costs 16 bytes a pixel instead of 4 - 4.9 MB at 640x480, against the shadow atlas's 66 MB.
+
+And the prepass needs no camera matrix either, for the same reason from the other end: it rasterises
+each caster with **that draw's own `mvp`**, which already is world x view x projection. It is one
+more walk of the list `RecordShadowPass` walks, through the same `CollectCasters(IsShadowCaster, ...)`
+- so "an occluder for the sun" and "an occluder here" are one definition and cannot drift.
+
+Three things that are load-bearing and easy to get wrong later:
+
+- **The prepass uses `ViewportOrigin()`'s half-pixel origin** (§4.28). It is what makes pixel (i,j)
+  of the AO target the same surface point as pixel (i,j) of the frame, which is the assumption the
+  world shader's `Load` rests on. Off by half a pixel the occlusion still looks plausible and is
+  consistently misregistered against every edge in the frame.
+- **The resolve uses a zero origin**, because its geometry is a full-screen triangle and its fragment
+  reads its own integer `SV_Position`. Shifting that viewport would undo the registration the
+  prepass just took care to get right.
+- **The hemisphere is a bounded volume, and that is the range check.** A tap on distant background
+  projects into the disc and falls outside the half-ball, so it does not count - the halo a depth
+  comparison has to add a falloff to suppress costs nothing here, because the test was always a
+  containment test.
+
+### The pattern is a lattice, not blue noise, and the first version got that wrong
+
+The first revision generated the disc with Mitchell's best-candidate - a blue-noise set, which is
+what a paper would reach for. The video's published plot is **not** that: it is a lattice, spacing
+0.1 on axes running to +-0.4, with each point nudged slightly off its cell. Stratified, not random.
+
+The difference is the technique. A stratified set has no clumps and no holes *by construction*,
+where a blue-noise set only has few of them on average - and with one pattern reused by every pixel,
+"on average" is not a property anything gets to rely on. The disc is now the video's own 32 points,
+transcribed and normalised, plus 32 more from the same lattice half a cell over, chosen maximin. The
+whole set is maximin-ordered from the centre tap, so `render.ao_taps` below 64 is still a
+well-spread subset: minimum separation 0.160 for all 64, 0.182 for the video's 32, 0.530 for an
+8-tap prefix.
+
+**Density is the one lever, and under-sampling does not look like noise - it looks like structure.**
+A fixed kernel cannot trade its artefact for grain the way a randomised one does, so each missing tap
+shows up as a shifted *copy* of every occluder's silhouette. Measured on level02 at a 121-pixel disc:
+at 32 taps each character leaves a visible fan of its own outlines, at 64 the term is smooth. The
+ghosts' spacing is the minimum separation times the disc's radius, which is why a denser disc is the
+fix and why the video's pattern is as dense as it is. `ao_taps` defaults to all 64.
+
+### The physically-correct application point is inert in this game
+
+The first version scaled the **ambient** term - which is what occlusion means, and which is where
+every reference puts it. Measured: **0.31% of the frame**.
+
+Gunlok has essentially no ambient to occlude. `D3DRS_AMBIENT` and the lights' own ambient are zero on
+these draws, and `map_light_sum`'s `map_ambience` is a per-channel `max()` floor that `acc * gain`
+wins almost everywhere a level is lit at all (§4.55). Occluding the floor therefore reaches only the
+places that were already dark.
+
+What the term has to scale here is the **`STDLIGHT` rig itself**, and that is a claim about what that
+rig *is* rather than a convenience: 51 static lights on level02 whose whole job was to bake the
+level's vertex colours, standing in for an environment. D3D's own lights are the other kind - the sun
+and the two fires, few and dynamic - and every one of them already has a shadow map answering "is
+this light blocked" exactly, per light (§4.58, §4.61, §4.65, §4.66). Multiplying those by a
+hemisphere's worth of nearby geometry as well is double-counting, so `render.ao_direct` defaults to 0
+and leaves them alone. The specular is never occluded at any setting.
+
+With that moved, the same frame reads **0.675 MAD over 21.14% of it** against an off-vs-off floor of
+0.011 (0.027 across an on-off-on cycle, which is the units' animation phase, §4.38).
+
+### The knobs, and which of their defaults are measurements
+
+- **`ao_screen_radius` is a fraction of the frame's HEIGHT, not a pixel count.** The render extent is
+  not a constant: 640x480 on the machine every other number in these notes comes from, 3072x1728 on
+  the one this section was measured on. A pixel default is wrong by 3.6x on one of them, in the
+  direction that makes the feature invisible rather than obviously broken. 0.07 - 34 pixels at 480
+  lines, 121 at 1728. It costs the technique nothing: what a fixed kernel buys is that every pixel of
+  a *frame* walks the same pattern, and a value derived once per frame from the target size is still
+  one constant.
+- **`ao_radius` is 3 world units, and that is a sweep.** The occluded fraction of the debug view goes
+  0.341 / 0.384 / 0.412 / 0.417 for 0.75 / 1.5 / 3 / 6 at level02's settled camera. 3 is the knee:
+  past it the disc is the binding constraint and the hemisphere has stopped rejecting anything, while
+  the picture keeps darkening until a character self-occludes over its whole body.
+- A constant screen radius is affordable here in a way it would not be generally, and that is a
+  property of this game rather than of the technique: Gunlok's camera is a fixed-height orbit, so one
+  frame's depth spread is narrow and a constant screen radius is very nearly a constant world radius.
+
+### What it does not cover
+
+**Props and units get no occlusion of their own**, and `render.ao_map_only` is very nearly inert as a
+result - it reads the same 21.14% either way on level02. The reason is the one §4.55 gives for
+restricting the map-lighting substitution: a prop or a unit is a separate `RBOBJECT` whose vertex
+colours were baked from its own file's lights, and that bake already contains occlusion. Only the map
+rig's contribution is replaced at runtime, so only the map's own geometry has anything for this to
+scale. The contact shadow *under* a character is there - that pixel is ground - but the character's
+own creases are not. The knob still matters with `map_lighting_all` on.
+
+**Tessellation is not reproduced in the prepass.** With `render.tessellation` on, the world pass draws
+a PN-amplified surface and this pass draws the untessellated one, so the two disagree by the
+displacement. The shadow passes have tessellated twins for exactly this reason (§4.71); this does not,
+because tessellation is off by default and the disagreement is sub-unit. It is the first thing to
+build if the two are ever used together.
+
+**The frame cost is bounded, not measured.** Level02 holds the 60 Hz FIFO cap with the pass on and
+off alike, which says only that it fits. §4.79's rule applies and the usual way through it -
+`GKPLUS_VK_PRESENT_MODE=immediate` - is not available: it crashes this machine.

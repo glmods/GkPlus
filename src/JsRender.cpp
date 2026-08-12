@@ -753,6 +753,60 @@ GK_SHADOW_KNOB(shadow_strength, ShadowStrength)
 GK_SHADOW_KNOB(shadow_extent, ShadowExtent)
 GK_SHADOW_KNOB(map_shadow_bias, MapShadowBias)
 GK_SHADOW_KNOB(dynamic_shadow_bias, DynamicShadowBias)
+// Ambient occlusion's five float knobs (§4.86). Same macro, because they are the same shape - a
+// float in, a float out, clamped on the C++ side where a clamp is a real requirement.
+GK_SHADOW_KNOB(ao_radius, AoRadius)
+GK_SHADOW_KNOB(ao_screen_radius, AoScreenRadius)
+GK_SHADOW_KNOB(ao_bias, AoBias)
+GK_SHADOW_KNOB(ao_strength, AoStrength)
+GK_SHADOW_KNOB(ao_direct, AoDirect)
+
+// `render.ao` and its knobs (VkDraw.h, §4.86) - screen-space ambient occlusion with **no blur
+// pass**, because its kernel is one fixed disc rather than a per-pixel randomised one. Off by
+// default: the game never had it, so nothing here is a fidelity improvement and off is
+// bit-identical to the build before it existed.
+//
+// `render.ao_debug` is not optional when tuning: the radius and the tap count are invisible in a
+// shaded frame and obvious in the term itself.
+JSValue GetAo(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::AmbientOcclusion());
+}
+
+JSValue SetAoValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetAmbientOcclusion(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+JSValue GetAoMapOnly(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::AoMapOnly());
+}
+
+JSValue SetAoMapOnlyValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetAoMapOnly(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+JSValue GetAoDebug(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::AoDebug());
+}
+
+JSValue SetAoDebugValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetAoDebug(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+JSValue GetAoTaps(JSContext *ctx, JSValueConst) {
+  return JS_NewInt32(ctx, vulkan::AoTaps());
+}
+
+JSValue SetAoTapsValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  int32_t taps = 16;
+  if (JS_ToInt32(ctx, &taps, value) < 0) {
+    return JS_EXCEPTION;
+  }
+  vulkan::SetAoTaps(taps);
+  return JS_UNDEFINED;
+}
 
 // `render.map_shadows` and its two knobs (VkDraw.h, §4.61) - the static shadow atlas for the
 // level's own STDLIGHT rig. Off by default, and the atlas is baked whether or not it is sampled,
@@ -1619,6 +1673,15 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("map_shadow_rate", GetMapShadowRate, SetMapShadowRateValue),
     JS_CGETSET_DEF("map_shadow_indirect", GetMapShadowIndirect, SetMapShadowIndirectValue),
     JS_CGETSET_DEF("map_shadow_report", GetMapShadowReport, nullptr),
+    JS_CGETSET_DEF("ao", GetAo, SetAoValue),
+    JS_CGETSET_DEF("ao_radius", GetAoRadius, SetAoRadiusValue),
+    JS_CGETSET_DEF("ao_screen_radius", GetAoScreenRadius, SetAoScreenRadiusValue),
+    JS_CGETSET_DEF("ao_bias", GetAoBias, SetAoBiasValue),
+    JS_CGETSET_DEF("ao_strength", GetAoStrength, SetAoStrengthValue),
+    JS_CGETSET_DEF("ao_direct", GetAoDirect, SetAoDirectValue),
+    JS_CGETSET_DEF("ao_taps", GetAoTaps, SetAoTapsValue),
+    JS_CGETSET_DEF("ao_map_only", GetAoMapOnly, SetAoMapOnlyValue),
+    JS_CGETSET_DEF("ao_debug", GetAoDebug, SetAoDebugValue),
     JS_CGETSET_DEF("force_lod", GetForceLod, SetForceLodValue),
     JS_CGETSET_DEF("lighting_maps", GetLightingMaps, SetLightingMapsValue),
     JS_CGETSET_DEF("lighting_map_report", GetLightingMapReport, nullptr),

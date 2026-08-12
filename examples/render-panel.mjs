@@ -187,6 +187,51 @@ export function draw_render_panel(ImGui) {
     ImGui.TreePop();
   }
 
+  // --- ambient occlusion -----------------------------------------------------
+  //
+  // Its own section rather than a line under a light system, because it belongs to
+  // none of them: it is a screen-space term that scales whichever sum ran.
+  if (ImGui.TreeNode("Ambient occlusion")) {
+    const ao = toggle(ImGui, "ao", "ao",
+      "Screen-space AO with NO blur pass - one fixed LATTICE disc shared by every " +
+        "pixel, so the output is not noise. Off by default: the game never had it.");
+    ImGui.BeginDisabled(!ao);
+    toggle(ImGui, "debug view", "ao_debug",
+      "Show the occlusion term itself as grey. Tune the radius and the tap count " +
+        "against THIS - both are close to invisible in a shaded frame.");
+    slider(ImGui, "radius (world)", "ao_radius", 0.1, 8,
+      "The hemisphere, in world units - what 'near enough to occlude' means. 3 is a " +
+        "sweep: past it the disc binds instead and only the over-darkening grows.",
+      "%.2f");
+    slider(ImGui, "radius (of height)", "ao_screen_radius", 0.002, 0.12,
+      "The disc, as a fraction of the frame's height, and independent of the one " +
+        "above. Not pixels: the render extent is 640x480 on one machine and " +
+        "3072x1728 on another. 0.07 is 34 px at 480 lines, 121 at 1728.",
+      "%.4f");
+    intSlider(ImGui, "taps", "ao_taps", 1, 64,
+      "How much of the 64-point disc to walk - all of it by default. Lowering it " +
+        "does not add grain, it adds a visible copy of every silhouette per missing " +
+        "tap. 32 is exactly the pattern the technique's author published; the set is " +
+        "maximin-ordered, so any lower count is still well spread.");
+    slider(ImGui, "bias", "ao_bias", 0, 0.5,
+      "How far along the normal a tap must be to count, in world units. Too low and " +
+        "a flat wall shades itself; too high and a shallow crease vanishes.",
+      "%.3f");
+    slider(ImGui, "strength", "ao_strength", 0, 2,
+      "A scale on the occlusion before it leaves the resolve pass.",
+      "%.2f");
+    slider(ImGui, "direct", "ao_direct", 0, 1,
+      "How much it also scales D3D's OWN diffuse sum - the sun and the dynamic " +
+        "lights, not the map rig, which is always occluded in full. 0 because each " +
+        "of those already has a shadow map. The specular is never occluded.",
+      "%.2f");
+    toggle(ImGui, "map geometry only", "ao_map_only",
+      "On. A prop or a unit carries a bake that already contains occlusion, so " +
+        "applying this there darkens the same crease twice.");
+    ImGui.EndDisabled();
+    ImGui.TreePop();
+  }
+
   // --- the game's own D3D point and spot lights ------------------------------
   //
   // Deliberately its own section rather than a line in "Map lighting": they share

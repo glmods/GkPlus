@@ -35,6 +35,23 @@ colour by default), the key light is `diffuse 4.0` (so `specular_scale` defaults
 reciprocal), and a bump that only shapes highlights is invisible wherever metallic is 0 (so the
 derived normal reaches the diffuse too, as a ratio).
 
+**And it now has ambient occlusion, with no blur pass** (§4.86). `render.ao` runs the technique
+from <https://www.youtube.com/watch?v=vJU1PgGdH3k>: the sample offsets are generated in **2D**, from
+one fixed disc shared by every pixel, and what is reconstructed is the 3D position of the *tapped*
+pixel — so the kernel needs no per-pixel randomisation, the output is not noise, and nothing has to
+blur it afterwards. Worth **0.675 MAD over 21.14% of level02** against an off-vs-off floor of 0.011.
+Off by default.
+
+Three things in it are measurements and each would have shipped wrong. **The pattern is a lattice,
+not blue noise** — the first revision used Mitchell's best-candidate, which is what a paper would
+reach for and is measurably worse at the same count, because a stratified set has no clumps *by
+construction* where blue noise only has few on average. **Under-sampling a fixed kernel does not look
+like noise, it looks like structure**: each missing tap is a shifted copy of every occluder's
+silhouette, visible as a fan of outlines at 32 taps and gone at 64. And **the physically-correct
+application point is inert here** — scaling the ambient term reached 0.31% of the frame, because
+Gunlok has no ambient to occlude; what the term has to scale is the `STDLIGHT` rig, which is this
+game's environment lighting, while D3D's own lights already have shadow maps and are left alone.
+
 **And it now adds geometry, not just shading** (§4.71). `render.tessellation` runs a PN-triangle
 amplification pass over the level mesh: the generated points sit on a cubic Bézier patch fitted to
 each triangle's corner positions and corner **normals**, whose edge control point collapses to the
@@ -225,6 +242,7 @@ and still forwards every call to d3d8to9 so the A/B stays available.
 | **The specular sum runs only over lights with `N·L > 0`** | ✅ §4.46 — the ledge that was "much redder in Vulkan". Bit-identical specular over all 104,693 lit pixels, and the whole frame at the fire camera drops **2.093 → 0.522 against a 0.521 cross-launch floor** |
 | **The viewport's RECTANGLE** — `D3DVIEWPORT8::X/Y/Width/Height`, per draw, as the Vulkan viewport *and* scissor | ✅ §4.47 — the upgrade screen that filled the window. 17.23 → **0.089** against the real D3D8 there, and the noise floor in level |
 | **A pre-transformed vertex's depth** — `clamp(z, MinZ, MaxZ)`, not the viewport transform | ✅ §4.45 — the flames that came and went with camera distance. Every screen-space draw sat `MinZ * (1 - z)` too far away; the flame's retention across a distance sweep goes from a 79% → 0.9% collapse to a flat ~92% |
+| **Ambient occlusion, with no blur pass** — a fixed lattice disc in screen space, world positions in a prepass | ✅ §4.86 — the first thing here with **no matrix in it at all**: the prepass writes world position per pixel, so the resolve inverts nothing and needs no camera transform, which is the very quantity `BuildSunCascades` records as unavailable on this side. **0.675 MAD over 21.14% of level02** against a 0.011 off-vs-off floor. The disc is the technique author's own **lattice** rather than blue noise, and the tap count is not a quality dial with a cheap end — 32 taps leaves a fan of every silhouette, 64 is smooth. **Off by default** |
 | **Geometry amplification** — PN triangles over the level mesh, and over the shadow passes with it | ✅ §4.71 — the first thing here that adds *geometry*. A corner whose normal is its face normal contributes nothing to the patch, so **hard edges stay hard by arithmetic rather than by a heuristic** while a boulder or a pipe rounds off; and the patch is watertight across a shared edge by construction, which is what ruled out height-map displacement. **Off by default.** 1.667 MAD over 51.5% of level02, `pn_strength = 0` at the floor, and the off-state at the cross-launch floor against the pre-change build |
 | **Runtime map lighting** — the level's own `STDLIGHT` rig, per pixel, replacing the bake | ✅ §4.53 (loader), §4.54 (the fitted model), §4.55 (the substitution), **on by default in §4.60** — 1.83 ms on the level with 686 of them and nothing measurable on three others |
 | **The game's stencil, checked on every level** | ✅ §4.60 — 22 pipeline configurations over **sixteen** levels, **3** with stencil, all three flat-shaded, all three first seen on level01. §4.31's marker is now measured on the whole game rather than on two levels. `railway` is the one that could not be: `levels.start` on it takes gl.exe down inside its own `ConvertParsedObjects` |

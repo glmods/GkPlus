@@ -9,10 +9,11 @@
 //
 // Included from VkDraw.cpp, inside its anonymous namespace - the one point where
 // src/VkDraw.h, src/VertexFormat.h and that file's three push blocks are all in scope.
-// recipe-hash: a9cc25a55f9d9af550c8bf75e4654da2e3aad969760d22732ffa704a843139f4
-// source-hash: src/shaders/world.slang 21046e18a4b8bdb2897d477cbac688dd1c460f973550c0fcdd4b3d231ced695e
+// recipe-hash: 39a0a2051e4f891b7db8507ddb573f2b360791b58d0a2d2ea5edbb590fbc3666
+// source-hash: src/shaders/world.slang 17aef410f4b1fc9c5d0231b245628fe55a84936d4c4da8ca8efa255cb56b5a60
 // source-hash: src/shaders/shadow.slang b325b3a5b737846cc8af68c3c9aa6a8ad7b67e01d1baa16d2196d8342fa9fa59
 // source-hash: src/shaders/lightgrid.slang ff7a10915c25b2d2a2a2d60a06decb9fa459a327c1cfe0e04f1655221fc1fa8b
+// source-hash: src/shaders/ao.slang bfda9602ecce369540d5935bca9f6aa0a93877e235c635178470da4e1b407655
 #pragma once
 
 #include <cstddef>
@@ -104,7 +105,15 @@ static_assert(offsetof(GpuFrameData, cascades) == 176,
               "GpuFrameData::cascades moved away from world.slang's GpuFrameData");
 static_assert(offsetof(GpuFrameData, sun_matrix) == 240,
               "GpuFrameData::sun_matrix moved away from world.slang's GpuFrameData");
-static_assert(sizeof(GpuFrameData) == 304,
+static_assert(offsetof(GpuFrameData, ao_texture) == 304,
+              "GpuFrameData::ao_texture moved away from world.slang's GpuFrameData");
+static_assert(offsetof(GpuFrameData, ao_flags) == 308,
+              "GpuFrameData::ao_flags moved away from world.slang's GpuFrameData");
+static_assert(offsetof(GpuFrameData, ao_direct) == 312,
+              "GpuFrameData::ao_direct moved away from world.slang's GpuFrameData");
+static_assert(offsetof(GpuFrameData, pad_ao) == 316,
+              "GpuFrameData::pad_ao moved away from world.slang's GpuFrameData");
+static_assert(sizeof(GpuFrameData) == 320,
               "GpuFrameData is not the size GpuFrameData declares");
 
 // src/shaders/world.slang : struct GpuLight
@@ -328,6 +337,76 @@ static_assert(offsetof(LightGridPush, pad2) == 60,
               "LightGridPush::pad2 moved away from lightgrid.slang's GridPush");
 static_assert(sizeof(LightGridPush) == 64,
               "LightGridPush is not the size GridPush declares");
+
+// src/shaders/ao.slang : struct Vertex
+static_assert(offsetof(CanonicalVertex, pos) == 0,
+              "CanonicalVertex::pos moved away from ao.slang's Vertex");
+static_assert(offsetof(CanonicalVertex, normal) == 16,
+              "CanonicalVertex::normal moved away from ao.slang's Vertex");
+static_assert(offsetof(CanonicalVertex, uv0) == 32,
+              "CanonicalVertex::uv0 moved away from ao.slang's Vertex");
+static_assert(sizeof(CanonicalVertex) == 48,
+              "CanonicalVertex is not the size Vertex declares");
+
+// src/shaders/ao.slang : struct GpuDrawRecord
+static_assert(offsetof(GpuDrawRecord, mvp) == 0,
+              "GpuDrawRecord::mvp moved away from ao.slang's GpuDrawRecord");
+static_assert(offsetof(GpuDrawRecord, world) == 64,
+              "GpuDrawRecord::world moved away from ao.slang's GpuDrawRecord");
+static_assert(offsetof(GpuDrawRecord, normal_transform) == 128,
+              "GpuDrawRecord::normal_transform moved away from ao.slang's GpuDrawRecord");
+static_assert(offsetof(GpuDrawRecord, material_ambient) == 176,
+              "GpuDrawRecord::material_ambient moved away from ao.slang's GpuDrawRecord");
+static_assert(offsetof(GpuDrawRecord, material_diffuse) == 192,
+              "GpuDrawRecord::material_diffuse moved away from ao.slang's GpuDrawRecord");
+static_assert(offsetof(GpuDrawRecord, material_specular) == 208,
+              "GpuDrawRecord::material_specular moved away from ao.slang's GpuDrawRecord");
+static_assert(offsetof(GpuDrawRecord, material_emissive) == 224,
+              "GpuDrawRecord::material_emissive moved away from ao.slang's GpuDrawRecord");
+static_assert(offsetof(GpuDrawRecord, global_ambient) == 240,
+              "GpuDrawRecord::global_ambient moved away from ao.slang's GpuDrawRecord");
+static_assert(offsetof(GpuDrawRecord, eye) == 256,
+              "GpuDrawRecord::eye moved away from ao.slang's GpuDrawRecord");
+static_assert(offsetof(GpuDrawRecord, view_rotation) == 272,
+              "GpuDrawRecord::view_rotation moved away from ao.slang's GpuDrawRecord");
+static_assert(offsetof(GpuDrawRecord, light_offset) == 320,
+              "GpuDrawRecord::light_offset moved away from ao.slang's GpuDrawRecord");
+static_assert(offsetof(GpuDrawRecord, light_count) == 324,
+              "GpuDrawRecord::light_count moved away from ao.slang's GpuDrawRecord");
+static_assert(offsetof(GpuDrawRecord, lighting) == 328,
+              "GpuDrawRecord::lighting moved away from ao.slang's GpuDrawRecord");
+static_assert(offsetof(GpuDrawRecord, lit_colour) == 332,
+              "GpuDrawRecord::lit_colour moved away from ao.slang's GpuDrawRecord");
+static_assert(sizeof(GpuDrawRecord) == 336,
+              "GpuDrawRecord is not the size GpuDrawRecord declares");
+
+// src/shaders/ao.slang : struct AoPush
+static_assert(offsetof(AoPushConstants, vertices) == 0,
+              "AoPushConstants::vertices moved away from ao.slang's AoPush");
+static_assert(offsetof(AoPushConstants, draws) == 8,
+              "AoPushConstants::draws moved away from ao.slang's AoPush");
+static_assert(offsetof(AoPushConstants, record) == 16,
+              "AoPushConstants::record moved away from ao.slang's AoPush");
+static_assert(offsetof(AoPushConstants, base_vertex) == 20,
+              "AoPushConstants::base_vertex moved away from ao.slang's AoPush");
+static_assert(offsetof(AoPushConstants, position_texture) == 24,
+              "AoPushConstants::position_texture moved away from ao.slang's AoPush");
+static_assert(offsetof(AoPushConstants, normal_texture) == 28,
+              "AoPushConstants::normal_texture moved away from ao.slang's AoPush");
+static_assert(offsetof(AoPushConstants, radius) == 32,
+              "AoPushConstants::radius moved away from ao.slang's AoPush");
+static_assert(offsetof(AoPushConstants, screen_radius) == 36,
+              "AoPushConstants::screen_radius moved away from ao.slang's AoPush");
+static_assert(offsetof(AoPushConstants, bias) == 40,
+              "AoPushConstants::bias moved away from ao.slang's AoPush");
+static_assert(offsetof(AoPushConstants, strength) == 44,
+              "AoPushConstants::strength moved away from ao.slang's AoPush");
+static_assert(offsetof(AoPushConstants, taps) == 48,
+              "AoPushConstants::taps moved away from ao.slang's AoPush");
+static_assert(offsetof(AoPushConstants, pad0) == 52,
+              "AoPushConstants::pad0 moved away from ao.slang's AoPush");
+static_assert(sizeof(AoPushConstants) == 56,
+              "AoPushConstants is not the size AoPush declares");
 
 // Constants declared on both sides
 static_assert(kMaxShadowCascades == 4,

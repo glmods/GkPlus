@@ -74,6 +74,10 @@ PAIRS = [
     ("shadow.slang", "ShadowPush", "ShadowPushConstants", {}),
     ("lightgrid.slang", "GpuMapLight", "GpuMapLight", {}),
     ("lightgrid.slang", "GridPush", "LightGridPush", {}),
+    ("ao.slang", "Vertex", "CanonicalVertex",
+     {"pos": "pos", "normal_and_color": "normal", "uv": "uv0"}),
+    ("ao.slang", "GpuDrawRecord", "GpuDrawRecord", {}),
+    ("ao.slang", "AoPush", "AoPushConstants", {}),
 ]
 
 # size and the two alignments: (bytes, scalar align, std430 align).
