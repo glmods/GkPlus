@@ -1341,6 +1341,55 @@ bool ShadeMode();
 void SetPerPixelLighting(bool enabled);
 bool PerPixelLighting();
 
+// --- the stock-look preset (§4.87) ------------------------------------------------------------
+//
+// Every deliberate departure from D3D8, switched together. `render.stock = true` is the setup a
+// fidelity comparison against `GKPLUS_RENDERER=d3d8` needs, in one write instead of nine; `false`
+// puts back what was there before.
+//
+// **A preset over the knobs, not a mode of its own.** Nothing in the draw path reads it - it
+// writes the same setters a hand-typed A/B does, and each keeps its own behaviour on the way
+// through, so `SetLocalShadows` still forgets its atlas keys and `SetLightingMaps` still drops its
+// images. That is what makes it correct by construction rather than a second description of the
+// pipeline that can drift from the first.
+//
+// The set is exactly what this header already documents as "off is the build before it existed":
+// `per_pixel_lighting`, `map_lighting` and `lighting_maps` - §4.60's "three departures to switch
+// off" - plus the four shadow systems the game never had (`sun_shadows`, `map_shadows`,
+// `dynamic_shadows`, `local_shadows`), plus `ao` and `tessellation`. The last two are off by
+// default already and are here anyway, so that a session which turned them on is not a session
+// this lies about.
+//
+// Two things deliberately outside it:
+//
+//   - **`stencil_shadow` needs no entry.** The game's own blob is dropped only while the sun's map
+//     is actually drawing a real one (see SetStencilShadow), so `sun_shadows = false` restores it
+//     by itself. Listing it would be a second place to keep that interaction true.
+//   - **The fidelity knobs are untouched** - `half_pixel`, `rhw_depth_raw`, `viewport_rect`,
+//     `shade_mode`, `local_lights`, `map_light_cull`. For every one of those ON *is* the
+//     reproduction, so switching them would move the frame away from D3D8 rather than towards it.
+//     `stock` is not "turn the renderer off"; it is "draw what the original drew".
+//
+// **It restores the session, not the build's defaults.** Switching to stock snapshots the nine
+// first, so switching back returns a `local_shadows` that was off before to off. The snapshot is
+// taken only on a transition *into* stock, so writing `true` twice cannot overwrite it with the
+// values it just wrote; with no snapshot to restore - a fresh session's first `false` - it applies
+// the defaults, which is the shipped pipeline with `ao` and `tessellation` still off.
+//
+// Only the nine switches move. Every parameter under them - `shadow_bias`, `map_light_gain`,
+// `bump_scale`, the AO radius - is left exactly as it was, so a tuned value survives the round
+// trip without being part of the snapshot at all.
+//
+// Reads back **derived**: true iff all nine are currently configured off, so turning one back on
+// by hand makes it read false rather than leaving a mode flag that disagrees with the frame. It is
+// the *wanted* value of each that is compared, not the effective one - `ao` reads false until its
+// pass exists and `tessellation` false on a device without the feature, and a preset that could
+// not tell "off" from "unavailable" would restore the wrong frame on that device.
+//
+// `GKPLUS_VK_STOCK=1` is the launch-time form, applied once when the pipeline comes up.
+void SetStock(bool enabled);
+bool Stock();
+
 // --- PN-triangle amplification (§4.71) --------------------------------------------------------
 //
 // Hardware tessellation over the level mesh, with the generated points placed on a cubic Bezier

@@ -74,6 +74,16 @@ less of this game than its reputation suggests, and `render.pn_flat_threshold` e
 that number. It stays watertight because the term it thresholds is a function of `(Pi, Pj, Ni)`
 alone.
 
+**And all of that goes away with one write** (§4.87). `render.stock = true` switches off every
+deliberate departure at once — `per_pixel_lighting`, `map_lighting`, `lighting_maps`, the four
+shadow systems and `ao`/`tessellation` — which is the setup a comparison against
+`GKPLUS_RENDERER=d3d8` needs, inside a single **paused** frame instead of spread over nine.
+`GKPLUS_VK_STOCK=1` is the launch-time form. It is a preset over the existing knobs and nothing
+else reads it, so each keeps its own behaviour on the way through; the fidelity knobs (`half_pixel`,
+`shade_mode`, `map_light_cull` …) are deliberately **not** in the set, because for those *on* is the
+reproduction. `false` restores what the session had rather than the defaults, and leaves every
+slider under those nine untouched.
+
 **Compare against `GKPLUS_RENDERER=d3d8`, not d3d9** (§4.33). Windows 10 still ships a 32-bit
 `d3d8.dll` in SysWOW64, so that mode runs the game on the original runtime with the capture layer
 and the whole REPL harness intact — which is what makes the frame alignable, and a reference you
@@ -810,6 +820,13 @@ that decided how to implement it.
 
 One run per renderer, then a numeric difference. Three-way — `d3d8`, `d3d9`, `vulkan` — is one
 extra launch of the same script and is what tells a translation-layer defect from a real one.
+
+**Switch the departures off with `render.stock = true`, not one at a time** (§4.87). There are nine
+of them now, and the comparison that matters is on a *paused* frame — nine writes is nine frames of
+drift on anything animating, which is precisely the floor of order 1 the rest of this section is
+about. One write is one frame. `GKPLUS_VK_STOCK=1` does it from launch for a run that is only ever
+going to be a reference. It reads back derived, so it also answers "did I leave something on?"
+after a long REPL session, and `false` puts back whatever the session had rather than the defaults.
 
 **Wait for the camera to stop moving; do not settle for a fixed delay.** The renderers run at
 different frame rates, so the same wall-clock delay lands at a different point in any intro

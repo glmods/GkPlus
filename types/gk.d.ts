@@ -2490,6 +2490,38 @@ declare module "gk" {
      *  `GKPLUS_VK_PER_PIXEL_LIGHTING=0` is the launch-time form. */
     per_pixel_lighting: boolean;
 
+    /** Every deliberate departure from D3D8, switched together.
+     *
+     *  `true` is the setup a fidelity comparison against
+     *  `GKPLUS_RENDERER=d3d8` needs, in one write rather than nine - which is
+     *  the whole point, because the comparison worth making is on a *paused*
+     *  frame and nine writes is nine frames of drift on anything that moves.
+     *
+     *  The set is exactly what each knob already documents as "off is the build
+     *  before it existed": `per_pixel_lighting`, `map_lighting`,
+     *  `lighting_maps`, the four shadow systems the game never had
+     *  (`sun_shadows`, `map_shadows`, `dynamic_shadows`, `local_shadows`), and
+     *  `ao` and `tessellation` - the last two off by default already, and here
+     *  so a session that turned them on is not one this lies about.
+     *
+     *  The fidelity knobs are **not** in it - `half_pixel`, `rhw_depth_raw`,
+     *  `viewport_rect`, `shade_mode`, `local_lights`, `map_light_cull`. For
+     *  those, on *is* the reproduction. Nor is `stencil_shadow`: the game's own
+     *  blob shadow comes back on its own once the sun's map stops drawing a
+     *  real one.
+     *
+     *  **`false` restores the session, not the defaults.** Switching to stock
+     *  snapshots the nine first, so a `local_shadows` that was off before
+     *  returns to off. Only those nine switches move - `shadow_bias`,
+     *  `map_light_gain`, `bump_scale` and every other parameter under them
+     *  survive the round trip untouched.
+     *
+     *  Reads back derived: `true` only while all nine are configured off, so
+     *  turning one back on by hand makes this read `false` rather than leaving
+     *  a mode flag that disagrees with the frame.
+     *  `GKPLUS_VK_STOCK=1` is the launch-time form. */
+    stock: boolean;
+
     /** Replace the level's **baked** per-vertex lighting with a per-pixel evaluation
      *  of the light rig that produced it.
      *

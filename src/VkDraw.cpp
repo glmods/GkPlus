@@ -2997,6 +2997,27 @@ bool StartDraw(uint32_t width, uint32_t height, uint32_t colour_format) {
   Ready = true;
   TheStats.ready = true;
   Error.clear();
+  // `GKPLUS_VK_STOCK=1` - the whole departure set off from the first frame, for a session that is
+  // there to compare against `GKPLUS_RENDERER=d3d8` (see SetStock in VkDraw.h).
+  //
+  // Here rather than in a lazy reader like the two per-knob env vars have, because there is no
+  // single flag this gates - it writes nine, and nothing on the draw path asks it anything. After
+  // `Ready`, so a setter that checks it sees the pipeline up; **once per process**, because the
+  // device can be recreated and re-applying the preset on a resize would silently undo whatever
+  // the REPL had set since.
+  static bool stock_env_read = false;
+  if (!stock_env_read) {
+    stock_env_read = true;
+    char value[16] = {};
+    const DWORD len = ::GetEnvironmentVariableA("GKPLUS_VK_STOCK", value, sizeof(value));
+    if (len > 0 && len < sizeof(value)) {
+      const std::string text(value, len);
+      if (!(text == "0" || text == "off" || text == "no")) {
+        SetStock(true);
+        DebugWrite("gkplus: GKPLUS_VK_STOCK - every departure off, drawing the stock look\n");
+      }
+    }
+  }
   DebugWrite("gkplus: vulkan world pipeline up\n");
   return true;
 }
@@ -5682,6 +5703,100 @@ float MapLightGain() { return MapLightGainValue; }
 void SetShadeMode(bool enabled) { ShadeModeEnabled = enabled; }
 
 bool ShadeMode() { return ShadeModeEnabled; }
+
+// --- the stock-look preset (§4.87) ------------------------------------------------------------
+//
+// See SetStock in VkDraw.h for what is in the set and what is deliberately not.
+
+namespace {
+// The nine departures, as one value that can be snapshotted and compared. The defaults here are
+// the build's, which is what a `stock = false` with nothing saved applies.
+struct DepartureSet {
+  bool per_pixel_lighting = true;
+  bool map_lighting = true;
+  bool lighting_maps = true;
+  bool sun_shadows = true;
+  bool map_shadows = true;
+  bool dynamic_shadows = true;
+  bool local_shadows = true;
+  bool ambient_occlusion = false;
+  bool tessellation = false;
+
+  friend bool operator==(const DepartureSet &, const DepartureSet &) = default;
+};
+
+// Every departure's reproduction value. Spelled out per field rather than as nine bare `false`s
+// because the *list* is the claim - a departure added later whose stock value is something other
+// than false would need a member here, and would be invisible as a tenth positional zero.
+constexpr DepartureSet kStock = {
+    .per_pixel_lighting = false,
+    .map_lighting = false,
+    .lighting_maps = false,
+    .sun_shadows = false,
+    .map_shadows = false,
+    .dynamic_shadows = false,
+    .local_shadows = false,
+    .ambient_occlusion = false,
+    .tessellation = false,
+};
+
+DepartureSet SavedDepartures;
+bool HaveSavedDepartures = false;
+
+DepartureSet CurrentDepartures() {
+  DepartureSet set;
+  // **The wanted value of each, never the effective one.** `AmbientOcclusion()` is false until
+  // `CreateAoPass` has run and `TessellationEnabled()` is false on a device with no tessellation
+  // shader, so snapshotting through the public getters would read "off" for a knob the user had
+  // switched on and restore a frame they never configured. The two env-backed pairs go through
+  // their lazy readers instead of at their flags, which is what makes a `GKPLUS_VK_LOCAL_SHADOWS=0`
+  // session survive the round trip rather than coming back on out of the header's default.
+  set.per_pixel_lighting = PerPixelLightingEnabled();
+  set.map_lighting = MapLightingEnabled;
+  set.lighting_maps = LightingMaps();
+  set.sun_shadows = SunShadowsEnabled;
+  set.map_shadows = MapShadowsEnabled;
+  set.dynamic_shadows = DynamicShadowsEnabled;
+  set.local_shadows = LocalShadowsEnabled();
+  set.ambient_occlusion = AoEnabled;
+  set.tessellation = TessellationOn;
+  return set;
+}
+
+// Through the setters and not at the flags, because three of them do work rather than assign:
+// `SetPerPixelLighting` marks the environment as read so the first draw cannot undo this,
+// `SetLocalShadows` forgets every atlas key so a slot is re-earned and re-baked rather than
+// sampled from a tile whose light may have moved, and `SetLightingMaps` drops its cache and images
+// so a map edited while the game ran is picked up. A preset that assigned the flags would be a
+// second path through state those three are careful about, and it would drift from them silently.
+void ApplyDepartures(const DepartureSet &set) {
+  SetPerPixelLighting(set.per_pixel_lighting);
+  SetMapLighting(set.map_lighting);
+  SetLightingMaps(set.lighting_maps);
+  SetSunShadows(set.sun_shadows);
+  SetMapShadows(set.map_shadows);
+  SetDynamicShadows(set.dynamic_shadows);
+  SetLocalShadows(set.local_shadows);
+  SetAmbientOcclusion(set.ambient_occlusion);
+  SetTessellationEnabled(set.tessellation);
+}
+} // namespace
+
+void SetStock(bool enabled) {
+  if (enabled) {
+    // Guarded on the transition, so `stock = true` twice keeps the first snapshot instead of
+    // saving the stock values over it and making the way back a no-op.
+    if (!Stock()) {
+      SavedDepartures = CurrentDepartures();
+      HaveSavedDepartures = true;
+    }
+    ApplyDepartures(kStock);
+    return;
+  }
+  ApplyDepartures(HaveSavedDepartures ? SavedDepartures : DepartureSet{});
+}
+
+bool Stock() { return CurrentDepartures() == kStock; }
 
 // --- the material override, from the outside --------------------------------------------------
 //

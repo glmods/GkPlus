@@ -685,6 +685,26 @@ JSValue SetPerPixelLightingValue(JSContext *ctx, JSValueConst, JSValueConst valu
   return JS_UNDEFINED;
 }
 
+// `render.stock` - all nine deliberate departures from D3D8 at once, and back again (VkDraw.h,
+// notes §4.87). `true` is the setup a comparison against `GKPLUS_RENDERER=d3d8` needs; `false`
+// restores what the session had, not the build's defaults.
+//
+// **The point of it is that the A/B is one write on a paused frame.** Nine of them by hand is nine
+// frames of drift on anything that moves, and the comparison this exists to serve is the one with
+// the zero noise floor.
+//
+// It reads back derived rather than as a mode flag - `render.ao = true` while stock is applied
+// makes `render.stock` false on the next read, because it is - so a panel binding a checkbox to it
+// stays honest with no state of its own.
+JSValue GetStock(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::Stock());
+}
+
+JSValue SetStockValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetStock(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
 // `render.map_lighting` - replace the level's BAKED per-vertex colour with a per-pixel evaluation
 // of its own light rig (VkDraw.h, notes §4.54). **Off by default on performance grounds**: it is
 // brute force over every light in the level per pixel until phase 2's culling exists.
@@ -1676,6 +1696,7 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("pn_flat_threshold", Getpn_flat_threshold, Setpn_flat_thresholdValue),
     JS_CGETSET_DEF("pn_max_offset", Getpn_max_offset, Setpn_max_offsetValue),
     JS_CGETSET_DEF("tess_shadow_factor", Getshadow_factor, Setshadow_factorValue),
+    JS_CGETSET_DEF("stock", GetStock, SetStockValue),
     JS_CGETSET_DEF("per_pixel_lighting", GetPerPixelLighting, SetPerPixelLightingValue),
     JS_CGETSET_DEF("map_light_report", GetMapLightReport, nullptr),
     JS_CGETSET_DEF("map_lighting", GetMapLighting, SetMapLightingValue),

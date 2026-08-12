@@ -122,6 +122,18 @@ export function draw_render_panel(ImGui) {
   // Narrow enough that a label fits beside it in the default overlay width.
   ImGui.PushItemWidth(150);
 
+  // --- the whole departure set, at the top because it moves everything below --
+  //
+  // Not inside a TreeNode: it is the one control here that answers a question
+  // ("what did the original look like?") rather than tuning an answer, and the
+  // nine checkboxes it drives are scattered across six of the sections below.
+  toggle(ImGui, "stock D3D8 look", "stock",
+    "Every deliberate departure off at once - per-pixel lighting, map lighting, " +
+      "lighting maps, all four shadow systems, AO and tessellation. The setup for " +
+      "an A/B against GKPLUS_RENDERER=d3d8. Off restores what you had, not the " +
+      "defaults, and leaves every slider alone.");
+  ImGui.Separator();
+
   // --- the sun's shadow ------------------------------------------------------
   if (ImGui.TreeNode("Sun shadow")) {
     const sun = toggle(ImGui, "sun_shadows", "sun_shadows",

@@ -8549,3 +8549,86 @@ build if the two are ever used together.
 **The frame cost is bounded, not measured.** Level02 holds the 60 Hz FIFO cap with the pass on and
 off alike, which says only that it fits. §4.79's rule applies and the usual way through it -
 `GKPLUS_VK_PRESENT_MODE=immediate` - is not available: it crashes this machine.
+
+## 4.87 One switch for the whole departure set, and why the getter is derived
+
+By §4.86 the renderer had nine deliberate departures from D3D8, added one section at a time, each
+documenting itself as "off is the build before it existed". That is nine separate switches to write
+before a fidelity comparison against `GKPLUS_RENDERER=d3d8`, and §4.60 had already noticed the list
+was growing - it says "a fidelity comparison now has three departures to switch off, not two".
+
+**The cost of that is not typing, it is the noise floor.** Every comparison worth making here is on
+a *paused* frame (§4.28), because that is the only one with a zero floor. Nine writes over a live
+frame is nine frames of drift on anything that moves, so the setup was quietly forcing the weaker
+comparison. `render.stock` is the same nine writes in one, which puts the whole set inside a single
+paused frame.
+
+### What is in it, and the two things that are not
+
+The set is not a new claim about the renderer - it is exactly the knobs this repo already documents
+as reproducing the original when off: `per_pixel_lighting`, `map_lighting` and `lighting_maps`
+(§4.60's three), the four shadow systems the game never had - `sun_shadows`, `map_shadows`,
+`dynamic_shadows`, `local_shadows` - and `ao` and `tessellation`. The last two are off by default
+already and are in the set anyway, so that a session which turned them on is not a session `stock`
+lies about.
+
+**The fidelity knobs are deliberately out of it**: `half_pixel`, `rhw_depth_raw`, `viewport_rect`,
+`shade_mode`, `local_lights`, `map_light_cull`. For every one of those *on* is the reproduction -
+`half_pixel` is a pixel-centre convention (§4.28), `map_light_cull` is required to be bit-identical
+(§4.60). Switching them would move the frame away from D3D8, not towards it. `stock` is not "turn
+the renderer off"; it is "draw what the original drew".
+
+**And `stencil_shadow` needs no entry, which was checked rather than assumed.** The game's own blob
+shadow is dropped only while the sun's map is drawing a real one - the guard is
+`!StencilShadowEnabled && SunShadowsEnabled && ShadowReady && item.pipeline.stencil_enable` - so
+`sun_shadows = false` restores it by itself. Measured on level02 in the level: `stencil draws` reads
+0 a frame with the departures on, climbs (7206 -> 7932 over two seconds) under `stock`, and is
+frozen again after the round trip, while the cumulative "draws dropped" counter stops advancing and
+resumes. Listing it in the preset would have been a second place to keep that interaction true.
+
+### The snapshot, and why it is not the defaults
+
+`stock = false` restores **what the session had**, not the build's defaults. That is what makes it a
+toggle rather than a reset: the panel's checkbox can be flipped repeatedly while tuning, and an `ao`
+that was on comes back on. Verified on level02 - `ao = true`, then `stock` on and off, and `ao`
+reads `true` again where the default is `false`.
+
+The snapshot is taken only on a transition *into* stock, so `stock = true` twice cannot save the
+stock values over it and make the way back a no-op (checked: `ao` still `true` after a double
+apply). With nothing saved - a fresh session's first `false` - it applies the defaults, which is the
+shipped pipeline with `ao` and `tessellation` still off.
+
+**Only the nine switches move.** Every parameter under them is left alone, so a tuned
+`shadow_bias = 3.5` and `map_light_gain = 1.8` survive the round trip untouched - confirmed on the
+same run. That falls out of the preset holding nine bools and nothing else, and it is the property
+that makes the toggle usable while tuning rather than only before a comparison.
+
+### The trap: the wanted value, not the effective one
+
+The snapshot reads each knob's **wanted** flag, never its public getter, and the two differ in
+exactly the cases that matter. `AmbientOcclusion()` returns `AoEnabled && AoReady` and
+`TessellationEnabled()` returns `TessellationOn && Caps().tessellation_shader` - so on a device with
+no tessellation shader, or before `CreateAoPass` has run, snapshotting through the getters reads
+"off" for a knob the user had switched **on**, and the way back restores a frame they never
+configured. A preset that cannot tell "off" from "unavailable" is worse than no preset, because the
+loss is silent and happens only on the hardware that was already the weakest.
+
+The two env-backed knobs go the other way: `per_pixel_lighting` and `local_shadows` are read through
+their lazy `...Enabled()` readers rather than at their flags, so a `GKPLUS_VK_LOCAL_SHADOWS=0`
+session survives the round trip instead of coming back on out of the header's default.
+
+For the same reason the **getter is derived** - `Stock()` compares the nine wanted values against
+the stock set - rather than a mode flag. A mode flag would keep saying "stock" after
+`render.ao = true`, which is a lie about the frame; derived, the next read is `false`. Confirmed
+both ways in the level. The cost is that `render.stock` answers "is it configured stock", not "is
+the picture stock", on a device that could not honour the setting anyway - which is the reading the
+setter writes, so the two cannot disagree.
+
+### The launch-time form
+
+`GKPLUS_VK_STOCK=1` applies the preset once, from `StartDraw`, after `Ready`. Not a lazy reader like
+the two per-knob env vars have, because there is no single flag it gates - it writes nine, and
+nothing on the draw path asks it anything. **Once per process**, because the device can be recreated
+and re-applying on a resize would silently undo whatever the REPL had set since. Verified: the
+pipeline comes up with all nine off before a level is loaded, and `stock = false` from such a
+session gives back the shipped defaults, because the snapshot it took at startup *is* the defaults.
