@@ -125,7 +125,9 @@ JSValue GetItemValue(JSContext *ctx, JSValueConst self) {
   if (!item) {
     return JS_EXCEPTION;
   }
-  return item->is_toggle ? JS_NewBool(ctx, item->value != 0) : JS_UNDEFINED;
+  return item->kind == CustomMenuItemKind::Toggle
+             ? JS_NewBool(ctx, item->value != 0)
+             : JS_UNDEFINED;
 }
 
 JSValue SetItemValue(JSContext *ctx, JSValueConst self, JSValueConst v) {
@@ -133,7 +135,7 @@ JSValue SetItemValue(JSContext *ctx, JSValueConst self, JSValueConst v) {
   if (!item) {
     return JS_EXCEPTION;
   }
-  if (!item->is_toggle) {
+  if (item->kind != CustomMenuItemKind::Toggle) {
     return JS_ThrowTypeError(ctx, "'%s' is not a toggle item",
                              item->label.c_str());
   }

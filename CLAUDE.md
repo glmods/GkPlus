@@ -297,7 +297,8 @@ Each pair is a header of decompiled structs/enums plus native free-function decl
 whose null-ness is the "is a level loaded" test),
 `src/Triggers`, `src/Console`, `src/Misc`, `src/Camera`, `src/Debug`, `src/GUI`, `src/InputFix`,
 `src/HudFix` (the HUD's meters drawn in front of their panel, see below),
-`src/CustomMenu`, `src/ScriptQueue`, `src/CustomLevel`, `src/Script`, `src/WindowPlacement`
+`src/CustomMenu`, `src/RenderMenu` (the renderer knobs as a front-end page, see below),
+`src/ScriptQueue`, `src/CustomLevel`, `src/Script`, `src/WindowPlacement`
 (the game window clear of the taskbar, see below), `src/Font` (the text queue, see below),
 `src/Session` (starting a
 level without the menus, see below), `src/MakeRole` (native constructors, see below),
@@ -370,9 +371,38 @@ Front-end menu items owned by GkPlus. `CustomMenuSystem` hooks `UpdateAndDrawMen
   handler, which opens with exactly that.
 
 There is no removal: `Menu::ClearItems` is all-or-nothing and each item caches its own index, so
-`ClearCustomMenuActions()` (used at host teardown) makes items inert rather than deleting them.
-Only the **front-end** `Menus[36]` is covered; `InGameMenus[7]` has a separate dispatch
-(`InGameMenu::OnItemActivated`) and is not wired up.
+`ClearCustomMenuActions()` (used at host teardown) makes items inert rather than deleting them —
+and it skips `CustomMenuOwner::Native` registrations, whose actions are plain functions that
+outlive any script. Only the **front-end** `Menus[36]` is covered; `InGameMenus[7]` has a separate
+dispatch (`InGameMenu::OnItemActivated`) and is not wired up.
+
+A **page** — a screen of our own rather than items appended to the game's — is
+`ClaimCustomMenuPage(menu, title_resource_id)`, and there is exactly one menu it may be used on.
+`Menus[36]` is a fixed `.data` array indexed by `ChosenMenu`, so there is no 37th id; what makes a
+page possible at all is that **menu 19 (`Preferences`) is dead** — no `GoToMenu` call site passes
+19, so nothing but us reaches it and nothing repopulates it. Claiming it clears the game's items
+once, on the first reconcile that has something available to put there, after which every index is
+ours and its (already dead) dispatch is unreachable. Claiming a menu the game *does* navigate to
+would destroy that menu.
+
+A **cycle row** is `AddCustomMenuValue` — item type 1 (`LabelWithValue`), because type 3
+(`MultiValue`) resolves its labels through `GetResourceString` and the string table has no `"2x"`.
+Type 1's right-hand text is a plain `char *`, which makes it the only way to put arbitrary text on
+a Gunlok menu. The buffer is a fixed `char[32]` in the registration and **not** a `std::string`:
+the game stores the pointer once and re-measures it every frame. `SetCustomMenuRefresh` runs a
+callback once per reconcile, before the append pass, so a row can mirror state something else owns
+and is correct on the frame it first appears.
+
+`src/RenderMenu.cpp` is the worked example and the only page so far: "Advanced Graphics" on
+Options, opening a claimed menu 19 with the eight renderer knobs. It registers from `DllMain`
+(no detour, no `*System` — a second detour on `UpdateAndDrawMenuScreen` would silently disable
+one of the two, see Conventions), and hides itself entirely unless `d3d8::RendererName()` says
+`vulkan`. Two details are measurements: the antialiasing row reads `vulkan::MsaaWanted()` rather
+than `Msaa()`, since a write is only adopted at the top of the next frame and the effective value
+would lag one frame behind every click; and the tessellation row is absent without
+`DeviceCaps::tessellation_shader`, because the setting would otherwise read back off forever.
+Nothing is written to disk — the page edits the current session, and settings return to their
+`GKPLUS_*` defaults on the next launch.
 
 ### Building game objects (`src/MakeRole`, `src/JsMake.cpp`, `src/JsGls.cpp`)
 

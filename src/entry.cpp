@@ -16,6 +16,7 @@
 #include "InputFix.h"
 #include "MapLights.h"
 #include "Music.h"
+#include "RenderMenu.h"
 #include "Script.h"
 #include "ScriptQueue.h"
 #include "WindowPlacement.h"
@@ -104,6 +105,11 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID) {
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
     subsystems = std::make_unique<Subsystems>();
+    // Not a member of Subsystems: this installs no detour and holds no state the
+    // game can reach. It only fills CustomMenuSystem's registration list, which
+    // is our own memory, and everything it registers is applied lazily by the
+    // hook that subsystem already owns.
+    RegisterRenderMenu();
     Commit("attach");
 
   } else if (reason == DLL_PROCESS_DETACH) {

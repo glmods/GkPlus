@@ -172,6 +172,12 @@ void MenuAddMultiValueItem(Menu *menu, const char *label, int *index,
   fn(menu, label, index, labels);
 }
 
+void MenuClearItems(Menu *menu) {
+  ThisCall<void, Menu *> fn;
+  GetObjectAtOffset(fn, 0x004f7cd0);
+  fn(menu);
+}
+
 void *GetMenuItemData(Menu *menu, int index) {
   ThisCall<void *, Menu *, int> fn;
   GetObjectAtOffset(fn, 0x004f7750);

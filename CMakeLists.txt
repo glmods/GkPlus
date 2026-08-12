@@ -94,6 +94,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Music.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Profiler.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/RenderMenu.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Repl.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Rif.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Roles.cpp"

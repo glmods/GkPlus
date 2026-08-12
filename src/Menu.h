@@ -209,6 +209,13 @@ void MenuAddValueItem(Menu *menu, const char *label, const char *value,
 void MenuAddToggleItem(Menu *menu, const char *label, int *value);
 void MenuAddMultiValueItem(Menu *menu, const char *label, int *index,
                            unsigned **labels);
+// ClearItems @ 0x004f7cd0 - all-or-nothing; there is no way to remove one item.
+// Per item it frees `extra_owned_buffer`, `label` iff `label_is_static == 0` and
+// `value_text` iff `value_text_owned != 0`, then destroys the node. An item built
+// by MenuAddItem/MenuAddToggleItem, or by MenuAddValueItem with
+// `label_is_static` and without `value_text_owned`, therefore owns nothing here
+// and its caller's buffers survive.
+void MenuClearItems(Menu *menu);
 // GetItemData @ 0x004f7750 - cached, NO bounds check.
 void *GetMenuItemData(Menu *menu, int index);
 } // namespace gk

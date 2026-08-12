@@ -824,3 +824,60 @@ confirmed against `FUN_0056c9e0` @ `0x0056c9e0`, which actually builds the dialo
 
 `src/Menu.h` / `src/Menu.cpp` expose all of the above through `require("gk.menu")`. See the
 module table in `CLAUDE.md` for the surface.
+
+### Pages: a menu of our own, in menu 19
+
+`src/CustomMenu` can append items to any front-end menu, but a *page* - a screen the player
+navigates to - needs a menu id, and there is no spare one. `Menus[36]` @ `0x007b76d0` is a fixed
+`.data` array indexed by `ChosenMenu`; a 37th id would be an out-of-bounds read on every draw, and
+`Menu::itemsOwner` only lets one menu render another's list, not conjure a slot.
+
+**Menu 19 (`Preferences`) is the slot**, for the reason recorded in the inventory above: nothing
+navigates to it. `ClaimCustomMenuPage(menu, title_resource_id)` takes it over -
+
+- `Menu::ClearItems` runs **once**, on the first reconcile where at least one of our items for that
+  menu is available, so the game's four legacy toggles go and the page is entirely ours. Deferred
+  rather than done at claim time because the list sentinel is not linked until `SetupMenus`, and
+  gated on availability so a page with nothing to show is left alone rather than emptied.
+- Every index on the page is then ours, so `DispatchCustomMenuClick` answers all of them and the
+  jump-table entry for menu 19 - dead already - is never reached.
+- `GoToMenu(19, true)` writes `parentMenuId = ChosenMenu`, so Back returns to whatever opened it
+  with no work on our side.
+- The title is a `GL_RESOURCE_ID` like every other menu label, so a page borrows an existing
+  localized title. There is no id for a name GkPlus invents.
+
+Claiming a menu the game *does* navigate to would destroy that menu instead - this works because
+19 is dead, not because clearing is safe in general.
+
+### Item kinds, and why a cycle row is type 1
+
+A `MultiValue` item (type 3) resolves each label through `GetResourceString`, so it can only ever
+display strings the game shipped - there is no `"2x"` in the table. `LabelWithValue` (type 1) is
+the only type whose right-hand text is a plain `char *`, which makes it the only way to put
+arbitrary text on a Gunlok menu. `AddCustomMenuValue` uses it, with `label_is_static` set and
+`value_text_owned` clear so `ClearItems` frees neither of our buffers.
+
+The text buffer is a fixed `char[32]` inside the registration and not a `std::string`: the game
+stores the pointer once and re-measures the string every frame, so a reallocation would leave it
+reading freed memory. `SetCustomMenuValueText` writes through it in place.
+
+A `CustomMenuRefresh` callback runs once per reconcile - i.e. once a frame while that menu is on
+screen - which is what lets a row mirror state something else owns (a toggle's `value`, a value
+row's text). It runs *before* the append pass, so a row is correct on the frame it first appears.
+
+### The graphics page (`src/RenderMenu`)
+
+"Advanced Graphics" on Options, opening a claimed menu 19 with Antialiasing (a cycle row over the
+sample counts `DeviceCaps::sample_counts` offers) and toggles for tessellation, dynamic / sun / map
+shadows, ambient occlusion, per-pixel lighting and lighting maps. Registration only - it installs no
+detour, and `CustomMenuSystem`'s existing hook on `UpdateAndDrawMenuScreen` is what applies it.
+
+Two details are measurements rather than taste. The antialiasing row reads `MsaaWanted()`, not
+`Msaa()`: a write is adopted by `ReconcileRenderTarget` at the top of the *next* frame, so a row
+bound to the effective value would show the old count for one frame after every click. And the
+tessellation row is absent unless `DeviceCaps::tessellation_shader` is set, because without that
+feature the setting can be turned on and reads back off forever.
+
+Verified in the running game: Options gains the item, the page draws with its six visible rows,
+and clicking Antialiasing twice took `render.msaa` 1 -> 2 -> 4 while the second row took
+`render.tessellation` false -> true.
