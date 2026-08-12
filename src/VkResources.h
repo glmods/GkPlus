@@ -159,6 +159,7 @@ struct ResourceStats {
   uint64_t scratch_materials_peak = 0;
   uint64_t scratch_map_lights_peak = 0;
   uint64_t scratch_frames_peak = 0;
+  uint64_t scratch_split_corners_peak = 0; // in dwords of the PN split-corner bitset
   // Allocations that did not fit in the frame's slice, so those draws were dropped. Must be 0;
   // if it ever is not, the slice is too small - the numbers to size it by are the two peaks.
   uint64_t scratch_exhausted = 0;
@@ -359,6 +360,11 @@ ScratchAlloc AllocateScratchLights(uint32_t count);
 ScratchAlloc AllocateScratchMaterials(uint32_t count);
 ScratchAlloc AllocateScratchMapLights(uint32_t count);
 ScratchAlloc AllocateScratchFrames(uint32_t count);
+// The PN-triangle split-corner bitset (§4.71): one bit per canonical vertex, saying that the mesh
+// has split this corner into vertices carrying different normals and the tangent term there must
+// therefore be zeroed. Sized in DWORDS rather than in corners, because that is the unit the
+// shader addresses - `bits[i >> 5] & (1u << (i & 31))`.
+ScratchAlloc AllocateScratchSplitCorners(uint32_t dwords);
 
 // The scratch vertex buffer's shader-readable address, and the index scratch as a handle. The
 // address carries the current slice, so it is only valid for the scene now being recorded -
@@ -370,6 +376,7 @@ uint64_t ScratchLightAddress();
 uint64_t ScratchMaterialAddress();
 uint64_t ScratchMapLightAddress();
 uint64_t ScratchFrameAddress();
+uint64_t ScratchSplitCornerAddress();
 // The same slice as a bindable handle and a byte offset, for the one consumer that binds it as a
 // descriptor rather than reaching it by address - the light-grid compute pass, which writes and
 // therefore uses a plain storage binding. Handle as uint64_t for the reason above.

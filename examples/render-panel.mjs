@@ -344,6 +344,10 @@ export function draw_render_panel(ImGui) {
       "Snap a near-flat corner to exactly flat. Only 6.4% of level02's map triangles " +
         "are fully flat on their own, so this is what keeps walls from doming.",
       "%.3f");
+    toggle(ImGui, "pn_seam_fix", "pn_seam_fix",
+      "Zero the tangent term where the mesh has split a corner into two differently-" +
+        "normalled vertices, which is what keeps a material boundary from tearing open. " +
+        "Off reproduces the tear; seam_census below is the check.");
     toggle(ImGui, "tess_shadows", "tess_shadows",
       "Amplify in the shadow passes too. Separable because the bake is where the " +
         "cost is - and re-baking is what makes a change here visible in the atlas.");
@@ -354,6 +358,12 @@ export function draw_render_panel(ImGui) {
     ImGui.SetItemTooltip(
       "How much of the frame carries smooth normals at all - which is the ceiling on " +
         "what this feature can reach. Reads the arena back; do not call it per frame."
+    );
+    readoutButton(ImGui, "seam_census", () => render.seam_census());
+    ImGui.SetItemTooltip(
+      "Where two triangles meet, do their two patches agree? A corner the mesh has split " +
+        "into two differently-normalled vertices tears open, and this prices it in world " +
+        "units at the knobs above. Reads the arena back; do not call it per frame."
     );
     ImGui.EndDisabled();
     ImGui.TreePop();

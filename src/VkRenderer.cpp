@@ -791,6 +791,16 @@ void DrawFrame() {
   static const uint16_t record_site = prof::RegisterSite("vulkan/record", prof::Cat::Render);
   prof::Zone record_zone(record_site, prof::Cat::Render);
 
+  // The PN split-corner table (§4.71), and its position is pinned from both sides. It has to be
+  // **before the shadow passes**, which take it through their push block and would otherwise get
+  // an address into the scratch slice about to be overwritten; and **before RecordUploads**,
+  // because it reads the arena back and `RecordUploads` moves this frame's staged copies out of
+  // the pending batch and into `frame.cmd`, where a readback's own `FlushUploads` can no longer
+  // reach them. That window is exactly one frame wide and it is the frame that matters: a level's
+  // geometry is uploaded and first drawn in the same one, so a table built after would be derived
+  // from whatever the arena held before the level loaded. Records no commands itself.
+  PrepareTessellationTables();
+
   RecordUploads(frame.cmd, FrameIndex);
 
   // Outside any render pass, which is the whole reason it is here and not in RecordDraws: a

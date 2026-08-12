@@ -296,6 +296,17 @@ constexpr VkDeviceSize kSmallScratchMapLightBytes = 1024u * sizeof(GpuMapLight);
 // element past the end.
 constexpr VkDeviceSize kScratchFrameBytes = 64u * sizeof(GpuFrameData);
 
+// The PN-triangle split-corner bitset (§4.71): one bit per canonical vertex of the tessellated
+// set, refilled every frame. 16,384 dwords is 524,288 vertices, against level03's 3,216 map
+// triangles - four orders of magnitude of headroom, for 64 KB a slice.
+//
+// **Per-frame scratch rather than a buffer of its own**, for the reason the map-light rig above
+// gives and with the same caveat: the set is static for a whole level, so a device-local upload
+// would be strictly better. Refilling it is a memcpy of a few hundred bytes on a real level and
+// it reuses fencing that is already proven, which is the cheaper thing to be wrong about.
+constexpr VkDeviceSize kScratchSplitCornerBytes = 16384u * sizeof(uint32_t);
+constexpr VkDeviceSize kSmallScratchSplitCornerBytes = 4096u * sizeof(uint32_t);
+
 struct Scratch {
   VkBuffer buffer = VK_NULL_HANDLE;
   VmaAllocation allocation = VK_NULL_HANDLE;
@@ -313,6 +324,7 @@ Scratch ScratchLights;
 Scratch ScratchMaterials;
 Scratch ScratchMapLights;
 Scratch ScratchFrames;
+Scratch ScratchSplitCorners;
 // Which slice the scene now being recorded writes into. It belongs to the *scene*, not to a
 // frame in flight - see kScratchSlices.
 uint32_t ScratchSlice = 0;
@@ -1043,6 +1055,8 @@ bool StartResources() {
   const VkDeviceSize scratch_map_light =
       SmallHeaps ? kSmallScratchMapLightBytes : kScratchMapLightBytes;
   const VkDeviceSize scratch_frame = kScratchFrameBytes;
+  const VkDeviceSize scratch_split =
+      SmallHeaps ? kSmallScratchSplitCornerBytes : kScratchSplitCornerBytes;
 
   VmaVulkanFunctions functions = {};
   functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
@@ -1082,6 +1096,8 @@ bool StartResources() {
                      "map light") ||
       !CreateScratch(ScratchFrames, scratch_frame, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                      "frame data") ||
+      !CreateScratch(ScratchSplitCorners, scratch_split,
+                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, "split corner") ||
       !CreateBindlessSet()) {
     return false;
   }
@@ -1512,7 +1528,7 @@ uint32_t MippedSamplerFor(uint32_t sampler_index) {
 }
 
 void RotateFrameScratch() {
-  // Rewrites base/head for all seven slices; AllocateScratch reads both. See the note there.
+  // Rewrites base/head for all eight slices; AllocateScratch reads both. See the note there.
   ResourceGuard guard(ResourceLock);
   if (!Ready) {
     return;
@@ -1520,7 +1536,7 @@ void RotateFrameScratch() {
   ScratchSlice = (ScratchSlice + 1) % kScratchSlices;
   for (Scratch *scratch :
        {&ScratchVertices, &ScratchIndices, &ScratchDraws, &ScratchLights, &ScratchMaterials,
-        &ScratchMapLights, &ScratchFrames}) {
+        &ScratchMapLights, &ScratchFrames, &ScratchSplitCorners}) {
     scratch->base = scratch->slice * ScratchSlice;
     scratch->head = 0;
   }
@@ -1533,7 +1549,7 @@ void ResetFrameScratch() {
   }
   for (Scratch *scratch :
        {&ScratchVertices, &ScratchIndices, &ScratchDraws, &ScratchLights, &ScratchMaterials,
-        &ScratchMapLights, &ScratchFrames}) {
+        &ScratchMapLights, &ScratchFrames, &ScratchSplitCorners}) {
     scratch->head = 0;
   }
 }
@@ -1618,6 +1634,14 @@ ScratchAlloc AllocateScratchFrames(uint32_t count) {
 ScratchAlloc AllocateScratchMapLights(uint32_t count) {
   return AllocateScratch(ScratchMapLights, count, static_cast<uint32_t>(sizeof(GpuMapLight)),
                          TheStats.scratch_map_lights_peak);
+}
+
+// Sized in DWORDS rather than in corners, because that is the unit the shader addresses: a bit
+// per canonical vertex, so the caller's `(count + 31) / 32` is the allocation and the shader's
+// `bits[i >> 5] & (1u << (i & 31))` is the read.
+ScratchAlloc AllocateScratchSplitCorners(uint32_t dwords) {
+  return AllocateScratch(ScratchSplitCorners, dwords, static_cast<uint32_t>(sizeof(uint32_t)),
+                         TheStats.scratch_split_corners_peak);
 }
 
 ScratchAlloc AllocateScratchMaterials(uint32_t count) {
@@ -1713,6 +1737,10 @@ uint64_t ScratchMapLightAddress() {
 
 uint64_t ScratchFrameAddress() {
   return Ready ? ScratchFrames.address + ScratchFrames.base : 0;
+}
+
+uint64_t ScratchSplitCornerAddress() {
+  return Ready ? ScratchSplitCorners.address + ScratchSplitCorners.base : 0;
 }
 
 uint64_t ScratchMapLightVkBuffer() {
@@ -2493,7 +2521,7 @@ void ShutdownResources() {
   }
   for (Scratch *scratch :
        {&ScratchVertices, &ScratchIndices, &ScratchDraws, &ScratchLights, &ScratchMaterials,
-        &ScratchMapLights, &ScratchFrames}) {
+        &ScratchMapLights, &ScratchFrames, &ScratchSplitCorners}) {
     if (scratch->buffer != VK_NULL_HANDLE) {
       vmaDestroyBuffer(Allocator, scratch->buffer, scratch->allocation);
       *scratch = Scratch();

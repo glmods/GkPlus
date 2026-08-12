@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <set>
 #include <vector>
 
 #include "Core.h"
@@ -576,16 +577,22 @@ struct ShadowPushConstants {
   // note below created.
   float pn_max_offset;
   float tess_factor;
+  // The split-corner table, which shapes the patch and therefore travels with the three knobs
+  // above for exactly their reason: a seam the colour pass now closes would otherwise still cast
+  // the shadow of one torn open (§4.71).
+  uint64_t split_corners;
+  uint32_t split_base;
+  uint32_t split_count;
   // **Slang rounds the block up to its own alignment and this side must too.** The struct
   // contains a float4 array, so its alignment is 16 and its size rounds to a multiple of 16 -
-  // 112, not the 108 the fields once added up to. Caught by `src/gen-shader-abi.py`, which
-  // reported the Slang side as 112 bytes against a 108-byte assert; without it the range and the
-  // push would have disagreed with the shader's idea of the block by four bytes.
+  // 112 before the table below was added, not the 108 the fields then added up to. Caught by
+  // `src/gen-shader-abi.py`, which reported the Slang side as 112 bytes against a 108-byte
+  // assert; without it the range and the push would have disagreed by four bytes.
 };
-// 112: three addresses, two words, the matrix, the three PN scalars, and the pad above. Still
-// inside the guaranteed 128, which this block can afford because it is its own layout rather than
-// a share of the world pass's.
-static_assert(sizeof(ShadowPushConstants) == 112);
+// 128: three addresses, two words, the matrix, the four PN scalars and the split-corner table.
+// **Exactly the guaranteed minimum**, which is the ceiling this block now sits on - anything
+// further needs a descriptor rather than a push, or `maxPushConstantsSize` checked at startup.
+static_assert(sizeof(ShadowPushConstants) == 128);
 
 VkImage ShadowImage = VK_NULL_HANDLE;
 VkFormat ShadowFormat = VK_FORMAT_UNDEFINED;
@@ -687,6 +694,8 @@ bool ShadowTessellating() {
 // switches: they have to be the ones the colour pass used, because the patch is a function of them
 // and the shadow has to be cast by the surface actually drawn. A factor of 1 makes the pass sample
 // that same patch at its corners, which is the untessellated triangle.
+void SplitCornerTableFor(uint64_t &address, uint32_t &base, uint32_t &count);
+
 void FillShadowTessPush(ShadowPushConstants &push) {
   const TessellationParams &tess = TessParams();
   push.pn_strength = tess.pn_strength;
@@ -695,6 +704,9 @@ void FillShadowTessPush(ShadowPushConstants &push) {
   // floored here rather than trusted from the knob.
   push.pn_max_offset = tess.pn_max_offset < 0.0f ? 0.0f : tess.pn_max_offset;
   push.tess_factor = tess.shadow_factor < 1.0f ? 1.0f : tess.shadow_factor;
+  // The same table the colour pass reads, from the same place, for the reason the three knobs
+  // above are here: a seam the world pass now closes must not still cast a torn shadow.
+  SplitCornerTableFor(push.split_corners, push.split_base, push.split_count);
 }
 bool ShadowReady = false;
 bool SunShadowsEnabled = true;
@@ -3139,7 +3151,290 @@ void UploadMapLights() {
   FrameMapLightCount = static_cast<uint32_t>(lights.size());
   FrameMapAmbience = MapAmbience();
 }
+// Bounded rather than unbounded, and the report says how many it skipped: a silent cap would
+// read as "the whole frame is flat" when it means "most of the frame was never looked at".
+constexpr uint32_t kMaxCensusDraws = 512;
+
+// What a census did not look at. Carried rather than discarded for the reason above: a report
+// that answers for a subset and does not say so is worse than no report.
+struct CensusSkips {
+  uint32_t source = 0, topology = 0, over_cap = 0, read_failures = 0, examined = 0;
+};
+
+// One draw's indices and the canonical vertices they address, read out of the arena.
+//
+// `lowest` comes back as the vertex the span starts at, so a triangle's corner `k` of triangle
+// `t` is `vertices[base_vertex + indices[t + k] + vertex_offset - lowest]`.
+//
+// One read for the whole draw rather than one per triangle, because `ReadArena` submits and
+// waits; and the span is derived from the indices rather than assumed to start at `base_vertex`,
+// since `base_vertex + index + vertex_offset` is what the shader addresses.
+bool ReadDrawGeometry(const DrawItem &item, CensusSkips &skips, std::vector<uint32_t> &indices,
+                      std::vector<CanonicalVertex> &vertices, int64_t &lowest) {
+  // Both sources must be the arena: the scratch is a different buffer and rotates, and a
+  // non-indexed draw has no shared vertices for a normal to be averaged across in the first
+  // place - so neither can answer a census question even in principle.
+  if (!item.indexed || item.vertex_source != DrawSource::Arena ||
+      item.index_source != DrawSource::Arena) {
+    ++skips.source;
+    return false;
+  }
+  if (item.pipeline.topology != 4 /* D3DPT_TRIANGLELIST */ || item.count < 3) {
+    ++skips.topology;
+    return false;
+  }
+  if (skips.examined >= kMaxCensusDraws) {
+    ++skips.over_cap;
+    return false;
+  }
+  ++skips.examined;
+
+  const uint32_t stride = item.index_stride == 4 ? 4u : 2u;
+  std::vector<uint8_t> index_bytes(size_t(item.count) * stride, 0);
+  if (!ReadArena(false, uint64_t(item.first_index) * stride, uint32_t(index_bytes.size()),
+                 index_bytes.data())) {
+    ++skips.read_failures;
+    return false;
+  }
+  indices.resize(item.count);
+  for (uint32_t i = 0; i < item.count; ++i) {
+    indices[i] = stride == 4 ? reinterpret_cast<const uint32_t *>(index_bytes.data())[i]
+                             : reinterpret_cast<const uint16_t *>(index_bytes.data())[i];
+  }
+
+  lowest = INT64_MAX;
+  int64_t highest = INT64_MIN;
+  for (const uint32_t index : indices) {
+    const int64_t v = int64_t(item.base_vertex) + int64_t(index) + item.vertex_offset;
+    lowest = v < lowest ? v : lowest;
+    highest = v > highest ? v : highest;
+  }
+  if (lowest < 0 || highest < lowest) {
+    ++skips.read_failures;
+    return false;
+  }
+  const uint64_t span = uint64_t(highest - lowest) + 1;
+  vertices.assign(size_t(span), CanonicalVertex{});
+  if (!ReadArena(true, uint64_t(lowest) * sizeof(CanonicalVertex),
+                 uint32_t(span * sizeof(CanonicalVertex)), vertices.data())) {
+    ++skips.read_failures;
+    return false;
+  }
+  return true;
+}
+
+// --- the PN split-corner table (§4.71) --------------------------------------------------------
+//
+// **The fix for the tear at a material boundary**, and it is a data fix because it cannot be
+// anything else: `b210` for edge (P1,P2) is a function of P1, P2 and N1 alone, so the two
+// triangles sharing that edge build the same boundary curve only while they present the same
+// normal at each end. Where the mesh has split a corner into two vertices carrying different
+// normals - an exporter at a material boundary or a smoothing-group break - they do not, and the
+// two patches pull apart. A patch sees only its own three normals, so nothing in the shader can
+// close it; the only quantities both sides could agree on are the two positions.
+//
+// So the question is answered here, where the whole mesh is visible, and the answer travels down
+// as one bit per canonical vertex. **The bit means "the mesh says this corner is not smooth"**,
+// which makes zeroing its tangent term the right answer and not merely a safe one - an
+// intentional hard edge stays hard instead of being averaged into a smooth one, which is what
+// reconciling the two normals would have done.
+//
+// Positions are keyed on their **bit patterns**, exactly as `render.seam_census()` keys an edge,
+// because that is what makes a split corner one corner rather than two.
+struct SplitPosition {
+  float normal[3];                  // the first normal seen here
+  std::vector<uint32_t> vertices;   // every canonical vertex at this position
+  bool split = false;
+};
+
+struct PositionKey {
+  uint32_t bits[3];
+  bool operator<(const PositionKey &o) const {
+    return std::memcmp(bits, o.bits, sizeof(bits)) < 0;
+  }
+};
+
+// **Analysis is per draw and each draw is analysed once**, keyed on the three fields that say
+// which vertices it addresses. A draw's identity cannot be its index in the list: culling
+// reorders and resizes that every frame, which would re-read the whole set forever.
+struct DrawKey {
+  uint32_t base_vertex, first_index, count;
+  bool operator<(const DrawKey &o) const {
+    return base_vertex != o.base_vertex     ? base_vertex < o.base_vertex
+           : first_index != o.first_index   ? first_index < o.first_index
+                                            : count < o.count;
+  }
+};
+
+std::map<PositionKey, SplitPosition> SplitPositions;
+std::set<DrawKey> SplitAnalysedDraws;
+std::set<uint32_t> SplitVertices; // the answer: which canonical vertices are split corners
+uint32_t SplitGeneration = UINT32_MAX;
+uint32_t SplitBase = 0, SplitCount = 0;
+uint64_t SplitAddress = 0;
+uint32_t SplitPending = 0;   // draws seen this frame that have not been analysed yet
+bool SplitTooLarge = false;  // the bitset would not fit its scratch slice
+bool SplitCornerFixOn = true;
+
+// **Bounded per frame, not per level.** The analysis is `ReadArena`, which submits and waits, and
+// a level's first tessellated frame sees ~65 map draws at once - reading all of them in one frame
+// is a visible hitch where spreading them over eight is not. Until a draw has been analysed its
+// corners read as unsplit, which is the behaviour that existed before this table, so the cost of
+// converging slowly is a few frames of the old tear rather than anything new.
+constexpr uint32_t kSplitDrawsPerFrame = 8;
+
+void ResetSplitCorners() {
+  SplitPositions.clear();
+  SplitAnalysedDraws.clear();
+  SplitVertices.clear();
+  SplitBase = 0;
+  SplitCount = 0;
+  SplitTooLarge = false;
+}
+
+// Records one corner. The first normal at a position is kept as the reference; a second, different
+// one marks the position split and every vertex ever seen at it - including the ones recorded
+// before the disagreement showed up, which is why the vertex list is kept rather than a count.
+void NoteSplitCorner(const CanonicalVertex &vertex, uint32_t index) {
+  PositionKey key;
+  std::memcpy(key.bits, vertex.pos, sizeof(key.bits));
+  SplitPosition &entry = SplitPositions[key];
+  if (entry.vertices.empty()) {
+    std::memcpy(entry.normal, vertex.normal, sizeof(entry.normal));
+  } else if (!entry.split &&
+             std::memcmp(entry.normal, vertex.normal, sizeof(entry.normal)) != 0) {
+    entry.split = true;
+    for (const uint32_t seen : entry.vertices) {
+      SplitVertices.insert(seen);
+    }
+  }
+  // Guarded, because a position is revisited by every triangle that touches it and the list is
+  // walked on the transition above.
+  if (std::find(entry.vertices.begin(), entry.vertices.end(), index) == entry.vertices.end()) {
+    entry.vertices.push_back(index);
+  }
+  if (entry.split) {
+    SplitVertices.insert(index);
+  }
+}
+
+bool WantsTessellation(const DrawItem &item);
+
+// Analyses up to `kSplitDrawsPerFrame` of the frame's tessellated draws that have not been seen
+// before. Called from UploadFrameData, so `Items` is this frame's complete list.
+void UpdateSplitCorners() {
+  // `MapLightsGeneration()` moves on a level change and on nothing else, which is exactly the
+  // event that invalidates every vertex index here.
+  const uint32_t generation = MapLightsGeneration();
+  if (generation != SplitGeneration) {
+    SplitGeneration = generation;
+    ResetSplitCorners();
+  }
+  SplitPending = 0;
+  if (!SplitCornerFixOn || !TessellationEnabled()) {
+    return;
+  }
+  CensusSkips skips;
+  std::vector<CanonicalVertex> vertices;
+  std::vector<uint32_t> indices;
+  uint32_t analysed = 0;
+  for (const DrawItem &item : Items) {
+    if (!WantsTessellation(item)) {
+      continue;
+    }
+    const DrawKey key = {item.base_vertex, item.first_index, item.count};
+    if (SplitAnalysedDraws.count(key) != 0) {
+      continue;
+    }
+    if (analysed >= kSplitDrawsPerFrame) {
+      ++SplitPending;
+      continue;
+    }
+    int64_t lowest = 0;
+    if (!ReadDrawGeometry(item, skips, indices, vertices, lowest)) {
+      // Insert anyway: a draw this cannot read is one it will never be able to read, and
+      // retrying it every frame would stall the frame forever.
+      SplitAnalysedDraws.insert(key);
+      continue;
+    }
+    ++analysed;
+    SplitAnalysedDraws.insert(key);
+    for (uint32_t i = 0; i < item.count; ++i) {
+      const int64_t absolute = int64_t(item.base_vertex) + int64_t(indices[i]) + item.vertex_offset;
+      NoteSplitCorner(vertices[size_t(absolute - lowest)], uint32_t(absolute));
+    }
+  }
+}
+
+// Copies the bitset into this frame's scratch and returns its address, so the fields written into
+// GpuFrameData and every ShadowPushConstants come from one place and cannot disagree.
+//
+// The bitset spans only the split vertices themselves - `base` is the lowest and `count` the
+// span - because they are what has to be addressed, and an arena offset is far from zero.
+void UploadSplitCorners() {
+  SplitAddress = 0;
+  SplitBase = 0;
+  SplitCount = 0;
+  if (SplitVertices.empty()) {
+    return;
+  }
+  const uint32_t lowest = *SplitVertices.begin();
+  const uint32_t highest = *SplitVertices.rbegin();
+  const uint32_t count = highest - lowest + 1;
+  const uint32_t dwords = (count + 31u) / 32u;
+  const ScratchAlloc alloc = AllocateScratchSplitCorners(dwords);
+  if (!alloc.valid || alloc.mapped == nullptr) {
+    // The slice could not hold it. Reported rather than silently truncated: half a table closes
+    // half the seams and leaves the rest torn, which reads as the fix not working.
+    SplitTooLarge = true;
+    return;
+  }
+  SplitTooLarge = false;
+  auto *bits = static_cast<uint32_t *>(alloc.mapped);
+  std::memset(bits, 0, size_t(dwords) * sizeof(uint32_t));
+  for (const uint32_t vertex : SplitVertices) {
+    const uint32_t index = vertex - lowest;
+    bits[index >> 5u] |= 1u << (index & 31u);
+  }
+  SplitAddress = ScratchSplitCornerAddress() + uint64_t(alloc.offset) * sizeof(uint32_t);
+  SplitBase = lowest;
+  SplitCount = count;
+}
+
+void SplitCornerTableFor(uint64_t &address, uint32_t &base, uint32_t &count) {
+  address = SplitAddress;
+  base = SplitBase;
+  count = SplitAddress != 0 ? SplitCount : 0;
+}
 } // namespace
+
+// Built before any pass reads it, which is why this is its own entry point rather than a line in
+// UploadFrameData: the shadow bakes take the same table through their push block, and they are
+// recorded *before* RecordDraws. The address is into the frame scratch, so a table built after
+// the shadow pass would hand it the previous slice - the one being overwritten.
+void PrepareTessellationTables() {
+  UpdateSplitCorners();
+  UploadSplitCorners();
+}
+
+void SetSplitCornerFix(bool enabled) {
+  if (SplitCornerFixOn != enabled) {
+    SplitCornerFixOn = enabled;
+    // Cleared rather than kept, so turning it back on re-derives the table instead of trusting
+    // one built before whatever the caller changed in between.
+    ResetSplitCorners();
+  }
+}
+
+bool SplitCornerFix() { return SplitCornerFixOn; }
+
+void SplitCornerCounts(uint32_t &corners, uint32_t &analysed_draws, uint32_t &pending_draws,
+                       bool &too_large) {
+  corners = static_cast<uint32_t>(SplitVertices.size());
+  analysed_draws = static_cast<uint32_t>(SplitAnalysedDraws.size());
+  pending_draws = SplitPending;
+  too_large = SplitTooLarge;
+}
 
 // One GpuFrameData for this frame, written after the lights are uploaded (so the addresses are
 // this frame's) and before any draw is recorded (so every draw's push points at the same block).
@@ -3185,6 +3480,9 @@ void UploadFrameData() {
   frame->target_width = float(ViewportWidth);
   frame->target_height = float(ViewportHeight);
   frame->pn_max_offset = tess.pn_max_offset < 0.0f ? 0.0f : tess.pn_max_offset;
+  frame->split_corners = SplitAddress;
+  frame->split_base = SplitBase;
+  frame->split_count = SplitAddress != 0 ? SplitCount : 0;
   frame->map_light_gain = MapLightGainValue;
   frame->map_ambience = FrameMapAmbience;
   frame->map_light_count = FrameMapLightCount;
@@ -6121,9 +6419,6 @@ void CensusText(std::string &out, const char *what, const NormalCensus &c) {
   out += line;
 }
 
-// Bounded rather than unbounded, and the report says how many it skipped: a silent cap would
-// read as "the whole frame is flat" when it means "most of the frame was never looked at".
-constexpr uint32_t kMaxCensusDraws = 512;
 } // namespace
 
 std::string DescribeNormalCensus() {
@@ -6134,63 +6429,14 @@ std::string DescribeNormalCensus() {
   // Read from the live knob rather than hard-coded, so the cap row below answers "what does the
   // current setting do to this frame" - which is what makes a REPL sweep of it readable.
   const double cap = double(TessParams().pn_max_offset);
-  uint32_t skipped_source = 0, skipped_topology = 0, over_cap = 0, read_failures = 0;
-  uint32_t examined = 0;
+  CensusSkips skips;
 
-  std::vector<uint8_t> index_bytes;
   std::vector<CanonicalVertex> vertices;
   std::vector<uint32_t> indices;
 
   for (const DrawItem &item : LastItems) {
-    // Both sources must be the arena: the scratch is a different buffer and rotates, and a
-    // non-indexed draw has no shared vertices for a normal to be averaged across in the first
-    // place - so neither can answer this question even in principle.
-    if (!item.indexed || item.vertex_source != DrawSource::Arena ||
-        item.index_source != DrawSource::Arena) {
-      ++skipped_source;
-      continue;
-    }
-    if (item.pipeline.topology != 4 /* D3DPT_TRIANGLELIST */ || item.count < 3) {
-      ++skipped_topology;
-      continue;
-    }
-    if (examined >= kMaxCensusDraws) {
-      ++over_cap;
-      continue;
-    }
-    ++examined;
-
-    const uint32_t stride = item.index_stride == 4 ? 4u : 2u;
-    index_bytes.assign(size_t(item.count) * stride, 0);
-    if (!ReadArena(false, uint64_t(item.first_index) * stride,
-                   uint32_t(index_bytes.size()), index_bytes.data())) {
-      ++read_failures;
-      continue;
-    }
-    indices.resize(item.count);
-    for (uint32_t i = 0; i < item.count; ++i) {
-      indices[i] = stride == 4 ? reinterpret_cast<const uint32_t *>(index_bytes.data())[i]
-                               : reinterpret_cast<const uint16_t *>(index_bytes.data())[i];
-    }
-
-    // One read for the whole draw rather than one per triangle: ReadArena submits and waits.
-    // The span is what the shader would address - `base_vertex + index + vertex_offset` - so it
-    // is derived from the indices rather than assumed to start at base_vertex.
-    int64_t lowest = INT64_MAX, highest = INT64_MIN;
-    for (const uint32_t index : indices) {
-      const int64_t v = int64_t(item.base_vertex) + int64_t(index) + item.vertex_offset;
-      lowest = v < lowest ? v : lowest;
-      highest = v > highest ? v : highest;
-    }
-    if (lowest < 0 || highest < lowest) {
-      ++read_failures;
-      continue;
-    }
-    const uint64_t span = uint64_t(highest - lowest) + 1;
-    vertices.assign(size_t(span), CanonicalVertex{});
-    if (!ReadArena(true, uint64_t(lowest) * sizeof(CanonicalVertex),
-                   uint32_t(span * sizeof(CanonicalVertex)), vertices.data())) {
-      ++read_failures;
+    int64_t lowest = 0;
+    if (!ReadDrawGeometry(item, skips, indices, vertices, lowest)) {
       continue;
     }
 
@@ -6254,14 +6500,409 @@ std::string DescribeNormalCensus() {
                 "  the metric is |dot(normalize(edge), normal)| - the PN tangent term over edge "
                 "length,\n"
                 "  so a corner reading d bulges its edge by about d * length / 3\n",
-                static_cast<unsigned>(LastItems.size()), examined);
+                static_cast<unsigned>(LastItems.size()), skips.examined);
   out += line;
   CensusText(out, "map geometry (IsMapGeometry)", map);
   CensusText(out, "everything else (props, units, effects)", other);
   std::snprintf(line, sizeof(line),
                 "  not examined: %u not arena-indexed, %u not a triangle list, %u over the %u "
                 "draw cap, %u arena read failures\n",
-                skipped_source, skipped_topology, over_cap, kMaxCensusDraws, read_failures);
+                skips.source, skips.topology, skips.over_cap, kMaxCensusDraws,
+                skips.read_failures);
+  out += line;
+  return out;
+}
+
+namespace {
+// --- the seam census (§4.71) ------------------------------------------------------------------
+//
+// The normal census answers "is there curvature for tessellation to find". This one answers the
+// question that comes *after* it: **where two triangles meet, do their two PN patches agree?**
+//
+// The construction's watertight property is conditional, and the condition is about the DATA
+// rather than about the arithmetic: `b210` for edge (P1,P2) is a function of P1, P2 and N1
+// alone, so the two triangles sharing that edge build the same boundary curve **provided they
+// present the same P and the same N at each end**. Where the mesh splits a corner into two
+// vertices with different normals - which is what an exporter does at a material boundary or a
+// smoothing-group break - the two curves are different curves through the same two points, and
+// the patches pull apart into a visible tear whose width is bounded by the mid-edge deviation.
+//
+// So this walks the frame's triangles, keys every edge on the bit patterns of its two endpoint
+// positions, and for each edge used by exactly two triangles measures the widest separation of
+// the two boundary curves in world units. Keying on the position BITS rather than on the index
+// is the whole point: a duplicated corner has a different index in each draw and the identical
+// position, which is exactly the case that has to be caught.
+
+// An edge, canonically ordered so the two triangles sharing it produce the same key.
+struct SeamKey {
+  uint32_t bits[6];
+  bool operator<(const SeamKey &o) const {
+    return std::memcmp(bits, o.bits, sizeof(bits)) < 0;
+  }
+};
+
+// One triangle's view of an edge: the two endpoint normals, in the key's own order.
+struct SeamSide {
+  float normal_a[3], normal_b[3];
+  bool tessellated;
+  bool map_geometry;
+};
+
+struct SeamEntry {
+  SeamKey key;
+  SeamSide side[2];
+  uint32_t uses; // counted past 2, so a non-manifold edge is reported rather than silently kept
+};
+
+SeamKey MakeSeamKey(const float *a, const float *b, bool &swapped) {
+  uint32_t pa[3], pb[3];
+  std::memcpy(pa, a, sizeof(pa));
+  std::memcpy(pb, b, sizeof(pb));
+  // Ordered on the raw bit patterns and not on the float values: this only has to be a total
+  // order that both sides agree on, and NaN or a signed zero would make a value comparison
+  // disagree with itself. A -0.0 and a +0.0 corner would key apart, which is the one case this
+  // gets wrong - and it is the right way round, since it reports a seam that is not one rather
+  // than hiding one that is.
+  swapped = std::memcmp(pa, pb, sizeof(pa)) > 0;
+  SeamKey key;
+  std::memcpy(key.bits, swapped ? pb : pa, sizeof(pa));
+  std::memcpy(key.bits + 3, swapped ? pa : pb, sizeof(pb));
+  return key;
+}
+
+// `pn_weight` from world.slang, on the CPU and at the live settings, so this reports the tear the
+// current knobs produce rather than the one the defaults would. Kept deliberately expression-for-
+// expression with the shader - if the two ever disagree, this instrument is the thing that lies.
+double PnWeight(const float *pi, const float *pj, const double *ni_unit,
+                const TessellationParams &p) {
+  const double edge[3] = {double(pj[0]) - pi[0], double(pj[1]) - pi[1], double(pj[2]) - pi[2]};
+  const double length_sq = edge[0] * edge[0] + edge[1] * edge[1] + edge[2] * edge[2];
+  if (length_sq < 1e-18) {
+    return 0.0;
+  }
+  const double w = edge[0] * ni_unit[0] + edge[1] * ni_unit[1] + edge[2] * ni_unit[2];
+  const double threshold = double(p.pn_flat_threshold);
+  if (w * w <= threshold * threshold * length_sq) {
+    return 0.0;
+  }
+  const double limit = 3.0 * double(p.pn_max_offset);
+  const double clamped = w < -limit ? -limit : (w > limit ? limit : w);
+  return clamped * double(p.pn_strength);
+}
+
+// False when the normal is unusable, which is not the same as flat: `normalize` on a zero vector
+// is a NaN in the shader too, so a corner with no normal is a case this cannot answer rather than
+// one it should score as agreeing.
+bool UnitNormal(const float *n, double *out) {
+  const double length =
+      std::sqrt(double(n[0]) * n[0] + double(n[1]) * n[1] + double(n[2]) * n[2]);
+  if (length < 1e-9) {
+    return false;
+  }
+  out[0] = n[0] / length;
+  out[1] = n[1] / length;
+  out[2] = n[2] / length;
+  return true;
+}
+
+// The two interior control points of the cubic boundary curve, in the key's order.
+//
+// On edge (p1,p2) the domain shader's third barycentric is zero, so the position collapses to
+// `p1*u^3 + 3*b210*u^2*v + 3*b120*u*v^2 + p2*v^3` with `u = 1-t, v = t` - an ordinary cubic
+// Bezier with control points p1, b210, b120, p2. Only the middle two can differ between the two
+// triangles, so they are the whole tear.
+// `split_a`/`split_b` are the shader's own rule: a corner the mesh has split contributes no
+// tangent term, so that end of the curve is linear on both sides and cannot disagree.
+bool BoundaryControls(const float *pa, const float *pb, const float *na, const float *nb,
+                      const TessellationParams &p, bool split_a, bool split_b, double *b1,
+                      double *b2) {
+  double ua[3], ub[3];
+  if (!UnitNormal(na, ua) || !UnitNormal(nb, ub)) {
+    return false;
+  }
+  const double wa = split_a ? 0.0 : PnWeight(pa, pb, ua, p);
+  const double wb = split_b ? 0.0 : PnWeight(pb, pa, ub, p);
+  for (uint32_t i = 0; i < 3; ++i) {
+    b1[i] = (2.0 * pa[i] + pb[i] - wa * ua[i]) / 3.0;
+    b2[i] = (2.0 * pb[i] + pa[i] - wb * ub[i]) / 3.0;
+  }
+  return true;
+}
+
+// The widest separation of two cubics that share their endpoints.
+//
+// Their difference is `3*(1-t)^2*t*db1 + 3*(1-t)*t^2*db2`, a smooth curve vanishing at both
+// ends, so a fixed sample of the interior finds its maximum to well within what this is for.
+// Sampled rather than solved because the answer wanted is "how wide is the tear", not the
+// parameter it is widest at.
+double WidestGap(const double *b1a, const double *b2a, const double *b1b, const double *b2b) {
+  double worst = 0.0;
+  for (uint32_t step = 1; step < 8; ++step) {
+    const double t = double(step) / 8.0;
+    const double u = 1.0 - t;
+    const double ca = 3.0 * u * u * t, cb = 3.0 * u * t * t;
+    double d = 0.0;
+    for (uint32_t i = 0; i < 3; ++i) {
+      const double delta = ca * (b1a[i] - b1b[i]) + cb * (b2a[i] - b2b[i]);
+      d += delta * delta;
+    }
+    worst = d > worst ? d : worst;
+  }
+  return std::sqrt(worst);
+}
+
+struct SeamCensus {
+  uint64_t edges = 0;       // distinct edges seen
+  uint64_t shared = 0;      // used by exactly two triangles
+  uint64_t border = 0;      // used once - a genuine mesh boundary, or a T-junction's long side
+  uint64_t nonmanifold = 0; // used more than twice
+  uint64_t agree = 0;       // shared, and both endpoint normals identical: watertight
+  uint64_t differ = 0;      // shared, normals differ: a tear
+  uint64_t no_normal = 0;   // shared, but a corner carries no normal so the question is undefined
+  uint64_t tess_split = 0;  // shared, and only ONE side takes the tessellated pipeline
+  uint64_t open = 0;        // of `differ`, those whose gap survives the current knobs
+  double gap_total = 0.0;
+  double gap_worst = 0.0;
+  float worst_at[3] = {0.0f, 0.0f, 0.0f};
+  // The same three with the split-corner rule applied - **recomputed here rather than read off
+  // the live table**, so agreeing with the shader is evidence and not a tautology. This is the
+  // check on `render.pn_seam_fix`: it must be 0 open, on every level and at every knob setting.
+  uint64_t open_fixed = 0;
+  double gap_fixed_total = 0.0;
+  double gap_fixed_worst = 0.0;
+};
+
+void SeamText(std::string &out, const char *what, const SeamCensus &c) {
+  char line[768];
+  std::snprintf(
+      line, sizeof(line),
+      "  %s: %llu distinct edges\n"
+      "    shared by two triangles : %10llu  %5s%%\n"
+      "      normals agree         : %10llu  %5s%%   <- watertight by construction\n"
+      "      normals differ        : %10llu  %5s%%   <- a tear unless the knobs close it\n"
+      "      a corner has no normal: %10llu  %5s%%\n"
+      "      only one side tessellated: %7llu  %5s%%   <- a tear the predicates opened\n"
+      "    used once (mesh border) : %10llu  %5s%%\n"
+      "    used more than twice    : %10llu  %5s%%\n",
+      what, (unsigned long long)c.edges, (unsigned long long)c.shared,
+      Percent(c.shared, c.edges).c_str(), (unsigned long long)c.agree,
+      Percent(c.agree, c.shared).c_str(), (unsigned long long)c.differ,
+      Percent(c.differ, c.shared).c_str(), (unsigned long long)c.no_normal,
+      Percent(c.no_normal, c.shared).c_str(), (unsigned long long)c.tess_split,
+      Percent(c.tess_split, c.shared).c_str(), (unsigned long long)c.border,
+      Percent(c.border, c.edges).c_str(), (unsigned long long)c.nonmanifold,
+      Percent(c.nonmanifold, c.edges).c_str());
+  out += line;
+  if (c.differ == 0) {
+    return;
+  }
+  std::snprintf(line, sizeof(line),
+                "    the gap at the current pn_strength / pn_flat_threshold / pn_max_offset:\n"
+                "      %llu of the %llu still open (%s%%), mean %.4f, worst %.4f world units\n"
+                "      worst at (%.2f, %.2f, %.2f)\n"
+                "    ... and with the split-corner rule applied (render.pn_seam_fix):\n"
+                "      %llu still open, mean %.4f, worst %.4f   <- has to be 0\n",
+                (unsigned long long)c.open, (unsigned long long)c.differ,
+                Percent(c.open, c.differ).c_str(),
+                c.open == 0 ? 0.0 : c.gap_total / double(c.open), c.gap_worst, c.worst_at[0],
+                c.worst_at[1], c.worst_at[2], (unsigned long long)c.open_fixed,
+                c.open_fixed == 0 ? 0.0 : c.gap_fixed_total / double(c.open_fixed),
+                c.gap_fixed_worst);
+  out += line;
+}
+} // namespace
+
+std::string DescribeSeamCensus() {
+  if (LastItems.empty()) {
+    return "no frame has been recorded yet\n";
+  }
+  const TessellationParams &params = TessParams();
+  CensusSkips skips;
+  std::map<SeamKey, SeamEntry> edges;
+  // The split-corner rule, re-derived here from the frame's own geometry rather than read off the
+  // live table. That is what makes "0 still open with the rule applied" evidence about the rule
+  // instead of a restatement of whatever the table happens to hold: two independent walks of the
+  // same mesh have to reach the same set. Keyed on the position, like everything else here.
+  // Comparing every corner against the FIRST normal seen at its position is enough to answer
+  // "are they all equal", which is the question - a third normal that matches the first still
+  // leaves the position split, and the flag is never cleared.
+  struct CensusSplit {
+    float normal[3];
+    bool split;
+  };
+  std::map<PositionKey, CensusSplit> split;
+  std::vector<CanonicalVertex> vertices;
+  std::vector<uint32_t> indices;
+  uint64_t triangles = 0;
+
+  const auto note_split = [&split](const CanonicalVertex &vertex) {
+    PositionKey key;
+    std::memcpy(key.bits, vertex.pos, sizeof(key.bits));
+    const auto found = split.find(key);
+    if (found == split.end()) {
+      CensusSplit entry = {};
+      std::memcpy(entry.normal, vertex.normal, sizeof(entry.normal));
+      split.emplace(key, entry);
+    } else if (std::memcmp(found->second.normal, vertex.normal,
+                           sizeof(found->second.normal)) != 0) {
+      found->second.split = true;
+    }
+  };
+  const auto is_split = [&split](const float *pos) {
+    PositionKey key;
+    std::memcpy(key.bits, pos, sizeof(key.bits));
+    const auto found = split.find(key);
+    return found != split.end() && found->second.split;
+  };
+
+  for (const DrawItem &item : LastItems) {
+    int64_t lowest = 0;
+    if (!ReadDrawGeometry(item, skips, indices, vertices, lowest)) {
+      continue;
+    }
+    const bool is_map = IsMapGeometry(item);
+    const bool tessellated = WantsTessellation(item);
+    for (uint32_t t = 0; t + 2 < item.count; t += 3) {
+      const CanonicalVertex *corner[3];
+      for (uint32_t k = 0; k < 3; ++k) {
+        const int64_t v =
+            int64_t(item.base_vertex) + int64_t(indices[t + k]) + item.vertex_offset - lowest;
+        corner[k] = &vertices[size_t(v)];
+      }
+      ++triangles;
+      for (uint32_t k = 0; k < 3; ++k) {
+        note_split(*corner[k]);
+      }
+      for (uint32_t k = 0; k < 3; ++k) {
+        const CanonicalVertex &a = *corner[k];
+        const CanonicalVertex &b = *corner[(k + 1) % 3];
+        bool swapped = false;
+        const SeamKey key = MakeSeamKey(a.pos, b.pos, swapped);
+        SeamEntry &entry = edges[key];
+        entry.key = key;
+        if (entry.uses < 2) {
+          SeamSide &side = entry.side[entry.uses];
+          const CanonicalVertex &first = swapped ? b : a;
+          const CanonicalVertex &second = swapped ? a : b;
+          std::memcpy(side.normal_a, first.normal, sizeof(side.normal_a));
+          std::memcpy(side.normal_b, second.normal, sizeof(side.normal_b));
+          side.tessellated = tessellated;
+          side.map_geometry = is_map;
+        }
+        ++entry.uses;
+      }
+    }
+  }
+
+  size_t split_positions = 0;
+  for (const auto &pair : split) {
+    split_positions += pair.second.split ? 1 : 0;
+  }
+
+  SeamCensus map, other;
+  for (const auto &pair : edges) {
+    const SeamEntry &entry = pair.second;
+    // An edge is the map's when everything meeting along it is - a seam between the map object
+    // and a prop belongs in neither bucket's "watertight" column, and putting it in `other` is
+    // what keeps the map row answering only for §4.65's set.
+    const bool is_map =
+        entry.side[0].map_geometry && (entry.uses < 2 || entry.side[1].map_geometry);
+    SeamCensus &bucket = is_map ? map : other;
+    ++bucket.edges;
+    if (entry.uses == 1) {
+      ++bucket.border;
+      continue;
+    }
+    if (entry.uses > 2) {
+      ++bucket.nonmanifold;
+      continue;
+    }
+    ++bucket.shared;
+    if (entry.side[0].tessellated != entry.side[1].tessellated) {
+      ++bucket.tess_split;
+    }
+    const bool same = std::memcmp(entry.side[0].normal_a, entry.side[1].normal_a,
+                                  sizeof(entry.side[0].normal_a)) == 0 &&
+                      std::memcmp(entry.side[0].normal_b, entry.side[1].normal_b,
+                                  sizeof(entry.side[0].normal_b)) == 0;
+    if (same) {
+      ++bucket.agree;
+      continue;
+    }
+    const float *pa = reinterpret_cast<const float *>(entry.key.bits);
+    const float *pb = reinterpret_cast<const float *>(entry.key.bits + 3);
+    double b1a[3], b2a[3], b1b[3], b2b[3];
+    if (!BoundaryControls(pa, pb, entry.side[0].normal_a, entry.side[0].normal_b, params, false,
+                          false, b1a, b2a) ||
+        !BoundaryControls(pa, pb, entry.side[1].normal_a, entry.side[1].normal_b, params, false,
+                          false, b1b, b2b)) {
+      ++bucket.no_normal;
+      continue;
+    }
+    ++bucket.differ;
+    const double gap = WidestGap(b1a, b2a, b1b, b2b);
+    if (gap > 0.0) {
+      ++bucket.open;
+      bucket.gap_total += gap;
+      if (gap > bucket.gap_worst) {
+        bucket.gap_worst = gap;
+        bucket.worst_at[0] = pa[0];
+        bucket.worst_at[1] = pa[1];
+        bucket.worst_at[2] = pa[2];
+      }
+    }
+    // The same edge again under the split-corner rule. An edge only reaches here because the two
+    // sides' normals differ, so at least one of its ends IS split by definition - which is why
+    // this must come out at zero, and why a non-zero would mean the rule as implemented is not
+    // the rule as derived rather than that some seam is merely unlucky.
+    const bool split_a = is_split(pa), split_b = is_split(pb);
+    if (BoundaryControls(pa, pb, entry.side[0].normal_a, entry.side[0].normal_b, params, split_a,
+                         split_b, b1a, b2a) &&
+        BoundaryControls(pa, pb, entry.side[1].normal_a, entry.side[1].normal_b, params, split_a,
+                         split_b, b1b, b2b)) {
+      const double fixed = WidestGap(b1a, b2a, b1b, b2b);
+      if (fixed > 0.0) {
+        ++bucket.open_fixed;
+        bucket.gap_fixed_total += fixed;
+        bucket.gap_fixed_worst =
+            fixed > bucket.gap_fixed_worst ? fixed : bucket.gap_fixed_worst;
+      }
+    }
+  }
+
+  std::string out;
+  char line[768];
+  std::snprintf(line, sizeof(line),
+                "seam census over %u draws of the last frame (%u examined), %llu triangles\n"
+                "  edges are keyed on the BITS of their two endpoint positions, so a corner the\n"
+                "  mesh has split into two vertices still reads as one edge - which is the case\n"
+                "  the whole question is about\n"
+                "  the gap is in WORLD UNITS: the widest separation of the two boundary curves\n",
+                static_cast<unsigned>(LastItems.size()), skips.examined,
+                (unsigned long long)triangles);
+  out += line;
+  SeamText(out, "map geometry (IsMapGeometry)", map);
+  SeamText(out, "everything else, and map-to-prop seams", other);
+  // The table the shader is actually reading, beside the rule this function just re-derived.
+  // `pending` is the one to watch after a level load: the analysis is an arena readback and is
+  // deliberately spread over frames, so a non-zero here means the table is still converging and
+  // some seams are legitimately open this frame.
+  uint32_t corners = 0, analysed = 0, pending = 0;
+  bool too_large = false;
+  SplitCornerCounts(corners, analysed, pending, too_large);
+  std::snprintf(line, sizeof(line),
+                "  the live table (render.pn_seam_fix %s): %u corners marked over %u draws "
+                "analysed, %u still queued%s\n"
+                "  this census found %u split positions of its own\n",
+                SplitCornerFix() ? "on" : "off", corners, analysed, pending,
+                too_large ? ", AND THE BITSET DID NOT FIT ITS SCRATCH SLICE" : "",
+                static_cast<unsigned>(split_positions));
+  out += line;
+  std::snprintf(line, sizeof(line),
+                "  not examined: %u not arena-indexed, %u not a triangle list, %u over the %u "
+                "draw cap, %u arena read failures\n",
+                skips.source, skips.topology, skips.over_cap, kMaxCensusDraws,
+                skips.read_failures);
   out += line;
   return out;
 }

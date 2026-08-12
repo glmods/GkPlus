@@ -2317,6 +2317,27 @@ declare module "gk" {
      *  back, which submits and waits twice per draw. */
     normal_census(): string;
 
+    /** **Where two triangles meet, do their two PN patches agree?** As text.
+     *
+     *  The question that comes after `normal_census`, and the one that decides
+     *  whether tessellation tears the level mesh open. The watertight property
+     *  PN triangles rest on is conditional, and the condition is about the
+     *  *data*: the boundary curve for edge (P1,P2) is a function of P1, P2, N1
+     *  and N2 alone, so the two triangles sharing it agree **provided each
+     *  presents the same position and normal at each end**. Where the mesh has
+     *  split a corner into two vertices with different normals -- what an
+     *  exporter does at a material boundary -- the two curves run between the
+     *  same two points by different routes and the patches pull apart.
+     *
+     *  Edges are keyed on the **bit patterns of their endpoint positions**, so a
+     *  split corner reads as one edge rather than two. The reported gap is in
+     *  world units, at the live `pn_strength` / `pn_flat_threshold` /
+     *  `pn_max_offset`, so sweeping a knob and re-reading this prices it.
+     *
+     *  A REPL diagnostic only, and heavier than `normal_census`: it holds a map
+     *  keyed on every distinct edge in the frame. */
+    seam_census(): string;
+
     /** **PN-triangle amplification over the level mesh.** Off by default.
      *
      *  Hardware tessellation, with the generated points placed on a cubic
@@ -2360,6 +2381,28 @@ declare module "gk" {
      *  pipeline for their whole caster set, so with `tess_set = "map"` a prop's
      *  shadow follows a smoothed silhouette its geometry does not have. */
     tess_shadows: boolean;
+
+    /** **Keep a material boundary from tearing open.** On by default.
+     *
+     *  The PN patch is watertight across a shared edge only while the two
+     *  triangles present the same normal at each end, and the level mesh does
+     *  not: an exporter splits a corner into two differently-normalled vertices
+     *  at a material boundary, so the two boundary curves run between the same
+     *  two points by different routes and the patches pull apart. One shared map
+     *  edge in five on level02, worst 0.0696 world units at the defaults.
+     *
+     *  No patch can see the other side, so the answer is worked out on the CPU
+     *  -- where the whole mesh is visible -- and handed down as one bit per
+     *  vertex. A marked corner contributes no tangent term, so both sides build
+     *  the same linear boundary. It is also the *right* rule rather than merely
+     *  a safe one: a corner the mesh has split is one it is saying is not smooth
+     *  there, so an intentional hard edge stays hard.
+     *
+     *  `render.seam_census()` is the check -- "still open with the rule applied"
+     *  has to read 0. Turning this off reproduces the tear. The table is built
+     *  from an arena readback spread over a few frames after a level loads, so
+     *  the census's `still queued` is non-zero while it converges. */
+    pn_seam_fix: boolean;
 
     /** The screen-space edge length, in the render target's pixels, that a
      *  tessellation factor aims for. An edge covering twice this gets 2. */

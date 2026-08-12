@@ -66,6 +66,13 @@ struct ShadowPush {
     // adaptive rule is what needs care about shared edges, and a constant cannot disagree with
     // itself. A shadow map does not need adaptive density the way a silhouette does.
     float tess_factor;
+    // The split-corner table, which shapes the patch and therefore has to be here for the same
+    // reason the three knobs above are (§4.71). Leaving it out would be exactly the defect this
+    // block's comment warns about: the colour pass would draw a surface closed at its seams that
+    // still cast the shadow of one torn open at them.
+    ConstBufferPointer<uint> split_corners;
+    uint split_base;
+    uint split_count; // 0 is "off", "no level" and "not built yet" alike
 };
 
 [[vk::push_constant]]
@@ -136,7 +143,22 @@ struct ShadowControlPoint {
     // Flat, and read from control point 0 in the domain shader: every vertex of a patch belongs to
     // one draw, so the three copies always agree.
     nointerpolation uint record;
+    // Per corner, unlike `record`: see world.slang's `is_split_corner`, which this must agree with
+    // exactly for the same reason `shadow_pn_weight` must agree with `pn_weight`.
+    nointerpolation uint split;
 };
+
+// world.slang's `is_split_corner`, against this stage's own push block.
+bool shadow_is_split_corner(uint vertex) {
+    if (pc.split_count == 0u || vertex < pc.split_base) {
+        return false;
+    }
+    const uint index = vertex - pc.split_base;
+    if (index >= pc.split_count) {
+        return false;
+    }
+    return (pc.split_corners[index >> 5u] & (1u << (index & 31u))) != 0u;
+}
 
 struct ShadowPatchConstants {
     float edges[3]  : SV_TessFactor;
@@ -150,6 +172,7 @@ ShadowControlPoint shadow_tess_vertex(uint vertex_id: SV_VertexID) {
     cp.pos = v.pos.xyz;
     cp.normal = v.normal_and_color.xyz;
     cp.record = pc.record;
+    cp.split = shadow_is_split_corner(pc.base_vertex + vertex_id) ? 1u : 0u;
     return cp;
 }
 
@@ -161,6 +184,7 @@ ShadowControlPoint map_shadow_tess_vertex(uint vertex_id: SV_VertexID, uint draw
     cp.pos = v.pos.xyz;
     cp.normal = v.normal_and_color.xyz;
     cp.record = param.x;
+    cp.split = shadow_is_split_corner(param.y + vertex_id) ? 1u : 0u;
     return cp;
 }
 
@@ -190,7 +214,10 @@ ShadowControlPoint shadow_hull(InputPatch<ShadowControlPoint, 3> patch,
 // two ever differ, the shadow is cast by a surface the colour pass does not draw. **The ceiling
 // belongs here as much as the floor does**, and leaving it out would be that defect: the colour
 // pass would draw a rounded pipe that still cast the shadow of an inflated one.
-float shadow_pn_weight(float3 pi, float3 pj, float3 ni) {
+float shadow_pn_weight(float3 pi, float3 pj, float3 ni, uint split) {
+    if (split != 0u) {
+        return 0.0;
+    }
     const float3 edge = pj - pi;
     const float length_sq = dot(edge, edge);
     if (length_sq < 1e-18) {
@@ -215,12 +242,13 @@ float4 shadow_domain(ShadowPatchConstants constants, float3 bary: SV_DomainLocat
     const float3 n2 = normalize(patch[1].normal);
     const float3 n3 = normalize(patch[2].normal);
 
-    const float3 b210 = (2.0 * p1 + p2 - shadow_pn_weight(p1, p2, n1) * n1) / 3.0;
-    const float3 b120 = (2.0 * p2 + p1 - shadow_pn_weight(p2, p1, n2) * n2) / 3.0;
-    const float3 b021 = (2.0 * p2 + p3 - shadow_pn_weight(p2, p3, n2) * n2) / 3.0;
-    const float3 b012 = (2.0 * p3 + p2 - shadow_pn_weight(p3, p2, n3) * n3) / 3.0;
-    const float3 b102 = (2.0 * p3 + p1 - shadow_pn_weight(p3, p1, n3) * n3) / 3.0;
-    const float3 b201 = (2.0 * p1 + p3 - shadow_pn_weight(p1, p3, n1) * n1) / 3.0;
+    const uint s1 = patch[0].split, s2 = patch[1].split, s3 = patch[2].split;
+    const float3 b210 = (2.0 * p1 + p2 - shadow_pn_weight(p1, p2, n1, s1) * n1) / 3.0;
+    const float3 b120 = (2.0 * p2 + p1 - shadow_pn_weight(p2, p1, n2, s2) * n2) / 3.0;
+    const float3 b021 = (2.0 * p2 + p3 - shadow_pn_weight(p2, p3, n2, s2) * n2) / 3.0;
+    const float3 b012 = (2.0 * p3 + p2 - shadow_pn_weight(p3, p2, n3, s3) * n3) / 3.0;
+    const float3 b102 = (2.0 * p3 + p1 - shadow_pn_weight(p3, p1, n3, s3) * n3) / 3.0;
+    const float3 b201 = (2.0 * p1 + p3 - shadow_pn_weight(p1, p3, n1, s1) * n1) / 3.0;
     const float3 e = (b210 + b120 + b021 + b012 + b102 + b201) / 6.0;
     const float3 v = (p1 + p2 + p3) / 3.0;
     const float3 b111 = e + (e - v) * 0.5;

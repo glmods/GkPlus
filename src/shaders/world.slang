@@ -200,6 +200,18 @@ struct GpuFrameData {
     // occlusion means physically; 1 darkens everything and is the knob for a stylised look.
     float ao_direct;
     float pad_ao;
+    // --- the PN split-corner table (§4.71) --------------------------------------------------
+    //
+    // One bit per canonical vertex: set when the mesh has split this corner into vertices
+    // carrying different normals, so the tangent term there has to be zeroed on *both* sides or
+    // the two patches build different boundary curves through the same two points and tear apart.
+    // Appended after the AO block for the reason that block was appended after `sun_matrix`.
+    //
+    // `split_count` of 0 is the single test - "the fix is off", "no level is loaded" and "the
+    // table has not been built yet" are all that state, and none is a branch of its own.
+    ConstBufferPointer<uint> split_corners;
+    uint split_base;   // the canonical-vertex index bit 0 stands for
+    uint split_count;  // how many bits are valid
 };
 
 // **56 bytes of a guaranteed 128.** It reached exactly 128 with the light grid (§4.56), and
@@ -1063,7 +1075,38 @@ struct ControlPoint {
     float3 normal;
     float4 uv;
     float4 colour;
+    // Whether the mesh has split THIS corner into vertices carrying different normals, in which
+    // case its tangent term is zeroed and the two edges leaving it stay linear. See
+    // `is_split_corner` - this is looked up in the vertex stage because that is the only stage
+    // that still knows the vertex index.
+    nointerpolation uint split;
 };
+
+// **The condition the watertight property actually rests on, made checkable.**
+//
+// `b210` for edge (P1,P2) is a function of P1, P2 and N1 alone, so the two triangles sharing that
+// edge build the same curve *provided each presents the same normal at each end*. Where an
+// exporter has split a corner at a material boundary or a smoothing-group break, they do not, and
+// the patches pull apart - one shared map edge in five on level02, worst 0.0696 world units at the
+// defaults (§4.71). No patch can see the other side, so the only quantities both could agree on
+// are the two positions; the fix is therefore to answer the question on the CPU, where the whole
+// mesh is visible, and hand the answer down as one bit per canonical vertex.
+//
+// The bit says "this corner is not smooth here", which is what the split is telling us, so zeroing
+// its term is also the *right* answer rather than merely a safe one: an intentional hard edge
+// stays hard instead of being averaged smooth. Both sides read the same bit - a split marks every
+// vertex at that position - so they agree by construction.
+bool is_split_corner(uint vertex) {
+    const uint count = pc.frame[0].split_count;
+    if (count == 0u || vertex < pc.frame[0].split_base) {
+        return false;
+    }
+    const uint index = vertex - pc.frame[0].split_base;
+    if (index >= count) {
+        return false;
+    }
+    return (pc.frame[0].split_corners[index >> 5u] & (1u << (index & 31u))) != 0u;
+}
 
 struct PatchConstants {
     float edges[3]  : SV_TessFactor;
@@ -1081,6 +1124,7 @@ ControlPoint tess_vertex_main(uint vertex_id: SV_VertexID) {
     // packed D3DCOLOR cannot be blended as an integer, and unpacking after interpolation would
     // mean interpolating the *bits*.
     cp.colour = unpack_colour(asuint(v.normal_and_color.w));
+    cp.split = is_split_corner(pc.base_vertex + vertex_id) ? 1u : 0u;
     return cp;
 }
 
@@ -1154,8 +1198,12 @@ ControlPoint hull_main(InputPatch<ControlPoint, 3> patch, uint id: SV_OutputCont
 //
 // Every operation is a function of (Pi, Pj, Ni) alone, so the watertight property survives all
 // three: the triangle on the other side of edge (i,j) computes, tests, snaps and clamps the
-// identical number.
-float pn_weight(float3 pi, float3 pj, float3 ni) {
+// identical number - **provided it has the same Ni**, which is exactly what `split` says it does
+// not. A split corner returns zero here, so both sides build the linear boundary and agree.
+float pn_weight(float3 pi, float3 pj, float3 ni, uint split) {
+    if (split != 0u) {
+        return 0.0;
+    }
     const float3 edge = pj - pi;
     const float length_sq = dot(edge, edge);
     if (length_sq < 1e-18) {
@@ -1197,12 +1245,15 @@ VertexOut domain_main(PatchConstants constants, float3 bary: SV_DomainLocation,
 
     // The six edge control points. Named for their barycentric exponents, as Vlachos does:
     // b210 carries u^2*v, so it sits on edge 1->2, nearer corner 1.
-    const float3 b210 = (2.0 * p1 + p2 - pn_weight(p1, p2, n1) * n1) / 3.0;
-    const float3 b120 = (2.0 * p2 + p1 - pn_weight(p2, p1, n2) * n2) / 3.0;
-    const float3 b021 = (2.0 * p2 + p3 - pn_weight(p2, p3, n2) * n2) / 3.0;
-    const float3 b012 = (2.0 * p3 + p2 - pn_weight(p3, p2, n3) * n3) / 3.0;
-    const float3 b102 = (2.0 * p3 + p1 - pn_weight(p3, p1, n3) * n3) / 3.0;
-    const float3 b201 = (2.0 * p1 + p3 - pn_weight(p1, p3, n1) * n1) / 3.0;
+    // The split flag gates by whose NORMAL each control point uses, not by which edge it sits on:
+    // b210 and b201 both bend along n1, so both answer to corner 0's bit.
+    const uint s1 = patch[0].split, s2 = patch[1].split, s3 = patch[2].split;
+    const float3 b210 = (2.0 * p1 + p2 - pn_weight(p1, p2, n1, s1) * n1) / 3.0;
+    const float3 b120 = (2.0 * p2 + p1 - pn_weight(p2, p1, n2, s2) * n2) / 3.0;
+    const float3 b021 = (2.0 * p2 + p3 - pn_weight(p2, p3, n2, s2) * n2) / 3.0;
+    const float3 b012 = (2.0 * p3 + p2 - pn_weight(p3, p2, n3, s3) * n3) / 3.0;
+    const float3 b102 = (2.0 * p3 + p1 - pn_weight(p3, p1, n3, s3) * n3) / 3.0;
+    const float3 b201 = (2.0 * p1 + p3 - pn_weight(p1, p3, n1, s1) * n1) / 3.0;
     // The interior point, pulled half again from the average of the six towards itself. This one
     // IS a function of all three corners - which is allowed precisely because it only ever
     // contributes where u, v and w are all non-zero, i.e. strictly inside the patch, and the

@@ -610,6 +610,18 @@ JSValue SetTessShadowsValue(JSContext *ctx, JSValueConst, JSValueConst value) {
   return JS_UNDEFINED;
 }
 
+// `render.pn_seam_fix` - zero the tangent term at a corner the mesh has split into vertices with
+// different normals, which is what keeps a material boundary from tearing open (§4.71). On by
+// default; the knob is the A/B that prices the rule, and turning it off reproduces the tear.
+JSValue GetSeamFix(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::SplitCornerFix());
+}
+
+JSValue SetSeamFixValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetSplitCornerFix(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
 // `render.tess_set` - "map" (the level mesh), "all" (props and units too) or "off". A string
 // rather than a pair of booleans because the three are exclusive, and `render.normal_census` says
 // the choice is a real one: more than half the curvature in a frame is in the props.
@@ -1246,6 +1258,13 @@ JSValue NormalCensus(JSContext *ctx, JSValueConst, int, JSValueConst *) {
   return JS_NewStringLen(ctx, text.data(), text.size());
 }
 
+// `render.seam_census()` - where two triangles meet, do their two PN patches agree? The
+// measurement behind "tessellation tears the level mesh". See DescribeSeamCensus in VkDraw.h.
+JSValue SeamCensus(JSContext *ctx, JSValueConst, int, JSValueConst *) {
+  const std::string text = vulkan::DescribeSeamCensus();
+  return JS_NewStringLen(ctx, text.data(), text.size());
+}
+
 JSValue GetShadowState(JSContext *ctx, JSValueConst) {
   const std::string text = d3d8::FormatShadowState();
   return JS_NewStringLen(ctx, text.data(), text.size());
@@ -1648,6 +1667,7 @@ const JSCFunctionListEntry RenderProps[] = {
     // The PN-triangle amplification pass (§4.71).
     JS_CGETSET_DEF("tessellation", GetTessellation, SetTessellationValue),
     JS_CGETSET_DEF("tess_shadows", GetTessShadows, SetTessShadowsValue),
+    JS_CGETSET_DEF("pn_seam_fix", GetSeamFix, SetSeamFixValue),
     JS_CGETSET_DEF("tess_set", GetTessSet, SetTessSetValue),
     JS_CGETSET_DEF("tess_edge_pixels", Getedge_pixels, Setedge_pixelsValue),
     JS_CGETSET_DEF("tess_max", Getmax_factor, Setmax_factorValue),
@@ -1707,6 +1727,7 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("ref_hide", GetRefHide, SetRefHideValue),
     JS_CFUNC_DEF("draw_info", 1, DrawInfo),
     JS_CFUNC_DEF("normal_census", 0, NormalCensus),
+    JS_CFUNC_DEF("seam_census", 0, SeamCensus),
     JS_CFUNC_DEF("frame_draws", 2, FrameDraws),
     JS_CGETSET_DEF("frame_lights", GetFrameLights, nullptr),
     JS_CGETSET_DEF("local_lights", GetLocalLights, SetLocalLightsValue),

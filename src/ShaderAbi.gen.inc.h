@@ -10,8 +10,8 @@
 // Included from VkDraw.cpp, inside its anonymous namespace - the one point where
 // src/VkDraw.h, src/VertexFormat.h and that file's three push blocks are all in scope.
 // recipe-hash: 39a0a2051e4f891b7db8507ddb573f2b360791b58d0a2d2ea5edbb590fbc3666
-// source-hash: src/shaders/world.slang 17aef410f4b1fc9c5d0231b245628fe55a84936d4c4da8ca8efa255cb56b5a60
-// source-hash: src/shaders/shadow.slang b325b3a5b737846cc8af68c3c9aa6a8ad7b67e01d1baa16d2196d8342fa9fa59
+// source-hash: src/shaders/world.slang 6704f345ce19ff2ddce6dc4035ac3b6a0b68babd9ae4100905bc06aac26b6766
+// source-hash: src/shaders/shadow.slang f9cda9eb8c11e73acbc937f97bd7880dcb545f532ef8710b4f574cc810ed9cfc
 // source-hash: src/shaders/lightgrid.slang ff7a10915c25b2d2a2a2d60a06decb9fa459a327c1cfe0e04f1655221fc1fa8b
 // source-hash: src/shaders/ao.slang bfda9602ecce369540d5935bca9f6aa0a93877e235c635178470da4e1b407655
 #pragma once
@@ -113,7 +113,13 @@ static_assert(offsetof(GpuFrameData, ao_direct) == 312,
               "GpuFrameData::ao_direct moved away from world.slang's GpuFrameData");
 static_assert(offsetof(GpuFrameData, pad_ao) == 316,
               "GpuFrameData::pad_ao moved away from world.slang's GpuFrameData");
-static_assert(sizeof(GpuFrameData) == 320,
+static_assert(offsetof(GpuFrameData, split_corners) == 320,
+              "GpuFrameData::split_corners moved away from world.slang's GpuFrameData");
+static_assert(offsetof(GpuFrameData, split_base) == 328,
+              "GpuFrameData::split_base moved away from world.slang's GpuFrameData");
+static_assert(offsetof(GpuFrameData, split_count) == 332,
+              "GpuFrameData::split_count moved away from world.slang's GpuFrameData");
+static_assert(sizeof(GpuFrameData) == 336,
               "GpuFrameData is not the size GpuFrameData declares");
 
 // src/shaders/world.slang : struct GpuLight
@@ -307,7 +313,13 @@ static_assert(offsetof(ShadowPushConstants, pn_max_offset) == 104,
               "ShadowPushConstants::pn_max_offset moved away from shadow.slang's ShadowPush");
 static_assert(offsetof(ShadowPushConstants, tess_factor) == 108,
               "ShadowPushConstants::tess_factor moved away from shadow.slang's ShadowPush");
-static_assert(sizeof(ShadowPushConstants) == 112,
+static_assert(offsetof(ShadowPushConstants, split_corners) == 112,
+              "ShadowPushConstants::split_corners moved away from shadow.slang's ShadowPush");
+static_assert(offsetof(ShadowPushConstants, split_base) == 120,
+              "ShadowPushConstants::split_base moved away from shadow.slang's ShadowPush");
+static_assert(offsetof(ShadowPushConstants, split_count) == 124,
+              "ShadowPushConstants::split_count moved away from shadow.slang's ShadowPush");
+static_assert(sizeof(ShadowPushConstants) == 128,
               "ShadowPushConstants is not the size ShadowPush declares");
 
 // src/shaders/lightgrid.slang : struct GpuMapLight

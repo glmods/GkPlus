@@ -6894,12 +6894,165 @@ validation if the bake ever becomes a suspect.
   fields add up to. Caught by `src/gen-shader-abi.py` - §4.68's generator earning its keep on a
   case §4.67 could not have caught, since this is a *size* disagreement rather than a permutation.
 
+### The watertight property is conditional, and one map edge in five fails the condition
+
+Reported as *"tessellation causes tears in meshes"*, at material boundaries, growing with the
+tessellation factor. It reproduces, and `render.seam_census()` was written to say why rather than
+to guess.
+
+**The condition is about the data, not the arithmetic.** `b210` for edge (P1,P2) is a function of
+P1, P2 and N1 alone, so the two triangles sharing that edge build the same boundary curve - *if
+each presents the same position and the same normal at each end*. Where the mesh has split a corner
+into two vertices carrying different normals, which is what an exporter does at a material boundary
+or a smoothing-group break, the two curves run between the same two points by different routes and
+the patches pull apart. Nothing in the shader can close that: each patch sees only its own three
+normals, and the only quantities both sides share are the two positions - so **any curved boundary
+is non-watertight unless the normals agree**. That is a property of the construction, not a defect
+in this implementation of it.
+
+The census keys every edge on the **bit patterns of its two endpoint positions**, which is the
+whole trick: a split corner has a different index in each draw and the identical position, so it
+reads as one edge. Level02, settled camera, at the shipped defaults:
+
+| map geometry (`IsMapGeometry`) | |
+|---|---|
+| distinct edges | 2,548 |
+| shared by two triangles | 2,177 (85.4%) |
+| — normals agree, watertight | 1,723 (79.1%) |
+| — **normals differ** | **454 (20.9%)** |
+| — only one side tessellated | **0** |
+| used once (mesh border) / more than twice | 332 / 39 |
+| of the 454: still open at the defaults | 238, mean gap 0.0243, **worst 0.0696 world units** |
+
+Three of those rows rule something out, and that is most of their value:
+
+- **`only one side tessellated: 0`.** `IsMapGeometry` and `WantsTessellation` do not split any
+  shared edge in this frame, so the predicates are not the mechanism - which was the other
+  candidate, and the one that would have been cheap to fix.
+- **`a corner has no normal: 0`** on the map mesh, so no seam is an artefact of the unlit FVFs
+  that make 77% of the *props'* corners unanswerable.
+- **`pn_strength = 0` closes every seam** (0 of 454 open), as do `pn_flat_threshold = 9` and
+  `pn_max_offset = 0`. Three knobs, three exact zeros: the instrument responds to the construction
+  the way the algebra says it must rather than reporting a constant. The same A/B on screen is
+  §4.71's `pn_strength = 0` reading, 765 differing pixels of 5.25 M at `tess_max = 32`.
+
+**`pn_flat_threshold` closes seams but cannot bound the worst one**, which is §4.74's finding
+again in a second place - a floor cannot reach a failure at the ceiling. Sweeping it takes the
+open count down and the *mean* gap **up**, because what it removes are the small ones:
+
+| `pn_flat_threshold` | 0.00 | 0.02 | 0.05 | 0.10 | 0.15 | 0.20 | 0.30 |
+|---|---|---|---|---|---|---|---|
+| seams still open | 454 | 238 | 168 | 127 | 110 | 86 | 56 |
+| mean gap | 0.0225 | 0.0421 | 0.0554 | 0.0664 | 0.0712 | 0.0740 | 0.0865 |
+| **worst gap** | **0.3357** | **0.3357** | **0.3357** | **0.3357** | **0.3357** | **0.3357** | **0.3357** |
+
+**`pn_max_offset` is the one that bounds it, and it does so almost exactly linearly** - the tear
+is a difference of two control-point offsets, so capping the offset caps the tear:
+
+| `pn_max_offset` | 0.50 | 0.20 | 0.10 | 0.05 | 0.02 | 0.01 |
+|---|---|---|---|---|---|---|
+| worst gap | 0.3357 | 0.1343 | 0.0806 | 0.0516 | 0.0217 | 0.0108 |
+
+So it is already the tear knob, and what it costs is measurable on the same frame. MAD against the
+same camera with tessellation off - §4.71's "how much is the feature doing" metric:
+
+| `pn_max_offset` | 0.08 (default) | 0.04 | 0.02 | 0.01 | `pn_strength = 0` |
+|---|---|---|---|---|---|
+| worst tear | 0.0696 | ~0.041 | ~0.022 | ~0.011 | 0 |
+| MAD vs off | 1.381 | 1.130 | 0.837 | 0.498 | 0.009 |
+| % of frame differing | 50.96 | 49.81 | 46.77 | 39.50 | 0.37 |
+
+Halving the cap keeps 82% of the effect and halves the worst tear; a quarter of it keeps 61% and
+thirds the tear. **The default is not retuned on one camera of one level** - the sixteen-level
+spread above says level02 is near the curved end and a threshold set there is pessimistic, which
+makes it a safe place to tune a floor and a *misleading* place to tune a ceiling.
+
+### The fix: one bit per corner, and it is a data fix because it cannot be anything else
+
+A corner the mesh has split into two differently-normalled vertices is a corner the mesh is saying
+is **not smooth there**. So the rule is to snap the tangent term to zero at such a corner: both
+sides then build the linear boundary and agree by construction, and an intentional hard edge stays
+hard instead of being averaged smooth - which is what reconciling the two normals into one would
+have done, and is why that was not the fix.
+
+**Zeroing per split *corner* is exactly sufficient**, which is what makes the rule cheap. `b210`
+depends on (P1,P2,N1) and `b120` on (P2,P1,N2), so an edge's boundary is shared as soon as each
+*end* is either unsplit (both sides hold the same normal) or split (both sides zero it). Nothing
+has to be decided per edge, and a patch with one split corner still curves along the two edges
+that do not touch it.
+
+The shape of it:
+
+- **`render.pn_seam_fix`**, on by default. Off reproduces the tear, which is what prices the rule.
+- The table is **one bit per canonical vertex**, and needs no hashing on the GPU side: the arena
+  addresses vertices as `base_vertex + vertex_id`, so a bitset with a base and a count is a direct
+  index. It rides in the **frame scratch** (`AllocateScratchSplitCorners`), for the reason the map
+  light rig does - the set is static for a level, a device-local buffer would be strictly better,
+  and a memcpy of a few hundred bytes reuses fencing that is already proven.
+- Built on the CPU by walking each tessellated draw's triangles once, keying positions on their
+  **bit patterns**, and marking every vertex at a position that carries more than one distinct
+  normal. Level02: **1,338 corners over 466 positions, from 65 map draws.**
+- **Bounded to eight newly-seen draws a frame.** The analysis is `ReadArena`, which submits and
+  waits, and a level's first tessellated frame sees all 65 at once. Until a draw is analysed its
+  corners read as unsplit, which is the behaviour that existed before the table - so converging
+  over eight frames costs a few frames of the old tear and not anything new. `render.seam_census()`
+  reports `still queued` so that is visible rather than assumed.
+- Reset on `MapLightsGeneration()`, which moves on a level change and on nothing else - exactly the
+  event that invalidates every vertex index in it.
+- **The shadow passes take the same table**, through `ShadowPush`, for the reason they already take
+  `pn_strength`/`pn_flat_threshold`/`pn_max_offset`: a seam the colour pass closes must not still
+  cast the shadow of one torn open. That takes the block to **128 bytes, exactly the guaranteed
+  minimum** - it has no room left.
+
+**Where it is built is pinned from both sides, and one of the two is not obvious.** It has to run
+before the shadow passes, whose push carries the table's *scratch* address - built later they would
+get the slice about to be overwritten. And it has to run **before `RecordUploads`**, because that
+moves this frame's staged copies out of the pending batch and into the frame's command buffer,
+where the readback's own `FlushUploads` can no longer reach them. That window is one frame wide and
+it is the frame that matters: a level's geometry is uploaded and first drawn in the same one, so a
+table built after `RecordUploads` would be derived from whatever the arena held before the level
+loaded - and a draw is analysed once, so it would stay wrong for the level.
+
+#### What it is measured to do
+
+`render.seam_census()` computes the gap twice - as the data gives it, and with the split-corner
+rule applied - and **re-derives the split set from the frame's own geometry rather than reading the
+live table**. That is deliberate: two independent walks reaching the same set is evidence, where
+querying the table the shader reads would be a restatement of it.
+
+| level02, settled camera | map geometry | props and mixed |
+|---|---|---|
+| shared edges whose normals differ | 454 | 29 |
+| still open at the defaults | 238, worst 0.0696 | 12, worst 0.0486 |
+| **still open with the rule applied** | **0** | **0** |
+
+And on screen, against the same camera and the same frame:
+
+| | MAD vs tessellation off | % of frame differing |
+|---|---|---|
+| defaults, `pn_seam_fix` off | 1.3883 | 50.96 |
+| **defaults, `pn_seam_fix` on** | **1.1395** | **45.13** |
+| `tess_edge_pixels = 4, tess_max = 32`, off | 1.3960 | 51.19 |
+| ... on | 1.1614 | 45.37 |
+
+**The rule keeps 82% of the amplification and changes 12.4% of the frame** (MAD 0.386 between the
+two, at both factor settings - the rule is about the data and not about how finely it is sampled,
+which is what those two rows agreeing says). The dashed line of detached fragments below the rock
+silhouette at `tess_max = 32`, and the sliver of wall floating in the black at the defaults, are
+both gone.
+
+**The off-state moved again, for §4.71's own reason.** `GpuFrameData` gained 16 bytes and
+`ShadowPush` 16, so every entry point's SPIR-V shifted once more; `render.tessellation = false` is
+equivalent rather than bit-identical, and the cross-launch floor is what it has to be judged
+against.
+
 ### What is deliberately not solved
 
-- **The crease case.** A triangle with two smooth corner normals and one flat one - a pipe meeting
-  a flange - curves into the flat region, and where the two sides are separate vertices the curved
-  boundary pulls away from the straight one. PN keeps the corners exact so the gap is bounded by
-  the mid-edge deviation, but it is real; `pn_strength` is the dial, not a fix.
+- **The crease case, and the tear it opens across a seam.** A triangle with two smooth corner
+  normals and one flat one - a pipe meeting a flange - curves into the flat region, and where the
+  two sides are separate vertices the curved boundary pulls away from the straight one. Measured
+  above: one shared map edge in five, worst 0.0696 world units at the defaults. PN keeps the
+  corners exact, so `pn_max_offset` bounds it and `pn_strength` scales it - neither is a fix.
 - **The shadow passes tessellate their whole caster set or none of it.** One pipeline serves the
   batch, and the indirect path cannot select per draw. With `tess_set = "map"` a prop's shadow
   therefore follows a smoothed silhouette its geometry does not have. Bounded by the size of the

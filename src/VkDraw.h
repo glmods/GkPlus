@@ -302,11 +302,21 @@ struct GpuFrameData {
   uint32_t ao_flags;   // kAoMapOnly | kAoDebug
   float ao_direct;     // how much the occlusion scales the DIRECT sum; 0 is ambient only
   float pad_ao;
+  // --- the PN split-corner table (§4.71) ---------------------------------------------------
+  //
+  // One bit per canonical vertex, saying the mesh has split this corner into vertices carrying
+  // different normals - so its tangent term must be zeroed on both sides of the seam, or the two
+  // patches build different boundary curves between the same two points and tear apart. Appended
+  // after the AO block for the reason that block was appended after `sun_matrix`.
+  uint64_t split_corners; // device address of the bitset in the frame scratch
+  uint32_t split_base;    // the canonical-vertex index bit 0 stands for
+  uint32_t split_count;   // how many bits are valid; 0 is the single "no table" test
 };
-static_assert(sizeof(GpuFrameData) == 320, "the scratch stride is part of the shader ABI");
+static_assert(sizeof(GpuFrameData) == 336, "the scratch stride is part of the shader ABI");
 static_assert(offsetof(GpuFrameData, cascades) == 176, "std430 puts a float4 array on 16");
 static_assert(offsetof(GpuFrameData, sun_matrix) == 240, "... and so does the matrix after it");
 static_assert(offsetof(GpuFrameData, ao_texture) == 304, "the AO block appends, it does not insert");
+static_assert(offsetof(GpuFrameData, split_corners) == 320, "... and so does this one");
 
 // GpuDrawRecord::lighting flags.
 //
@@ -1214,6 +1224,49 @@ std::string DescribeDraw(uint32_t index);
 //
 // A REPL diagnostic and nothing else: `ReadArena` submits and waits, twice per draw.
 std::string DescribeNormalCensus();
+
+// **Where two triangles meet, do their two PN patches agree?** The question that comes after the
+// normal census, and the one that decides whether tessellation tears the level mesh open.
+//
+// The watertight property §4.71 rests on is conditional, and the condition is about the *data*:
+// `b210` for edge (P1,P2) is a function of P1, P2 and N1 alone, so the two triangles sharing that
+// edge build the same boundary curve **provided each presents the same position and the same
+// normal at each end**. Where the mesh has split a corner into two vertices carrying different
+// normals - what an exporter does at a material boundary or a smoothing-group break - the two
+// curves run through the same two points by different routes, and the patches pull apart.
+//
+// So this keys every edge on the **bit patterns of its two endpoint positions**, which is what
+// makes a split corner read as one edge rather than two, and for each edge used by exactly two
+// triangles measures the widest separation of the two boundary curves in world units, at the
+// live `pn_strength` / `pn_flat_threshold` / `pn_max_offset`. It also counts the other way a seam
+// opens: an edge whose two sides disagree about whether they are tessellated at all, which
+// `IsMapGeometry` and `WantsTessellation` can produce at a material boundary.
+//
+// A REPL diagnostic and nothing else, and a heavier one than the normal census: it holds a map
+// keyed on every distinct edge in the frame.
+std::string DescribeSeamCensus();
+
+// Builds this frame's PN split-corner table and copies it into the frame scratch (§4.71).
+//
+// **Called before RecordUploads and before every pass**, and both halves of that are load-bearing
+// - see the call site in VkRenderer.cpp. The short version: its address is into the scratch, which
+// rotates, and its analysis is an arena readback, which `RecordUploads` can put out of reach for
+// exactly the frame a level's geometry is uploaded and first drawn. Records no commands of its own.
+//
+// A no-op unless tessellation and `render.pn_seam_fix` are both on, and bounded to a handful of
+// newly-seen draws a frame - the analysis is an arena readback, which submits and waits.
+void PrepareTessellationTables();
+
+// `render.pn_seam_fix` - zero the PN tangent term at a corner the mesh has split into vertices
+// carrying different normals, so the two patches meeting there build the same linear boundary and
+// the seam stays closed (§4.71). On by default; the knob exists because it is the A/B that says
+// what the rule costs the amplification, and because turning it off reproduces the tear.
+void SetSplitCornerFix(bool enabled);
+bool SplitCornerFix();
+// The table's state, for the report: how many corners are marked, how many draws have been
+// analysed, how many are still queued, and whether the bitset outgrew its scratch slice.
+void SplitCornerCounts(uint32_t &corners, uint32_t &analysed_draws, uint32_t &pending_draws,
+                       bool &too_large);
 
 // The converted vertices and indices one draw was actually given, which is the question no other
 // instrument here answers: `render.draws` counts what was skipped, `render.state` histograms what
