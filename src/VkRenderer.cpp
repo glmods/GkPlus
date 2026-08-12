@@ -95,6 +95,23 @@ bool SwapchainTransferDst = false;
 // `render.present_linear` is the A/B, because that deduction is about one measurement.
 bool PresentLinearFilter = false;
 
+// --- the multisampled colour target (see SetMsaa in VkDraw.h) ---------------------------------
+//
+// Filed with the offscreen target rather than with the depth buffer in VkDraw, because it is the
+// same kind of thing: a colour image in the swapchain's format at the render extent, whose whole
+// lifetime is `ReconcileRenderTarget`'s. When it exists the world pass draws into it and RESOLVES
+// into whichever image `world_view` names - so the offscreen target, the scale blit, the overlay
+// pass and the present barrier below are all unaware this feature exists.
+//
+// `MsaaSamples` is the count the target was actually BUILT at, which is what the reconcile
+// compares against and what it hands `ApplySampleCount`. It stays 1 whenever there is no target,
+// including after a failed allocation - so a device that cannot spare the memory draws the frame
+// it drew before rather than not drawing one.
+VkImage MsaaImage = VK_NULL_HANDLE;
+VkDeviceMemory MsaaMemory = VK_NULL_HANDLE;
+VkImageView MsaaView = VK_NULL_HANDLE;
+VkSampleCountFlagBits MsaaSamples = VK_SAMPLE_COUNT_1_BIT;
+
 bool Fail(const std::string &message) {
   Error = message;
   DebugWrite("gkplus: vulkan renderer: " + message + "\n");
@@ -433,6 +450,85 @@ bool CreateOffscreen(VkExtent2D extent) {
   return true;
 }
 
+void DestroyMsaaTarget() {
+  VkDevice device = GetDevice();
+  if (MsaaView != VK_NULL_HANDLE) {
+    vkDestroyImageView(device, MsaaView, nullptr);
+    MsaaView = VK_NULL_HANDLE;
+  }
+  if (MsaaImage != VK_NULL_HANDLE) {
+    vkDestroyImage(device, MsaaImage, nullptr);
+    MsaaImage = VK_NULL_HANDLE;
+  }
+  if (MsaaMemory != VK_NULL_HANDLE) {
+    vkFreeMemory(device, MsaaMemory, nullptr);
+    MsaaMemory = VK_NULL_HANDLE;
+  }
+  MsaaSamples = VK_SAMPLE_COUNT_1_BIT;
+}
+
+// Allocated directly rather than through VMA, for the reason CreateOffscreen and CreateDepth both
+// give: one image whose lifetime is the render target's.
+bool CreateMsaaTarget(VkExtent2D extent, VkSampleCountFlagBits samples) {
+  DestroyMsaaTarget();
+  VkDevice device = GetDevice();
+
+  VkImageCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  info.imageType = VK_IMAGE_TYPE_2D;
+  info.format = Format.format;
+  info.extent = {extent.width, extent.height, 1};
+  info.mipLevels = 1;
+  info.arrayLayers = 1;
+  info.samples = samples;
+  info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  // COLOUR ATTACHMENT ONLY, and no TRANSFER_SRC unlike the offscreen target: nothing ever reads
+  // this image except the resolve, which is part of the pass rather than a transfer. Naming a
+  // usage it does not need is how a driver loses the transient/lossless path for it.
+  info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (vkCreateImage(device, &info, nullptr, &MsaaImage) != VK_SUCCESS) {
+    return Fail("could not create the multisampled colour target");
+  }
+
+  VkMemoryRequirements requirements = {};
+  vkGetImageMemoryRequirements(device, MsaaImage, &requirements);
+  VkPhysicalDeviceMemoryProperties memory = {};
+  vkGetPhysicalDeviceMemoryProperties(GetPhysicalDevice(), &memory);
+  uint32_t type = UINT32_MAX;
+  for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+    if ((requirements.memoryTypeBits & (1u << i)) != 0 &&
+        (memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+      type = i;
+      break;
+    }
+  }
+  if (type == UINT32_MAX) {
+    return Fail("no device-local memory type for the multisampled colour target");
+  }
+
+  VkMemoryAllocateInfo allocate = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  allocate.allocationSize = requirements.size;
+  allocate.memoryTypeIndex = type;
+  if (vkAllocateMemory(device, &allocate, nullptr, &MsaaMemory) != VK_SUCCESS ||
+      vkBindImageMemory(device, MsaaImage, MsaaMemory, 0) != VK_SUCCESS) {
+    // The one failure here that is likely rather than theoretical - 4x at a large render extent is
+    // tens of megabytes - which is why the caller falls back to one sample instead of stopping.
+    return Fail("could not back the multisampled colour target");
+  }
+
+  VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  view.image = MsaaImage;
+  view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view.format = Format.format;
+  view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  if (vkCreateImageView(device, &view, nullptr, &MsaaView) != VK_SUCCESS) {
+    return Fail("could not create the multisampled colour target's view");
+  }
+  MsaaSamples = samples;
+  return true;
+}
+
 bool OffscreenEnvEnabled() {
   if (!OffscreenWantedRead) {
     OffscreenWantedRead = true;
@@ -461,14 +557,21 @@ VkExtent2D DesiredRenderExtent(bool &offscreen) {
   return Extent;
 }
 
-// Brings the render target and the depth buffer in line with what the game is drawing at.
-// Called once a frame and a no-op unless something moved - a resize, a Reset, or the toggle -
-// because it waits for the device to go idle before it destroys anything the last frame read.
+// Brings the render target, the multisampled target and the depth buffer in line with what the
+// game is drawing at. Called once a frame and a no-op unless something moved - a resize, a Reset,
+// or either toggle - because it waits for the device to go idle before it destroys anything the
+// last frame read.
+//
+// **This is also where `render.msaa` lands.** The knob only records a number; the rebuild it
+// implies is three objects and a pipeline cache, and every one of them needs exactly the idle
+// device a resize needs. Hanging it here rather than on the setter is what makes the knob safe to
+// write from the REPL mid-frame - the write is a store, and the work happens between frames.
 bool ReconcileRenderTarget() {
   bool want_offscreen = false;
   const VkExtent2D want = DesiredRenderExtent(want_offscreen);
+  const auto want_samples = static_cast<VkSampleCountFlagBits>(MsaaTargetSamples());
   if (want_offscreen == OffscreenActive && want.width == RenderExtent.width &&
-      want.height == RenderExtent.height) {
+      want.height == RenderExtent.height && want_samples == MsaaSamples) {
     return true;
   }
   {
@@ -486,6 +589,20 @@ bool ReconcileRenderTarget() {
   } else {
     DestroyOffscreen();
   }
+  // After the offscreen target, because it is sized to `RenderExtent` and the fallback above can
+  // still move it. Same fallback shape for the same reason - a target that will not allocate
+  // costs the antialiasing, not the frame.
+  if (want_samples != VK_SAMPLE_COUNT_1_BIT) {
+    if (!CreateMsaaTarget(RenderExtent, want_samples)) {
+      DestroyMsaaTarget();
+    }
+  } else {
+    DestroyMsaaTarget();
+  }
+  // `MsaaSamples` and not `want_samples`: it is what the target was actually built at, so a
+  // failure above leaves the pipelines and the depth image at one sample and agreeing with the
+  // attachment they will be used with. Before ResizeDraw, whose CreateDepth reads it.
+  ApplySampleCount(static_cast<uint32_t>(MsaaSamples));
   // DrawReady() is false during bring-up, where StartDraw creates the depth buffer at this same
   // extent immediately afterwards.
   if (DrawReady() && !ResizeDraw(RenderExtent.width, RenderExtent.height)) {
@@ -834,6 +951,17 @@ void DrawFrame() {
           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 
+  // The multisampled target needs the same transition when it is the one being drawn into. The
+  // barrier above still applies to `world_image` in that case and is still needed - it becomes the
+  // RESOLVE destination, which is written at the same stage with the same access.
+  const bool multisampling = MsaaView != VK_NULL_HANDLE;
+  if (multisampling) {
+    Barrier(frame.cmd, MsaaImage, VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+  }
+
   // The clear is the attachment's load op rather than a separate vkCmdClearColorImage: one
   // less barrier and one less layout.
   //
@@ -853,6 +981,22 @@ void DrawFrame() {
   colour.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   colour.clearValue.color = {{channel(clears.colour, 16), channel(clears.colour, 8),
                               channel(clears.colour, 0), channel(clears.colour, 24)}};
+
+  // Multisampling is entirely this: the pass draws into `MsaaView` and averages into the image it
+  // would otherwise have drawn into. Everything downstream - the scale blit, the overlay pass, the
+  // present barrier - keeps reading `world_image` and needs no knowledge of any of it.
+  //
+  // **DONT_CARE on the multisampled attachment.** Its samples exist only to be averaged, and the
+  // resolve happens at the end of the pass whatever the store op says, so storing them as well is
+  // a full-size write of an image nothing will ever read. It is also what lets a driver keep the
+  // samples in tile memory and never allocate them in main memory at all.
+  if (multisampling) {
+    colour.imageView = MsaaView;
+    colour.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    colour.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+    colour.resolveImageView = world_view;
+    colour.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  }
 
   auto depth_view = reinterpret_cast<VkImageView>(DepthImageView());
   // The stencil aspect rides on the same image and the same view (§4.21): the game's shadow
@@ -1065,6 +1209,7 @@ void ShutdownRenderer() {
     ImGuiReady = false;
   }
   DestroyOffscreen();
+  DestroyMsaaTarget();
   RenderExtent = {};
   DestroySwapchainObjects();
   if (Swapchain != VK_NULL_HANDLE) {
@@ -1143,6 +1288,16 @@ std::string FormatStats() {
     add("rendering at: %ux%u %s%s\n", RenderExtent.width, RenderExtent.height,
         OffscreenActive ? "offscreen, scaled to the swapchain at present" : "direct",
         OffscreenActive ? (PresentLinearFilter ? " (linear)" : " (nearest)") : "");
+    // The count in force, and the one asked for when they differ - which is the whole diagnostic
+    // for "I set render.msaa = 8 and nothing happened": either the device does not offer it or its
+    // target would not allocate, and both read here rather than silently.
+    if (MsaaWanted() != static_cast<uint32_t>(MsaaSamples)) {
+      add("msaa: %ux (requested %ux - unsupported, or its target would not allocate)\n",
+          (unsigned)MsaaSamples, MsaaWanted());
+    } else {
+      add("msaa: %ux%s\n", (unsigned)MsaaSamples,
+          MsaaSamples == VK_SAMPLE_COUNT_1_BIT ? " (off)" : "");
+    }
     add("presented: %llu   rebuilds: %llu   acquire failures: %llu\n",
         (unsigned long long)TheStats.frames_presented,
         (unsigned long long)TheStats.swapchain_rebuilds,

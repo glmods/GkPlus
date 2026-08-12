@@ -85,6 +85,15 @@ struct DeviceCaps {
   // one, which is the same frame the renderer drew before the feature existed.
   bool tessellation_shader = false;
 
+  // The sample counts the world pass can actually use, as a `VkSampleCountFlags` bitmask - the
+  // INTERSECTION of `framebufferColorSampleCounts`, `framebufferDepthSampleCounts` and
+  // `framebufferStencilSampleCounts`, because the pass has one colour and one depth/stencil
+  // attachment and dynamic rendering requires every attachment and the pipeline to agree on the
+  // count. Intersecting rather than reading the colour limit alone is not caution: a device may
+  // advertise 8x colour and 4x depth, and asking for the colour figure would build an attachment
+  // set no pipeline could be created against. Always contains VK_SAMPLE_COUNT_1_BIT.
+  uint32_t sample_counts = 0;
+
   // Limits that size the design rather than merely describing the device.
   uint32_t max_bindless_textures = 0; // maxDescriptorSetUpdateAfterBindSampledImages
   // maxTessellationGenerationLevel - the ceiling on a tess factor. 64 is the guaranteed

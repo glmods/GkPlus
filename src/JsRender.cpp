@@ -685,11 +685,40 @@ JSValue SetPerPixelLightingValue(JSContext *ctx, JSValueConst, JSValueConst valu
   return JS_UNDEFINED;
 }
 
-// `render.stock` - all nine deliberate departures from D3D8 at once, and back again (VkDraw.h,
+// `render.msaa` - the world pass's sample count (VkDraw.h). 1 is off and is the default; 2, 4 and
+// 8 are the counts a desktop device is likely to offer.
+//
+// **Writable at any time, and it costs one frame.** The setter only records the number - the
+// rebuild it implies (a multisampled target, the depth image, and every cached world pipeline,
+// since `rasterizationSamples` is not dynamic state) happens in `ReconcileRenderTarget` at the top
+// of the next frame, under the wait-idle a resize takes anyway.
+//
+// It reads back **effective, not requested**, which is why a read straight after a write can
+// answer the old value: the frame that adopts it has not started yet. A panel that binds a control
+// to this must therefore keep its own pending value or it will fight itself for one frame - the
+// same shape `render.tessellation` has on a device with no tessellation, one frame wide instead of
+// forever. `render.status` prints both when they disagree.
+JSValue GetMsaa(JSContext *ctx, JSValueConst) {
+  return JS_NewUint32(ctx, vulkan::Msaa());
+}
+
+JSValue SetMsaaValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  uint32_t samples = 0;
+  if (JS_ToUint32(ctx, &samples, value) != 0) {
+    return JS_EXCEPTION;
+  }
+  // No range check and no throw: `SetMsaa` rounds down to a power of two the device offers, so
+  // every number is meaningful and a 3 or a 1000 is a request for the nearest count rather than an
+  // error. Throwing would make a slider that passes its raw position an exception generator.
+  vulkan::SetMsaa(samples);
+  return JS_UNDEFINED;
+}
+
+// `render.stock` - all ten deliberate departures from D3D8 at once, and back again (VkDraw.h,
 // notes §4.87). `true` is the setup a comparison against `GKPLUS_RENDERER=d3d8` needs; `false`
 // restores what the session had, not the build's defaults.
 //
-// **The point of it is that the A/B is one write on a paused frame.** Nine of them by hand is nine
+// **The point of it is that the A/B is one write on a paused frame.** Ten of them by hand is ten
 // frames of drift on anything that moves, and the comparison this exists to serve is the one with
 // the zero noise floor.
 //
@@ -1696,6 +1725,7 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("pn_flat_threshold", Getpn_flat_threshold, Setpn_flat_thresholdValue),
     JS_CGETSET_DEF("pn_max_offset", Getpn_max_offset, Setpn_max_offsetValue),
     JS_CGETSET_DEF("tess_shadow_factor", Getshadow_factor, Setshadow_factorValue),
+    JS_CGETSET_DEF("msaa", GetMsaa, SetMsaaValue),
     JS_CGETSET_DEF("stock", GetStock, SetStockValue),
     JS_CGETSET_DEF("per_pixel_lighting", GetPerPixelLighting, SetPerPixelLightingValue),
     JS_CGETSET_DEF("map_light_report", GetMapLightReport, nullptr),

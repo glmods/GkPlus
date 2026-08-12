@@ -74,15 +74,23 @@ less of this game than its reputation suggests, and `render.pn_flat_threshold` e
 that number. It stays watertight because the term it thresholds is a function of `(Pi, Pj, Ni)`
 alone.
 
+**And it now has MSAA** (§4.88), `render.msaa`, off by default and settable at any time — the
+cheapest feature in this file to build, because dynamic rendering means the resolve is three fields
+on an attachment that already existed and the image the pass used to draw into simply becomes the
+one it resolves into. Everything downstream is unaware of it. The only thing it is not free for is
+the pipeline cache, which `rasterizationSamples` invalidates whole, so the switch costs one frame
+and hangs off `ReconcileRenderTarget` rather than off the setter. It smooths geometric edges and
+the stencil shadow's border; it does nothing for alpha-**tested** cutouts.
+
 **And all of that goes away with one write** (§4.87). `render.stock = true` switches off every
 deliberate departure at once — `per_pixel_lighting`, `map_lighting`, `lighting_maps`, the four
-shadow systems and `ao`/`tessellation` — which is the setup a comparison against
-`GKPLUS_RENDERER=d3d8` needs, inside a single **paused** frame instead of spread over nine.
+shadow systems, `ao`, `tessellation` and `msaa` — which is the setup a comparison against
+`GKPLUS_RENDERER=d3d8` needs, inside a single **paused** frame instead of spread over ten.
 `GKPLUS_VK_STOCK=1` is the launch-time form. It is a preset over the existing knobs and nothing
 else reads it, so each keeps its own behaviour on the way through; the fidelity knobs (`half_pixel`,
 `shade_mode`, `map_light_cull` …) are deliberately **not** in the set, because for those *on* is the
 reproduction. `false` restores what the session had rather than the defaults, and leaves every
-slider under those nine untouched.
+slider under those ten untouched.
 
 **Compare against `GKPLUS_RENDERER=d3d8`, not d3d9** (§4.33). Windows 10 still ships a 32-bit
 `d3d8.dll` in SysWOW64, so that mode runs the game on the original runtime with the capture layer
@@ -261,6 +269,7 @@ and still forwards every call to d3d8to9 so the A/B stays available.
 | **The viewport's RECTANGLE** — `D3DVIEWPORT8::X/Y/Width/Height`, per draw, as the Vulkan viewport *and* scissor | ✅ §4.47 — the upgrade screen that filled the window. 17.23 → **0.089** against the real D3D8 there, and the noise floor in level |
 | **A pre-transformed vertex's depth** — `clamp(z, MinZ, MaxZ)`, not the viewport transform | ✅ §4.45 — the flames that came and went with camera distance. Every screen-space draw sat `MinZ * (1 - z)` too far away; the flame's retention across a distance sweep goes from a 79% → 0.9% collapse to a flat ~92% |
 | **Ambient occlusion, with no blur pass** — a fixed lattice disc in screen space, world positions in a prepass | ✅ §4.86 — the first thing here with **no matrix in it at all**: the prepass writes world position per pixel, so the resolve inverts nothing and needs no camera transform, which is the very quantity `BuildSunCascades` records as unavailable on this side. **0.675 MAD over 21.14% of level02** against a 0.011 off-vs-off floor. The disc is the technique author's own **lattice** rather than blue noise, and the tap count is not a quality dial with a cheap end — 32 taps leaves a fan of every silhouette, 64 is smooth. **Off by default** |
+| **MSAA** — the world pass at N samples, resolved on the way out | ✅ §4.88 — the cheapest feature here, and the one that best shows what dynamic rendering bought: a resolve is three fields on the attachment, the image the pass drew into becomes the one it resolves into, and the blit, the overlay pass and the present barrier are all unaware. **0.069 MAD over 0.73% of a paused level02 at 4x** against a 0.008 floor — under 1% of pixels changed a lot, which is the signature of a silhouette-only effect. Validation clean over both resolve targets and a live 1→2→8→4 cycle. Costs the pipeline cache, which `rasterizationSamples` invalidates whole. **Off by default** |
 | **Geometry amplification** — PN triangles over the level mesh, and over the shadow passes with it | ✅ §4.71 — the first thing here that adds *geometry*. A corner whose normal is its face normal contributes nothing to the patch, so **hard edges stay hard by arithmetic rather than by a heuristic** while a boulder or a pipe rounds off; and the patch is watertight across a shared edge by construction - **conditionally**, on the two sides presenting the same normal, which the level mesh does not do at a material boundary: one shared map edge in five tore open until `render.pn_seam_fix` closed it with one bit per corner, verified at **0 open seams** by an independent re-derivation in `render.seam_census()`. **Off by default.** 1.667 MAD over 51.5% of level02, `pn_strength = 0` at the floor, and the off-state at the cross-launch floor against the pre-change build |
 | **Runtime map lighting** — the level's own `STDLIGHT` rig, per pixel, replacing the bake | ✅ §4.53 (loader), §4.54 (the fitted model), §4.55 (the substitution), **on by default in §4.60** — 1.83 ms on the level with 686 of them and nothing measurable on three others |
 | **The game's stencil, checked on every level** | ✅ §4.60 — 22 pipeline configurations over **sixteen** levels, **3** with stencil, all three flat-shaded, all three first seen on level01. §4.31's marker is now measured on the whole game rather than on two levels. `railway` is the one that could not be: `levels.start` on it takes gl.exe down inside its own `ConvertParsedObjects` |
@@ -705,6 +714,7 @@ level02 when starting fresh.
 | `render.frame_draws([first, last])` | the capture layer's **own** draw list for the last complete frame — index, topology, primitives, FVF, buffered/user-pointer, blend, depth, cull, alpha test, depth slice, stage-0 `.rim` name. Mirror-side, so it works in every mode. It is what `ref_range` is aimed with: **an index does not carry between runs** (aiming at 222 because a `vulkan` session called the quad 222 landed on the HUD portraits), so find the draw by its signature in the mode you are in |
 | `render.force_lod` | run-time only, `-1` off: force every texture fetch to an explicit mip level. The probe that ruled mip selection out of the residual (§4.34); pair it with `GKPLUS_NO_MIPMAP=1` on the reference, which pins the original to level 0 |
 | `render.shade_mode` | run-time only, on by default: honour `D3DRS_SHADEMODE`, or interpolate everything the way every build before §4.31 did. Worth **0.000** on level01 and level02, because every flat-shaded draw there is the stencil shadow — kept because that is a fact about two levels, not about the game |
+| `render.msaa` | run-time, **1 (off)** by default: the world pass's sample count (§4.88). Anything not a supported power of two rounds **down**, so no value throws — `render.vulkan_report` prints the counts the device offers and flags a request that could not be met. **Reads back effective, not requested**, and the frame that adopts a new count is the next one, so a read straight after a write can still answer the old value; a UI control must hold its own pending value. Antialiases geometric edges and the stencil shadow's border, and nothing else — an alpha-**tested** cutout is a texkill, not a coverage question. `GKPLUS_VK_MSAA=4` sets what the first frame comes up at |
 | `GKPLUS_VK_LOCAL_SHADOWS=0` | the launch-time form of `render.local_shadows` (§4.65). It exists because the run-time knob is reachable only through the REPL, which is reachable only from a running game on a **usable display** |
 | `GKPLUS_VK_SKIP` | switch off this renderer's own features to bisect them: `t` topologies, `s` seeding a buffer from its own contents, `l` the material colour for unlit-vertex draws, `d` the API's initial state defaults |
 
@@ -821,8 +831,8 @@ that decided how to implement it.
 One run per renderer, then a numeric difference. Three-way — `d3d8`, `d3d9`, `vulkan` — is one
 extra launch of the same script and is what tells a translation-layer defect from a real one.
 
-**Switch the departures off with `render.stock = true`, not one at a time** (§4.87). There are nine
-of them now, and the comparison that matters is on a *paused* frame — nine writes is nine frames of
+**Switch the departures off with `render.stock = true`, not one at a time** (§4.87). There are ten
+of them now, and the comparison that matters is on a *paused* frame — ten writes is ten frames of
 drift on anything animating, which is precisely the floor of order 1 the rest of this section is
 about. One write is one frame. `GKPLUS_VK_STOCK=1` does it from launch for a run that is only ever
 going to be a reference. It reads back derived, so it also answers "did I leave something on?"

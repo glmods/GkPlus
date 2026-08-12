@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <set>
@@ -104,6 +105,15 @@ VkDeviceMemory DepthMemory = VK_NULL_HANDLE;
 VkImageView DepthView = VK_NULL_HANDLE;
 VkFormat DepthFormat = VK_FORMAT_UNDEFINED;
 bool DepthStencil = false;
+
+// See SetMsaa in VkDraw.h. Two values and not one, because "what was asked for" and "what the
+// frame is drawn at" genuinely differ: a device may not support the count, and its target may
+// fail to allocate. `SampleCount` is the second - it is what CreateDepth stamps on the depth
+// image and what CreatePipelineFor writes into `rasterizationSamples`, so those two agree by
+// construction rather than by two reads of the same knob.
+uint32_t MsaaRequested = 1;
+bool MsaaEnvRead = false;
+VkSampleCountFlagBits SampleCount = VK_SAMPLE_COUNT_1_BIT;
 // The swapchain's extent, kept because a draw's viewport has to be reissued when its depth
 // slice changes and only the width and height stay constant across that (§4.32).
 uint32_t ViewportWidth = 0;
@@ -179,6 +189,42 @@ VkImageAspectFlags DepthAspect() {
          (DepthStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VkImageAspectFlags(0));
 }
 
+// The count the device will actually take, from the one the caller asked for. Rounds DOWN twice:
+// to a power of two, then to a bit `DeviceCaps::sample_counts` has - so an unsupported 8 lands on
+// 4 rather than failing, and a request of 3 lands on 2 rather than being rejected as malformed.
+// Cannot return zero: VK_SAMPLE_COUNT_1_BIT is always supported, and a caps mask that somehow did
+// not contain it would still leave the `1` this starts from.
+VkSampleCountFlagBits ClampSamples(uint32_t requested) {
+  uint32_t best = 1;
+  for (uint32_t candidate = 2; candidate <= 64; candidate *= 2) {
+    if (candidate > requested || (Caps().sample_counts & candidate) == 0) {
+      continue;
+    }
+    best = candidate;
+  }
+  return static_cast<VkSampleCountFlagBits>(best);
+}
+
+// `GKPLUS_VK_MSAA` - the value the first frame comes up at, read once and lazily for the reason
+// LocalShadowsEnabled gives: DllMain is far too early to ask the environment anything. It writes
+// `MsaaRequested` and then never runs again, so a later `render.msaa` is not fighting it.
+void ReadMsaaEnvOnce() {
+  if (MsaaEnvRead) {
+    return;
+  }
+  MsaaEnvRead = true;
+  char value[16] = {};
+  const DWORD len = ::GetEnvironmentVariableA("GKPLUS_VK_MSAA", value, sizeof(value));
+  if (len == 0 || len >= sizeof(value)) {
+    return;
+  }
+  const uint32_t parsed = static_cast<uint32_t>(std::strtoul(std::string(value, len).c_str(),
+                                                             nullptr, 10));
+  if (parsed != 0) {
+    MsaaRequested = parsed;
+  }
+}
+
 void DestroyDepth() {
   if (DepthView != VK_NULL_HANDLE) {
     vkDestroyImageView(GetDevice(), DepthView, nullptr);
@@ -211,7 +257,9 @@ bool CreateDepth(uint32_t width, uint32_t height) {
   info.extent = {width, height, 1};
   info.mipLevels = 1;
   info.arrayLayers = 1;
-  info.samples = VK_SAMPLE_COUNT_1_BIT;
+  // The world pass's colour attachment, the depth image and every pipeline bound inside it must
+  // agree on this, which is why all three read the one `SampleCount` rather than a knob each.
+  info.samples = SampleCount;
   info.tiling = VK_IMAGE_TILING_OPTIMAL;
   info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
   info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -399,9 +447,17 @@ VkPipeline CreatePipelineFor(const PipelineState &state) {
   raster.depthClampEnable =
       (state.depth_clamp != 0 && Caps().depth_clamp) ? VK_TRUE : VK_FALSE;
 
+  // Not dynamic - there is no VK_DYNAMIC_STATE for it in core - so this is baked, and the whole
+  // cache has to go when the count moves. `ApplySampleCount` is what does that; nothing here can,
+  // because a pipeline is only ever built on first sight of its state.
+  //
+  // `sampleShadingEnable` stays off deliberately: the fragment shader runs once per PIXEL and its
+  // result is written to every covered sample. That is what makes this cost coverage and a resolve
+  // rather than N times the shading, and it is also why the AO fetch in world.slang - a `Load` at
+  // `input.position.xy` - keeps landing on the same texel it does at one sample.
   VkPipelineMultisampleStateCreateInfo multisample = {
       VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-  multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  multisample.rasterizationSamples = SampleCount;
 
   VkPipelineDepthStencilStateCreateInfo depth = {
       VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -502,6 +558,23 @@ VkPipeline PipelineFor(const PipelineState &state) {
   Pipelines.emplace(state, pipeline);
   TheStats.pipelines = Pipelines.size();
   return pipeline;
+}
+
+// Every world pipeline destroyed and the cache emptied, so the next draw of each state builds one
+// against whatever the pipeline-wide state now is. Shutdown's use is the obvious one; the other is
+// a sample-count change, which invalidates all of them at once.
+//
+// **The caller owns the wait.** Nothing here checks that the pipelines are idle, because both
+// callers already hold the `vkDeviceWaitIdle` they need for their own reasons and taking a second
+// one under the queue lock would be the deadlock, not the safety.
+void DestroyPipelineCache() {
+  for (const auto &[state, pipeline] : Pipelines) {
+    if (pipeline != VK_NULL_HANDLE) {
+      vkDestroyPipeline(GetDevice(), pipeline, nullptr);
+    }
+  }
+  Pipelines.clear();
+  TheStats.pipelines = 0;
 }
 
 // The shader modules outlive every pipeline, unlike the old single-pipeline version which
@@ -5704,12 +5777,54 @@ void SetShadeMode(bool enabled) { ShadeModeEnabled = enabled; }
 
 bool ShadeMode() { return ShadeModeEnabled; }
 
+// --- multisample antialiasing ------------------------------------------------------------------
+//
+// See SetMsaa in VkDraw.h. Everything here is bookkeeping: the work happens in
+// `ReconcileRenderTarget`, which compares `MsaaTargetSamples()` against the target it built last
+// and rebuilds under the wait-idle it already takes.
+
+void SetMsaa(uint32_t samples) {
+  // The env var is consumed here as well as at bring-up, so that the first *write* cannot be
+  // overwritten by a lazy read that had not happened yet. Reading it after assigning would put
+  // the environment's value back over the caller's.
+  ReadMsaaEnvOnce();
+  // Stored as asked, not as clamped. `MsaaTargetSamples` does the clamping on the way out, which
+  // keeps a request of 8 on a 4x device asking for 8 - so it takes effect by itself if the device
+  // is ever replaced by one that can, rather than being quietly rewritten to 4 forever.
+  MsaaRequested = samples == 0 ? 1 : samples;
+}
+
+uint32_t Msaa() { return static_cast<uint32_t>(SampleCount); }
+
+uint32_t MsaaWanted() {
+  ReadMsaaEnvOnce();
+  return MsaaRequested;
+}
+
+uint32_t MsaaTargetSamples() {
+  ReadMsaaEnvOnce();
+  return static_cast<uint32_t>(ClampSamples(MsaaRequested));
+}
+
+void ApplySampleCount(uint32_t samples) {
+  const auto wanted = static_cast<VkSampleCountFlagBits>(samples == 0 ? 1 : samples);
+  if (wanted == SampleCount) {
+    return;
+  }
+  SampleCount = wanted;
+  // **Not optional and not deferrable.** `rasterizationSamples` is baked into every one of these
+  // and a pipeline whose count disagrees with the attachments is an invalid draw, not a wrong
+  // picture - so they go now, while the caller's wait-idle still holds, rather than being marked
+  // stale for a frame that would use them first.
+  DestroyPipelineCache();
+}
+
 // --- the stock-look preset (§4.87) ------------------------------------------------------------
 //
 // See SetStock in VkDraw.h for what is in the set and what is deliberately not.
 
 namespace {
-// The nine departures, as one value that can be snapshotted and compared. The defaults here are
+// The ten departures, as one value that can be snapshotted and compared. The defaults here are
 // the build's, which is what a `stock = false` with nothing saved applies.
 struct DepartureSet {
   bool per_pixel_lighting = true;
@@ -5721,13 +5836,17 @@ struct DepartureSet {
   bool local_shadows = true;
   bool ambient_occlusion = false;
   bool tessellation = false;
+  // The only member that is not a bool, and the reason kStock spells its value out rather than
+  // relying on a zero: the reproduction here is ONE sample per pixel, not none.
+  uint32_t msaa = 1;
 
   friend bool operator==(const DepartureSet &, const DepartureSet &) = default;
 };
 
-// Every departure's reproduction value. Spelled out per field rather than as nine bare `false`s
+// Every departure's reproduction value. Spelled out per field rather than as ten bare `false`s
 // because the *list* is the claim - a departure added later whose stock value is something other
-// than false would need a member here, and would be invisible as a tenth positional zero.
+// than false would need a member here, and would be invisible as an eleventh positional zero.
+// `msaa` is exactly that departure, and a positional zero would have been a sample count of none.
 constexpr DepartureSet kStock = {
     .per_pixel_lighting = false,
     .map_lighting = false,
@@ -5738,6 +5857,7 @@ constexpr DepartureSet kStock = {
     .local_shadows = false,
     .ambient_occlusion = false,
     .tessellation = false,
+    .msaa = 1,
 };
 
 DepartureSet SavedDepartures;
@@ -5760,6 +5880,12 @@ DepartureSet CurrentDepartures() {
   set.local_shadows = LocalShadowsEnabled();
   set.ambient_occlusion = AoEnabled;
   set.tessellation = TessellationOn;
+  // `MsaaWanted` and not `Msaa` for the same reason, and it bites harder here than anywhere else
+  // in this function: `Msaa()` reads 1 for a whole frame after a change is asked for, because the
+  // reconcile has not run yet - so a snapshot through it would record "off" for a knob the caller
+  // had just turned on, and `Stock()` would answer true for a frame that is about to be
+  // multisampled.
+  set.msaa = MsaaWanted();
   return set;
 }
 
@@ -5779,6 +5905,7 @@ void ApplyDepartures(const DepartureSet &set) {
   SetLocalShadows(set.local_shadows);
   SetAmbientOcclusion(set.ambient_occlusion);
   SetTessellationEnabled(set.tessellation);
+  SetMsaa(set.msaa);
 }
 } // namespace
 
@@ -7264,12 +7391,7 @@ void ShutdownDraw() {
   // side created, and nothing outside the draw path knows they exist.
   ShutdownLightingMaps();
   DestroyDepth();
-  for (const auto &[state, pipeline] : Pipelines) {
-    if (pipeline != VK_NULL_HANDLE) {
-      vkDestroyPipeline(GetDevice(), pipeline, nullptr);
-    }
-  }
-  Pipelines.clear();
+  DestroyPipelineCache();
   for (VkShaderModule *module :
        {&VertexModule, &FragmentModule, &TessVertexModule, &HullModule, &DomainModule}) {
     if (*module != VK_NULL_HANDLE) {

@@ -2497,19 +2497,39 @@ declare module "gk" {
      *  `GKPLUS_VK_PER_PIXEL_LIGHTING=0` is the launch-time form. */
     per_pixel_lighting: boolean;
 
+    /** The world pass's MSAA sample count. `1` is off and is the default.
+     *
+     *  Write `2`, `4` or `8`; anything else **rounds down** to a power of two
+     *  the device supports, so no value throws and `render.status` is where an
+     *  unsupported request shows up. Antialiases geometric edges, the stencil
+     *  shadow volumes included - it does nothing for the alpha-*tested*
+     *  cutouts (sprites, foliage), which need alpha-to-coverage.
+     *
+     *  **Takes effect on the next frame, not on the write.** The setter records
+     *  a number; rebuilding the multisampled target, the depth buffer and every
+     *  cached pipeline happens between frames, under the same wait a resize
+     *  takes. So this reads back the count in force rather than the one
+     *  requested, and a read straight after a write still answers the old
+     *  value - bind a control to your own pending value, not to this, or it
+     *  fights itself for one frame.
+     *
+     *  `GKPLUS_VK_MSAA=4` sets what the first frame comes up at; the knob stays
+     *  writable afterwards either way. */
+    msaa: number;
+
     /** Every deliberate departure from D3D8, switched together.
      *
      *  `true` is the setup a fidelity comparison against
-     *  `GKPLUS_RENDERER=d3d8` needs, in one write rather than nine - which is
+     *  `GKPLUS_RENDERER=d3d8` needs, in one write rather than ten - which is
      *  the whole point, because the comparison worth making is on a *paused*
-     *  frame and nine writes is nine frames of drift on anything that moves.
+     *  frame and ten writes is ten frames of drift on anything that moves.
      *
      *  The set is exactly what each knob already documents as "off is the build
      *  before it existed": `per_pixel_lighting`, `map_lighting`,
      *  `lighting_maps`, the four shadow systems the game never had
      *  (`sun_shadows`, `map_shadows`, `dynamic_shadows`, `local_shadows`), and
-     *  `ao` and `tessellation` - the last two off by default already, and here
-     *  so a session that turned them on is not one this lies about.
+     *  `ao`, `tessellation` and `msaa` - the last three off by default already,
+     *  and here so a session that turned them on is not one this lies about.
      *
      *  The fidelity knobs are **not** in it - `half_pixel`, `rhw_depth_raw`,
      *  `viewport_rect`, `shade_mode`, `local_lights`, `map_light_cull`. For
@@ -2518,12 +2538,12 @@ declare module "gk" {
      *  real one.
      *
      *  **`false` restores the session, not the defaults.** Switching to stock
-     *  snapshots the nine first, so a `local_shadows` that was off before
-     *  returns to off. Only those nine switches move - `shadow_bias`,
+     *  snapshots the ten first, so a `local_shadows` that was off before
+     *  returns to off. Only those ten switches move - `shadow_bias`,
      *  `map_light_gain`, `bump_scale` and every other parameter under them
      *  survive the round trip untouched.
      *
-     *  Reads back derived: `true` only while all nine are configured off, so
+     *  Reads back derived: `true` only while all ten are configured off, so
      *  turning one back on by hand makes this read `false` rather than leaving
      *  a mode flag that disagrees with the frame.
      *  `GKPLUS_VK_STOCK=1` is the launch-time form. */

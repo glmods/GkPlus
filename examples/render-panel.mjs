@@ -30,6 +30,17 @@ import { console, render } from "gk";
  *  @type {{title: string, body: string} | null} */
 let readout = null;
 
+/** The sample counts offered, and their labels. Not read from the device - a
+ *  count it cannot do rounds down on the way in, and `render.status` says so. */
+const MSAA_COUNTS = [1, 2, 4, 8];
+const MSAA_LABELS = ["off", "2x", "4x", "8x"];
+
+/** The count asked for while the frame that adopts it has not run yet, or null.
+ *  `render.msaa` reads back what is IN FORCE, so a control bound straight to it
+ *  would show the old value for one frame and write it back over the request.
+ *  @type {number | null} */
+let msaaPending = null;
+
 /** A checkbox bound to a `render` property, written only when it changes.
  *  @param {ImGui} ImGui
  *  @param {string} label
@@ -126,11 +137,11 @@ export function draw_render_panel(ImGui) {
   //
   // Not inside a TreeNode: it is the one control here that answers a question
   // ("what did the original look like?") rather than tuning an answer, and the
-  // nine checkboxes it drives are scattered across six of the sections below.
+  // ten switches it drives are scattered across seven of the sections below.
   toggle(ImGui, "stock D3D8 look", "stock",
     "Every deliberate departure off at once - per-pixel lighting, map lighting, " +
-      "lighting maps, all four shadow systems, AO and tessellation. The setup for " +
-      "an A/B against GKPLUS_RENDERER=d3d8. Off restores what you had, not the " +
+      "lighting maps, all four shadow systems, AO, tessellation and MSAA. The setup " +
+      "for an A/B against GKPLUS_RENDERER=d3d8. Off restores what you had, not the " +
       "defaults, and leaves every slider alone.");
   ImGui.Separator();
 
@@ -378,6 +389,36 @@ export function draw_render_panel(ImGui) {
         "units at the knobs above. Reads the arena back; do not call it per frame."
     );
     ImGui.EndDisabled();
+    ImGui.TreePop();
+  }
+
+  // --- multisampling ---------------------------------------------------------
+  if (ImGui.TreeNode("Antialiasing")) {
+    // The one control in this file that does NOT read the knob straight back,
+    // and the module-level `msaaPending` above is why. `render.msaa` answers
+    // with the count in force, and the frame that adopts a new one has not
+    // started yet - so a Combo bound to the raw getter would show the old value
+    // for a frame, decide it "changed" back, and write the old value over the
+    // new one. Holding the request until the getter agrees is the whole fix.
+    const live = Number(render.msaa);
+    if (msaaPending !== null && msaaPending === live) {
+      msaaPending = null;
+    }
+    const shown = msaaPending ?? live;
+    const index = Math.max(0, MSAA_COUNTS.indexOf(shown));
+    const picked = ImGui.Combo("samples", index, MSAA_LABELS);
+    if (picked.changed) {
+      msaaPending = MSAA_COUNTS[picked.current_item];
+      render.msaa = msaaPending;
+    }
+    ImGui.SetItemTooltip(
+      "Sample count for the world pass. Takes effect next frame - it rebuilds the " +
+        "target, the depth buffer and every cached pipeline. Smooths geometric edges " +
+        "and the stencil shadow's border; does nothing for alpha-tested cutouts."
+    );
+    if (msaaPending !== null) {
+      ImGui.TextWrapped(`waiting for the next frame (in force: ${live}x)`);
+    }
     ImGui.TreePop();
   }
 

@@ -1341,10 +1341,66 @@ bool ShadeMode();
 void SetPerPixelLighting(bool enabled);
 bool PerPixelLighting();
 
+// --- multisample antialiasing -----------------------------------------------------------------
+//
+// The world pass rasterised at N samples per pixel and resolved on the way out. Off (1) by
+// default, because it is a departure from D3D8 like the lighting and shadow work above it and a
+// default run has to keep the renderer's residual claim true.
+//
+// **Settable at any time**, which is the whole point: an A/B on a paused frame is what makes an
+// antialiasing change judgeable at all, and a launch-time-only form would mean two sessions and
+// two camera positions. `SetMsaa` only records the wanted count - `ReconcileRenderTarget` notices
+// the mismatch on the next frame and does the work, under the `vkDeviceWaitIdle` it already takes
+// for a resize. That is why this is cheap to expose despite rebuilding three things:
+//
+//   - the depth image, which carries the count on its own `VkImageCreateInfo`;
+//   - a colour target at the render extent and N samples, which the pass draws into instead of
+//     the offscreen/swapchain image - that image becomes the pass's RESOLVE attachment and every
+//     consumer downstream (the scale blit, the overlay pass, the present barrier) is unchanged;
+//   - **the whole world pipeline cache.** `rasterizationSamples` is pipeline state and is not
+//     dynamic, so every cached pipeline is wrong the instant the count moves. They are destroyed
+//     and rebuilt on demand, which costs the first frame after a change and nothing after it.
+//
+// Accepts 1, 2, 4, 8, 16, 32 or 64 and **clamps to what the device supports** rather than failing
+// - `DeviceCaps::sample_counts`, which is the colour/depth/stencil intersection. A request that is
+// not a power of two, or is zero, rounds DOWN to one that is.
+//
+// Reads back **effective, not wanted**: `Msaa()` is what the frame is being drawn at, so a 4 asked
+// for on a device that tops out at 2 reads 2, and a request whose target failed to allocate reads
+// 1. Nothing here reports "asked for" - a knob that could not tell "off" from "unavailable" is
+// exactly what the stock preset's comment warns about, and the wanted value is kept only so a
+// device that grows the capability across a Reset can take it.
+//
+// **What it does and does not smooth.** Geometric edges, including the stencil shadow volumes -
+// stencil is per sample, so the blob's border resolves smoothly for free. It does nothing for
+// alpha-TESTED cutouts (the sprites and the foliage), which stay as hard as they were: fixing
+// those needs alpha-to-coverage, which changes what every blended draw writes and so would have
+// to be its own knob rather than a silent part of this one.
+//
+// `GKPLUS_VK_MSAA=4` sets the value the first frame comes up at. It is an initial value and not a
+// mode - the knob is writable afterwards exactly as if it had never been set.
+void SetMsaa(uint32_t samples);
+uint32_t Msaa();
+
+// The wanted count, for the stock preset's snapshot - see CurrentDepartures on why a preset must
+// never snapshot through an effective-value getter. Not exposed to script.
+uint32_t MsaaWanted();
+
+// The count `ReconcileRenderTarget` should build its targets at: the wanted one clamped to
+// `DeviceCaps::sample_counts`. Separate from `MsaaWanted` so the clamp happens once, on the way
+// to the renderer, rather than at every place that compares two counts.
+uint32_t MsaaTargetSamples();
+
+// Adopt a sample count: stamp it on the depth image the next `ResizeDraw` builds, and destroy
+// every cached world pipeline, since `rasterizationSamples` is baked into each. **The caller must
+// already hold a `vkDeviceWaitIdle`** - see DestroyPipelineCache. `ReconcileRenderTarget` is the
+// only caller, and it takes one for the resize it is doing anyway.
+void ApplySampleCount(uint32_t samples);
+
 // --- the stock-look preset (§4.87) ------------------------------------------------------------
 //
 // Every deliberate departure from D3D8, switched together. `render.stock = true` is the setup a
-// fidelity comparison against `GKPLUS_RENDERER=d3d8` needs, in one write instead of nine; `false`
+// fidelity comparison against `GKPLUS_RENDERER=d3d8` needs, in one write instead of ten; `false`
 // puts back what was there before.
 //
 // **A preset over the knobs, not a mode of its own.** Nothing in the draw path reads it - it
@@ -1356,9 +1412,13 @@ bool PerPixelLighting();
 // The set is exactly what this header already documents as "off is the build before it existed":
 // `per_pixel_lighting`, `map_lighting` and `lighting_maps` - §4.60's "three departures to switch
 // off" - plus the four shadow systems the game never had (`sun_shadows`, `map_shadows`,
-// `dynamic_shadows`, `local_shadows`), plus `ao` and `tessellation`. The last two are off by
-// default already and are here anyway, so that a session which turned them on is not a session
-// this lies about.
+// `dynamic_shadows`, `local_shadows`), plus `ao`, `tessellation` and `msaa`. The last three are
+// off by default already and are here anyway, so that a session which turned them on is not a
+// session this lies about.
+//
+// `msaa` is the one member that is not a bool, and it is in the set for the plainest reason of
+// all: the original rasterised one sample per pixel, so any other count is a departure and a
+// residual measured under it is measuring this rather than the renderer.
 //
 // Two things deliberately outside it:
 //
@@ -1370,17 +1430,17 @@ bool PerPixelLighting();
 //     reproduction, so switching them would move the frame away from D3D8 rather than towards it.
 //     `stock` is not "turn the renderer off"; it is "draw what the original drew".
 //
-// **It restores the session, not the build's defaults.** Switching to stock snapshots the nine
+// **It restores the session, not the build's defaults.** Switching to stock snapshots the ten
 // first, so switching back returns a `local_shadows` that was off before to off. The snapshot is
 // taken only on a transition *into* stock, so writing `true` twice cannot overwrite it with the
 // values it just wrote; with no snapshot to restore - a fresh session's first `false` - it applies
 // the defaults, which is the shipped pipeline with `ao` and `tessellation` still off.
 //
-// Only the nine switches move. Every parameter under them - `shadow_bias`, `map_light_gain`,
+// Only the ten switches move. Every parameter under them - `shadow_bias`, `map_light_gain`,
 // `bump_scale`, the AO radius - is left exactly as it was, so a tuned value survives the round
 // trip without being part of the snapshot at all.
 //
-// Reads back **derived**: true iff all nine are currently configured off, so turning one back on
+// Reads back **derived**: true iff all ten are currently configured off, so turning one back on
 // by hand makes it read false rather than leaving a mode flag that disagrees with the frame. It is
 // the *wanted* value of each that is compared, not the effective one - `ao` reads false until its
 // pass exists and `tessellation` false on a device without the feature, and a preset that could

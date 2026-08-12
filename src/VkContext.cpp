@@ -109,6 +109,13 @@ void QueryDevice(VkPhysicalDevice device, DeviceCaps &caps) {
   caps.max_bindless_textures =
       indexing_props.maxDescriptorSetUpdateAfterBindSampledImages;
   caps.max_tessellation_level = props.properties.limits.maxTessellationGenerationLevel;
+  // See DeviceCaps::sample_counts. The stencil limit is intersected unconditionally even though
+  // the depth format may turn out to be depth-only: a depth/stencil format is what
+  // ChooseDepthFormat prefers, and a cap that changed meaning with that choice would be one more
+  // thing for the two files to agree about.
+  caps.sample_counts = props.properties.limits.framebufferColorSampleCounts &
+                       props.properties.limits.framebufferDepthSampleCounts &
+                       props.properties.limits.framebufferStencilSampleCounts;
 
   caps.descriptor_indexing = features12.descriptorIndexing != 0;
   caps.runtime_descriptor_array = features12.runtimeDescriptorArray != 0;
@@ -424,6 +431,17 @@ std::string FormatCaps() {
       (unsigned long long)(c.host_visible_device_local_bytes >> 20));
   add("bindless sampled images: %u   push constants: %u bytes   graphics family: %u\n",
       c.max_bindless_textures, c.max_push_constants, c.graphics_queue_family);
+  // The counts `render.msaa` will accept, listed rather than printed as the bitmask they are:
+  // the question this line answers is "what may I write there".
+  {
+    std::string counts;
+    for (uint32_t n = 1; n <= 64; n *= 2) {
+      if ((c.sample_counts & n) != 0) {
+        counts += (counts.empty() ? "" : " ") + std::to_string(n) + "x";
+      }
+    }
+    add("msaa sample counts: %s\n", counts.empty() ? "none" : counts.c_str());
+  }
   add("descriptor_indexing=%d runtime_array=%d partially_bound=%d variable_count=%d\n",
       c.descriptor_indexing, c.runtime_descriptor_array, c.partially_bound,
       c.variable_descriptor_count);

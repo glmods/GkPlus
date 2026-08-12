@@ -8632,3 +8632,120 @@ nothing on the draw path asks it anything. **Once per process**, because the dev
 and re-applying on a resize would silently undo whatever the REPL had set since. Verified: the
 pipeline comes up with all nine off before a level is loaded, and `stock = false` from such a
 session gives back the shipped defaults, because the snapshot it took at startup *is* the defaults.
+
+## 4.88 MSAA as a runtime knob, and the three things it did not need to touch
+
+The tenth departure, and by a distance the cheapest one to build - which is itself the interesting
+part of it. The world pass had been one `vkCmdBeginRendering` into one colour attachment since the
+beginning, and every structural decision made for other reasons turned out to be what makes
+multisampling four objects and no new code path.
+
+### Why it costs so little
+
+**Dynamic rendering.** There is no `VkRenderPass` and no `VkFramebuffer` (§2), so there is no
+object that encodes "one colour attachment at one sample count" and has to be rebuilt in step with
+the swapchain. The resolve is three fields on a `VkRenderingAttachmentInfo` that already existed:
+
+```
+colour.imageView          = MsaaView;                       // was world_view
+colour.storeOp            = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+colour.resolveMode        = VK_RESOLVE_MODE_AVERAGE_BIT;
+colour.resolveImageView   = world_view;                     // what it used to draw into
+colour.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+```
+
+The image the pass used to draw into becomes the image it resolves into, so **everything
+downstream is unaware the feature exists**: the offscreen scale blit (§4.37), the overlay pass, the
+`ended_as_attachment` present barrier and the readback probes all still name `world_image` and all
+still find a single-sample image with the finished frame in it. The two paths that image can be -
+the offscreen target or the swapchain image directly - both work with no branch of their own, and
+both were tested under validation.
+
+**The depth buffer is ours.** `CreateDepth` in `VkDraw.cpp` owns it, and `DepthImageView()` has
+exactly one consumer - the attachment in `BeginFrame`. Nothing samples it. So raising its sample
+count breaks no reader, which is the difference between this and a renderer that reconstructs
+position from depth in a later pass.
+
+**Nothing else renders into the world target.** `ColourFormat` appears in exactly one
+`VkPipelineRenderingCreateInfo`, so there is one pipeline family to change. The shadow atlases and
+the AO pass have their own targets and stay at one sample.
+
+### The three things that did not need touching, and why each could have
+
+- **The AO pass.** It renders its own G-buffer at its own extent and `world.slang` reads the
+  result with `ao_at`, a `Load` at `int2(input.position.xy)`. That keeps working *because
+  `sampleShadingEnable` is off*: the fragment shader runs once per pixel and its result is written
+  to every covered sample, so `input.position.xy` is still the pixel centre and still floors to the
+  same texel. Turning per-sample shading on for quality would silently break that relationship
+  before it improved anything, which is a good reason it is not a knob.
+- **The stencil shadow volumes.** Stencil is per sample, so the game's own blob and the volume
+  counting work unchanged and the border comes out antialiased for free. Nothing had to know.
+- **The 2D content.** Every HUD, menu and text draw goes through the same pass and is now
+  rasterised at N samples for no benefit, since an axis-aligned quad has no edge to smooth. That is
+  cost, not incorrectness, and separating it would mean two passes and a second resolve to save a
+  fraction of a millisecond of coverage work.
+
+### The one thing that is genuinely not free: the pipeline cache
+
+`rasterizationSamples` is pipeline state and there is no core dynamic state for it. So the moment
+the count moves, **every cached world pipeline is invalid** - not wrong-looking, invalid: a pipeline
+whose count disagrees with its attachments is an illegal draw. `ApplySampleCount` destroys the whole
+`Pipelines` map and lets `PipelineFor` rebuild on demand, which is what makes the knob cost one
+frame rather than a restart. Measured on level02: the cache went 11 -> 0 and was back to 4 within
+the first frame after a switch, with 0 failures.
+
+That is also why the work hangs off **`ReconcileRenderTarget`** rather than off the setter.
+`render.msaa = 4` from the REPL arrives mid-frame on the main thread; the rebuild needs an idle
+device, and the reconcile already takes one once a frame for a resize or a `Reset`. So the setter
+is a store, the reconcile compares `MsaaTargetSamples()` against the count its target was built at,
+and the work happens between frames. The same structure is what lets a failed allocation fall back
+to one sample cleanly - `MsaaSamples` is what was *built*, and `ApplySampleCount` is handed that
+rather than what was asked for, so the pipelines and the depth image cannot disagree with the
+attachment they will be used with.
+
+### The reads are effective, the snapshot is wanted
+
+`render.msaa` reads back the count in force, for the reason §4.87's getter is derived: a knob that
+cannot tell "off" from "unavailable" reports a frame nobody is looking at. The consequence is a
+one-frame window where a read after a write answers the old value, which is why
+`examples/render-panel.mjs` holds its own pending value - a Combo bound to the raw getter would
+decide it had "changed" back and write the old count over the new one.
+
+`CurrentDepartures()` must therefore snapshot `MsaaWanted()` and not `Msaa()`, and this is the
+member where that distinction bites hardest: the effective value lags by a frame *by design*, so a
+snapshot through it would record 1 for a knob just set to 4 and `render.stock` would answer true
+for a frame that is about to be multisampled.
+
+### Measured
+
+AMD RX 7600 XT, level02, windowed at a 3072x1728 render extent, **paused** - a live frame's numbers
+are mostly animation and were four to five times larger before the pause, which is §4.28 again.
+
+| comparison | MAD | pixels changed | max |
+|---|---|---|---|
+| 1x vs 1x (noise floor) | 0.008/255 | 0.01% | 242 |
+| 1x vs 4x | 0.069/255 | 0.73% | 167 |
+| 1x vs 8x | 0.076/255 | 0.86% | 242 |
+
+That shape is the whole signature of the feature: **under 1% of pixels, changed a lot**. A
+whole-frame MAD is the wrong reading for it in the same way §4.60 says it is wrong for per-pixel
+lighting - the difference lives entirely on silhouettes, and averaging it over a level's flat
+ground buries it. The magnified crop is unambiguous where the number is small.
+
+Frame cost is **not measured here.** Present mode was `fifo`, so 1x, 4x and 8x all read 60.0-60.1
+presented frames per second, which is the monitor and not the renderer (§4.79). What that does
+establish is that 8x at 3072x1728 still reaches the refresh interval on this device; anything
+finer needs `GKPLUS_VK_PRESENT_MODE=immediate`.
+
+**Validation: 0 errors, 0 warnings** across coming up at 4x from `GKPLUS_VK_MSAA`, a full level
+load, cycling 1 -> 2 -> 8 -> 4 in a live level, and both the offscreen and the direct-to-swapchain
+resolve targets. The `stock` round trip was verified too: `msaa = 4` makes `stock` read false,
+`stock = true` takes it to 1, and `stock = false` gives back 4 rather than the default. Clamping
+behaves as documented - 3 -> 2, 64 -> 8 (the device's ceiling), 0 -> 1.
+
+### What it does not do
+
+Alpha-**tested** cutouts - the sprites and the foliage - are exactly as hard as they were. MSAA
+resolves coverage, and a texkill'd fragment is not a coverage question. Fixing those means
+alpha-to-coverage, which changes what every alpha-blended draw writes and would therefore have to
+be its own knob rather than a silent part of this one.

@@ -500,6 +500,16 @@ The one fact that shapes everything: **the seam is `Direct3DCreate8`, not the AW
 queue**, and the ground truth to compare against is `GKPLUS_RENDERER=d3d8` - the original runtime,
 still shipped in SysWOW64.
 
+It also does **MSAA** (`render.msaa`, off by default, settable at any time): the world pass at N
+samples resolved on the way out, which dynamic rendering makes three fields on the attachment the
+pass already had - the image it used to draw into becomes the one it resolves into, so the scale
+blit, the overlay pass and the present barrier are all unaware of it. Two things there are
+load-bearing: `rasterizationSamples` is **not dynamic state**, so a count change invalidates the
+whole world pipeline cache and the work therefore hangs off `ReconcileRenderTarget` (which already
+holds a `vkDeviceWaitIdle`) rather than off the setter; and `sampleShadingEnable` stays **off**, so
+the fragment shader runs once per pixel and `world.slang`'s AO fetch keeps landing on the texel it
+did at one sample. `vulkan_renderer_notes.md` §4.88.
+
 It also draws **ambient occlusion with no blur pass** (`render.ao`, off by default): the sample
 offsets are generated in 2D from one fixed lattice disc shared by every pixel and the 3D position of
 the *tapped* pixel is what gets reconstructed, so the kernel needs no per-pixel randomisation and
