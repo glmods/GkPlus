@@ -22,20 +22,17 @@ find_package(imgui CONFIG REQUIRED)
 find_package(detours MODULE REQUIRED)
 
 find_package(d3d8to9 MODULE REQUIRED)
-find_package(volk CONFIG REQUIRED)
 
-# Vulkan::Headers, NOT Vulkan::Vulkan: VMA only needs vulkan/vulkan.h, and linking the
-# loader's import library would give d3d8.dll a load-time dependency on vulkan-1.dll -
-# the thing volk and the vendored imgui backend exist to avoid.
 find_package(VulkanHeaders CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 
-# volk.c is compiled into GkPlus rather than taken from volk::volk, so that the platform
-# defines below apply to volk's own translation unit as well as to ours. vcpkg's prebuilt
-# volk library is built WITHOUT VK_USE_PLATFORM_WIN32_KHR, so its vkCreateWin32SurfaceKHR
-# pointer does not exist - volk.h still declares it (the header sees our define), so the
-# mismatch surfaces as an undefined symbol at link time rather than anywhere useful.
-find_path(VOLK_SOURCE_DIR NAMES volk.c REQUIRED)
+# Vulkan::Loader is vcpkg's 32-bit import library for vulkan-1.dll - the one the Vulkan SDK
+# does not ship (it has no Lib32). Linking it is what lets both this codebase and vcpkg's
+# prebuilt imgui Vulkan backend call vk* directly instead of through loaded pointers.
+#
+# It is DELAY-loaded, see target_link_options below: the import library is a build-time
+# convenience, not a promise that the machine has Vulkan.
+find_package(VulkanLoader CONFIG REQUIRED)
 
 find_package(qjs CONFIG REQUIRED)
 
@@ -105,8 +102,6 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Settings.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Tokens.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Triggers.cpp"
-    "${VOLK_SOURCE_DIR}/volk.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui_backends/imgui_impl_vulkan.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/VertexFormat.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/VkContext.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/VkDraw.cpp"
@@ -117,8 +112,16 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/WindowPlacement.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/World.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/exports.def")
-target_link_libraries(GkPlus PRIVATE huffman detours imgui::imgui d3d8to9 d3d9 qjs imgui-quickjs ws2_32 volk::volk_headers GPUOpen::VulkanMemoryAllocator Vulkan::Headers
+target_link_libraries(GkPlus PRIVATE huffman detours imgui::imgui d3d8to9 d3d9 qjs imgui-quickjs ws2_32 GPUOpen::VulkanMemoryAllocator Vulkan::Headers Vulkan::Loader delayimp
     $<IF:$<TARGET_EXISTS:PhysFS::PhysFS>,PhysFS::PhysFS,PhysFS::PhysFS-static>)
+
+# GkPlus *is* `d3d8.dll`, so a load-time dependency on vulkan-1.dll would stop Gunlok launching
+# at all on a machine with no Vulkan - and the Vulkan renderer is opt-in
+# (`GKPLUS_RENDERER=vulkan`), so that would be a hard requirement for a path most runs never
+# take. Delay-loading keeps the import table clean of it until the first vk* call, which is
+# inside vulkan::Initialize() and only after its LoadLibrary probe has found the loader
+# (src/VkContext.cpp). `delayimp` above is the helper the stubs jump through.
+target_link_options(GkPlus PRIVATE "LINKER:/DELAYLOAD:vulkan-1.dll")
 
 if(GKPLUS_RENDERDOC_INTEGRATION)
     find_package(RenderDoc REQUIRED)
@@ -134,15 +137,14 @@ endif()
 # Needed for VK_KHR_win32_surface and vkCreateWin32SurfaceKHR. On the target rather
 # than per-TU so every Vulkan source agrees - a TU that forgot it would still compile
 # and then miss the surface entry points at link time.
-target_compile_definitions(GkPlus PRIVATE VK_USE_PLATFORM_WIN32_KHR VK_NO_PROTOTYPES
-    IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
+target_compile_definitions(GkPlus PRIVATE VK_USE_PLATFORM_WIN32_KHR)
 set_target_properties(GkPlus
     PROPERTIES
     OUTPUT_NAME "d3d8"
     CXX_STANDARD 23)
 
 # `src/Shaders.gen.inc.h` is checked in, so d3d8.dll builds on a machine with no shader
-# toolchain - the same reasoning that makes the renderer reach Vulkan through volk. The
+# toolchain - the same reasoning that makes the renderer delay-load `vulkan-1.dll`. The
 # requirement here is therefore not "compile the shaders" but "never silently compile against a
 # STALE header": for as long as nothing in the build ran the generator, editing a `.slang` and
 # running `cmake --build` reported success having changed nothing, and the only tell was that the

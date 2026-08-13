@@ -3,7 +3,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-#include <volk.h>
+#include <vulkan/vulkan.h>
 
 #include <cstdio>
 #include <vector>
@@ -26,6 +26,12 @@ VkPhysicalDevice PhysicalDevice = VK_NULL_HANDLE;
 VkDevice Device = VK_NULL_HANDLE;
 VkQueue GraphicsQueue = VK_NULL_HANDLE;
 VkDebugUtilsMessengerEXT Messenger = VK_NULL_HANDLE;
+// The only two entry points this file resolves by hand. VK_EXT_debug_utils is an instance
+// extension, so the loader does not export it and there is nothing for the import library to
+// bind - unlike the swapchain and surface functions, which it does export. Null unless
+// validation is on.
+PFN_vkCreateDebugUtilsMessengerEXT CreateMessenger = nullptr;
+PFN_vkDestroyDebugUtilsMessengerEXT DestroyMessenger = nullptr;
 uint64_t ValidationErrors = 0;
 uint64_t ValidationWarnings = 0;
 std::vector<std::string> ValidationLog;
@@ -184,7 +190,17 @@ bool HasLayer(const char *name) {
 }
 
 InitResult DoInitialize() {
-  if (volkInitialize() != VK_SUCCESS) {
+  // vulkan-1.dll is DELAY-loaded (see CMakeLists.txt), so no vk* call may be made before this
+  // succeeds: the delay-load stub would raise a structured exception the moment it could not
+  // find the DLL, and there is no handler for that anywhere on this path. This probe is
+  // therefore the guard that makes the whole file safe on a machine with no Vulkan, and it has
+  // to stay the first statement in it. It also warms the delay-load: LoadLibrary is what the
+  // stub itself would call, so once it has returned non-null the first real call resolves out
+  // of the already-loaded module.
+  //
+  // Not freed. The library stays loaded for the process either way once anything here has
+  // called into it, and a FreeLibrary on the failure path would only invite a stub to reload it.
+  if (::LoadLibraryA("vulkan-1.dll") == nullptr) {
     return Fail(InitResult::NoLoader,
                 "no vulkan-1.dll, or it exposes no ICD for this process. gl.exe is 32-bit, "
                 "so this needs the SysWOW64 loader and the driver's VulkanDriverNameWow ICD");
@@ -193,10 +209,14 @@ InitResult DoInitialize() {
   // 1.3 is a hard floor, not a preference: dynamic rendering and synchronization2 are 1.3
   // core, and the renderer is built on both. Checked against the loader first so an old
   // loader gets a legible message instead of a vkCreateInstance failure.
+  //
+  // vkEnumerateInstanceVersion is called unconditionally now that it is an import rather than
+  // a loaded pointer - `&vkEnumerateInstanceVersion` is the delay-load thunk's address and is
+  // never null, so a null test here would have tested nothing. Every loader since 1.1 (2018)
+  // exports it; one that does not fails at the stub, which is the same class of failure as any
+  // other missing export and not one this code can report.
   uint32_t instance_version = VK_API_VERSION_1_0;
-  if (vkEnumerateInstanceVersion != nullptr) {
-    vkEnumerateInstanceVersion(&instance_version);
-  }
+  vkEnumerateInstanceVersion(&instance_version);
   if (instance_version < VK_API_VERSION_1_3) {
     return Fail(InitResult::NoInstance, "loader reports Vulkan " +
                                             std::to_string(VK_VERSION_MAJOR(instance_version)) +
@@ -237,9 +257,13 @@ InitResult DoInitialize() {
     return Fail(InitResult::NoInstance,
                 "vkCreateInstance returned " + std::to_string(created));
   }
-  volkLoadInstance(Instance);
-
   if (use_validation) {
+    CreateMessenger = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
+        vkGetInstanceProcAddr(Instance, "vkCreateDebugUtilsMessengerEXT"));
+    DestroyMessenger = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
+        vkGetInstanceProcAddr(Instance, "vkDestroyDebugUtilsMessengerEXT"));
+  }
+  if (use_validation && CreateMessenger != nullptr) {
     VkDebugUtilsMessengerCreateInfoEXT messenger = {
         VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
     messenger.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
@@ -248,7 +272,7 @@ InitResult DoInitialize() {
                             VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
                             VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
     messenger.pfnUserCallback = DebugCallback;
-    vkCreateDebugUtilsMessengerEXT(Instance, &messenger, nullptr, &Messenger);
+    CreateMessenger(Instance, &messenger, nullptr, &Messenger);
     DebugWrite("gkplus: vulkan validation enabled\n");
   }
 
@@ -354,9 +378,10 @@ InitResult DoInitialize() {
     return Fail(InitResult::NoDevice,
                 "vkCreateDevice returned " + std::to_string(device_created));
   }
-  // Device-level entry points bypass the loader's dispatch after this, which is the reason
-  // volk is here at all beyond dynamic loading.
-  volkLoadDevice(Device);
+  // Device-level entry points go through the loader's trampoline, which resolves the dispatch
+  // table from the handle on every call. That is one indirection more than a per-device table
+  // fetched with vkGetDeviceProcAddr would cost; the draw path is measured in
+  // vulkan_renderer_notes.md and this is not where its time goes.
   vkGetDeviceQueue(Device, TheCaps.graphics_queue_family, 0, &GraphicsQueue);
 
   Result = InitResult::Ok;
@@ -496,8 +521,8 @@ void Shutdown() {
     vkDestroyDevice(Device, nullptr);
     Device = VK_NULL_HANDLE;
   }
-  if (Messenger != VK_NULL_HANDLE) {
-    vkDestroyDebugUtilsMessengerEXT(Instance, Messenger, nullptr);
+  if (Messenger != VK_NULL_HANDLE && DestroyMessenger != nullptr) {
+    DestroyMessenger(Instance, Messenger, nullptr);
     Messenger = VK_NULL_HANDLE;
   }
   if (Instance != VK_NULL_HANDLE) {

@@ -1578,9 +1578,9 @@ JSValue ClearValidation(JSContext *ctx, JSValueConst, int, JSValueConst *) {
 // --- the Vulkan device -------------------------------------------------------
 //
 // Reading any of these brings the device up if it is not up already. That is deliberate:
-// initialization cannot happen at DLL load (volkInitialize does LoadLibrary, which deadlocks
-// under the loader lock), so *something* has to trigger it from the main thread, and a REPL
-// query is the earliest useful trigger during bring-up.
+// initialization cannot happen at DLL load (it does LoadLibrary("vulkan-1.dll"), which
+// deadlocks under the loader lock), so *something* has to trigger it from the main thread,
+// and a REPL query is the earliest useful trigger during bring-up.
 
 JSValue GetVulkanReport(JSContext *ctx, JSValueConst) {
   const std::string text = vulkan::FormatCaps() + vulkan::FormatStats() +

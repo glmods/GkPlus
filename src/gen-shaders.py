@@ -7,8 +7,8 @@ generics and interfaces for the übershader's stage ops, and one file per pass h
 entry point, so a push constant block shared across stages cannot drift between two files.
 
 Shaders are compiled OFFLINE and the generated header is checked in, so `d3d8.dll` depends on
-no shader toolchain at runtime - the same reasoning that makes the renderer reach Vulkan through
-volk rather than the loader's import library. GkPlus *is* `d3d8.dll`, and a missing build-time
+no shader toolchain at runtime - the same reasoning that makes the renderer delay-load
+`vulkan-1.dll` rather than import it outright. GkPlus *is* `d3d8.dll`, and a missing build-time
 tool must not stop the game launching.
 
 CMake drives this now, and the reason is a defect it caused twice: for as long as nothing in the

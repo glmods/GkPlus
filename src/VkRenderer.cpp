@@ -618,18 +618,11 @@ bool StartImGui() {
   if (ImGuiReady) {
     return true;
   }
-  // The backend is compiled with IMGUI_IMPL_VULKAN_NO_PROTOTYPES (see
-  // third_party/imgui_backends/README.md), so it has no entry points until this fills them.
-  // Routed through volk's vkGetInstanceProcAddr rather than the loader's exported symbol,
-  // which is the whole point: nothing here needs an import library.
-  if (!ImGui_ImplVulkan_LoadFunctions(
-          VK_API_VERSION_1_3,
-          [](const char *name, void *user) {
-            return vkGetInstanceProcAddr(static_cast<VkInstance>(user), name);
-          },
-          GetInstance())) {
-    return Fail("ImGui_ImplVulkan_LoadFunctions failed");
-  }
+  // No ImGui_ImplVulkan_LoadFunctions call: vcpkg builds the backend against the loader's
+  // prototypes, the same way this codebase does, so its entry points are ordinary imports of
+  // the delay-loaded vulkan-1.dll. That function is not even compiled in without
+  // IMGUI_IMPL_VULKAN_NO_PROTOTYPES - calling it would fail to link rather than at run time.
+  // Getting here at all means Initialize() succeeded, so the DLL is loaded.
 
   // The overlay has its own pass on the swapchain image, with no depth attachment, so its
   // pipeline declares colour only. It used to share the world's pass and therefore had to name

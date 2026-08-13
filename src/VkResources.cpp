@@ -3,15 +3,16 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-// VMA reaches Vulkan through the two getters we hand it, which volk has already resolved.
-// STATIC 0 because there are no prototypes to link against (the whole point of volk here);
-// DYNAMIC 1 so VMA loads the rest itself from those two.
+// VMA reaches Vulkan through the two getters we hand it (see CreateAllocator below), and loads
+// everything else from them itself. STATIC 0 although vulkan-1.dll is now linked: the two
+// getters cost one indirection at allocator-creation time and keep VMA off the delay-load
+// stubs, so nothing it might reference can pull the library in behind Initialize()'s probe.
 #define VMA_STATIC_VULKAN_FUNCTIONS 0
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
 #define VMA_VULKAN_VERSION 1003000
 // VMA is header-only: exactly one translation unit must define this, and it is this one so
 // the three defines above are guaranteed to apply to the implementation as well as to the
-// declarations. Splitting them would repeat the volk mismatch from section 4.4.
+// declarations. Splitting them would repeat the header/library mismatch from section 4.4.
 #define VMA_IMPLEMENTATION
 #include <vk_mem_alloc.h>
 

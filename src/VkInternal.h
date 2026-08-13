@@ -4,11 +4,11 @@
 //
 // Separate from VkContext.h on purpose: that header is what the JS bindings and anything
 // else outside the renderer include, and it deliberately mentions no Vulkan type, so
-// including it costs nothing and pulls in no volk. This one is the inside view.
+// including it costs nothing and pulls in no Vulkan header. This one is the inside view.
 //
 // Every handle is null until vulkan::Initialize() has returned InitResult::Ok.
 
-#include <volk.h>
+#include <vulkan/vulkan.h>
 
 #include <mutex>
 

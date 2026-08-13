@@ -202,7 +202,7 @@ Node".
 | quickjs-ng | QuickJS JavaScript engine |
 | dear-bindings | ImGui language bindings |
 | physfs | Archive + search-path filesystem behind the mod loader (`src/Vfs.cpp`) |
-| vulkan-headers, volk, vulkan-memory-allocator | The Vulkan renderer (`src/Vk*`). **volk, not the loader's import library**, so `d3d8.dll` has no load-time dependency on `vulkan-1.dll` and the game still starts on a machine with no Vulkan |
+| vulkan-headers, vulkan-loader, vulkan-memory-allocator | The Vulkan renderer (`src/Vk*`). `vulkan-loader` is there for its **32-bit `vulkan-1.lib`**, which the SDK no longer ships; it is **delay-loaded** (`/DELAYLOAD:vulkan-1.dll`, and `vulkan::Initialize()` opens with a `LoadLibrary` probe), so `d3d8.dll` has no load-time dependency on it and the game still starts on a machine with no Vulkan |
 
 Custom vcpkg ports in `ports/` for: d3d8to9, detours, quickjs-ng, dear-bindings.
 Overlay configuration in `vcpkg-configuration.json`.

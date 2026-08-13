@@ -8,15 +8,16 @@
 //
 // Three things about the shape of this, in order of how much trouble they save:
 //
-// - **Initialization is lazy, and must NOT be moved into DllMain.** Vulkan is reached through
-//   volk, whose volkInitialize does LoadLibrary("vulkan-1.dll"); calling LoadLibrary under
-//   the loader lock is a deadlock. Everything here initializes on first use instead, from the
-//   main thread, long after DLL_PROCESS_ATTACH.
+// - **Initialization is lazy, and must NOT be moved into DllMain.** The first thing it does is
+//   LoadLibrary("vulkan-1.dll"), and calling LoadLibrary under the loader lock is a deadlock.
+//   Everything here initializes on first use instead, from the main thread, long after
+//   DLL_PROCESS_ATTACH.
 //
 // - **A machine with no Vulkan is not an error.** GkPlus ships as `d3d8.dll`, so a hard
-//   dependency on the loader would stop the game launching at all. volk is used precisely
-//   because it resolves the loader at run time: Initialize() returns a reason and the game
-//   keeps running on the d3d8to9 path.
+//   dependency on the loader would stop the game launching at all. vulkan-1.dll is therefore
+//   linked but DELAY-loaded (CMakeLists.txt): the import table does not mention it until the
+//   first vk* call, and that call is behind the LoadLibrary probe in Initialize(), which
+//   returns a reason instead. The game keeps running on the d3d8to9 path.
 //
 // - **32-bit is the constraint that matters, not the GPU.** gl.exe is x86, so this needs the
 //   SysWOW64 loader and the ICD's 32-bit half (`VulkanDriverNameWow` in the display adapter
@@ -35,7 +36,7 @@ namespace vulkan {
 // Why initialization failed, if it did. Ordered by how early the failure happens.
 enum class InitResult {
   Ok,
-  NoLoader,        // no vulkan-1.dll, or volkInitialize failed - not an error, just absent
+  NoLoader,        // vulkan-1.dll would not load - not an error, just absent
   NoInstance,      // vkCreateInstance failed
   NoPhysicalDevice, // zero devices enumerated
   MissingFeatures, // a device exists but cannot do bindless

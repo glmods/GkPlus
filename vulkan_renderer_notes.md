@@ -303,12 +303,13 @@ worth carrying:
 
 Three implementation constraints, all of which bite before anything renders:
 
-- **`volkInitialize` calls `LoadLibrary`, so initialization can never live in `DllMain`** -
-  that is the loader lock, and it deadlocks. `VkContext` initializes lazily on first use from
-  the main thread instead.
-- **A machine with no Vulkan must not be an error.** GkPlus *is* `d3d8.dll`; a hard link to the
-  loader would stop the game launching. volk resolves it at run time and `Initialize()` returns
-  a reason.
+- **Bring-up calls `LoadLibrary`, so initialization can never live in `DllMain`** - that is the
+  loader lock, and it deadlocks. `VkContext` initializes lazily on first use from the main
+  thread instead.
+- **A machine with no Vulkan must not be an error.** GkPlus *is* `d3d8.dll`; a load-time link to
+  the loader would stop the game launching. `vulkan-1.dll` is therefore delay-loaded and
+  `Initialize()` opens with a `LoadLibrary` probe, so absence returns a reason instead of
+  faulting. (Until §4.89 this was volk's runtime loading; the requirement has not changed.)
 - **The legacy `HKLM\SOFTWARE\...\Khronos\Vulkan\Drivers` ICD keys are absent on a current
   driver.** Modern loaders discover the ICD through the display adapter key's
   `VulkanDriverName` / `VulkanDriverNameWow`. For a 32-bit host it is the `...Wow` one that
@@ -382,11 +383,15 @@ Six things worth keeping:
 
 ### One build trap, because it cost a link error
 
-**vcpkg's prebuilt volk is compiled WITHOUT `VK_USE_PLATFORM_WIN32_KHR`.** `volk.h` still declares
-`vkCreateWin32SurfaceKHR` (the header sees *our* define), so the mismatch surfaces as an undefined
-symbol at link time and nowhere useful. The fix is to compile the shipped `volk.c` into GkPlus so
-the platform defines apply to volk's own translation unit too - `find_path(VOLK_SOURCE_DIR NAMES
-volk.c)` and link `volk::volk_headers` instead of `volk::volk`.
+**vcpkg's prebuilt volk was compiled WITHOUT `VK_USE_PLATFORM_WIN32_KHR`.** `volk.h` still declared
+`vkCreateWin32SurfaceKHR` (the header saw *our* define), so the mismatch surfaced as an undefined
+symbol at link time and nowhere useful. The fix was to compile the shipped `volk.c` into GkPlus so
+the platform defines applied to volk's own translation unit too.
+
+**Historical as of §4.89** - volk is gone and the platform define now only reaches a header, since
+the surface entry points come out of `vulkan-1.dll` itself. The shape of the trap survives the
+rewrite and is why the define is still set on the *target* rather than per-TU: a declaration that
+disagrees with the object providing the symbol fails at the link, naming nothing useful.
 
 ## 4.5 Phase 1c results: the overlay
 
@@ -403,22 +408,26 @@ layout transition, and the swapchain no longer needs `TRANSFER_DST` usage.
 
 vcpkg builds imgui's `vulkan-binding` **without** `IMGUI_IMPL_VULKAN_NO_PROTOTYPES`, so its
 prebuilt `imgui_impl_vulkan.o` calls `vkCreateFence` and friends directly and needs a Vulkan
-import library. GkPlus deliberately has none - it reaches Vulkan through volk's runtime loading
-precisely so that **`d3d8.dll` keeps loading, and the game keeps starting, on a machine with no
-Vulkan at all**. That is not a nicety for a d3d8 proxy to a 2000 game.
+import library. GkPlus had none - it reached Vulkan through volk's runtime loading precisely so
+that **`d3d8.dll` keeps loading, and the game keeps starting, on a machine with no Vulkan at
+all**. That is not a nicety for a d3d8 proxy to a 2000 game.
 
 1. Linking `Vulkan::Vulkan` works and silently destroys that property: a load-time import on
    `vulkan-1.dll`.
 2. `/DELAYLOAD:vulkan-1.dll` would have kept it, and is provably safe here because nothing
    reaches an imgui Vulkan entry point except through `StartImGui`, which runs only after
-   `volkInitialize` succeeded. **It is not available**: the installed Vulkan SDK has no `Lib32`,
-   and gl.exe is x86, so there is no 32-bit import library to delay-load.
-3. What works: vendor `imgui_impl_vulkan.cpp` (`third_party/imgui_backends/`) and compile it into
-   GkPlus with `IMGUI_IMPL_VULKAN_NO_PROTOTYPES`, filling its pointers from volk through
-   `ImGui_ImplVulkan_LoadFunctions`. Only the `.cpp` is vendored; the header still comes from
-   vcpkg, so a version bump fails to compile rather than drifting silently.
+   Vulkan bring-up succeeded. It was recorded here as unavailable, on the grounds that the
+   installed Vulkan SDK has no `Lib32` and gl.exe is x86 - **and that conclusion was wrong**,
+   which is the part worth keeping. The SDK is not the only source of an import library: vcpkg's
+   `vulkan-loader` port builds a 32-bit `vulkan-1.lib`, and it was already installed as a
+   dependency of the very imgui feature this section is about. §4.89 is the rewrite.
+3. What worked in the meantime: vendor `imgui_impl_vulkan.cpp` (`third_party/imgui_backends/`)
+   and compile it into GkPlus with `IMGUI_IMPL_VULKAN_NO_PROTOTYPES`, filling its pointers from
+   volk through `ImGui_ImplVulkan_LoadFunctions`.
 
-**Verified**: `llvm-objdump -p build/Debug/d3d8.dll` lists no `vulkan-1.dll` among its imports.
+**Verified at the time**: `llvm-objdump -p build/Debug/d3d8.dll` listed no `vulkan-1.dll` among
+its imports. It now lists one, under *delay* imports only - see §4.89 for the check that tells
+those two apart, because the obvious grep does not.
 
 Two smaller things:
 
@@ -1012,7 +1021,7 @@ Khronos's own language now, it ships in the SDK, and it earns its place here for
 file holds every entry point of a pass, so a push constant block shared across stages cannot
 drift between two files; and its generics are what the übershader's stage ops want. SPIR-V is
 compiled offline by `src/gen-shaders.py` and the header is checked in, so `d3d8.dll` depends on no
-shader toolchain — the same argument that makes the renderer reach Vulkan through volk.
+shader toolchain — the same argument that makes the renderer delay-load `vulkan-1.dll`.
 
 Two Slang specifics that cost a run each:
 
@@ -4304,8 +4313,8 @@ than part of it: every measurement that work takes is worthless if the binary ca
 the previous SPIR-V.
 
 **The header stays checked in.** That is the constraint, not a detail: `d3d8.dll` must build on a
-machine with no Vulkan SDK, which is the same reasoning that makes the renderer reach Vulkan
-through volk rather than the loader's import library. So the requirement is not "compile the
+machine with no Vulkan SDK, which is the same reasoning that makes the renderer delay-load
+`vulkan-1.dll` rather than import it outright. So the requirement is not "compile the
 shaders" but **"never silently compile against a stale header"**, and it has two halves:
 regenerate where `slangc` exists, and **fail the build** where it does not and the header is stale.
 
@@ -8749,3 +8758,79 @@ Alpha-**tested** cutouts - the sprites and the foliage - are exactly as hard as 
 resolves coverage, and a texkill'd fragment is not a coverage question. Fixing those means
 alpha-to-coverage, which changes what every alpha-blended draw writes and would therefore have to
 be its own knob rather than a silent part of this one.
+
+## 4.89 volk removed: a delay-loaded `vulkan-1.dll`, and vcpkg's own import library
+
+§4.5's "the dependency trap" concluded that the ImGui Vulkan backend had to be vendored and
+compiled with `IMGUI_IMPL_VULKAN_NO_PROTOTYPES` because there was **no 32-bit Vulkan import
+library to link or delay-load**. That was true of the *SDK* - LunarG stopped shipping `Lib32` -
+and false of the machine: vcpkg's `vulkan-loader` port builds one, it lands at
+`vcpkg_installed/x86-windows-static-md/lib/vulkan-1.lib` (71 KB, an import library, stdcall-
+decorated names bound to the loader's undecorated exports), and it was **already installed** as
+a dependency of the imgui feature the section is about. Nothing had to be added to get it.
+
+So volk is gone. Every `vk*` call in `src/Vk*` is now an ordinary import, the vendored
+`third_party/imgui_backends/` is deleted, `ImGui_ImplVulkan_LoadFunctions` is not called (with
+prototypes it is not even compiled in - calling it would fail to *link*, which is the right
+failure mode), and `VK_NO_PROTOTYPES` / `IMGUI_IMPL_VULKAN_NO_PROTOTYPES` are off the target.
+
+### The invariant is kept by delay-loading, not by dynamic loading
+
+`d3d8.dll` must still load on a machine with no Vulkan - the renderer is opt-in
+(`GKPLUS_RENDERER=vulkan`), so a load-time dependency would be a hard Vulkan requirement for a
+path most runs never take. `target_link_options(GkPlus PRIVATE "LINKER:/DELAYLOAD:vulkan-1.dll")`
+plus `delayimp` keeps it out of the import table proper, and `DoInitialize()` opens with
+`LoadLibraryA("vulkan-1.dll")`, which is both the "is Vulkan present" test and the thing the
+delay-load stub would have done anyway. That probe **must stay the first statement in the
+function**: a stub that cannot find the DLL raises a structured exception, and there is no handler
+for one anywhere on this path.
+
+Two facts settled before doing any of it, both by dumping symbols rather than by reasoning:
+
+- Of the **96** `vk*` entry points `src/` uses, `C:\Windows\SysWOW64\vulkan-1.dll` exports all but
+  `vkCreateDebugUtilsMessengerEXT` / `vkDestroyDebugUtilsMessengerEXT` - the loader exports core
+  (1.0 through 1.4) plus the WSI extensions, so surface and swapchain need nothing special, and
+  `VK_EXT_debug_utils` needs `vkGetInstanceProcAddr`. Those two are now the only hand-resolved
+  pointers in `VkContext.cpp`, held null unless validation is on.
+- Everything vcpkg's prebuilt `imgui_impl_vulkan.cpp.obj` references is in that export set too,
+  so it links as shipped. It references them **directly** rather than through `__declspec(dllimport)`,
+  which the import library's thunks handle.
+
+VMA keeps `VMA_STATIC_VULKAN_FUNCTIONS 0` even though prototypes now exist. It costs one
+indirection when the allocator is created and keeps VMA off the delay-load stubs, so nothing it
+might reference can pull the library in behind the probe.
+
+### The check that a grep gets wrong
+
+`llvm-readobj --coff-imports` prints `Import {` and `DelayImport {` blocks with identically
+indented `Name:` lines, so grepping for `vulkan-1.dll` finds it either way and says nothing. Keep
+the state:
+
+```
+llvm-readobj --coff-imports build/RelWithDebInfo/d3d8.dll |
+  awk '/^Import \{/{d=0} /^DelayImport \{/{d=1} /  Name: .*\.dll/{print (d?"DELAY":"NORMAL"), $2}'
+```
+
+`DELAY vulkan-1.dll` and nothing else Vulkan-shaped, in both configurations. **105** delayed vk
+symbols, no debug-utils among them.
+
+### Measured in the running game, both halves
+
+- **The fallback is intact, and this is the observation that proves the delay-load rather than
+  inferring it.** Launched with the default renderer, `vulkan-1.dll` is absent from
+  `(Get-Process gl).Modules`; one `render.vulkan_report` over the REPL - which calls
+  `Initialize()` - and it is present, with `status: ok` on an RX 7600 XT. A load-time import would
+  have had it in the list from the first frame.
+- **level02 under `GKPLUS_RENDERER=vulkan`**: 273 draws, 178 actors, 16.81 ms/frame in a Debug
+  build, and the F11 overlay draws through vcpkg's backend - text, sliders and buttons all
+  correct, which is the whole surface `ImGui_ImplVulkan_LoadFunctions` used to be responsible for.
+- **Validation: 0 errors, 0 warnings** over a full level load with the overlay up. `validation: on`
+  in the report is `Messenger != VK_NULL_HANDLE`, so it is also the assertion that the two
+  hand-resolved debug-utils pointers came back live.
+
+### What this gives up
+
+A loader that predates `vkEnumerateInstanceVersion` (Vulkan 1.1, 2018). It used to be called
+through a null check, which is meaningless now that `&vkEnumerateInstanceVersion` is a delay-load
+thunk and never null; such a loader fails at the stub instead, the same as any other missing
+export. The 1.3 floor makes that hypothetical anyway.

@@ -13,7 +13,7 @@
         "detours",
         "vulkan-headers",
         "vulkan-memory-allocator",
-        "volk",
+        "vulkan-loader",
         "quickjs-ng",
         "dear-bindings",
         "physfs"
