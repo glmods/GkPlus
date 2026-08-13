@@ -86,6 +86,224 @@ void NoteServed(const std::string &vpath) {
   g_recent.push_back(vpath);
 }
 
+// --- read accounting -----------------------------------------------------------
+//
+// `GKPLUS_FILE_STATS=1`, off otherwise, because it takes a lock on a path that a
+// level load runs 150,000 times. It exists because the shape of this layer's cost
+// is not what `file_io_notes.md` §1 says: ".rif and sound are whole-file reads" is
+// true and irrelevant, since something else issues six-figure counts of 64-byte
+// ones and that is where a load's wall clock goes.
+//
+// The caller is `_ReturnAddress()`, which is the gl.exe call site itself - the IAT
+// thunk is a `jmp`, so it adds no frame. Recorded as an RVA so it can be looked up
+// in the Ghidra database or the profiler's symbol map without caring about ASLR.
+constexpr size_t kReadSiteMax = 64;
+
+struct ReadSite {
+  uintptr_t rva = 0;
+  uint64_t calls = 0;
+  uint64_t bytes = 0;
+};
+
+bool g_read_stats = false;
+std::mutex g_read_mutex;
+ReadSite g_read_sites[kReadSiteMax];
+uint64_t g_read_buckets[24]; // by size, bucket n is [2^(n-1), 2^n)
+uint64_t g_read_calls = 0;
+uint64_t g_read_bytes = 0;
+
+void NoteRead(void *caller, DWORD count) {
+  const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+  const uintptr_t rva = reinterpret_cast<uintptr_t>(caller) - base;
+  size_t bucket = 0;
+  while (bucket + 1 < std::size(g_read_buckets) &&
+         (1ull << bucket) <= static_cast<uint64_t>(count)) {
+    ++bucket;
+  }
+  std::lock_guard lock(g_read_mutex);
+  ++g_read_calls;
+  g_read_bytes += count;
+  ++g_read_buckets[bucket];
+  for (ReadSite &site : g_read_sites) {
+    if (site.rva == rva) {
+      ++site.calls;
+      site.bytes += count;
+      return;
+    }
+    if (site.calls == 0) {
+      site.rva = rva;
+      site.calls = 1;
+      site.bytes = count;
+      return;
+    }
+  }
+  // Past 64 distinct sites the table stops learning rather than evicting: the
+  // question it answers is "which handful of call sites dominates", and an
+  // eviction policy would make the counts of the ones that matter unstable.
+}
+
+// --- read-ahead ----------------------------------------------------------------
+//
+// The reason a warm level load takes a second. `LoadOrBuildSectionAdjacency`
+// @ 0x0044fef0 reads the whole `<level>.map` adjacency cache **one 32-bit integer
+// per ReadFile call** - measured at 39,364 four-byte reads for level02's 157,456
+// byte cache, exactly its size, and ~150,000 for level10's 598 KB. At the ~4 us a
+// read syscall costs from the OS cache that is 600 ms of a 1.1 s load, and it is
+// syscall count rather than bytes: the same load moves only 9-23 MB.
+//
+// So this layer reads ahead. A handle it opened for reading gets a 64 KB buffer,
+// and the position becomes **ours** rather than the OS handle's: the real handle
+// is seeked only when the buffer misses. That is what makes it a win - keeping the
+// OS position in step would cost a SetFilePointer per read and buy nothing.
+//
+// Owning the position is safe here only because this layer owns every API that
+// could move it. gl.exe imports no `SetFilePointerEx`, no `ReadFileEx` and no
+// overlapped I/O at any of its 31 `CreateFileA` sites (`file_io_notes.md` §1, §5),
+// and a handle this layer did not open is never buffered - so there is no path by
+// which the OS position can change behind us.
+//
+// `GKPLUS_FILE_BUFFER=raw` (or `0`) turns it off, which is the A/B.
+constexpr size_t kReadAheadBytes = 64 * 1024;
+// One buffer per concurrently open read handle, capped so a pathological open loop
+// cannot grow this without bound. The engine opens files one or two at a time.
+constexpr size_t kReadAheadHandles = 16;
+
+struct ReadAhead {
+  uint64_t position = 0; // the logical file position this layer owns
+  uint64_t base = 0;     // file offset the buffer starts at
+  uint32_t valid = 0;    // bytes of `data` that hold file content
+  std::vector<uint8_t> data;
+};
+
+bool g_read_ahead = true;
+std::mutex g_ahead_mutex;
+std::unordered_map<HANDLE, ReadAhead> g_ahead;
+
+// Only handles this layer opened itself, read-only and non-overlapped. Anything
+// else keeps the stock path, including the virtual handles - those are already
+// served out of memory and have their own position.
+void TrackForReadAhead(HANDLE handle, DWORD access, DWORD flags) {
+  if (!g_read_ahead || handle == INVALID_HANDLE_VALUE) {
+    return;
+  }
+  if ((access & GENERIC_WRITE) != 0 || (access & GENERIC_READ) == 0) {
+    return;
+  }
+  if ((flags & FILE_FLAG_OVERLAPPED) != 0) {
+    return;
+  }
+  std::lock_guard lock(g_ahead_mutex);
+  // Assignment rather than try_emplace, and that is not a style choice: Windows
+  // recycles handle values, so an entry left behind by a close this layer did not
+  // see would otherwise be *kept*, and the new file would be read from the old
+  // file's position. Overwriting makes a stale entry harmless by construction.
+  auto it = g_ahead.find(handle);
+  if (it != g_ahead.end()) {
+    it->second = ReadAhead{};
+    return;
+  }
+  if (g_ahead.size() >= kReadAheadHandles) {
+    return;
+  }
+  g_ahead.emplace(handle, ReadAhead{});
+}
+
+void DropReadAhead(HANDLE handle) {
+  if (!g_read_ahead) {
+    return;
+  }
+  std::lock_guard lock(g_ahead_mutex);
+  g_ahead.erase(handle);
+}
+
+// Seeks the real handle to `offset` and fills the buffer from there. A short read
+// is end of file and is recorded as such rather than retried - `valid` shrinking
+// below the request is how the caller learns it.
+bool RefillReadAhead(HANDLE handle, ReadAhead &state, uint64_t offset) {
+  if (state.data.size() != kReadAheadBytes) {
+    state.data.resize(kReadAheadBytes);
+  }
+  LONG high = static_cast<LONG>(offset >> 32);
+  const DWORD low = OriginalSetFilePointer(
+      handle, static_cast<LONG>(offset & 0xffffffffu), &high, FILE_BEGIN);
+  if (low == INVALID_SET_FILE_POINTER && GetLastError() != NO_ERROR) {
+    return false;
+  }
+  DWORD got = 0;
+  if (!OriginalReadFile(handle, state.data.data(),
+                        static_cast<DWORD>(state.data.size()), &got, nullptr)) {
+    return false;
+  }
+  state.base = offset;
+  state.valid = got;
+  return true;
+}
+
+// The whole point of the layer. `state.position` is authoritative; the OS handle's
+// own pointer is scratch, moved only by a refill.
+BOOL BufferedRead(HANDLE handle, ReadAhead &state, LPVOID buffer, DWORD count,
+                  LPDWORD read) {
+  if (read) {
+    *read = 0;
+  }
+  if (count == 0) {
+    return TRUE;
+  }
+  if (!buffer) {
+    SetLastError(ERROR_INVALID_PARAMETER);
+    return FALSE;
+  }
+  // A request at or over the buffer size would evict more than it serves, so it
+  // goes straight to the file - which is the whole-file `.rif` and sound path.
+  if (count >= kReadAheadBytes) {
+    LONG high = static_cast<LONG>(state.position >> 32);
+    const DWORD low = OriginalSetFilePointer(
+        handle, static_cast<LONG>(state.position & 0xffffffffu), &high,
+        FILE_BEGIN);
+    if (low == INVALID_SET_FILE_POINTER && GetLastError() != NO_ERROR) {
+      return FALSE;
+    }
+    DWORD got = 0;
+    if (!OriginalReadFile(handle, buffer, count, &got, nullptr)) {
+      return FALSE;
+    }
+    state.position += got;
+    state.valid = 0; // the buffer no longer describes where we are
+    if (read) {
+      *read = got;
+    }
+    return TRUE;
+  }
+
+  uint8_t *out = static_cast<uint8_t *>(buffer);
+  DWORD served = 0;
+  while (served < count) {
+    const bool covered = state.valid != 0 && state.position >= state.base &&
+                         state.position < state.base + state.valid;
+    if (!covered) {
+      if (!RefillReadAhead(handle, state, state.position)) {
+        return FALSE;
+      }
+      if (state.valid == 0) {
+        break; // end of file
+      }
+      continue;
+    }
+    const uint64_t offset = state.position - state.base;
+    const DWORD available = static_cast<DWORD>(state.valid - offset);
+    // Explicit template argument: windows.h is included without NOMINMAX, so a
+    // bare std::min is eaten by the `min` macro. Same trick as the virtual path.
+    const DWORD take = std::min<DWORD>(available, count - served);
+    std::memcpy(out + served, state.data.data() + offset, take);
+    served += take;
+    state.position += take;
+  }
+  if (read) {
+    *read = served;
+  }
+  return TRUE;
+}
+
 FILETIME FileTimeFromUnix(int64_t seconds) {
   // PhysicsFS reports -1 for an archive that records no timestamp. "Now" is the
   // right answer there: it keeps a virtual file at least as new as any .opt/.map/
@@ -175,12 +393,17 @@ HANDLE WINAPI HookedCreateFileA(LPCSTR name, DWORD access, DWORD share,
       // behaviour, never propagate a C++ exception into game code.
     }
   }
-  return OriginalCreateFileA(name, access, share, security, disposition, flags,
-                            template_file);
+  HANDLE handle = OriginalCreateFileA(name, access, share, security, disposition,
+                                      flags, template_file);
+  TrackForReadAhead(handle, access, flags);
+  return handle;
 }
 
 BOOL WINAPI HookedReadFile(HANDLE handle, LPVOID buffer, DWORD count,
                            LPDWORD read, LPOVERLAPPED overlapped) {
+  if (g_read_stats) {
+    NoteRead(_ReturnAddress(), count);
+  }
   if (AnyVirtual()) {
     std::lock_guard lock(g_files_mutex);
     auto it = g_files.find(handle);
@@ -210,6 +433,13 @@ BOOL WINAPI HookedReadFile(HANDLE handle, LPVOID buffer, DWORD count,
       // A short read at end of file is success with zero bytes, exactly as the
       // real ReadFile reports it - which is what the engine's callers expect.
       return TRUE;
+    }
+  }
+  if (g_read_ahead && !overlapped) {
+    std::lock_guard lock(g_ahead_mutex);
+    auto it = g_ahead.find(handle);
+    if (it != g_ahead.end()) {
+      return BufferedRead(handle, it->second, buffer, count, read);
     }
   }
   return OriginalReadFile(handle, buffer, count, read, overlapped);
@@ -285,6 +515,56 @@ DWORD WINAPI HookedSetFilePointer(HANDLE handle, LONG distance,
       return static_cast<DWORD>(position & 0xffffffffu);
     }
   }
+  if (g_read_ahead) {
+    std::lock_guard lock(g_ahead_mutex);
+    auto it = g_ahead.find(handle);
+    if (it != g_ahead.end()) {
+      ReadAhead &state = it->second;
+      int64_t base = 0;
+      switch (method) {
+      case FILE_BEGIN:
+        base = 0;
+        break;
+      case FILE_CURRENT:
+        // Ours, not the OS handle's - the real pointer trails wherever the last
+        // refill left it, which is the whole reason this hook has to be here.
+        base = static_cast<int64_t>(state.position);
+        break;
+      case FILE_END: {
+        DWORD high = 0;
+        const DWORD low = OriginalGetFileSize(handle, &high);
+        if (low == INVALID_FILE_SIZE && GetLastError() != NO_ERROR) {
+          return INVALID_SET_FILE_POINTER;
+        }
+        base = static_cast<int64_t>((static_cast<uint64_t>(high) << 32) | low);
+        break;
+      }
+      default:
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_SET_FILE_POINTER;
+      }
+      const int64_t delta =
+          distance_high
+              ? static_cast<int64_t>(
+                    (static_cast<uint64_t>(static_cast<uint32_t>(*distance_high))
+                     << 32) |
+                    static_cast<uint32_t>(distance))
+              : static_cast<int64_t>(distance);
+      const int64_t position = base + delta;
+      if (position < 0) {
+        SetLastError(ERROR_NEGATIVE_SEEK);
+        return INVALID_SET_FILE_POINTER;
+      }
+      // The buffer is kept, not dropped: a seek backwards inside it is exactly
+      // the pattern a chunk reader produces, and re-reading would undo the win.
+      state.position = static_cast<uint64_t>(position);
+      if (distance_high) {
+        *distance_high = static_cast<LONG>(position >> 32);
+      }
+      SetLastError(NO_ERROR);
+      return static_cast<DWORD>(position & 0xffffffffu);
+    }
+  }
   return OriginalSetFilePointer(handle, distance, distance_high, method);
 }
 
@@ -336,6 +616,7 @@ BOOL WINAPI HookedCloseHandle(HANDLE handle) {
       g_open_files.fetch_sub(1, std::memory_order_release);
     }
   }
+  DropReadAhead(handle);
   // The handle is a real event whether or not it was ours, so the real
   // CloseHandle is what releases it. Everything else in the process - threads,
   // events, the executor's own handles - lands here untouched.
@@ -470,7 +751,54 @@ std::vector<std::string> RecentVirtualizedOpens() {
   return g_recent;
 }
 
+ReadStats ReadAccounting() {
+  ReadStats stats;
+  if (!g_read_stats) {
+    return stats;
+  }
+  std::lock_guard lock(g_read_mutex);
+  stats.enabled = true;
+  stats.calls = g_read_calls;
+  stats.bytes = g_read_bytes;
+  for (size_t i = 0; i < std::size(g_read_buckets); ++i) {
+    if (g_read_buckets[i] != 0) {
+      stats.buckets.push_back({i == 0 ? 0u : 1u << (i - 1), g_read_buckets[i]});
+    }
+  }
+  for (const ReadSite &site : g_read_sites) {
+    if (site.calls == 0) {
+      break;
+    }
+    stats.sites.push_back({site.rva, site.calls, site.bytes});
+  }
+  std::sort(stats.sites.begin(), stats.sites.end(),
+            [](const ReadStats::Site &a, const ReadStats::Site &b) {
+              return a.calls > b.calls;
+            });
+  return stats;
+}
+
+void ResetReadAccounting() {
+  std::lock_guard lock(g_read_mutex);
+  g_read_calls = 0;
+  g_read_bytes = 0;
+  std::fill(std::begin(g_read_buckets), std::end(g_read_buckets), 0ull);
+  for (ReadSite &site : g_read_sites) {
+    site = ReadSite{};
+  }
+}
+
 FileHookSystem::FileHookSystem() {
+  char stats[8]{};
+  g_read_stats = GetEnvironmentVariableA("GKPLUS_FILE_STATS", stats,
+                                         sizeof(stats)) != 0 &&
+                 stats[0] != '0';
+  char buffered[8]{};
+  if (GetEnvironmentVariableA("GKPLUS_FILE_BUFFER", buffered,
+                              sizeof(buffered)) != 0) {
+    g_read_ahead = buffered[0] != '0' && buffered[0] != 'r' && buffered[0] != 'R';
+  }
+
   // Slot addresses from file_io_notes.md §5. GetBaseAddress() is the relocation
   // delta, so these are the same "offsets" every other subsystem uses.
   //

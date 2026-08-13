@@ -42,6 +42,76 @@ through the import table, synchronously, on one thread.**
 - **The big asset formats are whole-file reads.** `File_Chunk` (.rif) and
   `SoundSample_LoadFile` do `GetFileSize` → `malloc` → **one** `ReadFile` → `CloseHandle`,
   and parse the buffer in memory. Nothing about them needs a real OS handle.
+  **This is true and it is not the shape of the cost** — see §1.1, which was written
+  after reading exactly this line and concluding the read path was fine.
+
+### 1.1 A level load is bound by the number of reads, not by their size
+
+Measured with `mods.read_stats()` (`GKPLUS_FILE_STATS=1`), one warm level02 load:
+
+| bucket | calls |
+|---|---|
+| exactly 4 bytes | **39,386** |
+| 1024 bytes | 4,751 |
+| 8 KB and over | 350 |
+| everything else | ~390 |
+
+44,879 calls for 23 MB. The three call sites behind the 4-byte reads are gl.exe RVAs
+`0x50112`, `0x50133` and `0x50163` — all inside `LoadOrBuildSectionAdjacency`
+@ 0x0044fef0, whose known interior offsets `+0x273`/`+0x307` appear in
+`game_defects_notes.md` §5. It reads the whole `<level>.map` adjacency cache **one
+32-bit integer per `ReadFile` call**, and the arithmetic is exact: 39,364 of those
+reads × 4 = 157,456 bytes = `level02.map` to the byte. The other 22 belong to a
+different site.
+
+It scales with the cache, so it is worst on the big levels: level10 (598 KB `.map`)
+issues 153,419 reads, level12 (731 KB) issues 187,313.
+
+At the ~4 µs a read syscall costs against the OS cache that is 600 ms of a 1.1 s
+load — half the wall clock, for 157 KB of data. The 1024-byte family is the image
+layer's buffered block read (§4), and it is second by the same logic.
+
+**So the engine is syscall-bound on a warm load, and the bytes are irrelevant.** A
+sampled profile says the same thing from the other end: ~50% of a load's samples are
+in ntdll, under `HookedReadFile`.
+
+### 1.2 The read-ahead layer
+
+`src/FileHooks.cpp` therefore buffers. A handle **this layer opened** for reading
+gets a 64 KB read-ahead buffer, and the file position becomes *ours* — the real
+handle is seeked only on a buffer miss. Keeping the OS position in step instead
+would cost a `SetFilePointer` per read and buy nothing, which is the whole reason
+the position has to move into this layer.
+
+Owning the position is only safe because this layer owns every API that can move
+it: gl.exe imports no `SetFilePointerEx` and no `ReadFileEx`, uses no overlapped
+I/O at any of its 31 `CreateFileA` sites (§1, §5), and a handle opened anywhere
+else — including the statically linked CRT's, which go through `CreateFileW` — is
+never buffered and keeps the stock path.
+
+Measured, d3d8 renderer, warm, `GKPLUS_FILE_BUFFER=raw` against the default:
+
+| level | reads before | reads after | blocked ms before | after |
+|---|---|---|---|---|
+| level02 | 46,090 | 636 | 324 | 237 |
+| level10 | 153,419 | 515 | 614 | 314 |
+| level12 | 187,313 | 478 | 625 | 267 |
+
+Bytes read move by under 7% either way, which is the check that the access pattern
+really is sequential — a random one would have paid 16× for every 4-byte read.
+
+Three things pin its correctness, and the screenshot is the weakest of them:
+
+- The **cold** path rebuilds `level04.cut` and `level04.map` **byte-identical** to
+  the references (SHA256), so the adjacency build and the `.cut` serialiser see the
+  same bytes through the buffer that they saw without it.
+- A handle entry is **overwritten, never `try_emplace`d**. Windows recycles handle
+  values, and an entry left by a close this layer did not see would otherwise be
+  kept and the new file read from the old file's position.
+- A settled level02 screenshot differs from the unbuffered one by 0.88% of channel
+  samples — and **two runs at the same setting differ by 2.17%**, so the A/B is
+  inside the run-to-run animation-phase noise rather than clean. Camera and actor
+  counts are identical. Take the byte-exact sidecar rebuild as the real evidence.
 
 ## 2. Paths are relative, and the CWD names the category
 

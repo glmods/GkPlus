@@ -62,6 +62,34 @@ uint64_t VirtualizedOpenCount();
 // from a GLDir and a string in a .gls.
 std::vector<std::string> RecentVirtualizedOpens();
 
+// What the engine's reads actually look like, behind `GKPLUS_FILE_STATS=1`. Off
+// otherwise: it locks on a path a level load runs six figures of times.
+//
+// It exists because the cost of a level load is not where the notes implied. The
+// ".rif and sound are whole-file reads" of §1 is true, and a load still issues
+// ~150,000 `ReadFile` calls averaging 64-150 bytes for 9-18 MB - so the load is
+// bound by syscall count, not by bytes. `sites` is what names the caller: an RVA
+// into gl.exe, resolvable against the Ghidra database or the profiler's symbol map.
+struct ReadStats {
+  struct Site {
+    uintptr_t rva;
+    uint64_t calls;
+    uint64_t bytes;
+  };
+  struct Bucket {
+    uint32_t at_least;
+    uint64_t calls;
+  };
+  bool enabled = false;
+  uint64_t calls = 0;
+  uint64_t bytes = 0;
+  std::vector<Bucket> buckets;
+  std::vector<Site> sites; // most calls first
+};
+
+ReadStats ReadAccounting();
+void ResetReadAccounting();
+
 // RAII, like every other *System: construct inside a Detours transaction from
 // entry.cpp. The IAT writes are plain memory stores and need no transaction of
 // their own; the two CRT detours do.

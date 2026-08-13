@@ -107,6 +107,55 @@ JSValue GetRecent(JSContext *ctx, JSValueConst) {
   return array;
 }
 
+// What the engine's reads look like, behind `GKPLUS_FILE_STATS=1`. A level load
+// is bound by the number of reads and not by their size, and this is what says so
+// - `sites` names the gl.exe call site by RVA, sorted by call count.
+JSValue ModsReadStats(JSContext *ctx, JSValueConst, int, JSValueConst *) {
+  const ReadStats stats = ReadAccounting();
+  JSValue out = JS_NewObject(ctx);
+  if (JS_IsException(out)) {
+    return out;
+  }
+  JS_SetPropertyStr(ctx, out, "enabled", JS_NewBool(ctx, stats.enabled));
+  JS_SetPropertyStr(ctx, out, "calls",
+                    JS_NewInt64(ctx, static_cast<int64_t>(stats.calls)));
+  JS_SetPropertyStr(ctx, out, "bytes",
+                    JS_NewInt64(ctx, static_cast<int64_t>(stats.bytes)));
+
+  JSValue buckets = JS_NewArray(ctx);
+  for (size_t i = 0; i < stats.buckets.size(); ++i) {
+    JSValue row = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, row, "at_least",
+                      JS_NewInt64(ctx, stats.buckets[i].at_least));
+    JS_SetPropertyStr(
+        ctx, row, "calls",
+        JS_NewInt64(ctx, static_cast<int64_t>(stats.buckets[i].calls)));
+    JS_SetPropertyUint32(ctx, buckets, static_cast<uint32_t>(i), row);
+  }
+  JS_SetPropertyStr(ctx, out, "buckets", buckets);
+
+  JSValue sites = JS_NewArray(ctx);
+  for (size_t i = 0; i < stats.sites.size(); ++i) {
+    JSValue row = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, row, "rva",
+                      JS_NewInt64(ctx, static_cast<int64_t>(stats.sites[i].rva)));
+    JS_SetPropertyStr(
+        ctx, row, "calls",
+        JS_NewInt64(ctx, static_cast<int64_t>(stats.sites[i].calls)));
+    JS_SetPropertyStr(
+        ctx, row, "bytes",
+        JS_NewInt64(ctx, static_cast<int64_t>(stats.sites[i].bytes)));
+    JS_SetPropertyUint32(ctx, sites, static_cast<uint32_t>(i), row);
+  }
+  JS_SetPropertyStr(ctx, out, "sites", sites);
+  return out;
+}
+
+JSValue ModsResetReadStats(JSContext *ctx, JSValueConst, int, JSValueConst *) {
+  ResetReadAccounting();
+  return JS_UNDEFINED;
+}
+
 JSValue ModsMount(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
   const char *path = JS_ToCString(ctx, argv[0]);
   if (!path) {
@@ -213,6 +262,8 @@ const JSCFunctionListEntry ModsProps[] = {
     JS_CGETSET_DEF("available", GetAvailable, nullptr),
     JS_CGETSET_DEF("served", GetServed, nullptr),
     JS_CGETSET_DEF("recent", GetRecent, nullptr),
+    JS_CFUNC_DEF("read_stats", 0, ModsReadStats),
+    JS_CFUNC_DEF("reset_read_stats", 0, ModsResetReadStats),
     JS_CFUNC_DEF("mount", 1, ModsMount),
     JS_CFUNC_DEF("resolve", 1, ModsResolve),
     JS_CFUNC_DEF("exists", 1, ModsExists),

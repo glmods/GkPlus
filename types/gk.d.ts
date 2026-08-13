@@ -2204,6 +2204,28 @@ declare module "gk" {
      *  a `.gls`. */
     readonly recent: string[];
 
+    /** What the engine's reads actually look like, behind `GKPLUS_FILE_STATS=1`
+     *  (`enabled` is false otherwise, and every count reads zero).
+     *
+     *  It exists because a warm level load is bound by the *number* of reads and
+     *  not by their size: `LoadOrBuildSectionAdjacency` @ 0x0044fef0 reads the
+     *  whole `<level>.map` adjacency cache four bytes per `ReadFile`, measured at
+     *  39,364 calls for level02 and ~187,000 for level12. `sites` is what names
+     *  the caller - an RVA into gl.exe, resolvable against the Ghidra database or
+     *  `prof.symbols`. The read-ahead layer (`GKPLUS_FILE_BUFFER=raw` to disable)
+     *  is what collapses those to a few hundred. */
+    read_stats(): {
+      enabled: boolean;
+      calls: number;
+      bytes: number;
+      /** Call counts by request size, bucket `at_least` up to the next entry. */
+      buckets: { at_least: number; calls: number }[];
+      /** Most calls first; at most 64 distinct sites are tracked. */
+      sites: { rva: number; calls: number; bytes: number }[];
+    };
+    /** Zeroes the above, so a single level load can be measured on its own. */
+    reset_read_stats(): void;
+
     /** Mounts an extra archive or directory at the highest priority. Throws if
      *  PhysicsFS cannot read it. */
     mount(path: string): void;
