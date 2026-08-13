@@ -47,6 +47,16 @@ bool RendererReady();
 // renderer is not up. Main thread only.
 void DrawFrame();
 
+// Throws this frame's recorded draws away without rendering them, exactly as
+// DrawFrame's own bail-out paths do when the swapchain is unusable.
+//
+// It exists for the loading-screen throttle (`src/LoadScreen.h`), which drops most
+// of a load's ~830 presents. Dropping one is NOT the same as skipping DrawFrame:
+// the draw list and the frame scratch are per-frame and DrawFrame is what clears
+// them, so a skipped frame would leave the next one drawing this one's geometry
+// out of a slice nothing rotated. Main thread only.
+void DropFrame();
+
 // Forces a swapchain rebuild before the next frame. Not normally needed - an actual resize
 // surfaces as VK_ERROR_OUT_OF_DATE_KHR and is handled - but the game's Reset paths change
 // the backbuffer size behind our back, and this makes that explicit rather than relying on

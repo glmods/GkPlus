@@ -219,7 +219,8 @@ Overlay configuration in `vcpkg-configuration.json`.
 `Subsystems` holds only the **hook-installing** subsystems — `FileHookSystem`,
 `d3d8::D3D8CaptureSystem`, `MusicSystem`, `DebugSystem`, `GUISystem`, `InputFixSystem`,
 `HudFixSystem`, `VersionTextSystem`, `CustomMenuSystem`, `WindowPlacementSystem`, `ScriptQueueSystem`,
-`gls::GlsSystem`, `CustomLevelSystem`, `MapLightSystem`, `image::ImageCodecSystem`, `ScriptSystem`.
+`gls::GlsSystem`, `CustomLevelSystem`, `MapLightSystem`, `loadscreen::LoadScreenSystem`,
+`image::ImageCodecSystem`, `ScriptSystem`.
 `FileHookSystem` is deliberately **first**: it patches gl.exe's file imports, and assets
 loaded during `WinMain` (before any other hook can fire) have to pass through it for a mod
 to replace them. `D3D8CaptureSystem` is second, and before `GUISystem` for a reason: it wraps
@@ -302,10 +303,11 @@ whose null-ness is the "is a level loaded" test),
 (the game window clear of the taskbar, see below), `src/Font` (the text queue, see below),
 `src/Session` (starting a
 level without the menus, see below), `src/MakeRole` (native constructors, see below),
-`src/FileHooks` (mod loading, see below), `src/Render` (the AWAPI renderer, see below).
+`src/FileHooks` (mod loading, see below), `src/LoadScreen` (the loading bar's ~830 presents a
+load, see below), `src/Render` (the AWAPI renderer, see below).
 `src/GLS.h/cpp` is the model the rest now follow. The behavioral-hook subsystems (`Music`, `Debug`,
 `GUI`, `InputFix`, `HudFix`, `CustomMenu`, `WindowPlacement`, `ScriptQueue`, `GLS`, `CustomLevel`,
-`Script`, `FileHooks`, `Font`) expose a `*System` RAII class constructed by `entry.cpp`; the
+`Script`, `FileHooks`, `Font`, `LoadScreen`) expose a `*System` RAII class constructed by `entry.cpp`; the
 others are pure struct + native-API.
 
 `FileHookSystem` and `WindowPlacementSystem` are the two that do not resolve *offsets* at all.
@@ -604,6 +606,7 @@ reference. Test invocations are under "Running the test suites" above.
 | `src/Font.h/cpp` | The engine's text layer: `GetFont` / `LineHeight` / `QueueText`, and `VersionTextSystem`. `Font` is deliberately left **incomplete** - its 0xb18 layout is measured but nothing here needs a field out of it, and an unchecked mirror would only go stale. See "The text queue and the version stamp" above |
 | `src/InputFix.h/cpp` | `InputFixSystem` - hook-only. Detours `AcquireDInputDevice` to suppress the vestigial DirectInput keyboard acquire and its `WH_KEYBOARD_LL` hook (see `input_notes.md`) |
 | `src/HudFix.h/cpp` | `HudFixSystem` - hook-only. **In stock Gunlok no health meter, armour meter or item icon is ever visible, in any level**: the HUD's panel plate is drawn opaquely on top of them. The engine layers 2D content by giving each camera a slice of the depth range (`rendering_notes.md` §4.4), and the two halves of a panel take different paths — the plate is a retained queue item submitted with `Camera_Hud` (0.03..0.04), while the meters are immediate-mode quads authored at `z = 0.03f` and drawn under whatever viewport is current at the batch's single flush, which `RunInGameFrame` reaches one instruction after `DrawOrderMenu` has switched back to `Camera_World` (0.1..1.0). D3D **clamps** a pre-transformed z to the slice rather than scaling it (`vulkan_renderer_notes.md` §4.45), so 0.03 becomes 0.1 and lands behind everything. The fix detours `RenderHudItems` @ 0x0055fb20 and flushes the batch while `Camera_Hud` is still current, then opens a fresh one — **splitting the batch rather than re-pointing the flush**, because `DrawOrderMenu` appends a unit health bar to the same batch at `z = 0.1f` that genuinely wants the world camera, and one flush is one viewport. `GKPLUS_HUD_FIX=raw` restores the stock behaviour. Full write-up in `game_defects_notes.md` §12 |
+| `src/LoadScreen.h/cpp` | `LoadScreenSystem` - hook-only, one detour on `LoadLevel` @ 0x004e0980 (`__fastcall(bool)`) purely to know when a load is running. **The loading bar repaints once per role converted - ~830 presents a load - so a load costs `presents x cost-of-one-present` and is hostage to the present mode, not to the work.** level01's `Loading level data` is 707 ms under d3d8 unthrottled and **5940 ms under Vulkan's FIFO**: the same work, waiting for 830 vertical blanks to animate a progress bar. So a present arriving during a load is **dropped** unless 32 ms have passed (`GKPLUS_LOAD_PRESENT_MS`, `raw` to disable), giving 501 ms / 1049 ms. A dropped Vulkan frame goes through `vulkan::DropFrame()` and **not** by skipping `DrawFrame`: the draw list and frame scratch are per-frame and `DrawFrame` is what clears them. `level_loading_notes.md` §3.1-3.2 |
 | `src/WindowPlacement.h/cpp` | `WindowPlacementSystem` - hook-only. Patches one IAT slot (`user32!CreateWindowExA`) so the windowed-mode window is created at the monitor's **work area** origin instead of the hardcoded 0,0 it would otherwise sit at, under a left- or top-docked taskbar. `GKPLUS_WINDOW_PLACEMENT=raw` restores the stock behaviour. See "The game window and the taskbar" below |
 | `src/ActorClasses.inc.h` | X-macro listing the 15 Actor subclasses: `GK_ACTOR_CLASS(Name, Parent, Predicate, Kind)`. Drives the JS class table, `kind`, the RTTI ladder and the prototype chain. **Must list every class before its own base** |
 | `src/Menus.inc.h` | X-macro listing all 36 Gunlok menus: `GUNLOK_MENU(Name, Id, TitleResourceId, "English title")`. There are no gaps - ids 11 and 14-20 are identified in `menu_system_notes.md`. Also counted into `gk::MenuCount` |

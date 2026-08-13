@@ -803,6 +803,16 @@ bool RendererReady() { return Ready; }
 
 void NotifyResize() { NeedsRebuild = true; }
 
+// The same disposal DrawFrame performs when it cannot render: see VkRenderer.h for
+// why a dropped frame has to be disposed of rather than simply skipped.
+void DropFrame() {
+  if (!Ready) {
+    return;
+  }
+  ClearDraws();
+  ResetFrameScratch();
+}
+
 void DrawFrame() {
   if (!Ready) {
     return;

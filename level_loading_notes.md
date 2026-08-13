@@ -292,6 +292,44 @@ then `ShowLoadingMessage` @ 0x004e2910; `FUN_004e2c20(pct)` advances the bar.
 14. multiplayer frag/time-limit trigger registered
 ```
 
+### 3.1 The loading messages, and timing a load by them
+
+`ShowLoadingMessage` stores its argument to **`LoadingMessage` @ 0x007b6dc4** before anything
+else (it is `__fastcall`; `testl %ecx,%ecx` / `cmovnel %ecx,%eax` / `movl %eax,0x7b6dc4`). So the
+current phase is readable with `ReadProcessMemory` from outside the process — which is the only
+way to time one, because the main thread does not pump for most of a load and the REPL cannot
+answer. `utils/rendertest/load-phases.ps1` is the harness.
+
+The global is never cleared, so a phase that sets no message of its own is charged to the
+previous one. `glres<lang>.dll` holds **seven** messages, not the four the outline above shows:
+
+```
+Loading AI and UI · Loading sounds · Loading level data · Loading textures
+Loading miscellaneous data · Loading shadows · Loading script files
+```
+
+A given load shows only some. **Step 7 dominates**: on level01, warm, `Loading level data` is
+501 ms of a ~640 ms load against 37 ms for step 5 and 100 ms for step 9.
+
+### 3.2 The loading screen presents once per role, and that is what a load costs
+
+The bar repaints per object converted, so a load issues **~830 presents** (measured on level12
+with the profiler's frame ring: 840 frames inside the load window, 11 of them longer than 8 ms).
+The load's wall clock is therefore `presents x cost-of-one-present`, which makes it hostage to
+the **present mode** rather than to the work:
+
+| | `Loading level data`, level01, warm |
+|---|---|
+| d3d8, unthrottled (~1.2 ms a present) | 707 ms |
+| Vulkan, **FIFO** (16.7 ms a present) | **5940 ms** |
+
+Same build, same level, same work — 8.4x, all of it vertical blanks. This is the trap behind
+"the load is slow on one renderer": it is not loading slower, it is waiting for the monitor
+830 times to animate a progress bar.
+
+`src/LoadScreen.h` throttles it to ~30 Hz, which takes level01 to 501 ms (d3d8) and 1049 ms
+(Vulkan). See that header for why `LoadLevel` is the gate and `GameState == 0x12` is not.
+
 Two flags gate large parts of it:
 
 - `LevelLoadReason` @ 0x007b9cf0 - `3` = restoring a full savegame, which suppresses the

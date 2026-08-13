@@ -14,6 +14,7 @@
 #include "GUI.h"
 #include "HudFix.h"
 #include "InputFix.h"
+#include "LoadScreen.h"
 #include "MapLights.h"
 #include "Music.h"
 #include "RenderMenu.h"
@@ -64,6 +65,10 @@ struct Subsystems {
   // after ConvertParsedObjects. Position does not matter: it only records, and its first read is
   // long after every hook here is installed. See src/MapLights.h.
   MapLightSystem map_lights; // the .rif's own lights, which the engine loads and never reads
+  // Detours LoadLevel purely to know when one is running, so the loading screen's ~830
+  // presents can be thrown away. Position does not matter - it installs one detour on a
+  // target nothing else touches, and the query it answers reads false until it is up.
+  loadscreen::LoadScreenSystem load_screen; // the loading bar does not need 830 vblanks
   // Detours SetupMenus purely to reach a point where the game's allocator exists:
   // RegisterImageCodec builds its trie with pool_alloc, which bottoms out in gl.exe's
   // static CRT heap, and that is not initialised until _mainCRTStartup - long after

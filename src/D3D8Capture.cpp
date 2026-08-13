@@ -17,6 +17,7 @@
 
 #include "Core.h"
 #include "ImageCodec.h"
+#include "LoadScreen.h"
 #include "Profiler.h"
 #include "D3D8Device.gen.inc.h"
 #include "DetourUtils.h"
@@ -1404,6 +1405,23 @@ HRESULT STDMETHODCALLTYPE CaptureDevice::Present(const RECT *pSourceRect,
   DrawProbeQuad();
   DrawDepthProbe();
   DrawViewportProbe();
+
+  // A level load presents once per role - ~830 times - so the load's wall clock is
+  // presents x cost-of-one-present, and under FIFO that is 830 vertical blanks
+  // (13.9 s) to animate a progress bar that the same load draws in ~1 s
+  // unthrottled. Most of those presents are dropped; see src/LoadScreen.h.
+  //
+  // Here rather than at the top of the function so the frame bookkeeping above
+  // still runs: the draw log, the stats and the profiler's frame boundary should
+  // describe every frame the game built, shown or not.
+  if (loadscreen::SuppressPresent()) {
+    loadscreen::NoteDropped();
+    if (vulkan::RendererRequested() && vulkan::RendererReady()) {
+      vulkan::DropFrame();
+    }
+    return D3D_OK;
+  }
+  loadscreen::NotePresented();
 
   if (vulkan::RendererRequested()) {
     if (!vulkan::RendererReady()) {

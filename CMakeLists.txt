@@ -82,6 +82,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsTriggers.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsWorld.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Json.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/LoadScreen.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/MakeRole.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Map.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/MapLights.cpp"
