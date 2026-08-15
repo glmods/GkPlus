@@ -233,10 +233,11 @@ def iter_shapes(root):
 #: dropped when geometry changes, because keeping a stale one is worse than
 #: keeping none -- their contents are indexed by vertex/polygon count.
 #:
-#: ``scene.py`` does reconstruct ``SHPMRGDT``, and that is safe only because the
-#: scene stores a **pair id** rather than the polygon index the wire holds -- see
-#: :func:`merge_pairs_from_wire` below, and :func:`merge_problems`, which export
-#: runs before writing the chunk at all.
+#: ``scene.py`` does reconstruct ``SHPMRGDT``, from the **quads** each pair was
+#: imported as (:func:`plan_faces`) and, for a pair that could not be one, from
+#: the **pair id** the scene stores in place of the polygon index the wire holds
+#: -- see :func:`merge_pairs_from_wire` below, and :func:`merge_problems`, which
+#: export runs before writing the chunk at all.
 DERIVED_CHUNKS = (b"SHPPCINF", b"SHPMRGDT", b"SHPVTINT")
 
 
@@ -394,6 +395,223 @@ def merge_problems(merge, num_polys):
             out.append("... and possibly more")
             break
     return out
+
+
+# --------------------------------------------------------------------------
+# Fusing a pair into a quad, and splitting it back
+# --------------------------------------------------------------------------
+#
+# A merge pair *is* a quad -- that is what `MergePolygonsInChunkShape` makes of
+# it -- so it is the natural thing for a modeller to edit. The wire form stays
+# two triangles plus `SHPMRGDT`, because that is what all 1,766,071 shipped
+# polygons are, and the engine builds its render buffers from the unmerged list
+# before the merger ever runs.
+#
+# The fuse has to be lossless in both directions, which is a stronger condition
+# than the engine's own merge test. Everything a Blender face can hold only once
+# has to already agree between the two triangles -- material, `engine_type`,
+# `flags`, and the UVs at the two shared vertices -- and the quad has to
+# tessellate back into exactly the two triangles it came from.
+
+#: `MergePolygonsInChunkShape` picks its comparator on `engine_type`:
+#: `TexMergePolys` @ 0x005d7590 inside these ranges, `MergePolys` @ 0x005d77e0
+#: outside. The two do not test the same things, and only the textured one
+#: reads UVs -- see :func:`merges_by_texture`.
+TEXTURED_MERGE_TYPES = ((5, 7), (0x14, 0x18))
+
+
+def merges_by_texture(engine_type):
+    """Does this polygon's merge go through ``TexMergePolys``?
+
+    That matters to a *writer* because ``TexMergePolys`` reads one ``(u,v)`` per
+    vertex out of each partner's UV record and writes a fused four-entry record
+    back into the lower-indexed one. A polygon with no UV record at all makes
+    both of those run off the end of it. No shipped pair is in that shape --
+    all 516,550 textured-path pairs have a full record on both partners -- so
+    export refuses to write one rather than find out what the engine does.
+    """
+    return any(lo <= engine_type <= hi for lo, hi in TEXTURED_MERGE_TYPES)
+
+
+def _sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def quad_would_flip(verts, quad, normal):
+    """Would Blender tessellate this quad along the *other* diagonal?
+
+    ``calc_loop_triangles`` splits a quad ``0-1-2`` / ``0-2-3`` unless
+    ``is_quad_flip_v3_first_third_fast`` rejects that diagonal, in which case it
+    splits ``0-1-3`` / ``1-2-3``. :func:`fuse_quad` puts the shared edge *on*
+    the ``0-2`` diagonal precisely so that export reproduces the two source
+    triangles, so a quad the tessellator would flip must not be fused at all --
+    it would come back as two different triangles with two different normals,
+    and on level geometry the normal is what decides walkability.
+
+    Both of Blender's variants are checked, because which one runs depends on
+    whether face normals are being computed in the same pass and that is not
+    ours to choose: the plain one asks whether the two halves face opposite
+    ways, the ``_with_normal`` one whether the diagonal lies inside the quad at
+    all. They agree on a coplanar quad and part company on a folded one.
+
+    The test is sign-only, so it is valid in RIF integer space: the importer's
+    swizzle to Blender is a rotation composed with a positive uniform scale.
+    """
+    v1, v2, v3, v4 = (verts[i] for i in quad)
+    d13 = _sub(v3, v1)
+    if _dot(_cross(_sub(v2, v1), d13), _cross(_sub(v4, v1), d13)) > 0.0:
+        return True
+    tangent = _cross(d13, normal)
+    base = _dot(v1, tangent)
+    return _dot(v4, tangent) >= base or _dot(v2, tangent) < base
+
+
+def fuse_quad(shape, ia, ib):
+    """Two paired triangles as one quad: ``(vertex indices, uvs)`` or None.
+
+    The quad is wound ``(shared0, odd_b, shared1, odd_a)`` so that its ``0-2``
+    diagonal is the shared edge and Blender's tessellation gives back ``b`` then
+    ``a``. ``uvs`` is one texel pair per corner, or None when neither triangle
+    has a UV record.
+
+    None means "leave these two as triangles" -- the pairing still rides along
+    as :data:`MERGE_NONE`-or-not on the face attribute, so nothing is lost by
+    refusing. Every reason to refuse is a thing a Blender face cannot hold
+    twice, or a tessellation that would not come back.
+    """
+    a, b = shape.polys[ia], shape.polys[ib]
+    if len(a.verts) != 3 or len(b.verts) != 3:
+        return None
+    # A face carries one material, one engine_type and one flags word. The
+    # engine's own mergers test all three too, so a pair that disagrees would
+    # not have been merged in game either.
+    if (a.engine_type, a.flags, a.texture_index) != (b.engine_type, b.flags, b.texture_index):
+        return None
+
+    av, bv = list(a.verts), list(b.verts)
+    shared = [v for v in av if v in bv]
+    if len(shared) != 2:
+        return None
+    if av[(av.index(shared[0]) + 1) % 3] != shared[1]:
+        shared.reverse()
+    ka = av.index(shared[0])
+    if av[(ka + 1) % 3] != shared[1]:
+        return None
+    # Consistent winding: `b` must cross the shared edge the other way, or the
+    # two triangles are a fold rather than two halves of one surface.
+    kb = bv.index(shared[1])
+    if bv[(kb + 1) % 3] != shared[0]:
+        return None
+    odd_a, odd_b = av[(ka + 2) % 3], bv[(kb + 2) % 3]
+
+    ua, ub = shape.uvs_for(a), shape.uvs_for(b)
+    if (ua is None) != (ub is None):
+        return None
+    uvs = None
+    if ua is not None:
+        # A quad holds one UV per corner, so a seam across the shared edge
+        # cannot be fused. `TexMergePolys` requires the same thing, bit for
+        # bit, which is why 27 shipped pairs never merge in game either.
+        if any(ua[av.index(v)] != ub[bv.index(v)] for v in shared):
+            return None
+        uvs = [ua[ka], ub[bv.index(odd_b)], ua[(ka + 1) % 3], ua[(ka + 2) % 3]]
+
+    na = face_normal(shape.verts, a.verts)
+    nb = face_normal(shape.verts, b.verts)
+    if _dot(na, nb) <= 0.0:
+        return None
+    quad = (shared[0], odd_b, shared[1], odd_a)
+    if len(set(quad)) != 4:
+        return None
+    if quad_would_flip(shape.verts, quad,
+                       (na[0] + nb[0], na[1] + nb[1], na[2] + nb[2])):
+        return None
+    return quad, uvs
+
+
+class Face:
+    """One face of the Blender mesh, and the source polygons it stands for.
+
+    ``sources`` is one polygon index for a triangle and two for a fused quad,
+    lower first -- the same partner the engine's merger takes the merged
+    polygon's attributes from.
+    """
+
+    __slots__ = ("verts", "sources", "uvs")
+
+    def __init__(self, verts, sources, uvs):
+        self.verts = verts
+        self.sources = sources
+        self.uvs = uvs
+
+    def __repr__(self):
+        return "<Face %r from %r>" % (self.verts, self.sources)
+
+
+def plan_faces(shape, pair_ids=None):
+    """The faces a Blender mesh should hold for this shape: ``(faces, lost)``.
+
+    ``lost`` counts the polygons Blender cannot represent -- two faces on the
+    same three vertices, which 775 shipped polygons across 193 shapes are.
+    **They are dropped here rather than by** ``validate()``, which renumbers
+    ``me.polygons`` out from under the source list and makes every face after
+    the first duplicate wear the previous one's texture, UVs and flags.
+
+    ``pair_ids`` is the pair-id form of ``SHPMRGDT``
+    (:func:`merge_pairs_from_wire`); pass it to fuse each pair into a quad, or
+    None to keep every polygon a triangle. Fusing never changes *which* source
+    polygons survive -- the drop above is decided first, over the original
+    numbering -- so the two options differ only in how the survivors are
+    grouped.
+    """
+    kept, seen, lost = [], set(), 0
+    for index, poly in enumerate(shape.polys):
+        if len(poly.verts) < 3:
+            continue
+        key = frozenset(poly.verts)
+        if len(key) < 3 or key in seen:
+            lost += 1
+            continue
+        seen.add(key)
+        kept.append(index)
+
+    partner = {}
+    if pair_ids:
+        members = {}
+        for index in kept:
+            pid = pair_ids[index] if index < len(pair_ids) else MERGE_NONE
+            if pid != MERGE_NONE:
+                members.setdefault(pid, []).append(index)
+        for group in members.values():
+            if len(group) == 2:
+                partner[group[0]], partner[group[1]] = group[1], group[0]
+
+    faces, taken, quad_keys = [], set(), set()
+    for index in kept:
+        if index in taken:
+            continue
+        other = partner.get(index)
+        if other is not None and other > index:
+            fused = fuse_quad(shape, index, other)
+            # A second quad on the same four vertices is the duplicate-face rule
+            # again, one dimension up: Blender would drop one of them.
+            if fused is not None and frozenset(fused[0]) not in quad_keys:
+                quad_keys.add(frozenset(fused[0]))
+                faces.append(Face(fused[0], (index, other), fused[1]))
+                taken.update((index, other))
+                continue
+        poly = shape.polys[index]
+        faces.append(Face(tuple(poly.verts), (index,), shape.uvs_for(poly)))
+        taken.add(index)
+    return faces, lost
 
 
 def build_bodies(verts, polys, uv_lists):

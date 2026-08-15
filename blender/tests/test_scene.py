@@ -52,6 +52,35 @@ def check(cond, msg):
         FAILURES.append(msg)
 
 
+def _uv_key(shape, poly):
+    """This polygon's texture and UVs, as a rotation-independent key.
+
+    **Which corner a polygon starts at is not meaning.** A triangle is the same
+    triangle read from any of its three corners -- same winding, same surface,
+    same UV on every vertex -- and the exporter does not preserve the source's
+    choice: a fused quad tessellates back into its two triangles starting at the
+    shared edge, wherever they began in the file. So the corners are rotated to
+    start at the lowest **vertex index**, which is exact (no float tie can pick
+    a different anchor) and still tells a genuine winding reversal apart, since
+    reversing is not a rotation.
+    """
+    uvs = shape.uvs_for(poly) or ()
+    if len(uvs) == len(poly.verts) and uvs:
+        k = poly.verts.index(min(poly.verts))
+        uvs = tuple(uvs[k:]) + tuple(uvs[:k])
+    return (poly.texture_index,) + tuple(c for uv in uvs for c in uv)
+
+
+def _merge_pairs(chunk, num_polys):
+    """How many polygon pairs this shape's ``SHPMRGDT`` actually names."""
+    merge = chunk.find(b"SHPMRGDT")
+    if merge is None:
+        return 0
+    wire = list(struct.unpack("<%di" % (len(merge.body) // 4), merge.body))
+    return sum(1 for pid in shp.merge_pairs_from_wire(wire, num_polys)
+               if pid != shp.MERGE_NONE) // 2
+
+
 def summarize(root):
     """The meaning of a file, as a comparable structure."""
     kids = list(root.children or ())
@@ -109,10 +138,11 @@ def summarize(root):
                     # sitting within 3e-5 of a `.xx5` boundary lands on either
                     # side of it and reads as a whole hundredth of difference.
                     # `Skeleton.RIF`'s skull has 11 such coordinates.
-                    "uvs": collections.Counter(
-                        (p.texture_index,) + tuple(c for uv in (s.uvs_for(p) or ())
-                                                   for c in uv)
-                        for p in s.polys),
+                    "uvs": collections.Counter(_uv_key(s, p) for p in s.polys),
+                    # The merge pairing survives being built as quads and
+                    # tessellated back -- pair for pair, not just "still
+                    # walkable". A lost pair is a lost nav section.
+                    "merge_pairs": _merge_pairs(kids[j], len(s.polys)),
                 }
         objects.append(entry)
     objects.sort(key=lambda e: (e["name"], e["location"] or ()))
@@ -321,6 +351,19 @@ def compare(name, want, got):
         if sa and (sb["textures"] - sa["textures"]):
             check(False, "%s: %s gained texture indices %r"
                   % (name, a["name"], dict(sb["textures"] - sa["textures"])))
+            break
+        # A shape that lost no face must come back with every merge pair it had.
+        # A quad *is* a pair on the way out, so this is what says the fusion is
+        # reversible rather than merely safe -- and a pair only goes missing
+        # legitimately when the face it named went with it.
+        if sa and not (sa["collisions"] or sa["degenerate"]):
+            if sa["merge_pairs"] != sb["merge_pairs"]:
+                check(False, "%s: %s exports %d merge pair(s), had %d"
+                      % (name, a["name"], sb["merge_pairs"], sa["merge_pairs"]))
+                break
+        elif sa and sb["merge_pairs"] > sa["merge_pairs"]:
+            check(False, "%s: %s invented %d merge pair(s)"
+                  % (name, a["name"], sb["merge_pairs"] - sa["merge_pairs"]))
             break
         gained_uvs = uv_residue(sb["uvs"], sa["uvs"]) if sa else collections.Counter()
         if gained_uvs:

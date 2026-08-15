@@ -107,7 +107,11 @@ NO_CENTRE_PROP = "rif_no_centre"
 #: Blender attribute and rides along with the mesh through an edit:
 #:
 #: - ``SHPMRGDT`` is exactly one int32 per polygon in all 9,357 shipped shapes
-#:   (AvP's ``{int *merge_data; int num_polys}``) -> a face attribute.
+#:   (AvP's ``{int *merge_data; int num_polys}``) -> a face attribute, and where
+#:   the pair can be one, **a quad**: the pairing is the quad, and export reads
+#:   it back off the tessellation rather than out of the attribute
+#:   (``shapes.plan_faces`` / ``fuse_quad``). The attribute stays for the pairs
+#:   no quad can hold and for a quad somebody splits.
 #:
 #:   Its wire value is the *index of the polygon this one pairs with*, so it is a
 #:   reference into a list whose numbering this addon changes -- import drops
@@ -2160,7 +2164,7 @@ def _iter_fcurves(action):
                 yield from bag.fcurves
 
 
-_CTX = {"scale": DEFAULT_SCALE, "y_down": True, "fps": 30.0,
+_CTX = {"scale": DEFAULT_SCALE, "y_down": True, "fps": 30.0, "fuse_quads": True,
         "textures": {}, "materials": {}, "images": {}, "texture_index": None,
         "table_chunk": None,
         "missing_textures": set(), "undecodable_textures": set()}
@@ -2173,39 +2177,42 @@ def _link(obj, collection, parent):
 
 
 def _mesh_for_shape(shape_chunk, name):
-    """REBSHAPE -> a Blender mesh, authored per-face data included as attributes."""
+    """REBSHAPE -> a Blender mesh, authored per-face data included as attributes.
+
+    Returns ``(mesh, polygons lost, merge pairs built as quads)``.
+    """
     shape = shp.read_shape(shape_chunk)
     me = bpy.data.meshes.new(name)
     if shape is None or not shape.verts:
-        return me, 0
+        return me, 0, 0
 
     verts = [to_blender(v, _CTX["scale"], _CTX["y_down"]) for v in shape.verts]
 
-    # **Drop the faces Blender cannot hold here, not in validate().** Two faces
-    # on the same three vertices are legal in a shape and 775 of them ship
-    # across 193 shapes -- 28 of Maskelyn MkII's 44 polygons are one. Letting
-    # `validate()` remove them silently renumbers `me.polygons` out from under
-    # the source list, so every face after the first duplicate takes the
-    # *previous* face's texture, UVs, flags and merge group. Removing them
-    # deterministically keeps the two lists index-for-index.
-    faces, kept, lost = [], [], 0
-    seen = set()
-    for index, poly in enumerate(shape.polys):
-        if len(poly.verts) < 3:
-            continue
-        key = frozenset(poly.verts)
-        if len(key) < 3 or key in seen:
-            lost += 1
-            continue
-        seen.add(key)
-        faces.append(tuple(poly.verts))
-        kept.append((index, poly))
+    # A **pair id**, not the wire value: the wire names a partner by index, and
+    # this importer changes the numbering (it drops faces Blender cannot hold).
+    # Both partners get the same id, so the pairing survives that; see
+    # `shapes.merge_pairs_from_wire`.
+    merge_vals = []
+    merge = shape_chunk.find(b"SHPMRGDT")
+    if merge is not None:
+        n = len(merge.body) // 4
+        merge_vals = shp.merge_pairs_from_wire(
+            list(struct.unpack_from("<%di" % n, merge.body, 0)), len(shape.polys))
+
+    # `plan_faces` drops the faces Blender cannot hold -- two on the same three
+    # vertices, 775 of them across 193 shipped shapes -- and, given the pairing,
+    # fuses each merge pair into the quad it stands for. Both decisions are made
+    # over the *source* numbering and returned index-for-index with `kept`,
+    # which is what keeps the per-face data attached to the right face.
+    kept, lost = shp.plan_faces(shape, merge_vals if _CTX["fuse_quads"] else None)
+    faces = [f.verts for f in kept]
 
     me.from_pydata(verts, [], faces)
     me.validate(verbose=False)
     if len(me.polygons) != len(kept):  # nothing shipped hits this
-        lost += len(kept) - len(me.polygons)
+        lost += sum(len(f.sources) for f in kept[len(me.polygons):])
         kept = kept[:len(me.polygons)]
+    quads = sum(1 for f in kept if len(f.sources) == 2)
 
     slot_of = {}
     scale_of = {}
@@ -2220,28 +2227,23 @@ def _mesh_for_shape(shape_chunk, name):
     hu = me.attributes.new("rif_has_uv", "BOOLEAN", "FACE")
     mg = me.attributes.new(MERGE_PAIR_ATTR, "INT", "FACE")
 
-    # A **pair id**, not the wire value: the wire names a partner by index, and
-    # this importer changes the numbering (it drops faces Blender cannot hold).
-    # Both partners get the same id, so the pairing survives that; see
-    # `shapes.merge_pairs_from_wire`.
-    merge_vals = []
-    merge = shape_chunk.find(b"SHPMRGDT")
-    if merge is not None:
-        n = len(merge.body) // 4
-        merge_vals = shp.merge_pairs_from_wire(
-            list(struct.unpack_from("<%di" % n, merge.body, 0)), len(shape.polys))
-
     uv_layer = me.uv_layers.new(name="UVMap")
-    for i, (poly, (source_index, src)) in enumerate(zip(me.polygons, kept)):
+    for i, (poly, plan) in enumerate(zip(me.polygons, kept)):
+        # A fused quad takes its attributes from the lower-indexed partner,
+        # which is also the one the engine's merger inherits from -- and
+        # `fuse_quad` only fuses a pair that agrees on all three anyway.
+        source_index = plan.sources[0]
+        src = shape.polys[source_index]
         poly.material_index = slot_of.get(src.texture_index, 0)
         et.data[i].value = src.engine_type
         fl.data[i].value = src.flags
         # Indexed by where the polygon was in the *file*, not where it ended up
         # in the mesh -- which is exactly the renumbering that made storing the
-        # raw wire value wrong.
+        # raw wire value wrong. A quad keeps its id too: split it back into two
+        # triangles and both halves still name the same pair.
         mg.data[i].value = (merge_vals[source_index]
                             if source_index < len(merge_vals) else shp.MERGE_NONE)
-        uvs = shape.uvs_for(src)
+        uvs = plan.uvs
         hu.data[i].value = uvs is not None
         scale = scale_of.get(src.texture_index, (1.0, 1.0))
         for k, loop in enumerate(poly.loop_indices):
@@ -2259,7 +2261,7 @@ def _mesh_for_shape(shape_chunk, name):
     # so does get one, which is what a well-formed new shape wants.
     if shape_chunk.find(b"SHPCENTR") is None:
         me[NO_CENTRE_PROP] = 1
-    return me, lost
+    return me, lost, quads
 
 
 def _hierarchy_binding(chunk):
@@ -2313,8 +2315,9 @@ def _build(chunk, index, parent_obj, collection, pairs, root_kids, stats):
         shape_index = pairs.get(index)
         if shape_index is not None:
             shape_chunk = root_kids[shape_index]
-            me, lost = _mesh_for_shape(shape_chunk, name)
+            me, lost, quads = _mesh_for_shape(shape_chunk, name)
             stats["lost_faces"] += lost
+            stats["quads"] += quads
             obj = bpy.data.objects.new(name, me)
             me["rif_id"] = "REBSHAPE"
             me["rif_index"] = shape_index
@@ -2351,8 +2354,9 @@ def _build(chunk, index, parent_obj, collection, pairs, root_kids, stats):
         # A shape no object claims -- Elint MkII ships two, of 4 vertices each.
         # It still gets a real mesh rather than an empty, or its geometry would be
         # visible only as a typed array.
-        me, lost = _mesh_for_shape(chunk, _label_for(chunk))
+        me, lost, quads = _mesh_for_shape(chunk, _label_for(chunk))
         stats["lost_faces"] += lost
+        stats["quads"] += quads
         obj = bpy.data.objects.new(me.name, me)
         skip |= GEOMETRY_CHUNKS | set(ATTRIBUTE_CHUNKS) | DISCARDED_CHUNKS
     else:
@@ -2443,7 +2447,8 @@ def _build(chunk, index, parent_obj, collection, pairs, root_kids, stats):
 
 
 def build_scene(root, name, scale=DEFAULT_SCALE, y_down=True, fps=30.0,
-                source_path=None, texture_dir="", load_images=True):
+                source_path=None, texture_dir="", load_images=True,
+                fuse_quads=True):
     """Chunk tree -> a Blender collection holding the whole file.
 
     ``source_path`` is only used to find the textures: a ``.RIM`` is not in the
@@ -2451,12 +2456,16 @@ def build_scene(root, name, scale=DEFAULT_SCALE, y_down=True, fps=30.0,
     named it (``texture_dir`` overrides that). Nothing else reads it, and an
     import with no textures found differs from one with them only in what the
     materials display.
+
+    ``fuse_quads`` builds each ``SHPMRGDT`` pair as one quad instead of two
+    triangles -- the same fusion the engine performs on a map object, and the
+    form the geometry was authored in. Export writes triangles either way.
     """
-    _CTX.update(scale=scale, y_down=y_down, fps=fps,
+    _CTX.update(scale=scale, y_down=y_down, fps=fps, fuse_quads=fuse_quads,
                 textures={}, materials={}, images={}, texture_index=None,
                 table_chunk=None, sound_dir=None,
                 missing_textures=set(), undecodable_textures=set())
-    stats = {"lost_faces": 0, "objects": 0}
+    stats = {"lost_faces": 0, "objects": 0, "quads": 0}
 
     collection = bpy.data.collections.new(name)
     bpy.context.scene.collection.children.link(collection)
@@ -2676,14 +2685,17 @@ def _shape_chunk_from_mesh(obj, me, scale, y_down, stats, textures=None):
     mg = me.attributes.get(MERGE_PAIR_ATTR)
     uv_layer = me.uv_layers.active
 
-    polys = []
-    uv_lists = []
-    pair_ids = []
+    # **Every face is triangulated on the way out**, whatever it is in Blender:
+    # all 1,766,071 shipped polygons are triangles, and the engine builds its
+    # render buffers from the unmerged list. A quad is a *merge pair* instead --
+    # see the second pass below.
+    #
     # Dropped before anything parallel is appended, so polys/uv_lists/merge stay
     # in step and `uv_index` stays contiguous. See shapes.welds_degenerate: a
     # triangle that loses a corner to the weld crashes the game while it builds
     # section adjacency, and the fault names neither the file nor the polygon.
     welded = shp.weld_map(verts)
+    records, by_face = [], {}
     for tri in me.loop_triangles:
         if shp.welds_degenerate(tri.vertices, welded):
             stats["degenerate_faces"] += 1
@@ -2698,27 +2710,75 @@ def _shape_chunk_from_mesh(obj, me, scale, y_down, stats, textures=None):
         engine_type = et.data[face].value if et is not None and face < len(et.data) else 3
         flags = fl.data[face].value if fl is not None and face < len(fl.data) else 0
         has_uv = bool(hu.data[face].value) if hu is not None and face < len(hu.data) else True
-        pair_ids.append(mg.data[face].value if mg is not None and face < len(mg.data)
-                        else shp.MERGE_NONE)
+        pair_id = (mg.data[face].value if mg is not None and face < len(mg.data)
+                   else shp.MERGE_NONE)
 
         flat = []
         if has_uv and uv_layer is not None:
             for loop in tri.loops:
                 flat += uv_to_rif(uv_layer.data[loop].uv, texels)
-        # One entry per triangle, which is what the shipped files do -- and past
-        # 65,535 of them the index moves into bits 12-15, or it would wrap and
-        # every face after the 65,536th would wear another face's UVs. Four
-        # shipped shapes are that big.
-        uv_index = len(uv_lists)
-        uv_lists.append(tuple(flat))
+        by_face.setdefault(face, []).append(len(records))
+        records.append((tri, face, engine_type, flags, texture_index, pair_id, tuple(flat)))
+
+    # **A quad is a merge pair.** The two triangles it tessellates into share an
+    # edge, a material and a flags word by construction, which is exactly what
+    # `MergePolygonsInChunkShape` fuses back into one nav section -- so pairing
+    # them needs no stored id and survives any edit that keeps the face a quad.
+    # An n-gon is not a pair: the engine's merged polygon is always four-sided.
+    quad_pairs, quad_faces = {}, set()
+    for face, group in by_face.items():
+        if len(group) != 2 or len(me.polygons[face].vertices) != 4:
+            continue
+        # Whatever the id attribute says, this face is now the pairing -- so it
+        # is out of the id pass either way, or a refused quad's two halves would
+        # be re-paired through their (identical) inherited id.
+        quad_faces.add(face)
+        a, b = group
+        if len({welded[v] for v in records[a][0].vertices}
+               & {welded[v] for v in records[b][0].vertices}) != 2:
+            continue        # the tessellation welded away the shared diagonal
+        if shp.merges_by_texture(records[a][2]) and not (records[a][6] and records[b][6]):
+            # `TexMergePolys` reads a (u,v) per vertex out of each partner's UV
+            # record and writes a four-entry one back. With no record there,
+            # both run off the end of it, and no shipped pair is in this shape.
+            stats["merge_no_uvs"] += 1
+            continue
+        quad_pairs[a] = b
+        quad_pairs[b] = a
+
+    polys, uv_lists, uv_index_of = [], [], {}
+    for n, (tri, _face, engine_type, flags, texture_index, _pair, flat) in enumerate(records):
+        partner = quad_pairs.get(n)
+        if not flat and partner is not None and partner < n:
+            # An untextured pair shares one empty UV record, because `MergePolys`
+            # compares the **whole `colour` dword** -- uv index included -- and
+            # would otherwise refuse a pair it accepted as shipped. All 59,640
+            # untextured pairs in the shipped levels share their record.
+            uv_index = uv_index_of[partner]
+        else:
+            # One entry per triangle otherwise, which is what the shipped files
+            # do -- and past 65,535 of them the index moves into bits 12-15, or
+            # it would wrap and every face after the 65,536th would wear another
+            # face's UVs. Four shipped shapes are that big.
+            uv_index = len(uv_lists)
+            uv_lists.append(flat)
+        uv_index_of[n] = uv_index
         colour = shp.encode_colour(texture_index, uv_index)
         polys.append(shp.Poly(engine_type, len(polys), flags, colour, tuple(tri.vertices)))
 
-    # The pairing is rebuilt from the ids rather than replayed, so a partner
-    # dropped anywhere above becomes an honest -1 instead of an index into a
-    # numbering that no longer exists.
-    merge, unpaired = shp.merge_wire_from_pairs(pair_ids)
+    # Outside a quad the pairing is rebuilt from the stored ids rather than
+    # replayed, so a partner dropped anywhere above becomes an honest -1 instead
+    # of an index into a numbering that no longer exists.
+    merge = [shp.MERGE_NONE] * len(polys)
+    for a, b in quad_pairs.items():
+        merge[a] = b
+    ids = [shp.MERGE_NONE if r[1] in quad_faces else r[5] for r in records]
+    wire, unpaired = shp.merge_wire_from_pairs(ids)
+    for i, j in enumerate(wire):
+        if merge[i] == shp.MERGE_NONE:
+            merge[i] = j
     stats["merge_unpaired"] += unpaired
+    stats["merge_quads"] += len(quad_pairs) // 2
 
     bodies = shp.build_bodies(verts, polys, uv_lists)
     children = [
@@ -2953,7 +3013,8 @@ def rebuild_tree(collection, scale=None, y_down=None, fps=None):
     fps = float(collection.get("rif_fps", 30.0)) if fps is None else fps
     stats = {"shapes": 0, "objects": 0, "lights": 0, "textures": 0, "new_textures": 0,
              "sounds": 0, "emitters": 0, "degenerate_faces": 0, "lighting_dropped": 0,
-             "merge_unpaired": 0, "merge_dropped": 0}
+             "merge_unpaired": 0, "merge_dropped": 0, "merge_quads": 0,
+             "merge_no_uvs": 0}
     # Read the rest pose, not whatever the animation system is posing right now.
     # This also runs the depsgraph, which export needs because matrix_world is
     # stale until it does.

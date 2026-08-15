@@ -114,7 +114,7 @@ parent's object.** On top of that, the things with a real Blender equivalent get
 | `STDLIGHT` | a light — colour, energy, cutoff distance, orientation |
 | `OBANSEQC` | an **Action** on that armature, named from `OBASEQHD` (`Seq_Walk`, `Seq_Die`) |
 | `OBASEQFR` | a keyframe in it, plus a sound event on the Action if it triggers one |
-| `SHPMRGDT` | a per-face `rif_merge_group` attribute |
+| `SHPMRGDT` | each pair fused into one **quad**, plus a per-face `rif_merge_pair` attribute |
 | `SHPVTINT` | a per-vertex `rif_light` **colour** attribute, paintable and bakeable |
 | `BMPNAMES` | the texture table on the collection, plus one material per texture index |
 | `INDSOUND` | a **Speaker** per entry, carrying the path, distances and volume |
@@ -685,6 +685,31 @@ exporter regenerate rather than mirror:
 
 Nothing is silently dropped when you edit a mesh.
 
+### Quads
+
+**A merge pair is a quad, and that is how it imports.** `SHPMRGDT` names pairs of coplanar
+triangles the engine fuses back into four-sided polygons when it loads level geometry, so the mesh
+you get is the one the level was modelled as: 99.77% of the 580,774 pairs in the shipped files come
+in as quads, and level01's 29,045 triangles become 19,675 faces. Turn it off with **Merged pairs as
+quads** in the import options if you would rather see the triangles.
+
+On the way out **every face is triangulated**, whatever it is in Blender, because that is what all
+1,766,071 shipped polygons are — and a quad becomes a merge pair. So the round trip is even, and
+two other things follow:
+
+- **Joining two triangles into a quad creates a merge pair**, and splitting a quad back into
+  triangles keeps it (both halves inherit the pair id). Nothing has to be edited by hand.
+- **An n-gon is not a pair.** The engine's merged polygon is always four-sided, so a face with five
+  or more corners exports as a fan of unpaired triangles. It is still valid geometry; it is just
+  more pathfinding sections.
+
+What a pair costs or saves is **nav sections, not pixels** — see the limitations at the end.
+
+A pair that cannot be a quad without losing something stays two triangles: a different material,
+`engine_type` or `rif_flags` on the two halves, a UV seam across their shared edge, opposite
+winding, or a quad Blender would tessellate along the other diagonal. All 1,311 of them across the
+shipped set still round-trip through the `rif_merge_pair` attribute.
+
 The **texture table is the exception, and is held to byte-exactness**: it is carried whole rather
 than regenerated, so an import/export cycle that touches no material has no reason to disturb a
 byte of it — uninitialised padding after a name included. `test_scene.py` asserts exactly that. The
@@ -777,6 +802,8 @@ Measured across all 563 shipped files:
 | A point's time is a duration in ticks | all 763 shipped point times are a multiple of 40 ms; the final point of a multi-point track is 0 in 94% against 38% elsewhere, which no cumulative timestamp could be |
 | Field of view survives the camera lens | degrees → radians → degrees is exact through float32 for all 139 shipped `CUTTRFOV` values |
 | `SHPMRGDT` is an exact involution | all 9,357 shipped shapes satisfy the predicate the engine's merge pass assumes, and all 9,357 reproduce their wire values byte for byte through the pair-id form the scene stores |
+| A merge pair is a quad, losslessly | 579,463 of the 580,774 pairs in the shipped files fuse into one, and every one of them tessellates back into exactly the two source triangles — same corners, same UVs. The 1,311 that do not fuse stay two triangles and keep their pairing |
+| Quads survive the game | `level02` imported as 6,468 quads, exported with the same 6,468 merge pairs, and loaded from a mod with 178 actors / 294 roles and no crash — identical to a stock run in the same session with the mod moved out of the tree |
 | The merge fix works where it failed | across the 24 level map objects it turns 15 unwalkable tables into 0, losing 73 pairs of ~320,000 — only where the partner face was genuinely dropped. `level02` and `level11`, which crashed Gunlok on load, now load with 178/294 and 317/352 actors and roles |
 | The two sound systems do not overlap | `INDSOUND` occurs in 52 files under `Objects\`/`Units\` and `DUMOBJTX` in 24 under `Levels\`, with no file and not one `.wav` name in common |
 | `DUMOBJTX` rebuilds exactly | `encode(decode(body)) == body` for all 1,097, and all 1,097 are padded to `(strlen + 4) & ~3` with NULs |

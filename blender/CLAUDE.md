@@ -423,6 +423,51 @@ These pin the design, in roughly decreasing order of how much everything else re
       file.
     - **Verified in the running game**: `level02` and `level11`, which faulted before, now load
       with 178/294 and 317/352 actors and roles.
+- **A merge pair is a quad, so that is what it imports as — and on the way out a quad *is* the
+  pairing.** `shapes.plan_faces` / `fuse_quad` fuse each pair into the four-sided polygon the
+  engine makes of it (`fuse_quads`, on by default), and export derives `SHPMRGDT` from the quads
+  themselves rather than from the stored id. That is the whole feature: the mesh is now the one
+  the level was modelled as, joining two triangles *creates* a pair and splitting a quad keeps
+  one, and 74.4% of a map's faces stop being half of something.
+  - **The fuse is a stronger test than the engine's merge, because it has to be reversible.**
+    Anything a Blender face can hold only once has to already agree — material, `engine_type`,
+    `rif_flags`, and the UVs at both shared vertices — on top of a shared edge and consistent
+    winding. 579,463 of the 580,774 shipped pairs qualify; the 1,311 that do not stay two
+    triangles and keep the `rif_merge_pair` attribute, which is why that attribute is still there
+    and still what a *split* quad exports through.
+  - **The quad is wound `(shared0, odd_b, shared1, odd_a)` so the shared edge is its `0-2`
+    diagonal**, which is the diagonal `calc_loop_triangles` splits on — so export reproduces the
+    two source triangles rather than two new ones. That is not cosmetic: the other diagonal is two
+    different normals, and on level geometry the normal is what decides walkability.
+    `quad_would_flip` is the guard, and it mirrors **both** of Blender's variants because which
+    one runs is not ours to choose (`is_quad_flip_v3_first_third_fast`, with and without the face
+    normal). The predicate needs its own control — a dart, in `test_shapes.py` — because a fused
+    pair can never trip it: consistent winding across a shared edge puts the two apexes on
+    opposite sides of it, which is the same condition. All 579,463 tessellate back exactly.
+  - **Export rotates each triangle's starting corner, and that is not a difference.** The
+    tessellation begins at the shared edge wherever the source began, so a re-exported polygon is
+    a cyclic rotation of the one that came in — same winding, same UV on every vertex, same
+    surface. `test_scene.py`'s UV key was rotation-*sensitive* and reported 152 phantom changes on
+    one 544-polygon object; `_uv_key` now rotates to the lowest vertex index, which is exact and
+    still catches a genuine winding reversal.
+  - **A pair on the untextured path shares one UV record, and it has to.** `MergePolys`
+    @ 0x005d77e0 compares the **whole `colour` dword**, uv index included — so two triangles with
+    an entry each never merge, which is what the exporter used to give them, silently killing all
+    59,640 untextured pairs in the shipped levels (11.8% of the merges). All 59,640 share their
+    record as shipped, so a quad whose halves have no UVs now shares one too.
+  - **And the other path must not be given a record that is not there.** `TexMergePolys` reads a
+    `(u,v)` per vertex out of each partner and writes a fused four-entry one back into the
+    lower-indexed one, so a textured `engine_type` with no UV list runs off both ends of it. None
+    of the 516,550 shipped textured-path pairs is in that shape; a quad that is has its pairing
+    dropped and is reported (`stats["merge_no_uvs"]`), never written.
+  - **Verified in the running game, against a control in the same session.** `level02` imported as
+    6,468 quads and exported with 6,468 merge pairs — the same count the source holds, and zero
+    findings from `merge_problems` — then served through the mod VFS
+    (`mods.recent` shows `rif/levels/level02.rif`, six reads) and loaded with **178 actors / 294
+    roles**, `game.state` 5, no crash dump. With the mod **moved out of the tree** (renaming does
+    not disable it), stock loads with exactly the same 178/294 and `mods.served` 0. This is the
+    check that matters for this chunk: the engine's merge pass has no bounds check anywhere, and
+    it is the map object's `SHPMRGDT` that runs through it.
 - **Blender cannot hold two faces on the same three vertices**, and the shipped assets contain
   them (doubled or reverse-wound triangles): 775 across 193 shapes, and 28 of Maskelyn MkII's 44
   polygons. **Drop them deliberately, before `from_pydata`** — letting `validate()` remove them
@@ -471,12 +516,14 @@ These pin the design, in roughly decreasing order of how much everything else re
   walkable but 2% in the largest is broken — that is what 21.7% open edges (against
   level01's 6.8%) does, and it leaves the walkable *fraction* looking fine. Full
   derivation in `level_loading_notes.md` §5.5.
-  One thing the preview deliberately does not model: the engine's sections are **not** one per
-  triangle. `SHPMRGDT` fuses 74.4% of map polygons into quads first, so level01's 29,045
-  triangles are 19,675 nav sections in game. That changes none of the metrics above — merging
-  two coplanar edge-sharing triangles alters neither the walkable surface nor the connectivity,
-  and a pair only merges when both halves already share their flags — so the *island* numbers are
-  the same either way. It does change the A\* node count, which is what the merge is for.
+  The engine's sections are **not** one per triangle — `SHPMRGDT` fuses 74.4% of map polygons
+  into quads first, so level01's 29,045 triangles are 19,675 nav sections in game — and since the
+  importer builds those quads the preview now counts what the engine will. It made no difference
+  to the metrics above and still does not: merging two coplanar edge-sharing triangles alters
+  neither the walkable surface nor the connectivity, and a pair only merges when both halves
+  already share their flags, so the *island* numbers are the same with or without the fusion.
+  What it changes is the A\* node count, which is what the merge is for — and what the face count
+  in the preview's report now means.
 - **RIF is Y-down, and the swizzle has to carry the orientation too, not just the position.** A
   biped's parts all sit at negative Y — feet nearest the origin (~-100), top of the head furthest
   (~-1990) — so the body extends in -Y from the ground and **-Y is up**; assembled in Blender a

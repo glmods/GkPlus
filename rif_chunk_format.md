@@ -1081,6 +1081,20 @@ crashed; the 9 that lose none loaded. Confirmed in the game on four - `level01` 
 loaded, `level02` and `level11` faulted at exactly the two addresses above, then loaded once the
 addon stored a **pair id** instead. Full write-up in `blender/CLAUDE.md`.
 
+**A pair is also the natural editing unit**, and the addon now imports one as a Blender quad -
+579,463 of the 580,774 pairs in the shipped files fuse, and export tessellates each quad back into
+the two triangles it came from and regenerates the pairing from the quad rather than from a stored
+id. Two things the write-side of that turned up are properties of the *engine* and belong here:
+
+- **`MergePolys` compares the whole `colour` dword, so a pair on the untextured path must share a
+  UV record.** All 59,640 untextured-path pairs in the shipped levels do, empty record included -
+  give the two triangles an entry each and the merge is silently refused.
+- **`TexMergePolys` needs a record that is there.** It reads a `(u,v)` per vertex out of both
+  partners and writes a fused four-entry one back into `uv_list[UVListIndex(a)]`, with no check
+  that the record holds one pair per vertex. None of the 516,550 shipped textured-path pairs is
+  missing one - which is a precondition on any *generated* `SHPMRGDT`, not a coincidence of the
+  art. (27 of them do have a UV seam across the shared edge, which the engine refuses cleanly.)
+
 ---
 
 ## `AVPSTRAT` and `OBJPRJDT` are inert

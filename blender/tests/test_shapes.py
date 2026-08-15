@@ -47,6 +47,70 @@ def _control():
     return caught
 
 
+def _tri_rotations(tri):
+    tri = tuple(tri)
+    return {tri[k:] + tri[:k] for k in range(len(tri))}
+
+
+def _tessellate(quad):
+    """Blender's own split of a quad: ``0-1-2`` then ``0-2-3``."""
+    return (quad[0], quad[1], quad[2]), (quad[0], quad[2], quad[3])
+
+
+def _fuse_control():
+    """:func:`shapes.fuse_quad` must refuse each pair a quad cannot represent.
+
+    Every case here is something the shipped set contains at least one of, and
+    a fusion that took it would either lose per-face data Blender can hold only
+    once or come back as two different triangles.
+    """
+    verts = [(0, 0, 0), (10, 0, 0), (5, 10, 0), (5, -10, 0), (50, 0, 0), (60, 10, 0)]
+
+    def shape(polys, uv_lists=()):
+        return shp.Shape(None, verts, polys, list(uv_lists), [], [])
+
+    def poly(vs, engine_type=3, flags=0, colour=1):
+        return shp.Poly(engine_type, 0, flags, colour, vs)
+
+    good = shape([poly((2, 0, 1)), poly((3, 1, 0))])
+    if shp.fuse_quad(good, 0, 1) is None:
+        return 0                    # a fusable pair must fuse, or the rest is noise
+
+    cases = [
+        # A fold: `b` crosses the shared edge the same way `a` does, so the two
+        # triangles face opposite ways and are not two halves of one surface.
+        shape([poly((2, 0, 1)), poly((3, 0, 1))]),
+        # Different flags -- one face, one flags word. 1 shipped pair.
+        shape([poly((2, 0, 1)), poly((3, 1, 0), flags=0x100)]),
+        # Different material. A face carries one.
+        shape([poly((2, 0, 1)), poly((3, 1, 0), colour=2)]),
+        # Not adjacent: one shared vertex. This is the pairing that makes
+        # `TexMergePolys` clobber a UV record before it notices (0x005d777a).
+        shape([poly((2, 0, 1)), poly((1, 4, 5))]),
+        # A UV seam across the shared edge -- a quad holds one UV per corner.
+        shape([poly((2, 0, 1)), poly((3, 1, 0))],
+              [(0.0, 0.0, 1.0, 0.0, 1.0, 1.0), (9.0, 9.0, 1.0, 0.0, 1.0, 1.0)]),
+    ]
+    cases[-1].polys[0].colour = 1 | (0 << 16)
+    cases[-1].polys[1].colour = 1 | (1 << 16)
+    caught = sum(1 for s in cases if shp.fuse_quad(s, 0, 1) is None)
+
+    # And the tessellation predicate itself, on a dart -- the one shape whose
+    # two diagonals are not interchangeable. With the reflex corner at index 1
+    # the `0-2` split falls outside the quad and Blender flips it; rotated so
+    # the reflex corner is at 0, the same four points split cleanly. A fused
+    # pair can never be either (consistent winding across a shared edge puts the
+    # two apexes on opposite sides of it), which is exactly why the predicate
+    # needs a control of its own.
+    dart = [(0, 4, 0), (1, 1, 0), (4, 0, 0), (0, 0, 0)]
+    normal = (0, 0, -1)
+    if not shp.quad_would_flip(dart, (0, 1, 2, 3), normal):
+        return 0
+    if shp.quad_would_flip(dart, (1, 2, 3, 0), normal):
+        return 0
+    return caught
+
+
 def main(game_dir):
     stats = collections.Counter()
     failures = []
@@ -163,6 +227,48 @@ def main(game_dir):
                     else:
                         stats["SHPMRGDT round-trips through pair ids"] += 1
 
+            # (3c) Fusing each pair into the quad it stands for, which is what
+            # the importer builds. The claim is that it is **lossless**: every
+            # surviving polygon is covered exactly once, and Blender's own
+            # tessellation of the quad gives back the two source triangles --
+            # same corners, same UVs. A quad that came back split the other way
+            # would change two face normals, and on level geometry the normal is
+            # what decides walkability.
+            ids = shp.merge_pairs_from_wire(wire, n) if src is not None else None
+            faces, _lost = shp.plan_faces(shape, ids)
+            plain, _plain_lost = shp.plan_faces(shape, None)
+            covered = [i for f in faces for i in f.sources]
+            if sorted(covered) != sorted(f.sources[0] for f in plain):
+                failures.append((rel, "fusing changed which polygons survive"))
+            elif len(covered) != len(set(covered)):
+                failures.append((rel, "a polygon is in two faces"))
+            for face in faces:
+                stats["faces planned"] += 1
+                if len(face.sources) == 1:
+                    continue
+                stats["pairs fused into a quad"] += 1
+                for tri, source in zip(_tessellate(face.verts), reversed(face.sources)):
+                    poly = shape.polys[source]
+                    if tuple(poly.verts) not in _tri_rotations(tri):
+                        failures.append((rel, "quad %r does not tessellate back to %r"
+                                         % (face.verts, poly.verts)))
+                        break
+                    want = shape.uvs_for(poly)
+                    if want is None:
+                        if face.uvs is not None:
+                            failures.append((rel, "quad invented UVs"))
+                            break
+                        continue
+                    at = dict(zip(face.verts, face.uvs))
+                    if any(at[v] != uv for v, uv in zip(poly.verts, want)):
+                        failures.append((rel, "quad %r moved a UV" % (face.verts,)))
+                        break
+                else:
+                    stats["quads that tessellate back exactly"] += 1
+            stats["pairs the wire holds"] += sum(
+                1 for k, v in collections.Counter(ids or ()).items()
+                if k != shp.MERGE_NONE and v == 2)
+
             # (4) normal direction
             if shape.poly_normals and len(shape.poly_normals) == len(shape.polys):
                 for p, ref in zip(shape.polys, shape.poly_normals):
@@ -191,6 +297,12 @@ def main(game_dir):
              stats["SHPMRGDT round-trips through pair ids"]))
     print("   control (must be non-zero) : %d synthetic breakages detected"
           % _control())
+    print("pairs fused into a quad       : %d of %d (%.2f%%), %d tessellate back exactly"
+          % (stats["pairs fused into a quad"], stats["pairs the wire holds"],
+             100.0 * stats["pairs fused into a quad"] / max(stats["pairs the wire holds"], 1),
+             stats["quads that tessellate back exactly"]))
+    print("   faces planned              : %d" % stats["faces planned"])
+    print("   control (must be non-zero) : %d unfusable pairs refused" % _fuse_control())
     if radius_deltas:
         near = sum(1 for d in radius_deltas if d <= 1e-2)
         print("   radius vs shipped          : %d within 0.01, max delta %.3f (not asserted)"
@@ -210,8 +322,8 @@ def main(game_dir):
         print("    %-45s %s" % (rel, why))
     if len(failures) > 15:
         print("    ... and %d more" % (len(failures) - 15))
-    # The control has to fire, or the SHPMRGDT checks above are vacuous.
-    return 1 if failures or _control() != 4 else 0
+    # The controls have to fire, or the SHPMRGDT and fusion checks are vacuous.
+    return 1 if failures or _control() != 4 or _fuse_control() != 5 else 0
 
 
 if __name__ == "__main__":

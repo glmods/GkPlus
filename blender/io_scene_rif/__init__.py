@@ -91,6 +91,15 @@ class IMPORT_SCENE_OT_rif(bpy.types.Operator, ImportHelper):
         description="Treat RIF coordinates as Y-down and convert to Blender's Z-up",
         default=True,
     )
+    fuse_quads: BoolProperty(
+        name="Merged pairs as quads",
+        description=(
+            "Build each SHPMRGDT pair as one quad instead of two triangles -- "
+            "the same fusion the engine performs on level geometry, and the "
+            "form it was modelled in. Export writes triangles either way"
+        ),
+        default=True,
+    )
     load_textures: BoolProperty(
         name="Load textures",
         description=(
@@ -123,9 +132,11 @@ class IMPORT_SCENE_OT_rif(bpy.types.Operator, ImportHelper):
             root, name, scale=self.scale, y_down=self.y_down,
             fps=context.scene.render.fps, source_path=self.filepath,
             texture_dir=bpy.path.abspath(self.texture_dir) if self.texture_dir else "",
-            load_images=self.load_textures)
+            load_images=self.load_textures, fuse_quads=self.fuse_quads)
 
         summary = "Imported %s: %d top-level chunks" % (name, stats["objects"])
+        if stats.get("quads"):
+            summary += "; %d merged pair(s) as quads" % stats["quads"]
         if stats.get("textures"):
             summary += "; %d texture(s), %d image(s) loaded" % (stats["textures"],
                                                                stats.get("images", 0))
@@ -281,6 +292,10 @@ class EXPORT_SCENE_OT_rif(bpy.types.Operator, ExportHelper):
             summary += ", %d INDSOUND entr(ies)" % stats["sounds"]
         if stats.get("emitters"):
             summary += ", %d ambient emitter(s)" % stats["emitters"]
+        # A quad *is* a merge pair, so this is the count of nav sections the
+        # level saves -- and the number to compare against the import's.
+        if stats.get("merge_quads"):
+            summary += ", %d quad(s) as merge pairs" % stats["merge_quads"]
 
         if self.textures != "NONE":
             written = sc.write_textures(target, texture_root,
@@ -333,6 +348,19 @@ class EXPORT_SCENE_OT_rif(bpy.types.Operator, ExportHelper):
                 "no bounds check, so a bad pairing crashes it during level load "
                 "(%s)" % (summary, stats["merge_dropped"],
                           (stats.get("merge_reasons") or ["?"])[0]),
+            )
+            return {"FINISHED"}
+        # Also never INFO: the quad is still in the file as two triangles, but it
+        # is no longer one nav section, and the reason is a mesh edit rather than
+        # anything the user could see.
+        if stats.get("merge_no_uvs"):
+            self.report(
+                {"WARNING"},
+                "%s; %d quad(s) were not written as merge pairs because their "
+                "faces carry a textured engine type with no UVs -- the engine's "
+                "textured merger reads a UV per vertex out of a record that is "
+                "not there. Give them UVs, or clear rif_has_uv, to merge them"
+                % (summary, stats["merge_no_uvs"]),
             )
             return {"FINISHED"}
         # Likewise never INFO: the object was marked as carrying lighting and
