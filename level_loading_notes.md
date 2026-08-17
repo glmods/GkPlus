@@ -266,6 +266,14 @@ Notes:
 
 ## 3. `LoadLevel` @ 0x004e0980
 
+`__fastcall(char freshStart /*CL*/)`, and **it returns a status in EAX** - `LoadGame`
+@ 0x00505730 tests it and abandons the restore when it is zero. The return was missed for a
+while because `BeginLevelSession`'s call site ignores it, so a fresh level start does not care;
+it surfaced as savegame restores failing on Debug builds only, when `LoadScreenSystem` hooked
+this function as `void` and handed `LoadGame` whatever its own body happened to leave in EAX.
+The width and the meaning of the value are **not established** - only that zero is failure -
+which is why `src/LoadScreen.cpp` forwards it as `int` rather than narrowing it.
+
 Ordered outline. Loading-bar text comes from `GetResourceString(&LocalizedStrings, ...)`
 then `ShowLoadingMessage` @ 0x004e2910; `FUN_004e2c20(pct)` advances the bar.
 

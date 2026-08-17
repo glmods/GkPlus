@@ -904,6 +904,19 @@ and audit the DB afterwards rather than trusting it.
   several times and *never written* is an argument until proven otherwise — check the first
   handful of instructions for a store from ECX/EDX, then check what each call site puts there
   (here `MOV CL,1` vs `XOR CL,CL`, which turned out to be new-level vs savegame-restore).
+- **A hooked function declared `void` that actually returns a value fails only in the build you
+  do not ship.** The same `LoadLevel` @ 0x004e0980 was hooked as `void(__fastcall)(char)` by
+  `LoadScreenSystem`. It returns a status, `LoadGame` @ 0x00505730 tests it, and a `void` hook
+  therefore returned whatever happened to be in EAX after its own body: **non-zero in
+  RelWithDebInfo, zero in Debug**. So restoring a savegame dumped the player back to the main
+  menu at the end of the load, in Debug only, silently - every failure path in that loader is
+  `CloseHandle` / `ResumeExecutor` / return with no message. A fresh level start ignores the
+  result, so only savegames broke, and only in the configuration CLAUDE.md recommends for hook
+  work. Two rules follow: a wrapper's return type is as load-bearing as its arguments and needs
+  the same `RET`-form scrutiny, and **forward the return as `int`** so all 32 bits of EAX pass
+  through exactly as the callee left them - a narrower type lets the compiler extend or truncate,
+  handing the caller a value the unhooked game never would. If a hook is right in one config and
+  wrong in another, suspect EAX before suspecting timing.
 - **No `static_assert` means nothing is pinning the layout.** Before trusting a GkPlus struct
   mirror, check it actually has one - `ParticleGenerator` and `Projectile` had none despite
   this file claiming otherwise.

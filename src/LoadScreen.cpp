@@ -13,9 +13,25 @@ namespace gk {
 namespace loadscreen {
 namespace {
 
-// __fastcall(bool freshStart) - see the header. Returns void; the flag is the only
-// argument and it arrives in CL, so there is nothing on the stack to clean up.
-using LoadLevelFn = void(__fastcall *)(char);
+// __fastcall(bool freshStart) - see the header. The flag is the only argument and it
+// arrives in CL, so there is nothing on the stack to clean up.
+//
+// **It RETURNS a value, and forwarding it is not optional.** This was declared `void`
+// until a savegame restore was found to fail on Debug builds only, dumping the player
+// back to the main menu at the end of the load. `LoadGame` @ 0x00505730 tests what
+// `LoadLevel` returns; a `void` hook returns whatever happens to be in EAX, which an
+// optimized build left non-zero (success, by luck) and an unoptimized one left zero.
+// So the bug was invisible in exactly the configuration nobody ships and fatal in the
+// one CLAUDE.md recommends for hook work - and it was silent, because every failure
+// path in that loader is `CloseHandle` / `ResumeExecutor` / return with no message
+// (save_system_notes.md, "Behavioural notes"). A fresh level start ignores the result,
+// which is why only savegames broke.
+//
+// `int` rather than `char` deliberately: the width of the real return is not
+// established, and returning `int` forwards all 32 bits of EAX exactly as the original
+// left them. A narrower type would let the compiler extend or truncate, i.e. hand the
+// caller a value the unhooked game never would.
+using LoadLevelFn = int(__fastcall *)(char);
 LoadLevelFn OriginalLoadLevel = nullptr;
 
 // LoadLevel runs on the main thread only (file_io_notes.md section 1: no level
@@ -41,18 +57,19 @@ long long Now() {
   return counter.QuadPart;
 }
 
-void __fastcall HookedLoadLevel(char fresh_start) {
+int __fastcall HookedLoadLevel(char fresh_start) {
   ++Depth;
   Shown = 0;
   Dropped = 0;
   // Not reset to Now(): the first present of a load should go through so the
   // screen appears immediately, and the previous frame's timestamp is already old
   // enough to guarantee that.
-  OriginalLoadLevel(fresh_start);
+  const int result = OriginalLoadLevel(fresh_start);
   --Depth;
   if (Depth == 0 && (Shown + Dropped) != 0) {
     DebugWrite("GkPlus: load presented {} frames, dropped {}\n", Shown, Dropped);
   }
+  return result;
 }
 
 } // namespace
