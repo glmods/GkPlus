@@ -459,7 +459,7 @@ as the camera pointer), and a `D3DVIEWPORT8` sits at `+0x254` with `MinZ` at `+0
 | 0x00571470 | CDecl<void*, size_t> | pool_alloc — page sub-allocator; falls back to real CRT malloc for big blocks |
 | 0x005715b0 | CDecl<void, void*> | pool_free — returns an emptied page to the real CRT free. **`__cdecl`, not `__stdcall`**: bare `RET` at 0x0057166f with one stack argument, and game call sites clean up themselves (`CALL free` then `ADD ESP,0x4`). Calling it through a `StdCall` pointer leaks 4 bytes of stack per call and eventually returns to garbage — see the comment in `src/Memory.cpp` |
 | 0x005e3f64 | CDecl<void, void*, int> | `free_sized` (discards the size, calls pool_free). `__cdecl` for the same reason. Was named `Dealloc?` |
-| 0x005e3f72 | — | `malloc` — bare `JMP pool_alloc` |
+| 0x005e3f72 | — | `malloc` — `PUSH EBP` / `MOV EBP,ESP` / `POP EBP` / `JMP pool_alloc` (`55 8b ec 5d e9 f5 d4 f8 ff`). The prologue is exactly **stack-neutral** — ESP and EBP are both back at their incoming values by the `JMP` — so it is still a tail jump and still `__cdecl`, but it is *not* a bare `JMP` and Ghidra therefore does **not** mark it `isThunk()`, unlike `free` below. Thunk-following xref and call-graph queries do not traverse it |
 | 0x005e3f7b | — | `free` — bare `JMP pool_free`; **every** `free` in game code goes here |
 | 0x0044e1a0 | FastCall<char*, char*> | `strdup` — game-written, allocates via the malloc thunk |
 | 0x00601f4a / 0x00601f2d | — | the *real* CRT malloc/free. Only pool_alloc/pool_free and a few file/rif paths (`ToMap`, `LoadOrGetRifFile`) call them — no field in any mirrored struct holds this memory |

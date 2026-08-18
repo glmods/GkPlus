@@ -280,7 +280,9 @@ Circular doubly-linked with a sentinel; **push at tail, pop at head** (FIFO).
 
 **Both allocations per entry come out of the game pool.** The **payload** is `malloc`
 @ 0x005e3f72 (`MsgQueue_Push` @ 0x0056d9b3) and the **node** is a direct `pool_alloc`
-@ 0x00571470 (@ 0x0056d9d0) — and the game's `malloc` is a bare `JMP pool_alloc`, so the
+@ 0x00571470 (@ 0x0056d9d0) — and the game's `malloc` tail-jumps to `pool_alloc` behind a
+stack-neutral `PUSH EBP` / `MOV EBP,ESP` / `POP EBP` prologue (see `address_map.md`; it is
+not the bare `JMP` this file used to call it, though the effect is the same), so the
 two are the same heap, not the CRT's and the pool's. (An earlier revision of this file
 said the payload was CRT `malloc`, "internally locked"; it is not, and the pool's own lock
 is compiled out — see below.) Only the queue's own RW lock serialises either.

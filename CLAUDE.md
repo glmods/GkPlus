@@ -825,9 +825,17 @@ something, write your understanding back into the database instead of keeping it
 Anything reusable (offsets, struct layouts, subsystem behavior) should also land in this file or
 the relevant `*_notes.md`.
 
-Read-only is **not enforced** on delegated work — a nested subagent renamed functions and globals
-this session despite being told not to. If you fan out analysis, treat the constraint as advisory
-and audit the DB afterwards rather than trusting it.
+**Writing is one agent's job, and reading is everyone else's.** All Ghidra work is delegated (see
+`.claude/skills/ghidra-recon`): any number of `ghidra-explorer` agents read the binary in parallel
+through `create_readonly_context`, and a single `ghidra-consolidator` afterwards applies what they
+found — to the DB, the `src/` mirror and the notes together, per the renaming convention above.
+Read-only used to be advisory, and a subagent told not to write renamed functions and globals
+anyway; it is now structural at three layers — a read-only context refuses the transaction, the
+explorer's `tools:` allowlist does not offer it `create_context` at all, and
+`.claude/hooks/gate-ghidra-access.sh` denies that tool to it by name. An explorer also has no
+`Write`/`Edit` and no `Agent`, so it cannot touch the repo or fan out further. Two consolidators at once
+is the arrangement that is still unsafe — the DB is shared mutable state with no merge — so run them
+one at a time, over areas that share no type, function, `src/` file or notes section.
 
 ### Analysis Traps
 
@@ -956,11 +964,33 @@ and audit the DB afterwards rather than trusting it.
 
 ### Ghidra MCP Mechanics
 
-- Tell a delegated `ghidra-analyst` **not to spawn subagents of its own**. The pool is 20 and
-  nested fan-out saturates it; the failure surfaces as `Concurrent subagent limit reached` on an
-  unrelated agent.
+- **A Ghidra agent must not spawn subagents of its own.** The pool is 20 and nested fan-out
+  saturates it; the failure surfaces as `Concurrent subagent limit reached` on an unrelated agent.
+  Both agent definitions say so; a brief that invites one to "delegate the rest" undoes it.
+- There are **two kinds of context** and picking the wrong one is not a style choice.
+  `create_readonly_context` binds an immutable snapshot and any write in it fails with
+  `Transaction not permitted: read-only`; `create_context` is read-write and wraps modifications in
+  a transaction for you. Every explorer in a round shares one snapshot, so they cannot disagree
+  because the program moved under one of them — and that snapshot is taken from the program **as
+  last saved in Ghidra**.
+- **A consolidator's edits are invisible to every explorer spawned afterwards until the program is
+  saved in the GUI**, and this is measured, not inferred: a consolidator wrote a plate comment, and
+  the next `create_readonly_context` came back with `The program has unsaved changes in Ghidra. This
+  snapshot reflects the last saved state, so those changes are not visible here.` So an explorer in
+  a later round will report the *old* name for something already renamed. Two consequences: put
+  names applied in an earlier round **in the brief**, since the DB will not carry them, and treat
+  that warning in a context's response as the signal that a round of consolidation has not been
+  saved yet. The reports, not the database, are the record of what a round found.
 - `execute_command` runs in a **persistent** Jython context — globals survive between calls, so
-  accumulate into a global and process in batches.
+  accumulate into a global and process in batches. Always `close_context` when done; for a read-only
+  context that is what lets the shared snapshot be freed.
+- **A Java exception does not derive from Jython's `Exception`, so `except Exception, e` does not
+  catch one** — it propagates, fails the whole `execute_command` call, and discards every `print`
+  after the `try`. So one bad element mid-batch loses the rest of that call's output, exactly like a
+  timeout. Measured on a refused write (`db.NoTransactionException` out of `DBHandle.checkTransaction`
+  escaping the handler). Use a bare `except:` or `except java.lang.Exception` around anything that
+  can throw from the Ghidra API — a `setName` that collides, a `replaceAtOffset` on a bad offset, a
+  read of uninitialized `.bss` — and keep the `DONE` set updated as you go.
 - 30 s timeout: >~15 decompilations per call times out. Batch with a `DONE` set so a timeout
   doesn't lose progress.
 - `mem.getBytes()` into a Jython `bytearray` does not marshal back (silently returns zeros) — use

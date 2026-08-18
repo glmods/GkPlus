@@ -7,7 +7,7 @@
           {
             "type": "command",
             "shell": "bash",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/deny-ghidra-in-main-context.sh\"",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/gate-ghidra-access.sh\"",
             "statusMessage": "Checking Ghidra call site"
           }
         ]
