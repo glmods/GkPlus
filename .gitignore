@@ -17,3 +17,8 @@ vcpkg/
 CMakeUserPresets.json
 # find-draw.ps1 writes its bisect screenshots beside itself
 /utils/rendertest/_probe*.png
+# The shader headers are generated into <binary dir>/generated (already covered by build/ above).
+# This entry is for the leftovers: every checkout from before they moved keeps an untracked copy
+# in src/, and the quoted-include form would have let one shadow the generated header - so make
+# sure a stray one can never be committed back.
+/src/*.gen.inc.h

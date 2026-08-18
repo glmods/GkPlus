@@ -14,10 +14,13 @@
 #include "Core.h"
 #include "GUI.h"
 #include "Js.h"
+#include "Profile.h"
 #include "Repl.h"
+#include "Settings.h"
 
 #include <cstdio>
 #include <string>
+#include <vector>
 
 namespace gk {
 namespace {
@@ -38,56 +41,28 @@ JSValue SetupMenusFn = JS_UNDEFINED;
 JSValue ImGuiNamespace = JS_UNDEFINED;
 JSValue MenusNamespace = JS_UNDEFINED;
 
+// The runtime exists (phase one has run). Not the same as Booted, which means
+// the entry module has been through.
+bool RuntimeUp = false;
 bool Booted = false;
 
 // --- paths -------------------------------------------------------------------
 
-// Forward slashes throughout, including the drive-letter form. QuickJS's default
-// module normalizer resolves a relative specifier by scanning the importing
-// module's name for '/' - with backslashes it finds none and `import "./x.mjs"`
-// silently resolves to "x.mjs" in the process's current directory. Win32 takes
-// forward slashes everywhere, so this costs nothing.
-std::string ToForwardSlashes(std::string path) {
-  for (char &c : path) {
-    if (c == '\\') {
-      c = '/';
-    }
-  }
-  return path;
+// Which file a settings key names, resolved against the profile directory. An
+// explicit "" means "no module", which is how a profile that only mounts mods
+// turns the entry script off - so the fallback is only used when the key is
+// absent altogether, not when it is empty.
+std::string ModulePathFromSettings(const char *key, const char *fallback) {
+  const std::string configured = settings::GetString(key, fallback);
+  return profile::Resolve(configured.c_str());
 }
 
-// This DLL's own directory. Derived from an address inside the module rather
-// than from DllMain's HINSTANCE, so nothing has to be plumbed through.
-std::string ModuleDirectory() {
-  HMODULE self = nullptr;
-  if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                          reinterpret_cast<LPCSTR>(&ToForwardSlashes),
-                          &self)) {
-    return {};
-  }
-  char path[MAX_PATH]{};
-  DWORD len = GetModuleFileNameA(self, path, sizeof(path));
-  if (len == 0 || len >= sizeof(path)) {
-    return {};
-  }
-  std::string dir = ToForwardSlashes(path);
-  size_t slash = dir.find_last_of('/');
-  return slash == std::string::npos ? std::string{} : dir.substr(0, slash);
+std::string BootModulePath() {
+  return ModulePathFromSettings("core.boot", "boot.mjs");
 }
 
 std::string EntryModulePath() {
-  char override[MAX_PATH]{};
-  DWORD len = GetEnvironmentVariableA("GKPLUS_SCRIPT", override,
-                                      sizeof(override));
-  if (len > 0 && len < sizeof(override)) {
-    return ToForwardSlashes(override);
-  }
-  std::string dir = ModuleDirectory();
-  if (dir.empty()) {
-    return {};
-  }
-  return dir + "/gkplus/main.mjs";
+  return ModulePathFromSettings("core.script", "main.mjs");
 }
 
 bool ReadWholeFile(const char *path, std::string *out) {
@@ -222,14 +197,34 @@ bool LinkGkModule(JSContext *ctx) {
 // which the game moves around constantly while loading a level.
 std::string EntryPath;
 
-// Loads the entry module and picks up its exports. False means nothing is
-// callable afterwards; the reason has already been logged.
-bool LoadEntryModule(JSContext *ctx, const std::string &path) {
+// Every path LoadModule has already evaluated. A profile is free to point
+// `core.boot` and `core.script` at one file - the sensible shape for a small
+// one - and evaluating it twice would run its top level twice: JS_Eval compiles
+// a fresh module for the name each time rather than consulting the loader's
+// cache, so nothing else would stop it.
+std::vector<std::string> LoadedModules;
+
+// Loads a module and picks up whichever of the two callbacks it exports. False
+// means the file could not be evaluated; the reason has already been logged.
+// `what` names the settings key for the log line.
+bool LoadModule(JSContext *ctx, const std::string &path, const char *what,
+                bool quiet_if_missing) {
+  for (const std::string &loaded : LoadedModules) {
+    if (loaded == path) {
+      return true;
+    }
+  }
+
   std::string source;
   if (!ReadWholeFile(path.c_str(), &source)) {
-    js::Log(("no script loaded - " + path + " does not exist").c_str());
+    if (!quiet_if_missing) {
+      js::Log((std::string("no script loaded - ") + what + " names " + path +
+               ", which does not exist")
+                  .c_str());
+    }
     return false;
   }
+  LoadedModules.push_back(path);
 
   JSValue compiled =
       JS_Eval(ctx, source.c_str(), source.size(), path.c_str(),
@@ -251,19 +246,29 @@ bool LoadEntryModule(JSContext *ctx, const std::string &path) {
     js::ReportException(ctx, path.c_str());
     return false;
   }
-  DrawGui = JS_GetPropertyStr(ctx, ns, "draw_gui");
-  SetupMenusFn = JS_GetPropertyStr(ctx, ns, "setup_menus");
-  JS_FreeValue(ctx, ns);
-
-  // An export of the wrong type is a script bug worth naming, not a silent
-  // no-op: getting `export const draw_gui = ...` subtly wrong is easy.
-  for (auto *slot : {&DrawGui, &SetupMenusFn}) {
-    if (!JS_IsUndefined(*slot) && !JS_IsFunction(ctx, *slot)) {
-      js::Log(("ignoring a non-function export in " + path).c_str());
-      JS_FreeValue(ctx, *slot);
-      *slot = JS_UNDEFINED;
+  // Only an export that is actually there replaces what a module loaded earlier
+  // left: with two modules in play, taking the absent one would let `core.script`
+  // silently erase a `draw_gui` the boot module had provided.
+  const struct {
+    const char *name;
+    JSValue *slot;
+  } Exports[] = {{"draw_gui", &DrawGui}, {"setup_menus", &SetupMenusFn}};
+  for (const auto &e : Exports) {
+    JSValue value = JS_GetPropertyStr(ctx, ns, e.name);
+    if (JS_IsUndefined(value)) {
+      continue;
     }
+    // An export of the wrong type is a script bug worth naming, not a silent
+    // no-op: getting `export const draw_gui = ...` subtly wrong is easy.
+    if (!JS_IsFunction(ctx, value)) {
+      js::Log(("ignoring a non-function export in " + path).c_str());
+      JS_FreeValue(ctx, value);
+      continue;
+    }
+    JS_FreeValue(ctx, *e.slot);
+    *e.slot = value;
   }
+  JS_FreeValue(ctx, ns);
   return true;
 }
 
@@ -308,25 +313,18 @@ void OnOverlayDraw() {
   JS_FreeValue(Context, result);
 }
 
-} // namespace
-
-void BootScriptHost() {
-  if (Booted) {
-    return;
+// The runtime, the bindings and the two handed-over objects. Idempotent; false
+// means the host is unusable and the reason has been logged.
+bool StartRuntime() {
+  if (RuntimeUp) {
+    return Context != nullptr;
   }
-  Booted = true;
-
-  std::string path = EntryModulePath();
-  if (path.empty()) {
-    js::Log("could not work out where this DLL lives; no script loaded");
-    return;
-  }
-  EntryPath = path;
+  RuntimeUp = true;
 
   Runtime = JS_NewRuntime();
   if (!Runtime) {
     js::Log("could not create the JavaScript runtime");
-    return;
+    return false;
   }
   JS_SetModuleLoaderFunc(Runtime, nullptr, ModuleLoader, nullptr);
 
@@ -335,12 +333,12 @@ void BootScriptHost() {
     js::Log("could not create the JavaScript context");
     JS_FreeRuntime(Runtime);
     Runtime = nullptr;
-    return;
+    return false;
   }
 
   if (!js::RegisterGkModule(Context) || !LinkGkModule(Context)) {
     js::Log("could not register the script bindings; no script loaded");
-    return;
+    return false;
   }
 
   // The two handed-over objects. JS_EXCEPTION is not a value the destructor
@@ -359,14 +357,68 @@ void BootScriptHost() {
   SetOverlayDrawCallback(OnOverlayDraw);
   SetFrameCallback(OnFrame);
 
-  // Before the entry module on purpose: a REPL is most useful precisely when
-  // main.mjs is missing or throws, and LoadEntryModule returns early on both.
+  // Before any module on purpose: a REPL is most useful precisely when a script
+  // is missing or throws, and both of the loads below return early on that.
   StartRepl(Runtime);
+  return true;
+}
 
-  if (!LoadEntryModule(Context, path)) {
+} // namespace
+
+void BootScriptProfile() {
+  if (RuntimeUp) {
     return;
   }
-  js::Log(("running " + path).c_str());
+  const std::string path = BootModulePath();
+  if (path.empty()) {
+    // `core.boot` set to "", or no profile directory at all. Either way there is
+    // nothing to run this early, and the runtime is left for BootScriptHost.
+    return;
+  }
+  // Existence is checked before the runtime is created rather than after, so a
+  // profile with no boot module costs nothing and - more to the point - leaves
+  // the host booting exactly where it always did. Creating a runtime inside the
+  // engine's first file open is worth doing only for a profile that asked for
+  // it. This is *our* GetFileAttributesA, not the slot patched into gl.exe's
+  // import table, so it cannot re-enter the hook that called us.
+  if (GetFileAttributesA(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    return;
+  }
+  if (!StartRuntime()) {
+    return;
+  }
+  if (LoadModule(Context, path, "core.boot", /*quiet_if_missing=*/true)) {
+    js::Log(("ran " + path).c_str());
+  }
+  PumpJobs();
+}
+
+void BootScriptHost() {
+  if (Booted) {
+    return;
+  }
+  Booted = true;
+
+  // Not conditional on the boot module having run: a profile may have neither, or
+  // only one of the two.
+  if (!StartRuntime()) {
+    return;
+  }
+
+  std::string path = EntryModulePath();
+  if (path.empty()) {
+    // `core.script` set to "" - a profile that only mounts mods - or no profile
+    // directory. Nothing more to load, but the menus callback may still be
+    // waiting from a boot module that exported one.
+    CallSetupMenus(Context);
+    PumpJobs();
+    return;
+  }
+  EntryPath = path;
+
+  if (LoadModule(Context, path, "core.script", /*quiet_if_missing=*/false)) {
+    js::Log(("running " + path).c_str());
+  }
   CallSetupMenus(Context);
   PumpJobs();
 }
@@ -406,6 +458,11 @@ ScriptSystem::~ScriptSystem() {
     JS_FreeRuntime(Runtime);
     Runtime = nullptr;
   }
+  // So a harness that constructs a second ScriptSystem gets a fresh host rather
+  // than one that believes it has already evaluated every module it was given.
+  LoadedModules.clear();
+  EntryPath.clear();
+  RuntimeUp = Booted = false;
 
   DetourDetach(&SetupMenus, HookedSetupMenus);
 }

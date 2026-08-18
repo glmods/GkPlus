@@ -8,30 +8,57 @@ touching either file.
 
 Archives and directories layered over Gunlok's data tree, so a mod can add or replace any
 file the engine loads with nothing in the base install changing. A mod is a `.zip` (or any
-archive PhysicsFS reads) or a plain directory under `<Gunlok>\gkplus\mods`, and its
-contents **mirror the game's own directory tree**:
+archive PhysicsFS reads) or a plain directory under `<profile>\mods` (`script_host_notes.md`;
+with `GKPLUS_PROFILE` unset that is still `<Gunlok>\gkplus\mods`), and its contents **mirror
+the game's own directory tree**:
 
 ```
-gkplus/mods/bigger-bugs.zip
+<profile>/mods/bigger-bugs.zip
   rif/units/bug.rif          <- replaces <Gunlok>\rif\units\bug.rif
   scripts/defaults.gsh
   sound/robots.dat
 ```
 
-Mods mount in ascending name order and **a later name wins** (`20-tweaks.zip` beats
-`10-base.zip`); `mods[0]` is the highest priority. `file_io_notes.md` is the measurement
-this rests on — read §1 and §5 before touching either file.
+`file_io_notes.md` is the measurement this rests on — read §1 and §5 before touching either
+file.
 
-**Every entry under `mods` is mounted, so renaming one does not disable it.** A directory
-called `cutscene-test.disabled` still serves its contents — there is no extension filter and
-no manifest to opt out of. To take a mod out of play, move it out of the tree; renaming it
-produces a "baseline" run that is silently still modded, which is exactly how one in-game
-comparison in this repo ran for several rounds against itself. `mods.served` is the check,
-and it must be read **after** something has been loaded: before the first VFS lookup it is 0
-whether or not anything is mounted, and `mods.recent` names the paths actually served.
+**Nothing mounts on its own.** `vfs::Initialize` starts PhysicsFS with an empty search path;
+every mount comes from `vfs::Mount` or `vfs::MountAll`, and in a running game those come from
+the profile's **boot script** (`core.boot`), which runs at `FileHookSystem`'s first
+intercepted open — the last instant before the engine reads an asset, and therefore the only
+point from which the decision still applies to everything the game will load. A profile with
+no boot module runs the base game however many archives are sitting in its `mods` directory.
+One line brings the whole directory back:
 
-Five things decide the shape, in decreasing order of how much else depends on them:
+```js
+import { mods } from "gk";
+mods.mount_all();               // ascending by name, a later name wins
+```
 
+`mount_all` goes in ascending name order and **a later name wins** (`20-tweaks.zip` beats
+`10-base.zip`); `mods[0]` is the highest priority. That falls out of `Mount` *prepending* —
+each mount outranks the one before it — which is also why a `mount()` at run time beats
+everything the boot script did, and why a script wanting a different order just calls
+`mount()` weakest-first.
+
+**`mount_all` has no extension filter and no manifest, so renaming an entry does not disable
+it.** A directory called `cutscene-test.disabled` is still mounted and still serves — the
+only reason a name is ever excluded is that a script excluded it, which is what
+`mods.discover()` is for. To take a mod out of play under `mount_all`, move it out of the
+tree; renaming it produces a "baseline" run that is silently still modded, which is exactly
+how one in-game comparison in this repo ran for several rounds against itself. `mods.served`
+is the check, and it must be read **after** something has been loaded: before the first VFS
+lookup it is 0 whether or not anything is mounted, and `mods.recent` names the paths actually
+served.
+
+Six things decide the shape, in decreasing order of how much else depends on them:
+
+- **What is mounted is a script's decision, not this file's.** It used to be a directory
+  listing, which meant the most consequential thing about a launch could not be varied
+  without moving files about — no A/B of one mod against none, no per-profile mod set, no
+  ordering other than alphabetical. `Vfs` now only knows how to mount; `core.boot` knows
+  what to. The cost is that the capability has to exist *before* the first asset read, which
+  is the whole reason the script host has an early phase at all.
 - **The interception is gl.exe's import table, not Detours on kernel32.** Every file call
   in the exe is `CALL dword ptr [slot]` or `MOV reg,[slot]` + `CALL reg`, and both read the
   slot at run time — so one pointer write per slot catches every call site, and catches

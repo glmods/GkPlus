@@ -42,6 +42,18 @@ const char *ResourceString(unsigned id) {
   if (!LocalizedStrings) {
     return "";
   }
+  // The table itself, which is null until `LoadResourceStringTable` @ 0x00578f30
+  // fills it - `WinMain` at 0x0046b355, and like the console that is *after* the
+  // engine's first file open, so a script running from the first-open anchor is
+  // ahead of it. GetResourceString opens `MOV EAX,[ECX]` and then scans in
+  // 0x14-byte steps **with no end test**, so an unloaded table does not fault, it
+  // walks .data until something matches the id. Read fresh, because the whole
+  // point is that it changes after the first call this might get.
+  void **table;
+  GetObjectAtOffset(table, 0x00725664);
+  if (!*table) {
+    return "";
+  }
   const char *s = GetResourceString(&LocalizedStrings, id);
   return s ? s : "";
 }

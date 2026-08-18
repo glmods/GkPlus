@@ -170,6 +170,71 @@ JSValue ModsMount(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
   return JS_UNDEFINED;
 }
 
+// An optional directory argument, or nothing for `mods.dir`. Returns false only
+// after throwing.
+bool OptionalDir(JSContext *ctx, int argc, JSValueConst *argv,
+                 std::string *out) {
+  if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0])) {
+    return true;
+  }
+  const char *arg = JS_ToCString(ctx, argv[0]);
+  if (!arg) {
+    return false;
+  }
+  *out = arg;
+  JS_FreeCString(ctx, arg);
+  return true;
+}
+
+// What is sitting in the mods directory, mounted or not - so a boot script can
+// pick, filter or order rather than take the lot. The objects have no
+// `priority`: nothing here is in a search path yet.
+JSValue ModsDiscover(JSContext *ctx, JSValueConst, int argc,
+                     JSValueConst *argv) {
+  std::string dir;
+  if (!OptionalDir(ctx, argc, argv, &dir)) {
+    return JS_EXCEPTION;
+  }
+  std::vector<vfs::Mod> found = vfs::Discover(dir.c_str());
+  JSValue array = JS_NewArray(ctx);
+  if (JS_IsException(array)) {
+    return array;
+  }
+  for (size_t i = 0; i < found.size(); ++i) {
+    JSValue obj = JS_NewObject(ctx);
+    if (JS_IsException(obj) ||
+        JS_SetPropertyStr(ctx, obj, "name",
+                          JS_NewString(ctx, found[i].name.c_str())) < 0 ||
+        JS_SetPropertyStr(ctx, obj, "path",
+                          JS_NewString(ctx, found[i].path.c_str())) < 0 ||
+        JS_SetPropertyStr(ctx, obj, "archive",
+                          JS_NewBool(ctx, found[i].archive)) < 0 ||
+        JS_SetPropertyUint32(ctx, array, static_cast<uint32_t>(i), obj) < 0) {
+      JS_FreeValue(ctx, array);
+      return JS_EXCEPTION;
+    }
+  }
+  return array;
+}
+
+// Everything in the directory, ascending, so a later name wins - the one line
+// that reproduces what the loader used to do on its own. Returns how many
+// mounted, which is not the same as how many are there: an entry PhysicsFS
+// cannot read is skipped, not thrown on.
+JSValue ModsMountAll(JSContext *ctx, JSValueConst, int argc,
+                     JSValueConst *argv) {
+  std::string dir;
+  if (!OptionalDir(ctx, argc, argv, &dir)) {
+    return JS_EXCEPTION;
+  }
+  std::string error;
+  const int mounted = vfs::MountAll(dir.c_str(), &error);
+  if (mounted < 0) {
+    return JS_ThrowInternalError(ctx, "cannot mount: %s", error.c_str());
+  }
+  return JS_NewInt32(ctx, mounted);
+}
+
 // What the engine would get if it opened `path` right now, as a VFS path, or
 // null when no mod provides it. The argument is resolved exactly the way a game
 // open is - against the process's current directory - so from a script, where
@@ -265,6 +330,8 @@ const JSCFunctionListEntry ModsProps[] = {
     JS_CFUNC_DEF("read_stats", 0, ModsReadStats),
     JS_CFUNC_DEF("reset_read_stats", 0, ModsResetReadStats),
     JS_CFUNC_DEF("mount", 1, ModsMount),
+    JS_CFUNC_DEF("mount_all", 1, ModsMountAll),
+    JS_CFUNC_DEF("discover", 1, ModsDiscover),
     JS_CFUNC_DEF("resolve", 1, ModsResolve),
     JS_CFUNC_DEF("exists", 1, ModsExists),
     JS_CFUNC_DEF("read", 1, ModsRead),
@@ -273,7 +340,9 @@ const JSCFunctionListEntry ModsProps[] = {
 };
 
 // No `assign`: a mount is an action with a result to report, so it is mount()
-// rather than an assignment through the indexer.
+// rather than an assignment through the indexer. The collection itself is the
+// *mounted* set - `discover()` is the separate call for what is merely present,
+// because nothing mounts on its own any more (src/Vfs.h).
 const CollectionOps ModsOps = {
     .class_name = "Mods",
     .lookup_id = LookupModByIndex,

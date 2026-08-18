@@ -25,10 +25,11 @@ No shader toolchain is needed: this reads the `.slang` text, so unlike `gen-shad
 always run. Three entry points, the same three that script has:
 
     python3 src/gen-shader-abi.py            # write the header
-    python3 src/gen-shader-abi.py --check    # is the checked-in header stale?
+    python3 src/gen-shader-abi.py --check    # is the generated header stale?
     python3 src/gen-shader-abi.py --deps     # the source files, one per line, for CMake
 
-Output is `src/ShaderAbi.gen.inc.h`, included at the end of VkDraw.cpp's anonymous namespace -
+Output goes where `--output` says (CMake: `<binary dir>/generated/ShaderAbi.gen.inc.h`) and is
+included at the end of VkDraw.cpp's anonymous namespace -
 the one point where all three of `src/VkDraw.h`, `src/VertexFormat.h` and the file's own three
 push blocks are in scope.
 """
@@ -41,7 +42,11 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SHADER_DIR = ROOT / "src" / "shaders"
-OUTPUT = ROOT / "src" / "ShaderAbi.gen.inc.h"
+
+# A **build product**, not checked in - see the note in gen-shaders.py. CMake passes `--output`
+# and points it at `<binary dir>/generated`; this default is only where a bare
+# `python3 src/gen-shader-abi.py` puts it.
+OUTPUT = ROOT / "build" / "generated" / "ShaderAbi.gen.inc.h"
 
 RECIPE_MARKER = "// recipe-hash: "
 SOURCE_MARKER = "// source-hash: "
@@ -263,14 +268,22 @@ def stamp_lines():
     return lines
 
 
+def shown(path):
+    """`path` for a message: repo-relative where it can be, absolute where it cannot."""
+    try:
+        return path.relative_to(ROOT).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
 def describe_staleness():
     if not OUTPUT.exists():
-        return "%s does not exist" % OUTPUT.relative_to(ROOT).as_posix()
+        return "%s does not exist" % shown(OUTPUT)
     have = [line for line in OUTPUT.read_text(encoding="utf-8").splitlines()
             if line.startswith(RECIPE_MARKER) or line.startswith(SOURCE_MARKER)]
     want = stamp_lines()
     if not have:
-        return "%s carries no hashes" % OUTPUT.relative_to(ROOT).as_posix()
+        return "%s carries no hashes" % shown(OUTPUT)
     if have == want:
         return None
     if have[:1] != want[:1]:
@@ -334,7 +347,8 @@ def generate():
     out.append("")
 
     text = "\n".join(out)
-    relative = OUTPUT.relative_to(ROOT).as_posix()
+    relative = shown(OUTPUT)
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     if OUTPUT.exists() and OUTPUT.read_text(encoding="utf-8") == text:
         print("%s unchanged" % relative)
     else:
@@ -343,13 +357,19 @@ def generate():
 
 
 def main():
+    global OUTPUT
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--check", action="store_true",
-                       help="exit non-zero if the checked-in header is stale")
+                       help="exit non-zero if the generated header is stale")
+    parser.add_argument("--output", metavar="PATH",
+                        help="where to write the header (CMake passes the build tree)")
     group.add_argument("--deps", action="store_true",
                        help="print the shader sources, one absolute path per line")
     args = parser.parse_args()
+
+    if args.output:
+        OUTPUT = pathlib.Path(args.output).resolve()
 
     if args.deps:
         for path in sources():
@@ -360,7 +380,7 @@ def main():
         if reason is None:
             return
         sys.exit("%s is out of date: %s.\nRun:  python3 src/gen-shader-abi.py"
-                 % (OUTPUT.relative_to(ROOT).as_posix(), reason))
+                 % (shown(OUTPUT), reason))
     generate()
 
 

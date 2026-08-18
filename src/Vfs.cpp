@@ -1,6 +1,7 @@
 #include "Vfs.h"
 
 #include "Core.h"
+#include "Profile.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -18,7 +19,6 @@
 namespace gk::vfs {
 namespace {
 
-constexpr const char *kModsSubdir = "gkplus\\mods\\";
 // Materialized files live here; the suffix is our pid so two running copies of
 // the game cannot fight over the same tree.
 constexpr const char *kTempPrefix = "gkplus-vfs-";
@@ -66,6 +66,13 @@ std::unordered_map<std::string, std::string> g_index;
 const char *PhysfsError() {
   const char *msg = PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode());
   return msg ? msg : "unknown error";
+}
+
+// Every path this file hands to Win32 or keeps in a Mod is backslashed; only the
+// profile arrives the other way round.
+std::string ToBackslashes(std::string s) {
+  std::replace(s.begin(), s.end(), '/', '\\');
+  return s;
 }
 
 std::string Lower(std::string s) {
@@ -208,12 +215,15 @@ bool CreateDirectoryTree(const std::string &dir) {
   return true;
 }
 
-// Everything directly inside gkplus\mods, ascending by name, case-insensitively.
-// Sorting here rather than trusting FindFirstFile is what makes the documented
-// "a later name wins" rule hold: the directory order is whatever NTFS feels
-// like, and on a FAT volume it is creation order.
+// Everything directly inside `mods_dir` (which ends with a backslash), ascending
+// by name, case-insensitively. Sorting here rather than trusting FindFirstFile
+// is what makes the documented "a later name wins" rule hold: the directory
+// order is whatever NTFS feels like, and on a FAT volume it is creation order.
 std::vector<Mod> DiscoverMods(const std::string &mods_dir) {
   std::vector<Mod> found;
+  if (mods_dir.empty()) {
+    return found;
+  }
   WIN32_FIND_DATAA find{};
   HANDLE handle = FindFirstFileA((mods_dir + "*").c_str(), &find);
   if (handle == INVALID_HANDLE_VALUE) {
@@ -246,7 +256,15 @@ bool DoInitialize() {
     DebugWrite("gkplus vfs: cannot locate the game directory; mods disabled\n");
     return false;
   }
-  g_mods_dir = g_game_dir + kModsSubdir;
+  // `mods` inside the profile, not inside the install: a profile is meant to be
+  // a complete description of a launch, and a mod set that did not travel with
+  // GKPLUS_PROFILE would leave the most consequential half of one behind. With
+  // the variable unset the profile *is* <Gunlok>\gkplus, so this is the path it
+  // has always been.
+  g_mods_dir = ToBackslashes(profile::Dir());
+  if (!g_mods_dir.empty()) {
+    g_mods_dir += "\\mods\\";
+  }
 
   char module[MAX_PATH * 2];
   if (GetModuleFileNameA(nullptr, module, sizeof(module)) == 0) {
@@ -264,31 +282,14 @@ bool DoInitialize() {
     SweepStaleTempDirs(temp_root, pid);
   }
 
-  // Mounted last-to-first with appendToPath, so the alphabetically last mod ends
-  // up earliest in the search path and therefore wins. g_mods is filled in the
-  // same order, which makes index 0 the highest priority.
-  //
-  // Anything PhysicsFS does not recognize as an archive is reported and skipped
-  // rather than filtered by extension, so a format a future PhysicsFS learns
-  // works with no change here - and a stray readme is a log line, not an error.
-  std::vector<Mod> discovered = DiscoverMods(g_mods_dir);
-  for (auto it = discovered.rbegin(); it != discovered.rend(); ++it) {
-    if (!PHYSFS_mount(it->path.c_str(), nullptr, 1)) {
-      DebugWrite("gkplus vfs: skipping {} ({})\n", it->name, PhysfsError());
-      continue;
-    }
-    DebugWrite("gkplus vfs: mounted {}\n", it->name);
-    g_mods.push_back(std::move(*it));
-  }
-
+  // **Nothing is mounted here.** Which mods a launch gets is the profile's boot
+  // script's decision, not this file's - see the header. The search path starts
+  // empty and stays that way until something calls Mount() or MountAll(), which
+  // for a profile with no boot module means the game runs unmodified.
   RebuildIndex();
-  if (g_mods.empty()) {
-    DebugWrite("gkplus vfs: no mods in {}\n", g_mods_dir);
-  } else {
-    DebugWrite("gkplus vfs: {} mod(s) mounted, {} has priority, {} file(s)\n",
-               g_mods.size(), g_mods.front().name, g_index.size());
-  }
-  g_has_mods.store(!g_mods.empty(), std::memory_order_release);
+  DebugWrite("gkplus vfs: ready, nothing mounted yet (mods live in {})\n",
+             g_mods_dir);
+  g_has_mods.store(false, std::memory_order_release);
   return true;
 }
 
@@ -425,6 +426,48 @@ const std::string &ModsDir() {
   return g_mods_dir;
 }
 
+std::vector<Mod> Discover(const char *dir) {
+  std::string root = (dir && *dir) ? ToBackslashes(dir) : std::string{};
+  if (root.empty()) {
+    if (!Ensure()) {
+      return {};
+    }
+    std::lock_guard lock(g_mutex);
+    root = g_mods_dir;
+  } else if (root.back() != '\\') {
+    root.push_back('\\');
+  }
+  return DiscoverMods(root);
+}
+
+int MountAll(const char *dir, std::string *error) {
+  if (!Ensure()) {
+    if (error) {
+      *error = "the mod filesystem is not available";
+    }
+    return -1;
+  }
+  // Ascending, because Mount() prepends: the alphabetically last entry is
+  // mounted last and therefore ends up first in the search path, which is the
+  // "a later name wins" rule Vfs.h documents.
+  //
+  // Anything PhysicsFS does not recognize as an archive is reported and skipped
+  // rather than filtered by extension, so a format a future PhysicsFS learns
+  // works with no change here - and a stray readme is a log line, not a failure
+  // of the whole call.
+  int mounted = 0;
+  for (const Mod &mod : Discover(dir)) {
+    std::string why;
+    if (!Mount(mod.path.c_str(), &why)) {
+      DebugWrite("gkplus vfs: skipping {} ({})\n", mod.name, why);
+      continue;
+    }
+    DebugWrite("gkplus vfs: mounted {}\n", mod.name);
+    ++mounted;
+  }
+  return mounted;
+}
+
 bool Mount(const char *path, std::string *error) {
   if (!path || !*path) {
     if (error) {
@@ -439,8 +482,9 @@ bool Mount(const char *path, std::string *error) {
     return false;
   }
   std::lock_guard lock(g_mutex);
-  // appendToPath 0: an explicit mount outranks everything auto-mounted, and
-  // outranks any earlier explicit one.
+  // appendToPath 0: every mount outranks the one before it. That is what makes
+  // MountAll's plain ascending walk produce the documented "a later name wins",
+  // and it means a mount at run time beats everything a boot script did.
   if (!PHYSFS_mount(path, nullptr, 0)) {
     if (error) {
       *error = PhysfsError();

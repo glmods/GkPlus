@@ -3,7 +3,34 @@
 #include "Core.h"
 
 namespace gk {
+bool ConsoleReady() {
+  // Re-read every call rather than cached: ShutdownConsole @ 0x004d5620 clears
+  // this on the way out, after freeing the same four fonts, so a value latched at
+  // boot would be wrong at teardown as well as before init.
+  bool *flag;
+  GetObjectAtOffset(flag, 0x007b6c3a);
+  return *flag;
+}
+
 void Print(const char *what) {
+  // The gate is ours, and it is not defensive programming - it is the difference
+  // between a working early boot and an access violation. ConsolePrint reaches
+  // Font_GetNormalizedLineHeight @ 0x005782b0 five times and Console_QueueTextLine
+  // four, all of them with `SmallFont` @ 0x007b6a54 as `this`, and that global is
+  // **null until InitConsole** @ 0x004d5380 runs - which WinMain does at
+  // 0x0046bb81, long after the engine has opened its first file.
+  //
+  // Measured, not inferred: booting the profile's `core.boot` module from
+  // FileHookSystem's first intercepted open crashed the game at gl.exe+0x1782b3
+  // (`MOVD XMM0,[ECX+0xaf0]` on a null Font), and the dump's stack is
+  //   HookedFopen -> EnsureFirstOpen -> BootScriptProfile -> StartRuntime
+  //   -> StartRepl -> js::Log -> gk::Print -> ... -> Font_GetNormalizedLineHeight
+  // The host's own boot logging is enough to reach it; a script's console.log is
+  // not required. Here rather than in js::Log so every caller inherits it, which
+  // is the same reasoning as ExecuteCommand's length check below.
+  if (!ConsoleReady()) {
+    return;
+  }
   FastCall<void, const char *> fn;
   GetObjectAtOffset(fn, 0x004d4b50);
   fn(what);

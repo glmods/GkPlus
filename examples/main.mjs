@@ -1,8 +1,14 @@
-// GkPlus entry module.
+// GkPlus entry module - the `core.script` half of a profile.
 //
-// Copy this to <Gunlok>\gkplus\main.mjs - i.e. a `gkplus` folder next to
-// d3d8.dll - or point the GKPLUS_SCRIPT environment variable at it. It is loaded
-// once during the game's menu setup, before the first frame.
+// Copy this into a profile directory as `main.mjs`. A profile is whatever
+// GKPLUS_PROFILE points at, and with that variable unset it is the `gkplus`
+// folder next to d3d8.dll - so <Gunlok>\gkplus\main.mjs is still the default
+// location. `core.script` in the profile's settings.json can name a different
+// file; this one is the default.
+//
+// It is loaded once during the game's menu setup, before the first frame. That
+// is late enough for everything except deciding which mods are mounted, which is
+// boot.mjs's job - see the file beside this one.
 //
 // Everything here is optional: a module with no exports still loads, and a
 // missing file just logs the path it looked for and leaves the game unmodified.

@@ -70,6 +70,7 @@ skips the list entirely, drawing from the calling thread's PRNG for a uniform in
 | 0x007b6a64 / 0x007b6a68 | unsigned | UIColorDim 0xff595966 / UIColorYellow 0xffffef47 |
 | 0x007c149c | unsigned | CursorColor (ARGB, init 0xffe5e5e5 in `InitConsole` @ 0x004d5380) |
 | 0x007b6a54/58/5c/60 | Font* | **SmallFont / LargeFont / HudSmallFont / HeadingFont** (all built in `InitConsole`). Were `ConsoleSmallFont / ConsoleLargeFont / HudSmallFont / ConsoleLargeFont2`; three of those four names were wrong. Only `SmallFont` is a console font — the console draws through it exclusively, and `LargeFont`'s complete xref list (9 entries) contains nothing console-side. `LargeFont` and `HeadingFont` are **the same font twice**: same `large font.RIM`, same width table, same line height. All four are constructed with `line_height = 25`; `HeadingFont` measures 50-75 because `ScaleFontsForClientWidth` @ 0x004d79f0 writes `Font.scale` (+0xaf4) for that one only. Textures: `small font.RIM` / `large font.RIM` / `small font 2.RIM` / `large font.RIM`. **Construction order is not address order** — ctor #3 stores into 0x007b6a60, #4 into 0x007b6a5c |
+| 0x007b6c3a | bool | **ConsoleInitialized** — 0 at load, set by `InitConsole` @ 0x004d5380 as its *last* act, cleared by `ShutdownConsole` @ 0x004d5620 after it frees and nulls all four fonts. The engine uses it as InitConsole's own idempotence guard; four references in the whole binary, all in that pair. `gk::ConsoleReady()`, and the gate `gk::Print` needs: `WinMain` reaches InitConsole at 0x0046bb81, *after* the engine's first file open, so anything on the first-open anchor is ahead of it and printing there faults on a null `SmallFont`. Re-read per call — it goes back to 0 at teardown |
 | 0x007b6a70..0x007b6a7c | — | command **hash table**: NumRegisteredCommands, CommandTableNumBuckets, CommandTableMask, CommandTableBuckets (`CommandListElem**`) |
 | 0x007b6aa8..0x007b6ab4 | List | command exec queue: CommandsToExecute (anchor), NumCommandsToExecute, cache, cacheValid — one popped per frame by `PumpQueuedConsoleCommand` |
 | 0x007b6a80 / 0x007b6b38 | float | ConsoleTextScrollTarget / ConsoleSlidePos (open/close anim; -1=closed) |
@@ -283,7 +284,9 @@ CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84
 | 0x004d5380 | StdCall<void> | InitConsole (WinMain @ 0x0046bb81, right before SetupMenus) |
 | 0x004e7e50 | StdCall<void> | EnterMainMenuScreen |
 | 0x00470c70 | FastCall<void, void*> | MenuScreenInputHandler |
-| 0x00579000 | FastCall<const char*, void*, unsigned> | GetResourceString (ECX=&LocalizedStrings) |
+| 0x00579000 | FastCall<const char*, void*, unsigned> | GetResourceString (ECX=&LocalizedStrings). Opens `MOV EAX,[ECX]`, then scans in 0x14-byte steps **with no end test** — so a table that is not loaded does not fault, it walks `.data` until a dword happens to match the id |
+| 0x00578f30 | FastCall<void, void*, int, unsigned, void**> | LoadResourceStringTable — `WinMain` @ 0x0046b355 passes (res dll, 0, 0x7532, 0x00725664) |
+| 0x00725664 | void* | **LocalizedStrings** — the string table, null until the above. `gk::ResourceString`'s readiness test, for the same reason as ConsoleInitialized: it is filled after the engine's first file open |
 
 **In-game menus:**
 
@@ -424,7 +427,7 @@ as the camera pointer), and a `D3DVIEWPORT8` sits at `+0x254` with `MinZ` at `+0
 | 0x005789a0 | ThisCall<void, Font*, const int*, float> | Font_SetGlyphWidths — 140 entries at `font+0x8c0`, each `(int)(base[i]*scale + 0.5)`. Only caller is `ScaleFontsForClientWidth` |
 | 0x00666640 / 0x00666870 | int[140] | SmallFontGlyphWidths / LargeFontGlyphWidths — differ in 14 entries, so `large font.RIM` is separately authored art rather than a resample |
 | 0x00666aa0 | int[140] | FontGlyphSheetRows — shared by all four fonts |
-| 0x005780d0 | ThisCall<void, Font*> | Font_Dtor — **tail `JMP` to 0x00579170, no `RET` of its own**. 4 call sites, all `FUN_004d5620` |
+| 0x005780d0 | ThisCall<void, Font*> | Font_Dtor — **tail `JMP` to 0x00579170, no `RET` of its own**. 4 call sites, all `ShutdownConsole` @ 0x004d5620 |
 | 0x004f72e0 | FastCall<void, uint*> | DrawVersionText — draws the literal `"v1.3 DX8"` bottom-left. Two callers: the Main menu (gated `ChosenMenu == 0`) and the splash frame. Was `DrawVersionNumber?` |
 | 0x007c14a0 | List | the font registry `Font_Ctor` appends to and `ScenePass_Overlay2D` walks |
 | 0x00667434 | char[9] | `"v1.3 DX8"` — the on-screen stamp. **Unrelated** to `CommandVersion` @ 0x0043f1a0, which reports `"00.08 Built on Jun 24 2019"` @ 0x00651b2c |

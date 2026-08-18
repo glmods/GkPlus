@@ -17,10 +17,10 @@
 // --- The layout ---------------------------------------------------------------
 //
 // A mod is a `.zip` (or any other archive PhysicsFS reads) or a plain directory
-// under `<Gunlok>\gkplus\mods`, and its contents **mirror the game's own
-// directory tree**:
+// under `<profile>\mods` (src/Profile.h), and its contents **mirror the game's
+// own directory tree**:
 //
-//     gkplus/mods/bigger-bugs.zip
+//     <profile>/mods/bigger-bugs.zip
 //       rif/units/bug.rif          <- replaces <Gunlok>\rif\units\bug.rif
 //       scripts/defaults.gsh       <- replaces <Gunlok>\scripts\defaults.gsh
 //       sound/robots.dat
@@ -32,12 +32,30 @@
 // categories come from `gldirs.gls` and in a stock install are exactly `scripts`,
 // `fmv`, `rif`, `graphics`, `sound`, `fonts` and `Screenshots`.
 //
+// --- Who decides what is mounted -----------------------------------------------
+//
+// **This file mounts nothing on its own.** Initialize() starts PhysicsFS with an
+// empty search path; every mount comes from a Mount() or MountAll() call, and in
+// a running game those come from the profile's boot script (`core.boot`, see
+// src/Script.h), which runs at FileHookSystem's first intercepted open - the last
+// instant before the engine reads an asset, and therefore the only point from
+// which the decision can still be made.
+//
+// So a profile with no boot module runs the base game however many archives are
+// sitting in its `mods` directory, and `mods.mount_all()` in a boot script is
+// what asks for the scan-everything behaviour. That is deliberate: which mods a
+// launch gets is the most consequential thing about it, and having it follow
+// from a directory listing meant it could not be varied without moving files
+// about.
+//
 // --- Load order ---------------------------------------------------------------
 //
-// Mods are mounted in ascending name order, and **a later name wins**: given
+// MountAll() mounts in ascending name order, and **a later name wins**: given
 // `10-base.zip` and `20-tweaks.zip` that both carry `rif/units/bug.rif`, the one
-// from `20-tweaks.zip` is what the game gets. Mount() at run time beats every
-// auto-mounted mod, since it prepends.
+// from `20-tweaks.zip` is what the game gets. That falls out of Mount()
+// prepending - each mount outranks the one before it - so a Mount() after a
+// MountAll() beats everything in it, and a script that wants a different order
+// just calls Mount() in the order it wants, weakest first.
 //
 // --- What this deliberately does not do --------------------------------------
 //
@@ -49,18 +67,19 @@
 
 namespace gk::vfs {
 
-// One mounted mod, in search-path order (index 0 is consulted first, i.e. it is
-// the highest-priority mod).
+// One mod. Mods() reports the mounted ones in search-path order (index 0 is
+// consulted first, i.e. it is the highest-priority mod); Discover() reports
+// candidates that are not mounted at all.
 struct Mod {
-  std::string name; // the entry name inside gkplus\mods, e.g. "20-tweaks.zip"
+  std::string name; // the entry name inside <profile>\mods, e.g. "20-tweaks.zip"
   std::string path; // absolute, exactly what PHYSFS_mount was given
   bool archive;     // false for a plain directory
 };
 
-// Starts PhysicsFS and mounts everything in <Gunlok>\gkplus\mods. Called
-// lazily by every function below, so nothing has to sequence it against the
-// game's startup - the first file the engine opens triggers it, which is inside
-// WinMain and therefore long after DllMain's loader lock.
+// Starts PhysicsFS with an empty search path. Called lazily by every function
+// below, so nothing has to sequence it against the game's startup - the first
+// file the engine opens triggers it, which is inside WinMain and therefore long
+// after DllMain's loader lock.
 //
 // A failure is remembered: the whole layer then reports "no mod provides this"
 // forever and the game runs unmodified. That is also what happens when there is
@@ -77,12 +96,24 @@ const std::vector<Mod> &Mods();
 // Where gl.exe lives, with a trailing backslash. Every VFS path is relative to
 // this, and a file resolved outside it is never virtualized.
 const std::string &GameDir();
-// <Gunlok>\gkplus\mods\, with a trailing backslash. Need not exist.
+// <profile>\mods\, with a trailing backslash. Need not exist.
 const std::string &ModsDir();
 
-// Mounts one extra archive or directory at the highest priority. `error` is
-// filled with PhysicsFS's message on failure and may be null.
+// What is sitting in `dir` (ModsDir() when null or empty), ascending by name and
+// case-insensitively, whether or not any of it is mounted or is even something
+// PhysicsFS can read. Nothing is opened, so this is the list a script filters
+// before deciding what to Mount().
+std::vector<Mod> Discover(const char *dir);
+
+// Mounts one archive or directory at the highest priority - above everything
+// mounted so far. `error` is filled with PhysicsFS's message on failure and may
+// be null.
 bool Mount(const char *path, std::string *error);
+
+// Discover(dir) then Mount() each, ascending, so a later name wins. Returns how
+// many mounted, or -1 if the filesystem is unavailable; an entry PhysicsFS
+// cannot read is logged and skipped rather than failing the call.
+int MountAll(const char *dir, std::string *error);
 
 // --- The lookup the hooks use --------------------------------------------------
 

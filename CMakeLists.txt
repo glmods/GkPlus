@@ -91,6 +91,7 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Menu.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Misc.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Music.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Profile.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Profiler.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/RenderMenu.cpp"
@@ -144,17 +145,32 @@ set_target_properties(GkPlus
     OUTPUT_NAME "d3d8"
     CXX_STANDARD 23)
 
-# `src/Shaders.gen.inc.h` is checked in, so d3d8.dll builds on a machine with no shader
-# toolchain - the same reasoning that makes the renderer delay-load `vulkan-1.dll`. The
-# requirement here is therefore not "compile the shaders" but "never silently compile against a
-# STALE header": for as long as nothing in the build ran the generator, editing a `.slang` and
-# running `cmake --build` reported success having changed nothing, and the only tell was that the
-# screenshots came out byte-identical (vulkan_renderer_notes.md 4.46).
+# The two generated headers are **build products in the binary tree**, not checked-in sources:
+# `${CMAKE_CURRENT_BINARY_DIR}/generated`, on GkPlus's include path and nowhere else.
 #
-# So: regenerate where slangc exists, and FAIL where it does not and the header is stale.
+# They used to live in `src/` and be committed, so that d3d8.dll built on a machine with no
+# shader toolchain - the same reasoning that makes the renderer delay-load `vulkan-1.dll`. That
+# is the property this trades away: **slangc and Python are now hard requirements**, and the two
+# branches below say so with FATAL_ERROR rather than letting the compiler report a missing
+# header. What it buys is that a generated file can no longer be committed stale, reviewed as if
+# it were source, or conflict on a merge - the failure mode that produced the byte-identical
+# screenshots in vulkan_renderer_notes.md 4.46 was exactly a stale one of these being believed.
+#
+# The staleness machinery below is kept even so, because it guards a second thing the move does
+# not fix: within one build tree, Ninja still has to be told the header is an output (see the
+# comment on the custom command) or it compiles against the previous SPIR-V.
+#
 # `--deps` keeps `ENTRY_POINTS` in gen-shaders.py the single source of truth for which files that
 # depends on - nothing here names a shader, so the two lists cannot drift.
 set(GKPLUS_SHADER_GENERATOR "${CMAKE_CURRENT_SOURCE_DIR}/src/gen-shaders.py")
+
+# Only generated headers go in here. It is on the include path, so anything else dropped in it
+# would be reachable as <name> from every Vulkan TU - and the reason `src/` itself is kept OFF
+# the include path (quickjs.h's `#include <math.h>` finding `src/Math.h` on a case-insensitive
+# filesystem) applies just as much to this directory.
+set(GKPLUS_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+file(MAKE_DIRECTORY "${GKPLUS_GENERATED_DIR}")
+target_include_directories(GkPlus PRIVATE "${GKPLUS_GENERATED_DIR}")
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 
@@ -166,9 +182,9 @@ list(REVERSE GKPLUS_VULKAN_SDK_BIN)
 find_program(GKPLUS_SLANGC NAMES slangc HINTS ${GKPLUS_VULKAN_SDK_BIN})
 
 if(NOT Python3_Interpreter_FOUND)
-    message(WARNING
-        "Python 3 not found: the shaders will be neither rebuilt nor checked, so a stale "
-        "src/Shaders.gen.inc.h would be compiled in silently. Install Python to re-enable it.")
+    message(FATAL_ERROR
+        "Python 3 not found, and both generated shader headers are produced by Python scripts "
+        "into the build tree rather than being checked in. Install Python 3.")
 elseif(GKPLUS_SLANGC)
     execute_process(
         COMMAND "${Python3_EXECUTABLE}" "${GKPLUS_SHADER_GENERATOR}" --deps
@@ -192,9 +208,10 @@ elseif(GKPLUS_SLANGC)
     # `restat = 1` on custom-command edges - so an unchanged shader leaves the header's mtime
     # alone and Ninja keeps every dependent TU out of the rebuild.
     add_custom_command(
-        OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/src/Shaders.gen.inc.h"
+        OUTPUT "${GKPLUS_GENERATED_DIR}/Shaders.gen.inc.h"
                "${CMAKE_CURRENT_BINARY_DIR}/shaders.stamp"
         COMMAND "${Python3_EXECUTABLE}" "${GKPLUS_SHADER_GENERATOR}"
+                --output "${GKPLUS_GENERATED_DIR}/Shaders.gen.inc.h"
         COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/shaders.stamp"
         DEPENDS ${GKPLUS_SHADER_SOURCES} "${GKPLUS_SHADER_GENERATOR}"
         COMMENT "Compiling Slang shaders"
@@ -202,14 +219,12 @@ elseif(GKPLUS_SLANGC)
     add_custom_target(gkplus_shaders DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/shaders.stamp")
     add_dependencies(GkPlus gkplus_shaders)
 else()
-    message(STATUS
-        "slangc not found: using the checked-in src/Shaders.gen.inc.h. The build will fail if it "
-        "is stale; install the Vulkan SDK to regenerate it.")
-    add_custom_target(gkplus_shaders
-        COMMAND "${Python3_EXECUTABLE}" "${GKPLUS_SHADER_GENERATOR}" --check
-        COMMENT "Checking the checked-in SPIR-V against the shader sources"
-        VERBATIM)
-    add_dependencies(GkPlus gkplus_shaders)
+    # No fallback left to take: with the SPIR-V generated into the build tree there is no
+    # checked-in header to compile against, so this cannot degrade to a staleness check the way
+    # it did when `src/Shaders.gen.inc.h` was committed.
+    message(FATAL_ERROR
+        "slangc not found, and the SPIR-V header is generated into the build tree rather than "
+        "checked in. Install the Vulkan SDK or put slangc on PATH.")
 endif()
 
 # The shader ABI: one `offsetof` per field of every struct declared on both sides of the boundary,
@@ -233,9 +248,10 @@ if(Python3_Interpreter_FOUND)
         COMMAND_ERROR_IS_FATAL ANY)
     string(REPLACE "\n" ";" GKPLUS_ABI_SOURCES "${GKPLUS_ABI_SOURCES}")
     add_custom_command(
-        OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/src/ShaderAbi.gen.inc.h"
+        OUTPUT "${GKPLUS_GENERATED_DIR}/ShaderAbi.gen.inc.h"
                "${CMAKE_CURRENT_BINARY_DIR}/shader-abi.stamp"
         COMMAND "${Python3_EXECUTABLE}" "${GKPLUS_ABI_GENERATOR}"
+                --output "${GKPLUS_GENERATED_DIR}/ShaderAbi.gen.inc.h"
         COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/shader-abi.stamp"
         DEPENDS ${GKPLUS_ABI_SOURCES} "${GKPLUS_ABI_GENERATOR}"
         COMMENT "Deriving the shader ABI asserts"

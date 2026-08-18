@@ -210,6 +210,13 @@ JSValue SetEcho(JSContext *ctx, JSValueConst, JSValueConst v) {
   return JS_UNDEFINED;
 }
 
+// Whether `InitConsole` has run. False only from the profile's boot module,
+// which is anchored ahead of it - and there it is worth asking, because printing
+// while it is false does nothing at all rather than queuing up for later.
+JSValue GetReady(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, ConsoleReady());
+}
+
 JSValue GetCommands(JSContext *ctx, JSValueConst) {
   JSValue array = JS_NewArray(ctx);
   if (JS_IsException(array)) {
@@ -249,6 +256,7 @@ const JSCFunctionListEntry ConsoleProps[] = {
                     JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE),
     JS_CGETSET_DEF2("echo", GetEcho, SetEcho,
                     JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE),
+    JS_CGETSET_DEF("ready", GetReady, nullptr),
     JS_CGETSET_DEF("commands", GetCommands, nullptr),
     JS_CFUNC_DEF("hide", 0, Hide),
     JS_CFUNC_DEF("write_log", 1, WriteLog),

@@ -169,6 +169,12 @@ declare module "gk" {
      *  under strings from `glres<lang>.dll`, so a hard-coded
      *  `execute("QUIT")` does nothing on a French or German install. Searching
      *  this list is the portable way to spell them. */
+    /** Whether the game's console exists yet. It is false in exactly one place -
+     *  a profile's boot module (`core.boot`), which is anchored before
+     *  `InitConsole` - and there it is worth asking, because `print` and `log`
+     *  reach the screen only when this is true. The debugger half of `log` works
+     *  either way, so a boot module is not silent, only invisible in game. */
+    readonly ready: boolean;
     readonly commands: ConsoleCommand[];
 
     // --- administration -------------------------------------------------------
@@ -2169,8 +2175,7 @@ declare module "gk" {
 
   // --- mods ------------------------------------------------------------------
 
-  /** One mounted mod: an archive or a directory under
-   *  `<Gunlok>\gkplus\mods`. */
+  /** One mounted mod: an archive or a directory under `<profile>\mods`. */
   export interface Mod {
     /** The entry name inside the mods directory, e.g. `"20-tweaks.zip"`. */
     readonly name: string;
@@ -2182,11 +2187,20 @@ declare module "gk" {
     readonly priority: number;
   }
 
+  /** A mod that is merely *present*, as `discover()` reports it. It has no
+   *  `priority` because it is in no search path: nothing is mounted until
+   *  something mounts it. */
+  export interface ModCandidate {
+    readonly name: string;
+    readonly path: string;
+    readonly archive: boolean;
+  }
+
   export interface ModsMembers {
     readonly count: number;
     [Symbol.iterator](): IterableIterator<Mod>;
 
-    /** `<Gunlok>\gkplus\mods\`, with a trailing backslash. */
+    /** `<profile>\mods\`, with a trailing backslash. Need not exist. */
     readonly dir: string;
     /** Where `gl.exe` lives, with a trailing backslash. Every VFS path is
      *  relative to this. */
@@ -2226,9 +2240,35 @@ declare module "gk" {
     /** Zeroes the above, so a single level load can be measured on its own. */
     reset_read_stats(): void;
 
-    /** Mounts an extra archive or directory at the highest priority. Throws if
-     *  PhysicsFS cannot read it. */
+    /** Mounts an archive or directory at the highest priority - above
+     *  everything mounted before it. Throws if PhysicsFS cannot read it.
+     *
+     *  This, or `mount_all`, is the **only** way a mod ends up loaded: nothing
+     *  mounts on its own. Both belong in the profile's boot module
+     *  (`core.boot`), which runs before the engine reads its first asset; a
+     *  mount from anywhere later is only seen by files opened after it. */
     mount(path: string): void;
+    /** Mounts everything in `dir` (`mods.dir` if omitted), ascending by name so
+     *  a later name wins, and returns how many mounted. An entry PhysicsFS
+     *  cannot read is skipped, not thrown on - so this does not equal
+     *  `discover(dir).length`.
+     *
+     *  One line of a boot module, and the whole of what the loader used to do
+     *  before the decision became the script's:
+     *
+     *      import { mods } from "gk";
+     *      mods.mount_all();
+     */
+    mount_all(dir?: string): number;
+    /** What is sitting in `dir` (`mods.dir` if omitted), ascending by name,
+     *  mounted or not and readable or not. Nothing is opened. This is the list
+     *  a boot module filters when it wants some of the directory rather than
+     *  all of it:
+     *
+     *      for (const m of mods.discover())
+     *        if (!m.name.startsWith("off-")) mods.mount(m.path);
+     */
+    discover(dir?: string): ModCandidate[];
     /** The VFS path the engine would get if it opened `gamePath` right now, or
      *  null if no mod provides it. Resolved against the process's current
      *  directory exactly as a game open is, so prefer `mods.game_dir + ...`. */
@@ -2249,13 +2289,16 @@ declare module "gk" {
    *  touching the base install.
    *
    *  A mod is a `.zip` (or any archive PhysicsFS reads) or a directory under
-   *  `<Gunlok>\gkplus\mods`, and **its contents mirror the game's own directory
+   *  `<profile>\mods`, and **its contents mirror the game's own directory
    *  tree** - `rif/units/bug.rif`, `scripts/defaults.gsh`, `sound/robots.dat`.
    *  That is forced by the engine rather than chosen: every loader chdirs to one
    *  of its seven configured directories and then opens a relative name, so
    *  "where in the game tree" is the only thing an interception can reconstruct.
    *
-   *  Mods mount in ascending name order and **a later name wins**, so
+   *  **Nothing mounts on its own.** The profile's boot module decides, with
+   *  `mount_all()` for the whole directory or `mount()` per mod; a profile with
+   *  no boot module runs the base game whatever is sitting in `mods`.
+   *  `mount_all` goes in ascending name order and **a later name wins**, so
    *  `20-tweaks.zip` overrides `10-base.zip`. Index 0 is the highest priority.
    *
    *  Paths are case- and separator-insensitive. Music and FMV are the one gap:
@@ -2271,8 +2314,8 @@ declare module "gk" {
 
   // --- settings ----------------------------------------------------------------
 
-  /** `<Gunlok>\gkplus\settings.json` - one JSON file for anything that has to
-   *  outlive a launch, **shared** rather than GkPlus's own.
+  /** `<profile>\settings.json` - one JSON file for anything that has to outlive
+   *  a launch, **shared** rather than GkPlus's own.
    *
    *  The top level is one object per owner: GkPlus keeps its settings under
    *  `core`, and a mod takes a key of its own beside it. Nothing knows anybody
@@ -2280,9 +2323,18 @@ declare module "gk" {
    *  belonging to a mod this build has never heard of survives being rewritten.
    *
    *      {
-   *        "core":  { "render": { "msaa": 4, "ao": true } },
+   *        "core":  { "boot": "boot.mjs", "script": "main.mjs",
+   *                   "render": { "msaa": 4, "ao": true } },
    *        "mymod": { "anything": [1, 2, 3] }
    *      }
+   *
+   *  Two `core` keys decide **what runs**, both resolved against the profile
+   *  directory and both defaulting to the name above. `core.boot` is evaluated
+   *  inside `WinMain` before the engine reads an asset, which is what makes it
+   *  the place to mount mods; `core.script` is the entry module and runs once
+   *  the front end is up. Either may be `""` to turn that phase off, and a
+   *  missing file is not an error. Which directory all of this lives in is
+   *  `GKPLUS_PROFILE`, so two profiles are two directories.
    *
    *  Paths are dot-separated, so a key containing a dot cannot be addressed.
    *  Values cross as JSON: anything `JSON.stringify` accepts can be stored, and
@@ -2313,7 +2365,8 @@ declare module "gk" {
     reload(): boolean;
     /** The whole document, as a snapshot. Mutating it changes nothing. */
     readonly all: Record<string, unknown>;
-    /** Where the file is, with forward slashes. `GKPLUS_SETTINGS` overrides it. */
+    /** Where the file is, with forward slashes: `<profile>/settings.json`,
+     *  where the profile is `GKPLUS_PROFILE` or `gkplus` beside `d3d8.dll`. */
     readonly path: string;
   }
 

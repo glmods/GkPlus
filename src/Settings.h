@@ -2,8 +2,12 @@
 
 #include <string>
 
-// `<Gunlok>\gkplus\settings.json` - one JSON file for anything that has to
-// outlive a launch.
+// `<profile>\settings.json` - one JSON file for anything that has to outlive a
+// launch, in the directory `GKPLUS_PROFILE` names (src/Profile.h).
+//
+// It is also what decides **what runs**: `core.boot` and `core.script` name the
+// two script modules, so a profile is a settings file plus the scripts it points
+// at, and switching profiles switches both together.
 //
 // **It is a shared repository, not GkPlus's own file.** The top level is one
 // object per owner: GkPlus keeps its settings under `core`, and a mod takes a key
@@ -21,7 +25,9 @@
 // launch-time instruments - the switch you reach for when the thing you want to
 // turn off is the thing stopping the game from starting - so a stored value must
 // never quietly beat one. The knobs that have such a companion apply the file only
-// when the variable is absent (src/RenderMenu.cpp).
+// when the variable is absent (src/RenderMenu.cpp). `GKPLUS_PROFILE` is the one
+// exception in shape rather than in rule: it decides *which* file is read, so
+// there is nothing in the file for it to lose to.
 //
 // Loading is lazy and happens once, on the first access, because there is nothing
 // to read at DllMain: the file is found relative to this module and read with our
@@ -32,9 +38,9 @@
 // apply - a key containing a dot cannot be addressed.
 namespace gk::settings {
 
-// `<the directory holding d3d8.dll>\gkplus\settings.json`, with forward slashes,
-// or "" if the module path could not be resolved. `GKPLUS_SETTINGS` overrides it
-// whole, which is what lets a test run against a file of its own.
+// `<profile>/settings.json`, with forward slashes, or "" if the profile
+// directory could not be worked out. Pointing `GKPLUS_PROFILE` at a directory of
+// its own is what lets a test run against a settings file of its own.
 const std::string &Path();
 
 // The value at `path` as JSON text, "" when it is not there.

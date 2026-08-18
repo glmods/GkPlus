@@ -31,7 +31,20 @@ struct CommandListElem {
 
 // --- Native API over the console --------------------------------------------
 
-void Print(const char *what);                 // 0x004d4b50
+// Whether `InitConsole` @ 0x004d5380 has run and `ShutdownConsole` @ 0x004d5620
+// has not - i.e. whether the four font globals it builds are non-null. It is one
+// byte, `ConsoleInitialized` @ 0x007b6c3a, set as InitConsole's last act and
+// cleared as ShutdownConsole's, and the engine itself uses it as InitConsole's
+// idempotence guard.
+//
+// This is not a curiosity: `WinMain` reaches InitConsole at 0x0046bb81, well
+// *after* the engine has opened its first file, so anything running from
+// FileHookSystem's first-open anchor (the profile's boot module, above all) is
+// on the wrong side of it. Print() gates itself on this; a caller that wants to
+// know rather than to print asks here.
+bool ConsoleReady();
+
+void Print(const char *what);                 // 0x004d4b50, a no-op until ready
 void ExecuteCommandLine(const char *cmdline); // 0x004d59e0
 
 // ConsoleCommandLine @ 0x007b6958 is `char[252]`, so a command line may hold 251

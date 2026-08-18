@@ -77,7 +77,11 @@ struct Subsystems {
   // The DDS codec has no member here and installs no detour of its own: it registers
   // from FileHookSystem's first intercepted open, which is the only anchor that is both
   // past gl.exe's CRT init and ahead of every image dispatch. See src/ImageCodec.h.
-  ScriptSystem script;      // QuickJS host; runs gkplus/main.mjs
+  // Its detour is the *entry* module's boot point only. The profile's boot module runs from
+  // FileHookSystem's first intercepted open too - the same anchor, for the same reason plus one
+  // of its own: it is the last instant before the VFS is consulted, which is what lets a script
+  // decide which mods are mounted. See src/Script.h.
+  ScriptSystem script;      // QuickJS host; runs the profile's core.boot and core.script
 };
 
 // Commits the open Detours transaction, and says so when it fails.

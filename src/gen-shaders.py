@@ -6,10 +6,11 @@ language now, it ships in the Vulkan SDK, and it gives this project two things G
 generics and interfaces for the übershader's stage ops, and one file per pass holding every
 entry point, so a push constant block shared across stages cannot drift between two files.
 
-Shaders are compiled OFFLINE and the generated header is checked in, so `d3d8.dll` depends on
-no shader toolchain at runtime - the same reasoning that makes the renderer delay-load
-`vulkan-1.dll` rather than import it outright. GkPlus *is* `d3d8.dll`, and a missing build-time
-tool must not stop the game launching.
+Shaders are compiled OFFLINE into a header, so `d3d8.dll` depends on no shader toolchain at
+RUNTIME - the same reasoning that makes the renderer delay-load `vulkan-1.dll` rather than import
+it outright. That header used to be checked in, which extended the property to BUILD time as
+well; it is now a build product in the binary tree, so slangc is required to build (but still
+not to run).
 
 CMake drives this now, and the reason is a defect it caused twice: for as long as nothing in the
 build ran the generator, editing a shader and running `cmake --build` **reported success having
@@ -17,7 +18,7 @@ changed nothing** (vulkan_renderer_notes.md 4.46 - a real fix that measured as h
 whose only tell was that the screenshots were byte-identical). Three entry points:
 
     python3 src/gen-shaders.py            # compile and write the header
-    python3 src/gen-shaders.py --check    # is the checked-in header stale? no slangc needed
+    python3 src/gen-shaders.py --check    # is the generated header stale? no slangc needed
     python3 src/gen-shaders.py --deps     # the source files, one per line, for CMake
 
 `--check` is the half that matters on a machine with no Vulkan SDK: the build cannot regenerate
@@ -26,7 +27,8 @@ a content **hash**, embedded in the header and recomputed here - not a timestamp
 checkout shuffles mtimes and would report stale on a clean tree and fresh after a branch switch
 that changed a shader.
 
-Output is `src/Shaders.gen.inc.h`, one `const uint32_t kXxxSpv[]` per entry point.
+Output goes where `--output` says (CMake: `<binary dir>/generated/Shaders.gen.inc.h`), one
+`const uint32_t kXxxSpv[]` per entry point. It is a build product and is not checked in.
 """
 
 import argparse
@@ -40,7 +42,12 @@ import sys
 # script from the build tree. `python3 src/gen-shaders.py` from the repo root is unchanged.
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SHADER_DIR = ROOT / "src" / "shaders"
-OUTPUT = ROOT / "src" / "Shaders.gen.inc.h"
+
+# The header is a **build product** and is not checked in, so this is only where a bare
+# `python3 src/gen-shaders.py` puts it - CMake passes `--output` and points it at
+# `<binary dir>/generated`. The default matches the build directory the presets create, so a
+# manual run lands where the build would look; `--output` is the authority either way.
+OUTPUT = ROOT / "build" / "generated" / "Shaders.gen.inc.h"
 
 # One SPIR-V module per entry point rather than one multi-entry module: VkPipelineShaderStage
 # names an entry point, so either shape works, but separate modules keep the C++ side from
@@ -137,17 +144,25 @@ def stamp_lines():
     return lines
 
 
+def shown(path):
+    """`path` for a message: repo-relative where it can be, absolute where it cannot."""
+    try:
+        return path.relative_to(ROOT).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
 def describe_staleness():
-    """None if the checked-in header matches the sources, else why it does not."""
+    """None if the generated header matches the sources, else why it does not."""
     if not OUTPUT.exists():
-        return "%s does not exist" % OUTPUT.relative_to(ROOT).as_posix()
+        return "%s does not exist" % shown(OUTPUT)
     text = OUTPUT.read_text(encoding="utf-8")
     have = [line for line in text.splitlines()
             if line.startswith(RECIPE_MARKER) or line.startswith(SOURCE_MARKER)]
     want = stamp_lines()
     if not have:
         return ("%s carries no hashes - it predates this check and must be regenerated once"
-                % OUTPUT.relative_to(ROOT).as_posix())
+                % shown(OUTPUT))
     if have == want:
         return None
     have_recipe = [line for line in have if line.startswith(RECIPE_MARKER)]
@@ -223,7 +238,8 @@ def compile_all():
     # depending on this one, so an unchanged header keeps its mtime and every TU that includes
     # it stays out of the rebuild.
     text = "\n".join(out)
-    relative = OUTPUT.relative_to(ROOT).as_posix()
+    relative = shown(OUTPUT)
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     if OUTPUT.exists() and OUTPUT.read_text(encoding="utf-8") == text:
         print("%s unchanged" % relative)
     else:
@@ -232,13 +248,19 @@ def compile_all():
 
 
 def main():
+    global OUTPUT
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--check", action="store_true",
-                       help="exit non-zero if the checked-in header is stale (no slangc needed)")
+                       help="exit non-zero if the generated header is stale (no slangc needed)")
     group.add_argument("--deps", action="store_true",
                        help="print the shader sources, one absolute path per line")
+    parser.add_argument("--output", metavar="PATH",
+                        help="where to write the header (CMake passes the build tree)")
     args = parser.parse_args()
+
+    if args.output:
+        OUTPUT = pathlib.Path(args.output).resolve()
 
     if args.deps:
         for path in sources():
@@ -253,7 +275,7 @@ def main():
                 "\nslangc was not found, so this build cannot regenerate it for you - install "
                 "the\nVulkan SDK or put slangc on PATH.")
         sys.exit("%s is out of date: %s.\nRun:  python3 src/gen-shaders.py%s"
-                 % (OUTPUT.relative_to(ROOT).as_posix(), reason, hint))
+                 % (shown(OUTPUT), reason, hint))
 
     compile_all()
 

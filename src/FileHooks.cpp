@@ -3,6 +3,7 @@
 #include "Core.h"
 #include "ImageCodec.h"
 #include "RenderMenu.h"
+#include "Script.h"
 #include "Vfs.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -352,6 +353,38 @@ HANDLE OpenVirtual(const std::string &vpath) {
 
 bool AnyVirtual() { return g_open_files.load(std::memory_order_acquire) != 0; }
 
+// --- the first-open anchor -------------------------------------------------------
+
+// Everything that has to have happened before the engine reads its first byte,
+// run from whichever of the four hooks below the engine reaches first. This is
+// the one moment that is provably both late enough and early enough: the game
+// only opens a file from WinMain onwards, so gl.exe's CRT heap exists - and a
+// file is always opened before its bytes can be sniffed or its name looked up in
+// the VFS, so nothing here can be too late for its consumer.
+//
+// It is one anchor rather than three detours because two subsystems must never
+// detour one target (see Conventions in CLAUDE.md); each of the three is
+// idempotent in its own right, and the flag is set before they run so a call
+// back into a hook from inside one cannot recurse.
+void EnsureFirstOpen() {
+  static bool done = false;
+  if (done) {
+    return;
+  }
+  done = true;
+  // The image-codec registry allocates from gl.exe's CRT heap. See src/ImageCodec.h
+  // for why it is a registration here rather than a detour of its own.
+  image::RegisterDdsCodec();
+  // Inside WinMain puts this ahead of the device, so the stored renderer settings
+  // are on the knobs before the renderer initialises rather than a frame or a
+  // menu later. See src/RenderMenu.h.
+  ApplyStoredRenderSettings();
+  // The profile's boot module, which is what decides which mods are mounted -
+  // and this is the last instant at which that decision can still be made, since
+  // the caller is about to consult the VFS. See src/Script.h.
+  BootScriptProfile();
+}
+
 // --- the Win32 hooks -----------------------------------------------------------
 
 HANDLE WINAPI HookedCreateFileA(LPCSTR name, DWORD access, DWORD share,
@@ -366,19 +399,7 @@ HANDLE WINAPI HookedCreateFileA(LPCSTR name, DWORD access, DWORD share,
   // Access rights are deliberately *not* part of the test: IsFirstFileNewer
   // @ 0x004af430 opens with GENERIC_READ|GENERIC_WRITE and only reads
   // timestamps, and it has to see the mod's file or a stale on-disk cache wins.
-  // The first intercepted open is where the DDS codec registers itself, because it is
-  // the one moment that is provably both late enough and early enough: the game only
-  // opens a file from WinMain onwards, so gl.exe's CRT heap (which the codec registry
-  // allocates from) exists - and a file is always opened before its bytes can be
-  // sniffed, so no image can be dispatched before this has run. Idempotent; after the
-  // first call it is a static bool test. See src/ImageCodec.h for why it is not a
-  // detour of its own.
-  image::RegisterDdsCodec();
-  // The same anchor, for a different half of the same argument: being inside
-  // WinMain puts this ahead of the device, so the stored renderer settings are on
-  // the knobs before the renderer initialises rather than a frame or a menu in.
-  // Also idempotent. See src/RenderMenu.h.
-  ApplyStoredRenderSettings();
+  EnsureFirstOpen();
 
   if (name && disposition == OPEN_EXISTING) {
     try {
@@ -624,6 +645,10 @@ BOOL WINAPI HookedCloseHandle(HANDLE handle) {
 }
 
 DWORD WINAPI HookedGetFileAttributesA(LPCSTR name) {
+  // Also an anchor: this consults the VFS, so on the (unlikely) launch where the
+  // engine asks about a file before it opens one, the boot module still gets to
+  // mount first.
+  EnsureFirstOpen();
   if (name) {
     try {
       if (vfs::Resolve(name)) {
@@ -656,6 +681,7 @@ bool IsReadOnlyMode(const char *mode) {
 }
 
 void *__cdecl HookedFopen(const char *name, const char *mode) {
+  EnsureFirstOpen();
   if (name && IsReadOnlyMode(mode)) {
     try {
       if (auto vpath = vfs::Resolve(name)) {
@@ -672,6 +698,7 @@ void *__cdecl HookedFopen(const char *name, const char *mode) {
 }
 
 void *__cdecl HookedFreopen(const char *name, const char *mode, void *stream) {
+  EnsureFirstOpen();
   if (name && IsReadOnlyMode(mode)) {
     try {
       if (auto vpath = vfs::Resolve(name)) {

@@ -3960,6 +3960,12 @@ Two readings, neither of which is a difference image:
   **No longer true, and §4.50 is the fix**: `cmake --build` compiles the shaders now, and refuses a
   stale header on a machine that cannot. The *signature* in the last sentence still stands and is
   the part to carry forward.
+
+  **And the header has since left the tree entirely** — both `*.gen.inc.h` are generated into
+  `<binary dir>/generated` and are no longer checked in, so "the checked-in artifact" above is
+  historical and `slangc` plus Python are now hard build requirements. Every `src/Shaders.gen.inc.h`
+  in the paragraphs above and below records what a build printed at the time; the path is
+  `build/generated/Shaders.gen.inc.h` today.
 - **A draw index found by `find-draw.ps1` is the draw that painted that *pixel*, not the draw that
   produced the *difference* being chased.** Aiming at a pixel where both renderers agreed found
   draw 12, whose specular is zero in both, and half an hour went into asking why an agreeing draw
@@ -6508,7 +6514,7 @@ ms/frame, so neither of the checks already in the harness sees this.
 §4.67 was fixed twice - once as three inert knobs, once as a lost device (§4.66) - and the second
 fix took a section because nothing connects the two declarations of a struct. `src/gen-shader-abi.py`
 connects them: it parses the **Slang** structs, computes every field's byte offset, and emits
-`src/ShaderAbi.gen.inc.h` - one `offsetof` assert per field and one `sizeof` assert per struct,
+`<binary dir>/generated/ShaderAbi.gen.inc.h` - one `offsetof` assert per field and one `sizeof` assert per struct,
 against the C++ counterpart. Included at the end of `VkDraw.cpp`'s anonymous namespace, the one
 point where `src/VkDraw.h`, `src/VertexFormat.h` and that file's three push blocks are all in scope.
 

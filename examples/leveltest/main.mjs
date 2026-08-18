@@ -3,13 +3,20 @@
 // It is deliberately self-contained - no relative imports - so it can be run
 // without copying anything else. Two ways to use it:
 //
-//   set GKPLUS_SCRIPT=C:\Users\franc\GkPlus\examples\leveltest\main.mjs
+//   mkdir C:\gk-leveltest
+//   copy examples\leveltest\main.mjs C:\gk-leveltest\
+//   set GKPLUS_PROFILE=C:\gk-leveltest
 //   "<Gunlok>\gl.exe"
 //
-// or copy this one file to <Gunlok>\gkplus\main.mjs (which replaces whatever is
-// there). Launch gl.exe directly either way - Steam does not pass the variable
-// through. Add GKPLUS_REPL_PORT=9222 and the REPL comes up too, which is the
-// easiest way to poke at a loaded level.
+// - a profile of its own, which needs no settings.json at all because
+// `core.script` defaults to `main.mjs` inside it - or copy this one file to
+// <Gunlok>\gkplus\main.mjs (which replaces whatever is there). Launch gl.exe
+// directly either way - Steam does not pass the variable through. Add
+// GKPLUS_REPL_PORT=9222 and the REPL comes up too, which is the easiest way to
+// poke at a loaded level.
+//
+// A profile of its own also mounts no mods, since it has no boot.mjs - which is
+// usually what you want for a test.
 //
 // It registers THREE levels, because there are two code paths plus a control:
 //

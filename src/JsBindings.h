@@ -223,10 +223,11 @@ JSValue NewLevelsNamespace(JSContext *ctx);
 JSValue NewGlsNamespace(JSContext *ctx);
 JSValue NewMakeNamespace(JSContext *ctx);
 // The mod filesystem (src/Vfs.h): which archives are mounted, and what they
-// provide. Read-only from script apart from mount(); the interception that makes
-// the engine consult it is installed long before any script runs.
+// provide. Read-only apart from mount()/mount_all(), which are how anything gets
+// mounted at all - the interception is installed long before any script runs, but
+// the search path it consults starts empty and the profile's boot module fills it.
 JSValue NewModsNamespace(JSContext *ctx);
-// The settings file (src/Settings.h): `<Gunlok>\gkplus\settings.json`, shared by
+// The settings file (src/Settings.h): `<profile>\settings.json`, shared by
 // GkPlus (under `core`) and by whatever else wants a section of it. Values cross
 // as JSON, and `all` is a snapshot - the store's own tree lives in the codec's
 // private runtime and is never handed out.

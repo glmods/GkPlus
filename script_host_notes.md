@@ -1,31 +1,112 @@
 # The QuickJS script host and the REPL channel
 
-How `main.mjs` is booted and how the loopback debug channel works. The `"gk"` module's own
-surface is `js_bindings_notes.md`; the binding *conventions* that govern edits stay in
+How the profile's scripts are booted and how the loopback debug channel works. The `"gk"` module's
+own surface is `js_bindings_notes.md`; the binding *conventions* that govern edits stay in
 `CLAUDE.md`.
+
+### The profile (`src/Profile.h/cpp`)
+
+**`GKPLUS_PROFILE` is the only launch-time path knob**, and it names a directory:
+
+```
+<profile>/settings.json   the shared settings repository (src/Settings.h)
+<profile>/boot.mjs        core.boot   — inside WinMain, mounts mods
+<profile>/main.mjs        core.script — the entry module, at SetupMenus
+<profile>/mods/           what mods.mount_all() looks in
+```
+
+With the variable unset the profile is `gkplus` beside `d3d8.dll`, which is where all four of
+those already lived, so a stock install is unchanged and switching between two setups is one
+environment variable rather than a file swap.
+
+It replaced `GKPLUS_SETTINGS` and `GKPLUS_SCRIPT`, which were exactly the two halves of "point
+GkPlus somewhere else" — splitting them let a run take its settings from one place and its script
+from another, which is not a configuration anybody wanted, and it left the mods directory behind
+in the install either way. A relative `GKPLUS_PROFILE` is pinned against the *launch* directory,
+not the process's cwd, because by the time anything reads it the engine has chdir'd to whichever
+GLDir it last touched.
 
 ### Script host (`src/Script.h/cpp`)
 
-One `JSRuntime`, one `JSContext`, one entry module. The entry module is `GKPLUS_SCRIPT` if that
-environment variable is set, otherwise **`gkplus\main.mjs` next to `d3d8.dll`** (i.e. in Gunlok's
-directory). A missing file logs the path it looked for and leaves the game unmodified. An
-**empty** one does not: it loads, evaluates, exports nothing, and looks exactly like a working
-host that happens to do nothing — check the file is non-empty before debugging the bindings.
-`examples/main.mjs` is a working starting point.
+One `JSRuntime`, one `JSContext`, and up to **two modules the profile names**: `core.boot` and
+`core.script`, each resolved against the profile directory, each defaulting to the name above, and
+each settable to `""` to turn that phase off. A missing file logs the path it looked for and
+leaves the game unmodified. An **empty** one does not: it loads, evaluates, exports nothing, and
+looks exactly like a working host that happens to do nothing — check the file is non-empty before
+debugging the bindings. `examples/main.mjs` and `examples/boot.mjs` are working starting points.
 
 ```js
 export function setup_menus(menus) { menus.Main.add_item("Hi", (item) => {}); }
 export function draw_gui(ImGui)    { if (ImGui.Begin("x")) { … } ImGui.End(); }
 ```
 
-Four facts pin the design, in decreasing order of how expensive they were to find:
+Either module may export either callback; a module that does not export one does not clear what
+the other left. Pointing both keys at one file evaluates it **once** — `LoadModule` keeps the list
+of paths it has been through, because `JS_Eval` compiles a fresh module per call rather than
+consulting the loader's cache, so nothing else would stop the top level running twice.
 
-- **The boot point is a detour on `SetupMenus` @ 0x004e95e0**, not `DllMain` and not the first
-  frame. `WinMain` calls it exactly once, after `LoadResourceStringTable` (0x0046b355) and
-  `InitConsole` (0x0046bb81) and before the frame loop (0x0046be47) — so at boot the localized
+#### The two boot points
+
+`core.script` boots where the host always did. `core.boot` exists because that is far too late for
+one decision — which mods are mounted:
+
+| | `core.boot` | `core.script` |
+|---|---|---|
+| anchor | `FileHookSystem`'s first intercepted open | detour on `SetupMenus` @ 0x004e95e0 |
+| when | inside `WinMain`, before the engine reads any asset | inside `WinMain`, after the front end exists |
+| available | the bindings, `settings`, `mods` | everything |
+| not available | resource strings, the console registry, menus | — |
+
+- **`core.script`'s boot point is a detour on `SetupMenus` @ 0x004e95e0**, not `DllMain` and not
+  the first frame. `WinMain` calls it exactly once, after `LoadResourceStringTable` (0x0046b355)
+  and `InitConsole` (0x0046bb81) and before the frame loop (0x0046be47) — so at boot the localized
   strings and `gk::Print` both work, and the game's own menus are already populated. That last
   part is load-bearing: `OnMenuItemClicked` switches on the item *index*, so a script item added
   before the game's would shift every index in the dispatch table.
+- **`core.boot`'s is `EnsureFirstOpen` in `src/FileHooks.cpp`**, shared with the DDS codec
+  registration and `ApplyStoredRenderSettings` — one anchor rather than three detours, because two
+  subsystems must never detour one target. It is the last instant at which "which mods are
+  mounted" is still a decision that applies to every file the game will load, since the caller is
+  about to consult the VFS with it. Four hooks call it (`CreateFileA`, `GetFileAttributesA`,
+  `fopen`, `freopen`) — every one that reaches `vfs::Resolve` — so whichever the engine gets to
+  first is the anchor.
+- **The runtime is not created early unless a boot module exists.** `BootScriptProfile` checks the
+  file with `GetFileAttributesA` *before* `JS_NewRuntime`, so a profile without one leaves the host
+  booting exactly where it always did and the cost on a stock install is one stat. Creating a
+  QuickJS runtime inside the engine's first file open is worth doing only for a profile that asked
+  for it.
+- **The engine's first intercepted open is an `fopen`, not a `CreateFileA`** — measured, from the
+  crash stack below: `HookedLoadGLS` → gl.exe → `HookedFopen`. So anchoring only `CreateFileA`
+  (which is where the DDS codec registration and `ApplyStoredRenderSettings` had always sat, both
+  of them merely needing to be *early*) would have put the boot module **after** the first VFS
+  lookup, and a mod replacing a `.gls` would have missed its own file. All four hooks that reach
+  `vfs::Resolve` call `EnsureFirstOpen`.
+- **`gk::Print` faults before `InitConsole`, and the host's own logging is enough to reach it.**
+  The first attempt at an early boot module crashed the game outright at gl.exe+0x1782b3 —
+  `MOVD XMM0,[ECX+0xaf0]` in `Font_GetNormalizedLineHeight` @ 0x005782b0 on a **null `Font *`**.
+  `ConsolePrint` reaches that five times and `Console_QueueTextLine` four, always with `SmallFont`
+  @ 0x007b6a54 as `this`, and all four font globals are null until `InitConsole` @ 0x004d5380,
+  which `WinMain` does at 0x0046bb81 — long after the first file. No script call was needed: the
+  stack is
+
+  ```
+  HookedFopen -> EnsureFirstOpen -> BootScriptProfile -> StartRuntime
+    -> StartRepl -> js::Log -> gk::Print -> ... -> Font_GetNormalizedLineHeight
+  ```
+
+  i.e. `StartRepl`'s own "listening on port N" line. The fix is a gate in `gk::Print` rather than
+  in `js::Log`, so every caller inherits it: `gk::ConsoleReady()` reads `ConsoleInitialized`
+  @ 0x007b6c3a, the one byte `InitConsole` sets as its last act and `ShutdownConsole` @ 0x004d5620
+  clears as its own — which is why it is re-read per call and never cached. `console.ready`
+  exposes it, and it reads **false in a boot module and true in the entry module**, measured both
+  ways; a predicate stuck at false would silently kill every `console.log` in the game and look
+  like nothing at all.
+
+  `gk::ResourceString` has the same shape of hazard and now has the same kind of gate:
+  `LocalizedStrings` @ 0x00725664 is null until `LoadResourceStringTable` @ 0x00578f30
+  (`WinMain` @ 0x0046b355, also after the first file), and `GetResourceString` @ 0x00579000 scans
+  in 0x14-byte steps **with no end test**, so an unloaded table does not fault — it walks `.data`
+  until something matches the id.
 - **`ImGui` is not a module — it is only `draw_gui`'s argument.** Every call in it is valid only
   between `NewFrame` and `Render`, which is exactly the window `draw_gui` runs in, so
   `js_imgui_new_namespace` (imgui-quickjs) builds a plain object with `JS_SetPropertyFunctionList`
@@ -49,11 +130,11 @@ Four facts pin the design, in decreasing order of how expensive they were to fin
   relative specifier by scanning the *importing module's name* for `/`; with `C:\…\main.mjs` it
   finds none and `import "./x.mjs"` silently resolves to `x.mjs` in the process's cwd.
 
-**The host loads exactly one module, and the bindings load none.** `levels.add` used to take a
+**The host loads only the profile's own modules, and the bindings load none.** `levels.add` used to take a
 module *path* and pull the file in itself, through a `LoadScriptModule` host service; it now takes
 the description object, and a script reaches a level module with an ordinary
 `import * as arena from "./levels/arena.mjs"` — the namespace is already the right shape. That
-deleted the last binding-side module load, so `Script.h` exports only `BootScriptHost`. If a
+deleted the last binding-side module load, so `Script.h` exports only the two boot entry points. If a
 binding ever does need to load a script file from C, the answer is
 `Await(ctx, JS_LoadModule(ctx, EntryPath, specifier))` — QuickJS's own C-side `import()`, which
 normalizes, runs the loader, links, evaluates and resolves with the namespace — with the **entry
@@ -63,9 +144,9 @@ a synthetic wrapper module that does the import; that is what the deleted versio
 
 Two seams in `src/GUI.h` carry it: `SetOverlayDrawCallback` (inside the ImGui frame, F11 only)
 runs `draw_gui`, and `SetFrameCallback` (once per `PresentScene`, overlay or not) drains the job
-queue and then pumps the REPL channel. Both are installed by `BootScriptHost`, not by the
-`ScriptSystem` ctor, so they can never call into a context that does not exist yet. Everything runs
-on the main thread.
+queue and then pumps the REPL channel. Both are installed by `StartRuntime` — whichever phase gets
+there first — not by the `ScriptSystem` ctor, so they can never call into a context that does not
+exist yet. Everything runs on the main thread.
 
 One runtime, but not necessarily one context: `StartRepl` adds a second one for the debug channel
 (see "The REPL channel"). It is started *before* `LoadEntryModule`, because a REPL is most useful

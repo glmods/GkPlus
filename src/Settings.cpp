@@ -2,6 +2,7 @@
 
 #include "Core.h"
 #include "Json.h"
+#include "Profile.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -12,45 +13,6 @@
 
 namespace gk::settings {
 namespace {
-
-std::string ToForwardSlashes(std::string text) {
-  for (char &c : text) {
-    if (c == '\\') {
-      c = '/';
-    }
-  }
-  return text;
-}
-
-// Beside main.mjs, and found the same way src/Script.cpp finds that: relative to
-// this module rather than to the working directory, which the engine changes per
-// asset category (the GLDir scheme in file_io_notes.md) and so cannot be trusted.
-std::string ResolvePath() {
-  char override[MAX_PATH]{};
-  const DWORD len =
-      ::GetEnvironmentVariableA("GKPLUS_SETTINGS", override, sizeof(override));
-  if (len > 0 && len < sizeof(override)) {
-    return ToForwardSlashes(override);
-  }
-
-  HMODULE self = nullptr;
-  if (!::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            reinterpret_cast<LPCSTR>(&ResolvePath), &self)) {
-    return {};
-  }
-  char path[MAX_PATH]{};
-  const DWORD n = ::GetModuleFileNameA(self, path, sizeof(path));
-  if (n == 0 || n >= sizeof(path)) {
-    return {};
-  }
-  std::string dir = ToForwardSlashes(path);
-  const std::size_t slash = dir.find_last_of('/');
-  if (slash == std::string::npos) {
-    return {};
-  }
-  return dir.substr(0, slash) + "/gkplus/settings.json";
-}
 
 bool ReadWholeFile(const char *path, std::string *out) {
   std::FILE *file = std::fopen(path, "rb");
@@ -107,7 +69,7 @@ bool Leaf(const char *path, json::Kind kind, std::string *json,
 } // namespace
 
 const std::string &Path() {
-  static const std::string path = ResolvePath();
+  static const std::string path = profile::Resolve("settings.json");
   return path;
 }
 
@@ -172,8 +134,9 @@ bool Save() {
   }
   const std::string text = TheStore().doc.Stringify(true);
 
-  // `gkplus\` normally exists (main.mjs lives there) but nothing guarantees it,
-  // and a mod storing settings is a reason for it to exist on its own.
+  // The profile directory normally exists (the scripts live there) but nothing
+  // guarantees it - a GKPLUS_PROFILE naming a fresh directory is exactly how a
+  // new profile starts - and a mod storing settings is a reason of its own.
   const std::size_t slash = Path().find_last_of('/');
   if (slash != std::string::npos) {
     ::CreateDirectoryA(Path().substr(0, slash).c_str(), nullptr);

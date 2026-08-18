@@ -118,9 +118,10 @@ for (const [name, value] of Object.entries(tokens)) console.print(`${name}=${val
 console.log("actors:", actors.count);               // the host's own logging - no global console
 console.execute("GOD ON");                          // and the game's command surface
 tokens["score"] = 0;                                // upsert; actors/roles throw
+mods.mount_all();                                   // in a boot module: nothing mounts on its own
 for (const mod of mods) console.log(mod.priority, mod.name);   // what is mounted
 console.log(mods.served, mods.recent[0]);           // ... and what it actually served
-settings.set("mymod.window", {x: 10, y: 20});      // gkplus/settings.json, under a key of your own
+settings.set("mymod.window", {x: 10, y: 20});      // <profile>/settings.json, under a key of your own
 settings.save();                                   // set() is memory; save() is the file
 levels.add("Test Arena", arena);                    // `import * as arena` first
 levels.start("Test Arena", {difficulty: "hard"});   // no menus, no briefing

@@ -329,10 +329,18 @@ is re-lexed inside a `# line` directive so it must not contain a quote) are in
 
 ### Script host and the REPL channel (`src/Script`, `src/Repl`)
 
-One `JSRuntime`, one entry module (`<game dir>\gkplus\main.mjs`, booted from a detour on
-`SetupMenus`), plus an optional loopback JavaScript REPL behind `GKPLUS_REPL_PORT`. **The REPL is
-how you test anything in a running game** - see "Debugging the running game" above, and
-`script_host_notes.md` for the protocol, the boot sequence and the five facts that pin the design.
+One `JSRuntime`, **two modules the profile names**, plus an optional loopback JavaScript REPL
+behind `GKPLUS_REPL_PORT`. `core.script` (`<profile>\main.mjs`) is the entry module and boots from
+a detour on `SetupMenus`, where the front end is already up; `core.boot` (`<profile>\boot.mjs`) is
+the **boot module** and runs far earlier, at `FileHookSystem`'s first intercepted open, because
+that is the only point from which a script can still decide **which mods are mounted**. Almost
+nothing of the game exists that early — no resource strings, no console registry, no menus — so a
+boot module mounts and configures and hands the rest to the entry module. Both share one runtime
+and one context, and pointing both keys at one file evaluates it once. The runtime is only created
+early when a boot module actually exists, so a profile without one boots exactly where the host
+always did. **The REPL is how you test anything in a running game** - see "Debugging the running
+game" above, and `script_host_notes.md` for the protocol, both boot points and the facts that pin
+the design.
 
 **A launcher should not pick the port.** `GKPLUS_REPL_PORT=0` binds an ephemeral one and
 `GKPLUS_LAUNCHER_HWND` names a message-only window of class `GkPlusLauncher`, which is **posted**
@@ -409,9 +417,18 @@ page has no apply step. `ApplyStoredRenderSettings()` puts them back on the knob
 because it is inside `WinMain` and therefore ahead of the device, so the stored settings are in
 place before the renderer initialises rather than a frame or a menu later.
 
+### The profile (`src/Profile.h/cpp`)
+
+**`GKPLUS_PROFILE` is the only launch-time path knob**, and it names a directory holding
+`settings.json`, the two scripts that file points at (`core.boot`, `core.script`) and the `mods`
+those scripts mount. Unset, the profile is `gkplus` beside `d3d8.dll` — where all of that already
+lived — so a stock install is unchanged and two setups are two directories rather than a file swap.
+It replaced `GKPLUS_SETTINGS` and `GKPLUS_SCRIPT`, which were the two halves of the same idea and
+left the mods directory behind in the install either way. `script_host_notes.md` has the rest.
+
 ### Settings (`src/Settings.h/cpp`, `src/JsSettings.cpp`)
 
-`<Gunlok>\gkplus\settings.json`, and it is a **shared repository, not GkPlus's own file**. The top
+`<profile>\settings.json`, and it is a **shared repository, not GkPlus's own file**. The top
 level is one object per owner — GkPlus under `core`, a mod under a key of its own — and a write
 re-serialises the *parsed* document, so a section belonging to a mod this build has never heard of
 survives being rewritten by a build that only understands `core`. That requirement is the whole
@@ -423,6 +440,14 @@ instruments — the switch you reach for when the setting you need to change is 
 game from starting — so `ApplyStoredRenderSettings` skips any knob whose companion variable is
 set. Two of the eight have one (`GKPLUS_VK_MSAA`, `GKPLUS_VK_PER_PIXEL_LIGHTING`); doing it in one
 place is what keeps the rule from depending on which setter happens to latch its own env-read flag.
+`GKPLUS_PROFILE` is the exception in shape rather than in rule — it decides *which* file is read,
+so there is nothing inside the file for it to lose to.
+
+**It also decides what runs.** `core.boot` and `core.script` name the two script modules
+(`src/Script.h`), each resolved against the profile directory, each defaulting to `boot.mjs` /
+`main.mjs`, and each settable to `""` to turn that phase off. A profile is therefore a complete
+description of a launch — settings, scripts and mods — rather than a bag of settings beside a
+hardcoded script.
 
 Loading is lazy and once, on first access. Saving writes a temporary and moves it over the target,
 because a half-written file would take every other owner's section with it.
@@ -449,11 +474,17 @@ Nothing a custom level needs is ever written to disk. `custom_levels_notes.md` h
 that pin the design; `level_loading_notes.md` sections 6.5 and 7 are the measurements.
 ### Mod loading (`src/Vfs.h/cpp`, `src/FileHooks.h/cpp`)
 
-Archives and directories layered over Gunlok's data tree, mounted from `<Gunlok>\gkplus\mods`,
-later name wins. The interception is **gl.exe's import table**, not Detours on kernel32, which is
-what makes it non-recursive. `mod_loading_notes.md` has the five decisions that shape it and the
-three that are easy to get wrong later; `file_io_notes.md` sections 1 and 5 are the measurement -
-read those before touching either file.
+Archives and directories layered over Gunlok's data tree, from `<profile>\mods`, later name wins.
+The interception is **gl.exe's import table**, not Detours on kernel32, which is what makes it
+non-recursive.
+
+**Nothing mounts on its own.** `vfs::Initialize` starts PhysicsFS with an empty search path and
+every mount comes from the profile's boot script — `mods.mount_all()` for the whole directory,
+`mods.discover()` + `mods.mount()` to pick — which runs at `FileHookSystem`'s first intercepted
+open, the last instant at which the decision still applies to every file the game will load. A
+profile with no boot module runs the base game whatever is sitting in `mods`. `mod_loading_notes.md`
+has the six decisions that shape it and the three that are easy to get wrong later;
+`file_io_notes.md` sections 1 and 5 are the measurement - read those before touching either file.
 ### The game window and the taskbar (`src/WindowPlacement.h/cpp`)
 
 `WinMain` @ 0x0046aef0 passes **literal 0, 0** as X/Y to both of the binary's `CreateWindowExA`
@@ -598,10 +629,11 @@ reference. Test invocations are under "Running the test suites" above.
 | `src/Rif.h/cpp` | Reading `.rif` chunk files: the `REBCRIF1` container (via `huffman/`), the tree walk, and `LIGHTSET`/`STDLIGHT`/`AMBIENCE` — **the light rig that baked each level's per-vertex colours, which the shipped engine loads and never reads** (`rif_chunk_format.md`). **Pure**: bytes in, records out, no game memory and no VFS, which makes it the only `src/` file with a test that runs without Gunlok — `utils/riflights` over all 563 shipped files against `blender/io_scene_rif`, 3,794 lights, every field exact |
 | `src/MapLights.h/cpp` | `MapLightSystem` — the game-facing half of the above: where the level's `.rif` is, what scale it is in, and when to reload. **It has to be a hook**, because neither the path nor the rif object survives the load: `LoadLevel` frees the rif right after `ConvertParsedObjects` and `Map` retains only the *shadow* object's rif name. So it detours `LoadOrGetRifFile` @ 0x004ae960 — the one seam all three of `ToMap`'s routes pass through — records the path and the unit scale, and parses lazily on the first read after a level change. Deriving the path from the `.gls` name instead was measured and **fails on 4 of 32 shipped levels** |
 | `src/Vfs.h/cpp` | The mod filesystem: mount, case-folded index, lookup, read, `Materialize`. Pure lookup — touches no game memory, so it is the half a harness can exercise. See "Mod loading" above |
-| `src/FileHooks.h/cpp` | `FileHookSystem` — the nine IAT patches and the two static-CRT detours that make the engine consult `src/Vfs`, plus the virtual-handle table and the `mods.served`/`mods.recent` diagnostics. Also the **read-ahead layer**, which is where half of a level load went: `LoadOrBuildSectionAdjacency` @ 0x0044fef0 reads the whole `<level>.map` cache **four bytes per `ReadFile`** — 39,364 calls for level02, 187,313 for level12 — so a warm load is bound by syscall count and not by its 9-23 MB. A handle this layer opened for reading gets a 64 KB buffer and **this layer owns the file position**; keeping the OS pointer in step would cost a `SetFilePointer` per read and buy nothing. Safe only because gl.exe imports no `SetFilePointerEx`/`ReadFileEx` and uses no overlapped I/O, and a handle opened elsewhere (the static CRT uses `CreateFileW`) is never buffered. Reads drop ~99.7% and blocked load time 27-57%; `GKPLUS_FILE_BUFFER=raw` is the A/B and `mods.read_stats()` (`GKPLUS_FILE_STATS=1`) is the instrument. `file_io_notes.md` §1.1-1.2 |
+| `src/FileHooks.h/cpp` | `FileHookSystem` — the nine IAT patches and the two static-CRT detours that make the engine consult `src/Vfs`, plus the virtual-handle table and the `mods.served`/`mods.recent` diagnostics. Also **`EnsureFirstOpen`**, the shared first-open anchor: three things that must precede the engine's first byte and cannot each have a detour of their own (the DDS codec registration, `ApplyStoredRenderSettings`, and `BootScriptProfile`, which is what lets a script decide the mount set). All four hooks that reach `vfs::Resolve` call it, so whichever the engine gets to first is the anchor. Also the **read-ahead layer**, which is where half of a level load went: `LoadOrBuildSectionAdjacency` @ 0x0044fef0 reads the whole `<level>.map` cache **four bytes per `ReadFile`** — 39,364 calls for level02, 187,313 for level12 — so a warm load is bound by syscall count and not by its 9-23 MB. A handle this layer opened for reading gets a 64 KB buffer and **this layer owns the file position**; keeping the OS pointer in step would cost a `SetFilePointer` per read and buy nothing. Safe only because gl.exe imports no `SetFilePointerEx`/`ReadFileEx` and uses no overlapped I/O, and a handle opened elsewhere (the static CRT uses `CreateFileW`) is never buffered. Reads drop ~99.7% and blocked load time 27-57%; `GKPLUS_FILE_BUFFER=raw` is the A/B and `mods.read_stats()` (`GKPLUS_FILE_STATS=1`) is the instrument. `file_io_notes.md` §1.1-1.2 |
 | `src/Profiler.h/cpp` | The CPU profiler: the per-thread event rings, the frame ring, the sampling thread and the Chrome-trace writer. **Touches no game memory** — it is clock, rings and Win32 thread APIs — so it is one of the few `src/` files a harness could exercise. See "The profiler" above |
 | `src/Repl.h/cpp` | The loopback JavaScript REPL: `StartRepl` / `PumpRepl` / `StopRepl`, owned by `BootScriptHost` rather than by `Subsystems` (it installs no detour). Off unless `GKPLUS_REPL_PORT` is set; `=0` binds an ephemeral port and publishes it to `GKPLUS_LAUNCHER_HWND`, which is how a launcher gets one without racing for it. Also `NotifyRepl` — the **backchannel**, an unsolicited `{event, data}` line a script pushes to every connected client (`repl.notify` in JS, `src/JsRepl.cpp`), which is what makes something that *happens between two polls* observable from outside. A reply always carries `ok` and a notification never does: that is the whole rule a client needs. See "The REPL channel" above |
-| `src/Settings.h/cpp` | `<Gunlok>\gkplus\settings.json` — the shared settings repository. Typed get/set over a dotted path, lazy load, atomic save. **Touches no game memory**, so it is harness-testable; the tree is `json::Document`, and unknown top-level sections survive a rewrite by design. See "Settings" above |
+| `src/Profile.h/cpp` | Where a launch is configured from: `GKPLUS_PROFILE` or `gkplus` beside `d3d8.dll`, plus the join that resolves a settings key naming a file against it. **Touches no game memory and reads no file**, so it is safe from `DllMain` and harness-testable. It is also the one place that knows the DLL's own directory — `src/Settings` and `src/Script` both used to work it out for themselves. See "The profile" above |
+| `src/Settings.h/cpp` | `<profile>\settings.json` — the shared settings repository. Typed get/set over a dotted path, lazy load, atomic save. **Touches no game memory**, so it is harness-testable; the tree is `json::Document`, and unknown top-level sections survive a rewrite by design. Also where `core.boot` and `core.script` say what runs. See "Settings" above |
 | `src/Session.h/cpp` | `StartLevel` / `QueueLevelStart` / `QueueReturnToMainMenu` — a level start with no menus and no briefing, deferred to the message loop. Installs no detour and has no `*System`: it registers `SetMessageLoopCallback` on first use. See "Starting a level programmatically" above |
 | `src/Font.h/cpp` | The engine's text layer: `GetFont` / `LineHeight` / `QueueText`, and `VersionTextSystem`. `Font` is deliberately left **incomplete** - its 0xb18 layout is measured but nothing here needs a field out of it, and an unchecked mirror would only go stale. See "The text queue and the version stamp" above |
 | `src/InputFix.h/cpp` | `InputFixSystem` - hook-only. Detours `AcquireDInputDevice` to suppress the vestigial DirectInput keyboard acquire and its `WH_KEYBOARD_LL` hook (see `input_notes.md`) |
@@ -611,7 +643,8 @@ reference. Test invocations are under "Running the test suites" above.
 | `src/ActorClasses.inc.h` | X-macro listing the 15 Actor subclasses: `GK_ACTOR_CLASS(Name, Parent, Predicate, Kind)`. Drives the JS class table, `kind`, the RTTI ladder and the prototype chain. **Must list every class before its own base** |
 | `src/Menus.inc.h` | X-macro listing all 36 Gunlok menus: `GUNLOK_MENU(Name, Id, TitleResourceId, "English title")`. There are no gaps - ids 11 and 14-20 are identified in `menu_system_notes.md`. Also counted into `gk::MenuCount` |
 | `imgui-quickjs/` | Static library: the ImGui bindings, linked into `d3d8.dll`. **Not a QuickJS module** — `js_imgui_new_namespace(ctx)` builds a plain object the host passes to `draw_gui`, since an ImGui call outside that frame does not work. `JS_SetPropertyFunctionList` handles the whole export list, `JS_DEF_CGETSET` included (see the QuickJS conventions). **`types/imgui.d.ts` is generated from this file** — run `python3 types/gen-imgui-dts.py` after touching it and check the `any` count it prints is still 0, since it infers each parameter's type from the `JS_To*` the wrapper actually calls |
-| `examples/main.mjs` | A working entry module, JSDoc-annotated against `types/`. Install it as `<Gunlok>\gkplus\main.mjs`; `examples/jsconfig.json` is what type-checks it. **It imports `levels/` which imports `headers/`, so install all three** — a module the host cannot find takes the whole entry module with it and registers no hooks at all, so the symptom is that nothing happens rather than that one level is missing |
+| `examples/main.mjs` | A working entry module, JSDoc-annotated against `types/`. Install it in a profile as `main.mjs` (i.e. `<Gunlok>\gkplus\main.mjs` by default); `examples/jsconfig.json` is what type-checks it. **It imports `levels/` which imports `headers/`, so install all three** — a module the host cannot find takes the whole entry module with it and registers no hooks at all, so the symptom is that nothing happens rather than that one level is missing |
+| `examples/boot.mjs` | A working **boot** module — `mods.mount_all()` and the two shapes that replace it when a profile wants some of the directory rather than all of it. Install as `<profile>\boot.mjs`. Without one, no mod is mounted at all, which is the single most likely reason a previously-working install stops picking up its mods |
 | `examples/render-panel.mjs` | Every `render` knob as ImGui, in collapsing sections, drawn into the caller's window. Its own module because it is longer than the rest of the example put together and is the piece most worth copying. **Its one rule is write-on-`changed`**: `draw_gui` runs every frame, and `lighting_maps = true` re-reads every file while `map_shadow_rate` re-bakes the shadow atlas |
 | `examples/prof-panel.mjs` | The profiler as ImGui, in the same shape as `render-panel.mjs` — frame graph, zones, sampled profile, stacks, the trigger and its captures, and the ring configuration. **Its rule is query-on-a-cadence**: `zones`/`samples`/`stacks` build one JS object per row and reading them per frame would cost more than the frame they describe, invisibly — `overhead_ms` cannot see time spent on our side of the binding. So each section snapshots, and a collapsed one queries nothing. The other trap is the trigger: an options object with no `enabled` *arms* it, so every write passes the current value explicitly |
 | `examples/levels/arena.mjs` | A working level module for `levels.add` — `map` + `includes` + `define` + `populate` + `setup` |
@@ -1020,12 +1053,13 @@ unrelated, long after the call.
   there — one hook silently stops running. Measured: adding a second `SetupMenus` detour
   beside `ScriptSystem`'s killed the script host with no diagnostic at all (the REPL listener
   simply never opened, and the game otherwise looked normal). If a subsystem needs to run at
-  a point another already hooks, have that hook call it, or find a different anchor — the DDS
-  codec registers from `FileHookSystem`'s first intercepted open for exactly this reason
+  a point another already hooks, have that hook call it, or find a different anchor — three
+  things now hang off `EnsureFirstOpen` in `src/FileHooks.cpp` for exactly this reason (the DDS
+  codec registration, `ApplyStoredRenderSettings`, and the profile's boot module)
 - `static_assert` on struct sizes and offsets to catch layout mismatches
 - **A struct shared with a shader is checked by `src/gen-shader-abi.py`, not by hand.** It parses
   the `src/shaders/*.slang` declarations and generates an `offsetof` per field plus a `sizeof` per
-  struct into `src/ShaderAbi.gen.inc.h`. Adding or reordering a field in either declaration and not
+  struct into `<binary dir>/generated/ShaderAbi.gen.inc.h`. Adding or reordering a field in either declaration and not
   the other is then a compile error naming the field — which is what `vulkan_renderer_notes.md`
   §4.67 did not have, and it cost two sections (three knobs silently stuck on, and a lost device).
   A hand-written `offsetof` cannot replace it: a permutation preserves `sizeof` and every assert
