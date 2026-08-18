@@ -284,7 +284,7 @@ Pattern: store original as function pointer, attach hook in constructor, detach 
 | `src/List.h` | `List<T>` / `List_Member<T>` / `List_Member_Base<T>` — layout mirror of AvP's `list_tem.hpp`, with sentinel-safe `begin()`/`end()` |
 | `src/HashTable.h` | `HashTableBase<T>` / `HashTable<T>` — layout mirror of AvP's `Hash_tem.hpp`, with bucket-walking `begin()`/`end()` |
 | `src/Memory.h/cpp` | `pool_alloc`/`pool_free` and the `pool_unique_ptr`/`pool_string` ownership markers |
-| `src/Json.h/cpp` | `gk::json::Classify` / `Quote` / `Envelope` / `OpenEnvelope` — the two queues' JSON. This file owns the `{kind, body}` envelope's *shape*; the vocabulary of kinds is `ScriptQueue.cpp`'s. **The codec is QuickJS** (`JS_ParseJSON` / `JS_JSONStringify`) on a **private `JSRuntime` behind a lock**, because this runs on both game threads and the host's runtime may only be used from one. No modules and no scripts in it, so nothing there is observable from a script. See the `JS_UpdateStackTop` rule in the QuickJS conventions — sharing the runtime across threads disarms its stack guard. Everything in it is UTF-8; codepages are `Encoding.h`'s job. Also `json::Document`, a tree that can be read and written **by dotted path** — which the queues do not need and `src/Settings` does, because it has to update one key of a file whose other sections belong to somebody else's mod |
+| `src/Json.h/cpp` | `gk::json::Classify` / `Quote` / `Envelope` / `OpenEnvelope` — the two queues' JSON. This file owns the `{kind, body}` envelope's *shape*; the vocabulary of kinds is `ScriptQueue.cpp`'s. **The codec is QuickJS** (`JS_ParseJSON` / `JS_JSONStringify`) on a **private `JSRuntime` behind a lock**, because this runs on both game threads and the host's runtime may only be used from one. No modules and no scripts in it, so nothing there is observable from a script. See the `JS_UpdateStackTop` rule in the QuickJS conventions — sharing the runtime across threads disarms its stack guard. Everything in it is UTF-8; codepages are `Encoding.h`'s job. Also `json::Document`, a tree that can be read and written **by dotted path** — which the queues do not need and `src/Settings` does, because it has to update one key of a file whose other sections belong to somebody else's mod. Every step of that walk is an **own**-property lookup (`GetOwnStr`/`HasOwnStr`): the nodes are ordinary JS objects and therefore inherit `Object.prototype`, so a `JS_GetPropertyStr` walk found `toString` and `constructor` as document members |
 | `src/Encoding.h/cpp` | `Utf8FromGameText` / `GameTextFromUtf8` — CP_ACP ↔ UTF-8 via `MultiByteToWideChar`/`WideCharToMultiByte`. **The script queue's edges.** Everything the engine holds in a `char *` is ANSI (a `.gls` is read as bytes; `fopen` reads the codepage) and JSON is UTF-8, so a name is transcoded on the way into a payload and back on the way to `ExecuteCommandFile`. A conversion that fails returns its input unchanged |
 | `src/Varint.h` | Variable-length integer encode/decode utility (currently no callers) |
 
@@ -449,8 +449,35 @@ so there is nothing inside the file for it to lose to.
 description of a launch — settings, scripts and mods — rather than a bag of settings beside a
 hardcoded script.
 
+**Scripts see the document itself, not a copy** (`src/JsSettings.cpp`). `settings` is an object
+tree — `settings.mymod = {window: {x: 10}}`, then `settings.mymod.window.x = 40` — where reading an
+object subtree hands out a node bound to its path and every write goes straight into
+`json::Document`. It is not a convenience over the old four dotted-path calls but the reason they
+existed: a plain object parsed once would be a *second* truth, and the Advanced Graphics page writes
+`core.render.*` from the front end while a script holds the same object. Nothing cached means
+nothing to reconcile. The dotted-path `get`/`set`/`remove` stay on the root because `set` creates
+intermediate objects and `settings.a.b = 1` cannot; an array is a leaf and is handed out **frozen**,
+since its elements are not addressable by path and a `push` would otherwise vanish.
+
+**Nobody calls `save()`.** `SaveSettled()` runs from the script host's per-frame hook and writes
+once a change has sat still for a second (with a fifteen-second cap, so a script writing every frame
+still gets saved), and `SaveIfDirty()` runs first thing in `DllMain(DLL_PROCESS_DETACH)`. The
+per-frame one is the load-bearing half, and that ordering is measured rather than cautious: exiting
+Gunlok faults (`game_defects_notes.md` §4), which is why `vfs`'s temp-tree cleanup on the way out
+never ran once. Both halves were verified in the running game — a change reaches the disk ~1.25 s
+later and survives a `Stop-Process` that skips detach entirely, and the detach flush lands on a
+console `QUIT` because it is placed *ahead of the first destructor*, which is the part §4's rule is
+really about (`vfs::Shutdown` ran from a destructor mid-aggregate, the position that loses).
+
 Loading is lazy and once, on first access. Saving writes a temporary and moves it over the target,
 because a half-written file would take every other owner's section with it.
+
+`json::Document`'s walk is **own-property-only** (`GetOwnStr`/`HasOwnStr` in `src/Json.cpp`), which
+was a live defect and not a precaution: the tree is ordinary JS objects, so every node inherits
+`Object.prototype`, and a `JS_GetPropertyStr` walk made `settings.hasOwnProperty` resolve to a
+subtree node, `set("constructor.x", 1)` write into `Object` itself, and `remove("core.toString")`
+report a deletion it had not made. JSON has no prototypes, so an inherited key is never part of a
+document.
 
 ### Building game objects (`src/MakeRole`, `src/JsMake.cpp`, `src/JsGls.cpp`)
 
@@ -633,7 +660,7 @@ reference. Test invocations are under "Running the test suites" above.
 | `src/Profiler.h/cpp` | The CPU profiler: the per-thread event rings, the frame ring, the sampling thread and the Chrome-trace writer. **Touches no game memory** — it is clock, rings and Win32 thread APIs — so it is one of the few `src/` files a harness could exercise. See "The profiler" above |
 | `src/Repl.h/cpp` | The loopback JavaScript REPL: `StartRepl` / `PumpRepl` / `StopRepl`, owned by `BootScriptHost` rather than by `Subsystems` (it installs no detour). Off unless `GKPLUS_REPL_PORT` is set; `=0` binds an ephemeral port and publishes it to `GKPLUS_LAUNCHER_HWND`, which is how a launcher gets one without racing for it. Also `NotifyRepl` — the **backchannel**, an unsolicited `{event, data}` line a script pushes to every connected client (`repl.notify` in JS, `src/JsRepl.cpp`), which is what makes something that *happens between two polls* observable from outside. A reply always carries `ok` and a notification never does: that is the whole rule a client needs. See "The REPL channel" above |
 | `src/Profile.h/cpp` | Where a launch is configured from: `GKPLUS_PROFILE` or `gkplus` beside `d3d8.dll`, plus the join that resolves a settings key naming a file against it. **Touches no game memory and reads no file**, so it is safe from `DllMain` and harness-testable. It is also the one place that knows the DLL's own directory — `src/Settings` and `src/Script` both used to work it out for themselves. See "The profile" above |
-| `src/Settings.h/cpp` | `<profile>\settings.json` — the shared settings repository. Typed get/set over a dotted path, lazy load, atomic save. **Touches no game memory**, so it is harness-testable; the tree is `json::Document`, and unknown top-level sections survive a rewrite by design. Also where `core.boot` and `core.script` say what runs. See "Settings" above |
+| `src/Settings.h/cpp` | `<profile>\settings.json` — the shared settings repository. Typed get/set over a dotted path, `KindAt`/`Keys` for the script-facing tree to walk, lazy load, atomic save, and the two save-without-being-asked entry points (`SaveSettled` per frame, `SaveIfDirty` at detach). **Touches no game memory**, so it is harness-testable; the tree is `json::Document`, and unknown top-level sections survive a rewrite by design. Also where `core.boot` and `core.script` say what runs. See "Settings" above |
 | `src/Session.h/cpp` | `StartLevel` / `QueueLevelStart` / `QueueReturnToMainMenu` — a level start with no menus and no briefing, deferred to the message loop. Installs no detour and has no `*System`: it registers `SetMessageLoopCallback` on first use. See "Starting a level programmatically" above |
 | `src/Font.h/cpp` | The engine's text layer: `GetFont` / `LineHeight` / `QueueText`, and `VersionTextSystem`. `Font` is deliberately left **incomplete** - its 0xb18 layout is measured but nothing here needs a field out of it, and an unchecked mirror would only go stale. See "The text queue and the version stamp" above |
 | `src/InputFix.h/cpp` | `InputFixSystem` - hook-only. Detours `AcquireDInputDevice` to suppress the vestigial DirectInput keyboard acquire and its `WH_KEYBOARD_LL` hook (see `input_notes.md`) |

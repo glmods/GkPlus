@@ -2315,7 +2315,12 @@ declare module "gk" {
   // --- settings ----------------------------------------------------------------
 
   /** `<profile>\settings.json` - one JSON file for anything that has to outlive
-   *  a launch, **shared** rather than GkPlus's own.
+   *  a launch, **shared** rather than GkPlus's own, and read and written as an
+   *  ordinary object:
+   *
+   *      settings.mymod = {window: {x: 10, y: 20}};   // a section of your own
+   *      settings.mymod.window.x = 40;                // in the document at once
+   *      if (settings.core.render.ao) { ... }          // what the menus see too
    *
    *  The top level is one object per owner: GkPlus keeps its settings under
    *  `core`, and a mod takes a key of its own beside it. Nothing knows anybody
@@ -2328,6 +2333,23 @@ declare module "gk" {
    *        "mymod": { "anything": [1, 2, 3] }
    *      }
    *
+   *  **Nothing is a copy and nothing needs saving.** Reading a property goes to
+   *  the store and writing one goes straight through, so there is no snapshot to
+   *  push back and nothing can go stale - the front end's Advanced Graphics page
+   *  writes `core.render.*` while your script holds this object, and both see the
+   *  same value. The file catches up on its own: a change is written about a
+   *  second after the last one settles, and again when the game exits. `save()`
+   *  is only for something that must survive a *crash*.
+   *
+   *  Two limits, both of which throw rather than doing nothing quietly:
+   *
+   *   - **A key cannot contain a dot.** Keys are the path separator, so
+   *     `settings["my.mod"]` would mean `mod` inside `my`. Such a key reads as
+   *     absent and refuses to be written.
+   *   - **An array is a value, and the one you get back is frozen.** Its elements
+   *     are not addressable, so `list.push(x)` would have nowhere to go; assign a
+   *     whole array instead. (Objects *inside* an array are frozen too.)
+   *
    *  Two `core` keys decide **what runs**, both resolved against the profile
    *  directory and both defaulting to the name above. `core.boot` is evaluated
    *  inside `WinMain` before the engine reads an asset, which is what makes it
@@ -2335,40 +2357,39 @@ declare module "gk" {
    *  the front end is up. Either may be `""` to turn that phase off, and a
    *  missing file is not an error. Which directory all of this lives in is
    *  `GKPLUS_PROFILE`, so two profiles are two directories.
-   *
-   *  Paths are dot-separated, so a key containing a dot cannot be addressed.
-   *  Values cross as JSON: anything `JSON.stringify` accepts can be stored, and
-   *  `undefined` is refused rather than silently doing nothing.
-   *
-   *  `set` is in memory; `save` is what reaches the disk, and it writes to a
-   *  temporary and moves it over the target so a failed write cannot take
-   *  another owner's section with it.
-   *
-   *      const w = settings.get("mymod.window", { x: 0, y: 0 });
-   *      settings.set("mymod.window", { x: 10, y: 20 });
-   *      settings.save();
    */
-  export interface Settings {
-    /** The value at `path`, or `fallback` (undefined by default) when there is
-     *  nothing there. A fresh value each call - the store's own tree is never
-     *  handed out, so mutating the result changes nothing. */
+  export interface SettingsMembers {
+    /** The value at a dot-separated `path`, or `fallback` (undefined by default)
+     *  when there is nothing there. Worth reaching for over the tree when you
+     *  want a default in the same breath: `settings.get("mymod.window", {})`. */
     get<T = unknown>(path: string): T | undefined;
     get<T>(path: string, fallback: T): T;
-    /** Stores `value` at `path`, creating intermediate objects. In memory only;
-     *  call `save()` to write the file. Throws for a value with no JSON form. */
+    /** Stores `value` at a dot-separated `path`, **creating every intermediate
+     *  object**. That is what it is still here for: `settings.a.b = 1` needs `a`
+     *  to exist, exactly as it would for any object, while
+     *  `settings.set("a.b", 1)` does not. Throws for a value with no JSON form. */
     set(path: string, value: unknown): void;
-    /** Whether there was anything at `path` to remove. */
+    /** Whether there was anything at `path` to remove. `delete settings.a.b`
+     *  does the same thing for a path you can reach. */
     remove(path: string): boolean;
-    /** Writes the whole document out. False if the file could not be replaced. */
+    /** Writes the file now. Only needed for a change that must survive a crash -
+     *  otherwise it happens by itself. False if the file could not be replaced. */
     save(): boolean;
-    /** Re-reads from disk, discarding anything set since the last save. */
+    /** Re-reads from disk, discarding anything written since the last save. */
     reload(): boolean;
-    /** The whole document, as a snapshot. Mutating it changes nothing. */
+    /** The whole document as a plain **detached** object - the tree itself is the
+     *  live view, so this is for a copy that will not change under you. */
     readonly all: Record<string, unknown>;
     /** Where the file is, with forward slashes: `<profile>/settings.json`,
      *  where the profile is `GKPLUS_PROFILE` or `gkplus` beside `d3d8.dll`. */
     readonly path: string;
   }
+
+  /** The document itself, plus the members above. Any key is readable and
+   *  writable; an object subtree hands back another live view of it, and anything
+   *  else is a value. A section whose name collides with one of the members
+   *  above shadows it, so keep to a key of your own. */
+  export type Settings = SettingsMembers & { [section: string]: any };
 
   // --- the Vulkan renderer ---------------------------------------------------
 

@@ -294,6 +294,11 @@ void CallSetupMenus(JSContext *ctx) {
 void OnFrame() {
   PumpJobs();
   PumpRepl();
+  // After both, so a write either of them just made starts its settling delay
+  // from this frame. This is where a change to `settings` reaches the disk
+  // without a script asking - see src/Settings.h for why it is here rather than
+  // only at DLL detach.
+  settings::SaveSettled();
 }
 
 void OnOverlayDraw() {

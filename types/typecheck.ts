@@ -30,6 +30,7 @@ import gk, {
   units,
   mods,
   render,
+  settings,
   world,
 } from "gk";
 // @ts-expect-error - `menus` is not an export: it is only setup_menus'
@@ -716,6 +717,39 @@ if (mods["20-tweaks.zip"] !== undefined) {
 mods[0] = { name: "x", path: "y", archive: true, priority: 0 };
 // @ts-expect-error - `served` is a count the host owns
 mods.served = 0;
+
+// --- settings ------------------------------------------------------------------
+//
+// The document read and written as an object, plus the members on the root.
+
+settings.mymod = { window: { x: 10, y: 20 }, list: [1, 2, 3] };
+settings.mymod.window.x = 40;
+const settingsWindowX: number = settings.mymod.window.x;
+const settingsAo: boolean = settings.core?.render?.ao ?? false;
+delete settings.mymod.list;
+const settingSections: string[] = Object.keys(settings);
+for (const section of settingSections) {
+  const value: unknown = settings[section];
+}
+
+// The dotted-path half: a fallback in the same breath, and the only way to
+// create a path whose intermediate objects do not exist yet.
+const settingWindow = settings.get("mymod.window", { x: 0, y: 0 });
+const settingWindowY: number = settingWindow.y;
+const settingUnknown: unknown = settings.get("mymod.nothing");
+settings.set("mymod.a.b.c", 7);
+const settingRemoved: boolean = settings.remove("mymod.a");
+const settingsSaved: boolean = settings.save();
+const settingsReloaded: boolean = settings.reload();
+const settingsPath: string = settings.path;
+const settingsAll: Record<string, unknown> = settings.all;
+
+// @ts-expect-error - `path` is where the file is, not something to move it
+settings.path = "C:/elsewhere/settings.json";
+// @ts-expect-error - `all` is a detached copy; write through the tree instead
+settings.all = {};
+// @ts-expect-error - a path is a string, not a key array
+settings.get(["mymod", "window"]);
 
 // --- the Vulkan renderer's material override ---------------------------------
 

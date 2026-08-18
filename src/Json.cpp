@@ -7,6 +7,7 @@
 
 #include <quickjs.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -109,6 +110,32 @@ std::string StringifyAndFree(JSContext *ctx, JSValue value) {
   return out;
 }
 
+// Which of the seven shapes a value already in hand has. `undefined` maps to
+// Invalid, which is the right answer for both callers: for Classify nothing can
+// parse to it, and for Document::KindAt a missing key and a value JSON cannot
+// express are the same thing.
+Kind KindOfValue(JSValueConst v) {
+  if (JS_IsString(v)) {
+    return Kind::String;
+  }
+  if (JS_IsNull(v)) {
+    return Kind::Null;
+  }
+  if (JS_IsBool(v)) {
+    return Kind::Bool;
+  }
+  if (JS_IsNumber(v)) {
+    return Kind::Number;
+  }
+  if (JS_IsArray(v)) {
+    return Kind::Array;
+  }
+  if (JS_IsObject(v)) {
+    return Kind::Object;
+  }
+  return Kind::Invalid;
+}
+
 } // namespace
 
 Kind Classify(const char *text, std::string *value) {
@@ -134,9 +161,8 @@ Kind Classify(const char *text, std::string *value) {
     return Kind::Invalid;
   }
 
-  Kind kind = Kind::Invalid;
-  if (JS_IsString(parsed)) {
-    kind = Kind::String;
+  Kind kind = KindOfValue(parsed);
+  if (kind == Kind::String) {
     if (value) {
       const char *decoded = JS_ToCString(ctx, parsed);
       if (decoded) {
@@ -147,16 +173,6 @@ Kind Classify(const char *text, std::string *value) {
         kind = Kind::Invalid;
       }
     }
-  } else if (JS_IsNull(parsed)) {
-    kind = Kind::Null;
-  } else if (JS_IsBool(parsed)) {
-    kind = Kind::Bool;
-  } else if (JS_IsNumber(parsed)) {
-    kind = Kind::Number;
-  } else if (JS_IsArray(parsed)) {
-    kind = Kind::Array;
-  } else if (JS_IsObject(parsed)) {
-    kind = Kind::Object;
   }
   JS_FreeValue(ctx, parsed);
   return kind;
@@ -328,6 +344,61 @@ std::vector<std::string> SplitPath(const char *path) {
   return steps;
 }
 
+// **An own property, never an inherited one.** Every walk below goes through these
+// two rather than JS_GetPropertyStr/JS_HasProperty, and it is not a refinement:
+// the tree is made of ordinary JS objects, so every node inherits
+// Object.prototype, and a step named `toString` or `constructor` would otherwise
+// resolve to a function nobody put in the document. That made `KindAt("toString")`
+// answer Object, `Set("constructor.x", ...)` write a property into Object itself,
+// and `Remove("core.toString")` report a deletion it had not made. JSON has no
+// prototypes, so an inherited key is never part of the document by definition.
+//
+// The value comes back **owned**; the walks free it immediately and keep
+// borrowing, exactly as they did before.
+JSValue GetOwnStr(JSContext *ctx, JSValueConst obj, const char *name) {
+  if (!JS_IsObject(obj)) {
+    return JS_UNDEFINED;
+  }
+  JSAtom atom = JS_NewAtom(ctx, name);
+  if (atom == JS_ATOM_NULL) {
+    ClearException(ctx);
+    return JS_UNDEFINED;
+  }
+  JSPropertyDescriptor desc;
+  const int found = JS_GetOwnProperty(ctx, &desc, obj, atom);
+  JS_FreeAtom(ctx, atom);
+  if (found <= 0) {
+    if (found < 0) {
+      ClearException(ctx);
+    }
+    return JS_UNDEFINED;
+  }
+  // A parsed JSON document holds nothing but plain data properties, so these two
+  // are always undefined; freeing them is what keeps that an assumption rather
+  // than a leak if it ever stops being true.
+  JS_FreeValue(ctx, desc.getter);
+  JS_FreeValue(ctx, desc.setter);
+  return desc.value;
+}
+
+bool HasOwnStr(JSContext *ctx, JSValueConst obj, const char *name) {
+  if (!JS_IsObject(obj)) {
+    return false;
+  }
+  JSAtom atom = JS_NewAtom(ctx, name);
+  if (atom == JS_ATOM_NULL) {
+    ClearException(ctx);
+    return false;
+  }
+  // A null descriptor asks only whether it is there (quickjs.c:9276).
+  const int found = JS_GetOwnProperty(ctx, nullptr, obj, atom);
+  JS_FreeAtom(ctx, atom);
+  if (found < 0) {
+    ClearException(ctx);
+  }
+  return found > 0;
+}
+
 // The container the last step lives in, or JS_UNDEFINED if any earlier step is
 // missing or is not an object. Borrowed - the caller must not free it.
 JSValue ParentOf(JSContext *ctx, JSValue root,
@@ -337,18 +408,36 @@ JSValue ParentOf(JSContext *ctx, JSValue root,
     if (!JS_IsObject(node) || JS_IsArray(node)) {
       return JS_UNDEFINED;
     }
-    JSValue next = JS_GetPropertyStr(ctx, node, steps[i].c_str());
-    if (JS_IsException(next)) {
-      ClearException(ctx);
-      JS_FreeValue(ctx, next);
-      return JS_UNDEFINED;
-    }
-    // Borrowed, so the reference JS_GetPropertyStr took has to go back; the
-    // parent still holds one, and the parent is alive for the whole walk.
+    JSValue next = GetOwnStr(ctx, node, steps[i].c_str());
+    // Borrowed, so the reference GetOwnStr took has to go back; the parent still
+    // holds one, and the parent is alive for the whole walk.
     JS_FreeValue(ctx, next);
     node = next;
   }
   return JS_IsObject(node) && !JS_IsArray(node) ? node : JS_UNDEFINED;
+}
+
+// The value at `path` itself rather than its container, borrowed on the same
+// terms as ParentOf. An **empty path is the root** here - the two callers are the
+// ones that may address it (see Document::KindAt) - while a malformed one is
+// JS_UNDEFINED, exactly like a missing key.
+JSValue NodeAt(JSContext *ctx, JSValue root, const char *path) {
+  if (!path || !*path) {
+    return root;
+  }
+  const std::vector<std::string> steps = SplitPath(path);
+  if (steps.empty()) {
+    return JS_UNDEFINED;
+  }
+  JSValue parent = ParentOf(ctx, root, steps);
+  if (JS_IsUndefined(parent)) {
+    return JS_UNDEFINED;
+  }
+  JSValue leaf = GetOwnStr(ctx, parent, steps.back().c_str());
+  // Borrowed: the reference GetOwnStr took goes back, and the parent holds one for
+  // as long as the caller's lock is held.
+  JS_FreeValue(ctx, leaf);
+  return leaf;
 }
 
 } // namespace
@@ -441,18 +530,54 @@ std::string Document::Get(const char *path) const {
   if (JS_IsUndefined(parent)) {
     return {};
   }
-  JSValue leaf = JS_GetPropertyStr(ctx, parent, steps.back().c_str());
-  if (JS_IsException(leaf)) {
-    ClearException(ctx);
-    JS_FreeValue(ctx, leaf);
-    return {};
-  }
+  JSValue leaf = GetOwnStr(ctx, parent, steps.back().c_str());
   // JSON cannot express undefined, so this is exactly "no such key".
   if (JS_IsUndefined(leaf)) {
     JS_FreeValue(ctx, leaf);
     return {};
   }
   return StringifyAndFree(ctx, leaf);
+}
+
+Kind Document::KindAt(const char *path) const {
+  Locked locked;
+  JSContext *ctx = locked.ctx();
+  if (!ctx || !root_) {
+    return Kind::Invalid;
+  }
+  return KindOfValue(NodeAt(ctx, *static_cast<JSValue *>(root_), path));
+}
+
+std::vector<std::string> Document::Keys(const char *path) const {
+  std::vector<std::string> out;
+  Locked locked;
+  JSContext *ctx = locked.ctx();
+  if (!ctx || !root_) {
+    return out;
+  }
+  JSValue node = NodeAt(ctx, *static_cast<JSValue *>(root_), path);
+  if (!JS_IsObject(node) || JS_IsArray(node)) {
+    return out;
+  }
+  JSPropertyEnum *tab = nullptr;
+  uint32_t len = 0;
+  if (JS_GetOwnPropertyNames(ctx, &tab, &len, node,
+                             JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0) {
+    ClearException(ctx);
+    return out;
+  }
+  out.reserve(len);
+  for (uint32_t i = 0; i < len; ++i) {
+    const char *key = JS_AtomToCString(ctx, tab[i].atom);
+    if (key) {
+      out.emplace_back(key);
+      JS_FreeCString(ctx, key);
+    } else {
+      ClearException(ctx);
+    }
+  }
+  JS_FreePropertyEnum(ctx, tab, len);
+  return out;
 }
 
 bool Document::Set(const char *path, const char *json) {
@@ -476,12 +601,7 @@ bool Document::Set(const char *path, const char *json) {
   // The walk creates as it goes, so it cannot use ParentOf.
   JSValue node = *static_cast<JSValue *>(root_);
   for (std::size_t i = 0; i + 1 < steps.size(); ++i) {
-    JSValue next = JS_GetPropertyStr(ctx, node, steps[i].c_str());
-    if (JS_IsException(next)) {
-      ClearException(ctx);
-      JS_FreeValue(ctx, next);
-      next = JS_UNDEFINED;
-    }
+    JSValue next = GetOwnStr(ctx, node, steps[i].c_str());
     if (!JS_IsObject(next) || JS_IsArray(next)) {
       JS_FreeValue(ctx, next);
       next = JS_NewObject(ctx);
@@ -515,15 +635,17 @@ bool Document::Remove(const char *path) {
   if (JS_IsUndefined(parent)) {
     return false;
   }
+  if (!HasOwnStr(ctx, parent, steps.back().c_str())) {
+    return false;
+  }
   JSAtom key = JS_NewAtom(ctx, steps.back().c_str());
-  const int had = JS_HasProperty(ctx, parent, key);
-  const int deleted = had > 0 ? JS_DeleteProperty(ctx, parent, key, 0) : 0;
+  const int deleted = JS_DeleteProperty(ctx, parent, key, 0);
   JS_FreeAtom(ctx, key);
-  if (had < 0 || deleted < 0) {
+  if (deleted < 0) {
     ClearException(ctx);
     return false;
   }
-  return had > 0;
+  return true;
 }
 
 } // namespace gk::json

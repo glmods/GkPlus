@@ -187,6 +187,19 @@ and never ran; the working mechanism is the startup sweep in `Vfs.cpp`, which
 removes any such directory whose pid is no longer alive. Prefer that shape — *clean
 up other people's leftovers on the way in* — over trusting the way out.
 
+**The detach handler itself does run on this exit, though — the fault is later.**
+Measured, and worth knowing before writing off the way out entirely:
+`settings::SaveIfDirty()` is the *first* statement of the `DLL_PROCESS_DETACH`
+branch, ahead of the `Subsystems` teardown, and a value written from the REPL a
+moment before a `console.execute("QUIT")` reaches the file. The measurement had to
+isolate it — `src/Settings`'s per-frame autosave would have written the same value
+for a different reason, so it was disabled for the run (both its thresholds raised
+to ten minutes) and confirmed absent from the file after five seconds before the
+QUIT was sent. So the rule is about *ordering* rather than about the handler being
+unreachable: work placed before the first destructor completes, and anything after
+a destructor that faults does not. `vfs::Shutdown()` ran from a destructor
+mid-aggregate, which is exactly the position that loses.
+
 ### Where to start if someone picks this up
 
 WER already wrote the dump; `cdb -z <dump> -c ".ecxr; k 40; q"` plus

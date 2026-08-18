@@ -121,8 +121,8 @@ tokens["score"] = 0;                                // upsert; actors/roles thro
 mods.mount_all();                                   // in a boot module: nothing mounts on its own
 for (const mod of mods) console.log(mod.priority, mod.name);   // what is mounted
 console.log(mods.served, mods.recent[0]);           // ... and what it actually served
-settings.set("mymod.window", {x: 10, y: 20});      // <profile>/settings.json, under a key of your own
-settings.save();                                   // set() is memory; save() is the file
+settings.mymod = {window: {x: 10, y: 20}};          // <profile>/settings.json, under a key of your own
+settings.mymod.window.x = 40;                       // a live view of the document, saved for you
 levels.add("Test Arena", arena);                    // `import * as arena` first
 levels.start("Test Arena", {difficulty: "hard"});   // no menus, no briefing
 
@@ -198,6 +198,43 @@ an upsert. The handler **throws** rather than returning false: quickjs hands an 
 false into the strict-mode TypeError the ordinary read-only path raises, so returning false would
 make `actors[1] = x` a silent no-op. Own properties resolve first (quickjs.c:10137 vs :10203), so
 `tokens.count = 5` hits the read-only accessor and cannot reach the table.
+
+**`settings` is the other exotic shape, and it is not a collection.** It shares the mechanism -
+`get_own_property` / `get_own_property_names` / `set_property` / `delete_property` on a class of its
+own - and nothing else: a node holds only the **dotted path of the subtree it stands for**, a read
+of an object subtree mints another node one level deeper, and a leaf is `JS_ParseJSON`d out of the
+store on the spot. So `settings` is a *view*, not a snapshot, and a write goes straight into
+`json::Document`.
+
+That is what makes the shape correct rather than merely nicer to use. The old surface was four
+dotted-path calls precisely because a JS object handed out here would have been a copy, and a copy
+is a second truth: the Advanced Graphics page writes `core.render.*` from the front end while a
+script holds the object, the REPL's context builds a `settings` of its own, and whichever wrote last
+would win the file. With nothing cached there is nothing to reconcile. The file itself catches up
+without a `save()` - `settings::SaveSettled()` from the host's per-frame hook once a change has sat
+still for a second, plus a flush at DLL detach (`src/Settings.h` has the ordering and why the
+per-frame one is the load-bearing half).
+
+Four decisions inside it are worth keeping:
+
+- **A key containing a dot reads as absent and refuses to be written.** The path *is* dots all the
+  way down to `json::Document`, so `settings["my.mod"]` would read `mod` inside `my` and write
+  there too. Both halves are deliberate and only the write throws, because a read reporting "no
+  such key" is the truth while a silent write to somewhere else is not.
+- **An array is a leaf, and the one handed out is deep-frozen.** Its elements are not addressable by
+  path, so there is nothing for `list.push(x)` to write through; freezing turns a vanishing write
+  into a TypeError, the same call `tokens` makes for a read-only collection. Modules are strict, so
+  it throws where a script will see it.
+- **The root keeps `get`/`set`/`remove`/`save`/`reload`/`path`/`all` as own, non-enumerable
+  properties.** `set` is not redundant: it creates intermediate objects, and `settings.a.b = 1`
+  cannot, exactly as it could not for any object. Own properties win over the exotic hooks, so a
+  top-level section named `save` shadows the method - the trade `actors.classes` already makes.
+- **The walk inside `json::Document` is own-property-only**, and that was a live defect rather than
+  a precaution: the tree is ordinary JS objects, so every node inherits `Object.prototype`, and
+  `JS_GetPropertyStr` made `settings.hasOwnProperty` resolve to a *node* (breaking every inherited
+  method), `Set("constructor.x", 1)` write into `Object` itself, and `Remove("core.toString")`
+  report a deletion it had not made. `GetOwnStr`/`HasOwnStr` in `Json.cpp` are the fix; JSON has no
+  prototypes, so an inherited key is never part of a document by definition.
 
 `Actor`/`Role` wrappers hold the **raw game pointer**, so a wrapper kept past its object's
 destruction reads recycled pool memory — `.valid` is the escape hatch, and `frag()`, `remove()` and

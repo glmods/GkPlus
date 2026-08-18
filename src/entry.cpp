@@ -20,6 +20,7 @@
 #include "RenderMenu.h"
 #include "Script.h"
 #include "ScriptQueue.h"
+#include "Settings.h"
 #include "WindowPlacement.h"
 
 #include <memory>
@@ -122,6 +123,15 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID) {
     Commit("attach");
 
   } else if (reason == DLL_PROCESS_DETACH) {
+    // First, before anything is torn down. A script assigns into `settings` and
+    // the document has the change immediately, with no save call (src/Settings.h),
+    // so this is where the file catches up - and per game_defects_notes.md 4 a
+    // fault in one destructor can stop the rest of the teardown, which is exactly
+    // what the launch's settings must not be hostage to. It costs nothing when
+    // nothing was written, and the store is independent of the script host's
+    // runtime, so it does not matter that the host is about to go away.
+    settings::SaveIfDirty();
+
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
     subsystems = nullptr;

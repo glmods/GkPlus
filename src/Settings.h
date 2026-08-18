@@ -1,6 +1,9 @@
 #pragma once
 
 #include <string>
+#include <vector>
+
+#include "Json.h"
 
 // `<profile>\settings.json` - one JSON file for anything that has to outlive a
 // launch, in the directory `GKPLUS_PROFILE` names (src/Profile.h).
@@ -29,6 +32,13 @@
 // exception in shape rather than in rule: it decides *which* file is read, so
 // there is nothing in the file for it to lose to.
 //
+// **Scripts see this document itself, not a copy** - `settings` in JS is an object
+// tree over the calls below, where every read and write goes straight through
+// (src/JsSettings.cpp). Nothing here is cached on that side, which is what keeps a
+// script and the front-end pages that write `core.render.*` from ever holding two
+// different answers. Nor does anything call Save(): SaveSettled() below does it
+// once a change settles.
+//
 // Loading is lazy and happens once, on the first access, because there is nothing
 // to read at DllMain: the file is found relative to this module and read with our
 // own CRT, but doing file I/O and a JSON parse under the loader lock buys nothing
@@ -51,6 +61,14 @@ std::string GetJson(const char *path);
 bool SetJson(const char *path, const char *json);
 bool Remove(const char *path);
 
+// What shape the value at `path` has, and what is in it if that is an object.
+// These are how the script-facing tree walks the document (src/JsSettings.cpp):
+// a subtree that is an object gets a live node, anything else is read as a value.
+// An empty path is the document itself - the one place that is meaningful, see
+// json::Document::KindAt.
+json::Kind KindAt(const char *path);
+std::vector<std::string> Keys(const char *path);
+
 // Typed convenience over the two above. A value of the wrong type reads as
 // absent rather than being coerced: a `true` where a number belongs is a mistake
 // in the file, and silently making it 1 would hide it.
@@ -72,6 +90,27 @@ std::string Text();
 // to a temporary and is then moved over the target, because a half-written file
 // would take every *other* owner's section with it.
 bool Save();
+// Save() only if something has been written since the last save or load, so that
+// calling it costs nothing for a launch that changed nothing. True means either
+// that there was nothing to do or that the write succeeded.
+bool SaveIfDirty();
+// The same, once a change has *settled*: dirty, and either nothing written for a
+// second or a run of writes going on for fifteen. Cheap enough to call every
+// frame, which is what the script host does (src/Script.cpp).
+//
+// **This, and not the flush at DLL detach, is what makes a change durable**, and
+// that ordering is measured rather than cautious: exiting Gunlok faults
+// (game_defects_notes.md 4), so DLL_PROCESS_DETACH is best-effort - `vfs`'s
+// temp-tree cleanup was written to run there and never ran once. The repo's rule
+// out of that is to prefer doing the work while the process is healthy, so a
+// settled write reaches the disk with the game still running and the flush on the
+// way out only covers a change made in the last few frames.
+//
+// The delay is what keeps a per-frame assignment - a window position dragged
+// across the screen - from being one file write per frame; the fifteen-second cap
+// is what keeps a script that writes *every* frame from deferring the save
+// forever.
+void SaveSettled();
 // Re-reads from disk, discarding anything set since the last save.
 bool Reload();
 

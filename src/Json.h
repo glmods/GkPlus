@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 // The script queue's JSON, in the two shapes the queue actually asks for (see
 // ScriptQueue.h for the format).
@@ -134,6 +135,20 @@ public:
 
   // The value at `path` as JSON text, or "" when any step of it is missing.
   std::string Get(const char *path) const;
+  // The kind of the value at `path`, and Kind::Invalid when there is nothing
+  // there - JSON has no undefined, so those are the same answer. Cheaper than
+  // Get for a caller that only wants to know whether a subtree is an object,
+  // since it neither stringifies the subtree nor parses it back.
+  //
+  // These two are the only operations for which an **empty path means the
+  // document itself** (always Kind::Object, listing the top level). Get, Set and
+  // Remove all refuse it, because there an accidental "" would read or replace
+  // the whole file; asking what kind the root is, or what is in it, is safe.
+  Kind KindAt(const char *path) const;
+  // The enumerable keys of the object at `path`, in insertion order. Empty when
+  // that is not an object - including when it is an array, whose indices are not
+  // addressable by path anyway.
+  std::vector<std::string> Keys(const char *path) const;
   // `json` must be one complete JSON document. Intermediate steps that do not
   // exist are created as objects, and one that exists but is not an object is
   // replaced by one - a path always wins over whatever was in its way.

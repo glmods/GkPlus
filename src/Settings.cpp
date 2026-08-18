@@ -35,6 +35,15 @@ bool ReadWholeFile(const char *path, std::string *out) {
 struct Store {
   json::Document doc;
   bool loaded = false;
+  // Whether anything has been written since the last Save or Reload, and when.
+  // These exist because the script-facing tree writes straight through
+  // (src/JsSettings.cpp), so there is no longer a save call to mark the end of a
+  // change: `dirty` is what keeps SaveIfDirty from rewriting the file on a launch
+  // that changed nothing, and the two stamps are what let SaveSettled tell "the
+  // script has finished changing things" from "it is still changing them".
+  bool dirty = false;
+  unsigned long long dirty_since_ms = 0; // the write that made it dirty
+  unsigned long long last_write_ms = 0;  // the most recent one
 };
 
 Store &TheStore() {
@@ -75,11 +84,40 @@ const std::string &Path() {
 
 std::string GetJson(const char *path) { return TheStore().doc.Get(path); }
 
+namespace {
+void MarkDirty(Store &store) {
+  const unsigned long long now = ::GetTickCount64();
+  if (!store.dirty) {
+    store.dirty = true;
+    store.dirty_since_ms = now;
+  }
+  store.last_write_ms = now;
+}
+} // namespace
+
 bool SetJson(const char *path, const char *json) {
-  return TheStore().doc.Set(path, json);
+  Store &store = TheStore();
+  if (!store.doc.Set(path, json)) {
+    return false;
+  }
+  MarkDirty(store);
+  return true;
 }
 
-bool Remove(const char *path) { return TheStore().doc.Remove(path); }
+bool Remove(const char *path) {
+  Store &store = TheStore();
+  if (!store.doc.Remove(path)) {
+    return false;
+  }
+  MarkDirty(store);
+  return true;
+}
+
+json::Kind KindAt(const char *path) { return TheStore().doc.KindAt(path); }
+
+std::vector<std::string> Keys(const char *path) {
+  return TheStore().doc.Keys(path);
+}
 
 bool Has(const char *path) { return !TheStore().doc.Get(path).empty(); }
 
@@ -133,6 +171,10 @@ bool Save() {
     return false;
   }
   const std::string text = TheStore().doc.Stringify(true);
+  // Cleared before the write rather than after it: a failure is reported and
+  // logged, and retrying it at every later save point would turn one diagnostic
+  // into one per call for a directory that is not going to become writable.
+  TheStore().dirty = false;
 
   // The profile directory normally exists (the scripts live there) but nothing
   // guarantees it - a GKPLUS_PROFILE naming a fresh directory is exactly how a
@@ -168,8 +210,24 @@ bool Save() {
   return true;
 }
 
+bool SaveIfDirty() { return !TheStore().dirty || Save(); }
+
+void SaveSettled() {
+  const Store &store = TheStore();
+  if (!store.dirty) {
+    return;
+  }
+  const unsigned long long now = ::GetTickCount64();
+  const bool settled = now - store.last_write_ms >= 1000;
+  const bool overdue = now - store.dirty_since_ms >= 15000;
+  if (settled || overdue) {
+    Save();
+  }
+}
+
 bool Reload() {
   Store &store = TheStore();
+  store.dirty = false;
   std::string text;
   if (Path().empty() || !ReadWholeFile(Path().c_str(), &text)) {
     // No file is not an error: it is the state before the first Save.
