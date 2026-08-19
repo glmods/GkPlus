@@ -632,7 +632,7 @@ payload. `actor.damage(amount, use_armor, attacker_team)` now exposes it, defaul
 
 `ApplyDamage` turned out not to be alone. Every slot declared in `src/Actors.h` was checked against
 the `RET` operand of the function the game actually puts in it, across all sixteen vtables — 1,460
-slot entries. **Nine declarations were wrong.**
+slot entries. **Ten declarations were wrong** — the ten rows below.
 
 The check is exact, which is what makes it worth doing. `__thiscall` is callee-clean: `this` rides
 in ECX and everything else is on the stack, so `RET n` states precisely how many bytes of arguments
@@ -640,8 +640,8 @@ the callee pops. A declaration that disagrees drifts ESP by the difference on ev
 
 | Slot | Declared | Actual | Corrected to |
 |---|---|---|---|
-| 20 `ApplyArmorDamage` | `()` | RET 0x4 | `(int)` |
-| 21 `ApplyShieldDamage` | `()` | RET 0x4 | `(int)` |
+| 20 `ApplyArmorDamage` | `()` | RET 0x4 | `(float amount)` |
+| 21 `ApplyShieldDamage` | `()` | RET 0x4 | `(float amount)` |
 | 27 `Stub27` | `()` | RET 0x4 | `(int)` |
 | 55 `OnPrePhysics` | `()` | RET 0xc | `(int, int, int)` |
 | 56 `PathToTarget` | `()` | RET 0x8 | `(Actor *target, float stop_range_sq)` |
@@ -668,7 +668,25 @@ Two false-positive sources are worth recording for anyone repeating this:
   both look wrong under a naive one-dword-per-parameter model and are in fact correct.
 
 Where an argument's purpose is unknown the declaration now uses `int` with a comment. The arity is
-measured; the type is not, and one dword is what the slot pops either way.
+measured; the type is not, and one dword is what the slot pops either way. Slots 20 and 21 are the
+exception and are no longer `int`: `MobileActor::ApplyDamage` pushes a literal `1.0f` through slot 20
+(`FILD 1` / `FSTP` / `MOVSS` onto the pushed slot @ 0x00535bcf-0x00535bec) and its own float `damage`
+through slot 21 (`PUSH [EBP+0x8]` @ 0x00535bad), so both are `float`.
+
+**The sweep was re-run after the slot 56 and slot 70 retypes and `src/Actors.h` is clean:
+1,460/1,460 slot entries agree with the `RET` operand of the body the game installs, with only the
+sixteen slot-0 destructors flagged by the exempt rule above.** It is a result worth stating because
+the check can fail: restoring this table's pre-fix declarations makes the comparison flag exactly
+these ten slots and nothing else — slots 20, 21, 27, 55, 56, 59, 65, 68 and 76 in all sixteen tables
+plus slot 86 in eight.
+
+**The residual disagreements are now in the Ghidra database, not in the mirror**, which inverts the
+usual assumption that the DB is the more accurate surface: 19 Actor-tree slot bodies carried
+signatures contradicting their own `RET` form, `Actor::ApplyDamage` @ 0x0052f3b0 among them — still
+`(float, bool)` there while its own `MobileActor` override @ 0x00535ac0 had all three parameters. All
+19 have been brought into line with the mirror, along with the matching `/GkPlus/Vtables/*` funcdefs.
+For an Actor slot the mirror and the DB now say the same thing; where they ever diverge again, the
+`RET` operand of the installed body — not either surface — is what settles it.
 
 ### 6.4 The same sweep on Role, Map and the GLS sections
 

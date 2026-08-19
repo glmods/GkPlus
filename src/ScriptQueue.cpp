@@ -58,6 +58,17 @@ FastCall<void, Actor *> AddInterfaceBeamVulnerability;
 // The two console commands whose script name never reaches a field, and the
 // respawn that builds one on the stack. All three are *replaced* rather than
 // wrapped, except CommandVulnerability, whose trampoline the sweep calls.
+//
+// Measured: **both console handlers take no arguments at all.** Each is `void(void)`
+// with a bare RET, and reads the already-parsed command out of the global console word
+// buffer @ 0x006af5f8 (`MOV ECX,0x6af5f8` @ 0x00448412 -> CopyRemainingArgs). ECX is
+// killed unread and EDX is never read, so the zero arity is measured rather than
+// assumed. These two declarations are kept as-is deliberately: a bare RET purges
+// nothing, so passing two ignored register arguments is ABI-harmless, and narrowing the
+// signatures would churn the hook shapes for no gain. What it does mean is that the
+// `length`/`args` that HookedCommandVulnerability forwards are **garbage the callee
+// ignores** - the parameter names describe nothing. Do not add a call site that relies
+// on them.
 FastCall<void, int, char *> CommandBatchAndBroadcast;
 FastCall<void, int, char *> CommandVulnerability;
 FastCall<void, char *, int, Vec3, Vec4> MultiplayerRespawnRole;
@@ -328,7 +339,12 @@ int LevelLoadReason() {
 }
 
 void EnterScriptsDirectory() {
-  FastCall<unsigned, int> fn;
+  // `bool`, not `unsigned`: 0x00466b80 sets **AL only** (`MOV AL,0x1` @ 0x00466b8c) and
+  // always succeeds, so the upper 24 bits of EAX are the pointer left behind by its
+  // `CALL 0x00466b70`. Declaring a 32-bit result would hand a caller 24 bits of stale
+  // EAX. The result must never be widened or tested - it is discarded here, which is
+  // why the old `unsigned` was inert rather than a live defect.
+  FastCall<bool, int> fn;
   GetObjectAtOffset(fn, 0x00466b80);
   fn(0); // GL_Scripts
 }

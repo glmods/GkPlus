@@ -38,19 +38,34 @@ adjacent but unrelated. GkPlus historically only knew about `Menus`.
 > was a guess. Only `nItems` @ 0x24 was right; the field it called `label` @ 0x18 is
 > actually `scrollOffset`.
 
-### Constructor — `Menu::Menu` @ `0x004f94f0`
+### Populate — `Menu::Populate` @ `0x004f94f0`
 
 ```c
-void __thiscall Menu::Menu(Menu *this, GL_RESOURCE_ID firstItemId, int nLabels,
-                           GL_RESOURCE_ID titleId);
+void __thiscall Menu::Populate(Menu *this, GL_RESOURCE_ID firstItemId, int nLabels,
+                               GL_RESOURCE_ID titleId);
 ```
+
+**This is not a constructor**, despite being named `Menu::Menu` here and in the Ghidra database
+until it was measured. It never initialises `Menu+0x00..0x0c` — it *consumes* the `List` header
+already sitting there:
+
+```
+MOV EAX,[ESI] ; MOV EAX,[EAX+0x8] ; MOV [ESI+0x10],EAX   ->  currentItem = sentinel->next
+MOV [ESI+0x14],ESI                                       ->  itemsOwner = this
+```
+
+Reading a sentinel's `next` is only meaningful if somebody else built the header, so this is a
+populate/setup pass over an already-constructed object. That is consistent with `Menus[36]` being
+a fixed `.data` array — nothing is allocated here — and with all eight call sites being inside
+`SetupMenus` (0x004e95f1, 963b, 9984, 9aa7, 9b3b, 9d88, 9d9e, 9db4).
 
 Resets the list cursor and, when `firstItemId != GL_START`, auto-appends `nLabels` plain
 items whose labels are `GetResourceString(firstItemId + 0)` .. `GetResourceString(firstItemId + nLabels - 1)`.
 This is why so many menus are declared with just a first-id and a count: their labels are a
-contiguous run in the string table.
+contiguous run in the string table. `titleId` goes to `Menu+0x20`; `Menu+0x24` is the running
+item count, zeroed on entry and incremented per item. Single exit, `RET 0xc`.
 
-The sentinel is **not** allocated here — it already exists when the constructor runs, so an
+The sentinel is **not** allocated here — it already exists when this runs, so an
 "empty" menu (`firstItemResourceId == GL_START`, `nItems == 0`) is one that `SetupMenus`
 only reset, to be filled in later at runtime.
 

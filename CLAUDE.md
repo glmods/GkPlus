@@ -974,9 +974,11 @@ section.
   The same test applies to **arity**, not just convention, and it is worth running in bulk: `RET n`
   states exactly how many bytes of arguments a `__thiscall` callee pops, so a declaration with the
   wrong parameter count drifts ESP by the difference. Sweeping all sixteen Actor vtables (1,460 slot
-  entries) against `src/Actors.h` found **nine wrong declarations** — see `console_command_notes.md`
+  entries) against `src/Actors.h` found **ten wrong declarations** — see `console_command_notes.md`
   §6.3 for the table and the two false-positive sources (slot 0's hidden destructor flag, and a
-  by-value `Vec3` being 12 bytes). Re-run it after adding any slot.
+  by-value `Vec3` being 12 bytes). All ten are fixed and the sweep is **clean at 1,460/1,460**, and
+  it is a check that can fail: restoring the pre-fix declarations makes it flag exactly those ten
+  slots. Re-run it after adding any slot.
 
   `RET n` gives you the argument *bytes*, not the parameter count or their shapes — a `Vec3*`
   plus three dwords and a by-value `Vec3` plus a `bool` are both 0x10. What discloses a by-value
@@ -1049,6 +1051,46 @@ section.
 - **No `static_assert` means nothing is pinning the layout.** Before trusting a GkPlus struct
   mirror, check it actually has one - `ParticleGenerator` and `Projectile` had none despite
   this file claiming otherwise.
+- **A signature census goes stale the moment a consolidator saves, and it goes stale in both
+  directions.** Re-derived from the live DB, an `undefined`-return population recorded as 5,909 in a
+  CSV measured **6,031**: 53 CSV rows were no longer `undefined`, **175 undefined functions were
+  absent from the CSV**, and at least one *name* was stale (0x00466b90 is
+  `SetCurrentDirectoryToGameRoot` in the DB and `SetCurrentDirectory` in the CSV). One of a round's
+  four "crisp defects" - `AiThink_Pathfinder` @ 0x004556d0 - was already `USER_DEFINED` and correct.
+  **Rank and name from the live database, not from a saved census file**, and treat a census as a
+  work-list rather than as evidence.
+- **Ghidra's Function ID analyzer leaves a signature-shaped hole that is not a defect.** When several
+  library functions share a base name - C++ template instantiations are the usual case - FID applies
+  the base name only and writes the candidate prototypes into a **plate comment**, leaving
+  `signatureSource == DEFAULT` and zero parameters. "0 parameters" then means *no prototype*, not a
+  wrong one. The rule: FID plate comment says *Multiple Matches With Same Base Name* **and**
+  `signatureSource == DEFAULT` → exclude. **609 functions binary-wide** match it; 27 of them also
+  have a `RET n`, which is what made them look like arity contradictions. They are UCRT
+  `__crt_stdio_output::output_processor<...>` instantiations, and their true prototype is already in
+  each plate comment. Never `setPlateComment` on one - it overwrites silently and that comment is
+  the only record of the candidate set.
+- **A byte-purge sweep cannot see a missing register argument.** A bare `RET` is equally consistent
+  with "N register arguments", "N stack arguments `__cdecl`", and "zero arguments", so comparing
+  declared argument bytes against the `RET` operand rules out ESP drift and rules out nothing else.
+  Two measured instances: `CommandBatchAndBroadcast` @ 0x00448400 and `CommandVulnerability`
+  @ 0x0044a600 take **no arguments at all** (they read the console word buffer from the global
+  0x006af5f8) while GkPlus declares both `FastCall<void, int, char *>` - ABI-harmless, but the
+  forwarded `length`/`args` are garbage; and `LightSet_Ctor` @ 0x00579a20 is `__fastcall` with
+  **zero** declared parameters, so neither its `this` nor its return exists in the decompiler's
+  output. Add a "does the entry read ECX/EDX before writing them" column to any such sweep.
+- **Four decompiler/model artifacts that each flipped a return-type verdict.** A **tail `JMP` is
+  recorded as a call reference**, so the instructions after it are unrelated code - this produced
+  every apparent EAX-reader of `ConsolePrint`, `PlayUiSound` and `RenderQueue_Submit`. A
+  last-EAX-write walk must **skip `__security_check_cookie` @ 0x005e46aa**, which preserves EAX -
+  that alone flipped three functions from "void" to their real return. `FILD` counts as reading ST0
+  in Ghidra's model (41 fake floating-point consumers on one function). `OR EAX,0xffffffff`
+  reads-and-writes (3 fake readers).
+- **Return-type WIDTH is a separate claim from the return type.** A function ending `MOV AL,1` or
+  `MOV AL,BL` leaves EAX[31:8] as residue from a preceding call, so it is `bool`/`char` and **not**
+  `int` - measured at 0x00466b80, 0x00466b90, 0x004e0980, and at Actor slots 57/58, where all eight
+  dispatch sites read only AL. The inverse holds for a *hook*: GkPlus must forward all 32 bits of
+  EAX, so a wrapper's return type stays `int` precisely because the game's is narrower. Both halves
+  are needed; either alone misleads.
 
 ### Ghidra MCP Mechanics
 

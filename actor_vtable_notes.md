@@ -122,8 +122,8 @@ recorded as a plate comment on each function.
 | 17 | 0x0054e650 | `HasCustomisationHierarchy` | false |
 | 18 | 0x0054e8c0 | `GetArmorValue` | `+0xf0` |
 | 19 | 0x0054ebd0 | `GetShieldValue` | global 0.0 |
-| 20 | 0x0054f280 | `ApplyArmorDamage` | no-op |
-| 21 | 0x0054f290 | `ApplyShieldDamage` | no-op |
+| 20 | 0x0054f280 | `ApplyArmorDamage(float)` | `RET 0x4` no-op; the argument is a float - `MobileActor::ApplyDamage` pushes a literal `1.0f` through it (`FILD 1`/`FSTP`/`MOVSS` @ 0x00535bcf-0x00535bec) |
+| 21 | 0x0054f290 | `ApplyShieldDamage(float)` | `RET 0x4` no-op; same caller pushes its own float `damage` (`PUSH [EBP+0x8]` @ 0x00535bad) |
 | 22 | 0x0054eb60 | `GetAmmoCount` | 100 |
 | 23 | 0x0054ebb0 | `GetField0x304` | 0 |
 | 24 | 0x0054eb70 | `GetNavAgent` | NULL - MobileActor returns the actor's `NavAgent` (nav-mesh movement/collision agent, `+0x200`; see `src/Actors.cpp`) |
@@ -175,8 +175,8 @@ Only the class that *introduces* the override appears here; its descendants inhe
 | 54 | 0x0054f4f0 | `SetField0x188(bool)` | `RET 4`, discards |
 | 55 | 0x0054f270 | `OnPrePhysics` | no-op |
 | 56 | 0x0054efa0 | `PathToTarget` | `RET 0x8` stub, arguments discarded; `MobileActor::PathToTarget` @ 0x00539930 is the real body - it calls `FindNavPathWithinRadius` @ 0x0052c100 and pushes the result through slot 90 (`navigation_notes.md` §5.4) |
-| 57 | 0x0052e0a0 | `Raycast` | ray/shape intersection |
-| 58 | 0x0052df50 | `SweepTest` | swept intersection |
+| 57 | 0x0052e0a0 | `bool Raycast(float *out_hit, Vec3 *from, Vec3 *to, float *nearest_inout)` | ray/shape intersection, `RET 0x10`. Returns **`bool` in AL** - true = hit - and all eight slot 57/58 dispatch sites consume it with `TEST AL,AL`. AL only: the body ends `MOV AL,BL`, so EAX[31:8] is residue from the preceding call and widening the return to `int` would be wrong. Branches on `entity->field_0x18` to 0x004619d0, else on `anim_object` to 0x00461cb0; false if both are absent |
+| 58 | 0x0052df50 | `bool SweepTest(float *out_hit, Vec3 *from, Vec3 *to, Vec3 *sweep, float *nearest_inout)` | swept intersection, `RET 0x14` - same `bool`-in-AL contract, one extra `Vec3 *`. Helpers 0x00461b20 / 0x00461ed0 |
 | 59 | 0x0054f4e0 | `OnDamageReceived` | no-op - see PickupActor, where the slot is really `SetPickupType` |
 | 60 | 0x0054f1a0 | `IsTargetable` | false |
 | 61 | 0x0054f250 | `IsVisible` | `+0x10d` |
@@ -346,8 +346,15 @@ impact by raycasting every candidate actor; slot 55 (`OnPrePhysics`) is the actu
 networking of its own beyond chaining to `Actor::Update`.
 
 Guided mode (`flags & 0x40`) blends the velocity direction toward the target over the first 20 ms.
-Slots 57/58 (`Raycast`/`SweepTest`) return 0, opting the projectile out of being hit itself -
-`PickupActor` does the same.
+Slots 57/58 (`Raycast`/`SweepTest`) return `false` in AL (`XOR AL,AL ; RET 0x10` / `RET 0x14`),
+opting the projectile out of being hit itself - `PickupActor` does the same, and those four stubs are
+the only overrides of the pair. The base implementations at 0x0052e0a0 / 0x0052df50 return `bool`,
+consumed by `TEST AL,AL` at all eight dispatch sites: slot 57 at 0x0054007c, 0x00542a10, 0x00542ea7
+and 0x00543286, slot 58 at the same four functions (`CharacterActor::Update`,
+`ProjectileActor::InitPositionAndTiming` and two sites in `ProjectileActor::OnPrePhysics`), which
+spill AL to a byte local before testing it. The caller's pattern is a nearest-hit query: on true it
+copies `*out_hit` over its own best-distance field (`ProjectileActor+0x158`, compared with `COMISS`
+@ 0x005430ce) and records the hit actor's `id`.
 
 ### TrackObjectActor - spline-driven moving geometry
 

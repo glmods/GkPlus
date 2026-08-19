@@ -12,9 +12,14 @@
 namespace gk {
 namespace {
 // The GLS parser's three reporters, all __cdecl varargs ending in a bare RET.
-// 0x00477000 genuinely returns int; the other two return void, which is harmless
-// through this signature because __cdecl is caller-clean and no caller of either
-// reads EAX.
+// **All three genuinely return `int`**, so this signature is correct rather than
+// merely harmless: the bodies are byte-identical apart from the counter they bump
+// (0x00739a38 for Fatal and Error, 0x00739a3c for Warning), and EAX on exit is
+// `___stdio_common_vsprintf`'s character count, which `__security_check_cookie`
+// preserves. Separately, and independently: no call site of any of the three reads
+// EAX (5 / 24 / 25 sites), so the value is also unobservable. The formatted text
+// itself goes into a 2048-byte stack buffer and is discarded - see
+// game_defects_notes.md on these reporters throwing their output away.
 CDeclVarargs<int, char *> PrintParseError;
 CDeclVarargs<int, char *> PrintParseWarning;
 CDeclVarargs<int, char *> PrintFatalError;

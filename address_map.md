@@ -330,7 +330,7 @@ all.
 | 0x004e95e0 | StdCall<void> | SetupMenus (reads FlagChooseLevel @ 0x006b0173 **once**, so the Choose Level item cannot be enabled after boot; `WinMain` sets that flag from `-chooselevel`) |
 | 0x004ecf10 | StdCall<void> | OnMenuItemClicked (action dispatch) |
 | 0x004fbfa0 | FastCall<void, MenuIndex, bool> | GoToMenu (ECX=target, DL=push parent) |
-| 0x004f94f0 | ThisCall<void, Menu*, unsigned, int, unsigned> | Menu::Menu (firstItemId, nLabels, titleId) |
+| 0x004f94f0 | ThisCall<void, Menu*, unsigned, int, unsigned> | Menu::Populate (firstItemId, nLabels, titleId) — **not** a constructor; was `Menu::Menu` |
 | 0x004f7a60 | ThisCall<void, Menu*, const char*> | Menu::AddItem (type 0) |
 | 0x004f7ae0 | ThisCall<void, Menu*, const char*, const char*, bool, bool> | Menu::AddValueItem (type 1) |
 | 0x004f7950 | ThisCall<void, Menu*, const char*, int*> | Menu::AddToggleItem (type 2) |

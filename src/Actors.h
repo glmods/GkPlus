@@ -41,10 +41,11 @@ static_assert(sizeof(Weapon) == 0x28);
 // "Function Calling Convention" in CLAUDE.md, which surfaces as an access
 // violation with EIP on the stack, nowhere near the call.
 //
-// Nine declarations were wrong and are fixed below. Where the argument's purpose
-// is not known it is `int` with a comment: the arity is measured, the type is
-// not, and one dword is what the slot pops either way. Slot 0 is exempt - MSVC's
-// scalar deleting destructor always takes a hidden `int flags`.
+// Ten declarations were wrong and are fixed below; the sweep is now clean at
+// 1,460/1,460 slot entries. Where the argument's purpose is not known it is `int`
+// with a comment: the arity is measured, the type is not, and one dword is what
+// the slot pops either way. Slot 0 is exempt - MSVC's scalar deleting destructor
+// always takes a hidden `int flags`.
 struct Actor {
   // 0x04 reference count. Retain is `INC [ESI+4]`; release is
   // `ADD [ECX+4],-1 ; JNZ ; CALL [vtbl+0]` with the scalar-delete flag, in
@@ -196,9 +197,13 @@ struct Actor {
   // 19  base out-params 0.0; CharacterActor returns shield_value (+0x2d0).
   virtual void GetShieldValue(float *) = 0;
   // 20  base no-op; CharacterActor destroys an armor piece, broadcast 0xa6/0xa8.
-  virtual void ApplyArmorDamage(int) = 0; // RET 0x4: one argument, purpose unknown
+  // The argument is a float: MobileActor::ApplyDamage @ 0x00535bcf-0x00535bec pushes
+  // a literal 1.0f (FILD 1 / FSTP / MOVSS onto the pushed slot) through this slot.
+  virtual void ApplyArmorDamage(float amount) = 0; // RET 0x4
   // 21  base no-op; CharacterActor destroys a shield piece, broadcast 0xa6/0xa7.
-  virtual void ApplyShieldDamage(int) = 0; // RET 0x4: one argument, purpose unknown
+  // Also a float: the same caller pushes its own `damage` argument
+  // (`PUSH [EBP+0x8]` @ 0x00535bad, a float) straight through this slot.
+  virtual void ApplyShieldDamage(float amount) = 0; // RET 0x4
   // 22  base returns 100; CharacterActor returns the real ammo count.
   virtual int GetAmmoCount() = 0;
   // 23  base 0; CharacterActor returns the cannot-fire gate (+0x304). Paired w/ slot 95.
@@ -269,10 +274,21 @@ struct Actor {
   //     and no contact normal anywhere in it; it was named OnCollisionResponse
   //     here until it was read.
   virtual void PathToTarget(Actor *target, float stop_range_sq) = 0; // RET 0x8
-  // 57  ray/shape intersection; Pickup/Projectile return 0 to opt out of being hit.
-  virtual void Raycast(int *, int, int, int *) = 0;
-  // 58  swept intersection; same opt-out as slot 57.
-  virtual void SweepTest(int *, int, int, int, int *) = 0;
+  // 57  ray/shape intersection. Returns bool in AL - true = hit, and every one of
+  //     the four dispatch sites does TEST AL,AL (0x0054007c, 0x00542a10,
+  //     0x00542ea7, 0x00543286). AL only: the body @ 0x0052e0a0 ends MOV AL,BL, so
+  //     EAX's upper 24 bits are garbage - never widen this to int. Pickup/Projectile
+  //     stub it XOR AL,AL to opt out of being hit. `out_hit` is written by the
+  //     callee, `nearest_inout` only read by it; both are floats by measurement -
+  //     ProjectileActor+0x158 is the caller-side nearest-so-far that receives
+  //     *out_hit and is compared with COMISS @ 0x005430ce. `from` is a Vec3 at
+  //     every site (&Actor::coords, or &CharacterActor::aim_direction); `to` is a
+  //     12-byte local, endpoint vs direction unmeasured.
+  virtual bool Raycast(float *out_hit, Vec3 *from, Vec3 *to, float *nearest_inout) = 0; // RET 0x10
+  // 58  swept intersection; same bool-in-AL contract and the same opt-out, plus one
+  //     extra Vec3 * before the nearest-so-far pointer.
+  virtual bool SweepTest(float *out_hit, Vec3 *from, Vec3 *to, Vec3 *sweep,
+                         float *nearest_inout) = 0; // RET 0x14
   // 59  base no-op; in PickupActor this slot is really SetPickupType.
   virtual void OnDamageReceived(int, int) = 0; // RET 0x8: two arguments
   // 60  base false; MobileActor: alive && +0x17c != a global sentinel.
@@ -314,8 +330,10 @@ struct Actor {
   // 69  base no-op; health-changed hook.
   virtual void OnHealthChanged() = 0;
   // 70  the per-tick update, and the only vtable slot ExecutorActorTick
-  //     @ 0x0052fad0 dispatches for work (displacement 0x118). Ten distinct
-  //     bodies across the sixteen tables. The base @ 0x0052f8a0 advances a
+  //     @ 0x0052fad0 dispatches for work (displacement 0x118). Eleven distinct
+  //     bodies across the sixteen tables (0x0052f8a0, 0x00533720, 0x0053d8d0,
+  //     0x00544460, 0x00546120, 0x00547520, 0x00549cd0, 0x0054a060, 0x0054a8f0,
+  //     0x0054b000, 0x0054d4c0). The base @ 0x0052f8a0 advances a
   //     timer, stores the 64-bit clock into +0xc8/+0xd0 and `now` into +0xd8,
   //     pushes the transform to anim_object and only then, guarded on
   //     position_set_, broadcasts update 0x6f - a tick that opportunistically
