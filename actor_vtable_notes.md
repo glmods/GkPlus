@@ -196,10 +196,17 @@ Only the class that *introduces* the override appears here; its descendants inhe
 | 75 | 0x0054f230 | `HasCustomAnimation` | false |
 | 76 | 0x0054f4d0 | `OnAnimationComplete` | no-op |
 | 77 | 0x0054f350 | `OnAnimationEvent` | no-op |
-| 78 | 0x00530270 | `SetTarget` | broadcast 0x56 |
-| 79 | 0x00530390 | `ClearTarget` | broadcast 0x57 |
-| 80 | 0x00530470 | `ChangeOwnerAndTeam` | broadcasts 0x58 + 0x50 |
-| 81 | 0x00530650 | `ReleaseFromOwner` | broadcasts 0x59 + 0x50 |
+| 78 | 0x00530270 | `SetTarget` | `RET 0x8`; `void(float now, float deadline)`, stored to `+0x20`/`+0x24`. Broadcast 0x56 |
+| 79 | 0x00530390 | `ClearTarget` | bare `RET`; `void(Actor *)`. Broadcast 0x57 |
+| 80 | 0x00530470 | `ChangeOwnerAndTeam` | `RET 0xc`; `void(float now, float deadline, int team_id)`, stored to `+0x28`/`+0x2c` plus the team via slot 33. Broadcasts 0x58 + 0x50. `TurretActor` @ 0x0054af80 is the **only** class overriding it in any of the sixteen tables - it forwards all three arguments verbatim (`CALL 0x00530470` @ 0x0054afa1) and then advances its own `+0x58/+0x5c` 64-bit think time if behind. The only dispatch site in the whole binary is 0x0053f78d |
+| 81 | 0x00530650 | `ReleaseFromOwner` | bare `RET`; `void(Actor *)`. Zeroes both floats and sets the team to the **literal 2** (`PUSH 2` @ 0x00530801) - an expiring override does not restore the previous team. Broadcasts 0x59 + 0x50. `TurretActor` @ 0x0054afe0 is the only override |
+
+**"Owner" in both slot names is unconfirmed.** Neither body touches an owner pointer, an
+inventory, an attachment, or any actor id other than `this->+0xc`: slot 80's only durable effects
+are `+0x28`, `+0x2c` and the team, and slot 81 zeroes the floats and sets team 2. That reads as a
+**timed team override and its expiry** (`BeginTeamOverride`/`EndTeamOverride`), but the rename was
+deliberately *not* applied - it would have to sweep the DB, `src/Actors.h`, `src/JsActors.cpp` and
+every notes file in one pass. Open item.
 | 82 | 0x005308d0 | `ActivateInWorld` | re-register in spatial/team structures, set flag 0x200 |
 
 > Slot 70 is the per-tick update, and it is `Update` in all ten of its distinct bodies. What each
@@ -221,9 +228,11 @@ Fields whose meaning was settled by reading the code that touches them, not by t
 | Off | Type | Meaning | What pins it |
 |---|---|---|---|
 | 0x04 | `int` | **reference count** | the retain/release pair in `AiBeginInvestigate` @ 0x0045e050: `INC dword ptr [ESI+0x4]` to retain, and on release decrement then call slot 0 with the scalar-delete flag when it reaches zero |
-| 0x24 | `float` | deadline in seconds firing **slot 79** (`ClearTarget`); 0.0 means disabled | `AiThink_Waiting` @ 0x00456bed - `MOVSS XMM0,[ESI+0x24]`, compared in seconds against the scaled clock, then `CALL [vtbl+0x13c]` |
-| 0x2c | `float` | deadline in seconds firing **slot 81** (`ReleaseFromOwner`); 0.0 means disabled | the same shape @ 0x00456c21 -> `CALL [vtbl+0x144]` |
-| 0x38 | `void (*)(Actor *, uint, int)` | the **on-placed hook**, called once from slot 51 (`InitPositionAndTiming`) @ 0x0052dd18 under a null guard, immediately after the nav-poly lookup. It is *not* a think proc - every `AIType` installs its per-tick proc into `+0x34`, and `ExecutorActorTick` reads neither field | `Actor_SetAiBehaviour` @ 0x00450610 is the only writer, and only for `AIType::Mine` (`Mine_OnDeployed` @ 0x0045a640) |
+| 0x20 | `float` | **start time** in seconds of the slot-78 target window, arg1 of `SetTarget`; pairs with `+0x24` | `MOV [ESI+0x20],ECX` @ 0x005302bc (from `[EBP+0x8]`), plus `MOVSS [EDI+0x20],XMM0` @ 0x0052d299 in `Actor::Ctor`. arg1 is a float via a typed sink - `StopAndBroadcast` @ 0x00539bd0 does `MOVSS XMM0,[EBP+0x8]` @ 0x00539bfb / `COMISS XMM0,[ESI+0x1e8]` @ 0x00539c00 |
+| 0x24 | `float` | deadline in seconds firing **slot 79** (`ClearTarget`); 0.0 means disabled | `AiThink_Waiting` @ 0x00456bed - `MOVSS XMM0,[ESI+0x24]`, compared in seconds against the scaled clock, then `CALL [vtbl+0x13c]`. Stronger still, `AiThink_Turret` does **arithmetic** on it: `MULSS XMM0,[EBX+0x24]` @ 0x00455ec4 - a multiply is better evidence of a float than a compare is |
+| 0x28 | `float` | **start time** in seconds of the slot-80 team override, arg1 of `ChangeOwnerAndTeam`; pairs with `+0x2c` | `MOV [ESI+0x28],EDX` @ 0x005304c0 (from `[EBP+0x8]`). Typed by the constructor: `Actor::Ctor` zeroes all four of `+0x20/+0x24/+0x28/+0x2c` with adjacent `MOVSS ...,XMM0` @ 0x0052d299/0x0052d2b0/0x0052d2c7/0x0052d2de, each a literal 0 widened through the FPU - an `int` field zeroed is `MOV dword ptr [EDI+off],0` |
+| 0x2c | `float` | deadline in seconds firing **slot 81** (`ReleaseFromOwner`); 0.0 means disabled. With `+0x28` it is the start and expiry of a **timed team override** | read by **seven think procs plus `Actor::Frag`**, all `MOVSS` + `UCOMISS`/`COMISS` - `AiThink_Bot` @ 0x004513a8, `AiThink_Scavenger` @ 0x00455799, `AiThink_Turret` @ 0x00455f0f, `AiThink_Waiting` @ 0x00456c21 (`CALL [vtbl+0x144]`), `AiThink_Minebot` @ 0x00456d3b, `AiThink_Node` @ 0x0045a94b, `AiThink_Swarm` @ 0x0045b6f9, `Actor::Frag` @ 0x0052e2d9. `AiThink_Turret`'s read is gated on `GameMode`(0x007b9e28) `>= 2` @ 0x00455f01-0d, mirroring the writer's own SP/Coop skip @ 0x0053f743 - which is itself evidence the two sites mean the same field. The **writer** side, long read as an int, is a bit-copy of a stack-passed float (`MOV [ESI+0x2c],EAX` @ 0x005304b4) doing no arithmetic, so it is type-agnostic; `ReleaseFromOwner` @ 0x00530696 clears it with an x87-produced float zero, which an int would not need |
+| 0x38 | `void (*)(Actor *, uint, int)` | the **on-placed hook**, called once from slot 51 (`InitPositionAndTiming`) @ 0x0052dd18 under a null guard, immediately after the nav-poly lookup. It is *not* a think proc - every `AIType` installs its per-tick proc into `+0x34`, and `ExecutorActorTick` reads neither field | `Actor_SetAiBehaviour` @ **0x00450550** is the only writer (the store itself is `MOV [ESI+0x38],0x45a640` @ 0x00450610, inside its `Mine` case - this row used to cite that instruction address as the function entry), and only for `AIType::Mine` (`Mine_OnDeployed` @ 0x0045a640) |
 | 0xd8 | `float` | game time in seconds of the current tick | written by the slot-70 base body @ 0x0052f91a from its third argument |
 | 0xdc | `float` | the `+0xd8` value as of the last state broadcast | @ 0x0052fa66, and by all four `MobileActor` motion broadcasters, each of which ends `+0xdc = +0xd8` |
 

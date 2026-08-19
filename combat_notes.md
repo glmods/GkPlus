@@ -605,6 +605,12 @@ vuln->role      == shooter->entity                      // Vulnerability+0x00
 && (vuln->vuln_role == NULL || vuln->vuln_role == the projectile Role)   // +0x04
 ```
 
+`Vulnerability` is 0x1c bytes: `+0x00 role` (`entity` in the DB), `+0x04 vuln_role`
+(`vuln_entity`), `+0x08 delay`, `+0x0c duration`, `+0x10 script`, `+0x14 type`,
+`+0x18 actor_scoped`. The two int fields at `+0x08` and `+0x0c` are easy to swap and the
+distinction is load-bearing here: the *delay* gates when the effect fires, the *duration* is what
+becomes the expiry handed to slot 78 / slot 80.
+
 On the first match it latches `Actor+0x100 = 1`, `Actor+0x104 = now`,
 `Actor+0x108 = now + vuln->delay` (+0x08, in seconds at this point) on the **shooter** and
 broadcasts `0x51` (16 bytes). When `now >= Actor+0x108` it re-walks and dispatches on
@@ -613,12 +619,21 @@ broadcasts `0x51` (16 bytes). When `now >= Actor+0x108` it re-walks and dispatch
 | type | effect |
 |---|---|
 | 0 `Shutdown` | `target->+0x34 = 0`; if slot 14 (`IsMoving`) stop the movement; if slot 7 (`IsAttacking`) call slot 98 `StopAttacking` |
-| 1 `Confusion` | SP/Coop: slot 78 `SetTarget(now, now + vuln->duration)`; MP: slot 80 `ChangeOwnerAndTeam(now, deadline, shooter_team)` |
+| 1 `Confusion` | SP/Coop: slot 78 `SetTarget(float now, float now + vuln->duration)`; MP: slot 80 `ChangeOwnerAndTeam(float now, float deadline, int shooter_team)`. The receiver of both is **`this->attack_target`** (`CharacterActor+0x2d8`, `MOV ECX,[EDI+0x2d8]` @ 0x0053f76e), not `this`. The duration is `Vulnerability+0x0c` (`duration`), **not** `+0x08` (`delay`) - the call site reads `[ECX+0xc]` @ 0x0053f74c and converts it with `FILD`/`FSTP` then `ADDSS` onto `now` @ 0x0053f755-66. The SP/Coop-vs-MP test is `GameMode <= 1` (`GameMode` @ 0x007b9e28; `TEST EAX,EAX`/`JZ` @ 0x0053f743 and `CMP EAX,1`/`JZ` @ 0x0053f747), so modes 2-5 take slot 80. The "two times and a team" reading is confirmed; the `int` typing of those two times was **not** - both are `float` seconds (`Actor+0x28`/`+0x2c`), see `actor_vtable_notes.md` |
 | 2 `Destroy` | slot 64 `Frag` on the target, then stop |
 | 4 `Script` | broadcast `0x62` (8 bytes) with the target id, then `QueueScriptExecution(vuln->script)` under `GL_Scripts`, `free` the string and null the field |
 
 `VulnerabilityType::Charm` (3) has **no case in this switch** - `Confusion` (1) is the one that
-carries the team change. Whether 3 is handled elsewhere is not established.
+carries the team change. Case 3 falls to the loop-continue at 0x0053f8ca, so **`Charm` is inert in
+the shipped build**.
+
+The shipped scripts say the same thing from the other side. Across `<Gunlok>\scripts\*.gcs`,
+`confusion`/`confuse` appears **zero** times while `charm` appears on **53 lines - every one of them
+commented out, and every one of them targeting a turret** (`//vulnerability Turret01 elint 5 charm
+interface_beam` and its siblings). Those commented-out lines are the developers' own statement that
+**turrets are the intended target** of this mechanic - which is the same actor set that runs
+`AiThink_Waiting` (AI type 20 Turret is one of its five installers), i.e. the only proc that reads
+the `Actor+0x2c` expiry the surviving `Confusion` path writes.
 
 Note the consequence for `src/ScriptQueue.cpp`: `Vulnerability::script` is consumed here, on the
 **main** thread inside slot 70, and the field is freed and nulled after the first fire - a

@@ -61,26 +61,42 @@ struct Actor {
   // entries are only pool-freed by ~Actor when `actor_scoped` is set (the
   // role-supplied ones stay owned by the Role).
   VulnerabilityList vulnerabilities; // 0x10
-  int field0x20;
-  // 0x24 a float deadline in seconds, 0.0 meaning "disabled". The AI timer
-  // @ 0x00456bed does `MOVSS XMM0,[ESI+0x24]`, compares it against the scaled
-  // clock, and fires vtable slot 79 when it has passed.
-  float slot79_deadline;
-  // 0x28/0x2c: written only by ChangeOwnerAndTeam (slot 80), which also puts
-  // them in its 0x58 update. The DB's name for that slot says "owner"; nothing
-  // measured here confirms it, so they keep the field0xNN convention. They are
-  // exposed because a team change has to preserve them - see JsActors.cpp.
+  // 0x20/0x24 and 0x28/0x2c are two pairs of the same shape: a start time and an
+  // expiry, both floats, both in seconds on the scaled clock, both with 0.0
+  // meaning "disabled". +0x20/+0x24 are written by slot 78 (`SetTarget`, arg1 ->
+  // +0x20 @ 0x005302bc, arg2 -> +0x24 @ 0x005302b0) and +0x24's expiry fires
+  // slot 79 (`ClearTarget`); +0x28/+0x2c are written by slot 80
+  // (`ChangeOwnerAndTeam`, arg1 -> +0x28 @ 0x005304c0, arg2 -> +0x2c
+  // @ 0x005304b4) and +0x2c's expiry fires slot 81 (`ReleaseFromOwner`). The AI
+  // timer `AiThink_Waiting` @ 0x00456bed/0x00456c21 does `MOVSS` + `UCOMISS`
+  // against `FloatZero` and the scaled clock for both deadlines.
   //
-  // **+0x2c has a second, conflicting reading and is deliberately left `int`.**
-  // The same AI timer reads it at 0x00456c21 as a float deadline driving vtable
-  // slot 81, exactly as it reads +0x24 above. Both observations are measured -
-  // one is a writer, one is a reader - and nothing has reconciled them. Retyping
-  // it to `float` would make JsActors.cpp's `ChangeOwnerAndTeam(field0x28,
-  // field0x2c, team)` round-trip convert numerically instead of preserving the
-  // bits, so the storage type stays as the writer needs it until the conflict is
-  // settled.
-  int field0x28;
-  int field0x2c;
+  // **+0x2c's long-standing conflict is settled: it is a `float`, and so is
+  // +0x28.** It is not a union and the two readings were never on disjoint actor
+  // sets. Three measurements pin the type:
+  //
+  //   * `Actor::Ctor` zeroes all four fields as float32 - four adjacent
+  //     `MOVSS [EDI+off],XMM0` at 0x0052d299/0x0052d2b0/0x0052d2c7/0x0052d2de,
+  //     each a literal 0 widened through the FPU. An `int` field zeroed is
+  //     `MOV dword ptr [EDI+off],0`.
+  //   * At slot 80's only dispatch site in the binary (0x0053f78d, the
+  //     `Confusion` MP branch) arg2 is produced by `ADDSS` - `now` plus the
+  //     vulnerability's duration converted with `FILD`.
+  //   * `ReleaseFromOwner` clears both with an x87-produced float zero
+  //     (0x00530696/0x00530699), which an int field would not need.
+  //
+  // What misled the earlier reading: slot 80's stores are *bit-copies* of
+  // stack-passed floats (`MOV [ESI+0x2c],EAX`) doing no arithmetic, which is
+  // exactly what MSVC emits for a `float` parameter stored unmodified - so they
+  // are type-agnostic and are not evidence of an int. The pair is the start and
+  // expiry of a **timed team override**, written only by slot 80 and cleared
+  // only by slot 81. They are exposed because a team change has to preserve them
+  // - see JsActors.cpp, whose round-trip is bit-exact only because these types
+  // and the slot-80 signature below moved together.
+  float slot78_start_time;
+  float slot79_deadline;
+  float slot80_start_time;
+  float slot81_deadline;
   float alarm_delay;          // 0x30
   int field0x34;              // 0x34 the AI think proc, per AIType
   // 0x38 an optional "on placed" hook, called as `hook(this, now_lo, now_hi)`
@@ -90,7 +106,8 @@ struct Actor {
   // ExecutorActorTick reads only vtable displacements 0x18/0x90/0xdc/0x118 and
   // never touches +0x34 or +0x38. The only installer in the shipped build is
   // AIType::Mine, which puts Mine_OnDeployed @ 0x0045a640 here
-  // (Actor_SetAiBehaviour @ 0x00450610).
+  // (Actor_SetAiBehaviour @ 0x00450550 - the entry; 0x00450610 is the store
+  // instruction inside its Mine case, which is what this used to cite).
   void(__thiscall *on_placed)(Actor *, unsigned now_lo, int now_hi);
   int field0x3c;              // 0x3c gates the team-list move - see JsActors.cpp
   void *attachment;           // 0x40 ref-counted; released by slot 52
@@ -356,12 +373,17 @@ struct Actor {
   virtual void OnAnimationComplete(int, int, int) = 0; // RET 0xc: three arguments
   // 77  base no-op; TrackObjectActor starts a leg of motion, broadcast 0xad/0xae.
   virtual void OnAnimationEvent() = 0;
-  // 78  set target, broadcast 0x56.
-  virtual void SetTarget(int, int) = 0;
+  // 78  set target, broadcast 0x56. Stores now -> +0x20 and deadline -> +0x24;
+  //     `now` is provably a float via a typed sink, StopAndBroadcast
+  //     @ 0x00539bd0, which does `MOVSS`/`COMISS` on it. RET 0x8.
+  virtual void SetTarget(float now, float deadline) = 0;
   // 79  clear target, broadcast 0x57.
   virtual void ClearTarget() = 0;
-  // 80  reassign owner+team, broadcast 0x58 then 0x50.
-  virtual void ChangeOwnerAndTeam(int, int, int) = 0;
+  // 80  reassign owner+team, broadcast 0x58 then 0x50. Stores now -> +0x28 and
+  //     deadline -> +0x2c; both are floats (see the field comments above). RET
+  //     0xc. `TurretActor` is the only class overriding it (@ 0x0054af80), and
+  //     it forwards all three arguments verbatim.
+  virtual void ChangeOwnerAndTeam(float now, float deadline, int team_id) = 0;
   // 81  release from owner, broadcast 0x59 then 0x50.
   virtual void ReleaseFromOwner() = 0;
   // 82  (re)register in the spatial/team structures, set flag 0x200; MobileActor

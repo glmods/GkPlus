@@ -680,6 +680,16 @@ the check can fail: restoring this table's pre-fix declarations makes the compar
 these ten slots and nothing else — slots 20, 21, 27, 55, 56, 59, 65, 68 and 76 in all sixteen tables
 plus slot 86 in eight.
 
+**Re-confirmed again after the slot 78 / slot 80 float retype.** Turning
+`SetTarget(int, int)` into `SetTarget(float, float)` and
+`ChangeOwnerAndTeam(int, int, int)` into `ChangeOwnerAndTeam(float, float, int)` changes no argument
+*bytes* — 0x8 and 0xc either way — so no `static_assert` moved and the sweep is **still clean at
+1,460/1,460**: 1,444 entries compared after the 16 exempt slot-0 rows, 249 distinct target
+functions, and all sixteen table bounds re-confirmed by the reference test (including
+`PresidentActor` @ 0x00669380 at **96** slots, which adjacency would have cut short). Slots 56
+`PathToTarget` and 70 `Update` hold their original 0x8 and 0xc across all eleven `Update` bodies.
+That is bookkeeping, not a new finding — the claim above stands unqualified.
+
 **The residual disagreements are now in the Ghidra database, not in the mirror**, which inverts the
 usual assumption that the DB is the more accurate surface: 19 Actor-tree slot bodies carried
 signatures contradicting their own `RET` form, `Actor::ApplyDamage` @ 0x0052f3b0 among them — still

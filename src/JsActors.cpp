@@ -648,8 +648,22 @@ JSValue ActorSetTeam(JSContext *ctx, JSValueConst self, int argc,
   //     sends. SetTeamID broadcasts nothing.
   //
   // Passing the actor's current +0x28/+0x2c back in is what keeps this a team
-  // change: those are the only other things the slot writes.
-  a->ChangeOwnerAndTeam(a->field0x28, a->field0x2c, team); // slot 80
+  // change: those are the only other things the slot writes. What those two
+  // fields *are* is now measured rather than unknown - they are the start and
+  // the expiry of a timed team override, both `float` seconds, written only by
+  // this slot and cleared only by slot 81 (`ReleaseFromOwner`). The round-trip
+  // below is bit-preserving because the field types and the slot-80 signature
+  // moved to `float` **together**; a future edit must not touch one without the
+  // other, or this line silently becomes a numeric conversion.
+  //
+  // Script-visible consequence of preserving a *pending* deadline: if the actor
+  // currently has a non-zero slot81_deadline, set_team() keeps that expiry, and
+  // when it fires the AI timer calls slot 81, which sets the team to the
+  // **literal 2** (`PUSH 2` @ 0x00530801) - overriding the team the script just
+  // chose. Passing 0,0 instead would cancel the override, which is different
+  // behaviour and not something this call should silently start doing; the
+  // behaviour is left as it is, and documented.
+  a->ChangeOwnerAndTeam(a->slot80_start_time, a->slot81_deadline, team); // slot 80
   return JS_UNDEFINED;
 }
 

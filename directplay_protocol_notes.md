@@ -457,16 +457,16 @@ and the producing function (name conveys semantics). `R` = sent reliably (guaran
 | `0x49` | 8 | `Delete` | delete actor |
 | `0x4d` | 9 | `Actor_FixupAfterLoad` @ `0x005317b0` | what a **restored** actor publishes: `{u32 0x4d, u32 actorId, u8 is_concealed}` (`MobileActor+0x186`), emitted only when `is_crouched` (`MobileActor+0x187`) is set. Unreliable |
 | `0x4f` | 25 | `EquipObject`, `OnPickedUp`, `SyncPositionAndBroadcast` | equip + position |
-| `0x50` | 12 | `ChangeOwnerAndTeam`, `CommandGiveControl`, `ReleaseFromOwner`, `SyncPositionAndBroadcast`, `ReapDroppedPlayers` | owner/team change `{actorId, newTeam}`; `ReapDroppedPlayers` emits one per actor it transfers off a dropped player's team, paired with `0x91` |
+| `0x50` | 12 | `ChangeOwnerAndTeam`, `CommandGiveControl`, `ReleaseFromOwner`, `SyncPositionAndBroadcast`, `ReapDroppedPlayers` | owner/team change, `{u32 id, u32 actor_id, u32 team}`; on the `ReleaseFromOwner` path the team is the **literal 2** (`PUSH 2` @ 0x00530801). `ReapDroppedPlayers` emits one per actor it transfers off a dropped player's team, paired with `0x91`. Note `CommandGiveControl` and `ReapDroppedPlayers` reach this **without** calling slot 80: they write `Actor+0xbc` and call slot 33 directly, so they are *not* writers of `Actor+0x28`/`+0x2c`. The only slot-80 dispatch in the binary is 0x0053f78d |
 | `0x51` | 16 | `EvaluateTriggers`, `SyncPositionAndBroadcast` | position (trigger-driven) |
 | `0x52` | 8 | `EvaluateTriggers` | trigger event |
 | `0x53` | 16 | `SyncPositionAndBroadcast` | position |
 | `0x54` | 8 | `SyncPositionAndBroadcast` | position (short) |
 | `0x55` | 12 | `SetHealth` | **set health** `{actorId, f32 health}` `R` (see §8.2) |
-| `0x56` | 16 | `SetTarget` | set attack target |
-| `0x57` | 8 | `ClearTarget` | clear target |
-| `0x58` | 20 | `ChangeOwnerAndTeam` | owner+team+extra |
-| `0x59` | 8 | `ReleaseFromOwner` | release from owner |
+| `0x56` | 16 | `SetTarget` | set attack target, `{u32 id, u32 actor_id, f32 now, f32 deadline}` - **no team field**. Buffer fills at `EBP-0x38` @ 0x005302bf/0x005302c6/0x005302c9/0x005302b3 |
+| `0x57` | 8 | `ClearTarget` | clear target, `{u32 id, u32 actor_id}` |
+| `0x58` | 20 | `ChangeOwnerAndTeam` | the **timed team override**: `{u32 id, u32 actor_id, u32 team, f32 now, f32 deadline}`. Measured from `EDX = 0x14` and the buffer fills at `EBP-0x48` (@ 0x005304c3 id, 0x005304ca actor_id, 0x005304d0 team, 0x005304cd `now`, 0x005304b7 `deadline`) - note **team precedes the two floats**. Both trailing dwords are `float` seconds (`Actor+0x28`/`+0x2c`) and no conversion happens anywhere on the send path, so the network image is the raw float bits. This row used to read "owner+team+extra" |
+| `0x59` | 8 | `ReleaseFromOwner` | release from owner, `{u32 id, u32 actor_id}`. Followed by an `0x50` carrying team = literal 2 |
 | `0x5a` | 12 | `MobileActor::AssignToTeamSlot` @ `0x00532d40` | **team-slot assignment / recruit**, `{u32 0x5a, u32 actorId, u32 team_slot}` `R`. Not CTF. It also sets `TeamSlots[n]+0xa0` and `+0x74`, calls `Actor` slot 26 `SetField0x18c`, and — for the role named `Hark` specifically — ORs `0x1000` into `nav_agent->traversal_flags` (`NavAgent+0x2c`), a character-specific nav capability grant |
 | `0x5b`-`0x5d` | 12 | `0x00532e80` / `0x00532fe0` / `OnFlagCaptured` | CTF/objective state updates; `0x5d` is **flag captured** `{actorId, playerIdx}` `R` |
 | `0x5f` | 60 | `MobileActor::AddWalkingSpeed` @ `0x00539ed0` | `{u32 0x5f, u32 actorId, s32 speed_delta, MotionSnapshot[0x30]}` `R`. **Never sent by the shipped binary** — the sender has no callers and no pointer to it exists anywhere in `.rdata`/`.data`, so it is not a vtable slot either |
@@ -1057,6 +1057,13 @@ Loopback queues, events, and thread details: see `threading_model_notes.md`.
     left there is the header/payload split — the `Vec3` those calls pass by value was read off the
     call shape, not out of `BroadcastToPlayers` — and whether `0x60`/`0x61` carry the same pair.
   - Update ids `0x3f`/`0x40` — the PROPOSED attack-position pair; see the end of §7.
+  - **How a receiving peer applies `0x58`.** The send side is now fully measured
+    (`{u32 id, u32 actor_id, u32 team, f32 now, f32 deadline}`, §7), but there is **no slot-80
+    call site anywhere in the binary for an incoming `0x58`** — the only dispatch through
+    `[vtbl+0x140]` in the whole image is 0x0053f78d, the local `Confusion` path in
+    `CharacterActor::Update`. So a peer receiving `0x58` must write `Actor+0x28`/`+0x2c` by some
+    other route, and that route was not located. Stated as an open question, not a finding: the
+    apply handler may be in the undefined-byte region of `ApplyUpdateMessage` noted above.
   - Command `0x17` — whether it is *give item* (`inventory_notes.md` §12) or *board*
     (`orders_notes.md` §8, kind 6, `QueueBoardOrder` @ `0x0050a2e8`). The two files disagree and
     the sender is agnostic; the executor arms `0x0050a22f` / `0x0050a2e8` settle it. What **is**
