@@ -72,6 +72,12 @@ constructor. `BlockerActor::Destructor` carried a bogus demangled
 `Concurrency::call<unsigned int, std::function<...>>::~call<...>` symbol. Neither name meant
 anything; both are examples of the "existing names are not evidence" rule.
 
+**And the pattern is not a one-off.** The *client* counterpart, `BlockerUnit::~BlockerUnit`
+@ 0x004cd620, carried the **same** stray `Concurrency::call<...>::~call<...>` symbol until the
+client `Unit` tree was named (`rendering_notes.md` §5.1) - so a bogus demangled template on a
+blocker destructor has now been seen in both trees, and "no name at all" is a better prior than a
+plausible-looking library one.
+
 ## Actor Factory / Storage
 
 `CreateActor` @ 0x00510760 dispatches on `role->ai` to the right subclass. Actors live in the hash

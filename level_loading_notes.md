@@ -742,21 +742,44 @@ Notes:
 `ServerSpawnActorForTeam` @ 0x005035b0 (executor thread) - coop remaps team 1 for the
 five named heroes based on `GetPlayerCount()`, then `CreateActor(team, role, pos, ori)`.
 
-`ClientSpawnActorForTeam` @ 0x004fce90 (main thread) - the client actor factory,
-switching on `role->ai` (`AIType`). Allocation sizes, which are the *client* mirror
-classes and differ from the executor-side sizes in `actor_vtable_notes.md`:
+`ClientSpawnActorForTeam` @ 0x004fce90 (main thread) - the client unit factory,
+switching on `role->ai` (`AIType`). The allocation sizes are the *client* `Unit` classes and are
+**not comparable** with the executor-side sizes in `actor_vtable_notes.md`. Every row's class is now
+pinned by **vtable slot 35, `GetSize()`** (`rendering_notes.md` §5.1):
 
-| AIType | size | | AIType | size |
-|--------|------|-|--------|------|
-| Bot / default | 0x2e0 | | Pickup | 0x150 |
-| default, `character->weapon == 0x21` | 0x238 | | BackgroundCreature | 0x178 |
-| Mine | 0x238 | | FlyingBackgroundCreature | 0x190 |
-| no character, no projectile | 0x130 | | Centipede / Centibody / Popup | 0x2e8 |
-| Blocker | 0x140 | | Node / NodeWaiting | 0x240 |
-| TrackObject | 0x1d0 | | President | 0x248 |
-| Tumbleweed | 0x148 | | Turret | 0x2f0 |
+| AIType | size | class | vtable | ctor |
+|--------|------|-------|--------|------|
+| no character, no projectile | 0x130 | `Unit` | 0x006647ac | 0x004b4620 |
+| Blocker | 0x140 | `BlockerUnit` | 0x00665df0 | 0x004cd570 |
+| Tumbleweed | 0x148 | `TumbleweedUnit` | 0x006650e4 | 0x004c8390 |
+| Pickup | 0x150 | `PickupUnit` | 0x00664e00 | 0x004c6d70 |
+| BackgroundCreature | 0x178 | `BackgroundCreatureUnit` | 0x00665254 | 0x004c9730 |
+| FlyingBackgroundCreature | 0x190 | `FlyingBackgroundCreatureUnit` | 0x006653cc | 0x004cb530 |
+| TrackObject | 0x1d0 | `TrackObjectUnit` | 0x00664f74 | 0x004c6f50 |
+| Mine, and default with `character->weapon == 0x21` | 0x238 | `MobileUnit` | 0x0066491c | 0x004ba050 |
+| Node / NodeWaiting | 0x240 | `NodeUnit` | 0x00665544 | 0x004cbb30 |
+| President | 0x248 | `PresidentUnit` | 0x00665f60 | 0x004cdfe0 |
+| Bot / default | 0x2e0 | `CharacterUnit` | 0x00664ac8 | 0x004c1100 |
+| Centibody / Centipede / Popup | 0x2e8 | `CentibodyUnit` / `CentipedeUnit` / `PopupUnit` | 0x006656f0 / 0x006658b0 / 0x00665a70 | 0x004cbb90 / 0x004cbc70 / 0x004cc4f0 |
+| Turret | 0x2f0 | `TurretUnit` | 0x00665c30 | 0x004cc9a0 |
 
-Actor id source is `NextClientActorId`.
+Three things that table used to obscure:
+
+- **0x238 and 0x2e0 are one inheritance chain, not two peers.** `CharacterUnit : MobileUnit`, so
+  the 0x2e0 object *is* a 0x238 object plus a weapon.
+- **`character->weapon == 0x21` means "unarmed".** 0x21 is the no-weapon sentinel in
+  `Character+0xac`, so the discriminator is armed-vs-unarmed, and 0x238 is **not** a mine-specific
+  class: `ai mine` lands there because a mine carries no weapon, alongside every other unarmed
+  character. `AIType` 1 Scavenger, 3 Minebot, 4 Reserved, 6 Waiting, 7 Pathfinder and 17 Swarm all
+  take the same default arm and have no dedicated class either.
+- **0x180 is absent from the table because `ProjectileUnit` is reachable from neither factory.** A
+  projectile role returns 0 here (`XOR EAX,EAX` @ 0x004fd397) and `CreateUnit` refuses it too; the
+  class is built only by `ApplyUpdateMessage` update `0x46` @ 0x004fec38 and by `LoadGame`
+  @ 0x00506373.
+
+Actor id source is `NextClientActorId`. The sibling factory `CreateUnit` @ 0x004fd450 is the
+**network** path (update `0x64`) and allocates the same set minus 0x180 — 17 sites, **13** distinct
+sizes; see `address_map.md`.
 
 ## 5.5 The navmesh: there isn't one
 
@@ -863,6 +886,16 @@ normal is normalized.
 **Bit 0x100 survives the `0x3fffc1` mask, so it is an authored blocker as well as the
 loader's slope verdict** - level01 sets it on 1,914 polygons by hand. That is the way to
 mark a face off-limits without moving geometry.
+
+**There is a third source, and it is at runtime: `BlockerUnit`.** The client class behind
+`ai blocker` (vtable 0x00665df0) toggles the bit on live nav polygons —
+`BlockerUnit::EnterWorld` @ 0x004cd680 calls `FindNavPolygonUnder` and does
+`OR dword ptr [EAX+0x14],0x100` @ 0x004cdb38, recording each polygon it touched in the
+`List<T>` at `BlockerUnit+0x130`, and slot 91 `BlockerUnit::Unblock` @ 0x004cdf10 walks that
+list clearing it (`AND ... 0xfffffeff`). Both halves hold `TheMap->lock` and both are skipped
+entirely when `IsExecutorRunning()`, so on a listen host only the client side does this. So a
+polygon's 0x100 at any given moment is authored **or** the loader's slope verdict **or** a
+blocker standing on it, and only the first two are in the `.map` sidecar.
 
 ### Adjacency
 

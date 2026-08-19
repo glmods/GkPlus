@@ -16,14 +16,21 @@ proximity volume, no noise-event bus, no fence collision primitive and no contai
 ### 1.1 What `ai mine` produces
 
 `CreateActor` @ 0x00510760, `case Mine:` -> `pool_alloc(0x230)` + `MobileActor::Ctor`. So on the
-**executor** side `ai mine` is a plain `MobileActor` (0x230). `level_loading_notes.md:690`'s
-"Mine 0x238" is the **client** mirror class under `ClientSpawnActorForTeam` @ 0x004fce90 and is
-also correct - the two trees are not comparable. Use `Actor::GetSize` (slot 35) as the size oracle
-in the executor tree.
+**executor** side `ai mine` is a plain `MobileActor` (0x230). `level_loading_notes.md` §7's
+"Mine 0x238" row is the **client** side under `ClientSpawnActorForTeam` @ 0x004fce90 and is also
+correct - the two trees are not comparable. Use `Actor::GetSize` (slot 35) as the size oracle in the
+executor tree; slot 35 is `GetSize` in the client tree too.
+
+**But 0x238 is not a mine-specific class on the client either.** It is `MobileUnit` (vtable
+0x0066491c), and `ai mine` lands there only because a mine carries no weapon: the discriminator is
+`character->weapon == 0x21`, the *no-weapon* sentinel, so `MobileUnit` is **shared** by `ai mine`
+and every other unarmed character. `CharacterUnit` (0x2e0) is what an armed one gets, and it derives
+from `MobileUnit` rather than sitting beside it. `rendering_notes.md` §5.1 has the whole 16-class
+tree.
 
 **`CreateActor`'s other mine-looking test is not about mines.** The `character->weapon == 0x21`
 arm (0x00510c80, and the same compare in `ClientSpawnActorForTeam`, `DoSpawn`,
-`CharacterActor::Ctor` @ 0x0053c83d, `Unit::Unit_Ctor_00664ac8` @ 0x004c1100, `CreateUnit`
+`CharacterActor::Ctor` @ 0x0053c83d, `CharacterUnit::CharacterUnit` @ 0x004c1100, `CreateUnit`
 @ 0x004fd450) is the **"no weapon"**
 sentinel: `CharacterActor::Ctor` initialises its own weapon slot `+0x2a4` to 0x21 at 0x0053c825,
 and `src/Roles.h` already records 33 as the unnamed "none". A weaponless character becomes a
@@ -200,6 +207,25 @@ Finally `vtbl+0x104` (slot 65) deletes the mine.
 ## 2. The decoy
 
 Two objects, and neither is a noise event.
+
+**Arming it is a client-side mode, and it has its own flag.** `ActivateGadgetOnSelection`
+@ 0x004a1670 walks `SelectedUnits` for an inventory entry with `[0x00] == 5` and `[0x20] == arg2` —
+pickup class 5 (minelayer) with a sub-type. Sub-type **3** is the decoy, and its arm
+(0x004a1769-0x004a178b) sets `DecoyTargetPending` @ 0x007b3f52 to 1, then prints
+`GetResourceString(GL_UITXT_DECOY_LOCATION)` to the console and calls
+`SetCursorMode(GroundTarget)`. Both cursor-mode cancels clear it beside `FlareModeActive`
+@ 0x007b3f51 (0x004a449e in `OnGroundTargetClick`, 0x004a44fd in `CancelGroundTargeting`).
+
+The next **ground click** is what fires it: `IssueMoveOrderToSelection` @ 0x0049f06f reads that
+byte and dispatches client `Unit` vtable slot **80**, `CharacterUnit::Unit_SendThrowDecoy`
+@ 0x004c4040, instead of the slot-75 move order — which sends command **`0x2b`**, 24 bytes
+`{0x2b, unit_number, f32 GetGameTimeSeconds, Vec3 pos}`, to `MobileActor::ThrowDecoy`
+@ 0x00541170.
+
+**A queued decoy click is silently dropped — a game defect.** With `queued` set (Active Pause, or
+shift-click) and the flag armed, the dispatch falls through `TEST AL,AL` / `JNZ 0x0049f0ce`
+@ 0x0049f0bb and issues *nothing*: no command, no message, and the flag stays armed. Only the
+unqueued click works. `orders_notes.md` §8.3 has the four-way table.
 
 **The lure is fired.** `ProjectileActor::OnPrePhysics` @ 0x00542ae0: on the no-actor-hit branch
 (0x005434db) it compares the projectile's role against `GetRoleByName("decoy_projectile")`; on a

@@ -990,9 +990,14 @@ section.
   under a descendant. Fixing `setParentNamespace` also repairs the `this` parameter type for free.
 - **There are two parallel class trees, one per thread** - the executor's `Actor` family and the
   client's `Unit` family - and a size, an offset or a slot index is only comparable *within* one.
-  `role_system_notes.md`'s "MobileActor 0x230" and `level_loading_notes.md`'s "Mine 0x238"
-  describe different objects and are both right. Slot 35 (`GetSize`) is the size oracle for the
-  executor tree; `level_loading_notes.md`'s table is the client one, as its own header says.
+  `role_system_notes.md`'s "MobileActor 0x230" and `level_loading_notes.md` §7's "Mine 0x238" row
+  describe different objects and are both right. Slot 35 (`GetSize`) is the size oracle in **both**
+  trees. The two trees are *structural mirrors* - same sixteen class names, same edges - and the
+  15-wide RTTI predicate ladder in slots 36-50 maps index-for-index across them, but nothing else
+  does: client `PresidentUnit` is 0x248 against `PresidentActor` 0x240. Note also that the 0x238
+  client class is **`MobileUnit`, not a mine class**: `ai mine` lands there only because a mine
+  carries no weapon (`character->weapon == 0x21`), and it shares the class with every other unarmed
+  character. `rendering_notes.md` §5.1 is the client tree.
 - Vtable **slot indices are branch-local**. Two classes deriving from a common base number their own
   extension slots from the same index, so a "rename slot N everywhere" sweep silently clobbers an
   unrelated method in a sibling branch (`PickupActor` slot 85 vs `MobileActor` slot 85).

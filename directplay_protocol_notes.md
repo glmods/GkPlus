@@ -347,7 +347,7 @@ sender writes when the trailing bool is set — and are listed with their odd pa
 | `0x28` | 259 | `SendChatOrPlayerName` @ `0x004fcd00` | **set player name / chat text** (255-byte string, reliable) -> re-broadcast `0x8d`; in lobby (GameState 8) copies to the local name buffer `0x007b7150`. **Three unbounded `strcpy`s on this path — see §6.1** |
 | `0x29` | 16 | `0x004fcdf0` | **dead on both ends.** No call site anywhere in the image (no code *or* data reference, so it is in no vtable), and the executor byte table routes `0x29` to the same default arm as a range-check failure while the pre-switch if-chain does not mention it. Payload word 2 (`[EBP-0xc]`) is never initialised, so it would leak 4 bytes of the sender's stack if it were ever sent |
 | `0x2a` | 16 | `SendLobbyTeamAssignment` @ `0x004fce30` | lobby team assignment: `*(int*)(0x007b70e4 + (arg0*5 + arg1)*4) = arg2`, arm `0x00509217`. The formula is right; **there is no bounds check on any of the three — see §6.1**. Note the C argument order is not the wire order (`arg0` = EDX, `arg1` = ECX, `arg2` = the stack argument) |
-| `0x2b` | 24 | `Unit_SendUseAbilityAtPosition` (slot 80) | **throw decoy at a position** -> `MobileActor::ThrowDecoy` @ `0x00541170`, which consumes one inventory item of pickup class 5 / weapon 3, spawns `decoy_projectile` and broadcasts update `0x92`. Arm `0x00509f85` |
+| `0x2b` | 24 | `CharacterUnit::Unit_SendThrowDecoy` @ 0x004c4040 (slot 80) | **throw decoy at a position** -> `MobileActor::ThrowDecoy` @ `0x00541170`, which consumes one inventory item of pickup class 5 / weapon 3, spawns `decoy_projectile` and broadcasts update `0x92`. Arm `0x00509f85`. Payload `{0x2b, unit_number, f32 GetGameTimeSeconds, Vec3 pos}`. The sender is armed by `DecoyTargetPending` @ 0x007b3f52 and reached from `IssueMoveOrderToSelection` — and a **queued** decoy click sends nothing at all (`orders_notes.md` §8.3) |
 | `0x2c` | 8 | `SendCycleTeamRequest` @ `0x004fbf90` | **cycle this player to the next free team slot** -> `CyclePlayerToNextFreeTeam(payload[0] - 1)` @ `0x004f6b00`. Unreliable. The handler is *not* the no-arg global it looks like — the argument is spilled (`MOV ECX,[EBX+4]; DEC ECX`) |
 | `0x2d` | 8 | `SendSetLobbySlotFlag` @ `0x004fc0f0` | set lobby slot flag: `((byte*)0x007b7147)[arg0] = 1`, arm `0x005091eb`. **No bounds check on `arg0` — see §6.1** |
 | `0x2e` | 8 | `SendClearLobbySlotFlag` @ `0x004fc400` | clear lobby slot flag: `((byte*)0x007b7148)[arg0-1] = 0`, arm `0x005091fc`, bounds-checked `arg0-1 < 4` with `___report_rangecheckfailure` |
@@ -629,11 +629,23 @@ buffer's first field. They cluster in `SyncPositionAndBroadcast`, `EquipObject`,
 +0x00 u32     id = 0x64
 +0x04 u32     actorId          (new actor's id)
 +0x08 u32     roleId           (role->id)
-+0x0c u32     teamId           (low byte significant)
-+0x10 u32     ownerRef         (0 = none; else spawn-owner handle)
++0x0c u32     teamId           (consumed as a single byte)
++0x10 u32     ownerRef         (an owner UNIT ID PLUS ONE; 0 = none)
 +0x14 f32[3]  position
 +0x20 f32[4]  orientation quaternion
 ```
+
+**The receiving side, and the reason no class tag is on the wire.** The handler is at
+`0x004ff934`: it reads `roleId` at `msg+0x08`, resolves it with `GetRoleById` @ `0x004ae0d0`, and
+hands the resulting `Role *` to `CreateUnit` @ `0x004fd450` — `int __fastcall(int team /*ECX*/,
+Role * /*EDX*/, Vec3 *pos, Vec4 *quat, uint unit_id, uint owner_ref)`, `RET 0x10`, returning the new
+`Unit+0xc`. `CreateUnit` then switches on **`role->ai`** (21-entry jump table at `0x004fd8d4`) and
+picks one of the sixteen client `Unit` classes itself, so the client **re-derives the class from its
+own roles hash** and the packet never names one. A peer with a different `Role` table therefore
+builds a different class from the same bytes.
+
+`ownerRef` being id + 1 is what makes 0 usable as "none": the constructors themselves take **-1**
+for none, so the factory passes `owner_ref - 1` through.
 
 ### 8.4 Open/close door - update `0xbc`/`0xbd`, 8 bytes
 
@@ -682,6 +694,22 @@ of "position + direction/velocity + damage". The corrected layout was recovered 
 stack slots, which sum to exactly 0x40 — that total is the check that the field list is complete.
 Note the direction is a **quaternion at `+0x24`**, not a direction vector; `combat_notes.md` has
 the fire path that fills it.
+
+**What the client builds from it is `ProjectileUnit`** — vtable 0x00664c88, 94 slots, size 0x180,
+ctor 0x004c47e0 (`__thiscall`, 9 stack args, `RET 0x24`). The spawn is at `ApplyUpdateMessage`
+@ `0x004fec38` and is **gated on `role->projectile != 0`**. This is the one client class reachable
+from **neither** spawn factory: `CreateUnit` returns 0 for `role->character == 0 &&
+role->projectile != 0` (`0x004fd826`/`82a`/`82c`) and `ClientSpawnActorForTeam` returns 0 for a
+projectile role (`XOR EAX,EAX` @ `0x004fd397`). The only other builder is `LoadGame` @ `0x00506373`.
+The ctor takes the owner unit id in its **7th stack argument** (`[EBP+0x20]`, -1 = none), looks it up
+in the client units hash and addrefs it into `ProjectileUnit+0x170`.
+
+**One more piece of client structure is built from an update rather than locally: the centipede
+segment chain.** `ApplyUpdateMessage` @ `0x005006cc` resolves two unit ids through `GetUnitById`
+@ `0x0044e070` and calls `CentibodyUnit::SetNextSegment` @ `0x004cbc30`, which writes the refcounted
+`Unit *` at `CentibodyUnit+0x2e0`. That setter has no other caller, so nothing on the client links
+the chain by itself. **The update id for that call site was not established** — it is the arm at
+0x005006cc, and identifying which id reaches it is still open.
 
 ### 8.7 Movement / waypoint order - command `0x3b`/`0x3d` (server), 56 bytes
 

@@ -533,7 +533,9 @@ being consistently larger. Both measurements above stand — they simply measure
 
 The general lesson, which is the reason to keep this section: **Gunlok has two parallel class
 trees**, one per thread, and a size, an offset or a slot index is only comparable within one of
-them. `role_system_notes.md`'s "MobileActor 0x230" and this table's "Mine 0x238" are both right.
+them. `role_system_notes.md`'s "MobileActor 0x230" and this table's "Mine 0x238" are both right —
+and the 0x238 client class is `MobileUnit`, shared by `ai mine` and every unarmed character rather
+than being mine-specific (`rendering_notes.md` §5.1).
 
 ### 9.6 `NavPolygon` vertex offset
 
@@ -553,6 +555,16 @@ per-agent mask at query time, and the point lookups do not test it at all.
 - **What the traversal mask bits mean.** 0x80 / 0x200 / 0x400 / 0x100000 / 0x200040 are set on
   the *agent* from shape size and tested against polygon flags, but no writer of those bits into
   a polygon's flags was found. Candidates: `OpenDoor2` @ 0x0048da20 and the door subsystem.
+
+  **The door half of that is now closed on the client side.** The door/lift is
+  `TrackObjectUnit` (vtable 0x00664f74, `ai track object`): its `Update` @ 0x004c7220 calls
+  `OpenDoor2`, its slot 86 @ 0x004c8000 calls `TriggerCloseDoor`, and its `EnterWorld` @ 0x004c79f0
+  binds to a placed map object by shape. Authoring-side confirmation:
+  `<Gunlok>\scripts\level02.gls:329` is `role Rol_TOWERLIFTA` with `ai track object`, and line 395
+  `Rol_hoversled` likewise. So `OpenDoor2`'s caller is identified; what is still unknown is whether
+  it (or anything else) writes one of the *mask* bits into a polygon's flags. The one runtime
+  polygon-flag writer found so far writes **0x100** and nothing else: `BlockerUnit::EnterWorld`
+  @ 0x004cd680 / `BlockerUnit::Unblock` @ 0x004cdf10 (`level_loading_notes.md` §5.5).
 - **`NavPolygon+0x20`** — not written by the ctor and not identified.
 - **A stuck/repath timer.** None found in the movement layer; if it exists it is in the order/AI
   layer (`MobileActor::ClearOrderQueue` @ 0x00538830 and friends), which the brief assigned

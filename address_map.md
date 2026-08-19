@@ -98,11 +98,23 @@ cached_array, cache_valid}` — the anchor is a **pointer** to a heap sentinel, 
 **Client entity globals** (near the units block): `ObjectList` @0x007b6928 is the iterable
 `List<Object*>` of every client game object (IsXxx @vtbl+0x18, name-ptr @+0xb8, teamslot @+0xb4 —
 the named chars Gunlok/Elint/Hark/Frend/Maskelyn live here); `ProximityObjectList` @0x007b6938 is the
-proximity-activated subset. `UnitsTable` @0x007b68f0 is a `HashTable<Unit*>` (vptr variant like
+proximity-activated subset — and it has exactly **one producer**, `BackgroundCreatureUnit`'s ctor
+@ 0x004c9730, which appends a `List_Member` node (`pool_alloc(0x10)`, vtable 0x00666220, `data`
+@ +0xc) and bumps the count at +0x693c; its dtor @ 0x004c9af0 unlinks. So every entry is a
+`BackgroundCreatureUnit` or a `FlyingBackgroundCreatureUnit`.
+`UnitsTable` @0x007b68f0 is a `HashTable<Unit*>` (vptr variant like
 `actors`): n_entries=`NumUnits`@0x6f4, buckets=`UnitsTable_buckets`@0x6900. `CombatMusicKillCounter`
 @0x007b68ec counts kind-2 entity deaths to escalate battle music (UpdateBattleMusic). The six scattered
 `VestigialFloat_*` (0x6898/6904/6914/6924/6948/6a94 = 1024/1024/60/120/1024/1024) are CRT-constructed
 floats with **no readers**.
+
+**Open question on `ObjectList`, not acted on.** The client-`Unit`-tree round argued it is really the
+*local player's party roster* rather than a general object list: its only insert and remove
+(`UnitList_Add` @ 0x004d0310 from slot 51, `UnitList_Remove` @ 0x004d0380 from slot 91) are both
+gated on `team == LocalPlayerTeam`, and every reader is a select-character / friendlies /
+HUD-portrait function — while `UnitsTable` is the general list `DrawUnits` walks. That is plausible
+but **not measured**: it needs `SelectAllCharacters` and `HudItem_DrawByKind` read first, so the name
+above and the DB name were both deliberately left as they are.
 
 **Menu System:** (see `menu_system_notes.md`)
 
@@ -740,19 +752,60 @@ Three records that are passed around by pointer and are easy to mis-size:
   (0x007c07e4), and the two per-thread accumulators `src/GUI.h` names (0x007c07e8 main,
   0x007c07b8 executor) are each clock's +0x18.
 
-### The client `Unit` vtables
+### The client `Unit` hierarchy
 
 Sixteen adjacent tables, bounded by the reference test (the last one by the string `"blobarrel"`
 after it, **not** by adjacency). The base is 92 slots, so any offset >= 0x170 read off 0x006647ac
-is inside the next class's table. Slot counts and the identified slots are in
-`rendering_notes.md` §5.1.
+is inside the next class's table. Slot meanings and the ownership rules are in
+`rendering_notes.md` §5.1; sizes come from **vtable slot 35, `GetSize()`**.
 
 ```
-0x006647ac  92    0x0066491c 107    0x00664ac8 112    0x00664c88  94
-0x00664e00  93    0x00664f74  92    0x006650e4  92    0x00665254  94
-0x006653cc  94    0x00665544 107    0x006656f0 112    0x006658b0 112
-0x00665a70 112    0x00665c30 112    0x00665df0  92    0x00665f60 108
+class                              vtable      slots  size   ctor        dtor
+Unit                               0x006647ac    92   0x130  0x004b4620  0x004b5640
+  MobileUnit                       0x0066491c   107   0x238  0x004ba050  0x004ba630
+    CharacterUnit                  0x00664ac8   112   0x2e0  0x004c1100  0x004c1300
+      CentibodyUnit                0x006656f0   112   0x2e8  0x004cbb90  0x004cbbd0
+        CentipedeUnit              0x006658b0   112   0x2e8  0x004cbc70  0x004cbca0
+      PopupUnit                    0x00665a70   112   0x2e8  0x004cc4f0  0x004cc530
+        TurretUnit                 0x00665c30   112   0x2f0  0x004cc9a0  0x004cca10
+    NodeUnit                       0x00665544   107   0x240  0x004cbb30  0x004cbb60
+    PresidentUnit                  0x00665f60   108   0x248  0x004cdfe0  0x004ce060
+  ProjectileUnit                   0x00664c88    94   0x180  0x004c47e0  0x004c4a50
+  PickupUnit                       0x00664e00    93   0x150  0x004c6d70  0x004c6e60
+  TrackObjectUnit                  0x00664f74    92   0x1d0  0x004c6f50  0x004c70b0
+  TumbleweedUnit                   0x006650e4    92   0x148  0x004c8390  0x004c84b0
+  BackgroundCreatureUnit           0x00665254    94   0x178  0x004c9730  0x004c9af0
+    FlyingBackgroundCreatureUnit   0x006653cc    94   0x190  0x004cb530  0x004cb590
+  BlockerUnit                      0x00665df0    92   0x140  0x004cd570  0x004cd620
 ```
+
+`BlockerUnit`'s destructor @ 0x004cd620 carried the stray demangled name
+`Concurrency::call<...>::~call<...>` until it was identified — the same failure mode
+`actor_vtable_notes.md` records for `BlockerActor::Destructor`.
+
+**The two client factories, and the class that is reachable from neither:**
+
+| addr | name | role |
+|---|---|---|
+| 0x004fd450 | `CreateUnit` | the **network** path. `int __fastcall(int team /*ECX, consumed as a byte*/, Role * /*EDX*/, Vec3 *pos, Vec4 *quat, uint unit_id, uint owner_ref)`, `RET 0x10`. 17 allocation sites, **13** distinct sizes (14 sites inside the switch) — 13 and not 14 because it never allocates 0x180. Returns `Unit+0xc`, the unit id. `owner_ref` is an **owner unit id + 1**, 0 = none |
+| 0x004fce90 | `ClientSpawnActorForTeam` | the **level-load / savegame** path. `__fastcall void *(int team /*ECX*/, Role * /*EDX*/, Vec3 *pos, Vec4 *quat)`, `RET 0x8`, jump table 0x004fd3fc. Takes its id from `NextClientActorId` @ 0x007b68e4; callers `ToMap` @ 0x00481a91 and `LoadGame` @ 0x00506831. A projectile role returns 0 |
+| 0x004ae0d0 | `GetRoleById` | how update `0x64`'s handler @ 0x004ff934 turns a wire roleId into the `Role *` `CreateUnit` needs — no class tag is transmitted |
+| 0x0044e070 | `GetUnitById` | the client units-hash lookup (mask 0x007b68fc, buckets 0x007b6900, key = `Unit+0xc`) |
+
+`ProjectileUnit` is reachable from **neither** factory: it is built only by `ApplyUpdateMessage`
+update `0x46` @ 0x004fec38 (gated on `role->projectile != 0`) and by `LoadGame` @ 0x00506373.
+
+**Other client `Unit` addresses:**
+
+| addr | name |
+|---|---|
+| 0x004b8c20 | `Unit_LeaveWorld` — slot 91, the base table's last slot; the inverse of slot 51 `Unit_EnterWorld` |
+| 0x004b6530 | `Unit_Destroy` — slot 63 base body, in 11 tables, reached from update `0x49` |
+| 0x004b5640 | `Unit::~Unit` |
+| 0x004d0310 / 0x004d0380 | `UnitList_Add` / `UnitList_Remove` (both `ECX = 0x007b6928`, both gated on `team == LocalPlayerTeam`) |
+| 0x006a58e0 | `LocalPlayerTeam` |
+| 0x007b3f52 | `DecoyTargetPending` — one byte, immediately after `FlareModeActive` @ 0x007b3f51 |
+| 0x006a6308 | `Gravity` (9.81f) |
 
 ### Imports
 

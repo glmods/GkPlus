@@ -153,8 +153,8 @@ and do it while no enemy has you in its cone".
 
 On the client, `Unit+0x19e` is cleared by `Unit_SetAttackPosition` @ 0x004c324c and
 `Unit_SetAttackTarget` @ 0x004c3405 (slots 109 and 108), and by `Unit_UpdateMovement`
-@ 0x004bb760 (slot 57), `Unit_Dissociate` @ 0x004bc740 (slot 55) and `Unit_Slot91`
-@ 0x004c0f80. The Actor-side `Dissociate` @ 0x00535f8f and `Unit_Dissociate` are the same
+@ 0x004bb760 (slot 57), `Unit_Dissociate` @ 0x004bc740 (slot 55) and `MobileUnit::LeaveWorld`
+@ 0x004c0f80 (slot 91, was `Unit_Slot91`). The Actor-side `Dissociate` @ 0x00535f8f and `Unit_Dissociate` are the same
 operation in the two trees, joined by update **0x97**.
 
 ---
@@ -232,7 +232,7 @@ A concealed unit is submitted through `RenderQueue_Submit` with material
 **`Mat_Translucent`** and an explicit alpha object as the 9th argument — a 0xc-byte
 `pool_alloc` `{vptr = 0x00664024, refcount = 1, float alpha}`:
 
-- **Own team** (`Unit+0xb4 == DAT_006a58e0`), or a Cooperative ally
+- **Own team** (`Unit+0xb4 == LocalPlayerTeam` @ 0x006a58e0), or a Cooperative ally
   (`TeamSlots[team]+0x6a != 0`): **alpha = 0.7** (`0x3f333333`). That is the manual's
   "turns darker" — a constant 70% translucency, not a colour change.
 - **Any other team**: find the minimum squared distance from this unit to any entry of
@@ -344,8 +344,18 @@ A unit on the list at `FogSystem+0xdc` gets a `StampCircle` every frame at
 - radius = `Unit` vtable **slot 66** `Unit_GetDefogRadius` @ 0x004b6900 —
   `role(+0xb8)->character(+0x60)->sight_range(+0x28)`, or **53.0f** when the role has no
   character. Override @ 0x004cf900 returns `Unit+0x180`;
-- `partial` = `Unit` vtable **slot 38** `Unit_GetFogStampIsPartial` @ 0x004cf510 (base 0,
-  one class returns 1 @ 0x004cf520).
+- `partial` = `Unit` vtable **slot 38**, base body 0x004cf510 (returns 0), one class returning 1
+  @ 0x004cf520.
+
+  **That slot is `IsProjectile`, and the class is `ProjectileUnit`.** It was named
+  `Unit_GetFogStampIsPartial` here from this one consumer; slot 38 is in fact rung 3 of the client
+  tree's 15-wide RTTI predicate ladder (slots 36–50), whose base bodies are all `XOR AL,AL; RET`
+  and whose overrides are all `MOV AL,0x1; RET` — and 0x004cf520 appears in exactly one vtable,
+  `ProjectileUnit`'s @ 0x00664c88. `rendering_notes.md` §5.1 has the ladder and its index→predicate
+  mapping, which is identical to the executor `Actor` tree's. So the fog code is not asking "is this
+  a partial defogger", it is asking **"is this defogger a projectile"** — and the answer to §10's
+  open question is `ProjectileUnit`, i.e. a shot in flight, not a character. The DB name is now
+  `Unit::IsProjectile` / `ProjectileUnit::IsProjectile`.
 
 So **a unit reveals fog out to its own GLS `sight range`**.
 
@@ -354,8 +364,8 @@ Membership is `FogOfWar_AddDefoggerUnit` @ **0x004693c0** / `FogOfWar_RemoveDefo
 `Unit+0x211` through slot 27 `Unit_SetIsDefogger` @ 0x004d0000. Added from `LoadGame`,
 `Unit_SetTeamWithInventory` @ 0x004bb410 (`Unit` slot 33, and it is **`SetTeam`** - the base
 implementation at 0x004cf3b0 is literally `*(int *)(this + 0xb4) = arg; return;`) at 0x004bb4ed,
-`ApplyUpdateMessage` 0x004fecca (spawn path) and case **0xb7**; removed from `Unit_Slot91`
-@ 0x004c0f80, `Unit_Dtor_00664c88` @ 0x004c4a50 and case **0xb8**. The `+0x211 = 1` is therefore
+`ApplyUpdateMessage` 0x004fecca (spawn path) and case **0xb7**; removed from `MobileUnit::LeaveWorld`
+@ 0x004c0f80, `ProjectileUnit::~ProjectileUnit` @ 0x004c4a50 and case **0xb8**. The `+0x211 = 1` is therefore
 **not a construction-time event**: a unit becomes a defogger whenever its team becomes the local
 player's team - or, in Cooperative, any team whose `TeamSlots[team]+0x6a` is set - so every team
 change re-evaluates it.
@@ -404,7 +414,7 @@ Four producers:
 |---|---|---|
 | `EvaluateTriggers` @ **0x0050e55d** — the **DEFOG trigger** (`TriggerKind::Defog`, 15). Centre and radius come from the trigger record's `data+0x10..0x18` and `data+0x1c`, i.e. `coords[1]` and `coords[2].x` in `trigger_system_notes.md`'s layout | trigger's `defog_radius` | **0, permanent** |
 | `AiBeginInvestigate` @ **0x0045e05a** — AI "go investigate", called twice from `AiThink_Minebot` @ 0x00456f7c / 0x004571b0. Centre is the AI actor's own position | **20.0** | 1, **3 s** |
-| `ApplyUpdateMessage` **case 0x46** (spawn projectile / weapon fire) @ 0x004ff... — built inline when `msg[4] != DAT_006a58e0`, i.e. when the shooter is *not* on the local player's team. Centre is the fire position `msg[6..8]` | **25.0** | 1, **60 s** |
+| `ApplyUpdateMessage` **case 0x46** (spawn projectile / weapon fire) @ 0x004ff... — built inline when `msg[4] != LocalPlayerTeam` @ 0x006a58e0, i.e. when the shooter is *not* on the local player's team. Centre is the fire position `msg[6..8]` | **25.0** | 1, **60 s** |
 | `ApplyUpdateMessage` **case 0x47** — same shape, centre `msg[4..6]` | **20.0** | 1, **60 s** |
 
 **The manual's "firing a flare reveals a zone" is only partly pinned down.** The flare
@@ -525,8 +535,9 @@ nothing else.
   0x8 / 0x10 which choose between the two fog samplers.
 - **`MaxTextureDimension`** @ 0x006ab970 (the grid-dimension clamp) and `DAT_00738ff4` (the "full-rect update this
   frame" flag) are zero-init `.data`; their runtime values were not read.
-- Which `Unit` subclass returns 1 from `Unit_GetFogStampIsPartial` (slot 38 @ 0x004cf520) —
-  i.e. which kind of defogger only half-reveals.
+- ~~Which `Unit` subclass returns 1 from slot 38~~ — **closed**: slot 38 is `IsProjectile` and the
+  class is `ProjectileUnit` (see §7's stamp bullet). What is still open is *why* a projectile's
+  stamp is the partial one.
 - Whether a defog area's `partial` stamp is intentional or a defect: as measured, a DEFOG
   trigger can never bring a cell below 0x3f on its own.
 

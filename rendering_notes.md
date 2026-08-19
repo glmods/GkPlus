@@ -556,23 +556,59 @@ out of the DLL's `RT_STRING` resources; string *id* N lives in block `N/16 + 1` 
 Two producers keep a hedge in their names: `DrawWorldEffect_Unknown` (which effect it draws is not
 established) and `DrawTeamSelectOverlay` (named from its neighbours — the least-verified name here).
 
-## 5.1 The client `Unit` vtables: sixteen tables, and the base is 92 slots
+## 5.1 The client `Unit` hierarchy: sixteen classes, and the base is 92 slots
 
 The biggest producer dispatches through these, so their **bounds** are load-bearing: read a slot
 off the wrong table and you get a function from the next class down. Sixteen adjacent tables in
 `.rdata`, each start and each length fixed by the reference test — a vtable start is referenced
-from `.text` by its class's ctor/dtor, an interior slot by nothing:
+from `.text` by its class's ctor/dtor, an interior slot by nothing.
 
-| vtable | slots | ctor / dtor that reference it | vtable | slots | ctor / dtor |
-|---|---|---|---|---|---|
-| 0x006647ac | **92** | `Unit_Ctor` @ 0x004b4620, 0x004b5640 | 0x006653cc | 94 | 0x004cb530 / 0x004cb590 |
-| 0x0066491c | 107 | 0x004ba050 / 0x004ba630 | 0x00665544 | 107 | 0x004cbb30 / 0x004cbb60 |
-| 0x00664ac8 | 112 | 0x004c1100 / 0x004c1300 | 0x006656f0 | 112 | 0x004cbb90 / 0x004cbbd0 |
-| 0x00664c88 | 94 | 0x004c47e0 / 0x004c4a50 | 0x006658b0 | 112 | 0x004cbc70 / 0x004cbca0 |
-| 0x00664e00 | 93 | 0x004c6d70 / 0x004c6e60 | 0x00665a70 | 112 | 0x004cc4f0 / 0x004cc530 |
-| 0x00664f74 | 92 | 0x004c6f50 / 0x004c70b0 | 0x00665c30 | 112 | 0x004cc9a0 / 0x004cca10 |
-| 0x006650e4 | 92 | 0x004c8390 / 0x004c84b0 | 0x00665df0 | 92 | 0x004cd570 |
-| 0x00665254 | 94 | 0x004c9730 / 0x004c9af0 | 0x00665f60 | 108 | 0x004cdfe0 / 0x004ce060 |
+All sixteen classes are now named, and the tree is a **structural mirror of the executor `Actor`
+tree**: the same sixteen classes with the same edges. Sizes come from **vtable slot 35, which is
+`GetSize()`** — a two-instruction `MOV EAX,<imm32>; RET` — and each is independently corroborated
+by the highest field its constructor writes.
+
+```
+Unit                                    0x006647ac  92  0x130  ctor 0x004b4620  dtor 0x004b5640
+ ├── MobileUnit                         0x0066491c 107  0x238  ctor 0x004ba050  dtor 0x004ba630
+ │    ├── CharacterUnit                 0x00664ac8 112  0x2e0  ctor 0x004c1100  dtor 0x004c1300
+ │    │    ├── CentibodyUnit            0x006656f0 112  0x2e8  ctor 0x004cbb90  dtor 0x004cbbd0
+ │    │    │    └── CentipedeUnit       0x006658b0 112  0x2e8  ctor 0x004cbc70  dtor 0x004cbca0
+ │    │    └── PopupUnit                0x00665a70 112  0x2e8  ctor 0x004cc4f0  dtor 0x004cc530
+ │    │         └── TurretUnit          0x00665c30 112  0x2f0  ctor 0x004cc9a0  dtor 0x004cca10
+ │    ├── NodeUnit                      0x00665544 107  0x240  ctor 0x004cbb30  dtor 0x004cbb60
+ │    └── PresidentUnit                 0x00665f60 108  0x248  ctor 0x004cdfe0  dtor 0x004ce060
+ ├── ProjectileUnit                     0x00664c88  94  0x180  ctor 0x004c47e0  dtor 0x004c4a50
+ ├── PickupUnit                         0x00664e00  93  0x150  ctor 0x004c6d70  dtor 0x004c6e60
+ ├── TrackObjectUnit                    0x00664f74  92  0x1d0  ctor 0x004c6f50  dtor 0x004c70b0
+ ├── TumbleweedUnit                     0x006650e4  92  0x148  ctor 0x004c8390  dtor 0x004c84b0
+ ├── BackgroundCreatureUnit             0x00665254  94  0x178  ctor 0x004c9730  dtor 0x004c9af0
+ │    └── FlyingBackgroundCreatureUnit  0x006653cc  94  0x190  ctor 0x004cb530  dtor 0x004cb590
+ └── BlockerUnit                        0x00665df0  92  0x140  ctor 0x004cd570  dtor 0x004cd620
+```
+
+Three independent methods agree on that shape:
+
+1. **`CreateUnit` @ 0x004fd450's `role->ai` dispatch** — a 21-entry jump table at 0x004fd8d4
+   (`CMP EAX,0x14`), which matches the `AIType` enum mirrored at `src/Roles.h:21` value for value.
+2. **The constructor call edges.** Each ctor writes exactly **one** vtable pointer at `this+0x00`,
+   so it is single inheritance throughout with no multiple inheritance anywhere: 0x004ba0ad→
+   0x004b4620, 0x004c113a/0x004cbb49/0x004ce018→0x004ba050, 0x004cbba9/0x004cc509→0x004c1100,
+   0x004cbc89→0x004cbb90, 0x004cc9b9→0x004cc4f0, 0x004cb549→0x004c9730, 0x004cd5aa→0x004b4620,
+   and the remaining five call 0x004b4620 directly.
+3. **A 15-wide RTTI predicate ladder in slots 36–50** — one slot per derived class,
+   `XOR AL,AL; RET` in the base and `MOV AL,0x1; RET` (bytes `B0 01 C3`) in the owning class. This
+   is the client twin of `src/ActorClasses.inc.h`'s `Predicate` column, and the index→predicate
+   mapping is **the same as the executor tree's**: 36 `IsMobile`, 37 `IsCharacter`,
+   38 `IsProjectile`, 39 `IsTrackObject`, 40 `IsNode`, 41 `IsCentipede`, 42 `IsCentibody`,
+   43 `IsBackgroundCreature`, 44 `IsFlyingBackgroundCreature`, 45 `IsPickup`, 46 `IsTumbleweed`,
+   47 `IsPopup`, 48 `IsBlocker`, 49 `IsPresident`, 50 `IsTurret`. Each class's TRUE-set is
+   therefore a fingerprint, and it is what pins ownership of every other slot.
+
+**Sizes and non-ladder slot indices remain non-comparable across the two trees.** The ladder is the
+one thing that maps across, because both trees number the same fifteen predicates the same way.
+Everything else does not: client `PresidentUnit` is 0x248 against executor `PresidentActor` 0x240,
+and client `BlockerUnit` is 0x140 against `BlockerActor` 0x130. Same class names, different objects.
 
 Twelve of the sixteen were raw undefined bytes until this run was defined, so any slot count taken
 from the tables before then was a guess at bytes rather than a measurement — **no table in the run
@@ -589,19 +625,46 @@ is shorter than 92**. Two things pin the numbers:
   arithmetic. They are slots **8 and 9**.
 
 Slot 68 (`Draw`) is `Unit_Draw` @ 0x004b6ae0 / `Unit_DrawWithTeamState` @ 0x004be830 /
-`Unit_Draw_Override1` @ 0x004c96e0 in every table, which is the alignment cross-check that the
-starts above are right. The other identified slots:
+`TumbleweedUnit::Draw` @ 0x004c96e0 / `PopupUnit::Draw` @ 0x004cc7d0 in every table, which is the
+alignment cross-check that the starts above are right. The other identified slots, with the owner
+now taken from the ladder rather than from where a body happens to sit:
 
-| slot | +off | base implementation | meaning |
-|---|---|---|---|
-| 8 | 0x20 | `Unit_IsConcealed` @ 0x004cfe70 — `MOV AL,[ECX+0x19e]` | concealment flag getter |
-| 9 | 0x24 | `Unit_SetConcealed` @ 0x004cf5d0 — `RET 0x4` | its setter |
-| 33 | 0x84 | 0x004cf3b0 — `*(int *)(this+0xb4) = arg; RET 0x4` | `SetTeam` |
-| 51 | 0xcc | `Unit_EnterWorld` @ 0x004b57c0 | |
-| 55 | 0xdc | 0x004cf5b0 — bare `RET` stub | `Dissociate` |
-| 57 | 0xe4 | 0x004b5d50, `RET 0xc`, a body per subclass | the per-tick `Update` |
-| 67 | 0x10c | `Unit_ComputeLodLevel` @ 0x004b6930 (all sixteen tables) | the LOD level, below |
-| 68 | 0x110 | four distinct bodies across sixteen classes | `Draw` — the biggest producer |
+| slot | +off | base implementation | owner of the override | meaning |
+|---|---|---|---|---|
+| 8 | 0x20 | 0x004cfe60 — `XOR AL,AL; RET` | `MobileUnit` — `Unit_IsConcealed` @ 0x004cfe70 | concealment flag getter |
+| 9 | 0x24 | 0x004cf5c0 — bare `RET 0x4` | `MobileUnit` — `Unit_SetConcealed` @ 0x004cf5d0 | its setter |
+| 33 | 0x84 | `Unit_SetTeam` @ 0x004cf3b0 — `*(int *)(this+0xb4) = arg; RET 0x4` | `MobileUnit` (`Unit_SetTeamWithInventory`), `PresidentUnit` — 3 bodies | `SetTeam` |
+| 35 | 0x8c | `Unit::GetSize` @ 0x004cf650 — `MOV EAX,0x130; RET` | one stub per class, all 16 distinct | **`GetSize()`** — the size oracle for this tree |
+| 36–50 | 0x90–0xc8 | `XOR AL,AL; RET` | one class each | the RTTI predicate ladder above |
+| 51 | 0xcc | `Unit_EnterWorld` @ 0x004b57c0 | **15 distinct bodies** — every class but `TurretUnit`, which inherits `PopupUnit`'s | ends with `UnitList_Add` @ 0x004d0310 |
+| 55 | 0xdc | 0x004cf5b0 — bare `RET` stub | `MobileUnit` — `Unit_Dissociate` @ 0x004bc740 | `Dissociate` |
+| 57 | 0xe4 | `Unit_Update` @ 0x004b5d50, `RET 0xc` | **14 distinct bodies**; `BlockerUnit` keeps the base one and `NodeUnit` keeps `MobileUnit`'s | the per-tick `Update` |
+| 67 | 0x10c | `Unit_ComputeLodLevel` @ 0x004b6930 (all sixteen tables) | — | the LOD level, below |
+| 68 | 0x110 | four distinct bodies across sixteen classes | `MobileUnit`, `TumbleweedUnit`, `PopupUnit` | `Draw` — the biggest producer |
+| 80 | 0x140 | 0x004cff60 — bare `RET 0x4` stub | `CharacterUnit` — `Unit_SendThrowDecoy` @ 0x004c4040 | throw a decoy at a ground position (command `0x2b`) |
+| 91 | 0x16c | `Unit_LeaveWorld` @ 0x004b8c20 | four classes, each chaining back | the inverse of slot 51; `UnitList_Remove` @ 0x004d0380 |
+
+Three of those rows correct earlier readings. Slots **8 and 9** are `MobileUnit`'s overrides, not
+base methods — the base's own bodies are the two stubs at 0x004cfe60/0x004cf5c0; the slot numbers
+were already right and only the owning class was wrong. Slot **80** is not an unidentified
+move-to-position variant: it is the decoy throw, gated in its *caller* (§ below, and
+`gadgets_notes.md`). Slot **91** is a base `Unit` slot — the base table's last — and it is
+`Unit_LeaveWorld`, a chained "leave world" teardown; it is **not** `Dissociate`, which is slot 55.
+All eight DATA references to `Unit_Dissociate` @ 0x004bc740 sit at `table+0xdc`, never at `+0x16c`.
+
+Slot 91's overrides each tail-chain to the base body: `MobileUnit::LeaveWorld` @ 0x004c0f80 (in
+eight tables, and it ends `JMP 0x004b8c20` @ 0x004c10f3 with no `RET` of its own),
+`ProjectileUnit::LeaveWorld` @ 0x004c4c20, `BackgroundCreatureUnit::LeaveWorld` @ 0x004cb510 and
+`BlockerUnit::Unblock` @ 0x004cdf10. Its two callers are `Unit_Destroy` @ 0x004b6530 (the slot 63
+base body, in 11 tables, reached from update `0x49`) and `Unit_UpdateMovement` @ 0x004bc0ef, which
+latches a deferred remove-me on `+0x1a8`.
+
+Ownership of the *order-sending* slots also moved a level up, and `orders_notes.md` §8 has the
+corrected version: slots **100–104** (`Unit_SendInteract`, `Unit_SendEquip`, `Unit_SendDropItem`,
+`Unit_SendBoard`, `Unit_SendUseItem`) are added by `MobileUnit` @ 0x0066491c, not by
+`CharacterUnit`. `MobileUnit` also adds 92 `Unit_IsCrouched` and 93
+`Unit_SetCrouchedAndConcealed`, and overrides 33, 55, 57, 73, 77, 83 and 91; `CharacterUnit`
+overrides base slots 74, 75, 76, 78, 79, 80 and adds 108–111.
 
 **Slot 67 is the model's detail level**, and it is the client's whole LOD policy in one function.
 It is `int __thiscall(Unit *)`, bare `RET`, and it occupies slot 67 in all sixteen tables, so it

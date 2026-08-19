@@ -174,7 +174,7 @@ Values 0..10, no gaps.
 | 5 | `Interact` | `MobileActor::QueueInteractOrder` 0x00538e80, `RET 0x8` | MobileActor slot 70 → `EquipItemInSlot(arg_c, arg_b, 1)` @ 0x00536ba0 |
 | 6 | `Board` | `MobileActor::QueueBoardOrder` 0x00538f80, `RET 0xc` | MobileActor slot 70 → `GetActorById(arg_a)`, `this+0x40 = target` (refcounted), `+0x44 = arg_b`, `+0x124 = arg_d` |
 | 7 | `Equip` | `MobileActor::QueueEquipOrder` 0x00538ca0, `RET 0x4` | MobileActor slot 70 → `UseInventoryItem(arg_b, 1)` @ 0x005370d0 |
-| 8 | `Drop` | `MobileActor::QueueOrderKind8` 0x00538d40, `RET 0x4` | MobileActor slot 70 → `MobileActor::DropItem(arg_b)` @ 0x00538240 |
+| 8 | `Drop` | `MobileActor::QueueDropOrder` 0x00538d40, `RET 0x4` | MobileActor slot 70 → `MobileActor::DropItem(arg_b)` @ 0x00538240 |
 | 9 | `UseItem` | `MobileActor::QueueUseItemOrder` 0x00538de0, `RET 0x4` | MobileActor slot 70 → walk `inventory_list` for `entry+0x24 == arg_b`, `MobileActor::UnequipSlot(entry)` @ 0x00536ec0, broadcast **0x80** |
 | 10 | `SetAmmoType` | `CharacterActor::QueueOrderKind10` 0x00541980, `RET 0x4` | CharacterActor slot 70 → slot 99 `SetAmmoType(arg_b)` |
 
@@ -337,8 +337,8 @@ Walks `SelectedUnits` and calls `Unit_SendStandingOrder(unit, code)` for every e
 (`IsMobile`) is true. On an empty selection: `PlayUiSound(0x28)` and on-screen string id 0x2b18.
 
 Only codes 3..6 come through here. The three **formation** keys bypass it entirely and write
-`TeamSlots[DAT_006a58e0].formation` inline in `HandleGameKeyAction` (0x0046fd27 / 0x0046fd5d /
-0x0046fd93), where `DAT_006a58e0` is the local player's team index. That means a formation change
+`TeamSlots[LocalPlayerTeam].formation` inline in `HandleGameKeyAction` (0x0046fd27 / 0x0046fd5d /
+0x0046fd93), where `LocalPlayerTeam` @ 0x006a58e0 is the local player's team index. That means a formation change
 from the keyboard is **local only** — it does not go through command 0x1b and does not replicate.
 
 ---
@@ -358,11 +358,15 @@ them is movement, AI, pathing or order-issuing code:
 | `WaitCond_FriendliesUseAbreastFormation` @ 0x00570840, read @ 0x00570858 | `== 1`; a `WAIT FOR` script predicate, table entry @ 0x0066a40c |
 | `0x004d3280` (vtable 0x006664c4 slot 17), read @ 0x004d32d5 | the order menu's "is this order currently in effect?" query |
 
-The move path is offset-free end to end: `IssueOrderToSelection` @ 0x0049f010 hands **the identical
-`Vec3 *`** to every selected unit (the pushed pointer is loop-invariant across the selection walk),
-`Unit` slot 75 @ 0x004c3c90 copies it verbatim into the 0x18-byte command, and the executor arm
-copies it verbatim into `CharacterActor+0x2dc`. No per-member index, no perpendicular or trailing
-basis, no spacing constant, no unit-radius term.
+The move path is offset-free end to end: `IssueMoveOrderToSelection` @ 0x0049f010 hands **the
+identical `Vec3 *`** to every selected unit (the pushed pointer is loop-invariant across the
+selection walk), `Unit` slot 75 @ 0x004c3c90 copies it verbatim into the 0x18-byte command, and the
+executor arm copies it verbatim into `CharacterActor+0x2dc`. No per-member index, no perpendicular
+or trailing basis, no spacing constant, no unit-radius term.
+
+One branch of that function is **not** a movement order at all: with `DecoyTargetPending` set it
+dispatches slot 80 `Unit_SendThrowDecoy` instead of slot 75, and with `queued` also set it
+dispatches nothing. See §8.3.
 
 **So there is also no leader or anchor** — every member of the selection is given the clicked world
 point directly, and the spread visible in play is the nav agent's own collision avoidance
@@ -383,14 +387,25 @@ excluded by that sweep and are not worth reading for this.
 
 **Every** `PendingOrder` push in the binary is reached from `ExecutorThreadProc` @ 0x00509050
 (the client→server command switch at 0x005092a4) or from `ApplyUpdateMessage`. There is no local
-push path. The client-side producers are `Unit` vtable slots (table base **0x00664ac8**), and they
-come in **two shapes**, which the table below mixes:
+push path. The client-side producers are client `Unit`-tree vtable slots, and **their owners are two
+different classes** — the earlier reading, "table base 0x00664ac8", filed both groups under a
+descendant, which is the shallowest-owner error CLAUDE.md warns about. Measured ownership
+(`rendering_notes.md` §5.1):
 
-* slots 100-104 (`Unit_SendInteract`, `Unit_SendBoard`, `Unit_SendDropItem`, `Unit_SendUseItem`
-  and the crouch/ammo senders) take a trailing `bool queued` and choose between an immediate id
-  and `id + 1`, as the disassembly below shows;
-* slots **74, 75, 76, 78, 79 and 80** (0x004c3da0, `Unit` slot 75 @0x004c3c90, 0x004c3e40,
-  `Unit_SendAttackTarget`, `Unit_SendAttackPosition`, 0x004c4040) take **no such argument**. They
+* slots **100-104** (`Unit_SendInteract`, `Unit_SendEquip`, `Unit_SendDropItem`, `Unit_SendBoard`,
+  `Unit_SendUseItem`) are **added by `MobileUnit`, table base 0x0066491c** — not by
+  `CharacterUnit`. `MobileUnit` also adds 92 `Unit_IsCrouched` and 93
+  `Unit_SetCrouchedAndConcealed`, and overrides 33 `Unit_SetTeamWithInventory`,
+  55 `Unit_Dissociate`, 57 `Unit_UpdateMovement`, 73 `Unit_SendStop`,
+  77 `Unit_SendCrouchToggle`, 83 `Unit_SendSetAmmoType` and 91 `LeaveWorld`. These take a
+  trailing `bool queued` and choose between an immediate id and `id + 1`, as the disassembly below
+  shows;
+* slots **74, 75, 76, 78, 79 and 80** are **`CharacterUnit`'s overrides of base slots**, table base
+  0x00664ac8, which also **adds** extension slots 108 `Unit_SetAttackTarget`,
+  109 `Unit_SetAttackPosition`, 110 and 111. They are 0x004c3da0, `Unit` slot 75 @0x004c3c90,
+  0x004c3e40, `Unit_SendAttackTarget`, `Unit_SendAttackPosition`, and 0x004c4040 — which is **not**
+  a sixth movement variant but `Unit_SendThrowDecoy` — see §8.3. The other five take **no
+  `queued` argument**. They
   read `TEST byte ptr [KeyModifierState @0x007b6ddc],0x2` — the **CTRL** bit — and their second id
   is `id + 2`, not `id + 1`. That second id does not mean "queued" at all: it means
   **`close_range`**, which is where `Actor` slots 96/97's computed `0x41 + close_range` /
@@ -416,7 +431,7 @@ come in **two shapes**, which the table below mixes:
 | `0x0f` | `0x10` | 5 `Interact` | `Unit_SendInteract` 0x004c0bc0 (slot 0x190) | `QueueInteractOrder` @0x0050a21c |
 | `0x17` | `0x18` | 6 `Board` | `Unit_SendBoard` 0x004c0d50 (slot 0x19c) | `QueueBoardOrder` @0x0050a2e8 |
 | `0x11` | `0x12` | 7 `Equip` | `Unit_SendEquip` 0x004c0c90 (slot 0x194) | `QueueEquipOrder` @0x0050a33a |
-| `0x13` | `0x14` | 8 `Drop` | `Unit::Unit_SendDropItem` 0x004c0cf0 (slot 0x198) | `QueueOrderKind8` @0x0050a38a |
+| `0x13` | `0x14` | 8 `Drop` | `Unit::Unit_SendDropItem` 0x004c0cf0 (slot 0x198) | `QueueDropOrder` @0x0050a38a |
 | `0x15` | `0x16` | 9 `UseItem` | `Unit_SendUseItem` 0x004c0dc0 (slot 0x1a0) | `QueueUseItemOrder` @0x0050a4af |
 | `0x19` | `0x1a` | 10 `SetAmmoType` | `Unit_SendSetAmmoType` 0x004c0c30 (slot 0x14c) | vslot 85 `QueueOrderKind10` @0x0050a52c |
 | — | `0x1b` | — | `Unit_SendStandingOrder` 0x004bdd60 | `SetStandingOrder` @0x0050a4c2 |
@@ -457,6 +472,29 @@ attack-ground order — and the consequence *is* now known: that fourth argument
 **`close_range`**, so a queued attack-ground order can never be a close-range one. On the
 immediate path the same argument is supplied correctly as `(command_id == 0x0c)` at 0x00509eab,
 with the third argument a literal 0.
+
+### 8.3 Slot 80 is the decoy throw, not a movement order
+
+`0x004c4040` was `Unit_SendUseAbilityAtPosition` here and in the slot tables; it is
+**`Unit_SendThrowDecoy`**, `__thiscall void(Unit *, Vec3 *pos)`, `RET 0x4` @ 0x004c4113, owned by
+`CharacterUnit`. It sends command **`0x2b`**, 24 bytes `{0x2b, unit_number, f32
+GetGameTimeSeconds, Vec3 pos}`, and `directplay_protocol_notes.md` already documented `0x2b` as
+"throw decoy at a position → `MobileActor::ThrowDecoy` @ 0x00541170", so both ends now agree.
+
+**The gate is in the caller, not under the slot.** `IssueMoveOrderToSelection` @ 0x0049f06f loads
+`DecoyTargetPending` @ 0x007b3f52 (set when the player arms a decoy — `gadgets_notes.md` §2) and
+picks:
+
+| `queued` | `DecoyTargetPending` | dispatched |
+|---|---|---|
+| 0 | set | slot **80** `Unit_SendThrowDecoy` (`CALL [EAX+0x140]` @ 0x0049f0b3) |
+| 0 | clear | slot 75 (`CALL [EAX+0x12c]` @ 0x0049f0a2) |
+| 1 | set | **nothing at all** (`TEST AL,AL` / `JNZ 0x0049f0ce` @ 0x0049f0bb) |
+| 1 | clear | slot 79 (`CALL [EAX+0x13c]` @ 0x0049f0c8) |
+
+So a **queued** decoy click — Active Pause, or shift-click — is silently dropped: no command, no
+error, and the flag stays armed. That is a game defect, and it is why §7's move path never sees the
+decoy branch as a movement order.
 
 ---
 
