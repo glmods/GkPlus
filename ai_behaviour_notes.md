@@ -18,7 +18,7 @@ pointer, `ai_think` @ `Actor+0x34`, installed once from `role->ai`.
 
 | Address | Name | Notes |
 |---|---|---|
-| 0x00450550 | `Actor_SetAiBehaviour` | `__thiscall`, `RET 0x8`. Installs `ai_think`/`ai_think_secondary` from `AIType` |
+| 0x00450550 | `Actor_SetAiBehaviour` | `__fastcall`, `RET 0x8`. Installs `ai_think` (`Actor+0x34`) and, for `AIType::Mine` only, the on-placed hook at `Actor+0x38`, from `AIType` |
 | 0x0044f560 | `AiExecutorTick` | `__stdcall(uint time_lo, int time_hi)`, `RET 0x8`. Only caller is `ExecutorThreadProc` @ 0x00509050 |
 | 0x00457f30 | `RunAiForTeamGroup` | `__thiscall`, `RET 0x8`. Walks one `TeamActorLists[]` entry |
 | 0x00451220 | **`AiThink_Bot`** | `__thiscall void(Actor*, uint time_lo, int time_hi)`, `RET 0x8`, 0x1f39 bytes |
@@ -26,11 +26,11 @@ pointer, `ai_think` @ `Actor+0x34`, installed once from `role->ai`.
 `Actor_SetAiBehaviour` dispatches through a 21-entry byte table at `0x0045069c` and a 10-entry
 jump table at `0x00450674`. The full map (`AIType` -> think function):
 
-| AIType | `ai_think` | `ai_think_secondary` |
+| AIType | `ai_think` (`Actor+0x34`, per tick) | `Actor+0x38` (on-placed hook, once) |
 |---|---|---|
 | 0 Bot, 13 Centipede, 19 President | `AiThink_Bot` 0x00451220 — **only if vtable slot 11 `GetWeapon()` != 0**, otherwise NULL | — |
 | 1 Scavenger | `AiThink_Scavenger` 0x004556e0 | — |
-| 2 Mine | `AiThink_Mine` 0x004552a0 | `AiThink_MineSecondary` 0x0045a640 |
+| 2 Mine | `AiThink_Mine` 0x004552a0 | `Mine_OnDeployed` 0x0045a640 |
 | 3 Minebot | `AiThink_Minebot` 0x00456c50 | — |
 | 6 Waiting, 14 Centibody | `AiThink_Waiting` 0x00456bb0, and `has_ai` (`Actor+0x3c`) **cleared** | — |
 | 7 Pathfinder | `AiThink_Pathfinder` 0x004556d0 (a 2-instruction tail-jump to 0x0053a1d0) | — |
@@ -38,6 +38,22 @@ jump table at `0x00450674`. The full map (`AIType` -> think function):
 | 16 NodeWaiting, 18 Popup, 20 Turret | `AiThink_Waiting` 0x00456bb0, `has_ai` **set** | — |
 | 17 Swarm | `AiThink_Swarm` 0x0045b620 | — |
 | 4 Reserved, 5 Blocker, 8 TrackObject, 9 Tumbleweed, 10 Pickup, 11/12 BackgroundCreature | NULL, `has_ai` cleared | — |
+
+`Actor+0x38` is **not** a second think proc. Every `AIType` installs its per-tick proc into
+`Actor+0x34` (nine `MOV dword ptr [ESI + 0x34],imm` sites in `Actor_SetAiBehaviour`), and the
+mine's is already `AiThink_Mine`; the single `MOV dword ptr [ESI + 0x38],0x45a640` @ 0x00450610 is
+the only write to `+0x38` in the binary. That field is called **once**, from vtable slot 51
+(`Actor::InitPositionAndTiming`) @ 0x0052dd18, under a null guard and right after the nav-poly
+lookup — plus once more from `Actor_FixupAfterLoad` @ 0x00531860 when a savegame is restored, and
+nowhere else in the image. And `ExecutorActorTick` @ 0x0052fad0 reads neither `+0x34` nor `+0x38`, calling only
+vtable displacements 0x18, 0x90, 0xdc and 0x118. `Mine_OnDeployed`'s body matches: it switches on
+the mine sub-kind (`Character+0xac`), each arm arming a deadline or announcing once, and nothing in
+it loops or re-arms.
+
+`AiThink_Turret` @ 0x00455de0 is a tenth think proc that this table does not contain: it is not in
+`Actor_SetAiBehaviour`'s dispatch at all. A turret starts on `AiThink_Waiting` (AIType 20) and
+`TurretActor::Update` swaps `Actor+0x34` to `AiThink_Turret` @ 0x0054b0b6, gated on
+`TurretActor+0x191`.
 
 `Actor_SetAiBehaviour` also seeds `ai_state = 3`, `aggression` (`Actor+0x60`, default
 `0x3f333333` = 0.7 when slot 10 `GetCharacterData()` is NULL), and clears `+0x74`/`+0x78`.
@@ -71,7 +87,7 @@ Two separate integers, both on `Actor`, and they are **not** the same thing.
 | 1 | **engaging** — has an `attack_target` | 0x004534bf (behaviour handler 1) |
 | 3 | idle / hold | `Actor_SetAiBehaviour` @ 0x00450567; console `SET ACTIVITY STOP` @ 0x00445a70 |
 | 4 | **investigating** a stimulus | 0x00452422 |
-| 7 | (unidentified; only tested, at 0x004513e5) | — |
+| 7 | **investigating an object** — the retained object is `Actor+0x40` | `AiBeginInvestigate` @ 0x0045e090; tested by `AiThink_Minebot` @ 0x0045719a and `AiThink_Bot` @ 0x004513e5 |
 | 8 | patrol / move order | console `SET ACTIVITY PATROL` @ 0x00445a39 and `GOTO` @ 0x0043ee05 |
 | 6 | (tested at 0x0045459e / 0x004545c5, never written in this module) | — |
 
@@ -100,7 +116,7 @@ Supporting fields, all on `Actor`:
 |---|---|---|
 | 0x30 | `alarm_delay` | seconds, straight from the GLS `alarm delay` field (`Character+0x60`), copied by `Actor::Ctor` |
 | 0x34 | `ai_think` | the think function |
-| 0x38 | `ai_think_secondary` | only `AIType::Mine` |
+| 0x38 | `on_placed_hook` | called once from vtable slot 51, not per tick; only `AIType::Mine` installs one (`Mine_OnDeployed`) |
 | 0x3c | `has_ai` | bool |
 | 0x48 | `alarm_deadline` | `__int64` game clock; 4 -> 2 fires here |
 | 0x54 | `ai_state` | §2.1 |
@@ -114,6 +130,31 @@ Supporting fields, all on `Actor`:
 counter on the shooter (zeroed by `AttackTarget` @ 0x00540e72, tested `== 2` at 0x005400cc).
 
 ---
+
+### 2.3 `AiBeginInvestigate` @ 0x0045e050 — how state 7 is entered
+
+`__fastcall void(Actor *self /*ECX*/, Actor *object /*EDX*/, float seconds)`, `RET 0x4`. Both
+callers are in `AiThink_Minebot` (0x00456f7c, and 0x004571b0 where the same object is propagated
+to a second actor that is `ai_type == 3` and not already in state 7). The body, instruction by
+instruction: `ai_state = 7` (0x0045e090); broadcast **0xb6**, 24 bytes unreliable, carrying the
+actor's own position, a radius of 20.0 and a packed `kind = 1, life = 3 s` (§7.2); then
+`MobileActor::GotoObject(self, object->+0x118, seconds)` @ 0x005394d0; then a refcount handover
+into `Actor+0x40` — release the old attachment through slot 0, retain the new one with
+`INC dword ptr [ESI+0x4]`. So `Actor+0x40` in state 7 is the object being investigated, and
+`Actor+0x04` is a reference count.
+
+**Suspected defect — PROPOSED, not confirmed.** The 17-line tail that computes the state's
+deadline into `+0x90/+0x94` contains **no clock read at all**: no `ReadScaledClock64`, no
+`Clock::ReadScaled32` @ 0x00571b60. It reads the tick rate (`0x007c07e0`, or `0x007c07b0` when the caller is the
+executor thread), scales `seconds` by it, then `0045e1c6 MOV EDI,[0x007c07dc] / ADD EDI,EAX /
+MOV [EBX+0x90],EDI`. Every sibling reads the clock first — `Decoy_Dismiss` @ 0x00450f60
+(`clock + 60*ticks_per_second`), `Mine_OnDeployed` (`now + 10*ticks_per_second`), `PostAiStimulus`
+(`ReadScaledClock64(&GameTimeClock)`). If `0x007c07dc` is ticks-per-second, as `Decoy_Dismiss`'s
+`* 0x3c` use implies, then the deadline is `ticks_per_second + seconds*rate` rather than
+`now + seconds*rate` — a deadline already in the past, so the investigate window would expire on
+the tick it is set. **What would settle it**: an independent identification of `0x007c07dc`, and an
+in-game observation of a minebot holding state 7 for longer than one tick. It has not been
+reproduced in the running game, so it does not yet belong in `game_defects_notes.md`.
 
 ## 3. Perception: the vision "cone" is a **sweeping ray**, not a cone
 
@@ -192,15 +233,15 @@ Actor *self @ +0x1c}`:
      A candidate seen for the first time is therefore always dropped.
    - unseen memo nodes are freed at the end; the function returns `n != 0`.
 3. **`CullCandidatesBeyondScanRayHit`** @ 0x0045a2d0 — raycasts `scan_eye_pos -> scan_ray_end`
-   through `FUN_00463460`; on a hit `scan_ray_end` is clamped to the hit point and every
+   through `IsWorldSegmentClear` @ 0x00463460; on a hit `scan_ray_end` is clamped to the hit point and every
    candidate at or beyond that squared distance is removed. This is "a wall blocks the cone".
 4. **`CullCandidatesWithoutLineOfSight`** @ 0x0045a480 — per candidate, raycasts
-   `candidate->coords + AiEyeOffset` -> `self->coords + AiEyeOffset` with `FUN_00463460` and
+   `candidate->coords + AiEyeOffset` -> `self->coords + AiEyeOffset` with `IsWorldSegmentClear` and
    removes it when blocked.
 5. nearest survivor -> `*out`, `*inout_best`.
 
 **`AiEyeOffset` @ 0x006affec is `Vec3f {0, -1, 0}`**, built by the CRT static ctor
-`FUN_00436b80`. Gunlok's +Y points down (the navmesh rule is `normal.y < 0` for walkable), so
+`StaticInit_AiEyeOffset` @ 0x00436b80. Gunlok's +Y points down (the navmesh rule is `normal.y < 0` for walkable), so
 this is one metre **up** — the eye height for every ray above.
 
 ### 3.2.1 The acquisition call site, and a second dead branch
@@ -264,7 +305,7 @@ alert_state 0  ─────────────────────�
   It is *not* the reacquire timeout the brief guessed at.
 - The **1 second** at 0x004547c1 is `ticks_per_sec` exactly; the **17 seconds** in the dead
   state-1 arm is `0x11 * ticks_per_sec` (0x00454b4d: `SHL ECX,4; ADD ECX,EDX`).
-- Entering state 2 also calls `FUN_0053a830(this->coords, 0, 0)` when `MobileActor+0x218` is 0.
+- Entering state 2 also calls `MobileActor::AppendAuthoredWaypoint(this->coords, 0, 0)` @ 0x0053a830 when `MobileActor+0x218` is 0.
 
 ---
 
@@ -336,7 +377,7 @@ a hit sets `actor->ai_next_think_time = now` — i.e. **the noise wakes the list
 tick**; the actual reaction is `AiThink_Bot`'s stimulus scan.
 
 Callers: **`ProjectileActor::OnPrePhysics` @ 0x00542ae0** (this is the explosion/impact case
-the manual describes), `FUN_004507b0`, `AiThink_Mine`, `AiThink_Minebot`, `AiThink_Swarm`.
+the manual describes), `MineDetonate` @ 0x004507b0, `AiThink_Mine`, `AiThink_Minebot`, `AiThink_Swarm`.
 
 `AiExecutorTick` ages the list every 10th tick: a node whose owner is alive has its position
 refreshed from the owner and its kind set from `IsMoving()`; an ownerless or dead node is
@@ -380,7 +421,7 @@ renderer. Then two more gates:
   (`CommandVision` @ 0x00442e00 -> `SetVisionConesEnabled` @ 0x004a0eb0, getter 0x004a0ec0).
   Tested at 0x0049b327; everything below is skipped when clear.
 - **`Unit+0x7c` = `draw_vision_cone`, `Unit+0x7d` = `draw_hearing_range`**, read at
-  0x0049b355. Both are seeded in the Unit constructor `FUN_004b4620` @ 0x004b48cd / 0x004b48eb
+  0x0049b355. Both are seeded in the Unit constructor `Unit::Unit_Ctor` @ 0x004b4620, at 0x004b48cd / 0x004b48eb
   from `Character+0x81` / `Character+0x82`, i.e. straight from the GLS `draw vision cone` and
   `draw hearing range` booleans, defaulting to 1 when the role has no character. The console
   commands `TURN VISION CONE {on|off} <actor>` and `TURN HEARING RANGE {on|off} <actor>`
@@ -512,10 +553,11 @@ are `Character` bools, and `src/Roles.h` already mirrors them correctly at 0x81/
   `4.0*sight_range²` only in that state and `1.0` otherwise (§3.2.1).
 - **"returns to its original coordinates."** No home-position field was found. `Actor+0x64`
   is the *alert* position, not a spawn point; patrol points come from `ADD PATROLPOINT`
-  (handler 0x00442140 -> `FUN_0044c760`) into the `MobileActor` waypoint list at +0x204. The
+  (handler 0x00442140 -> `CommandAddWaypointOrPatrolPoint` @ 0x0044c760) into the `MobileActor` waypoint list at +0x204. The
   return-home behaviour, if it exists, is inside one of the nine behaviour handlers at
   0x00455250, which were not read.
-- **`ai_state` 6 and 7** are tested but never written in this module; their meaning is unknown.
+- **`ai_state` 6** is tested (0x0045459e / 0x004545c5) but no writer has been found; its meaning
+  is unknown. (7 is settled — see §2.1.)
 - **`scan acceptance angle` and `alertable`** have no reader in anything read here.
 - **`TeamSlots+0x6a` / `+0x6b`** gate which actors get AI at all (`AiExecutorTick`,
   `AiThink_Bot`'s enemy scans). Their meaning is a separate open question — no writer has been
@@ -533,5 +575,5 @@ are `Character` bools, and `src/Roles.h` already mirrors them correctly at 0x81/
   each handler does.
 - `AiThink_Scavenger`, `AiThink_Mine`, `AiThink_Minebot`, `AiThink_Node`, `AiThink_Swarm` and
   `AiThink_Waiting` were identified and named but **not analysed**.
-- The exact byte layout of the client `Unit` (0x004b4620's product) beyond +0x24, +0x7c/+0x7d,
+- The exact byte layout of the client `Unit` (`Unit::Unit_Ctor` @ 0x004b4620's product) beyond +0x24, +0x7c/+0x7d,
   +0x88 and +0x140..0x154 is not mapped here.

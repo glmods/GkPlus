@@ -114,7 +114,7 @@ Three things worth knowing:
   pointer problem, not something a consumer was traced to confirm.
 - **The last three `Vec3`s and the int at 0x3c are unidentified.** They are
   constructed on the read path and touched by the record's own method
-  (`FUN_00557010` takes the address of all five `Vec3`s), but the bake does not fill
+  (`ShadowCaster_ClearLists` takes the address of all five `Vec3`s), but the bake does not fill
   0x40/0x4c/0x58, so they are most likely per-frame scratch that happens to be
   serialized.
 - **This is why the caster is low-poly.** Edge count scales with polygon count and
@@ -167,8 +167,8 @@ WinMain
 
 BeginLevelSession(bool doLoad)            @ 0x004e2560
   |   callers: CommandEndBriefing & ShowBriefingOrDebriefScreen (front end, see 2.1),
-  |            LoadGame (savegame restore), FUN_004fb850 (multiplayer briefing),
-  |            FUN_0046c170 (attract-mode demo)
+  |            LoadGame (savegame restore), BeginMultiplayerGame (multiplayer briefing),
+  |            StartAttractModeDemo (attract-mode demo)
   +- first call only: StartExecutorThread + InitClientRouting (single-player too),
   |  register GAMESPEED/FOG* console commands, load movement_indicator2.rif
   +- GameState = 0x12
@@ -181,7 +181,7 @@ BeginLevelSession(bool doLoad)            @ 0x004e2560
 in CL and is stashed at `[EBP-0x175]` in the prologue (0x004e09ad), before anything
 else touches ECX. It gates five things: the sun colour/direction, the
 `ExecuteCommandFile(ConsoleFileName)` that queues the level `.gcs`, the
-`ExecuteAllCommands()` that runs it, `FUN_00504500`, and the mission-stats reset in
+`ExecuteAllCommands()` that runs it, `ResetPlayerReapedFlags`, and the mission-stats reset in
 SP/coop.
 
 Only two call sites, and they disagree:
@@ -220,7 +220,7 @@ ChooseLevel(5) item n ....................  LevelList__GetTitlePtrAt(0x007b74dc,
    |                                         node +0x10/+0x14 -> ScriptFileName/ConsoleFileName;
    |                                         GameMode(0x007b9e28)==coop -> menu 15, else GoToMenu(9)
 Difficulty(9) item 0/1 (Normal/Hard) .....  GameDifficulty(0x007b9cc4) = item+1;
-   |                                         FUN_004f94c0, FUN_004e8dd0 (menu-screen teardown);
+   |                                         EnterSinglePlayerMode, LeaveFrontEndScreen (menu-screen teardown);
    |                                         ShowBriefingOrDebriefScreen(isBriefing=1) @0x004b1f60
    v
 ShowBriefingOrDebriefScreen(1)            @ 0x004b1f60
@@ -261,7 +261,7 @@ Notes:
 - Front-end call sites pass the `BeginLevelSession` load flag in **CL** (`MOV CL,1`) — arg 1 of
   the `__fastcall`, not DL.
 - Training area (menu 21) and campaign-advance (`CommandNextLevel` @0x004f6ba0) reach the same
-  `ShowBriefingOrDebriefScreen`; multiplayer uses FUN_004fb850 / FUN_004ef950 instead, and a
+  `ShowBriefingOrDebriefScreen`; multiplayer uses BeginMultiplayerGame / StartMultiplayerGameWhenReady instead, and a
   savegame load uses `LoadGame` -> `BeginLevelSession` directly (no briefing screen).
 
 ## 3. `LoadLevel` @ 0x004e0980
@@ -275,11 +275,11 @@ The width and the meaning of the value are **not established** - only that zero 
 which is why `src/LoadScreen.cpp` forwards it as `int` rather than narrowing it.
 
 Ordered outline. Loading-bar text comes from `GetResourceString(&LocalizedStrings, ...)`
-then `ShowLoadingMessage` @ 0x004e2910; `FUN_004e2c20(pct)` advances the bar.
+then `ShowLoadingMessage` @ 0x004e2910; `DrawLoadingProgressBar(pct)` advances the bar.
 
 ```
  1. briefing background: GL_MISBRF_FILENAME -> "bitmaps\<name>" -> LoadRimFile2 -> BriefingRIM
- 2. SetAmbientLight, fog reset
+ 2. LightSet_SetEmissiveColour (0x00579ef0 - it sets no ambient light), fog reset
  3. if (LevelLoadReason != 2) flush the texture cache
  4. next_entity_id = 0; NextInventoryItemId = 0            <-- id counters reset here
  5. GL_LOADING_AI_AND_UI    : AI + UI init; per-team-slot init over TeamSlots[]
@@ -432,7 +432,7 @@ CreateSceneObjectFromCachedMesh()                     @ 0x0059da90
 | `shadow object rif` 0x54 | `Map->shadow_object_rif` @ 0x160 |
 | `shadow object name` 0x55 | `Map->shadow_object_name` @ 0x164 |
 | - | `Map->rif_time_low/high` @ 0x158/0x15c = the `.rif` FILETIME |
-| - | `Map->sky_object` @ 0x188 = sky object (0x1f0, `FUN_0059c0f0`) |
+| - | `Map->sky_object` @ 0x188 = sky object (0x1f0, `Renderable_CtorFromShape`) |
 
 ### The `Map` object (0x18c)
 
@@ -440,12 +440,18 @@ Mirrored in C++ as `gk::Map` in `src/Map.cpp`, with `static_assert`s on every
 offset below. Built by `Map_Ctor` @ 0x00470f20.
 
 The object has **two vptrs** (0x00 and 0xa4), i.e. multiple inheritance, and the
-C++ mirror reproduces it as `Map : MapBase, RefCountedBase`:
+C++ mirror reproduces it as `Map : MapBase, RefCountedBase`. The Ghidra database types it as one
+flat 0x18c-byte record instead; the two agree field for field, so the layout below is the thing to
+read from, not either model:
 
 - `MapBase` @ 0x00, **0xa4 bytes**. Its whole chain declares exactly one virtual —
-  vtables 0x00663e5c <- 0x00652818 <- 0x00652824 are each a single slot. Destructor
-  `FUN_00489ae0` (called with `this+0x00` at the tail of the Map dtor) frees the 0x24
-  list and the arrays at 0x34/0x38/0x3c and 0x7c/0x80/0x84/0x88.
+  vtables 0x00663e5c <- 0x00652818 <- 0x00652824 are each a single slot. Constructor
+  `MapBase_Ctor` @ 0x00489990 (`Map_Ctor` does `MOV ESI,ECX; CALL 0x00489990` and *then*
+  `MOV dword ptr [ESI],0x652818`, which is what identifies it as the base of the primary
+  chain): it installs vptr 0x00663e5c, runs `RWLock_Ctor` on +0x04, builds the `List<T>` at
+  +0x24 and zeroes the three nav-grid index levels at 0x34/0x38/0x3c. Destructor
+  `MapBase_Dtor` @ 0x00489ae0 (called with `this+0x00` at the tail of the Map dtor) frees the
+  0x24 list and the arrays at 0x34/0x38/0x3c and 0x7c/0x80/0x84/0x88.
 - `RefCountedBase` @ 0xa4, **8 bytes** = `{vptr, refcount}`. A base shared across the
   engine: root vtable 0x006522e8 is referenced by ~28 classes, and the same pair sits
   at +0x9c/+0xa0 on the scene objects Map holds at 0xc8 and 0x188. Chain 0x006522e8
@@ -464,10 +470,10 @@ directly, only virtually.
 | 0x08c | `num_sections` | bound for the `.map` adjacency sidecar |
 | 0x094 | list header | |
 | 0x0a4 | vptr | second base subobject; vtable 0x00652828 (2 slots) |
-| 0x0a8 | `refcount` | `LoadGame` addrefs; `FUN_004e2090` releases, deletes at 0 |
+| 0x0a8 | `refcount` | `LoadGame` addrefs; `UnloadLevel` releases, deletes at 0 |
 | 0x0ac | `adjacency_built` | run-once gate in `LoadOrBuildSectionAdjacency` |
 | 0x0b4 | Vec4 | `{1,1,1,1}` |
-| 0x0c8 | `scene_object` | 0x1f0 bytes, `FUN_0059c3a0(sceneObject, 1)` |
+| 0x0c8 | `scene_object` | 0x1f0 bytes, `Renderable_CtorFromObject(sceneObject, 1)` |
 | 0x0cc | `bitmap` | owned `char*` |
 | 0x0fc | list header | |
 | 0x10c | list header | |
@@ -485,9 +491,9 @@ directly, only virtually.
 | 0x188 | `sky_object` | lazily built; `ToMap` tests then sets |
 
 `0x024..0x088` and `0x08c..0x0a4` remain unmapped: they are only reached through
-`__thiscall` methods invoked directly on `TheMap` (`FUN_0048cf50` and the
+`__thiscall` methods invoked directly on `TheMap` (`Map::FindNavPolygonUnder` and the
 `0x00472xxx` / `0x0048xxxx` cluster), so a global-reference sweep does not see
-them. Sweeping `FUN_0048cf50` is the highest-yield follow-up.
+them. Sweeping `Map::FindNavPolygonUnder` is the highest-yield follow-up.
 
 **The origin is stored negated.** `Map_Ctor` XORs each component of its `origin`
 argument with `0x80000000` before storing it at 0x11c, and `ToMap` *adds* that
@@ -569,7 +575,7 @@ every scalar operand in `.text` landing in `[0x7b4d80, 0x7b4ec0]`; and every ini
 dword in the image matching one of the six addresses. The only hits are the eight writes
 in `ToMap` and `InitRenderCameras`. The near misses are the backwards-`Vec3` idiom
 (`XOR EAX,EAX` / `SUB EAX,4` / `[EAX + <end+4>]`) walking `CameraCoords` @ 0x007b4e0c —
-`FUN_00484e40` at 0x0048703b and 0x004872bb, and `WaitCond_IsScreenScrolled` at 0x0056fd67.
+`UpdateReconCamera` at 0x0048703b and 0x004872bb, and `WaitCond_IsScreenScrolled` at 0x0056fd67.
 Contrast the sibling fields `Min`/`MaxCameraFocusHeight`, which the camera update genuinely
 reads (five sites each).
 
@@ -583,7 +589,7 @@ authored, the parser field exists, `ToMap` computes the plane, and nothing consu
 So `camera plane` is **vestigial**: the plane has no readers, and its one remaining side
 effect reproduces the fallback. The surviving members of the same family are
 `min`/`max camera focus height`, which name locator objects the same way and *are* read —
-five sites each in the camera update `FUN_00484e40`. It joins `max camera distance` as
+five sites each in the camera update `UpdateReconCamera`. It joins `max camera distance` as
 parsed-and-discarded, and a script-defined level can set it or omit it with no observable
 difference.
 
@@ -750,7 +756,7 @@ classes and differ from the executor-side sizes in `actor_vtable_notes.md`:
 | TrackObject | 0x1d0 | | President | 0x248 |
 | Tumbleweed | 0x148 | | Turret | 0x2f0 |
 
-Actor id source is `DAT_007b68e4`.
+Actor id source is `NextClientActorId`.
 
 ## 5.5 The navmesh: there isn't one
 
@@ -891,14 +897,14 @@ looking healthy. The Blender addon exposes all of this through **Preview Navmesh
 Run-once per level (`Map->adjacency_built` @ 0xac). Reads the `.map` file; if its leading
 FILETIME matches `Map->rif_time_low/high` @ 0x158/0x15c (the `.rif` time) it replays the
 cached per-section neighbour lists through vtbl slot 0x5c; otherwise it rebuilds them with
-`FUN_0048aa00` (under `Map->lock` @ 0x04) and writes the file back.
+`Map::BuildPolygonAdjacencyGrid` (under `Map->lock` @ 0x04) and writes the file back.
 
 Format: FILETIME, then per section `{neighbourCount, sectionId, neighbourCount x
 neighbourSectionId}` over `Map->sections[0 .. Map->num_sections)` (0x88/0x8c).
 
 ### `<level rif>.opt` / `.loc`
 
-Written and re-read by `FUN_005b03b0` (the rif recompressor) from the RIFs directory
+Written and re-read by `File_Chunk_WriteFile` (the rif recompressor) from the RIFs directory
 during the cold path only. `.loc` is the level rif stripped down to its **named locator
 objects** — the camera plane, the focus-height markers and the `use ... for` spawn points —
 built by deleting every `REBSHAPE` except one and re-pointing every object at that
@@ -1128,6 +1134,15 @@ Three things this rests on, two of them found by crashing the game:
 - **`EndLevelSession` and its coop twin are guarded by `LevelSessionStarted` @ 0x007b6dd8**
   and return early when no session was ever begun. That is what lets one code path serve
   both "start from the menus" and "switch levels mid-game".
+- **`UnloadLevel` @ 0x004e2090 is `LoadLevel`'s counterpart and it returns a `bool`.**
+  `__cdecl bool(void)` — no arguments at all, the first instruction being
+  `CMP byte ptr [LevelSessionLoaded 0x007b6dd9],0x0` — and `EndLevelSession` consumes the result
+  (`004e272b CALL 0x004e2090 ; MOV BL,AL`). Both return paths return 1 today, so nothing observes
+  a false yet; a `void` mirror would still be the wrong shape, for the reason `LoadLevel` was
+  (CLAUDE.md: a hooked function declared `void` returns whatever is in EAX, and that differs
+  between build configurations). Callers: `EndLevelSession`, `EndLevelSessionKeepingExecutor`
+  @ 0x004e2810, `CommandNextLevel` @ 0x004f6ba0, `LoadGame` @ 0x00505730. It is the whole
+  session teardown: destroys the `FogSystem`, `DestroyRoles`, releases `TheMap`.
 
 **Where it may run.** `LoadLevel` must not run inside the renderer, and the script host's
 frame callback is driven from inside `HookedPresentScene` whenever a level is up - so the

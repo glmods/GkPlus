@@ -27,16 +27,16 @@ graph, vertex buffers) plus `0x005a6000`-`0x005aa000` (the render queue) and
 This is the single most important thing about the renderer, and it is why looking for a
 "render the world" traversal finds nothing.
 
-`RunInGameFrame` @ 0x0046e6c0 (called from `WinMain`'s loop; the front end runs `FUN_0046eae0`
+`RunInGameFrame` @ 0x0046e6c0 (called from `WinMain`'s loop; the front end runs `RunFrontEndFrame`
 instead) does:
 
 1. `BeginFrameAndClear`, script-queue pump, AI/input, camera update
 2. `BeginScene` @ 0x0058ffe0
 3. **the submit phase** — every producer pushes into the one global `RenderQueue` @ 0x00803e98
    through `RenderQueue_Submit` @ 0x0059d760. Nothing is drawn. The producers are
-   `FUN_005201c0` (world effects), `FUN_004720a0` (the map, only when `TheMap` is set),
-   `FUN_0049f4f0`, `RenderHudItems` @ 0x0055fb20 (HUD), `DrawOrderMenu` @ 0x00498610,
-   `Hud2D_BeginBatch` @ 0x005695a0, `FUN_004d5060` (console).
+   `DrawWorldEffects` (world effects), `Map::SubmitAndFlushMapGeometry` (the map, only when `TheMap` is set),
+   `DrawInventoryScreen`, `RenderHudItems` @ 0x0055fb20 (HUD), `DrawOrderMenu` @ 0x00498610,
+   `Hud2D_BeginBatch` @ 0x005695a0, `DrawConsole` (console).
 
    `Hud2D_BeginBatch` is not a producer and was mislabelled "(in-game menu)" here: it opens the
    **immediate-mode 2D batch**, a second path that bypasses the queue entirely. See §4.3.
@@ -195,14 +195,59 @@ slot +0x04 with the mesh's own bounds (+0x48, +0x54) and world matrix — per-me
 from a bounding volume — but **only while `CurrentLightSet == SceneLightSet`**, i.e. only when no
 draw item has overridden the lighting.
 
+`SceneLightSet` is a **subclass**, not the base object: 0x6c bytes = `LightSet` (0x5c) plus its own
+`List<Light *>` at +0x5c, with vtable **0x006523b8** and three overrides. `WinMain` builds it inline
+(`PUSH 0x6c; CALL malloc` @ 0x0046b815, base ctor, `MOV dword ptr [ESI],0x6523b8` @ 0x0046b83f, a
+fresh 0xc-byte list sentinel into +0x5c, then `InstallSceneLightSet`).
+
+```
++0x00  0x0046c140                                   (base 0x0057ac50, the deleting dtor)
++0x04  SceneLightSet_SelectLightsForBounds 0x00488400   override — base 0x0057ac80 is an empty RET 0xc
++0x08  0x00488640                                   override of LightSet_RemoveLight 0x0057a6d0
++0x0c  LightSet_Apply                               inherited
++0x10  Light_Disable                                inherited
++0x14  0x00488740                                   override of LightSet_AddLight 0x0057aa20
+```
+
+Because lighting is state-sorted through this interface, that slot-1 override — not the base stub —
+is **the** lighting path for world geometry, and it does something nothing else in the renderer
+does:
+
+- **Every light is attenuated by the fog of war at the light's own position.**
+  `SceneLightSet_SelectLightsForBounds` @ 0x00488400 (`void __thiscall(SceneLightSet *, const Vec3
+  *bounds_max, const Vec3 *bounds_min, const AwMatrix *world)`, `RET 0xc`) early-outs unless
+  `direct3d_device != 0 && DynamicLightsOn @ 0x006abdfc`, then walks the light list at +0x5c testing
+  each light's sphere against the AABB translated by the world matrix's translation row
+  (`world+0x30/0x34/0x38`) on all three axes. A light that passes is scaled by
+  `1.0 - FogOfWar_SampleTotal(lightPos) * (1/254)` through its own vtable slot 3 before
+  `Light_Apply` binds it — `FLOAT_00663f54` is 0.003937, the same 1/254 divisor `Unit_Draw` uses.
+  D3D slot indices start at `this+0xc`, wrap back to 1 at `MaxD3DLights`, and every unused slot up
+  to `MaxD3DLights` gets `LightEnable(i, FALSE)` afterwards. Its only reference is the vtable entry
+  at 0x006523bc; there are no direct callers.
+- **A particle emitter attaches a dynamic light through `SceneLightSet_AddDynamicLight`**
+  @ 0x0057a040 — `__thiscall`, `RET 0x1c`, i.e. seven stack dwords *plus* the receiver. All five
+  call sites load `ECX` from `[0x007c18cc]`, so it is a method on the scene light set and not the
+  free function its decompiled call in `ParticleEmitter_Ctor` looks like. It builds a 0x6c-byte
+  light record — two 16-byte values evaluated out of a pair of `PGenChannel`s, a position, a colour
+  lazily unpacked from the `LightInfo` at 0x006ab218, a lifetime, and two terms derived from that
+  lifetime — and installs it through vtable slot 5. The 0x6c matches what `LightSet_Reset`
+  @ 0x0057a780 frees, which is what the name rests on.
+- **`LightSet_SetEmissiveColour` @ 0x00579ef0 sets no ambient light**, despite ~90 call sites across
+  the HUD, menus, console and world effects and despite `src/World.h` still wrapping it as
+  `SetAmbientLight`. It writes `this+0x48` — `D3DMATERIAL8.Emissive`, the material starting at
+  +0x18 — and `this+0x24`, `Diffuse.a`; if `this == CurrentLightSet` it re-pushes via
+  `SetD3DMaterial`, otherwise the colour reaches D3D lazily through `LightSet_Apply`. There is no
+  ambient term anywhere in it. (`src/World.h` is not this file's to fix; the header's `AwColour`
+  layout and its "flags == 2 means the four floats are authoritative" rule are both correct.)
+
 ### The per-`DrawItem` callback pair
 
 `RenderQueue_Submit`'s 9th argument lands at `DrawItem+0x2c`. If non-null, `DrawItemList_Render`
 calls its vtable slot 1 (+0x04) immediately **before** `DrawItem_RenderGeometry` and slot 2 (+0x08)
 immediately **after**, both with `this` = the `Renderable`. This is an engine mechanism in active
 use: of the 102 submit sites, **56 pass null and 46 pass an object** — 20 of
-`UpdateAndDrawMenuScreen`'s 29, plus sites in the HUD (`FUN_0055fbd0`), the world-effects pass
-(`FUN_005201c0`) and `FUN_0049f4f0`.
+`UpdateAndDrawMenuScreen`'s 29, plus sites in the HUD (`HudItem_DrawByKind`), the world-effects pass
+(`DrawWorldEffects`) and `DrawInventoryScreen`.
 
 ## 4. Hook points
 
@@ -278,7 +323,7 @@ Three things this establishes, in order of how much they constrain a replacement
   `Draw*` slot (0x118/0x11c/0x120/0x124) yields 24 candidate functions — but only these four also
   reference `direct3d_device` @ 0x007c121c. The other 20 are **displacement collisions on unrelated
   vtables**: an `Actor` vtable has 83-105 slots, so 0x118..0x124 is slots 70-73 and lands squarely
-  inside it. That is why the hit list contains things like `SyncPositionAndBroadcast` and
+  inside it. That is why the hit list contains things like `Actor::Update` (slot 70) and
   `ApplyUpdateMessage`. A displacement-only scan is not a call-site scan; intersect it with the
   device global.
 - **Two of the four take a user pointer**, so for the shadow, scanner, level-load-overlay and
@@ -302,7 +347,7 @@ that every producer calls does not draw:
 producers (39 call sites)
   └─ Font_QueueText 0x005782e0   lays the text out, appends a List_Member<TextDrawItem>
                                  to font+0xb08. Touches no device, no vertex buffer,
-                                 and not DAT_007c146c.
+                                 and not CurrentCamera.
 
 RenderSceneAndPresent 0x00574ccd
   └─ ScenePass_Overlay2D  0x00578ee0   walks the font registry List at DAT_007c14a0
@@ -443,7 +488,7 @@ out of the DLL's `RT_STRING` resources; string *id* N lives in block `N/16 + 1` 
 
 | Producer | Address | Sites | Reached from |
 |---|---|---:|---|
-| `UpdateAndDrawMenuScreen` | 0x004ea8e0 | 29 | the front-end frame `FUN_0046eae0` |
+| `UpdateAndDrawMenuScreen` | 0x004ea8e0 | 29 | the front-end frame `RunFrontEndFrame` |
 | `DrawWorldEffects` | 0x005201c0 | 15 | `RunInGameFrame` **and** `ScenePass_WorldEffects` |
 | `HudItem_DrawByKind` | 0x0055fbd0 | 11 | `HudItem_Draw` @ 0x0056a7b0 |
 | `DrawInventoryScreen` | 0x0049f4f0 | 6 | `RunInGameFrame` |
@@ -453,11 +498,11 @@ out of the DLL's `RT_STRING` resources; string *id* N lives in block `N/16 + 1` 
 | `DrawItemValueBrackets` | 0x004fa930 | 3 | `UpdateAndDrawMenuScreen` |
 | `DrawItemLabelBrackets` | 0x004fb500 | 3 | `UpdateAndDrawMenuScreen` |
 | `DrawOrderMenu` | 0x00498610 | 2 | `RunInGameFrame` |
-| `DrawInventoryFrame` | 0x0049eba0 | 2 | `FUN_00484e40` |
+| `DrawInventoryFrame` | 0x0049eba0 | 2 | `UpdateReconCamera` |
 | `InGameMenuWidget_Draw` | 0x0056c3c0 | 2 | widget vtable slot 2 |
 | `SubmitAndFlushMapGeometry` | 0x004720a0 | 1 | `RunInGameFrame` |
 | `DrawCtfFlagMarker` / `…2` | 0x004963b0 / 0x004963f0 | 1 each | `DrawUnits` / `Unit_DrawWithTeamState` |
-| `SubmitSkyDome` | 0x004a0ed0 | 1 | `FUN_00484e40`, `FUN_00497ca0` |
+| `SubmitSkyDome` | 0x004a0ed0 | 1 | `UpdateReconCamera`, `UpdateSelectedUnitCamera` |
 | `DrawTargetInfoPanel` | 0x004a86c0 | 1 | `DrawOrderMenu` |
 | `DrawTargetingReticule` | 0x004ac540 | 1 | `DrawTargetInfoPanel` |
 | `Sprite_Draw` | 0x004b0df0 | 1 | sprite vtable slot 1 |
@@ -470,7 +515,7 @@ out of the DLL's `RT_STRING` resources; string *id* N lives in block `N/16 + 1` 
 | `DrawLevelLoadOverlay` | 0x00524740 | 1 | `ScenePass_Shadows` |
 | `DrawWorldEffect_Unknown` | 0x00529750 | 1 | `DrawWorldEffects` |
 | `ShadowRenderer_Quality1` | 0x005520a0 | 1 | `ShadowRendererFn` |
-| `DrawTeamSelectOverlay` | 0x00566bd0 | 1 | `FUN_00565920` |
+| `DrawTeamSelectOverlay` | 0x00566bd0 | 1 | `DrawInGameOverlay` |
 | `InGameMenuWidget_DrawLabelled` | 0x0056c6e0 | 1 | widget vtable slot 2 |
 | `SubmitSkyBackdrop` | 0x00588ad0 | 1 | `RenderSceneAndPresent` |
 
@@ -495,19 +540,88 @@ out of the DLL's `RT_STRING` resources; string *id* N lives in block `N/16 + 1` 
   `RunInGameFrame` during the submit phase, and again as `ScenePass_WorldEffects`, which
   `RenderSceneAndPresent` invokes as its `preCb` from *inside* the scene. `ApplyShadowQuality` is
   what installs that callback pair, along with `ShadowRendererFn`: quality 0 gets the `CommandRem`
-  no-op stub, quality 1 `ShadowRenderer_Quality1`, quality 2 and 3 `FUN_0054fe40` (3 additionally
+  no-op stub, quality 1 `ShadowRenderer_Quality1`, quality 2 and 3 `ShadowRenderer_Quality23` (3 additionally
   bakes static shadows). So **the shadow setting changes which functions are producers at all.**
 - **The inventory screen replaces the world rather than overlaying it.** `RunInGameFrame` branches
-  on `InventoryScreenOpen` @ 0x007b6e50 and `InGameInterface` @ 0x007b3f38 `+0x60`; when the screen
+  on `InventoryScreenOpen` @ 0x007b6e50 — which is a **`Renderable *`, not a flag**: it holds the
+  screen's model, built by `Renderable_CtorCopy` in `OpenUpgradeScreen` @ 0x004e5ad0 — and on
+  `InGameInterface` @ 0x007b3f38 `+0x60`; when the screen
   is up, `DrawInventoryScreen` runs *instead of* `DrawWorldEffects` +
   `SubmitAndFlushMapGeometry` + `DrawUnits`. Anything counting draws per frame sees the world
   disappear entirely, which is correct behaviour and not a dropped hook.
 - **`RunGameFrame` is a producer too, and a bulky one.** Before it calls `RenderSceneAndPresent` it
-  builds ~22 UI sprites through `FUN_004b1150` and submits each with `DrawUiSprite`. The submit
+  builds ~22 UI sprites through `UiSprite_Ctor` and submits each with `DrawUiSprite`. The submit
   phase is therefore split across `RunInGameFrame` *and* `RunGameFrame`, not confined to the former.
 
 Two producers keep a hedge in their names: `DrawWorldEffect_Unknown` (which effect it draws is not
 established) and `DrawTeamSelectOverlay` (named from its neighbours — the least-verified name here).
+
+## 5.1 The client `Unit` vtables: sixteen tables, and the base is 92 slots
+
+The biggest producer dispatches through these, so their **bounds** are load-bearing: read a slot
+off the wrong table and you get a function from the next class down. Sixteen adjacent tables in
+`.rdata`, each start and each length fixed by the reference test — a vtable start is referenced
+from `.text` by its class's ctor/dtor, an interior slot by nothing:
+
+| vtable | slots | ctor / dtor that reference it | vtable | slots | ctor / dtor |
+|---|---|---|---|---|---|
+| 0x006647ac | **92** | `Unit_Ctor` @ 0x004b4620, 0x004b5640 | 0x006653cc | 94 | 0x004cb530 / 0x004cb590 |
+| 0x0066491c | 107 | 0x004ba050 / 0x004ba630 | 0x00665544 | 107 | 0x004cbb30 / 0x004cbb60 |
+| 0x00664ac8 | 112 | 0x004c1100 / 0x004c1300 | 0x006656f0 | 112 | 0x004cbb90 / 0x004cbbd0 |
+| 0x00664c88 | 94 | 0x004c47e0 / 0x004c4a50 | 0x006658b0 | 112 | 0x004cbc70 / 0x004cbca0 |
+| 0x00664e00 | 93 | 0x004c6d70 / 0x004c6e60 | 0x00665a70 | 112 | 0x004cc4f0 / 0x004cc530 |
+| 0x00664f74 | 92 | 0x004c6f50 / 0x004c70b0 | 0x00665c30 | 112 | 0x004cc9a0 / 0x004cca10 |
+| 0x006650e4 | 92 | 0x004c8390 / 0x004c84b0 | 0x00665df0 | 92 | 0x004cd570 |
+| 0x00665254 | 94 | 0x004c9730 / 0x004c9af0 | 0x00665f60 | 108 | 0x004cdfe0 / 0x004ce060 |
+
+Twelve of the sixteen were raw undefined bytes until this run was defined, so any slot count taken
+from the tables before then was a guess at bytes rather than a measurement — **no table in the run
+is shorter than 92**. Two things pin the numbers:
+
+- **The last table is bounded by the reference test, not by adjacency.** 0x00665f60 has no
+  successor vtable to end it; the first referenced dword past it belongs to the string
+  `"blobarrel"`, which puts the table at 108 slots. This is the same trap that once undercounted
+  `PresidentActor` by 12 slots (`actor_vtable_notes.md`) — "it ends where the next vtable starts"
+  is not a bound when there is no next vtable.
+- **The base is 92 slots, so an offset of 0x170 or more read off 0x006647ac is already inside the
+  *next* class's table.** That is not hypothetical: the shipped names `Unit_IsConcealed`
+  @ 0x004cfe70 and `Unit_SetConcealed` @ 0x004cf5d0 were filed as slots 100 and 101 by exactly that
+  arithmetic. They are slots **8 and 9**.
+
+Slot 68 (`Draw`) is `Unit_Draw` @ 0x004b6ae0 / `Unit_DrawWithTeamState` @ 0x004be830 /
+`Unit_Draw_Override1` @ 0x004c96e0 in every table, which is the alignment cross-check that the
+starts above are right. The other identified slots:
+
+| slot | +off | base implementation | meaning |
+|---|---|---|---|
+| 8 | 0x20 | `Unit_IsConcealed` @ 0x004cfe70 — `MOV AL,[ECX+0x19e]` | concealment flag getter |
+| 9 | 0x24 | `Unit_SetConcealed` @ 0x004cf5d0 — `RET 0x4` | its setter |
+| 33 | 0x84 | 0x004cf3b0 — `*(int *)(this+0xb4) = arg; RET 0x4` | `SetTeam` |
+| 51 | 0xcc | `Unit_EnterWorld` @ 0x004b57c0 | |
+| 55 | 0xdc | 0x004cf5b0 — bare `RET` stub | `Dissociate` |
+| 57 | 0xe4 | 0x004b5d50, `RET 0xc`, a body per subclass | the per-tick `Update` |
+| 67 | 0x10c | `Unit_ComputeLodLevel` @ 0x004b6930 (all sixteen tables) | the LOD level, below |
+| 68 | 0x110 | four distinct bodies across sixteen classes | `Draw` — the biggest producer |
+
+**Slot 67 is the model's detail level**, and it is the client's whole LOD policy in one function.
+It is `int __thiscall(Unit *)`, bare `RET`, and it occupies slot 67 in all sixteen tables, so it
+belongs to the base `Unit`:
+
+```
+base    = ModelDetailLevelBase @ 0x007b9c78          ; written once by LoadLevel @ 0x004e0d0d
+maxDist = role->+0x1c ? *(int *)(role->+0x1c + 0x44) : 20000
+          and * 1.4f when this->team (+0xb4) is neither 0 nor 2
+dist    = |Camera_World position (0x007b4d7c) - this->+0x98|, via RsqrtMantissaTable @ 0x007fef80
+return clamp(dist * 1000.0f * (float)[0x007b4e34] / 0.4f > maxDist ? base + 2 : base, 0, 9)
+```
+
+Read that off the **disassembly**: the decompiled C drops the `COMISS` and shows the distance being
+discarded, so it reads as if nothing depends on the camera. The `+2` is the only distance term —
+there is no per-mesh LOD curve, just "near" and "two levels coarser". `ModelDetailLevelBase` has
+exactly two references in the image, the `LoadLevel` write and this read. There is one virtual call
+site in the `Unit` tree, inside `Unit_Draw` @ 0x004b707d; a displacement scan for `+0x10c` also
+finds `MineDetonate` and three others, but those are **`Actor`**-tree objects and a different slot
+67 — the two trees' slot numbers are not comparable (CLAUDE.md, Analysis Traps).
 
 ## 6. What the fields turned out to be
 
@@ -572,8 +686,15 @@ typed ones, and it is worth reaching for before reading any more call sites:
 - `Renderable::vertices` (+0x1a0) and its neighbour (+0x19c) are **counted arrays**: the element
   count sits in the dword *before* the pointer, which is how the destructor frees them
   (`count * 0xc + 4`).
-- `SceneNode::name` (+0x11c) is the string `SceneNode_FindByName` matches case-insensitively —
-  the same name a RIF `OBJHIERD` binding carries. `SceneNode::textures` (+0x9c) is the list a
+- `SceneNode::name` (+0x11c) is the string `SceneNode_GetWorldPositionByName` @ 0x0059ab20
+  matches case-insensitively — the same name a RIF `OBJHIERD` binding carries. That function
+  **returns a `bool`, not a node**: on a match it builds the transform for the given animation time
+  and writes the translation column (`m[0x0c]`, `m[0x1c]`, `m[0x2c]`) into a caller-supplied
+  `Vec3 *`, recursing over children and post-multiplying on the way back up. It is
+  `__thiscall bool(SceneNode *, Vec3 *out, const char *name, int anim_time)`, `RET 0xc`, and
+  `Renderable_GetNodeWorldPosition` @ 0x0059d270 is the five-instruction thunk that reaches it
+  through `Renderable::root_node` (+0x17c). `src/Render.h` still calls it `SceneNode_FindByName`,
+  which describes a lookup it does not perform — it never returns the node. `SceneNode::textures` (+0x9c) is the list a
   `Renderable` harvests into its own at construction, which is what lets it be bucketed by
   texture without walking the graph. `current_frame`/`previous_frame` (+0x198/+0x19c) are a
   rotating pair, which is what makes interpolation rather than snapping possible.
@@ -608,7 +729,7 @@ kinds** — worth stating, because neither is a matter of not having looked:
   why they stay unnamed.
 - **Filled by the geometry builder.** `SceneMesh`'s two extra lists (+0x14, +0x24) and its build
   state (+0x44, +0x60..+0x74, +0x7c, +0x8c, +0x94), and `SceneNode` +0x124/+0x130. These are
-  written by `BuildShapeVertexBuffers` and `FUN_0059b7d0`, neither of which is dissected here.
+  written by `BuildShapeVertexBuffers` and `SceneNode_BindHierarchyNode`, neither of which is dissected here.
   `SceneMesh_ResetBuildState` is what establishes that the whole +0x44..+0x94 run *is* build
   state, since it clears exactly that run and raises `needs_rebuild`.
 
@@ -623,9 +744,8 @@ Also open:
 - `ScenePass_Overlay2D` @ 0x00578ee0 — named but not analysed. (`ScenePass_WorldEffects` and
   `ScenePass_Shadows`, the `preCb`/`postCb` arguments of `RenderSceneAndPresent`, are covered in
   §5: `ApplyShadowQuality` installs them.)
-- The `Unit` hierarchy itself — sixteen subclasses with ~69-slot vtables in
-  0x006647ac..0x00665f60. Only slot 68 (`Draw`) and slot 67 (`FUN_004b6930`, shared by both draw
-  families) are identified.
+- The `Unit` hierarchy's remaining slots. Its sixteen vtables and their real bounds are §5.1;
+  what is identified there is slots 8, 9, 33, 51, 55, 57, 67 and 68, out of 92 on the base.
 - `VertexBufferSet` / `IndexBufferSet` / `SharedVB` (`AwSharedVB`, `AwBBSharedVB`) — named, and
   clearly the `vertbuff.cpp` half of AWAPI, but their pooling policy is unexamined.
 - Whether any of this is reachable from a `.gls` or a console command. Nothing in

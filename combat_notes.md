@@ -35,9 +35,8 @@ projectile path (arc solve, team assignment), never a different damage mechanism
 
 ## 2. The fire path
 
-`CharacterActor::Update` is vtable **slot 70** @ 0x0053d8d0 (the DB name
-`CharacterActor::SyncPositionAndBroadcast` is the family-wide slot-70 name; slot 70 is really
-"Update" - see `actor_vtable_notes.md`). The whole fire sequence is inline in it; the projectile
+`CharacterActor::Update` is vtable **slot 70** @ 0x0053d8d0 - the per-tick update for the whole
+family (see `actor_vtable_notes.md`). The whole fire sequence is inline in it; the projectile
 is constructed at 0x00540649, not through `SpawnProjectileActor`.
 
 ### 2.1 Order to fire
@@ -229,20 +228,24 @@ the square biases most shots well inside the bound.
 
 ### 3.5 The optical tracker / `target imager`
 
-`MobileActor_RecomputeAimSpread` @ 0x00536b20,
-`__thiscall void(MobileActor *this, int delta)`:
+`MobileActor::ApplyAimModule` @ 0x00536b20, `__thiscall void(MobileActor *this, int delta)`,
+`RET 0x4`:
 
 ```
 this->aim_level (+0x1b8) += delta;  if (aim_level < 0) aim_level = 0
 this->aim (+0x1b4) = role->character->aim * 0.5^aim_level
 ```
 
-**Each aim module halves the spread.** It is called from the equip path @ 0x00536ba0 for inventory
+**Each aim module halves the spread**, and the halving is **re-derived, not accumulated**:
+`+0x1b4` is reset from `Character::aim` (`character+0x08`) on every call and then halved
+`aim_level` times against `FLOAT_006520a0` = 0.5f, so removing a module is exact. That is also
+the arithmetic that confirms `aim` is a **spread** rather than an accuracy - halving it doubles
+accuracy. It is called from `MobileActor::EquipItemInSlot` @ 0x00536ba0 for inventory
 items whose module subtype (`item+0x20`) is **6**, passing `item+0x18` as the delta. In
 `scripts\body_slot_upgrades.gsh` those are the `aim accuracy pickup` roles (`weapon target imager`,
 with the comment `walking speed 1 // 1 = standard aim pickup`).
 
-The same equip function shows the sibling module kinds: item kind 3 adds to the shield
+`EquipItemInSlot` also shows the sibling module kinds: item kind 3 adds to the shield
 (slots 19/29), kind 9 adds to armour (slots 18/28), kind 4 calls `SetWeapon` (slot 94).
 
 ### 3.6 `Actor+0x74` - a consecutive-miss counter
@@ -339,7 +342,7 @@ AmmoTable[weapon_type * 19 + ammo_type] != NULL        // AmmoTable = 0x007b5ec0
 ```
 
 Sites: `CharacterActor_SelectAmmo` @ 0x00541900, `SetWeaponAmmoType` @ 0x004b1da6,
-`MobileActor::EquipObject` @ 0x0053723e, `CharacterActor::Update`'s auto-equip @ 0x0053dd7b, the
+`MobileActor::UseInventoryItem` @ 0x0053723e (the USE handler's ammo arm), `CharacterActor::Update`'s auto-equip @ 0x0053dd7b, the
 inventory/command-wheel UI @ 0x004a6a79 and @ 0x004bd710.
 
 There is **no weapon-id compare anywhere**. The discriminating case in the brief resolves in
@@ -401,7 +404,8 @@ empty. Otherwise, with `a = AmmoTable[weapon_type*19 + ammo_type]`:
 | +0x20 `ammo_type` | the argument | |
 | +0x24 `sound` | `Ammo::sound` (+0x10) | |
 
-The tick rate is the **calling thread's** (`DAT_007c07e0` main / `DAT_007c07b0` executor), so a
+The tick rate is the **calling thread's** (`TickRate` @ 0x007c07e0 main / `TickRateExecutor`
+@ 0x007c07b0 executor), so a
 weapon configured on one thread and fired on the other would have the wrong cadence. Callers:
 `CharacterActor::SetAmmoType` (slot 99), `CharacterActor_SelectAmmo`, `ReadActorFixups` and three
 UI paths.
@@ -415,7 +419,9 @@ UI paths.
 
 Two readers, both testing it against an inventory item's `+0x30` bitmask:
 
-- `MobileActor::EquipObject` @ 0x00536c64: `if ((item->+0x30 & role->limit) == 0)` before equipping.
+- `MobileActor::EquipItemInSlot` @ 0x00536c64: `if ((item->+0x30 & role->limit) == 0)` before
+  equipping; on failure `SendLocalizedMessageToOwner(owner, 0x2f38)` + `SendSoundToOwner(owner, 0x28)`.
+  `MobileActor::UseInventoryItem` @ 0x005370d0 carries its own copy of the same gate at its top.
 - `CharacterActor::Update`'s auto-equip @ 0x0053...: the same test while choosing the
   highest-numbered weapon item (`kind == 4`, type `< 0x0d`) that the role is allowed to hold.
 
@@ -702,8 +708,9 @@ settle it in one REPL call.
 | 0x00541700 | `__fastcall int(CharacterActor*)` | **`CharacterActor_ConsumeRoundAndReload`** |
 | 0x005423c0 | `__fastcall void(CharacterActor*)` | **`CharacterActor_RefreshCanFire`** |
 | 0x004b1da0 | `__fastcall void(Weapon*, int)` | **`SetWeaponAmmoType`** |
-| 0x00536b20 | `__thiscall void(MobileActor*, int)` | **`MobileActor_RecomputeAimSpread`** |
-| 0x00536ba0 | `__thiscall` | equip an inventory item (module effects, `Role::limit` test) |
+| 0x00536b20 | `__thiscall void(MobileActor*, int)` `RET 0x4` | **`MobileActor::ApplyAimModule`** - the argument is a module-count delta |
+| 0x00536ba0 | `__thiscall` `RET 0xc` | **`MobileActor::EquipItemInSlot`**(slot, item_id, silent) - equip an inventory item (module effects, `Role::limit` test), broadcasts 0x79/0x7a |
+| 0x005370d0 | `__thiscall` `RET 0x8` | **`MobileActor::UseInventoryItem`**(item_id, say) - the USE handler; health, ammo compatibility, mine deploy, audio cloak, and `EquipItemInSlot(0, ...)` for weapons |
 | 0x00503bd0 | `__fastcall` `RET 0x14` | `SpawnProjectileActor` (script/effect side) |
 | 0x00542410 | `RET 0x24` | `ProjectileActor::Ctor` |
 | 0x00542ae0 | `__thiscall void(ProjectileActor*, +3)` `RET 0xc` slot 55 | `ProjectileActor::OnPrePhysics` - impact, damage, splash |

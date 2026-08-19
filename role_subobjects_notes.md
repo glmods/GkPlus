@@ -258,7 +258,8 @@ reads as a flags word, not the keyframe count previously assumed. Only one consu
 been checked, so treat that as measured-but-not-exhaustive.
 
 Channels C and D are gated: `use_channel_cd` (0x5c) enables
-`FUN_0057a040(&chanC, &chanD, &field0xb8, 5.5f, field0xa8, field0xac, field0xb0)`.
+`SceneLightSet_AddDynamicLight(&chanC, &chanD, &field0xb8, 5.5f, field0xa8, field0xac, field0xb0)`
+@ 0x0057a040.
 `ToParticleGenerator` zeroes that gate, which is why it can leave C/D/E's leads
 uninitialised without it mattering - a latent hazard for any code that builds a generator
 by hand, not a live bug.
@@ -331,7 +332,8 @@ but ids 7, 8 and 10 have no console keyword. 7 and 8 share an identical sprite r
 (`trail`) and 10 have identical physics - so the unnamed ids are variants of their
 neighbours, not unused slots.
 
-**Next levers:** the per-tick update `FUN_00581180` (single caller `FUN_00580460`) and the
+**Next levers:** the per-tick update `ParticleEmitter_Update` @ 0x00581180 (single caller
+`ParticleTypeInfo_UpdateEmitters` @ 0x00580460) and the
 renderer `ParticleSystem_Render` @ 0x00582d10 (single caller `RenderSceneAndPresent`
 @ 0x00574c50) are the only remaining consumers;
 between them they should settle `turbulence`, `field0xa4`, `field0xa0` and the emitter's

@@ -4,7 +4,7 @@
 
 The trigger system uses a global doubly-linked list of trigger nodes. Each trigger has
 a type, coordinates, timing/radius data, a list of actor token names, and a script
-filename. Triggers are evaluated every game tick by EvaluateTriggers (FUN_0050ccc0).
+filename. Triggers are evaluated every game tick by EvaluateTriggers @ 0x0050ccc0.
 
 ## Global State
 
@@ -96,7 +96,9 @@ entry to resolve actor token names to actor IDs. The resolved IDs are used to:
 The field at offset 0x54 stores the **script filename** that is passed to
 `QueueScriptExecution` when the trigger condition is met.
 
-> **Under GkPlus this field always holds a JSON document.** `RegisterTriggers` is hooked, so a bare
+> **Under GkPlus this field always holds a JSON document.** `AddTriggerToGlobalList` @ 0x0043e240
+> is hooked (GkPlus still exports it as `RegisterTriggers` in `src/Triggers.h`; that wrapper name
+> is wrong twice over, since one call registers exactly one trigger), so a bare
 > name from `ADD TRIGGER` is stored as the JSON string `"crtbaa.gcs"`, and
 > `triggers.create({ script: {...} })` stores an object instead — which the script queue delivers to
 > a level's `message_received` rather than opening as a file. That hook covers all 23 game-side
@@ -306,22 +308,38 @@ Note: FRAG_SCORE, TIME_LIMIT are NOT available as console commands.
 ### CommandRemoveTrigger @ 0x00444500
 Only supports removing SHOT triggers by coordinate match.
 
-### TriggerList::Ctor @ 0x0044ca10
-Allocates sentinel, initializes empty list.
+### The list helpers are `List<char*>`, not trigger-specific
 
-### TriggerList::CtorWithScript (FUN_0044c900) @ 0x0044c900
-Constructor + CreateTrigger in one call. Initializes list then adds one entry.
-Name is misleading - it adds a generic string entry, not specifically a script.
+Four of the five functions below are AvP `list_tem.hpp` template instantiations of
+`List<char*>` reached through the trigger commands; nothing in their bodies knows about
+triggers, and the sibling `add_entry_end` @ 0x0044e8c0 is also used by `LoadLevel` to append
+`"dum exhaust"` to `GlowNodeNameList` @ 0x007b9d24.
+
+### List<char*>::Ctor @ 0x0044ca10
+`List<T>::List()` verbatim: allocates the 0xc-byte sentinel, self-links it, `n_entries = 0`,
+`entry_pointers = 0`, `calculated_indices = false`. All 11 callers happen to be
+`CommandAddTrigger`.
+
+### List<char*>::Ctor1 @ 0x0044c900
+`List<T>::List(const T &n)` verbatim: the constructor above followed by one `add_entry`.
+At all 12 call sites (`CommandAddTrigger` x10, `Frag` x2) the element passed is the pointer
+at 0x0064dca0, **the empty string** - so neither "script" nor "actor name" is part of what it
+does; the element type is `char *` and its meaning belongs to the caller.
 
 ### TriggerList::CreateTrigger @ 0x0044e8c0
-Adds a new Trigger node (with string) to the list. Despite the name, the string
+`add_entry_end`: appends a node (with string) to the list. Despite the name, the string
 stored may be an actor token name rather than a script filename.
 
-### TriggerList::DeleteTriggers @ 0x0044ce40
-Removes all triggers from list and frees the sentinel.
+### List<char*>::Dtor @ 0x0044ce40
+The real destructor: `while (n_entries) delete_last_entry();` then `delete sentinel;` then
+`free(entry_pointers)`. `src/Triggers.h` exports it as `DeleteTriggers`.
 
-### TriggerList::RemoveFirst (Dtor) @ 0x0044eb60
-Removes the first (most recently added) trigger from the list.
+### TriggerList::RemoveFirst @ 0x0044eb60
+`delete_first_entry` verbatim, including the re-read of `sentinel->next->prev` and the
+trailing `cleanup()` (`calculated_indices = false`; `delete[] entry_pointers`). It unlinks and
+deletes the **first** (most recently added) node and decrements `n_entries`. It does **not**
+free the sentinel and it is not a destructor - the destructor is 0x0044ce40 above. Its callers
+are not trigger-specific either (`ParseGSH` x3, `FUN_004d8f10`, `CommandAddTrigger` x9).
 
 ### TriggerList::CopyList @ 0x0044c950
 Copies a trigger list into the outgoing parameter area on the stack. Used to pass
@@ -344,20 +362,21 @@ All trigger handlers pass NULL for out_rotation (position only).
 Copies the remaining unparsed portion of the console command line to the given buffer.
 Used by script-only triggers to capture the script filename as the last argument.
 
-### FUN_0050c400 @ 0x0050c400
-Called when TIME_LIMIT trigger expires and has a script_name. Likely executes the
-end-of-round script.
+### RemoveTriggerFromGlobalList @ 0x0050c400
+Called when a TIME_LIMIT trigger expires and has a script_name.
 
-### FUN_00510d80 @ 0x00510d80
-Called when TIME_LIMIT trigger deadline is reached. Likely the "game over" handler.
+### DetermineMatchWinners @ 0x00510d80
+Called when the TIME_LIMIT trigger deadline is reached - the "game over" handler.
 
-### FUN_00548760 @ 0x00548760
-Door toggle function. Called by DOOR/DOOR_ONCE/DOORS_EITHER trigger handlers
-after resolving door actor names from the target list via GetTokenValue.
+### TrackObjectActor::SetMoveDirection @ 0x00548760
+Called by DOOR/DOOR_ONCE/DOORS_EITHER trigger handlers after resolving door actor names from
+the target list via GetTokenValue. Two branches: when the track object is idle it starts a leg
+through slot 77, and when it is already moving it mirrors the animation start time about the
+tick clock - i.e. it reverses direction mid-travel rather than toggling a door flag.
 
 ## Network Events
 
-When triggers fire or reset, network broadcast messages are sent via FUN_00504bf0:
+When triggers fire or reset, network broadcast messages are sent via `BroadcastToPlayers` @ 0x00504bf0:
 - `0x51` - Timed trigger activation (TIME, TIME_IF_ALIVE, TIME_LIMIT fire)
 - `0x52` - Trigger reset (condition becomes false, rearms trigger)
 - `0x3d` - Death event (actor died, checked by DEATH triggers)
@@ -369,8 +388,8 @@ When triggers fire or reset, network broadcast messages are sent via FUN_00504bf
 1. **field_0x34** and **field_0x64**: Never accessed in trigger evaluation (EvaluateTriggers).
    Likely struct padding. Could verify by checking save/load game functions.
 
-2. **FUN_0050be10**: References FirstTrigger 4 times. Might be a trigger serialization
-   or cleanup function. Not yet analyzed.
+2. **`TriggerInsertAlternate` @ 0x0050be10**: references FirstTrigger 4 times. Its body has not
+   been read, so the name describes its shape and not a measured behaviour.
 
 3. **SaveGame?** @ 0x005083d6: References FirstTrigger. May contain trigger save/load
    logic that could reveal the purpose of padding fields.

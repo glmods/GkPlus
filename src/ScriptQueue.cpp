@@ -35,12 +35,16 @@ FastCall<bool, const char *> ExecuteCommandFile;
 // Kept only so Detours has a pointer to patch: HookedPumpQueuedConsoleCommand
 // replaces the body outright and never calls through this.
 StdCall<void> PumpQueuedConsoleCommand;
-// Named after the Ghidra DB rather than after gk::RegisterTriggers, which is the
-// wrapper in Triggers.h - a trampoline of the same name would make every use of
-// either ambiguous inside namespace gk.
+// `Orig` prefix, not the plain DB name, because gk::AddTriggerToGlobalList in
+// Triggers.h is the wrapper for the same function. An anonymous namespace is
+// reached by an implicit using-directive rather than by nesting, so both names
+// would be visible at the same level and **every** unqualified use inside gk
+// would be ambiguous - the compiler rejects it outright. (ExecuteCommandFile
+// above gets away with the collision only because Console.h is not included
+// here.) Calling through this runs the original.
 FastCall<void, TriggerKind, Vec3 *, long long, TriggerList, const unsigned char *,
          int>
-    AddTriggerToGlobalList;
+    OrigAddTriggerToGlobalList;
 // Both converters are __thiscall on the ParsedThing with nothing but `this` in
 // ECX, which is ABI-identical to a one-argument __fastcall.
 FastCall<Role *, void *> ToRole;
@@ -63,7 +67,7 @@ ScriptMessageHandler Handler = nullptr;
 // --- provenance of a script-name write -------------------------------------------
 
 // `thread_local`: the write side (EncodedPayloadScope, from JsTriggers/JsActors) is main
-// thread, but the READ side is not - HookedRegisterTriggers runs wherever
+// thread, but the READ side is not - HookedAddTriggerToGlobalList runs wherever
 // AddTriggerToGlobalList @ 0x0043e240 is called from, and one of its three callers is
 // `Frag` @ 0x0052e220, an executor-side Actor vtable slot. Per-thread makes the flag mean
 // what its name says: "the payload *this* call stack already encoded". A shared bool
@@ -150,22 +154,24 @@ bool IsEnvelope(const char *text) {
   return json::OpenEnvelope(text, nullptr, nullptr);
 }
 
-// RegisterTriggers @ 0x0043e240 - the only writer of TriggerData::script_name, and
-// it covers all 23 game-side registrations: 21 branches of CommandAddTrigger (the
-// console `ADD TRIGGER`) plus one each in LoadLevel and Frag. It strdups the
-// string, so a temporary is enough.
-void __fastcall HookedRegisterTriggers(TriggerKind kind, Vec3 *coords,
-                                       long long value, TriggerList targets,
-                                       const unsigned char *script, int team) {
+// AddTriggerToGlobalList @ 0x0043e240 - the only writer of
+// TriggerData::script_name, and it covers all 23 game-side registrations: 21
+// branches of CommandAddTrigger (the console `ADD TRIGGER`) plus one each in
+// LoadLevel and Frag. It strdups the string, so a temporary is enough.
+void __fastcall HookedAddTriggerToGlobalList(TriggerKind kind, Vec3 *coords,
+                                             long long value,
+                                             TriggerList targets,
+                                             const unsigned char *script,
+                                             int team) {
   const char *name = reinterpret_cast<const char *>(script);
   if (!ShouldEncode(name)) {
-    AddTriggerToGlobalList(kind, coords, value, targets, script, team);
+    OrigAddTriggerToGlobalList(kind, coords, value, targets, script, team);
     return;
   }
   std::string envelope = FileEnvelopeFromGameText(name);
-  AddTriggerToGlobalList(kind, coords, value, targets,
-                         reinterpret_cast<const unsigned char *>(envelope.c_str()),
-                         team);
+  OrigAddTriggerToGlobalList(
+      kind, coords, value, targets,
+      reinterpret_cast<const unsigned char *>(envelope.c_str()), team);
 }
 
 // PickupActor::Associate @ 0x005469f0, Actor vtable slot 66 - the only writer of
@@ -931,7 +937,7 @@ ScriptQueueSystem::ScriptQueueSystem() {
   GetObjectAtOffset(ApplyUpdateMessage, 0x004fde70);
   GetObjectAtOffset(ExecuteCommandFile, 0x0043f250);
   GetObjectAtOffset(PumpQueuedConsoleCommand, 0x004d6120);
-  GetObjectAtOffset(AddTriggerToGlobalList, 0x0043e240);
+  GetObjectAtOffset(OrigAddTriggerToGlobalList, 0x0043e240);
   GetObjectAtOffset(ToRole, 0x0047cc20);
   GetObjectAtOffset(ToReplaceDestructibility, 0x0047eaa0);
   GetObjectAtOffset(Associate, 0x005469f0);
@@ -946,7 +952,7 @@ ScriptQueueSystem::ScriptQueueSystem() {
   ::DetourAttach(&ApplyUpdateMessage, HookedApplyUpdateMessage);
   ::DetourAttach(&ExecuteCommandFile, HookedExecuteCommandFile);
   ::DetourAttach(&PumpQueuedConsoleCommand, HookedPumpQueuedConsoleCommand);
-  ::DetourAttach(&AddTriggerToGlobalList, HookedRegisterTriggers);
+  ::DetourAttach(&OrigAddTriggerToGlobalList, HookedAddTriggerToGlobalList);
   ::DetourAttach(&ToRole, HookedToRole);
   ::DetourAttach(&AddInterfaceBeamVulnerability,
                  HookedAddInterfaceBeamVulnerability);
@@ -963,7 +969,7 @@ ScriptQueueSystem::~ScriptQueueSystem() {
   ::DetourDetach(&ApplyUpdateMessage, HookedApplyUpdateMessage);
   ::DetourDetach(&ExecuteCommandFile, HookedExecuteCommandFile);
   ::DetourDetach(&PumpQueuedConsoleCommand, HookedPumpQueuedConsoleCommand);
-  ::DetourDetach(&AddTriggerToGlobalList, HookedRegisterTriggers);
+  ::DetourDetach(&OrigAddTriggerToGlobalList, HookedAddTriggerToGlobalList);
   ::DetourDetach(&ToRole, HookedToRole);
   ::DetourDetach(&AddInterfaceBeamVulnerability,
                  HookedAddInterfaceBeamVulnerability);

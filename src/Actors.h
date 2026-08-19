@@ -46,7 +46,11 @@ static_assert(sizeof(Weapon) == 0x28);
 // not, and one dword is what the slot pops either way. Slot 0 is exempt - MSVC's
 // scalar deleting destructor always takes a hidden `int flags`.
 struct Actor {
-  int field0x4;
+  // 0x04 reference count. Retain is `INC [ESI+4]`; release is
+  // `ADD [ECX+4],-1 ; JNZ ; CALL [vtbl+0]` with the scalar-delete flag, in
+  // FUN_0045e050 @ 0x0045e174-89. Do not adjust it from GkPlus - the release
+  // path runs the destructor.
+  int ref_count;
   bool field0x8;
   char pad0x9[3];
   int id;                     // 0x0c
@@ -56,15 +60,38 @@ struct Actor {
   // entries are only pool-freed by ~Actor when `actor_scoped` is set (the
   // role-supplied ones stay owned by the Role).
   VulnerabilityList vulnerabilities; // 0x10
-  char pad0x20[8];
+  int field0x20;
+  // 0x24 a float deadline in seconds, 0.0 meaning "disabled". The AI timer
+  // @ 0x00456bed does `MOVSS XMM0,[ESI+0x24]`, compares it against the scaled
+  // clock, and fires vtable slot 79 when it has passed.
+  float slot79_deadline;
   // 0x28/0x2c: written only by ChangeOwnerAndTeam (slot 80), which also puts
   // them in its 0x58 update. The DB's name for that slot says "owner"; nothing
   // measured here confirms it, so they keep the field0xNN convention. They are
   // exposed because a team change has to preserve them - see JsActors.cpp.
+  //
+  // **+0x2c has a second, conflicting reading and is deliberately left `int`.**
+  // The same AI timer reads it at 0x00456c21 as a float deadline driving vtable
+  // slot 81, exactly as it reads +0x24 above. Both observations are measured -
+  // one is a writer, one is a reader - and nothing has reconciled them. Retyping
+  // it to `float` would make JsActors.cpp's `ChangeOwnerAndTeam(field0x28,
+  // field0x2c, team)` round-trip convert numerically instead of preserving the
+  // bits, so the storage type stays as the writer needs it until the conflict is
+  // settled.
   int field0x28;
   int field0x2c;
   float alarm_delay;          // 0x30
-  char pad0x34[0xc];
+  int field0x34;              // 0x34 the AI think proc, per AIType
+  // 0x38 an optional "on placed" hook, called as `hook(this, now_lo, now_hi)`
+  // (matching its RET 0x8) from Actor::InitPositionAndTiming @ 0x0052dd18 right
+  // after the nav-poly lookup, and from Actor_FixupAfterLoad @ 0x00531860 on a
+  // savegame restore. It is a *placement-time* hook, not a per-tick one:
+  // ExecutorActorTick reads only vtable displacements 0x18/0x90/0xdc/0x118 and
+  // never touches +0x34 or +0x38. The only installer in the shipped build is
+  // AIType::Mine, which puts Mine_OnDeployed @ 0x0045a640 here
+  // (Actor_SetAiBehaviour @ 0x00450610).
+  void(__thiscall *on_placed)(Actor *, unsigned now_lo, int now_hi);
+  int field0x3c;              // 0x3c gates the team-list move - see JsActors.cpp
   void *attachment;           // 0x40 ref-counted; released by slot 52
   int field0x44;
   char pad0x48[8];
@@ -92,8 +119,15 @@ struct Actor {
   int field0xcc;
   int field0xd0;
   int field0xd4;
-  float field0xd8;            // 0xd8 latched into 0xdc on death
-  int field0xdc;
+  // 0xd8 the game time in seconds, written **every tick** by the base slot-70
+  // body Actor::Update @ 0x0052f91a (`MOV [EDI+0xd8],EAX` with EAX = the `now`
+  // argument). It is also the first field of the 0x30-byte MotionSnapshot.
+  float state_time;
+  // 0xdc state_time as of the last state broadcast - broadcast dirty-tracking,
+  // written at 0x0052fa66 and by all four motion broadcasters, each of which
+  // ends `0xdc = 0xd8`. It was described here as "latched into 0xdc on death",
+  // which is one of nine writers (Die) mistaken for the rule.
+  float broadcast_time;
   // 0xe0 3D model, driven by slots 71-74. pool_alloc'd (0x1f0) by Actor::Ctor but
   // refcounted from then on - the dtor decrements and calls slot 0, so the free
   // is the model's business, not the Actor's.
@@ -224,8 +258,17 @@ struct Actor {
   virtual void SetField0x188(bool) = 0;
   // 55  base no-op; ProjectileActor's is the physics step (integrate/collide/damage).
   virtual void OnPrePhysics(int, int, int) = 0; // RET 0xc: three arguments
-  // 56  base no-op.
-  virtual void OnCollisionResponse(int, int) = 0; // RET 0x8: two arguments
+  // 56  path to a target and start moving. The base @ 0x0054efa0 is a bare
+  //     `RET 0x8` stub; MobileActor overrides at 0x00539930 with the real body -
+  //     early-out on a null nav poly, shorten the goal by a fixed margin when
+  //     stop_range_sq is large, allocate a 0xc-byte List_Member_Base sentinel,
+  //     read the target's centre through its slot 4, then call
+  //     FindNavPathWithinRadius @ 0x0052c100 with nav_agent->traversal_flags,
+  //     SetMoveState(0), ClearRouteWaypoints, and push each returned node
+  //     through slot 90 AddWaypoint. There is no collision manifold, no impulse
+  //     and no contact normal anywhere in it; it was named OnCollisionResponse
+  //     here until it was read.
+  virtual void PathToTarget(Actor *target, float stop_range_sq) = 0; // RET 0x8
   // 57  ray/shape intersection; Pickup/Projectile return 0 to opt out of being hit.
   virtual void Raycast(int *, int, int, int *) = 0;
   // 58  swept intersection; same opt-out as slot 57.
@@ -270,10 +313,17 @@ struct Actor {
   virtual bool ApplyDamage(float, bool, int attacker_team) = 0;
   // 69  base no-op; health-changed hook.
   virtual void OnHealthChanged() = 0;
-  // 70  really "Update": base syncs model position + broadcast 0x6f, but every
-  //     mobile subclass replaces this with its whole per-tick logic (AI/movement,
-  //     weapon fire, spline motion, projectile dead-reckoning).
-  virtual void SyncPositionAndBroadcast(int, int, float) = 0;
+  // 70  the per-tick update, and the only vtable slot ExecutorActorTick
+  //     @ 0x0052fad0 dispatches for work (displacement 0x118). Ten distinct
+  //     bodies across the sixteen tables. The base @ 0x0052f8a0 advances a
+  //     timer, stores the 64-bit clock into +0xc8/+0xd0 and `now` into +0xd8,
+  //     pushes the transform to anim_object and only then, guarded on
+  //     position_set_, broadcasts update 0x6f - a tick that opportunistically
+  //     broadcasts, which is why it was named SyncPositionAndBroadcast here.
+  //     Every mobile subclass chains to it and then does its whole per-tick
+  //     logic (AI/movement, weapon fire, spline motion, projectile
+  //     dead-reckoning).
+  virtual void Update(int clock_lo, int clock_hi, float now_seconds) = 0;
   // 71  play an animation on anim_object (+0xe0).
   virtual void PlayAnimation(int, int, int, int, int, int) = 0;
   // 72  cross-fade blend into an animation.
@@ -342,6 +392,41 @@ static_assert(offsetof(NavAgent, nav_poly) == 0x14);
 static_assert(offsetof(NavAgent, velocity) == 0x1c);
 static_assert(offsetof(NavAgent, traversal_flags) == 0x2c);
 
+// The serialised motion state of one MobileActor, filled by
+// MobileActor::WriteMotionSnapshot @ 0x0053bb00 (__thiscall(this, MotionSnapshot
+// *out), RET 0x4). Every field is pinned by an instruction in that 122-byte
+// body:
+//
+//   0053bb06  MOV EAX,[ECX + 0xd8]   -> time      (Actor::state_time)
+//   0053bb0e  MOVQ  [ECX + 0xa0]     -> position.xy
+//   0053bb1b  MOV EAX,[ECX + 0xa8]   -> position.z
+//   0053bb24  MOVUPS [ECX + 0xac]    -> orientation, 16 bytes
+//   0053bb35  MOVQ  [nav_agent+0x1c] -> velocity.xy
+//   0053bb3f  MOV EAX,[nav_agent+0x24] -> velocity.z
+//   0053bb55  MOV ECX,[nav_poly+0x20]  -> nav_poly_id, LOW 24 BITS ONLY
+//
+// When nav_agent->nav_poly is null those 24 bits are set to 0xffffff instead
+// (0053bb66 `OR ECX,0xffffffff`); the top byte of that dword is preserved either
+// way, which is why the id is a bitfield rather than a plain u32.
+//
+// This settles the payload layout of four wire updates, each of which builds
+// {u32 id, u32 actor_id, ...} on the stack immediately below the snapshot:
+// 0x39 (80 B) adds a Vec3 destination and a Vec3 current waypoint, 0x3b and 0x3c
+// (56 B) carry the snapshot alone, and 0x5f (60 B) inserts an s32 speed delta
+// before it.
+struct MotionSnapshot {
+  float time;         // 0x00
+  Vec3 position;      // 0x04
+  Vec4 orientation;   // 0x10
+  Vec3 velocity;      // 0x20
+  unsigned nav_poly_id : 24; // 0x2c low 24 bits; 0xffffff = no polygon
+  unsigned field0x2f : 8;    // 0x2f the preserved top byte
+};
+static_assert(sizeof(MotionSnapshot) == 0x30);
+static_assert(offsetof(MotionSnapshot, position) == 0x04);
+static_assert(offsetof(MotionSnapshot, orientation) == 0x10);
+static_assert(offsetof(MotionSnapshot, velocity) == 0x20);
+
 struct MobileActor : Actor {
   char pad0x120[0x40];
   Character *character;        // 0x160 cached role->character
@@ -377,21 +462,49 @@ struct MobileActor : Actor {
   void *path_object;           // 0x1cc ref-counted; slot 52
   Vec3 collision_bounds;       // 0x1d0
   Vec3 goto_target;            // 0x1dc
-  float goto_priority;         // 0x1e8
-  float goto_priority_current; // 0x1ec
+  // 0x1e8 / 0x1ec are **game-time seconds, not priorities**. Every writer stores
+  // the tick's `now`: GotoObject @ 0x005394d0 sets both to it, 0x00539540 sets
+  // +0x1ec = Actor::state_time, and CancelLastOrder / Dissociate /
+  // ReleaseFromOwner all call GetGameTimeSeconds @ 0x00571b10 immediately before
+  // the call that writes +0x1e8. The gate `+0x1e8 <= now` guarding GotoObject
+  // and StopAndBroadcast is therefore a stale-command / re-entry guard, not an
+  // arbitration between competing orders - which is what `goto_priority` and
+  // `goto_priority_current` implied here until it was measured.
+  float move_cmd_time;         // 0x1e8
+  float move_start_time;       // 0x1ec
   List<void *> order_queue;    // 0x1f0 (size() @ 0x1f4 is slot 32)
   NavAgent *nav_agent;         // 0x200 slot 24 (see NavAgent above)
-  List<void *> waypoints;      // 0x204 embedded waypoint list
-  void *field0x214;
-  char pad0x218[0xc];
-  void *waypoint_ptr;          // 0x224 cursor into the waypoint list
-  List<void *> *waypoint_list; // 0x228 -> &waypoints
+  // 0x204 the *route* list - the waypoints the navigation solve produces.
+  // PushRouteWaypoint @ 0x0053a640 push-FRONTs a pool_alloc'd 0x18-byte
+  // {Vec3 pos; u32; u32} record onto it (which is what makes the A* backtrack
+  // come out in travel order), ClearRouteWaypoints @ 0x0053a450 drains it.
+  List<void *> waypoints;      // 0x204
+  // 0x214 a SECOND List<void *>, of authored waypoints. MobileActor::Ctor
+  // initialises it as a list at 0x005327b4-0x005327da, exactly as it does the
+  // one above; AppendAuthoredWaypoint @ 0x0053a830 push-BACKs onto it and
+  // ClearAuthoredWaypoints @ 0x0053a550 drains it. Slot 90 AddWaypoint pushes to
+  // both. Nothing in the binary reads an element's payload - the only read is
+  // `CMP [EBX+0x218],0`, i.e. the count, used by AiThink_Bot as a "have I
+  // recorded anything yet" latch. This was `void *field0x214` plus 0xc of
+  // padding here until the constructor was read.
+  List<void *> waypoints_authored; // 0x214
+  void *waypoint_ptr;          // 0x224 cursor into the route list
+  // 0x228 -> &waypoints, confirmed by `MOV [EDI+0x228],ESI` in the constructor
+  // with ESI = EDI + 0x204. It points at the route list, never at the authored
+  // one.
+  List<void *> *waypoint_list; // 0x228
   char pad0x22c[4];
 
   // MobileActor extension slots 83-94.
-  // 83  deploy/crouch toggle (name doubtful): flips +0x187, swaps the collision box
-  //     between standing and halved, broadcast 0x4c/0x4e; gated on model node 0x13.
-  virtual void UpdateMineDetectionAndBounds() = 0;
+  // 83  @ 0x00536090, bare RET. Flips is_crouched (+0x187) and sets/clears
+  //     is_concealed (+0x186) from a cover test and nav-polygon flag 0x800 (the
+  //     water/camouflage-terrain bit, and the binary's only reader of it - see
+  //     stealth_and_fog_notes.md §2). Also swaps the collision box between
+  //     standing and halved, and broadcasts `0x4c + 2*(!is_crouched)`, i.e. 0x4c
+  //     for crouched and 0x4e for standing; gated on model node 0x13. Nothing in
+  //     it detects mines - it was named UpdateMineDetectionAndBounds here, and
+  //     flagged doubtful, until it was read.
+  virtual void ToggleCrouchAndCamouflage() = 0;
   // 84  equip into the first free slota..sloth (inventory-list indices 2-9).
   virtual void EquipToFirstOpenSlot(int, int) = 0;
   // 85  append a tag-10 order record (0x28 bytes) to the order queue (+0x1f0).
@@ -435,6 +548,14 @@ static_assert(offsetof(MobileActor, character) == 0x160);
 static_assert(offsetof(MobileActor, is_concealed) == 0x186);
 static_assert(offsetof(MobileActor, inventory) == 0x194);
 static_assert(offsetof(MobileActor, nav_agent) == 0x200);
+static_assert(offsetof(MobileActor, move_cmd_time) == 0x1e8);
+// The two waypoint lists. These three are what pin the second List<void *> at
+// 0x214 - without them the 0x230 size assert alone would pass for the old
+// `void *field0x214` + `char pad0x218[0xc]` spelling too.
+static_assert(offsetof(MobileActor, waypoints) == 0x204);
+static_assert(offsetof(MobileActor, waypoints_authored) == 0x214);
+static_assert(offsetof(MobileActor, waypoint_ptr) == 0x224);
+static_assert(offsetof(MobileActor, waypoint_list) == 0x228);
 
 // Records every nav-mesh polygon whose "blocked" bit (0x100) this actor set, so
 // slot 82 can undo them.

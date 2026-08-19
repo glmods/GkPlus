@@ -15,6 +15,12 @@ namespace {
 
 // __fastcall void RegisterImageCodec(const char *magic /*ECX*/, Factory /*EDX*/).
 // Bare RET at the end of 0x005c8360, so no stack arguments and both go in registers.
+// Re-verified against the binary: this declaration and this argument order are exact.
+//
+// Ghidra reports **zero callers** for it, which is not evidence that nothing registers.
+// The engine's seven registrations are tail-jump thunks - `MOV EDX,factory ; MOV ECX,magic
+// ; JMP rel32` - at 0x0043c520 ("BM") and 0x0043c560-0x0043c5b0 ("FORM", "LIST", "CAT ",
+// "P4", "P5", "P6"); every one of those E9 displacements resolves to 0x005c8360.
 using Factory = EngineImage *(__cdecl *)();
 FastCall<void, const char *, Factory> RegisterImageCodec;
 

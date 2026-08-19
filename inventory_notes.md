@@ -247,7 +247,7 @@ independent confirmation of the field order.
 The names are 11 NUL-terminated strings at **0x006672c4, stride 8** (`slota`..`slotk`; the last is
 at 0x00667314). `MobileActor::EquipToFirstOpenSlot` @ 0x00536830 (MobileActor vtable **slot 84**)
 copies eight of them (`slota`..`sloth`) onto the stack and asks the actor's *hierarchy* whether each
-node exists (`FUN_0059d270(hierarchyInstance, "slotX", 0)`), then picks the first that exists and is
+node exists (`Renderable_GetNodeWorldPosition(hierarchyInstance, "slotX", 0)` @ 0x0059d270), then picks the first that exists and is
 not already occupied. Slot 0/1 come from `MobileActor::UnequipSlot`'s `case 0: case 1:` arm, which
 detaches from `"Upper Arm Right"` / `"Upper Arm Left"`.
 
@@ -265,7 +265,7 @@ Range checks:
 **Weapons are right-arm only, and it is hard-coded.** `MobileActor::UseInventoryItem`, class 4:
 
 ```
-FUN_00536ba0(0, item_id, silent);   /* slot 0 == "Upper Arm Right" */
+EquipItemInSlot(0, item_id, silent);   /* slot 0 == "Upper Arm Right" */
 ```
 
 Nothing writes slot 1 from any dispatch path; the left arm is reachable only through the `0x0f`
@@ -273,7 +273,9 @@ network command, which carries an explicit slot number.
 
 ### 5.1 Eligibility — the red LED, and why only Frend gets the heavy guns
 
-One mask test, in three places, always the same shape:
+One mask test, in three places, always the same shape. The executor-side one - the gate that
+actually refuses the equip - is inside **`MobileActor::EquipItemInSlot` @ 0x00536ba0**, at
+0x00536c64:
 
 ```
 00536c64  MOV  EAX,dword ptr [ESI+0xc0]   ; Actor::role
@@ -302,7 +304,7 @@ So the manual's "only Frend can use the heaviest weapons" is **a per-role bitmas
 class and not a name list**. It is authored per pickup.
 
 The three sites: `MobileActor::EquipItemInSlot` @ 0x00536c70 (refuses, plays
-`FUN_00508e70`/`FUN_00508f60`), `MobileActor::UseInventoryItem` @ 0x005371f8 (same), and
+`SendLocalizedMessageToOwner` @ 0x00508e70 / `SendSoundToOwner` @ 0x00508f60), `MobileActor::UseInventoryItem` @ 0x005371f8 (same), and
 `DrawInventoryItemLamps` @ 0x004a697b + `DrawInventoryItemPanel` @ 0x004a7ef2 — the UI runs the
 *identical* test to choose the lamp / material. That is the red LED.
 
@@ -368,7 +370,7 @@ Actor+0x44  = item id
 MobileActor+0x124 = amount
 ```
 
-and the handler first issues a move order toward the recipient (`FUN_005394d0`), which is the
+and the handler first issues a move order toward the recipient (`MobileActor::GotoObject` @ 0x005394d0), which is the
 "if too far, the giver walks to them first" behaviour. `MobileActor::Update` then polls every tick
 (0x00533f26):
 
@@ -689,8 +691,8 @@ from the Ghidra plate.
   +0xb8 falls inside `Actor::orientation`. Yet its vtable exposes the Actor slots (`+0x2c`
   `GetWeapon`, `+0x88` `GetInventoryListPtr`, `+0x144`) and it is refcounted at +0x04 like an Actor.
   So it is a **client-side entity class parallel to `Actor`**, not an `Actor`. Which class was not
-  established. Nothing in §5.1 depends on it — the executor-side test at 0x00536c64 is on
-  `Actor+0xc0` and is definitive.
+  established. Nothing in §5.1 depends on it — the executor-side test at
+  0x00536c64, inside `MobileActor::EquipItemInSlot`, is on `Actor+0xc0` and is definitive.
 - **Class 8.** Reachable in code, absent from all shipped headers. What distinguishes it from
   class 7 is not established.
 - **`Character::walking_speed` is typed `float` in the Ghidra DB and in `src/Roles.h`, but every
@@ -706,11 +708,11 @@ from the Ghidra plate.
 - **Which lamp graphic is green and which red** was not read out of the UV constants at
   0x006643a0..0x006643ac; the *roles* of the three drawers are measured from their guards, the
   colours are taken from the manual.
-- **`FUN_004e5ad0`** (2874 bytes) writes `InventoryScreenEntity` and `InventorySelectedItem` and
-  references the `"slota"` table; it is almost certainly the Upgrade screen's open/refresh. Not read,
-  not renamed.
+- **`OpenUpgradeScreen` @ 0x004e5ad0** (2874 bytes) writes `InventoryScreenEntity` and
+  `InventorySelectedItem` and references the `"slota"` table. Its body was not read, so what it
+  does beyond opening the Upgrade screen is not established.
 - **`0x0050a22f` is command `0x17`** was derived from the byte map + pointer table, not from a
-  client-side sender. The sender `FUN_004c0d50` was not read.
+  client-side sender. The sender `Unit::Unit_SendBoard` @ 0x004c0d50 was not read.
 
 ---
 

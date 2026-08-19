@@ -41,7 +41,7 @@ namespace gk {
 // name, with no residual doubt - see `gk::json::OpenEnvelope`.
 //
 // **The wrapping happens where the value is written, not where it is queued.**
-// Four hooks - RegisterTriggers, PickupActor::Associate, ToRole and
+// Four hooks - AddTriggerToGlobalList, PickupActor::Associate, ToRole and
 // ToReplaceDestructibility - wrap the bare name the engine hands them, so a
 // script-name field holds an envelope from the moment it is set. Every field that
 // reaches the queue is written through one of those, by the vulnerability sweep
@@ -120,7 +120,7 @@ namespace gk {
 // ends up at QueueScriptExecution.
 //
 // GkPlus writes documents into two of them through the engine's own setters -
-// RegisterTriggers and Associate - which are hooked to quote what they are given.
+// AddTriggerToGlobalList and Associate - hooked to quote what they are given.
 // Scoping a call says "this one is already encoded, leave it alone". Main-thread
 // only, and it must wrap the call itself rather than being set and forgotten.
 class EncodedPayloadScope {

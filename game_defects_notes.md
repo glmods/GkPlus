@@ -22,6 +22,10 @@ Gunlok*, which is an appendix and not a defect — and never renumber an existin
 | 10 | ambient sound volume (`V` in a `DUMOBJTX`) is parsed and discarded | every level in the game |
 | 11 | the pool allocator's critical section is gated on a flag nothing sets | every allocation |
 | 12 | the HUD's meters and item icons are drawn under the world's depth slice | every frame of every level |
+| 13 | three unchecked writes reachable from any peer in a multiplayer session | the wire (commands `0x2a`, `0x2d`, `0x28`/`0x8d`) |
+| 14 | `InventoryInfo_Ctor` leaves `pickup_radius` uninitialised on both paths | every role with an inventory |
+| 15 | `SoundSample_ReadWholeFile` leaks the file `HANDLE` when the read fails | a truncated or unreadable sound file |
+| 16 | `AiBeginInvestigate` builds its deadline with no clock read (PROPOSED) | a minebot spotting something |
 
 ---
 
@@ -838,6 +842,135 @@ not — the meters render — but the margin is unmeasured. If a future change m
 the tie-proof variant is to write a degenerate range (`cam+0x264 = cam+0x268 = 0.029f`) into
 `Camera_Hud`'s viewport for the batch draw only; `Camera_UpdateDepthState` rewrites both from
 `+0x19c`/`+0x1a0` on the next change, so a missed restore self-heals.
+
+---
+
+## 13. Three unchecked writes reachable from any peer in a multiplayer session
+
+**Status:** confirmed by disassembly, unpatched, and reachable by anyone in the session. These are
+defects in **Gunlok**, not vulnerabilities in GkPlus - GkPlus neither introduces nor widens them,
+and it is a game from 2000 with no vendor to notify. `directplay_protocol_notes.md` section 6.1
+records them beside the wire format; this is the fuller write-up.
+
+The executor services a handful of command ids in an **if-chain before** its jump table
+(0x005091b8-0x0050922f), so the table's range check on the id never covers them and each arm is
+responsible for checking its own payload. Two do not.
+
+- **Command `0x2d` writes one byte at a wire-controlled 32-bit offset.** The arm at 0x005091f0 is
+  `MOV byte ptr [EAX + 0x7b7147],1` with `EAX` loaded straight from `payload[0]`. The evidence that
+  this is an omission rather than a deliberately wide range is its **sibling writing the same
+  cell**: `0x2e` at 0x005091fc does `DEC EAX ; CMP EAX,4 ; JNC ___report_rangecheckfailure` first.
+  One arm range-checks 1..4; the neighbouring arm does not check at all.
+- **Command `0x2a` writes four bytes at a wire-controlled offset, with no check on any of its three
+  arguments.** `*(int *)(0x007b70e4 + (arg0 * 5 + arg1) * 4) = arg2` at 0x0050921c-0x00509228 -
+  both indices and the stored value come from the payload. The intended target is the
+  `MaxUnitsPerTeam` region; nothing constrains it to that.
+- **Three unbounded inline `strcpy`s on the `0x28` / `0x8d` chat-and-player-name path.** The wire
+  form carries a 255-byte string inside a 259-byte message and every copy terminates only on a NUL.
+  The sender `SendChatOrPlayerName` @ 0x004fcd00 copies into a `SUB ESP,0x108` frame at
+  `[EBP-0x104]`, so **a long enough local chat line smashes the sender's own frame** past ~256
+  bytes - the same family as section 1, and reachable with no peer involved at all. The executor's
+  lobby-name arm copies to the fixed buffer 0x007b7150 at 0x005091bd-0x005091d2, and the `0x8d`
+  re-broadcast at 0x00509734 copies it again into a stack frame; a peer that sends 259 bytes with
+  no NUL in the text field overruns both of those.
+
+Consequence for GkPlus: none of this is ours to fix, but anything that *exposes* the wire to script
+would make all three script-reachable, which is the reason to keep them written down.
+
+---
+
+## 14. `InventoryInfo_Ctor` @ 0x00483390 leaves `pickup_radius` uninitialised
+
+**Status:** confirmed, latent. The field reads back whatever the pool block last held.
+
+`InventoryInfo` is 0x18 bytes and its constructor zeroes **five** dwords, not six: +0x00, +0x04,
++0x08, +0x0c and +0x14. It never touches **+0x10, `pickup_radius`**. All four call sites are in
+`ToRole` (0x0047cee1, 0x0047cf8f, 0x0047cfd5, 0x0047d01a), each
+`PUSH 0x18; CALL malloc; ...; MOV ECX,EAX; CALL 0x00483390; MOV [role+0x64],EAX` - so the block is
+pool memory and nothing has zeroed it for them. The two later sites go on to write +0x14 and derive
+a value from `ParsedRole+0x528`; **none of the four writes +0x10**. The field is therefore
+uninitialised on *both* construction paths, not just one.
+
+---
+
+## 15. `SoundSample_ReadWholeFile` @ 0x005d3940 leaks the file handle on its failure path
+
+**Status:** confirmed, bounded - one handle per failed read.
+
+`__thiscall void(SoundSample *, const char *filename)`, `RET 0x4`, single caller 0x00589be8 inside
+`SoundSystem_LoadSampleIntoSlot`. It does `CreateFileA(GENERIC_READ, share read, OPEN_EXISTING)`,
+`GetFileSize`, `malloc`, then one `ReadFile` of the whole file into `this+0x20` with the size into
+`this+0x1c`. **`CloseHandle` sits inside the `if (ReadFile succeeded)` branch**, so a failed read
+returns with the handle still open. It takes an unreadable or truncated sound file to trigger,
+which is why normal play never shows it - but a mod filesystem is exactly the thing that can serve
+one, so it is worth knowing before blaming `src/Vfs` for a handle count that climbs.
+
+(Adjacent and harmless: the same function frees the previous buffer with
+`free_sized(this+0x20, 1)` when it was allocated at its real size. That works only because the pool
+ignores the size argument.)
+
+---
+
+## 16. `AiBeginInvestigate` @ 0x0045e050 sets its deadline with no clock read (PROPOSED)
+
+**Status:** proposed, not settled. The mechanism is measured; the interpretation rests on one
+global's meaning.
+
+Every sibling that arms a deadline reads the clock first - `Decoy_Dismiss` @ 0x00450f60 uses
+`clock + 60 * ClockTicksPerSecond`, `Mine_OnDeployed` uses `now + 10 * ClockTicksPerSecond`,
+`PostAiStimulus` calls `ReadScaledClock64(&GameTimeClock)`. `AiBeginInvestigate` does not: there is
+**no clock read anywhere in the function** - no `Clock::ReadScaled32`, no `ReadScaledClock64`. Its
+tail is
+
+```
+0045e18c  CALL GetCurrentThreadId / CMP EAX,[ExecutingThread]
+          MOV ECX,[0x007c07e0] / CMOVZ ECX,[0x007c07b0]     ; per-thread ticks-per-second
+          MULSS by [EBP+8] / FLD / FISTP -> EAX             ; seconds * tick rate
+0045e1c6  MOV EDI,[0x007c07dc] / CMOVZ EDI,[0x007c07ac]
+          ADD EDI,EAX / MOV [EBX+0x90],EDI                  ; deadline = that global + the delta
+```
+
+so `+0x90` becomes `[0x007c07dc] + seconds * tick_rate` rather than `now + seconds * tick_rate` -
+a deadline in the distant past if 0x007c07dc holds the ticks-per-second constant it appears to,
+which would make the investigate state expire on the tick it is entered.
+
+**What would settle it** is the writer of 0x007c07dc: if that global is a per-thread copy of the
+*current* time, the code is correct and merely reads oddly. Nothing in this pass identified the
+writer, so the mark stays PROPOSED - keep it that way until someone reads it.
+
+---
+
+## Dead code: things that look reachable and are not
+
+Not defects. Recorded so nobody analyses them twice.
+
+- **`GameState` 4 and 20 are unreachable.** `WinMain` @ 0x0046aef0 ends in a 20-entry jump table at
+  **0x0046bec8** indexed by `GameState - 1` (`MOV EAX,[GameState 0x006b02b4]; DEC EAX;
+  CMP EAX,0x13; JA <loop>; JMP dword [EAX*4 + 0x0046bec8]`). A sweep of every writer of `GameState`
+  shows that the functions which would set 4 and 20 have **zero xrefs of any kind**, so those two
+  arms never run - which makes `RunSplashScreenFrame` @ 0x0046d0f0 (state 20) and
+  `HandleSplashScreenKeyPress` @ 0x0046f020 dead.
+- **`MobileActor::AddWalkingSpeed` @ 0x00539ed0 is dead, and so is update `0x5f`.** It adds a delta
+  into `MobileActor+0x178`, calls `UpdateSpeedAndTurnRadius` and broadcasts `0x5f` (60 bytes,
+  reliable). It has no callers, and a byte scan of the whole 0x00600000+ range for its
+  little-endian address finds no pointer either, so it is not a vtable slot: **the shipped binary
+  never sends update `0x5f`.**
+- **`File_OpenForRead` @ 0x005e25f0 and `File_OpenForWrite` @ 0x005e2750 have zero references
+  image-wide.** Two complete `CreateFileA` wrappers (`GENERIC_READ`/`OPEN_EXISTING` and
+  `GENERIC_WRITE`/`CREATE_ALWAYS`) that nothing calls - worth knowing before treating them as part
+  of the file-I/O surface a mod filesystem has to cover (`file_io_notes.md`).
+- **Command `0x29` is dead on both ends.** Its sender @ 0x004fcdf0 has no call sites anywhere, and
+  `ExecutorThreadProc` maps id `0x29` to the default arm of both its if-chain and its jump table.
+  Its payload word 2 is never initialised either, which stays academic while nothing sends it.
+
+**"No xrefs" is not sufficient evidence of death**, and this pass proved it twice.
+`BuildModemCompoundAddress` @ 0x00512080 was recorded as dead on exactly that basis and **is not**:
+its address sits in a 2-slot vtable at 0x0066742c, found only by a byte scan for the little-endian
+dword, because the referencing data had never been defined. The image-codec registry
+(`file_io_notes.md`) was the other case - seven callers, all tail-jump thunks sitting in
+undisassembled bytes, reported as zero. Before calling anything dead, scan `.rdata`/`.data` for the
+address as raw bytes and look for a thunk that jumps to it. A reference count is a fact about the
+database, not about the binary.
 
 ---
 

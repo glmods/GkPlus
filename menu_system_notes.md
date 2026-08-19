@@ -11,7 +11,7 @@ container types but nothing else:
 | Built by | `SetupMenus` @ `0x004e95e0` | one `OpenInGameXxxMenu` per menu, on demand |
 | Activation | `OnMenuItemClicked` @ `0x004ecf10` | `InGameMenu__OnItemActivated` @ `0x00563c30` |
 | Lifetime | built once at startup, persists | built on open, freed by `CloseInGameMenu` |
-| Rendering | front-end renderer | HUD renderer inside `FUN_0055fbd0` |
+| Rendering | front-end renderer | HUD renderer inside `HudItem_DrawByKind` |
 
 `InGameMenus` ends at `0x007b76ac`, i.e. immediately before `Menus`; the two arrays are
 adjacent but unrelated. GkPlus historically only knew about `Menus`.
@@ -396,8 +396,8 @@ plain `.rdata` literal at `0x00667434`, not a `GL_RESOURCE_ID`, so it is unlocal
 `"Particle Rate"` but for a better reason: it is a version, not a label. It is drawn bottom-left
 through `SmallFont`, at a rect of `{0.01, 0.99 - lineheight, 1.00, 0.99}`.
 
-The **only** other caller is `FUN_0056e310` @ `0x0056e32f`, the pre-menu splash frame reached from
-`WinMain` → `FUN_0046edd0`, which passes a near-white `0xffe5e5ea` instead. So the stamp is on
+The **only** other caller is `DrawSplashFrame` @ `0x0056e32f`, the pre-menu splash frame reached from
+`WinMain` → `RunTitleScreenFrame`, which passes a near-white `0xffe5e5ea` instead. So the stamp is on
 screen for the splash, off for every menu but Main, and off in game.
 
 Do not confuse it with the console `VERSION` command: `CommandVersion` @ `0x0043f1a0` reports an
@@ -490,7 +490,7 @@ switch (ChosenMenu)  ->  jump table @0x004ef318 (36 entries)
 
 **A decompiler trap:** `LAB_004ef2f1` is `CALL GoToMenu` whose `ECX` (target menu) and `DL`
 (push flag) are set at roughly 30 different `JMP` predecessors. Ghidra renders **every** menu
-transition as a bare no-argument `FUN_004fbfa0()` and loses the destination entirely — read the
+transition as a bare no-argument `GoToMenu()` and loses the destination entirely — read the
 disassembly, not the C output. The table below was recovered that way.
 
 The menu-13 jump table is typed at `0x004ef464`, with computed-jump references from the jump
@@ -579,11 +579,12 @@ onward is what GkPlus models as `Settings` in `src/Misc.cpp`. `WinMain` seeds de
 the call, so a missing/short file still yields sane values.
 
 **The table below is the in-memory layout. It is NOT the file layout, and the two orders
-differ.** `WriteGLKeys`'s writer is `FUN_0060e3df`, which the symbol table names `__putw`: the
+differ.** `WriteGLKeys`'s writer is `__putw` @ 0x0060e3df (the CRT symbol name survives in the
+binary): the
 block is a stream of raw 4-byte ints written **positionally**, with no key names, so a value
 is identified purely by its ordinal in the stream. The write order interleaves globals from
 outside this struct and does not follow the offsets — the run around `Use32BitTextures` is
-`0x006abdf4, 0x007b9cb4, 0x007b9cac, 0x007b9cb8, 0x007b9cbc, FUN_005901c0(), 0x006abdd8,
+`0x006abdf4, 0x007b9cb4, 0x007b9cac, 0x007b9cb8, 0x007b9cbc, GetAdapterDeviceId(), 0x006abdd8,
 0x006abdd4, 0x006abddc, 0x006abdf0, 0x006abde8, 0x006abdec, 0x006abdf8, `**`0x006abde0`**`,
 0x006abdfc, …`. Reading the file's `data` block as if it were this struct produces plausible
 nonsense (booleans reading 5 and 9), which is exactly how it misled one session; recover the
@@ -599,10 +600,10 @@ directly does not stick.
 |-----|--------|------|---------|---------|
 | 0x00 | 0x006abdd0 | `UnusedPrefToggle` | 0 | vestigial, see below |
 | 0x04 | 0x006abdd4 | `LinearMipmapOn` | 0 | menu 24 / 19 toggle |
-| 0x08 | 0x006abdd8 | `AnisotropicFilteringOn` | 0 | menu 24 / 19 toggle; auto-cleared and retried if `ValidateDevice` fails (`FUN_005a2460`) |
+| 0x08 | 0x006abdd8 | `AnisotropicFilteringOn` | 0 | menu 24 / 19 toggle; auto-cleared and retried if `ValidateDevice` fails (`AwMaterial_Compile`) |
 | 0x0c | 0x006abddc | `TripleBufferingOn` | 0 | menu 19 toggle |
 | 0x10 | 0x006abde0 | `Use32BitTextures` | 0 | menu 19 toggle; feeds the bytes-per-texel term below |
-| 0x14 | 0x006abde4 | `EnableRenderFlag0x400` | 1 | **not persisted** — ORs render flag 0x400 when caps bit 0x10 is set (`FUN_005a1d60`) |
+| 0x14 | 0x006abde4 | `EnableRenderFlag0x400` | 1 | **not persisted** — ORs render flag 0x400 when caps bit 0x10 is set (`TextureManager_SetCreateFlag0x400`) |
 | 0x18 | 0x006abde8 | `DepthStencilBits` | 32 | depth/stencil depth; **discarded on load** |
 | 0x1c | 0x006abdec | `VramTextureReduction` | 0 | auto-computed, not a user setting |
 | 0x20 | 0x006abdf0 | `TextureDetail` | 0 | menu 24 multi-value |
@@ -652,7 +653,7 @@ zero-init, so editing the cfg by hand is the only way to set it.
 function pointers. `ReadGLKeys` loads the word and immediately calls `ApplyShadowQuality`,
 which reads the *global* `ShadowQuality` — still the pre-load default at that point — so both
 the file value and that call are wasted. It comes out right anyway because `WinMain` ->
-`InitBuiltinEffectObjects` -> `FUN_0054f900` re-runs `ApplyShadowQuality` at `0x0046b9c3`, well
+`InitBuiltinEffectObjects` -> `CreateAlphaJunkSprites` re-runs `ApplyShadowQuality` at `0x0046b9c3`, well
 after the copy-out at `0x0046b667`.
 
 #### The load guard: a new graphics card wipes everything
@@ -693,7 +694,7 @@ Three fields do not round-trip:
 - `EnableRenderFlag0x400` (+0x14) is neither written nor read — `WinMain` hardcodes it to 1.
 - `DepthStencilBits` (+0x18) is written but `ReadGLKeys` overwrites it with 32. Deliberate:
   `InitDirect3DDevice` re-negotiates it per device, stepping 32 -> 24 -> 16 while
-  `CheckDepthStencilMatch` fails and giving up below 16, with `FUN_005a5150` picking the best
+  `CheckDepthStencilMatch` fails and giving up below 16, with `PickDepthStencilFormat` picking the best
   format whose alpha+colour bits fit under it.
 - `ColourDepthIndex` (+0x28) is written but `ReadGLKeys` overwrites it with 2 (32-bit). This
   one *is* a user-visible menu choice, so the Colour Depth setting silently resets to 32-bit
@@ -701,9 +702,16 @@ Three fields do not round-trip:
   properly. Same family as the music-volume bug in `threading_model_notes.md`.
 
 `VramTextureReduction` (+0x1c) is not a setting at all despite living in the file:
-`FUN_00574da0` derives it from available video memory and `Use32BitTextures` (falling back to
-3 when VRAM is unknown), and texture load uses `max(TextureDetail, VramTextureReduction)` — so
-it can only push quality *below* the menu choice, never above.
+`RecomputeVramTextureReduction` @ 0x00574da0 derives it from `GetAvailableTextureMem()` and
+`Use32BitTextures`, and texture load uses `max(TextureDetail, VramTextureReduction)` — so it can
+only push quality *below* the menu choice, never above.
+
+**The `= 3` arm is not a "VRAM unknown" fallback.** It is taken when the texture-area accumulator
+`TextureAreaUsed4K` @ 0x006ab978 (a running total in units of 4096 texels) has reached the budget
+constant 0x3000, or when `(0x3000 - TextureAreaUsed4K) >> 8` is zero — i.e. when the *budget* is
+exhausted. An absent device gives `GetAvailableTextureMem() == 0`, and a zero simply drives the
+divide that computes the reduction; it does not reach this branch at all. The rest of the
+arithmetic is in `rif_chunk_format.md`.
 
 `UnusedPrefToggle` (+0x00) is dead. `OnMenuItemClicked` has a `case 6:` under menu 26 that
 flips it, but `SetupMenus` adds exactly six items (0..5) to `Menus[26]`, so the case is
@@ -757,7 +765,7 @@ Each open menu also owns a panel widget in `InGameMenuPanels[7]` @ `0x007ba1dc`.
 - `OpenInGameMultiplayerFailedMenu` is called from the multiplayer client message dispatch
   (`ApplyUpdateMessage` @ `0x0050037c`); it refuses to run in SinglePlayer or Cooperative mode.
 - The save/load menus enumerate `*.msv` in Cooperative mode and `*.sav` otherwise, through
-  `FUN_004e6840` into `SaveFileList` @ `0x007b6f20` (see `save_system_notes.md`).
+  `RefreshFileList` into `SaveFileList` @ `0x007b6f20` (see `save_system_notes.md`).
 - In-game options renders each value into the label buffers at `0x007ba2c4`..`0x007ba2e4`
   (`CDMusicVolumeLabel`, `BattleMusicVolumeLabel`, `SoundEffectsVolumeLabel`,
   `CinematicsVolumeLabel`, then bandwidth / friendly fire / friendly mines / hints /
@@ -781,10 +789,10 @@ Pause-menu actions (kind `0x00`):
 
 | Item | Label | Action |
 |------|-------|--------|
-| 0 | Resume Play | `FUN_004a0dc0` — close menus, resume |
+| 0 | Resume Play | `ToggleInGamePauseMenu` — close menus, resume |
 | 1 | Options | `OpenInGameOptionsMenu`, unless already on index 4 |
-| 2 | Load Game | `FUN_004a0e70` -> `OpenInGameLoadMenu` |
-| 3 | Save Game | `FUN_004a0ea0` -> `OpenInGameSaveMenu` |
+| 2 | Load Game | `InGameMenuAction_LoadGame` -> `OpenInGameLoadMenu` |
+| 3 | Save Game | `InGameMenuAction_SaveGame` -> `OpenInGameSaveMenu` |
 | 4 | Restart Level | sets `LevelLoadReason` @ `0x007b9cf0` = 2 |
 | 5 | Exit to Menu | confirm dialog (see below) |
 
@@ -816,7 +824,7 @@ so the dialog gets the resolved prompt, `CommandMenu` @ `0x0043e940`, and
 `OpenInGamePauseMenu`. Which of the two callbacks is "yes" and which is "no" is inferred
 from the labels, not proven — `CommandMenu` returns to the front-end (yes) and
 `OpenInGamePauseMenu` reopens the pause menu (no), but the argument order has not been
-confirmed against `FUN_0056c9e0` @ `0x0056c9e0`, which actually builds the dialog.
+confirmed against `InGameConfirmDialog_Ctor` @ `0x0056c9e0`, which actually builds the dialog.
 
 `CommandConfirmDialogTest` @ `0x0044c0f0` exercises this path from the console.
 

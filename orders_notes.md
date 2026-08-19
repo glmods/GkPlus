@@ -48,8 +48,10 @@ So **bit 0 is discarded and the remaining bits must match exactly**. Only masks 
 in the shipped defaults, and mask 2 is the one carried by `Select all characters` (CTRL+A),
 `Quit to the desktop` (CTRL+Q) and the four CTRL+arrow camera actions — so **`2` is CTRL**.
 `menu_system_notes.md`'s "bit 1 = CTRL, bit 2 = ALT" is **wrong** and should be corrected;
-`KeyModifierState`'s `MOD_Ctrl = 2` is right. What bits 0 and 2 mean is *not established* — no
-shipped binding uses them.
+`KeyModifierState`'s `MOD_Ctrl = 2` is right. All three bits are now pinned at their writer,
+`HandleKeyMessage` @ 0x004e3f20: DIK `0x2a` LSHIFT -> bit **0x1** (0x004e3fa5), DIK `0x1d` LCTRL
+-> bit **0x2**, DIK `0x38` LALT -> bit **0x4**. No shipped binding uses 0x1 or 0x4, which is why
+only mask 0 and mask 2 appear in `GLkeys.cfg`.
 
 ### 1.3 The action table
 
@@ -151,7 +153,7 @@ must not be read.
 | remove tail | `MobileActor::CancelLastOrder` **0x00539030** | `__thiscall`, bare `RET` |
 | clear all | `MobileActor::ClearOrderQueue` **0x00538830** | `__thiscall`, bare `RET`; also sets `Actor+0x13c = 1` |
 
-`FUN_00538830` **is** the queue drain the brief asked about, but only in the "throw everything
+`MobileActor::ClearOrderQueue` **is** the queue drain the brief asked about, but only in the "throw everything
 away" sense — it pops and pool-frees every record and executes nothing. The *executor* is slot 70
 (§4).
 
@@ -168,18 +170,20 @@ Values 0..10, no gaps.
 | 1 | `AttackPosition` | `CharacterActor::QueueOrderPosition` 0x00541ac0, `RET 0x10` | CharacterActor slot 70 → slot 97 `AttackPosition` |
 | 2 | `GotoObject` | `MobileActor::QueueGotoObjectOrder` 0x00538b20, `RET 0x8` | MobileActor slot 70 → `GotoObject` 0x005394d0 |
 | 3 | `HoldMarker` | `MobileActor::PushHoldMarkerOrder` 0x00538a30, bare `RET` — **prepended** | none: the jump table maps kind 3 to the *exit* label, so it blocks the queue |
-| 4 | `CrouchToggle` | `MobileActor::QueueCrouchOrder` 0x00538be0, bare `RET` | MobileActor slot 70 → slot 83 `UpdateMineDetectionAndBounds` |
-| 5 | `Interact` | `MobileActor::QueueInteractOrder` 0x00538e80, `RET 0x8` | MobileActor slot 70 → `FUN_00536ba0(arg_c, arg_b, 1)` |
+| 4 | `CrouchToggle` | `MobileActor::QueueCrouchOrder` 0x00538be0, bare `RET` | MobileActor slot 70 → slot 83 `ToggleCrouchAndCamouflage` |
+| 5 | `Interact` | `MobileActor::QueueInteractOrder` 0x00538e80, `RET 0x8` | MobileActor slot 70 → `EquipItemInSlot(arg_c, arg_b, 1)` @ 0x00536ba0 |
 | 6 | `Board` | `MobileActor::QueueBoardOrder` 0x00538f80, `RET 0xc` | MobileActor slot 70 → `GetActorById(arg_a)`, `this+0x40 = target` (refcounted), `+0x44 = arg_b`, `+0x124 = arg_d` |
-| 7 | `Equip` | `MobileActor::QueueEquipOrder` 0x00538ca0, `RET 0x4` | MobileActor slot 70 → `FUN_005370d0(arg_b, 1)` |
-| 8 | *(unnamed)* | `MobileActor::QueueOrderKind8` 0x00538d40, `RET 0x4` | MobileActor slot 70 → `FUN_00538240(arg_b)` |
-| 9 | `UseItem` | `MobileActor::QueueUseItemOrder` 0x00538de0, `RET 0x4` | MobileActor slot 70 → walk `inventory_list` for `entry+0x24 == arg_b`, `FUN_00536ec0(entry)`, broadcast **0x80** |
+| 7 | `Equip` | `MobileActor::QueueEquipOrder` 0x00538ca0, `RET 0x4` | MobileActor slot 70 → `UseInventoryItem(arg_b, 1)` @ 0x005370d0 |
+| 8 | `Drop` | `MobileActor::QueueOrderKind8` 0x00538d40, `RET 0x4` | MobileActor slot 70 → `MobileActor::DropItem(arg_b)` @ 0x00538240 |
+| 9 | `UseItem` | `MobileActor::QueueUseItemOrder` 0x00538de0, `RET 0x4` | MobileActor slot 70 → walk `inventory_list` for `entry+0x24 == arg_b`, `MobileActor::UnequipSlot(entry)` @ 0x00536ec0, broadcast **0x80** |
 | 10 | `SetAmmoType` | `CharacterActor::QueueOrderKind10` 0x00541980, `RET 0x4` | CharacterActor slot 70 → slot 99 `SetAmmoType(arg_b)` |
 
-Names for 5/6/7/8 are taken from the *immediate* console/wire twin that reaches the same callee
+Names for 5/6/7 are taken from the *immediate* console/wire twin that reaches the same callee
 (§8); `Board` for 6 follows `directplay_protocol_notes.md`'s reading of command 0x17
-("board / attach (escort)") and is the least certain of them. Kind 8 has no name at all —
-`FUN_00538240` is 1096 bytes and was not read.
+("board / attach (escort)") and is the least certain of them. Kind 8 is **`Drop`**: its consumer is
+`MobileActor::DropItem` @ 0x00538240 and its client producer is `Unit::Unit_SendDropItem`
+@ 0x004c0cf0, whose 12-byte payload is `{id, actor_id, item_id}` with the id chosen by
+`CMP byte [EBP+0xc],0` — 0x14 queued, 0x13 immediate.
 
 ### 3.1 Correction to `src/Actors.h`
 
@@ -370,7 +374,7 @@ slot-pointer sites, and all 141 instructions in `.text` carrying a `0xb0` displa
 exactly 8 are in the two-register TeamSlot form. The rebased idiom (`ADD reg,[0x007b3ec4]` then
 `[reg+disp]`) reaches displacements 0x64, 0x6a, 0x70, 0x74, 0x7c, 0x84, 0x94, 0x9c, 0xa0, 0xac —
 **no 0xb0**. No site anywhere pushes or stores a formed TeamSlot pointer, so no callee can reach
-`+0xb0` off a parameter. `FUN_0053a450` / `FUN_0053a640` / `FUN_004a17b0` / `FUN_004a17e0` are
+`+0xb0` off a parameter. `ClearRouteWaypoints` / `PushRouteWaypoint` / `ExitFlareMode` / `EnterFlareMode` are
 excluded by that sweep and are not worth reading for this.
 
 ---
@@ -379,8 +383,19 @@ excluded by that sweep and are not worth reading for this.
 
 **Every** `PendingOrder` push in the binary is reached from `ExecutorThreadProc` @ 0x00509050
 (the client→server command switch at 0x005092a4) or from `ApplyUpdateMessage`. There is no local
-push path. The client-side producers are `Unit` vtable slots (table base **0x00664ac8**), and each
-takes a trailing `bool queued` that selects between an immediate id and `id + 1`:
+push path. The client-side producers are `Unit` vtable slots (table base **0x00664ac8**), and they
+come in **two shapes**, which the table below mixes:
+
+* slots 100-104 (`Unit_SendInteract`, `Unit_SendBoard`, `Unit_SendDropItem`, `Unit_SendUseItem`
+  and the crouch/ammo senders) take a trailing `bool queued` and choose between an immediate id
+  and `id + 1`, as the disassembly below shows;
+* slots **74, 75, 76, 78, 79 and 80** (0x004c3da0, `Unit` slot 75 @0x004c3c90, 0x004c3e40,
+  `Unit_SendAttackTarget`, `Unit_SendAttackPosition`, 0x004c4040) take **no such argument**. They
+  read `TEST byte ptr [KeyModifierState @0x007b6ddc],0x2` — the **CTRL** bit — and their second id
+  is `id + 2`, not `id + 1`. That second id does not mean "queued" at all: it means
+  **`close_range`**, which is where `Actor` slots 96/97's computed `0x41 + close_range` /
+  `0x3f + close_range` broadcast ids come from, and which also scales `Unit+0x2c4` (engagement
+  range) by 0.65.
 
 ```
 004c0bd0  CMP  byte ptr [EBP + 0x10], 0     ; the `queued` argument
@@ -399,10 +414,10 @@ takes a trailing `bool queued` that selects between an immediate id and `id + 1`
 | — | `0x26` push / `0x25` pop | 3 `HoldMarker` | `ActivateUnitAndResume` 0x0046ef50 | `PushHoldMarkerOrder` @0x0050a10c / `ReleaseHoldMarkerOrder` @0x0050a0b0 |
 | `0x1c` | `0x22` | 4 `CrouchToggle` | `Unit_SendCrouchToggle` 0x004c09d0 (slot 0x134) | `QueueCrouchOrder` @0x00509dc9 |
 | `0x0f` | `0x10` | 5 `Interact` | `Unit_SendInteract` 0x004c0bc0 (slot 0x190) | `QueueInteractOrder` @0x0050a21c |
-| `0x17` | `0x18` | 6 `Board` | `Unit_SendBoard` 0x004c0d50 | `QueueBoardOrder` @0x0050a2e8 |
+| `0x17` | `0x18` | 6 `Board` | `Unit_SendBoard` 0x004c0d50 (slot 0x19c) | `QueueBoardOrder` @0x0050a2e8 |
 | `0x11` | `0x12` | 7 `Equip` | `Unit_SendEquip` 0x004c0c90 (slot 0x194) | `QueueEquipOrder` @0x0050a33a |
-| `0x13` | `0x14` | 8 — | `Unit_SendOrderKind8` 0x004c0cf0 | `QueueOrderKind8` @0x0050a38a |
-| `0x15` | `0x16` | 9 `UseItem` | `Unit_SendUseItem` 0x004c0dc0 | `QueueUseItemOrder` @0x0050a4af |
+| `0x13` | `0x14` | 8 `Drop` | `Unit::Unit_SendDropItem` 0x004c0cf0 (slot 0x198) | `QueueOrderKind8` @0x0050a38a |
+| `0x15` | `0x16` | 9 `UseItem` | `Unit_SendUseItem` 0x004c0dc0 (slot 0x1a0) | `QueueUseItemOrder` @0x0050a4af |
 | `0x19` | `0x1a` | 10 `SetAmmoType` | `Unit_SendSetAmmoType` 0x004c0c30 (slot 0x14c) | vslot 85 `QueueOrderKind10` @0x0050a52c |
 | — | `0x1b` | — | `Unit_SendStandingOrder` 0x004bdd60 | `SetStandingOrder` @0x0050a4c2 |
 | — | `0x23` | — | `Unit_SendCancelLastOrder` 0x004be6f0 | `CancelLastOrder` @0x0050a015 |
@@ -438,8 +453,10 @@ In the `0x1d`/`0x1f` case block the "queued" byte is computed as
 
 `0x20` is not one of that block's ids — the neighbouring `0x1e`/`0x20` block uses the identical
 two instructions, where the test *is* correct. So `PendingOrder::flag` is always 0 for an
-attack-ground order. **Measured, but the consequence is not** — what slot 97 `AttackPosition`
-does with its fourth argument was not read.
+attack-ground order — and the consequence *is* now known: that fourth argument is
+**`close_range`**, so a queued attack-ground order can never be a close-range one. On the
+immediate path the same argument is supplied correctly as `(command_id == 0x0c)` at 0x00509eab,
+with the third argument a literal 0.
 
 ---
 
@@ -486,7 +503,7 @@ character keys:
 ```
 if (ActivePauseOn == 1) {
     SendToServer({0x26, unit->id}, 8);
-    GameMode == 0 ? ToggleActivePause() : FUN_0046f590();
+    GameMode == 0 ? ToggleActivePause() : SendPauseToggleRequest();
 } else if (HasPendingOrders() && IsMobile() && head order kind == 3) {
     SendToServer({0x25, unit->id}, 8);          // release the hold marker
 } else {
@@ -535,14 +552,13 @@ exactly like `actors`:
 `List<Object*>` of every game object, and the scan is a plain forward/backward walk with the
 sentinel skipped, filtered by vslot 71. There is no separate "player character" array.
 
-Every selection mutator opens with `CMP byte ptr [0x007b3f51],0` → `FUN_004a17b0(CL=0)`, which is
+Every selection mutator opens with `CMP byte ptr [0x007b3f51],0` → `ExitFlareMode(CL=0)` @ 0x004a17b0, which is
 presumably "close the open command wheel"; that was not confirmed.
 
-**No box/marquee select was found.** `ToggleReconMode` @ 0x004976d0 (was `FUN_004976d0`, and was
-described here as "the world-click order handler", which it is not — it is the Recon Mode toggle
+**No box/marquee select was found.** `ToggleReconMode` @ 0x004976d0 (the Recon Mode toggle
 of line 103, and the master gate on the cone renderer; see `ai_behaviour_notes.md` §7) and
-`FUN_00497ca0` (the per-frame cursor update called from `RunInGameFrame`) contain no rectangle
-test and no repeated `AddToSelection`. The only entry points into the table are the single-unit
+`UpdateSelectedUnitCamera` @ 0x00497ca0 (the **default** in-game camera update, the one that runs
+while `ReconModeActive == 0`, not a cursor update) contain no rectangle test and no repeated `AddToSelection`. The only entry points into the table are the single-unit
 click path, `SelectAllCharacters`, next/previous and the five character keys — which is consistent
 with Gunlok being a four-character squad game rather than an RTS. Stated as **not found**, not as
 proven absent.
@@ -553,14 +569,12 @@ proven absent.
 
 - **The formation geometry.** `TeamSlot+0xb0` has four writers and no reader was located. Neither
   the per-member offsets for Cluster / Side-by-side / Single file nor the anchor rule was found.
-- **Kind 8.** `FUN_00538240` (1,096 bytes) was not read, so the order has no name.
 - **Kind 6's exact meaning.** "Board / attach" is carried over from `directplay_protocol_notes.md`
   rather than measured; what `Actor+0x40`/`+0x44`/`+0x124` mean was not established.
-- **Kinds 5 and 7.** Named from their immediate wire twins (`FUN_00536ba0`, `FUN_005370d0`), whose
-  bodies were not read.
-- **`PendingOrder::flag`.** Set from the wire id, consumed as the fourth argument of slots 96/97,
-  never decoded. §8.2's suspected copy-paste bug hinges on it.
-- **Modifier bits 0 and 2.** No shipped binding uses them; only mask 2 = CTRL is measured.
+- **Kinds 5 and 7.** Named from their immediate wire twins (`MobileActor::EquipItemInSlot`
+  @ 0x00536ba0, `MobileActor::UseInventoryItem` @ 0x005370d0), whose bodies were not read here.
+- **`PendingOrder::flag` for kinds other than 0/1.** On the slots 96/97 path it is `close_range`
+  (§8.2); what the field means for the remaining kinds was not decoded.
 - **Command Wheel / Standing Orders Menu contents.** `OpenCommandWheel` 0x004a0fa0,
   `OpenAmmoMenu` 0x004a11d0, `OpenStandingOrdersMenu` 0x004a12e0, `DrawOrderMenu` and
   `BeginAttackGroundTargeting` 0x004a13f0 were identified but not read, so which wheel entry maps

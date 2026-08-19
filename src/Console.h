@@ -10,7 +10,10 @@ using ConsoleCommandCallback = void(__fastcall *)(int, char *);
 //
 // Buckets are `CommandListElem *[CommandTableNumBuckets]`, chained singly, and
 // the hash is just the uppercased first character of the name masked by
-// CommandTableMask (HashCommandName @ 0x004d4290). Registration prepends, so a
+// CommandTableMask (HashFunction_Command @ 0x004d4290 - the HashFunction(T)
+// overload for this table, named for symmetry with HashFunction_Actor
+// @ 0x0054db10, and it really does hash only `toupper(name[0])`). Registration
+// prepends, so a
 // bucket lists its commands newest-first; nothing is ever removed.
 struct CommandData {
   const char *name;

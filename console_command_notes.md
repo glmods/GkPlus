@@ -62,8 +62,12 @@ The real thing is at 0x007b6a70..0x007b6a7c:
 
 `CommandData` is `{const char *name; const char *help; callback; int condition;}` (0x10) and
 `CommandListElem` is `{CommandData *command; CommandListElem *next;}` (8). The hash
-(`HashCommandName` @ 0x004d4290) is just the uppercased first character of the name, masked;
-registration prepends, and nothing is ever removed.
+(`HashFunction_Command` @ 0x004d4290 — the `HashFunction(T)` overload for this table, named for
+symmetry with `HashFunction_Actor` @ 0x0054db10) hashes **only `toupper(name[0])`**, masked:
+seven instructions, `MOVSX EDX,byte [EAX]` then a `CMOVA` that keeps the raw byte when it is not
+lowercase. That is why the longest-prefix dispatch below only ever has to walk *one* bucket, and
+why every command sharing a first letter shares it. Registration prepends, and nothing is ever
+removed.
 
 `ConsoleExecuteCommandLine` @ 0x004d59e0 walks the one bucket, keeps the **longest**
 case-insensitive prefix match, strips that prefix from the line and calls the handler with the
@@ -496,7 +500,7 @@ The 27, with the update id recovered from the dword written to the message buffe
 | `SET SPEED` | `CommandSetSpeed` | 0xab [12] |
 | `SET TRACK` | `CommandSetTrack` | 0xa9 |
 | `SHADOW` | `CommandShadow` | 0xc4 [8] |
-| `SMOKE` | `FUN_00448640` | 0xbe [8] |
+| `SMOKE` | `CommandSmoke` | 0xbe [8] |
 | `SPEAK` | `CommandSpeak` | *computed* |
 | `STOP PARTICLES` | `CommandStopParticles` | 0xbf [8] |
 | `TELEPORT` | `CommandTeleport` | 0x3d [56] **and** 0x6f [40] |
@@ -576,7 +580,7 @@ Measured by forward reachability to `BroadcastToPlayers` @ 0x00504bf0 or `SendTo
 | `turret.turret_enabled` | `TurretActor::SetTurretEnabled` @ 0x0054e8b0 | **no** |
 | `pickup.set_required_item()` | `PickupActor::SetRequiredItem` @ 0x00546b20 | **no** |
 | `tokens[name] = value` | `SetOrCreateToken` @ 0x004d35f0 | **no** |
-| `triggers.create()` | `RegisterTriggers` @ 0x0043e240 | **no**, by design |
+| `triggers.create()` | `AddTriggerToGlobalList` @ 0x0043e240 | **no**, by design |
 
 Three of these deserve more than a row:
 
@@ -640,7 +644,7 @@ the callee pops. A declaration that disagrees drifts ESP by the difference on ev
 | 21 `ApplyShieldDamage` | `()` | RET 0x4 | `(int)` |
 | 27 `Stub27` | `()` | RET 0x4 | `(int)` |
 | 55 `OnPrePhysics` | `()` | RET 0xc | `(int, int, int)` |
-| 56 `OnCollisionResponse` | `()` | RET 0x8 | `(int, int)` |
+| 56 `PathToTarget` | `()` | RET 0x8 | `(Actor *target, float stop_range_sq)` |
 | 59 `OnDamageReceived` | `()` | RET 0x8 | `(int, int)` |
 | 65 `Delete` | `()` | RET 0x4 | `(bool broadcast)` |
 | 68 `ApplyDamage` | `(float, bool)` | RET 0xc | `(float, bool, int attacker_team)` |
@@ -747,8 +751,8 @@ mismatches.** What it took to get a trustworthy answer:
   0x004697d0, which **overwrites its own argument slot** before jumping so the tail callee's
   `RET 0x4` is what makes the whole chain `__stdcall`-clean.
 - **`"long long".split()[-1]` is `"long"`**, and a size table that misses that silently counts a
-  64-bit argument as 4 bytes - which is exactly how `RegisterTriggers`' correct declaration reads as
-  a 4-byte mismatch. `TriggerList` is a `List<T>`, 16 bytes by value.
+  64-bit argument as 4 bytes - which is exactly how `AddTriggerToGlobalList`'s correct declaration
+  reads as a 4-byte mismatch. `TriggerList` is a `List<T>`, 16 bytes by value.
 
 **The `RET` test is blind to register arguments**, which is how the
 `AcquireLevelRifForLocators` defect above survived it - a missing ECX argument changes no `RET`

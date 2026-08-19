@@ -83,7 +83,7 @@ Container chunk bodies consist entirely of concatenated child chunks. Some also 
 | `CUTSCUSR` | `Cutscene_User_Chunk2`        | 0x005d81c0 | One participant in a cutscene. **Empty body** |
 | `CUTTRACK` | `Cutscene_Track_Chunk2`       | 0x005d8c90 | One motion track of one participant. **Empty body** |
 | `SUBRIFFL` | (Sub_RIF_File_Chunk)          | 0x005b0ec0 | External RIF file reference. Opens and loads another .rif file. |
-| `OBINTDT\0` | `Object_Interface_Data_Chunk` | 0x005b30a0 | **A container, not a leaf** - and its id is seven characters NUL-padded, `b"OBINTDT\0"`. Every one of the 9,313 in the shipped assets is a child of `RBOBJECT` holding a single `OBJNOTES`, usually the editor's placeholder "Enter notes here". Treating it as a leaf hides 9,313 chunks |
+| `OBINTDT\0` | `Object_Interface_Data_Chunk` | 0x005b2f60, 0x005b3010 | **A container, not a leaf** - and its id is seven characters NUL-padded, `b"OBINTDT\0"`. Every one of the 9,313 in the shipped assets is a child of `RBOBJECT` holding a single `OBJNOTES`, usually the editor's placeholder "Enter notes here". Treating it as a leaf hides 9,313 chunks. **Two constructors**, matching the two overloads at AvP `OBCHUNK.HPP:169,177`: 0x005b2f60 `(Chunk_With_Children *parent, const char *data, size_t size)` `RET 0xc`, and 0x005b3010 `(Object_Chunk *parent)` `RET 0x4`, which is the one that creates the default notes chunk. The `DYNCREATE` registrar is `RifRegisterCtor_OBINTDT` @ 0x0043b517. 0x005b30a0, cited here in an earlier revision, is the **`OBJNOTES`** constructor — `Chunk::Chunk(this, parent, "OBJNOTES")`, AvP's `Object_Notes_Chunk` (`OBCHUNK.CPP:628`), `RET 0xc` — see its own row below |
 
 ---
 
@@ -1036,7 +1036,7 @@ ShapeMergeDataChunk_FromData @ 0x005b97d0 num_polys = payload_size >> 2 -- never
 **Only the map object and the shadow object are ever merged.** Of the eight call sites of
 `RifFindObjectByName`, exactly two pass `merge_and_build = 1`: `ToMap`'s cold geometry path
 @ 0x0047f926 and `GetShape` @ 0x004ae6c4 (the `shadow object rif` / `shadow object name` pair).
-The other six - `ToMap` @ 0x00480b80, `FUN_0049c7b0` @ 0x0049da28, `InitBuiltinEffectObjects`
+The other six - `ToMap` @ 0x00480b80, `BuildInventoryScreenObjects` @ 0x0049da28, `InitBuiltinEffectObjects`
 (twice) and
 `EnterMainMenuScreen` (three times) - pass 0 and skip the merge entirely. So a *prop* with corrupt
 merge data is inert and a *level* with it is a crash.
@@ -1814,7 +1814,7 @@ variable (bound in `SetupMenus` @ 0x004ea26a) persisted to `GLkeys.cfg` by `Writ
 @ 0x004fa84d, written by `WinMain` @ 0x0046b675 (config restore - a `MOVUPS` that carries
 `VramTextureReduction` @ 0x006abdec in the *same* 16-byte store) and by `OnMenuItemClicked`
 @ 0x004ed918 (the unreachable menu 19 toggle). Read by `PickPreferredTextureFormat`
-@ 0x005762f4, `FUN_00574da0` @ 0x00574dde, `WriteGLKeys`, and the toggle's own read-back.
+@ 0x005762f4, `RecomputeVramTextureReduction` @ 0x00574dde, `WriteGLKeys`, and the toggle's own read-back.
 
 **Forcing it to 1 cannot regress a shipped texture**, but not for the reason the rules above
 might suggest. It is not that a compressed candidate wins before the uncompressed fallback is
@@ -1824,16 +1824,34 @@ at the source's own fourcc via `SurfaceDesc_SetCompressedFormat`: 0x005c7a70 for
 destination, 0x005c7a59 for an uncompressed one. `PickPreferredTextureFormat`'s list is
 consulted only for a non-S3TC source.
 
-**What it does cost** is size, through the other reader. `FUN_00574da0` computes
-`VramTextureReduction` from available texture memory and a bytes-per-texel term
-`bpp = (caps & 4) ? 4 : 0x10`, overridden to `0x20` when the flag is set - it assumes 32 bits
-per texel and therefore derives a *larger* reduction. Its five callers (`ResetD3D2`,
-`InitDirect3DDevice`, `FUN_005a1d10` ×2, `FUN_004b1490`) all discard the return and simply
+**What it does cost** is size, through the other reader. `RecomputeVramTextureReduction` computes
+`VramTextureReduction` from `GetAvailableTextureMem()` and a bytes-per-texel term
+`bpp = (RenderConfigFlags & 4) ? 4 : 0x10`, overridden to `0x20` when `Use32BitTextures` is set -
+it assumes 32 bits per texel and therefore derives a *larger* reduction. There is a **second
+doubling**, gated on bit 4 of `RenderConfigFlags` @ 0x006ab968: the divisor is `bpp` when that bit
+is set and `bpp * 2` when it is clear. The whole expression, for the arm taken while the texture
+budget still has room:
+
+```
+denom  = (0x3000 - TextureAreaUsed4K) >> 8                      ; 0 -> takes the "= 3" arm
+budget = ((mem / denom << 3) / ((RenderConfigFlags >> 4 & 1) ? bpp : bpp * 2)) * 3 >> 2
+VramTextureReduction = how many times 0x100000 must be divided by 4 to fall below budget
+                       (0 when budget > 0xfffff)
+```
+
+`VramTextureReduction = 3` is the *other* arm, taken when `TextureAreaUsed4K >= 0x3000` or that
+shift is zero - the texture-area **budget** being exhausted, not the video memory being
+unknowable (an absent device yields `mem = 0`, which drives the divide). `TextureAreaUsed4K`
+@ 0x006ab978 is a running total of texture footprint in units of 4096 texels:
+`Texture_UpdateVramAccounting` and `TextureManager_ReleaseAll` add and subtract `(w * h) >> 12`.
+
+`RecomputeVramTextureReduction`'s five callers (`ResetD3D2`, `InitDirect3DDevice`,
+`Texture_UpdateVramAccounting` ×2, `TiledRimTexture_Load`) all discard the return and simply
 refresh the global; the function communicates only through it.
 
 **`VramTextureReduction` is a floor under the user's texture-detail setting, not the skip
-count itself** - both consumers (`FUN_005a19a0` @ 0x005a1ad7 and the device-lost reload
-`FUN_005a1b80` @ 0x005a1c15) do `max(TextureDetail @ 0x006abdf0, VramTextureReduction)` with a
+count itself** - both consumers (`TextureManager_LoadPending` @ 0x005a1ad7 and the device-lost reload
+`TextureManager_RecreateAll` @ 0x005a1c15) do `max(TextureDetail @ 0x006abdf0, VramTextureReduction)` with a
 `CMOVA` and pass that as the `m` option. It reaches `image+0x18` and drives
 `FillSurfaceFromImage`'s skip loop, which is guarded by `while (mipCount != 0)` - so it
 applies to compressed and uncompressed alike but cannot touch a single-level image.
@@ -1841,8 +1859,9 @@ applies to compressed and uncompressed alike but cannot touch a single-level ima
 The cost is bounded and small: the loop's threshold divides by 4 per level while `bpp` only
 doubles, so 0x10 -> 0x20 is **at most one extra level**, and a card on the `(caps & 4)` path
 going 4 -> 0x20 is at most two. Each level is one skipped mip, i.e. a quarter of the texels.
-(Arithmetic, not measured - and `DAT_006ab968`/`DAT_006ab978`, the caps bits and the early-out
-threshold, were not traced to their writers, so which real cards take which path is unknown.)
+(Arithmetic, not measured. `TextureAreaUsed4K`'s writers are known - the two accounting calls
+above - but the `RenderConfigFlags` caps bits are not traced to theirs, so which real cards take
+which path is still unknown.)
 
 **Confirmed in the running game, and now used deliberately.** `src/ImageCodec` reports
 `alpha_bits = 8` for an uncompressed `.dds` even when it is opaque, and forces
@@ -1859,7 +1878,7 @@ source - but not through the candidate list.** The list is irrelevant here, beca
 uncompressed source declaring `alpha_bits = 8` it accepts *nothing* either way; what changes
 is the **fallback descriptor**.
 
-`FUN_005c64c0` (`__fastcall(const D3DFORMAT *chosen /*ECX*/)`) empties the list and then
+`TextureFormatCandidates_Clear` (`__fastcall(const D3DFORMAT *chosen /*ECX*/)`) empties the list and then
 initialises three standalone descriptors: `DAT_00838b8c` = A8R8G8B8 staging,
 `DAT_00838bcc` = X8R8G8B8 staging, and **`DAT_00838c24` = the chosen format**, which is
 literally the value `ChooseSurfaceFormatForImage`'s walk starts from. So the chosen format is
@@ -1895,7 +1914,7 @@ register arguments, which are the ones that differ per site.)
 
 `CONT` is not a hint: it is the whole chain, and if a source does not carry one the texture
 has exactly one level. There is **no mip filter anywhere in the binary** - the only D3DX call
-that crosses out of the game layer is `FillSurfaceFromImage` @ 0x005c6950 -> `FUN_00414e8c`
+that crosses out of the game layer is `FillSurfaceFromImage` @ 0x005c6950 -> `D3DXLoadSurfaceFromSurface`
 at 0x005c76fc, which is the fallback for `IDirect3DDevice8::CopyRects` on the DXT staging
 path, not a downsample. `LinearMipmapOn` @ 0x006abdd4 is read only by `InitBuiltinMaterials`
 and sets the sampler's mip *filter*, which does nothing without levels to filter.

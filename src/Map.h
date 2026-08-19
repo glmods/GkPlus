@@ -93,6 +93,12 @@ static_assert(sizeof(RWLock) == 0x20);
 // reached through __thiscall methods invoked directly on TheMap (FUN_0048cf50
 // and the 0x00472xxx / 0x0048xxxx cluster), not through field access at the
 // call sites, so a global-reference sweep does not see them.
+//
+// **The Ghidra database models Map as one flat 0x18c record; this header models
+// it as `Map : MapBase, RefCountedBase`. The two AGREE on the layout** - every
+// field lands at the same offset either way, and the split is what puts the
+// second vptr at 0xa4 without a hand-written `void *sub_vtbl`. It is a
+// modelling difference, not a discrepancy, and neither side needs correcting.
 // Primary base subobject at Map+0x00 (0xa4 bytes). The whole primary chain
 // declares exactly ONE virtual: the vtables 0x00663e5c <- 0x00652818 <-
 // 0x00652824 are each a single slot, so nothing down the chain adds one. Its
@@ -125,7 +131,9 @@ struct RefCountedBase {
   virtual ~RefCountedBase() = 0; // slot 0: scalar deleting destructor
   virtual void Stub1() = 0;      // slot 1: __purecall in the middle base
 
-  int refcount; // +0x04 (Map+0xa8) LoadGame addrefs; FUN_004e2090 releases
+  // +0x04 (Map+0xa8) LoadGame addrefs; UnloadLevel @ 0x004e2090 (__cdecl,
+  // returning bool) releases.
+  int refcount;
 };
 static_assert(sizeof(RefCountedBase) == 0x8);
 

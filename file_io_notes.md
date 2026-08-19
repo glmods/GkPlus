@@ -20,7 +20,7 @@ through the import table, synchronously, on one thread.**
   data references to the slot - `File_Chunk`'s own call at 0x005aff71 is one, so a sweep
   over `getReferencesTo(CreateFileA)` reports 24 functions and misses the single most
   important one. Scan the *disassembly* for the slot address instead: 31 mentions, 30
-  calls plus one `MOV ESI,[slot]` in `FUN_0046c170`. Patching the slot needs neither
+  calls plus one `MOV ESI,[slot]` in `StartAttractModeDemo`. Patching the slot needs neither
   count to be right.
 - **No asynchronous I/O anywhere.** All 31 `CreateFileA` sites were swept for
   `dwFlagsAndAttributes`: the only values are `0`, `0x80` (NORMAL), `0x8000080`
@@ -137,23 +137,23 @@ Consequences for anything intercepting an open:
 
 ## 3. The read sites, classified
 
-Win32 handle family. 24 functions call `CreateFileA`; two of them (`FUN_00422cd0`,
-`FUN_00422de0`) are **statically-linked D3DX** (that region also contains libpng and
-zlib strings) and two (`FUN_005e25f0`, `FUN_005e2750`) have no callers at all.
+Win32 handle family. 24 functions call `CreateFileA`; two of them (`D3DX_MapFileForRead`,
+`D3DX_CreateFileForWrite`) are **statically-linked D3DX** (that region also contains libpng and
+zlib strings) and two (`File_OpenForRead`, `File_OpenForWrite`) have no callers at all.
 
 | What | Function | Notes |
 |---|---|---|
-| **.rif** | `File_Chunk::File_Chunk` @ 0x005afeb0 | the one entry point; whole-file read. Wrapper `FUN_005a9b50` has 7 callers, plus `RifCacheEntry_Load` @ 0x004af2b0 |
+| **.rif** | `File_Chunk::File_Chunk` @ 0x005afeb0 | the one entry point; whole-file read. Wrapper `BuildRifFileObject` @ 0x005a9b50 has 7 callers, plus `RifCacheEntry_Load` @ 0x004af2b0 |
 | **.rif (nested)** | `SUBRIFFL_Chunk` @ 0x005b0ec0 | same shape |
 | **.rim / images** | `ImageFile_Read` @ 0x005c6850 | **already has a memory-source path** — see §4 |
-| **sound samples** | `SoundSample_LoadFile` @ 0x005d3740, `FUN_005d3940` | whole-file read; reached from `FUN_0058bdb0` / `FUN_00589b30` |
-| **.dat sound banks** | `FUN_0058d0d0` ← `LoadDatFile` @ 0x0058c2a0 | `FILECHNK` container |
+| **sound samples** | `SoundSample_LoadFile` @ 0x005d3740, `SoundSample_ReadWholeFile` @ 0x005d3940 | whole-file read; reached from `SoundSystem_GetOrLoadSample` @ 0x0058bdb0 / `SoundSystem_LoadSampleIntoSlot` @ 0x00589b30 |
+| **.dat sound banks** | `DatFile_Ctor` @ 0x0058d0d0 ← `LoadDatFile` @ 0x0058c2a0 | `FILECHNK` container |
 | **level rif locators** | `AcquireLevelRifForLocators` @ 0x00483da0 | |
-| level sidecar caches | `ToMap` @ 0x0047f160, `LoadOrBuildSectionAdjacency` @ 0x0044fef0, `FUN_00579070`, `FUN_005542c0` | read **and** write (`.cut` / `.map` / `.opt`) |
-| rif `.opt` recompress | `FUN_005b03b0`, `FUN_00579070` | write, then `DeleteFileA` + `MoveFileA` |
+| level sidecar caches | `ToMap` @ 0x0047f160, `LoadOrBuildSectionAdjacency` @ 0x0044fef0, `RewriteCacheTailWithChunk` @ 0x00579070, `BakeStaticShadows` @ 0x005542c0 | read **and** write (`.cut` / `.map` / `.opt`) |
+| rif `.opt` recompress | `File_Chunk_WriteFile` @ 0x005b03b0, `RewriteCacheTailWithChunk` @ 0x00579070 | write, then `DeleteFileA` + `MoveFileA` |
 | rif vs `.opt` freshness | `IsFirstFileNewer` @ 0x004af430 | the only `GetFileTime` consumer besides `ToMap` |
-| savegames | `SaveGame`, `LoadGame`, `PeekSaveGameScriptName`, `MenuLoadGame`, `FUN_0056cb00`, `FUN_004b8d90` | keep on the real filesystem |
-| demos | `LoadDemoFile`, `CommandSaveDemo`, `FUN_0046c170` | |
+| savegames | `SaveGame`, `LoadGame`, `PeekSaveGameScriptName`, `MenuLoadGame`, `ReadSaveGameHeader` @ 0x0056cb00, `Unit_RestoreFromSave` @ 0x004b8d90 | keep on the real filesystem |
+| demos | `LoadDemoFile`, `CommandSaveDemo`, `StartAttractModeDemo` @ 0x0046c170 | |
 
 CRT `fopen` family — the game statically links a **UCRT** (`__acrt_*`,
 `common_sopen_dispatch<char>`, `___stdio_common_vfprintf` are all present), so `_fopen`
@@ -166,13 +166,13 @@ runtime. Seven callers, and only six of them read:
 | **.gsh** | `ParseGSH` | yes — same parser, same seam |
 | **.gcs / batch** | `ExecuteCommandFile` @ 0x0043f250 | yes — already detoured by `ScriptQueueSystem` |
 | cutscene camera tracks | `CameraTrack_LoadFromCutscene` | no |
-| `credits.mca` | `FUN_004dbdc0` | no |
+| `credits.mca` | `LoadCreditsScript` @ 0x004dbdc0 | no |
 | `GLkeys.cfg` | `ReadGLKeys` / `WriteGLKeys` | config — leave alone |
-| screenshots, logs | `FUN_005a5f40`, `LogString`, `FUN_0058ced0` | writes — leave alone |
+| screenshots, logs | `OpenNextScreenshotFile` @ 0x005a5f40, `LogString`, `AppendLogLine` @ 0x0058ced0 | writes — leave alone |
 
 No `_access`, `_stat`, `_findfirst`, `_wfopen` or `tmpfile` in game code: the game never
 probes for a file except by opening it (the one exception is
-`GetFileAttributesA` in `FUN_005b03b0`).
+`GetFileAttributesA` in `File_Chunk_WriteFile`).
 
 Directory enumeration is **one function**: `EnumerateFilesIntoFileList` @ 0x004e6ef0
 (`FindFirstFileA`/`FindNextFileA`, node 0x14c bytes), reached only through
@@ -217,10 +217,23 @@ bytes one at a time through slot 3, walks the trie keeping the **last** factory 
 (longest prefix wins), rewinds with tell/seek, and calls the factory with **no arguments**.
 No match sets `RimLoadErrorCode = 7`.
 
-Seven codecs are registered, from thunks at 0x0043c520 and 0x0043c560..0x0043c5b0 whose
-addresses sit in the C++ static-init table at 0x0064dbe8..0x0064dc04. Ghidra has not
-disassembled that region, so `getReferencesTo(0x005c8360)` reports nothing — scan `.text`
-for `E8`/`E9` rel32 targeting it instead.
+Seven codecs are registered, from tail-jump thunks whose addresses sit in the C++ static-init
+table at 0x0064dbe8..0x0064dc04. Each is three instructions — `MOV EDX,factory ; MOV ECX,magic ;
+JMP 0x005c8360`:
+
+```
+0x0043c520  "BM"     -> 0x005dd3f0      0x0043c590  "P4"   -> 0x005e02c0
+0x0043c560  "FORM"   -> 0x005de290      0x0043c5a0  "P5"   -> 0x005e0270
+0x0043c570  "LIST"   -> 0x005de300      0x0043c5b0  "P6"   -> 0x005e0220
+0x0043c580  "CAT "   -> 0x005de370
+```
+
+Those thunks are the reason a reference query on `RegisterImageCodec` is worth nothing until they
+are defined: while they sat as raw bytes `getReferencesTo(0x005c8360)` returned **zero** callers
+for a function with seven. All seven are defined now and the query returns seven call edges, which
+is the confirmation this section was written to predict. A zero-xref count on a registration
+function is evidence about the *database*, not about the binary — the same trap as an undefined
+vtable (CLAUDE.md, Analysis Traps).
 
 | Magic | Factory | Object |
 |---|---|---|
@@ -413,7 +426,7 @@ No power-of-two or square requirement was found on this path.
 `RegisterImageCodec` allocates each trie node with the game's `pool_alloc`. `pool_alloc`
 itself needs no static ctor - its free lists self-link and `PoolAllocUseLock` @ 0x007c066c
 has four readers and **zero writers**, so the critical section is never entered - but its
-backing store is not ours: `FUN_00571670` calls `AllocateMemory` @ 0x00601f4a, a hot-patch
+backing store is not ours: `pool_alloc_page` calls `AllocateMemory` @ 0x00601f4a, a hot-patch
 thunk into **gl.exe's own statically linked CRT allocator**, initialised by that exe's
 `_mainCRTStartup`. The loader calls our `DllMain(DLL_PROCESS_ATTACH)` before that, since
 we are an implicit-load dependency. The game's own seven codecs register from `.CRT$XC`,
@@ -503,7 +516,7 @@ naming surface a mod cannot retarget without replacing the resource DLL.
 
 Nothing downstream re-derives the name either: `AcquireRimTexture` hashes the **whole**
 string (`sum of _mbctolower(c)`) and resolves collisions with `__stricmp` on the full stored
-path, `__strdup`ing it into `AwTexture+0x2c`; the device-lost reload `FUN_005a1b80` re-passes
+path, `__strdup`ing it into `AwTexture+0x2c`; the device-lost reload `TextureManager_RecreateAll` re-passes
 that stored pointer (`PUSH dword ptr [EDX + 0x2c]` @ 0x005a1c3b) rather than rebuilding a
 name; and `CreateSceneObjectFromCachedMesh` replays the `.opt` cache's length-prefixed string
 verbatim. (The `.opt` *writer* was not inspected - if a new extension survives a cold load and
@@ -524,7 +537,7 @@ Two consumers have **no** seam and cannot be served from memory without either a
 shim or a materialized file:
 
 - **Bink.** `_BinkOpen@8` has exactly two call sites — `PlayMusicTrack` @ 0x00587b60 and
-  `FUN_004b0b00` (cutscene FMV) — and both pass flags `0`, i.e. a **file name**. The open
+  `Fmv_OpenBinkMovie` (cutscene FMV) — and both pass flags `0`, i.e. a **file name**. The open
   then happens inside BINKW32.DLL, which does not use gl.exe's IAT. (Bink 1 does accept a
   `HANDLE` under its `BINKFILEHANDLE` flag, so this is solvable, but only with a real
   handle.)

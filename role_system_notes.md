@@ -146,10 +146,14 @@ re-resolved from the alternate name. Shape/pgen roles leave all four (0x2c, 0x38
 | 0x10 | `pickup_radius` | 0x5e | default 6.0 |
 | 0x14 | `action_on_death` | 0x5d | |
 
-**Latent bug:** the inline allocation path (taken when the `inventory shape` field 0x06
-is present) initialises only 5 of the 6 fields and leaves `pickup_radius` (+0x10)
-**uninitialised**; the `FUN_00483390` constructor path zeroes all six. A role that sets
-`inventory shape` but not `pickup radius` therefore gets garbage pickup radius.
+**Latent bug: `pickup_radius` (+0x10) is uninitialised on *both* construction paths.** The
+inline allocation path (taken when the `inventory shape` field 0x06 is present) writes five of
+the six fields, and `InventoryInfo_Ctor` @ 0x00483390 is 37 bytes whose whole body writes
+`+0x00`, `+0x04`, `+0x08`, `+0x0c` and `+0x14` - it skips `+0x10` too. Neither of the two
+`ToRole` sites (0x0047cee1 / 0x0047cf8f) writes it afterwards. So a role that sets
+`inventory shape` but not `pickup radius` gets a garbage pickup radius whichever path built it.
+This is a defect in the game rather than in the mirror; the full entry belongs in
+`game_defects_notes.md`, which does not yet carry it.
 
 ## 5. The `flags` word (0x78) - 10 packed booleans
 
@@ -208,7 +212,7 @@ Actor depending on the character/projectile presence). Every spawn does `num_act
 
 Note there is a **second, lighter actor factory** for the client/main thread,
 `ClientSpawnActorForTeam` @ 0x004fce90, with different class sizes and its own id counter
-(`DAT_007b68e4`); see `level_loading_notes.md`. On a listen host both run.
+(`NextClientActorId` @ 0x007b68e4); see `level_loading_notes.md`. On a listen host both run.
 
 `Actor::Ctor` (0x0052d1f0) reads these Role fields when building the actor: `shape` /
 `hierarchy` / `flags` bit7 (visual object), `armor_value`, `character->strength` /

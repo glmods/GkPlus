@@ -69,6 +69,15 @@ them. See `directplay_protocol_notes.md` §8.11 for the full host-vs-joiner sche
 Either way each message is applied by `ApplyUpdateMessage` and then `free`d by the pump — which is
 the concrete demonstration that `MsgQueue_Pop` hands ownership of the payload to its caller.
 
+The pump also drives **clock sync from the client side**. `SendClientTimeSync` @ `0x00502ab0` is
+called from `ClientReceivePump` and from the pump's sibling `FUN_004fdd60`, gated on
+`ClientDPlay != 0`, and **throttled to once every 2.0 seconds** of `GetGameTimeSeconds`
+(`if (now < ClientLastSyncTime + 2.0) return;`). It sends command `0x36`,
+`{u32 0x36, f32 GetGameTimeSeconds()}`, 8 bytes, unreliable, to which the host replies with update
+`0xca`. It also decrements `ClientSyncCountdown` and, on reaching zero, applies a clock scale
+through `FUN_00571aa0`. So a joiner's game clock is corrected on a 2-second cadence off the main
+thread's own pump, not by anything on the executor.
+
 DllMain of d3d8.dll (and therefore GkPlus init) also runs on this thread:
 the game loads d3d8.dll from `InitD3DAndSetMode`, called from WinMain.
 
@@ -87,9 +96,10 @@ The only game-created worker thread. Ghidra names its id global `ExecutingThread
 
 `StartExecutorThread(dplay)` creates five auto-reset events, optionally binds a DirectPlay
 session (CreatePlayer with the msg-available event, CreateGroup), then CreateThread.
-Started on every level start (`FUN_004e2560` @ 0x004e2560, reached from briefing-end /
-load-save paths) — **the executor thread runs in single-player too**. Stopped on level
-end / FMV / credits / next-level (`FUN_004e2710` @ 0x004e2710).
+Started on every level start (`BeginLevelSession` @ 0x004e2560, `__fastcall int(bool load_level)`
+with the flag in CL, reached from briefing-end / load-save paths) — **the executor thread runs in
+single-player too**. Stopped on level end / FMV / credits / next-level (`EndLevelSession`
+@ 0x004e2710, `__stdcall bool(void)`).
 
 Thread proc structure (loop):
 
@@ -115,7 +125,7 @@ what WinMain sets per-frame — float determinism across both threads.
 
 | Address | Role |
 |---------|------|
-| 0x007b9df4 | msg-available (DirectPlay player event in MP; `SetEvent` by main thread in SP via `FUN_00505280` to wake the executor early) |
+| 0x007b9df4 | msg-available (DirectPlay player event in MP; `SetEvent` by main thread in SP via `WakeExecutor` @ 0x00505280 — 13 bytes, no parameters, just `SetEvent(hEventMsgAvailable)` — to wake the executor early. Callers: `ClientReceivePump`, `FUN_004fdd60`) |
 | 0x007b9df8 | kill request |
 | 0x007b9dfc | kill ack (created on demand by StopExecutorThread) |
 | 0x007b9e00 | pause request (main -> executor) |
@@ -171,9 +181,25 @@ next launch. `LoadLevel` repairs it, so in-game music is correct — the window 
 the first level load.
 
 The same defect covers three more call sites that also construct-and-play without setting a
-volume: `FUN_0046f020` and `FUN_0046d0f0` (`2a.bik`) and `FUN_004db3c0` (`victory.bik`). The
-three call sites that *do* set their own volume are cinematics (`FUN_004dd4b0`,
-`CinematicsVolume * 0xe38`), the Audio-menu slider, and battle music (`FUN_004e7a40`).
+volume: `FUN_0046f020` and `FUN_0046d0f0` (`2a.bik`) and `StartCreditsScreen` @ 0x004db3c0
+(`victory.bik`; it also sets `GameState = 0x13`, which is how credits are identified). The three
+call sites that *do* set their own volume are cinematics (`CameraTrackObject_PlayBinkAudio`
+@ 0x004dd4b0, `CinematicsVolume * 0xe38` — reached only through **slot 4 of the cutscene-event
+vtable at 0x00666e90**, so it has no code references but does run), the Audio-menu slider, and
+battle music (`StartMusicForSituation` @ 0x004e7a40).
+
+Battle music is **thread-aware**, which is the only reason it appears in this document.
+`StartMusicForSituation` and its per-frame driver `UpdateBattleMusic` @ 0x004e7230 both read the
+time scale off the *calling* thread's clock — `DAT_007c07b4` when
+`GetCurrentThreadId() == ExecutingThread`, `DAT_007c07e4` otherwise — so the fade ramps advance on
+whichever thread happens to service them. Those two globals are the `+0x14` field of the two clock
+structs below.
+
+> `StartMusicForSituation`'s signature is an ESP hazard worth repeating from `address_map.md`:
+> `__fastcall void(int /*ECX, never read*/, int situation /*EDX*/, int /*stack, never read*/)` with
+> **`RET 0x4`**. The stack argument is popped and ignored and ECX is not a parameter at all — one
+> call site does not set ECX. A wrapper modelled as `__fastcall(a, b)` would drift ESP by 4 per
+> call.
 
 GkPlus fixes all four by detouring `MusicTrack_Ctor` in `MusicModule` (`src/Music.cpp`) and
 seeding `volume` from `BattleMusicVolume` instead of the hardcoded 0x8000; the three
@@ -328,10 +354,17 @@ hook.
 > trigger field verbatim. See `save_system_notes.md`.
 
 `BroadcastToPlayers(msg, size, guaranteed, coords)` in MP: per-player send with position
-relevance filtering (`FUN_00511250`), per-player backlog counters (`0x007b9d84[i]`),
+relevance filtering (`IsRelevantToPlayer` @ 0x00511250), per-player backlog counters (`0x007b9d84[i]`),
 and probabilistic throttling — when a player's queue is backed up, unreliable messages
 are dropped except a ~1-in-10 random sample (using the per-thread RNG). Reliable
 messages go `DPSEND_GUARANTEED | DPSEND_ASYNC`, unreliable get a 3000ms timeout.
+
+`IsRelevantToPlayer` is `__fastcall bool(int player, Vec3f coords)` (`RET 0xc` — the `Vec3f` is
+by value). It walks the actors of that player's team list and keeps the message if any of them is
+within a radius chosen by the `BandwidthUse` setting @ 0x006abe24, values 0..9 selecting
+120, 110, 100, 90, 80, 70, 60, 50, 40, 30 units (compared squared: 14400 down to 900). The team
+index it walks is `player == 0 ? 1 : player + 2`, which **skips index 2** — recorded as measured,
+not tidied away.
 
 ### Who queues scripts (all seven callers of `QueueScriptExecution`)
 
@@ -354,8 +387,11 @@ guard, or being simulation-authority code that broadcasts. This is why a joining
 | `MultiplayerRespawnRole` | 0x0050c8b0 | respawns a role for a team, then queues `CTFRespawn.gcs` / `RTPRespawn.gcs` | sole caller is `EvaluateTriggers` (14 sites) — **executor-only by call graph, proven** |
 
 > **`RespawnRoleList` @ 0x007b9d98 is how the respawn hands the actor to that script.**
-> `MultiplayerRespawnRole` appends the `SpawnRole` result to it (`FUN_00511600`, `__thiscall` on the
-> list header), and the queued `.gcs` then equips the actor at the head with `GIVE ROLE ID` /
+> `MultiplayerRespawnRole` appends the `SpawnRole` result to it with `List_AddEntry` @ 0x00511600
+> (`__thiscall void(List<T*> *this, T *const &value)`, `RET 0x4`, the list header in ECX). That is
+> Rebellion's generic `List<T>::add_entry` template body — `pool_alloc(0x10)` node, tail insert,
+> `++n_entries`, cache invalidated and freed — and **not** a respawn-specific helper;
+> `DetermineMatchWinners` shares it. The queued `.gcs` then equips the actor at the head with `GIVE ROLE ID` /
 > `GIVE AND EQUIP ROLE ID` — "gives to last respawned actor if it matches role" — and pops it with
 > `NEXT RESPAWN ID` @ 0x0044a530. It is a FIFO rather than a single slot precisely because
 > `RunQueuedScript` drains one script per frame while several respawns can already be pending, so
@@ -475,7 +511,12 @@ exclusive flag (byte), +0x04 CRITICAL_SECTION, +0x1C reader count. Writers spin 
   written from both threads);
 - door open/close (`OpenDoor`/`CloseDoor` @ 0x0043fbd0/0x0043fc50);
 - position sync (`SyncPositionAndBroadcast`, `InitPositionAndTiming` variants);
-- a renderer shared-VB manager object (ctor `FUN_00489990`).
+- **the `Map`** — the lock is `Map->lock`, taken by both threads, and the constructor that
+  initialises it is `MapBase_Ctor` @ 0x00489990. (Note the DB models `Map` as **one flat 0x18c
+  record** with both its constructor and destructor in namespace `Map`; there is no `MapBase` type
+  there, whereas `src/Map.h` splits the same bytes into `Map : MapBase, RefCountedBase`. The
+  layout is what matters here and the two agree on it — the lock sits in the leading portion, ahead
+  of the second vptr at 0xa4.)
 
 ### 3. Plain critical sections
 
@@ -489,7 +530,7 @@ exclusive flag (byte), +0x04 CRITICAL_SECTION, +0x1C reader count. Writers spin 
 
 ### 4. Pool allocator with a *disabled* lock
 
-The game's small-block allocator (`malloc` @ 0x00571470, free path `FUN_005715b0`;
+The game's small-block allocator (`malloc` @ 0x00571470, free path `pool_free` @ 0x005715b0;
 page-masked chunk headers, per-size free lists @ 0x007ba668) takes
 `EnterCriticalSection(0x007c0670)` **only if the byte flag @ 0x007c066c is set — and
 nothing in the binary ever sets it** (it lives in uninitialized .data, no write refs).
@@ -507,22 +548,37 @@ The binary predates convenient TLS; instead ~180 functions do
 This inlined pattern is why so many gameplay functions reference
 `GetCurrentThreadId` — it is *not* locking, just per-thread variable selection.
 
-### Game clocks (two 0x30-byte structs)
+### Game clocks (two `Clock` instances)
 
 | Instance | Address | Owner |
 |----------|---------|-------|
-| executor clock | 0x007c07a0 | thread id == ExecutingThread |
-| main clock | 0x007c07d0 | any other thread |
+| `ExecutorClock` | 0x007c07a0 | thread id == ExecutingThread |
+| `MainClock` | 0x007c07d0 | any other thread |
 
-Layout (offsets relative to instance base): +0x0C ticks-per-frame-ish int (0x007c07ac /
-0x007c07dc), +0x10 int, +0x14 float time scale (0x007c07b4 / 0x007c07e4), +0x18 64-bit
-accumulated counter, +0x20 last raw sample.
+**`Clock` is 0x24 bytes**, and is now a type in the Ghidra DB. The two instances sit **0x30 apart**,
+which is the instance stride and not the record size — that spacing is where this note's earlier
+"two 0x30-byte structs" heading came from, and no field beyond +0x20 was ever attributed to the
+struct.
+
+Layout (offsets relative to instance base):
+
+| Off | Type | Meaning | Main / Executor globals |
+|-----|------|---------|-------------------------|
+| +0x0C | int | ticks-per-second | 0x007c07dc / 0x007c07ac |
+| +0x10 | **float** | tick rate — read with `MULSS` against a seconds value, so it is a float and not an int | 0x007c07e0 / 0x007c07b0 |
+| +0x14 | float | time scale | 0x007c07e4 / 0x007c07b4 |
+| +0x18 | u64 | accumulated counter | 0x007c07e8 / 0x007c07b8 |
+| +0x20 | u32 | last raw sample | — |
+
+The base addresses are self-checking against that table: `0x007c07d0 + 0x18 = 0x007c07e8` and
+`0x007c07a0 + 0x18 = 0x007c07b8`, and the same arithmetic lands every other row, which is the
+independent confirmation that `ExecutorClock` is the instance at 0x007c07a0.
 
 Time source: `rdtsc >> 20` (`ReadRawClock` @ 0x0044e8a0). `AccumThreadClock64` @ 0x0044df20
 accumulates 22-bit-masked deltas into the calling thread's 64-bit counter — per-thread
 so the last-sample/accumulator pair is never shared between threads. Readers:
 `FUN_00571b60` (32-bit scaled), `ReadScaledClock64` @ 0x00571bb0 (64-bit scaled; takes a
-`{mul_lo, mul_hi, offset_lo, offset_hi}` conversion struct), `FUN_00571b10`
+`{mul_lo, mul_hi, offset_lo, offset_hi}` conversion struct), `GetGameTimeSeconds` @ 0x00571b10
 (float seconds). There are **three** conversion structs, and `CommandTimerInfo`
 @ 0x0044afb0 prints them with its own labels: `RealTimeClock` @ 0x006aaaa0 ("Real time"),
 `GameTimeClock` @ 0x006aaab8 ("Game time") and `ServerTimeClock` @ 0x006aaad0

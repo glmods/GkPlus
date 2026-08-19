@@ -32,18 +32,31 @@ void SetSunBrightness(float r, float g, float b, float a);
 // SetSunAngle does would leave the two inconsistent.
 Vec3 GetSunDirection();
 
-// --- ambient light -----------------------------------------------------------
+// --- the scene light set's emissive colour ------------------------------------
 
-// SetAmbientLight @ 0x00579ef0, __thiscall(renderer @ 0x007c18cc, LightInfo *),
-// RET 0x4. The flags word at +0x14 selects how the colour is read: with **2**
-// the four floats are authoritative, and the packed-byte conversion at the top
-// of the function is skipped. `AMBIENT` sets exactly that, which is also the
-// only reason it gets away with leaving +0x00 uninitialised.
+// LightSet_SetEmissiveColour @ 0x00579ef0,
+// __thiscall(LightSet *this @ 0x007c18cc, AwColour *), RET 0x4.
+//
+// **It sets no ambient light**, despite being what the `AMBIENT` console command
+// calls and despite being named SetAmbientLight here until it was read. It
+// writes `this+0x48` - the Emissive member of the D3DMATERIAL8 starting at
+// `this+0x18` - from colour->rgba[0..3], and `this+0x24` (Diffuse.a) from
+// rgba[3]. If `this` is the current light set it re-pushes the material through
+// SetD3DMaterial (IDirect3DDevice8::SetMaterial); otherwise the colour reaches
+// D3D lazily through LightSet_Apply, the light set's vtable slot 3.
+//
+// The flags word at +0x14 selects how the colour is read: with **2** the four
+// floats are authoritative, and the packed-byte conversion at the top of the
+// function is skipped. `AMBIENT` sets exactly that, which is also the only
+// reason it gets away with leaving +0x00 uninitialised.
 //
 // This is *not* `DARK`: that command also tears down the dynamic light list
-// (FUN_0057a780) before setting a constant ambient, and only the ambient half is
+// (FUN_0057a780) before setting a constant colour, and only this half is
 // reproduced here.
-void SetAmbientLight(float r, float g, float b, float a);
+//
+// The JS binding stays `world.set_ambient` - it is a published scripting API,
+// and renaming it would break every script that uses it.
+void LightSet_SetEmissiveColour(float r, float g, float b, float a);
 
 // --- fog ---------------------------------------------------------------------
 //

@@ -11,12 +11,16 @@
 
 namespace gk {
 namespace {
-CDeclVarargs<int, char *> DebugPrintError;
-CDeclVarargs<int, char *> DebugPrintWarning;
-CDeclVarargs<int, char *> DebugPrintFatal;
+// The GLS parser's three reporters, all __cdecl varargs ending in a bare RET.
+// 0x00477000 genuinely returns int; the other two return void, which is harmless
+// through this signature because __cdecl is caller-clean and no caller of either
+// reads EAX.
+CDeclVarargs<int, char *> PrintParseError;
+CDeclVarargs<int, char *> PrintParseWarning;
+CDeclVarargs<int, char *> PrintFatalError;
 
 // **Warnings are deliberately not redirected.** The GLS parser reports
-// "default value assumed for '<field>'" through DebugPrintWarning for every unset
+// "default value assumed for '<field>'" through PrintParseWarning for every unset
 // field of every section it parses - 13,000+ calls for one level load of the
 // Training Level. Sending those to OutputDebugString makes the game unplayable
 // whenever a debugger is attached, because each call is a synchronous round-trip
@@ -48,24 +52,24 @@ int __cdecl HookedDebugPrint(char *fmt, ...) {
 } // namespace
 
 DebugSystem::DebugSystem() {
-  GetObjectAtOffset(DebugPrintFatal, 0x00476fb0);
-  GetObjectAtOffset(DebugPrintError, 0x00477000);
-  GetObjectAtOffset(DebugPrintWarning, 0x00477050);
+  GetObjectAtOffset(PrintFatalError, 0x00476fb0);
+  GetObjectAtOffset(PrintParseError, 0x00477000);
+  GetObjectAtOffset(PrintParseWarning, 0x00477050);
 
-  DetourAttach(&DebugPrintFatal, HookedDebugPrint);
-  DetourAttach(&DebugPrintError, HookedDebugPrint);
+  DetourAttach(&PrintFatalError, HookedDebugPrint);
+  DetourAttach(&PrintParseError, HookedDebugPrint);
   if (RedirectWarnings) {
-    DetourAttach(&DebugPrintWarning, HookedDebugPrint);
+    DetourAttach(&PrintParseWarning, HookedDebugPrint);
   }
 }
 
 DebugSystem::~DebugSystem() {
-  DetourDetach(&DebugPrintFatal, HookedDebugPrint);
-  DetourDetach(&DebugPrintError, HookedDebugPrint);
+  DetourDetach(&PrintFatalError, HookedDebugPrint);
+  DetourDetach(&PrintParseError, HookedDebugPrint);
   // Must mirror the ctor exactly - detaching a hook that was never attached
   // fails the whole Detours transaction.
   if (RedirectWarnings) {
-    DetourDetach(&DebugPrintWarning, HookedDebugPrint);
+    DetourDetach(&PrintParseWarning, HookedDebugPrint);
   }
 }
 } // namespace gk

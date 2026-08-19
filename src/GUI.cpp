@@ -83,10 +83,19 @@ bool Dx9Overlay() {
 //
 // Suppressing ONLY the teardown is not enough, and that is the mistake this comment exists
 // to record. OnActivateApp's two branches are not symmetric around ReleaseD3DResources: the
-// focus-GAIN branch also runs restore work with no counterpart on the loss side -
-// FUN_005a1d60(&TexturesObject) against the loss branch's FUN_005a1ca0(&TexturesObject),
-// plus FUN_00468dc0/FUN_00557210/FUN_004b10f0. Skip the release and that restore still runs,
-// against objects that were never released.
+// focus-GAIN branch also runs restore work with no counterpart on the loss side. This
+// comment used to pair FUN_005a1d60 against the loss branch's FUN_005a1ca0 as a
+// release/reload couple; they are not one. 0x005a1ca0 is TextureManager_ReleaseAll (a COM
+// `Release` per texture); 0x005a1d60 flips a creation flag in a 0x20-byte record and
+// reloads nothing; the actual restore is TextureManager_RecreateAll @ 0x005a1b80, which
+// RestoreD3DResources calls and which the old text omitted. So the gain branch runs
+// RestoreD3DResources -> TextureManager_RecreateAll plus
+// FUN_00468dc0/FUN_00557210/FUN_004b10f0. Skip the release and that restore still runs,
+// against objects that were never released - so the conclusion below is unchanged.
+//
+// If TextureManager is ever mirrored: **its list at +0x1c is NOT a List<T>.** The node is
+// {data, prev, next} with no vptr and the payload at +0x00, which is not List_Member<T>'s
+// {vptr, prev, next, data} layout, so src/List.h does not describe it.
 //
 // So the whole handler is skipped instead. Nothing is torn down, nothing is rebuilt, and
 // DAT_007c1230 keeps the value it had - which is what makes RenderSceneAndPresent keep

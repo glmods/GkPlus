@@ -8,8 +8,10 @@ namespace {
 // indexes SinTable/CosTable.
 constexpr float kBamPerDegree = 4096.0f / 360.0f;
 
-// The renderer object SetAmbientLight is a method on.
-void *GetRenderer() {
+// The scene's LightSet @ 0x007c18cc - the receiver
+// LightSet_SetEmissiveColour is a method on. This was called GetRenderer() until
+// the callee was read: the object is a LightSet, not a renderer.
+void *GetSceneLightSet() {
   void **p;
   GetObjectAtOffset(p, 0x007c18cc);
   return *p;
@@ -28,17 +30,19 @@ float *FogField(unsigned offset) {
                         : reinterpret_cast<float *>(fog + offset);
 }
 
-// The LightInfo SetAmbientLight takes. Only `color` and `flags` are ever read
-// with flags == 2; `unk0` stays zero here because the game leaves it as stack
-// garbage and the flag makes it unreachable either way.
-struct LightInfo {
-  int unk0;
+// The AwColour LightSet_SetEmissiveColour takes (named LightInfo here until the
+// callee was read). `packed` is the 0xAARRGGBB byte form the callee expands into
+// `rgba` when `valid_mask & ~2` is set; with flags == 2 only `rgba` and
+// `valid_mask` are read, so `packed` stays zero here - the game leaves it as
+// stack garbage and the flag makes it unreachable either way.
+struct AwColour {
+  int packed;
   float color[4];
   int flags;
 };
-static_assert(sizeof(LightInfo) == 0x18);
-static_assert(offsetof(LightInfo, color) == 0x04);
-static_assert(offsetof(LightInfo, flags) == 0x14);
+static_assert(sizeof(AwColour) == 0x18);
+static_assert(offsetof(AwColour, color) == 0x04);
+static_assert(offsetof(AwColour, flags) == 0x14);
 } // namespace
 
 float GetSunAngle() {
@@ -84,16 +88,16 @@ Vec3 GetSunDirection() {
   return *p;
 }
 
-void SetAmbientLight(float r, float g, float b, float a) {
-  LightInfo info{};
+void LightSet_SetEmissiveColour(float r, float g, float b, float a) {
+  AwColour info{};
   info.color[0] = r;
   info.color[1] = g;
   info.color[2] = b;
   info.color[3] = a;
   info.flags = 2; // "the floats are authoritative" - see World.h
-  ThisCall<void, void *, LightInfo *> fn;
+  ThisCall<void, void *, AwColour *> fn;
   GetObjectAtOffset(fn, 0x00579ef0);
-  fn(GetRenderer(), &info);
+  fn(GetSceneLightSet(), &info);
 }
 
 bool HasFog() { return GetFogSystem() != nullptr; }

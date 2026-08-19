@@ -68,24 +68,26 @@ const JSCFunctionListEntry TriggerKinds[] = {
 };
 
 // Registers a trigger. Every ownership decision below is load-bearing and was
-// read out of RegisterTriggers @ 0x0043e240 and CreateTrigger @ 0x0044e8c0:
+// read out of AddTriggerToGlobalList @ 0x0043e240 and CreateTrigger
+// @ 0x0044e8c0:
 //
 //   * The engine copies every string it is handed - strdup for the script name,
 //     malloc+strcpy per actor name - so JS_ToCString buffers are correct and
 //     pool_alloc'ing them would leak.
 //   * CreateTrigger stores the `const char *` it is given without copying, which
 //     is why it takes its address; the buffer only has to outlive the
-//     RegisterTriggers call.
-//   * RegisterTriggers CONSUMES the list: its last act on every path is
+//     AddTriggerToGlobalList call.
+//   * AddTriggerToGlobalList CONSUMES the list: its last act on every path is
 //     DeleteTriggers on the by-value copy, which frees the sentinel InitList
 //     allocated. Calling DeleteList after it would double-free.
 //   * It reads coords[0..3] with no null and no length check, so the array is
 //     always four entries and always zero-filled first.
 //
-// Caveat with no fix in this layer: RegisterTriggers early-outs (still deleting
-// the list) when the executor is not running, so calling this outside a live
-// level silently registers nothing. Distinguishing that needs IsExecutorRunning
-// @ 0x00502da0, which this change deliberately does not pull in.
+// Caveat with no fix in this layer: AddTriggerToGlobalList early-outs (still
+// deleting the list) when the executor is not running, so calling this outside a
+// live level silently registers nothing. Distinguishing that needs
+// IsExecutorRunning @ 0x00502da0, which this change deliberately does not pull
+// in.
 JSValue TriggersCreate(JSContext *ctx, JSValueConst, int argc,
                        JSValueConst *argv) {
   if (argc < 1 || !JS_IsObject(argv[0])) {
@@ -185,20 +187,21 @@ JSValue TriggersCreate(JSContext *ctx, JSValueConst, int argc,
   }
 
   {
-    // ToScriptPayload has already encoded it, so the RegisterTriggers hook must
-    // not quote it a second time.
+    // ToScriptPayload has already encoded it, so the AddTriggerToGlobalList
+    // hook must not quote it a second time.
     EncodedPayloadScope encoded;
     // Trigger registration appends to the lists EvaluateTriggers walks on the
     // executor thread, so it takes the pause the engine's own handlers take. See
     // gk::ExecutorPause in Misc.h.
     ExecutorPause pause;
-    RegisterTriggers(static_cast<TriggerKind>(kind), coords, value, targets,
-                     has_script ? reinterpret_cast<const unsigned char *>(
-                                      script.c_str())
-                                : nullptr,
-                     team);
+    AddTriggerToGlobalList(static_cast<TriggerKind>(kind), coords, value,
+                           targets,
+                           has_script ? reinterpret_cast<const unsigned char *>(
+                                            script.c_str())
+                                      : nullptr,
+                           team);
   }
-  // No DeleteList here - RegisterTriggers already consumed `targets`.
+  // No DeleteList here - AddTriggerToGlobalList already consumed `targets`.
   release();
   return JS_UNDEFINED;
 }

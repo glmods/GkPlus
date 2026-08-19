@@ -74,7 +74,7 @@ skips the list entirely, drawing from the calling thread's PRNG for a uniform in
 | 0x007b6a70..0x007b6a7c | — | command **hash table**: NumRegisteredCommands, CommandTableNumBuckets, CommandTableMask, CommandTableBuckets (`CommandListElem**`) |
 | 0x007b6aa8..0x007b6ab4 | List | command exec queue: CommandsToExecute (anchor), NumCommandsToExecute, cache, cacheValid — one popped per frame by `PumpQueuedConsoleCommand` |
 | 0x007b6a80 / 0x007b6b38 | float | ConsoleTextScrollTarget / ConsoleSlidePos (open/close anim; -1=closed) |
-| 0x007b6b3c | Sprite* | ConsoleBackdropSprite (FUN_004d7b20) |
+| 0x007b6b3c | Renderable* | ConsoleBackdropSprite — a 0x1f0-byte `Renderable` over a 1024x1024 shape, built by `CreateConsoleBackdrop` @ 0x004d7b20, **not** a `Sprite` |
 | 0x007b6ac8..0x007b6ad4 | RECTF | static text rect passed as `Font_QueueText`'s `rect` by the two console draws @ 0x004d7337 / 0x004d73d0. Four **floats** `{left, top, right, bottom}`, normalized 0..1 — was recorded as a "DrawText scratch arg block (X/Ctx/Scale/4)" before the callee was read |
 
 The console keeps text as parallel `List<T>` headers (0x10 bytes each: `{anchor_ptr, count,
@@ -100,7 +100,7 @@ cached_array, cache_valid}` — the anchor is a **pointer** to a heap sentinel, 
 the named chars Gunlok/Elint/Hark/Frend/Maskelyn live here); `ProximityObjectList` @0x007b6938 is the
 proximity-activated subset. `UnitsTable` @0x007b68f0 is a `HashTable<Unit*>` (vptr variant like
 `actors`): n_entries=`NumUnits`@0x6f4, buckets=`UnitsTable_buckets`@0x6900. `CombatMusicKillCounter`
-@0x007b68ec counts kind-2 entity deaths to escalate battle music (FUN_004e7230). The six scattered
+@0x007b68ec counts kind-2 entity deaths to escalate battle music (UpdateBattleMusic). The six scattered
 `VestigialFloat_*` (0x6898/6904/6914/6924/6948/6a94 = 1024/1024/60/120/1024/1024) are CRT-constructed
 floats with **no readers**.
 
@@ -136,6 +136,9 @@ floats with **no readers**.
 | 0x007b9cc4 | int* | GameDifficulty |
 | 0x007b9c70 | Cheats* | Cheats |
 | 0x007b9df0 | int* | Foobar |
+| 0x006a7d2c | int[] | PlayerTeam — indexed by player index; its only two accessors are `GetPlayerTeam` @ 0x004fc0e0 (`MOV EAX,[ECX*4 + 0x6a7d2c]`) and `SetPlayerTeam` @ 0x004fc340 |
+| 0x007b70dc | int[6] | MaxUnitsPerTeam — `ApplyUpdateMessage` copies `msg+0x04..+0x18` into it as one run (0x004fe221-0x004fe24c); indexed 1..5 when a team assignment is validated |
+| 0x006abe24 | int* | BandwidthUse — 0..9, an **index into the relevance-radius table** `IsRelevantToPlayer` uses, not a byte count: radius 120, 110, 100, 90, 80, 70, 60, 50, 40, 30 units (the ten `FILD` immediates at 0x00511284-0x00511365 are the squares 14400 … 900), fetched as `table[BandwidthUse + 4]`. Higher setting = larger radius = more traffic |
 
 **PRNG** (BSD `random()`, additive LFG DEG_3=31 / SEP_3=3; the generator is inlined at call
 sites as `(*fptr += *rptr) >> 1`): there are **two** state tables selected per-call by
@@ -155,8 +158,12 @@ is the "SaveSettingsBlock", but its fields are ordinary live game state, not a s
 the WAIT-command deadline (`0x9c88`/`0x9c8c` game-clock 64-bit; real-time twin at `0x9c90`/`0x9c94`,
 click-cancel flags `0x9c98`/`0x9c99`), `GameDifficulty`, the sun color/direction
 (`SunLightColor` 0x9cc8 / `SunDirection` 0x9ce0, set by SetSunBrightness/SetSunAngle), the
-`TrainingAreaIndex` (0x9d14), and the **mission-stats** counters (reset by FUN_004fcc30, broadcast
-to clients at debrief via message id `0xa2` in FUN_005029d0, read by CommandStatsScreen):
+`TrainingAreaIndex` (0x9d14), and the **mission-stats** counters (reset by `ResetMissionStats`
+@ 0x004fcc30, read by `CommandStatsScreen`, and carried to clients at debrief as update `0xa2`, 35
+packed bytes. `ApplyMissionStatsUpdate` @ 0x005029d0 is the **client applier**, not the sender: it
+contains no `BroadcastToPlayers`, guards on `msg[0] == 0xa2`, copies the block out only when
+`!IsExecutorRunning()`, and sets `StatsScreenClientsReady`. It is reached from the client pump at
+0x004fdd60, not through `ApplyUpdateMessage`, whose byte map sends `0xa2` to the default arm):
 `MissionShotsFired` 0x9cf8 / `MissionShotsHit` 0x9cfc (accuracy = hit/fired, both count non-team-2
 shooters) with team-2 copies `…Team2` at 0x9d00/0x9d04, `MissionTimeSeconds` 0x9d08, the resurrection
 penalty 0x9d0c/0x9d10, and `DifficultyHealthToggle` 0x9cf4 (difficulty menu item 2).
@@ -199,7 +206,9 @@ CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84
 | 0x007b3ec4 | TeamSlot* | TeamSlots (stride 0xc4; `active` @ 0x69 = slot active) |
 | 0x007b3ec0 | int* | NumTeamSlots |
 | 0x007b6dd0 | char* | ConsoleFileName (level `.gcs`) |
-| 0x007b68e4 | int* | client actor id counter |
+| 0x007b68e4 | int* | NextClientActorId (client actor id counter) |
+| 0x007b6dc0 | float* | LoadingProgressFraction (`DrawLoadingProgressBar` clamps a percent into it) |
+| 0x007b6dd9 | bool* | LevelSessionLoaded — `UnloadLevel`'s early-out guard, cleared at its end. Distinct from `LevelSessionStarted` @ 0x007b6dd8 |
 
 **Window and video mode:** (see `src/WindowPlacement.h`)
 
@@ -257,11 +266,11 @@ CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84
 
 | Offset | Signature | Name |
 |--------|-----------|------|
-| 0x0043e240 | FastCall<void, TriggerKind, Vec3*, long long, TriggerList, const unsigned char*, int> | RegisterTriggers |
+| 0x0043e240 | FastCall<void, TriggerKind, Vec3*, long long, TriggerList, const unsigned char*, int> | AddTriggerToGlobalList — registers **one** trigger (`pool_alloc(0x68)` `TriggerData` plus a 0x10-byte node onto `FirstTrigger`, `NumTriggers++`), copying each name out of `targets` into the trigger's own target list. `RET 0x20` = 8 + 0x10 (`TriggerList` by value) + 4 + 4, kind/coords in ECX/EDX. 23 callers: `CommandAddTrigger` x21, `LoadLevel`, `Frag`. `src/Triggers.h` still exports it as `RegisterTriggers` |
 | 0x0050c400 | ThisCall (member) | RemoveTrigger |
 | 0x0044c950 | ThisCall<TriggerList*, TriggerList*, TriggerList*> | CopyList |
-| 0x0044ca10 | ThisCall<TriggerList*, TriggerList*> | InitList |
-| 0x0044c900 | ThisCall<TriggerList*, TriggerList*, const char**> | InitListWithActorName |
+| 0x0044ca10 | ThisCall<TriggerList*, TriggerList*> | `TriggerList::Ctor` — AvP `list_tem.hpp`'s `List<T>::List()`, instantiated for `char *`. Exported as `InitList` |
+| 0x0044c900 | ThisCall<TriggerList*, TriggerList*, const char**> | `List<char*>::Ctor1` — `List<T>::List(const T &)`: sentinel, then one `add_entry`. The element is **not** an actor name; at all 12 call sites (`CommandAddTrigger` x10, `Frag` x2) it is the empty string at 0x0064dca0. Exported as `InitListWithActorName` |
 | 0x0044e8c0 | ThisCall<ITrigger*, TriggerList*, const char**> | CreateTrigger |
 
 **Menu:** (see `menu_system_notes.md`)
@@ -331,11 +340,11 @@ conversion was going, and none of it is geometry the game draws)
 | 0x005a31c0 | ThisCall<void, VertexBufferSet*, char*> | VertexBufferSet_SetDebugName — was `SetString?` in the DB, which described neither the argument nor the field |
 | 0x005a1f30 | StdCall<void> | AwScratchVB_CreateAll — called once, from `CreateDirect3D` @ 0x00574b60. Creates the three scratch sets below |
 | 0x005a3fa0 | FastCall<void, VertexBufferSet* dest, VertexBufferSet* src, int, int, int, int> | Aw_ProcessVertices — forces `D3DRS_SOFTWAREVERTEXPROCESSING` on and `LIGHTING`/`CLIPPING` off, binds **src** with SetStreamSource, calls `ProcessVertices` (device slot 74) into **dest**, restores. The dest is never a stream source, which is why FVF 0x004 appears in no draw |
-| 0x005a7930 | — | Picking_TestNodeBoundingBox — the coarse pass: projects 8 bbox corners, once per drawn item from `DrawItem_RenderGeometry`. Was `FUN_005a7930` |
-| 0x005a70a0 | — | Picking_SelectPickersForNode — the same, once per `SceneMesh_Render`. Was `FUN_005a70a0` |
+| 0x005a7930 | — | Picking_TestNodeBoundingBox — the coarse pass: projects 8 bbox corners, once per drawn item from `DrawItem_RenderGeometry` |
+| 0x005a70a0 | — | Picking_SelectPickersForNode — the same, once per `SceneMesh_Render` |
 | 0x005a73c0 | — | Picking_PointInProjectedBox — cursor pixel against the six quads of a projected box |
 | 0x005998f0 | — | SceneMesh_BuildHitTestVB — the mesh's position-only picking copy |
-| 0x00582d10 | — | ParticleSystem_Render — writes `AwScratchVB_Particle`, the one scratch set the CPU fills. Was `FUN_00582d10` |
+| 0x00582d10 | — | ParticleSystem_Render — writes `AwScratchVB_Particle`, the one scratch set the CPU fills |
 | 0x00558cf0 | — | Spark_CreateVertexBuffer — the 512-vertex FVF 0x142 `"spark"` buffer, `MANAGED`+`WRITEONLY`, **drawn** from two sites (one gated on shadow quality) |
 
 | Offset | Type | Name |
@@ -379,16 +388,16 @@ linked-list chases over the game's own pool heap, touching no D3D object)
 
 | Offset | Signature | Name |
 |--------|-----------|------|
-| 0x0055fb20 | CDecl<void> | RenderHudItems — walks `HudItemList` @ 0x007ba250, makes `Camera_Hud` current, calls slot 2 on each item. **Exactly one call site** (0x0046e8c1) and zero literal references anywhere in the image. Was `FUN_0055fb20` |
+| 0x0055fb20 | CDecl<void> | RenderHudItems — walks `HudItemList` @ 0x007ba250, makes `Camera_Hud` current, calls slot 2 on each item. **Exactly one call site** (0x0046e8c1) and zero literal references anywhere in the image |
 | 0x0055fbd0 | ThisCall<void, HudItem*, int, int> | HudItem_DrawByKind — draws **one** HUD element, dispatched on `this->kind` (`+0x60`, 0..0x43; index table 0x00563928, jump table 0x005638f8). 11 `RenderQueue_Submit` sites, **all passing `Camera_Hud`**, then a run of immediate 2D quads. Was `DrawHud`, which described the caller rather than this |
-| 0x0056a7b0 | ThisCall<void, HudItem*, int, int> | HudItem_Draw — vtable slot 2 of the vtable at 0x006697a4; forwards to the above. Was `FUN_0056a7b0` |
+| 0x0056a7b0 | ThisCall<void, HudItem*, int, int> | HudItem_Draw — vtable slot 2 of the vtable at 0x006697a4; forwards to the above |
 | 0x005695a0 | CDecl<void> | Hud2D_BeginBatch — `RenderBatch_Begin` + bind `HudPlatesTexture`. 2 call sites, both in `RunInGameFrame` (0x0046e87a inventory / 0x0046e8b8 in-level) |
 | 0x005695c0 | FastCall<void, float*, float*, uint, float> | Hud2D_DrawQuad — `(rect_px, uv, diffuse, z)`; 4 verts (stride 0x20) + 6 indices into `ImmediateBatch`. Writes the caller's `z` **verbatim** and `rhw = 1/z`. Wrappers: `Hud2D_DrawQuadNormalized` 0x00569e00, `Hud2D_DrawMeterBar` 0x00569ef0, `Hud2D_DrawNumber` 0x0056d390 |
 | 0x00569ed0 | CDecl<void> | Hud2D_FlushBatch — `RenderBatch_End` + `RenderBatch_Draw(D3DPT_TRIANGLELIST, indexed)`. One call site (0x0046e8cf), no literal references |
 | 0x00803d94 | RenderBatch* | ImmediateBatch — shared by the HUD 2D quads and `ParticleSystem_Render`. Was `ParticleRenderBatch`; the name understated who uses it |
 | 0x007ba2b0 | void* | HudPlatesTexture — `units\plates 2 1024.rim`, the atlas holding both the panel plates and the meter/icon art |
 | 0x007ba250 / 0x007ba254 | List / int* | HudItemList and its count |
-| 0x004af4d0 | CDecl<void> | InitRenderCameras — carves the depth range into per-camera slices. Called from `WinMain` and `LoadLevel`. Was `FUN_004af4d0` |
+| 0x004af4d0 | CDecl<void> | InitRenderCameras — carves the depth range into per-camera slices. Called from `WinMain` and `LoadLevel` |
 | 0x00577490 | ThisCall<void, Camera*> | Camera_SetDeviceViewport — `SetViewport(this + 0x254)`. **The only `SetViewport` in the binary** |
 | 0x00577550 | ThisCall<void, Camera*> | Camera_ApplyViewportAndZFunc — the above, plus `D3DRS_ZFUNC` from `this->+0x1d0`. Returns the previous ZFUNC in EAX; no caller reads it |
 | 0x005774c0 | ThisCall<void, Camera*> | Camera_Apply — the three `SetTransform`s (world `+0xc4`, view `+0x84`, projection `+0x44`) and nothing else. **One** parameter: the DB had a second, which was an uninitialised-register artefact |
@@ -433,7 +442,7 @@ as the camera pointer), and a `D3DVIEWPORT8` sits at `+0x254` with `MinZ` at `+0
 | 0x00667434 | char[9] | `"v1.3 DX8"` — the on-screen stamp. **Unrelated** to `CommandVersion` @ 0x0043f1a0, which reports `"00.08 Built on Jun 24 2019"` @ 0x00651b2c |
 | 0x00667440 | unsigned | GREEN_TEXT_COLOR 0xff00e500 (the Main-menu version stamp; channel order unverified) |
 | 0x006ab100 | unsigned | TEXT_OUTLINE_COLOR 0xff000000 — read only under `TF_Outline` |
-| 0x007c1478 | int | TextAnchorAdjustDisabled — suppresses `TF_AnchorBottom`'s per-line y decrement. Cleared/set by `FUN_00484e40`; **why is not established** |
+| 0x007c1478 | int | TextAnchorAdjustDisabled — suppresses `TF_AnchorBottom`'s per-line y decrement. Cleared/set by `UpdateReconCamera`; **why is not established** |
 | 0x0066ccc0 | — | TextDrawNode_vtbl (one slot, dtor 0x00579240) |
 
 `TextFlags` and the 0x28-byte `TextDrawItem` are modelled in the Ghidra DB. The `Font` layout
@@ -468,7 +477,7 @@ as the camera pointer), and a `D3DVIEWPORT8` sits at `+0x254` with `MinZ` at `+0
 
 | Offset | Signature | Name |
 |--------|-----------|------|
-| 0x00474540 | FastCall<Parsed*, const char*, int> | ParseGLS |
+| 0x00474540 | FastCall<Parsed*, const char*, int> | LoadGLS — it `_fopen`s the script into a 0x14-byte `File`, pushes that on the parser stack and runs `ParseGSH` twice (both passes), so it opens as well as parses |
 
 **Level Loading:** (see `level_loading_notes.md`)
 
@@ -620,6 +629,45 @@ Roles are the "entity" hash @ 0x007b48f0 (`{num_entities, num_buckets, mask, buc
 ids come from `next_entity_id` @ 0x007b48d4. `CreateRole` @ 0x004add90 allocates+inserts;
 `ToRole` @ 0x0047cc20 converts a parsed `role`; `CreateActor` @ 0x00510760 dispatches
 `role->ai` to the Actor subclass; `SpawnRole` @ 0x00503710 is the native `gk::SpawnRole`.
+
+### Small structures worth having by name
+
+Three records that are passed around by pointer and are easy to mis-size:
+
+- **`MotionSnapshot`, 0x30 bytes** — what `MobileActor::WriteMotionSnapshot` @ 0x0053bb00
+  serialises and what four wire updates carry inline: `{float state_timestamp @0x00 (Actor+0xd8);
+  Vec3 position @0x04 (Actor+0xa0); Vec4 orientation @0x10 (Actor+0xac); Vec3 velocity @0x20
+  (nav_agent+0x1c); u32 nav_poly_id @0x2c}`. The last field is written **24 bits wide** — the
+  top byte of the destination dword is preserved, and 0xffffff goes in when the agent has no
+  nav polygon. Updates `0x39` (0x50 bytes), `0x3b`/`0x3c`/`0x3d` (0x38) all embed it after
+  `{id, actor_id}`; see `directplay_protocol_notes.md`.
+- **`Waypoint`, 0x18 bytes** — `pool_alloc(0x18)` = `{Vec3 pos; u32; u32}`, held in
+  `MobileActor+0x204` as a `List<Waypoint *>` (count +0x208, cache +0x20c/+0x210, cursor +0x224).
+  `MobileActor::PushRouteWaypoint` @ 0x0053a640 inserts at the **front**, which is what makes the
+  A* backtrack come out in travel order; `ClearRouteWaypoints` frees each record with
+  `free_sized(node->data, 0x18)`.
+- **`Clock`, 0x24 bytes** — `{u64 ticks_at_calibration @0x00; DWORD timeGetTime_at_calibration
+  @0x08; int ticks_per_sec @0x0c; float ticks_per_sec @0x10; float seconds_per_tick @0x14;
+  u64 accumulated_ticks @0x18; int last_raw @0x20}`, built by `Clock::Calibrate` @ 0x005718b0.
+  `MainClock` is 0x007c07d0 and `ExecutorClock` 0x007c07a0, so the **instance stride is 0x30**
+  and the struct is 0x24 — a 0x30 figure quoted elsewhere is the stride, not the size. This is
+  what pins the loose globals around them: `GetGameTimeSeconds` reads MainClock+0x14
+  (0x007c07e4), and the two per-thread accumulators `src/GUI.h` names (0x007c07e8 main,
+  0x007c07b8 executor) are each clock's +0x18.
+
+### The client `Unit` vtables
+
+Sixteen adjacent tables, bounded by the reference test (the last one by the string `"blobarrel"`
+after it, **not** by adjacency). The base is 92 slots, so any offset >= 0x170 read off 0x006647ac
+is inside the next class's table. Slot counts and the identified slots are in
+`rendering_notes.md` §5.1.
+
+```
+0x006647ac  92    0x0066491c 107    0x00664ac8 112    0x00664c88  94
+0x00664e00  93    0x00664f74  92    0x006650e4  92    0x00665254  94
+0x006653cc  94    0x00665544 107    0x006656f0 112    0x006658b0 112
+0x00665a70 112    0x00665c30 112    0x00665df0  92    0x00665f60 108
+```
 
 ### Imports
 

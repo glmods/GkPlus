@@ -47,13 +47,13 @@ from the moment it is set, and five on the two queues.
 
 | Hook | Address | Role |
 |---|---|---|
-| `RegisterTriggers` | 0x0043e240 | writer: `TriggerData::script_name`. Covers all 23 game-side registrations — 21 branches of `CommandAddTrigger`, plus `LoadLevel` and `Frag` |
+| `AddTriggerToGlobalList` | 0x0043e240 | writer: `TriggerData::script_name`. Covers all 23 game-side registrations — 21 branches of `CommandAddTrigger`, plus `LoadLevel` and `Frag` |
 | `PickupActor::Associate` | 0x005469f0 | writer: `associated_script`. The only implementation that stores — `Actor::Associate` @ 0x0054e640 is a `RET 0x8` stub |
 | `ToRole` | 0x0047cc20 | writer: `Role::interface_beam_script`, which `AddInterfaceBeamVulnerability` later copies *by pointer* into `Vulnerability::script` |
 | `AddInterfaceBeamVulnerability` | 0x00510fe0 | **not a writer** - gives each actor its own copy of that string. The original shares the Role's pointer into every spawned actor and sets `actor_scoped = 1`, so `~Actor` pool-frees it once per actor and the SCRIPT completion arm frees it again; nothing resets `Role+0x88`. No shipped role sets the field, so this is unreachable in retail Gunlok and reachable only through `make.role({interface_beam_script})` or a `gls`-authored role - i.e. through us. `game_defects_notes.md` §7 |
 | `ToReplaceDestructibility` | 0x0047eaa0 | writer: `ReplaceDestructibility::script` |
 | `CommandBatchAndBroadcast` | 0x00448400 | **replaced**: five calls reproduced, name wrapped |
-| `MultiplayerRespawnRole` | 0x0050c8b0 | **replaced**: wraps its `.gcs` name, drops the 15-byte leak. `FUN_00511600` is `__thiscall` on `RespawnRoleList` @ 0x007b9d98 — the decompiler hides the ECX `this` |
+| `MultiplayerRespawnRole` | 0x0050c8b0 | **replaced**: wraps its `.gcs` name, drops the 15-byte leak. `List_AddEntry` is `__thiscall` on `RespawnRoleList` @ 0x007b9d98 — the decompiler hides the ECX `this` |
 | `CommandVulnerability` | 0x0044a600 | wrapped, then every `Vulnerability::script` swept and wrapped |
 | `QueueScriptExecution` | 0x00505080 | guards the invariant for what the above do not cover |
 | `RunQueuedScript` | 0x00505310 | host consumer: arms the payload window, runs the original |

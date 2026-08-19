@@ -23,7 +23,8 @@ in the executor tree.
 
 **`CreateActor`'s other mine-looking test is not about mines.** The `character->weapon == 0x21`
 arm (0x00510c80, and the same compare in `ClientSpawnActorForTeam`, `DoSpawn`,
-`CharacterActor::Ctor` @ 0x0053c83d, `FUN_004c1100`, `FUN_004fd450`) is the **"no weapon"**
+`CharacterActor::Ctor` @ 0x0053c83d, `Unit::Unit_Ctor_00664ac8` @ 0x004c1100, `CreateUnit`
+@ 0x004fd450) is the **"no weapon"**
 sentinel: `CharacterActor::Ctor` initialises its own weapon slot `+0x2a4` to 0x21 at 0x0053c825,
 and `src/Roles.h` already records 33 as the unnamed "none". A weaponless character becomes a
 `MobileActor` rather than a `CharacterActor`. Nothing there concerns mines.
@@ -41,10 +42,10 @@ independent dispatches agree, and each one pins a different id:
 | 3 | `decoy mine` | `decoy` | lure tick, +6 s re-arm, broadcast 0x9f | broadcast 0x3e, expiry/next-think = INT64_MAX |
 | 4 | `EMP mine` | `EMP_mine` | proximity scan -> detonate | - |
 
-- The **role-name switch** at `MobileActor::EquipObject?` 0x0053730e maps 0..4 to the literals
+- The **role-name switch** at `MobileActor::UseInventoryItem` 0x0053730e maps 0..4 to the literals
   `"mine"`, `"remote_mine"`, `"timed_mine"`, `"decoy"`, `"EMP_mine"` (jump table 0x00537d90).
   Two more copies of the same table exist: `HudItem_DrawByKind` @ 0x0055fbd0 (0x005636a0) and
-  `FUN_004bd670` (0x004bd8c0, table 0x004bd8c0).
+  `Unit::Unit_ConsumeInventoryItem` @ 0x004bd670 (0x004bd8c0, table 0x004bd8c0).
 - The compare is `CMP EAX,0x4 / JA` with **no subtraction**, at all three sites, so the values
   really are 0..4 rather than 33..37 or 34..38.
 - Behaviour corroborates every id: `Mine_OnDeployed` gives id 2 a fuse and id 1 a detonator
@@ -57,8 +58,8 @@ independent dispatches agree, and each one pins a different id:
 the numbering collides head-on. The `character` section's `weapon` and the `ammo` section's
 `weapon type` are not one enum for these five keywords, whatever `src/Roles.h:469-477` hedges.
 Nothing breaks in the game because an id is only interpreted inside a pickup category:
-`GetWeaponPickupRole` requires pickup type 4, minelayers are type 5, and `EquipObject`'s case 5
-is the only reader of `+0x20` for a minelayer.
+`GetWeaponPickupRole` requires pickup type 4, minelayers are type 5, and `UseInventoryItem`'s
+case 5 is the only reader of `+0x20` for a minelayer.
 
 The DB now carries this as enum `/gunlok/MineWeaponType`.
 
@@ -73,7 +74,8 @@ about where an item hangs on the model, not about hotkeys:
 - Slot index = 2 + letter, i.e. **2..9**, and that index lives in `InventoryItem+0x0c`
   (`iVar1 - 2U < 8` at the occupancy scan).
 - Occupancy is a local 8-byte bitmap rebuilt per call from the inventory list; a slot is only
-  usable if the unit's own hierarchy really has that named node (`FUN_0059d270`).
+  usable if the unit's own hierarchy really has that named node
+(`Renderable_GetNodeWorldPosition` @ 0x0059d270).
 - Overflow: no free slot -> the function simply returns without equipping. No error, no
   eviction.
 
@@ -90,7 +92,7 @@ Decoys share nothing special here: a minelayer pickup is one inventory item like
 | 0x04 / 0x08 | shape / hierarchy (from `InventoryInfo` if present, else `role+0x1c` / `role+0x18`) |
 | 0x0c | body slot index 2..9 |
 | 0x14 | icon (`InventoryInfo+8`) |
-| 0x18 | **count** = `round(character->walking_speed * DAT_00652190)`, or the caller's `count` |
+| 0x18 | **count** = `round(character->walking_speed * DAT_00652190)` (that constant is 1/65536 - `walking_speed` is 16.16 fixed point), or the caller's `count` |
 | 0x1c | role id |
 | 0x20 | **`character->weapon` verbatim** - the `MineWeaponType` for a minelayer |
 | 0x24 | item id |
@@ -99,23 +101,23 @@ Decoys share nothing special here: a minelayer pickup is one inventory item like
 
 Two arms never allocate: **category 2 returns immediately** (that is the "nothing" pickup -
 `Chr_Nothing_Pickup`, aggression 0.21 - and so the origin of the "Junkpile Empty" message), and
-category 6 forwards to the ammo path `FUN_004e53e0`.
+category 6 forwards to the ammo path `Inventory::AddAmmo` @ 0x004e53e0.
 
 `Chr_Minelayer_Pickup`'s `walking speed 5 // number of mines carried` is therefore literally the
 item count, and `walking speed 10` on `Chr_Decoylayer_Pickup` is ten decoys.
 
-### 1.5 Deploying: `MobileActor::EquipObject?` case 5 @ 0x0053730e
+### 1.5 Deploying: `MobileActor::UseInventoryItem` case 5 @ 0x0053730e
 
 Guards, in order: `is_moving == false`, `+0x12c == 0` (not already laying), `is_crouched ==
 false`, and `GetRoleByName(<mine role>) != NULL`. Then:
 
 ```
-SetMoveState(this, 0); FUN_0053a450();
+SetMoveState(this, 0); ClearRouteWaypoints();
 this->+0x134 = mine role;  this->+0x138 = the inventory item;  this->+0x12c = 1;
 PlayAnimation(this, 0x60, ...);        BroadcastToPlayers(0x4f, 0x19 bytes)
 ```
 
-`MobileActor::SyncPositionAndBroadcast` runs the rest as a small state machine on `+0x128`
+`MobileActor::Update` @ 0x00533720 (vtable slot 70) runs the rest as a small state machine on `+0x128`
 (0 -> 1), driven by an animation-event byte at `+0x12e`, with a deadline float at `+0x130`:
 
 - state 0 -> 1 at 0x005353d3, broadcast **0x53** (0x10 bytes).
@@ -131,9 +133,11 @@ PlayAnimation(this, 0x60, ...);        BroadcastToPlayers(0x4f, 0x19 bytes)
 
 ### 1.6 AI: `AiThink_Mine` @ 0x004552a0 and `Mine_OnDeployed` @ 0x0045a640
 
-`FUN_00450550` (the AI-behaviour installer) sets, for `AIType::Mine` only, **two** function
-pointers: `Actor+0x34` = `AiThink_Mine` and `Actor+0x38` = `Mine_OnDeployed`. Every other AI type
-sets only `+0x34`.
+`Actor_SetAiBehaviour` @ 0x00450550 (the AI-behaviour installer) sets, for `AIType::Mine` only,
+**two** function pointers: `Actor+0x34` = `AiThink_Mine` and `Actor+0x38` = `Mine_OnDeployed`.
+Every other AI type sets only `+0x34`. The two are not peers: `+0x34` is the per-tick proc, while
+`+0x38` is a one-shot **on-placed hook** called from vtable slot 51
+(`Actor::InitPositionAndTiming`) @ 0x0052dd18 - `ExecutorActorTick` reads neither field.
 
 `AiThink_Mine` is `__thiscall(Actor*, uint now_lo, int now_hi)` and rate-limits itself to **1 Hz**
 against the calling thread's `ClockTicksPerSecond`, storing the next-think deadline in
@@ -162,8 +166,13 @@ ApplyDamage(victim, *out, 1, mine->team_id)          ; three stack args, RET 0xc
 
 `0x21` is the mine damage **kind**. The damage magnitude comes from `role->+0x54` (GLS `limit`,
 which `mine.gsh` comments as `// damage done`: 200 standard, 200 remote, 300 timed, 0 EMP,
-40 enemy_mine), read at 0x0045095a. Victims come from a sweep of `actors` @ 0x007ba0d8
-(`FUN_0045c730` iterator), radius test at 0x00450b2b, line-of-sight `FUN_00512a40`.
+40 enemy_mine), read at 0x0045095a. Victims come from a sweep of `actors` @ 0x007ba0d8 taken
+through `HashTable_Actor_CopyCtor` @ 0x0045c730 - a **whole-table snapshot copy**, not an
+iterator, so the sweep survives the deletions it causes (the iterator is
+`HashTable_Actor_IteratorCtor` @ 0x0044cad0). Radius test at 0x00450b2b; the call at the end of
+that test is `AreFriendlyMinesEnabled` @ 0x00512a40 - an 11-byte read of the `AreFriendlyMinesOn`
+game-rule option (`CMP dword ptr [0x006abe1c],0 / SETNZ AL / RET`), **not** a line-of-sight test.
+Whatever culls victims behind cover, it is not this call.
 
 Two arms worth naming:
 
@@ -181,7 +190,7 @@ Finally `vtbl+0x104` (slot 65) deletes the mine.
 
 - 0x00509c34: addresses one unit as `TeamSlots[team].roster[slot]` (stride 0xc4), requires
   `character->weapon != 0`, then `weapon == 1` -> `MineDetonate`, `weapon == 3` ->
-  `FUN_00450f60(team, slot)` (decoy dismissal).
+  `Decoy_Dismiss(team, slot)` @ 0x00450f60.
 - 0x00509cdd: the **detonate-all sweep** - iterate `actors`, keep
   `ai_type == 2 (Mine) && character->weapon == 1 && team_id == payload.team`, `MineDetonate` each.
   This is the `D` key's server-side arm.
@@ -207,12 +216,26 @@ SpawnRole(team = projectile->team_id (0xbc), role = GetRoleByName("decoy"),
 `Chr_Decoy` (`strength 50`, `sight range 5`, `hearing range 5`, `weapon decoy mine` = 3). Its
 "radius" is therefore whatever radius the *enemy's* perception has - the decoy is simply a
 hostile-looking actor to be shot at. `AiThink_Mine`'s id-3 arm re-arms itself every 6 seconds,
-calls `FUN_0044f960(pos, pos, deadline, ...)` (an AI stimulus post) and broadcasts update
+calls `PostAiStimulus(pos, pos, deadline, ...)` @ 0x0044f960 and broadcasts update
 **0x9f** (8 bytes, reliable) until the expiry in `Actor+0x90/+0x94`, at which point it deletes
 itself through slot 65.
 
+**What makes the decoy's own tick reachable.** `Mine_OnDeployed`'s id-3 arm sets *both* the
+expiry (`Actor+0x90/+0x94`) and the next-think (`Actor+0x58/+0x5c`) to `INT64_MAX`, and
+`AiThink_Mine` returns while `now <= next-think` - so on placement the id-3 arm can never run.
+`Decoy_Dismiss` @ 0x00450f60 is the writer that changes that: from `ExecutorThreadProc`'s
+`character->weapon == 3` arm of command 0x30 (0x00509ca7, i.e. the owning player pressing that
+unit's detonate key) it sets `+0x58/+0x5c` to the current clock (**next-think = now**), re-arms
+`+0x90/+0x94` to `clock + 60 * ClockTicksPerSecond`, broadcasts `0x3e` (12 bytes, unreliable,
+`{actor id, 0x7fffffff}`) and clears the team's deployed-decoy slot. So a decoy is inert until it
+is dismissed, and then lures for sixty seconds.
+
+`Mine_OnDeployed`'s own call site is traced: `Actor+0x38` is read at
+`Actor::InitPositionAndTiming` @ 0x0052dd18 and at `Actor_FixupAfterLoad` @ 0x00531860, and
+nowhere else in the image.
+
 **Reconciliation point for the perception agent:** the stimulus entry point is
-`FUN_0044f960` @ 0x0044f960 (the decoy's only outward call), and the mine's own detection
+`PostAiStimulus` @ 0x0044f960 (the decoy's only outward call), and the mine's own detection
 uses no perception function at all - `AiThink_Mine` reads `TeamSlots` directly.
 
 ---
@@ -228,7 +251,7 @@ uses no perception function at all - `AiThink_Mine` reads `TeamSlots` directly.
 1. First word: `GetRoleByName`; if that fails, `ConsoleParseInt` as an actor id.
 2. Then words are consumed as item roles into a **temporary** `List<Role*>` (pool nodes,
    vtable `HeapVtbl` @ 0x0065208c) until one is not a role name. Unbounded.
-3. **One is chosen at random**, and the list is thrown away (`FUN_0044cec0` at the end).
+3. **One is chosen at random**, and the list is thrown away (`List_Dtor` @ 0x0044cec0 at the end).
 4. Guarded by `IsExecutorRunning()` + `SuspendExecutor`/`ResumeExecutor` - a joining client
    no-ops.
 
@@ -359,7 +382,9 @@ into `WorldEffectList` @ 0x007b9ebc.
 
 `RemoveWorldEffectNearPoint` @ 0x0051a2b0, `__fastcall(Vec3f* /*ECX*/)`, bare `RET`. It scans
 `LightEffectList` @ 0x007b9ecc **first**, then `WorldEffectList` @ 0x007b9ebc, and only considers
-nodes whose `+0x00` is **3, 4 or 5**. Kinds 0..2 (pulse rings, basins, rays) are never touched.
+nodes whose `+0x00` is **3, 4 or 5**; every other kind is left alone. The pulse ring is kind
+**0xf**, not a low kind: `RemovePulseRingsNearPoint` @ 0x0051b000, the sole callee of the
+`REMOVE PULSE RINGS` console command, tests `data->+0x00 == 0xf`.
 
 For each candidate it tests **both** endpoints of the `+0x30` block against the point with a
 squared-distance epsilon `WorldEffectMatchEpsilonSq` @ **0x00667be8 = 0.00390625** = `(1/16)^2`
@@ -369,19 +394,21 @@ bytes apart, so kind-3 nodes carry a longer point array.
 
 **First match wins**: the node is unlinked, `free_sized(node, 0x80)`, and the function returns.
 A second fence sharing an endpoint survives. Kind 4 takes a different removal helper
-(`FUN_0052b4a0`) from kinds 3 and 5.
+(`List_EraseAtCursor` @ 0x0052b4a0, the generic `List<T>` erase-at-iterator, nothing
+effect-specific) from kinds 3 and 5.
 
 ### 4.6 Verdict: decoration, not damage and not a blocker
 
 The **only** consumer of a kind-5 node is `DrawWorldEffects` @ 0x005201c0 (reached from
 `ScenePass_WorldEffects` @ 0x00552000 for `WorldEffectList` and from `RunInGameFrame` @ 0x0046e88d
 for `LightEffectList`). Its `case 5:` arm (0x00520486) does a visibility test on both endpoints
-(`FUN_00468770 < 0xfe`), builds a 0x48-byte render-state block, flips `node+0x3c`, and issues one
+(`FogOfWar_SampleTotal` @ 0x00468770 `< 0xfe`), builds a 0x48-byte render-state block, flips `node+0x3c`, and issues one
 `RenderQueue_Submit(..., Mat_Translucent, ...)`. Nothing else.
 
 Full reader inventory for `WorldEffectList` @ 0x007b9ebc: `CreateElectricity`,
 `CreateLaserFence`, the nine other `Create*` effect functions, `CommandRemoveLightCylinder`,
-`RemoveWorldEffectNearPoint`, `FUN_0051b000` (remove pulse rings), `FUN_00523ae0` (clear all),
+`RemoveWorldEffectNearPoint`, `RemovePulseRingsNearPoint` @ 0x0051b000,
+`ClearAllWorldEffects` @ 0x00523ae0 (which drains all three lists, not one),
 `SaveGame`, `ScenePass_WorldEffects`. **No damage function, no collision function, no physics
 query.**
 
@@ -449,17 +476,17 @@ cache.
 
 ### 5.3 The completion function - and the ownership contradiction, resolved
 
-The completion is inside `CharacterActor::SyncPositionAndBroadcast` @ 0x0053d8d0, in the
+The completion is inside `CharacterActor::Update` @ 0x0053d8d0, in the
 `type == SCRIPT` arm, at **0x0053f892-0x0053f8c5**:
 
 ```
 vuln = node->data ([ESI+0xc])
 if (vuln->script != 0) {
-    FUN_00466b80(0)                 ; lock
+    SetCurrentDirectoryToGLDir(0)    ; lock
     QueueScriptExecution(vuln->script)
     free(vuln->script)              ; 0x005e3f7b, the pool free thunk
     vuln->script = 0
-    FUN_00466b90()                  ; unlock
+    SetCurrentDirectoryToGameRoot()  ; unlock
 }
 ```
 
@@ -490,7 +517,7 @@ freed here, and the `Role` field is what dangles.
 @ 0x004492b0 is the same with `0x20`. Neither broadcasts, so neither replicates -
 `units.make_flare_firer` and `units.make_hunter` are single-player-only in effect.
 
-**The flare-firing test is a different bit.** `CharacterActor::SyncPositionAndBroadcast`
+**The flare-firing test is a different bit.** `CharacterActor::Update`
 @ 0x0053e645:
 
 ```
@@ -511,7 +538,7 @@ weapon" is therefore not a live gate at all - see §9 for the one adjacent test 
 different branch entirely).
 
 `flare_light` @ 0x006695a8 and `flare` @ 0x0066958c are also read by
-`ProjectileActor::SyncPositionAndBroadcast` @ 0x00544460 (0x005453f9 / 0x005454e8), which is where
+`ProjectileActor::Update` @ 0x00544460 (0x005453f9 / 0x005454e8), which is where
 an in-flight flare gets its light - not traced further.
 
 ---
@@ -521,7 +548,7 @@ an in-flight flare gets its light - not traced further.
 | id | size | reliable | source |
 |----|------|----------|--------|
 | 0x3e | 0xc | no | `Mine_OnDeployed`, ids 1 and 3 |
-| 0x4c / 0x4e | 9 | no | `MobileActor::UpdateMineDetectionAndBounds` |
+| 0x4c / 0x4e | 9 | no | `MobileActor::ToggleCrouchAndCamouflage` (the crouch toggle, not mine detection) |
 | 0x4f | 0x19 | no | mine-lay animation start |
 | 0x53 | 0x10 | no | mine-lay state 0 -> 1 |
 | 0x7e | 0xc | yes | inventory item exhausted and removed |
@@ -568,8 +595,8 @@ None of the laser-fence or electricity commands broadcasts, confirming
 | 0x0052f2d0 | `Actor_SetHeapDropRole` | `Actor+0xc4`, update 0xb9 |
 | 0x0052f0d0 | `Actor::Delete` | spawns `+0xc4` at 0x0052f1bc |
 | 0x00536830 | `MobileActor::EquipToFirstOpenSlot` | 8 body slots, indices 2..9 |
-| 0x005370d0 | `MobileActor::EquipObject?` | case 5 = mine deploy @ 0x0053730e |
-| 0x0053d8d0 | `CharacterActor::SyncPositionAndBroadcast` | interface-beam completion @ 0x0053f892; flare swap @ 0x0053e645 |
+| 0x005370d0 | `MobileActor::UseInventoryItem` | case 5 = mine deploy @ 0x0053730e |
+| 0x0053d8d0 | `CharacterActor::Update` (slot 70) | interface-beam completion @ 0x0053f892; flare swap @ 0x0053e645 |
 | 0x00542ae0 | `ProjectileActor::OnPrePhysics` | decoy spawn @ 0x005435aa |
 | 0x00509050 | `ExecutorThreadProc` | remote detonate @ 0x00509cca, detonate-all @ 0x00509d2d |
 | 0x006672c4 | `BodySlotHotspotNames` | `slota`..`sloth`, stride 7 |
@@ -585,13 +612,6 @@ None of the laser-fence or electricity commands broadcasts, confirming
   computed at 0x0053542c from the actor's own animation data (`weapon_object+0x18`), not from
   this field. It looks vestigial. Settling it: breakpoint-free check would be to set it to an
   absurd value in a `.gsh` and time the lay animation.
-- **The decoy's own tick never runs as written.** `Mine_OnDeployed` id 3 sets *both* the expiry
-  (`+0x90/+0x94`) and the next-think (`+0x58/+0x5c`) to `INT64_MAX`, and `AiThink_Mine`'s gate
-  returns while `now <= next-think`. So the id-3 arm of `AiThink_Mine` is unreachable for a decoy
-  deployed through that path. Either something else rewrites `+0x58/+0x5c` (the `0x3e` broadcast
-  handler and `FUN_00450f60` are the candidates) or the decoy really is inert-but-shootable.
-  Not resolved. `Mine_OnDeployed` is also *named* from its shape (one-shot, sets deadlines) - its
-  call site was not traced, only its installation in `FUN_00450550`.
 - **The `0x8e` payload constant `0x2f3a`** (mine laid, remote/decoy only) was not identified -
   resource id or sound id.
 - **`Actor::flags` bit 0x80 has no writer** and bit 0x40 has no reader (§6). Either the flare

@@ -104,8 +104,13 @@ JSValue GetSunDirectionJs(JSContext *ctx, JSValueConst) {
   return NewVec3(ctx, GetSunDirection());
 }
 
-// Ambient is the same story - the renderer converts and stores it in its own
-// form, so this is a method too. The alpha default of 1.0 is `AMBIENT`'s own.
+// Same story - the scene LightSet converts and stores it in its own form, so
+// this is a method too. The alpha default of 1.0 is `AMBIENT`'s own.
+//
+// The JS name stays `set_ambient` deliberately. The native call underneath is
+// LightSet_SetEmissiveColour and sets no ambient light (see World.h), but
+// `world.set_ambient` is a published scripting API and renaming it would break
+// every script using it. `AMBIENT` is also the console command it stands in for.
 JSValue SetAmbientJs(JSContext *ctx, JSValueConst, int argc,
                      JSValueConst *argv) {
   if (argc < 1) {
@@ -115,7 +120,7 @@ JSValue SetAmbientJs(JSContext *ctx, JSValueConst, int argc,
   if (!ToColor(ctx, argv[0], &c)) {
     return JS_EXCEPTION;
   }
-  SetAmbientLight(c.r, c.g, c.b, c.a);
+  LightSet_SetEmissiveColour(c.r, c.g, c.b, c.a);
   return JS_UNDEFINED;
 }
 

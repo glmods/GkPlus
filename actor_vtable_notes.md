@@ -89,7 +89,7 @@ recorded as a plate comment on each function.
 | `OnUpdate` (9) | `SetConcealed` | base is `RET 0x4` - it *takes* an argument; MobileActor's stores the byte into `+0x186`. It is the setter paired with slot 8, not a tick callback |
 | `GetSecondaryWeapon` (15) | `GetAttackTarget` | CharacterActor's override returns `+0x2d8` = `attack_target`, not a weapon |
 | `OnPostUpdate` (54) | `SetField0x188` | base is `RET 0x4`; MobileActor's stores the byte into `+0x188`, pairing with slot 30's getter |
-| `GetMovementState` (16) | `GetInventory` | returns MobileActor `+0x194`, which the ctor null-inits, `SetTeamId` `malloc(0x44)`s into, `EquipObject`/`ReceiveObject` read and the destructor frees - a container pointer, not a state enum |
+| `GetMovementState` (16) | `GetInventory` | returns MobileActor `+0x194`, which the ctor null-inits, `SetTeamId` `malloc(0x44)`s into, `EquipItemInSlot`/`UseInventoryItem`/`ReceiveObject` read and the destructor frees - a container pointer, not a state enum |
 | `HasInventory` (32) | `HasPendingOrders` | tests MobileActor `+0x1f4`, the **order-queue** count, not inventory |
 
 ### Slots 0-35
@@ -168,7 +168,7 @@ Only the class that *introduces* the override appears here; its descendants inhe
 | 53 | 0x0052ded0 | `SetPositionAndOrientation` | coords + quaternion + timing |
 | 54 | 0x0054f4f0 | `SetField0x188(bool)` | `RET 4`, discards |
 | 55 | 0x0054f270 | `OnPrePhysics` | no-op |
-| 56 | 0x0054efa0 | `OnCollisionResponse` | no-op |
+| 56 | 0x0054efa0 | `PathToTarget` | `RET 0x8` stub, arguments discarded; `MobileActor::PathToTarget` @ 0x00539930 is the real body - it calls `FindNavPathWithinRadius` @ 0x0052c100 and pushes the result through slot 90 (`navigation_notes.md` §5.4) |
 | 57 | 0x0052e0a0 | `Raycast` | ray/shape intersection |
 | 58 | 0x0052df50 | `SweepTest` | swept intersection |
 | 59 | 0x0054f4e0 | `OnDamageReceived` | no-op - see PickupActor, where the slot is really `SetPickupType` |
@@ -182,7 +182,7 @@ Only the class that *introduces* the override appears here; its descendants inhe
 | 67 | 0x0054e880 | `Dissociate` | no-op |
 | 68 | 0x0052f3b0 | `ApplyDamage` | damage/heal, fragging at 0 |
 | 69 | 0x0054f2a0 | `OnHealthChanged` | no-op |
-| 70 | 0x0052f8a0 | `SyncPositionAndBroadcast` | model position + broadcast 0x6f |
+| 70 | 0x0052f8a0 | `Update` | the per-tick entry point, invoked by `ExecutorActorTick` @ 0x0052fad0 through `vtbl+0x118`. The base body ages a timer, stores the tick clock into `+0xc8`/`+0xd0` and the seconds into `+0xd8`, pushes the transform to `anim_object`, and broadcasts 0x6f **only** when `position_set` is set |
 | 71 | 0x005300e0 | `PlayAnimation` | |
 | 72 | 0x00530120 | `BlendAnimation` | |
 | 73 | 0x00530150 | `PlayAnimationEx` | arg 7 is the address of a completion flag |
@@ -196,15 +196,30 @@ Only the class that *introduces* the override appears here; its descendants inhe
 | 81 | 0x00530650 | `ReleaseFromOwner` | broadcasts 0x59 + 0x50 |
 | 82 | 0x005308d0 | `ActivateInWorld` | re-register in spatial/team structures, set flag 0x200 |
 
-> Slot 70's name fits the *base* implementation only. In `MobileActor` it is the whole per-tick
-> update (0x236a bytes: mode dispatch, enemy acquisition, movement integration, nav stepping,
-> order dispatch, deployable state machine); in `CharacterActor` it is the attack/weapon tick; in
-> `TurretActor` the firing solution; in `TrackObjectActor` the spline motion; in `ProjectileActor` the
-> projectile dead-reckoning, which broadcasts nothing at all. Read it as **`Update`**, not "sync".
+> Slot 70 is the per-tick update, and it is `Update` in all ten of its distinct bodies. What each
+> one does with the tick differs: in `MobileActor` (0x00533720, 0x236a bytes, 46 distinct callees)
+> it is mode dispatch, enemy acquisition, movement integration, nav stepping, order dispatch and
+> the deployable state machine; in `CharacterActor` (0x0053d8d0) the attack/weapon tick; in
+> `TurretActor` the firing solution; in `TrackObjectActor` the spline motion; in `ProjectileActor`
+> the flight step, which broadcasts nothing of its own. The *position sync* is a behaviour of the
+> `Actor` base body only - and even there it is conditional on `position_set`.
 >
 > Slot 82 has the same problem in reverse: `MobileActor`'s override disposes of the inventory on
 > death and `BlockerActor`'s *un*-blocks nav polygons. Both then chain to the base, which does
 > activate. Treat the name as describing the base only.
+
+## Actor fields pinned by the slot bodies
+
+Fields whose meaning was settled by reading the code that touches them, not by their position.
+
+| Off | Type | Meaning | What pins it |
+|---|---|---|---|
+| 0x04 | `int` | **reference count** | the retain/release pair in `AiBeginInvestigate` @ 0x0045e050: `INC dword ptr [ESI+0x4]` to retain, and on release decrement then call slot 0 with the scalar-delete flag when it reaches zero |
+| 0x24 | `float` | deadline in seconds firing **slot 79** (`ClearTarget`); 0.0 means disabled | `AiThink_Waiting` @ 0x00456bed - `MOVSS XMM0,[ESI+0x24]`, compared in seconds against the scaled clock, then `CALL [vtbl+0x13c]` |
+| 0x2c | `float` | deadline in seconds firing **slot 81** (`ReleaseFromOwner`); 0.0 means disabled | the same shape @ 0x00456c21 -> `CALL [vtbl+0x144]` |
+| 0x38 | `void (*)(Actor *, uint, int)` | the **on-placed hook**, called once from slot 51 (`InitPositionAndTiming`) @ 0x0052dd18 under a null guard, immediately after the nav-poly lookup. It is *not* a think proc - every `AIType` installs its per-tick proc into `+0x34`, and `ExecutorActorTick` reads neither field | `Actor_SetAiBehaviour` @ 0x00450610 is the only writer, and only for `AIType::Mine` (`Mine_OnDeployed` @ 0x0045a640) |
+| 0xd8 | `float` | game time in seconds of the current tick | written by the slot-70 base body @ 0x0052f91a from its third argument |
+| 0xdc | `float` | the `+0xd8` value as of the last state broadcast | @ 0x0052fa66, and by all four `MobileActor` motion broadcasters, each of which ends `+0xdc = +0xd8` |
 
 ## Override matrix
 
@@ -240,7 +255,7 @@ typed as plain `ActorVtbl` in the DB.
 
 | Slot | Addr | Name | Notes |
 |---|---|---|---|
-| 83 | 0x00536090 | `UpdateMineDetectionAndBounds` | **name is doubtful** - it toggles a bool at `+0x187`, swaps the collision box between a standing and a halved box, and broadcasts `0x4c`/`0x4e` chosen by that bool. Gated on model node 0x13 existing. Reads as a deploy/crouch toggle |
+| 83 | 0x00536090 | `ToggleCrouchAndCamouflage` | flips `is_crouched` (`+0x187`, read at 0x00536105, written at 0x00536110), sets `is_concealed` (`+0x186`) at 0x005362a1/0x005362cb and clears it on standing up at 0x005362dc, tests nav-polygon bit **0x800** (`SHR EAX,0xb` @ 0x005362c6 - the water/camouflage-terrain bit, `stealth_and_fog_notes.md` §2), swaps the collision box between a standing and a halved box, and broadcasts `0x4c + 2*(!is_crouched)` (`LEA EAX,[EAX*0x2 + 0x4c]` @ 0x00536783). Gated on model node 0x13 existing. Nothing in it detects mines |
 | 84 | 0x00536830 | `EquipToFirstOpenSlot` | first free `slota`..`sloth` (indices 2-9) from the `+0x19c` list |
 | 85 | 0x0054e5d0 | `QueueOrderKind10` | was `OnPreThink`; appends a tag-10 order record |
 | 86 | 0x0054e5f0 | `QueueOrderPosition` | was `OnPostThink`; appends a tag-1 record with a Vec3 |
@@ -254,7 +269,7 @@ typed as plain `ActorVtbl` in the DB.
 | 94 | 0x0054e690 | `SetWeapon` | was `OnMobileDamageReceived`; CharacterActor's override frees the old 0x28-byte weapon and allocates a new one (0x21 = none), broadcasting 0x83 |
 
 Slots 85/86/87 all `malloc(0x28)`, fill a tagged record and append it to the list header at
-`+0x1f0`. `MobileActor::FUN_00538830` drains that list and `Dealloc_(node->data, 0x28)`, which is
+`+0x1f0`. `MobileActor::ClearOrderQueue` @ 0x00538830 drains that list and `Dealloc_(node->data, 0x28)`, which is
 what proves the payload size. The queue is serialized by `Read`/`WriteActorFixups`, so pending
 orders survive a save/load. Slot 32 tests its count.
 
@@ -284,7 +299,7 @@ int64. The dword at `+0x314` is alignment padding to 8-align that pair — the c
 (0x0054aed0) initialises `+0x310`/`+0x318`/`+0x31c` but skips it, and no Actor-family function
 reads or writes it.
 
-Curiously, `TurretActor::SyncPositionAndBroadcast` (the firing solution) touches **none** of
+Curiously, `TurretActor::Update` (the firing solution) touches **none** of
 `+0x310`, `+0x318` or `+0x31c`. The angles it actually integrates are `CharacterActor+0x2f0` and
 `+0x2f4`, which are typed `int` in the DB but used as floats (gun yaw/pitch in 4096-unit brads).
 
@@ -322,7 +337,7 @@ Launch origin, velocity and launch time integrated against gravity, with a `Proj
 sub-object supplying damage, splash and radius. Slot 51 stamps the launch time *and* precomputes the
 impact by raycasting every candidate actor; slot 55 (`OnPrePhysics`) is the actual physics step
 (integrate, collide, damage, broadcast, self-delete); slot 70 dead-reckons or steers and does **no**
-networking of its own beyond chaining to `Actor::SyncPositionAndBroadcast`.
+networking of its own beyond chaining to `Actor::Update`.
 
 Guided mode (`flags & 0x40`) blends the velocity direction toward the target over the first 20 ms.
 Slots 57/58 (`Raycast`/`SweepTest`) return 0, opting the projectile out of being hit itself -
@@ -346,7 +361,7 @@ lies inside the blocker's world AABB, sets bit `0x100` ("not walkable") on each,
 the list header at `+0x120` purely so slot 82 can clear the bit again. The whole body runs under
 `TheMap->lock` taken for write.
 
-`FUN_0048cf50(Map*, Vec3*)` resolves a point to a nav polygon and reaches into `Map+0x34` (a
+`Map::FindNavPolygonUnder(Map*, Vec3*)` @ 0x0048cf50 resolves a point to a nav polygon and reaches into `Map+0x34` (a
 three-level spatial grid), `Map+0x68` (extent) and `Map+0x7c/0x80/0x84` (grid plane coordinates) -
 more of the unmapped `Map` region.
 
@@ -361,12 +376,12 @@ deliberately suppresses the CharacterActor tick.
 ### PopupActor / TurretActor
 
 `+0x308` is `deployed` and `+0x309` `transition_in_progress` (the DB had a single `short`).
-`FUN_0054ac90` is `PopupActor::Deploy(bool reverse)`: it plays the popup animation with
+`PopupActor::Deploy(bool reverse)` @ 0x0054ac90 plays the popup animation with
 `&this->deployed` as the completion flag, recomputes the collision bounds from model asset 0 or
 0x13, and broadcasts `0x4a + reverse`. Retracted popups scan enemy teams against
 `character->hearing_range_squared` and deploy on the first hit.
 
-`TurretActor::SyncPositionAndBroadcast` calls `Actor::SyncPositionAndBroadcast` **directly**,
+`TurretActor::Update` calls `Actor::Update` **directly**,
 skipping PopupActor, CharacterActor and MobileActor - a deliberate three-level bypass.
 
 ### PresidentActor - the escort/VIP
@@ -400,7 +415,7 @@ every message is the id and the second is almost always `Actor::id`.
 | 0x47 | ProjectileActor slot 55 | projectile impact |
 | 0x49 | Actor slot 65 | actor deleted |
 | 0x4a / 0x4b | `PopupActor::Deploy` | computed `0x4a + reverse` |
-| 0x4c / 0x4e | MobileActor slot 83 | bounds / detection toggle |
+| 0x4c / 0x4e | MobileActor slot 83 | crouch toggle; computed `0x4c + 2*(!is_crouched)`, so 0x4c now crouched / 0x4e now standing |
 | 0x4f | MobileActor slot 70, PickupActor slot 84 | replicate animation |
 | 0x50 | Actor slots 80/81, PresidentActor slot 70 | team change |
 | 0x53, 0x54, 0x7e, 0x7f, 0x80, 0x8e | MobileActor slot 70 | mine laying, deployable counts, inventory removal |
@@ -442,7 +457,7 @@ and when the victim's role name is one of `hark`, `gunlok`, `maskelyn`, `frend`,
    `Actor::`'s implementation directly - `TurretActor` slot 70 (skips three levels),
    `CentipedeActor` slot 70 (calls `CharacterActor::`, skipping `CentibodyActor::`), `PopupActor`
    slot 70 on the retracted path. Do not assume an override chains to its immediate parent.
-6. **Slot names describe the base implementation.** Slots 9, 15, 16, 32, 54, 59, 70, 76, 77 and 82
+6. **Slot names describe the base implementation.** Slots 9, 15, 16, 32, 54, 59, 76, 77 and 82
    all mean something materially different in at least one subclass. The five worst were renamed;
    the rest are flagged above.
 

@@ -225,8 +225,20 @@ struct ParticleGenerator {
   Vec3 field0x20;       // 0x20 -> emitter+0xdc..0xe4
   PGenChannel colour;   // 0x2c v = GLS red/green/blue/alpha 0x21-0x24; -> emitter+0xa0
   PGenChannel channel_b;// 0x44 -> emitter+0xb8
-  // Gate for the channel_c/channel_d feature: when set, ParticleEmitter_Ctor calls
-  // FUN_0057a040(&channel_c, &channel_d, &field0xb8, 5.5f, field0xa8, field0xac, field0xb0).
+  // Gate for attaching a **dynamic light** to the emitter. When set,
+  // ParticleEmitter_Ctor calls SceneLightSet_AddDynamicLight @ 0x0057a040, which
+  // builds a 0x6c-byte light record through its receiver's vtable slot 5.
+  //
+  // **It is a `__thiscall`, `RET 0x1c`, and the receiver is not one of these
+  // arguments.** All six call sites load `ECX = [0x007c18cc]` - the scene
+  // LightSet, the same object src/World.cpp's LightSet_SetEmissiveColour targets.
+  // The seven stack arguments are
+  // (&channel_c, &channel_d, &field0xb8, 5.5f, field0xa8, field0xac, field0xb0),
+  // so binding this as a seven-argument free function would pass `channel_c`
+  // where the callee wants `this` and then make a virtual call through it. This
+  // comment described it as "the channel_c/channel_d feature" and omitted the
+  // receiver entirely.
+  //
   // ToParticleGenerator zeroes it (with 0x5d, in one word store), so GLS-built generators
   // never take that path - which is also why the three channels below stay uninitialised.
   bool use_channel_cd;  // 0x5c
@@ -241,7 +253,7 @@ struct ParticleGenerator {
   bool generate_generators; // 0xb4 GLS 0x68 -> emitter+0xd2
   bool field0xb5;       // 0xb5 -> emitter+0xd0; not written by ToParticleGenerator
   short field0xb6;
-  Vec3 field0xb8;       // 0xb8 ctor'd/dtor'd; passed by address to FUN_0057a040
+  Vec3 field0xb8;       // 0xb8 ctor'd/dtor'd; passed by address to SceneLightSet_AddDynamicLight
   float start_scale;    // 0xc4 GLS 'start scale' 0x64
   float end_scale;      // 0xc8 GLS 'end scale' 0x65
   float spin;           // 0xcc GLS 'spin' 0x66

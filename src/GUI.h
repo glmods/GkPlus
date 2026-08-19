@@ -58,9 +58,11 @@ bool PostMessageLoopWork();
 //   * `RenderSceneAndPresent` @ 0x00574c50 wraps its whole body - scene,
 //     EndScene, PresentScene - in `if (DAT_007c1230 != 0)`, so PresentScene is
 //     never reached and the frame hook stops;
-//   * both per-thread clock accumulators (DAT_007c07e8 main, DAT_007c07b8
-//     executor) freeze at +0 over seconds, so the simulation is not merely
-//     unrendered, it is not running;
+//   * both per-thread clock accumulators freeze at +0 over seconds, so the
+//     simulation is not merely unrendered, it is not running. Those two are
+//     `MainClock+0x18` and `ExecutorClock+0x18` (DAT_007c07e8 and DAT_007c07b8),
+//     where ExecutorClock is 0x007c07a0 and a `Clock` is **0x24 bytes** - a 0x30
+//     figure recorded elsewhere was the instance *stride*, not the size;
 //   * yet the process still spins a full core, and SendMessageTimeout(WM_NULL)
 //     answers in 7 ms - the main thread is in a reactivation loop that pumps
 //     messages.

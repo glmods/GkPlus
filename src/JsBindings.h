@@ -54,8 +54,8 @@ bool GetInt64Prop(JSContext *ctx, JSValueConst obj, const char *name,
 bool GetFloatProp(JSContext *ctx, JSValueConst obj, const char *name,
                   float *out);
 // Reads an array of up to `count` Vec3s. Entries past the array's end are left
-// alone - RegisterTriggers reads all four unconditionally, so the caller must
-// zero-initialise.
+// alone - AddTriggerToGlobalList reads all four unconditionally, so the caller
+// must zero-initialise.
 bool GetVec3ArrayProp(JSContext *ctx, JSValueConst obj, const char *name,
                       Vec3 *out, int count);
 

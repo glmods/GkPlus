@@ -11,8 +11,9 @@
 // The layout is what matters here: these are views over game memory, never
 // objects we construct, so the AvP originals' constructors, destructor and
 // mutators are deliberately NOT reproduced. `List<T>` stays a trivially-copyable
-// standard-layout aggregate because the game passes it by value (RegisterTriggers
-// takes a whole TriggerList in registers/stack), and because it is embedded
+// standard-layout aggregate because the game passes it by value
+// (AddTriggerToGlobalList takes a whole TriggerList in registers/stack, 0x10
+// bytes of its 0x20-byte argument frame), and because it is embedded
 // inside larger mirrors whose `offsetof` static_asserts must keep working.
 //
 //   List_Member_Base<T>   0x0c   { vptr, prev, next }
@@ -60,7 +61,7 @@ template <typename T> struct List {
   // Flattened array of pointers-to-payload, rebuilt lazily by operator[] and
   // pool-freed on every mutation. `mutable T **` in the original. It is owned,
   // but cannot be a pool_unique_ptr: List<T> has to stay trivially copyable for
-  // the by-value RegisterTriggers call, and unique_ptr is move-only.
+  // the by-value AddTriggerToGlobalList call, and unique_ptr is move-only.
   T **entry_pointers;            // 0x08
   bool calculated_indices;       // 0x0c 1 = entry_pointers is up to date
 

@@ -187,10 +187,14 @@ Node".
   silently parses `d3d8` as the hex literal 0xD3D8, cdb echoes its whole `-c` list so `.echo`
   markers appear twice (anchor greps with `^MARKER$`), and cdb will not load our clang PDB —
   symbolize with `llvm-symbolizer --obj=build/Debug/d3d8.dll --relative-address <rva>`.
-- **`DebugSystem` deliberately leaves `DebugPrintWarning` unhooked** (`RedirectWarnings` in
-  `src/Debug.cpp`): the GLS parser emits one warning per unset field per section, 13,000+ per
-  level load, and redirecting those to `OutputDebugString` makes the game unplayable under any
-  debugger. Re-enabling it is the fastest way to make in-game testing impossible.
+- **`DebugSystem` deliberately leaves `PrintParseWarning` @ 0x00477050 unhooked**
+  (`RedirectWarnings` in `src/Debug.cpp`): the GLS parser emits one warning per unset field per
+  section, 13,000+ per level load, and redirecting those to `OutputDebugString` makes the game
+  unplayable under any debugger. Re-enabling it is the fastest way to make in-game testing
+  impossible. It was called `DebugPrintWarning` here until its 25 callers were read — all of
+  them `ParseGSH`/`GSHTokenize`/`PopFileFromParserStack`/`FinalizeAndRegisterObject` — which
+  also ties this bullet to `game_defects_notes.md`'s separate finding that the game's own
+  `PrintParseWarning`/`PrintParseError` discard their output: they are the same function.
 
 ### Dependencies (vcpkg.json)
 
@@ -1089,7 +1093,8 @@ unrelated, long after the call.
   `List<T>` terminates on the sentinel correctly by construction, which is the whole point;
   `entry_of()` is the escape hatch when you need the node itself, and it is only valid on a
   node you have already proved is not the head. `List<T>` is deliberately a trivially-copyable
-  aggregate with no constructors — `RegisterTriggers` takes one **by value** — and it is
+  aggregate with no constructors — `AddTriggerToGlobalList`, which registers one trigger whose
+  targets are the list, takes one **by value** — and it is
   standard-layout, so embedding it does not cost `-Winvalid-offsetof` warnings on the
   containing struct. Picking the right `T` is a real claim about the payload: `List_Member<T>`
   puts `data` at 0x0c for a pointer but at 0x10 for an 8-aligned value type, which is exactly

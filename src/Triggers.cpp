@@ -33,9 +33,9 @@ void DeleteList(TriggerList *list) {
   fn(list);
 }
 
-void RegisterTriggers(TriggerKind kind, Vec3 *coords, long long time_or_radius,
-                      TriggerList targets, const unsigned char *script,
-                      int team) {
+void AddTriggerToGlobalList(TriggerKind kind, Vec3 *coords,
+                            long long time_or_radius, TriggerList targets,
+                            const unsigned char *script, int team) {
   FastCall<void, TriggerKind, Vec3 *, long long, TriggerList,
            const unsigned char *, int>
       fn;

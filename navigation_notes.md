@@ -81,7 +81,7 @@ cell = (*(*(*(Map+0x34) + i*4) + j*4)) + k*0xc          /* 0x0048cff0 */
 cell = { NavPolygon **polys, uint count, ... }          /* 0xc bytes  */
 ```
 
-`FUN_004922b0` turns a `Vec3` into `(i, j, k)`. `Map+0x7c/0x80/0x84` are the per-axis plane
+`Map::MapGrid_WorldToCell` @ 0x004922b0 turns a `Vec3` into `(i, j, k)`. `Map+0x7c/0x80/0x84` are the per-axis plane
 coordinate arrays and `Map+0x68` bounds the middle (vertical) axis.
 
 **This settles the two-level question in the negative.** `FindNavPath` touches
@@ -93,7 +93,7 @@ is flat.
 
 Two near-identical `__thiscall(Map *, Vec3 *) -> NavPolygon *`, both `RET 0x4`:
 
-- **`FindNavPolygonUnder` @ 0x0048cf50** (was `FUN_0048cf50`) — used by `Goto`,
+- **`Map::FindNavPolygonUnder` @ 0x0048cf50** — used by `Goto`,
   `GetNavigationTarget`, `RebuildWaypointRoute`, the console teleport commands, `EvaluateTriggers`.
 - **`FindNavPolygonAt` @ 0x0048d380** — used by `CreateNavAgent`, `MoveNavAgent`,
   `ApplyUpdateMessage`.
@@ -238,7 +238,7 @@ Its sole caller is **vtable slot 56 @ 0x00539930** — see §6.1.
 **No funnel, no string-pulling, no smoothing.** `FindNavPath` emits a `List<NavPolygon*>` of
 0x10-byte `List_Member` nodes (vtable 0x00652084) and nothing else touches it.
 
-`MobileActor::RebuildWaypointRoute` @ 0x0053c270 (was `FUN_0053c270`), called from the tick,
+`MobileActor::RebuildWaypointRoute` @ 0x0053c270, called from the tick,
 uses the result almost entirely for its **length**:
 
 ```
@@ -248,20 +248,33 @@ if (pathLength < budget + waypointIndex) accept this waypoint;
 
 i.e. "is this waypoint reachable in few enough polygons" — a reachability filter, not a route.
 Waypoints that pass are consumed off the front of the list; the polygons of the accepted path
-are turned into actor waypoints one-for-one by `FUN_0053a640` (`MobileActor::AppendWaypoint`),
-which appends a 0x18-byte record `{Vec3 pos, int flag@0x0c, int @0x10}` to `waypoints` (+0x204).
+are turned into actor waypoints one-for-one by `MobileActor::PushRouteWaypoint` @ 0x0053a640,
+which **pushes a 0x18-byte record `{Vec3 pos, int @0x0c, int @0x10}` onto the *front*** of the
+route list (+0x204). Push-front, not append: the body is AvP's `add_entry_start` —
+`new->prev = sentinel; new->next = sentinel->next; sentinel->next->prev = new;
+sentinel->next = new` — and it then refreshes the cursor at +0x224. That is what makes the A\*
+backtrack, which is produced goal-first, come out in travel order. The record is `pool_alloc(0x18)`
+and the node `pool_alloc(0x10)` (`List_Member<Waypoint*>`, vptr `DAT_00652188`).
 So the unit walks **polygon centre to polygon centre**, with no corner optimisation at all.
+
+`MobileActor` carries **two** waypoint lists, and they are not interchangeable: **+0x204** is the
+route this function pushes (count +0x208, cache +0x20c/+0x210, cursor +0x224), and **+0x214** is
+the authored/queued list that `MobileActor::AppendAuthoredWaypoint` @ 0x0053a830 and the
+`ADD WAYPOINT` console path fill. `MobileActor+0x228` holds `&this->+0x204`, i.e. a pointer back
+to the route list's own header.
 
 Two other tests in the same function:
 
 - a waypoint is rejected outright when `(poly->flags & 0x200040) != 0`;
 - the search is called with `agent->traversal_flags_full | 0x200040`;
-- a trailing prune drops nodes whose slot-4/`FUN_0054efb0` value is below `DAT_006521c4` = 1.5.
+- a trailing prune drops nodes whose slot-4/`Vec3_FlatDistanceSquared` (0x0054efb0) value is below
+  `DAT_006521c4` = 1.5.
 
 ### 4.1 The player's numbered green waypoint line
 
 That line is **not** a pathfinding artefact. It is `MobileActor::waypoints` (+0x204) — the
-player's own queued move orders — rendered by `FUN_00565920`, the in-game order/cursor overlay
+player's own queued move orders — rendered by `DrawInGameOverlay` @ 0x00565920, the in-game
+order/cursor overlay
 called from `RunInGameFrame` @ 0x0046e6c0 (it `sprintf`s, calls `Font_QueueText` and reads
 `MobileActor+0x204` three times). Player waypoints enter through **slot 90
 `MobileActor::AddWaypoint` @ 0x0053a760**, which builds the same 0x18-byte record.
@@ -325,7 +338,7 @@ ADDSS XMM0,XMM0            ; 2r²
 ... fast reciprocal via the table at 0x007fff80 ...
 XMM0 = (1/(2r²)) * d2      ; d2 = squared distance to the target
 XMM1 = 1.0 - XMM0          ; DAT_006521b8 = 1.0
-COMISS XMM1, -1.0          ; DAT_00652220 = -1.0
+COMISS XMM1, -1.0          ; NoHitFraction @ 0x00652220 = -1.0
 JZ/JBE -> the target is unreachable this turn
 XMM1 *= 2048.0             ; DAT_006520b0; 2048 BAM = half a turn
 ```
@@ -340,7 +353,7 @@ stays small, `cos θ` stays near 1, and the unit can only bend its heading sligh
 It is *inferred* that this is what the manual is describing — no comparison of actual unit
 `turning_speed` values was made here.
 
-### 5.5 `MoveNavAgent` @ 0x00472e30 (was `FUN_00472e30`)
+### 5.5 `Map::MoveNavAgent` @ 0x00472e30
 
 The 4164-byte sweep underneath all of it. Sets
 `agent->velocity = (dest - agent->position) / (untilTime - agent->update_time)`, integrates
@@ -350,15 +363,14 @@ and three 0x004bxxxx/0x004cxxxx callers.
 
 ## 6. Dynamic collision and blockers
 
-### 6.1 Slot 56 @ 0x00539930 is "path to this actor", not collision response
+### 6.1 Slot 56 is `PathToTarget` — "path to this actor", and nothing to do with collision
 
-> **The DB name here is wrong and it misled the first draft of these notes.** The function is
-> `MobileActor` **vtable slot 56** (`MobileActorVtbl` 0x00667f7c + 0xe0, reached as
-> `CALL [reg+0xe0]`), it ends **`RET 0x8`** at 0x00539adc, and its arguments are
-> `(Actor *target, float stopRangeSq)` — an **actor** and a range, not a collision manifold.
-> Confirmed independently here and by a sibling lane; the rename is being made centrally, so
-> do not build on the name `OnCollisionResponse` at 0x00539930 (or on the `RET 0x8` stub the
-> base `Actor` installs at 0x0054efa0, whose empty body carries no meaning at all).
+> `MobileActor::PathToTarget` @ 0x00539930 is **vtable slot 56** (`MobileActorVtbl` 0x00667f7c +
+> 0xe0, reached as `CALL [reg+0xe0]`), it ends **`RET 0x8`** at 0x00539adc, and its arguments are
+> `(Actor *target, float stopRangeSq)` — an **actor** and a range. It is the pathfind-and-move
+> entry point, and the caller of `FindNavPathWithinRadius` @ 0x0052c100: there is no collision
+> manifold, impulse or contact normal anywhere in the body. The base `Actor` installs a bare
+> `RET 0x8` stub at 0x0054efa0 whose empty body carries no meaning at all.
 
 `__thiscall void (MobileActor *this, Actor *target, float stopRangeSq)`:
 
@@ -443,14 +455,14 @@ MobileActor::Update (slot 70) @ 0x00533720          per tick, executor side
  │    │    ├─ CollectBlockedNeighbours @ 0x0052cf10
  │    │    ├─ IsCornerCutBlocked @ 0x0052cf50
  │    │    └─ NavSearchNodeWorseThan @ 0x0052c980   f = g + h
- │    └─ MobileActor::AppendWaypoint @ 0x0053a640
+ │    └─ MobileActor::PushRouteWaypoint @ 0x0053a640   (push-FRONT onto +0x204)
  ├─ UpdateSpeedAndTurnRadius @ 0x0053bb80 (via 0x00539ed0, broadcast 0x5f)
  ├─ step = +0x17c * dt ; arrival test vs 0.2 ; turn clamp vs +0x180
  └─ MoveNavAgent @ 0x00472e30
       ├─ FindNavPolygonAt @ 0x0048d380
       └─ FindNavPolygonUnder @ 0x0048cf50
 
-slot 56 @ 0x00539930  "path to this actor" (DB name unreliable, see 6.1)
+MobileActor::PathToTarget (slot 56) @ 0x00539930      "path to this actor", see 6.1
  ├─ early-out on nav_agent->nav_poly == 0
  └─ FindNavPathWithinRadius @ 0x0052c100 -> slot 90 AddWaypoint per polygon
 
@@ -480,14 +492,14 @@ the goal**. Both names are misleading; `goto_polygon` would be right.
 `__thiscall void(MobileActor *, +3 stack args)`, **`RET 0xc`** at 0x00535a87, 0x236a bytes;
 slot 70 = `MobileActorVtbl` 0x00667f7c + 0x118. `NodeActor` shares it; `CharacterActor`
 overrides at 0x0053d8d0 (0x30f4 bytes, also `RET 0xc`), `TurretActor` at 0x0054b000,
-`PresidentActor` at 0x0054d4c0. Driven from `FUN_0052fad0` ← `ExecutorThreadProc` @ 0x0050b2f8,
+`PresidentActor` at 0x0054d4c0. Driven from `ExecutorActorTick` @ 0x0052fad0 ← `ExecutorThreadProc` @ 0x0050b2f8,
 so **executor-side** — which is what makes §3.4's non-re-entrancy tractable (arity, `RET` form
 and the thread route are a sibling lane's measurement, reproduced here for the address and
 size only).
 
-A **naming collision to watch**: the base `Actor` slot 70 at 0x0052f8a0 is still called
-`SyncPositionAndBroadcast`, and so were all seven overrides before this pass. Only 0x00533720
-was renamed here; the rest of the slot-70 family is being reconciled centrally.
+Slot 70 is `Update` in every one of its ten distinct bodies, base included: the `Actor` body at
+0x0052f8a0 is the one that does the position sync, and even there the 0x6f broadcast is
+conditional on `position_set`. `MobileActor::Update` calls it as one of its 46 callees.
 
 ### 9.4 The `NavAgent` mirror is correct; one comment is not
 
@@ -543,7 +555,8 @@ per-agent mask at query time, and the point lookups do not test it at all.
   a polygon's flags was found. Candidates: `OpenDoor2` @ 0x0048da20 and the door subsystem.
 - **`NavPolygon+0x20`** — not written by the ctor and not identified.
 - **A stuck/repath timer.** None found in the movement layer; if it exists it is in the order/AI
-  layer (`FUN_00538830` and friends), which the brief assigned elsewhere.
+  layer (`MobileActor::ClearOrderQueue` @ 0x00538830 and friends), which the brief assigned
+  elsewhere.
 - **Whether anything else calls slot 56.** Only the vtable entries were enumerated here; the
   hold-ground gate at `MobileActor+0x1b0` is a sibling lane's measurement, not re-derived.
 - **`MobileActor::GetNavigationTarget` (slot 91) @ 0x0053b560 has no callers.** Eight vtable

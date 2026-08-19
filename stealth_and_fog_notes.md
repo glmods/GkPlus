@@ -38,8 +38,7 @@ i.e. the engine's own definition of "hidden" is crouched **and** concealed.
 ### 1.1 The toggle
 
 `MobileActor::ToggleCrouchAndCamouflage` @ **0x00536090**, MobileActor vtable **slot 83**,
-`__thiscall void(MobileActor *this)`, plain `RET` (no stack args).
-Previously named `UpdateMineDetectionAndBounds`; renamed.
+`__thiscall void(MobileActor *this)`, plain `RET` (no stack args). Nothing in it detects mines.
 
 1. Early-out unless `HierarchyHasNode(this->entity->hierarchy, 0x13)` — a model with no
    crouch node cannot crouch.
@@ -56,8 +55,9 @@ Previously named `UpdateMineDetectionAndBounds`; renamed.
 Client side, updates 0x4c / 0x4d / 0x4e all land in `Unit_SetCrouchedAndConcealed`
 @ **0x004bc7f0** (Unit vtable slot 93, `__thiscall(bool crouched, bool concealed, bool
 instant)`, `RET 0xc`), which stores `+0x19f` / `+0x19e` and swaps the model bounds the same
-way. **0x4d** is the "instant" variant, emitted by `FUN_005317b0` (called only from
-`LoadGame` @ 0x005069ea) to resync crouch state after a savegame load.
+way. **0x4d** is the "instant" variant, emitted by `Actor_FixupAfterLoad` @ 0x005317b0 (the savegame
+fixup pass, called only from `LoadGame` @ 0x005069ea) - so 0x4d is what a **restored** actor
+publishes to resync its crouch state.
 
 ### 1.2 Who calls the toggle
 
@@ -65,8 +65,9 @@ way. **0x4d** is the "instant" variant, emitted by `FUN_005317b0` (called only f
   (0x006abe20) && actor->IsCrouched()) return;` otherwise `CALL [vtbl+0x14c]` (slot 83) to
   stand up first. This is what the Prefs "Auto Crouch" toggle does.
 - `ExecutorThreadProc` @ 0x0050a074, 0x0050b29b (other order kinds).
-- `SyncPositionAndBroadcast` @ 0x00535167 / 0x00535176, `ReceiveObject` @ 0x0053937b.
-- HUD/order-menu callers `FUN_004a17e0` / `FUN_004a17b0` / `FUN_004a4250`.
+- `MobileActor::Update` (slot 70) @ 0x00535167 / 0x00535176, `ReceiveObject` @ 0x0053937b.
+- HUD/order-menu callers `EnterFlareMode` @ 0x004a17e0 / `ExitFlareMode` @ 0x004a17b0 /
+  `CommitPendingOrderTarget` @ 0x004a4250 (that last name is **PROPOSED**).
 
 ---
 
@@ -78,7 +79,7 @@ in order:
 ### 2.1 Precondition — nobody is looking
 
 `Actor_IsUnseenByEnemies` @ **0x0052f4c0**, `__fastcall bool(Actor *this)` (ECX only, bare
-`RET`). Renamed from `FUN_0052f4c0`; its only caller is the toggle.
+`RET`). Its only caller is the toggle.
 
 For every team slot `t != this->team_id` whose `TeamSlots[t] + 0x6b` is 0, for every actor
 in that team's list that is alive (slot 6) and mobile (slot 36):
@@ -142,7 +143,7 @@ and do it while no enemy has you in its cone".
 | Site | Effect |
 |---|---|
 | `ToggleCrouchAndCamouflage` 0x005362a1 / 0x005362cb | set (cover / terrain) |
-| `EquipObject?` 0x005376cf | set |
+| `MobileActor::UseInventoryItem` 0x005376cf | set - the audio-cloak arm (`pickup_class` 10, `weapon` 5), guarded on `+0x154 == 0 && +0x150 == -1` |
 | `ToggleCrouchAndCamouflage` 0x005362dc | clear on standing up (if `+0x150 == -1`) |
 | `AttackPosition` 0x00540b20, `AttackTarget` 0x00540df2 | clear — **firing breaks camouflage** |
 | `Update` (MobileActor) 0x00535a22 | clear |
@@ -150,9 +151,11 @@ and do it while no enemy has you in its cone".
 | `Die` 0x0053a126 | clear |
 | `ActivateInWorld` 0x0053bc10 | clear |
 
-On the client, `Unit+0x19e` is cleared by `Unit::SetTarget`-family
-`FUN_004c3170` @ 0x004c324c and `FUN_004c32a0` @ 0x004c3405, and by
-`FUN_004bb760` / `FUN_004bc740` / `FUN_004c0f80`.
+On the client, `Unit+0x19e` is cleared by `Unit_SetAttackPosition` @ 0x004c324c and
+`Unit_SetAttackTarget` @ 0x004c3405 (slots 109 and 108), and by `Unit_UpdateMovement`
+@ 0x004bb760 (slot 57), `Unit_Dissociate` @ 0x004bc740 (slot 55) and `Unit_Slot91`
+@ 0x004c0f80. The Actor-side `Dissociate` @ 0x00535f8f and `Unit_Dissociate` are the same
+operation in the two trees, joined by update **0x97**.
 
 ---
 
@@ -165,13 +168,13 @@ it outright. The call is compiled as `MOV EAX,[reg+0x20]` + `CALL EAX`, not
 | Site | Enclosing function | Shape |
 |---|---|---|
 | 0x00451a24 | `AiThink_Bot` @ 0x00451220 | `if (!alive) skip; if (IsConcealed()) skip` |
-| 0x00456514, 0x00456804 | `FUN_00455de0` (turret AI, installed by TurretActor slot 70 @ 0x0054b0b6) | same |
-| 0x00459296 | `FUN_004591e0` | same |
+| 0x00456514, 0x00456804 | `AiThink_Turret` @ 0x00455de0 (installed by `TurretActor::Update` @ 0x0054b0b6, not by `Actor_SetAiBehaviour`) | same |
+| 0x00459296 | `FindNearestVisibleEnemy` @ 0x004591e0 | same |
 | **0x00459532** | `CollectDetectableEnemies` @ 0x00459440 | same |
-| 0x0045aa1f | `FUN_0045a850` (Node AI) | same |
-| 0x0053e3b2 | `CharacterActor` slot 70 @ 0x0053d8d0 | same |
-| 0x0054a9df | `PopupActor` slot 70 @ 0x0054a8f0 | same |
-| 0x0054c6bf | `TurretActor` slot 70 @ 0x0054b000 | same |
+| 0x0045aa1f | `AiThink_Node` @ 0x0045a850 | same |
+| 0x0053e3b2 | `CharacterActor::Update` (slot 70) @ 0x0053d8d0 | same |
+| 0x0054a9df | `PopupActor::Update` (slot 70) @ 0x0054a8f0 | same |
+| 0x0054c6bf | `TurretActor::Update` (slot 70) @ 0x0054b000 | same |
 
 Because the candidate is removed from the list *before* any range, cone, hearing or
 line-of-sight work, concealment defeats **both** the sight and the hearing channel, and it
@@ -185,7 +188,7 @@ concealment skip at 0x00459532. So the "scanner" path is *inside* the concealmen
 not outside it. `AiThink_Bot` @ 0x00451220 is the other entry point. AI-think-proc
 assignment table is `Actor_SetAiBehaviour` @ 0x00450550.
 
-`FUN_0045e220` @ 0x0045e220 is a second "is any enemy within sight range" helper that also
+`IsAnyEnemyWithinSightRange` @ 0x0045e220 is a second "is any enemy within sight range" helper that also
 consults slot 8 — it has **zero references, code or data**, i.e. dead code.
 
 ---
@@ -196,12 +199,13 @@ No perception path was found that ignores `is_concealed`. What was checked and r
 
 - All eight consult sites above (every AI think proc that acquires targets at all).
 - The AI-think dispatch `Actor_SetAiBehaviour` @ 0x00450550 assigns only: `AiThink_Bot`
-  (bot/centipede/president, and only when the actor has a weapon), `FUN_004556e0`
-  (scavenger), `FUN_004552a0` (mine), `AiThink_Minebot` @ 0x00456c50, `FUN_00456bb0`
-  (waiting/centibody/nodewaiting/popup/turret — a 149-byte timer that only fires Actor
-  slots 79 and 81, no perception), `LAB_004556d0` (pathfinder), `FUN_0045a850` (node),
-  `FUN_0045b620` (swarm), and nothing for blocker/pickup/tumbleweed/background creature.
-  The three that never touch slot 8 (`FUN_004556e0`, `AiThink_Minebot`, `FUN_0045b620`)
+  (bot/centipede/president, and only when the actor has a weapon), `AiThink_Scavenger`
+  @ 0x004556e0, `AiThink_Mine` @ 0x004552a0, `AiThink_Minebot` @ 0x00456c50, `AiThink_Waiting`
+  @ 0x00456bb0 (waiting/centibody/nodewaiting/popup/turret — a 149-byte timer that only fires
+  `Actor` slots 79 and 81 off the `+0x24` / `+0x2c` float deadlines, no perception),
+  `AiThink_Pathfinder` @ 0x004556d0, `AiThink_Node` @ 0x0045a850, `AiThink_Swarm` @ 0x0045b620,
+  and nothing for blocker/pickup/tumbleweed/background creature.
+  The three that never touch slot 8 (`AiThink_Scavenger`, `AiThink_Minebot`, `AiThink_Swarm`)
   were not read in full, so a concealment-ignoring acquisition inside one of them cannot be
   excluded — that is the place to look next.
 - Two `Actor::flags (+0x7c)` bits set by console commands look like AI-capability flags and
@@ -253,7 +257,7 @@ on the translucent submit.
 One object, `FogSystem` @ **0x006b0144** (`FogOfWar *`, name already in the DB). `pool_alloc`
 of **0xf4 bytes** in `LoadLevel` @ 0x004e0dd6, constructed by `FogOfWar_Ctor`
 @ **0x00467820** (`__thiscall`, `RET 4`) with `gridDim = 0x100`; cleared to null by
-`FUN_004e2090` @ 0x004e214a on level teardown. It is **client-only** — nothing on the
+`UnloadLevel` @ 0x004e2090 (at 0x004e214a) on level teardown. It is **client-only** — nothing on the
 executor side reads it.
 
 | Offset | Type | Meaning |
@@ -268,7 +272,7 @@ executor side reads it.
 | 0x28..0x5b | | fog system texture record ("Fog System Texture" name at +0x54) |
 | 0x5c..0x8f | | fog video texture record ("Fog Video Texture" name at +0x88) |
 | 0x90,0x94,0x98,0x9c | `int` | dirty rect `x0, y0, x1, y1` (also used as a `RECT` for `CopyRects`) |
-| 0xa0 | `int` | `gridDim`, clamped to `DAT_006ab970` |
+| 0xa0 | `int` | `gridDim`, clamped to `MaxTextureDimension` @ 0x006ab970 |
 | 0xa4 | `float` | `FOGVALUE` — fog level in discovered areas, 0..1 |
 | 0xa8 | `float` | `FOGUPDATE` — complete updates per second |
 | 0xac / 0xb0 | `float` | `FOGTRANSITION` metres / its reciprocal |
@@ -348,9 +352,13 @@ So **a unit reveals fog out to its own GLS `sight range`**.
 Membership is `FogOfWar_AddDefoggerUnit` @ **0x004693c0** / `FogOfWar_RemoveDefoggerUnit`
 @ **0x00469450** (both `__thiscall(Unit *)`, `RET 4`), which also refcount the unit and set
 `Unit+0x211` through slot 27 `Unit_SetIsDefogger` @ 0x004d0000. Added from `LoadGame`,
-`FUN_004bb410` (unit construction, `+0x211 = 1` at 0x004bb4ed), `ApplyUpdateMessage`
-0x004fecca (spawn path) and case **0xb7**; removed from `FUN_004c0f80`, `FUN_004c4a50` and
-case **0xb8**.
+`Unit_SetTeamWithInventory` @ 0x004bb410 (`Unit` slot 33, and it is **`SetTeam`** - the base
+implementation at 0x004cf3b0 is literally `*(int *)(this + 0xb4) = arg; return;`) at 0x004bb4ed,
+`ApplyUpdateMessage` 0x004fecca (spawn path) and case **0xb7**; removed from `Unit_Slot91`
+@ 0x004c0f80, `Unit_Dtor_00664c88` @ 0x004c4a50 and case **0xb8**. The `+0x211 = 1` is therefore
+**not a construction-time event**: a unit becomes a defogger whenever its team becomes the local
+player's team - or, in Cooperative, any team whose `TeamSlots[team]+0x6a` is set - so every team
+change re-evaluates it.
 
 Console `DEFOGGER` (`CommandDefogger` @ 0x00442a10) broadcasts **0xb7**, 8 bytes
 `{0xb7, actorId}`; `FOGGER` (`CommandFogger` @ 0x00442b10) broadcasts **0xb8**, same shape.
@@ -395,7 +403,7 @@ Four producers:
 | Producer | Radius | Kind / life |
 |---|---|---|
 | `EvaluateTriggers` @ **0x0050e55d** — the **DEFOG trigger** (`TriggerKind::Defog`, 15). Centre and radius come from the trigger record's `data+0x10..0x18` and `data+0x1c`, i.e. `coords[1]` and `coords[2].x` in `trigger_system_notes.md`'s layout | trigger's `defog_radius` | **0, permanent** |
-| `FUN_0045e050` @ **0x0045e05a** — AI "go investigate", called twice from `AiThink_Minebot` @ 0x00456f7c / 0x004571b0. Centre is the AI actor's own position | **20.0** | 1, **3 s** |
+| `AiBeginInvestigate` @ **0x0045e05a** — AI "go investigate", called twice from `AiThink_Minebot` @ 0x00456f7c / 0x004571b0. Centre is the AI actor's own position | **20.0** | 1, **3 s** |
 | `ApplyUpdateMessage` **case 0x46** (spawn projectile / weapon fire) @ 0x004ff... — built inline when `msg[4] != DAT_006a58e0`, i.e. when the shooter is *not* on the local player's team. Centre is the fire position `msg[6..8]` | **25.0** | 1, **60 s** |
 | `ApplyUpdateMessage` **case 0x47** — same shape, centre `msg[4..6]` | **20.0** | 1, **60 s** |
 
@@ -406,14 +414,14 @@ itself is `Actor::flags (+0x7c)` bit **0x80** ("fire a flare now"), consumed at
 0x005454e8). `CommandFlareFirer` @ 0x004492e0 sets bit **0x40** ("this actor fires
 flares"). What was *not* found is code linking the flare projectile or its light to a
 0xb6 broadcast — the reveal that accompanies an investigation is the 20 m / 3 s one from
-`FUN_0045e050`, and the two 60 s ones come off weapon fire generally. See "unknown" below.
+`AiBeginInvestigate`, and the two 60 s ones come off weapon fire generally. See "unknown" below.
 
 ### 7.3 Console fog commands
 
 | Command | Handler | Effect |
 |---|---|---|
 | `FOG` | `CommandFog` @ 0x004e2ec0 | `SetIsFogEnabled` -> `FogSystem+0x18` |
-| `FOGCOLOUR` | `CommandFocColor` | `FogSystem+0xb8..0xc4`, via `FUN_00469270` |
+| `FOGCOLOUR` | `CommandFocColor` | `FogSystem+0xb8..0xc4`, via `FogOfWar_SetColour` @ 0x00469270 |
 | `FOGVALUE` | `CommandFogValue` @ 0x004e2f80 | `FogSystem+0xa4`, clamped 0..1 |
 | `FOGUPDATE` | `CommandFogUpdate` @ 0x004e30d0 | `FogSystem+0xa8` |
 | `FOGTRANSITION` | `CommandFogTransition` @ 0x004e3020 | `FogSystem+0xac` (m) and `+0xb0` (1/m) |
@@ -423,14 +431,21 @@ flares"). What was *not* found is code linking the flare projectile or its light
 
 ## 8. What the fog gates
 
-**Rendering and effects only.** `FogOfWar_SampleTotal` @ 0x00468770 has 31 call sites and
-every one is a client draw or effect-spawn path: `Unit_Draw` (x4), `DrawWorldEffects` (x6),
-`SpawnSparks`, `HudItem_DrawByKind`-adjacent `FUN_004a4130`, the world-effect updaters
-`FUN_00513xxx`-`FUN_00515xxx`, `FUN_00488400`, `FUN_00558d30`, and four effect-spawn cases
-in `ApplyUpdateMessage`. `FogOfWar_SampleCurrent` @ 0x00468830 has exactly one caller,
-`FUN_004b68c0`, which picks between the two based on `Unit+0x118` bits 0x10 / 0x8 and is
-itself a draw helper.
+**Client-side only, and all but one of them rendering or effects.** `FogOfWar_SampleTotal`
+@ 0x00468770 has 31 call sites: `Unit_Draw` (x4), `DrawWorldEffects` (x6), `SpawnSparks`, the
+world-effect updaters `FUN_00513xxx`-`FUN_00515xxx`, `SceneLightSet_SelectLightsForBounds`
+@ 0x00488400, `FUN_00558d30`, and four effect-spawn cases in `ApplyUpdateMessage`. **The one
+exception is `OnClickSelectOrTrack` @ 0x004a4130** (name **PROPOSED**), which is neither a draw
+nor an effect spawn and is not adjacent to `HudItem_DrawByKind`: it is an interface **click
+handler**, registered into the 0x007b41f8 handler matrix with mask 0x501 from `BeginLevelSession`,
+with no direct callers at all, and it uses the fog sample (`> 0xfd`, i.e. fully fogged, on a
+`Role+0x7c == 10` unit) to decide whether the click may select the unit under the cursor. So fog
+gates one *input* decision as well as the drawing.
 
+`FogOfWar_SampleCurrent` @ 0x00468830 has exactly one caller, `Unit_SampleFogVisibility`
+@ 0x004b68c0, which picks between the two samplers on `Unit+0x118` bits 0x10 / 0x8. It is **not**
+a draw helper: its own single caller is `Unit::Unit_Update` @ 0x004b5d50, base `Unit` vtable **slot 57, the per-tick
+`Update`**. Where the sampled value goes from there is not established.
 The result is written as a 0..1 fade factor into the render node's `+0x38`
 (`Unit_Draw` @ 0x004b7d94, 0x004b7fee, 0x004b839c). Nothing on the executor thread — no
 targeting, no selection, no AI — reads the fog: the whole object is allocated, updated and
@@ -481,12 +496,11 @@ nothing else.
 
 ## 9. Cross-references to fix elsewhere
 
-- `src/Actors.h` lines 353-354 and 387-389: `is_mine` -> `is_concealed`, `can_be_picked_up`
-  -> `is_crouched`, slot 63 `CanBePickedUp` -> `IsCrouched`, slots 8/9 `IsMine`/`SetIsMine`
-  -> `IsConcealed`/`SetConcealed`, slot 83 `UpdateMineDetectionAndBounds` ->
-  `ToggleCrouchAndCamouflage`. **None of these had a `static_assert` behind them.**
-- `actor_vtable_notes.md` line 243 (MobileActor slot 83 row) — the "name is doubtful" note
-  can be replaced with the measurement above.
+- `src/Actors.h` carries the field and slot 8/9/63 names already (`is_concealed`, `is_crouched`,
+  `IsConcealed`/`SetConcealed`, `IsCrouched`). Still outstanding there: **slot 83**, declared as
+  `virtual void UpdateMineDetectionAndBounds() = 0;` at `src/Actors.h:394`, which is
+  `ToggleCrouchAndCamouflage`. **None of these has a `static_assert` behind it**, so nothing but
+  review catches a wrong slot name.
 - `Role::limit` (+0x54, GLS field 0x78) was suggested as a possible defogger consumer. It
   is **not**: the defogger radius comes from `Character+0x28` (`sight range`) through
   `Unit_GetDefogRadius`, and no reader of `Role+0x54` was found on any fog path. The
@@ -500,8 +514,8 @@ nothing else.
   (`sqrt(2) * field0x110`). Its writer was not traced, so the camouflage cover range has no
   metre value yet. This is the single most useful next measurement.
 - **The bypass.** No perception path ignoring `is_concealed` was found (§4). The three
-  unread think procs (`FUN_004556e0` scavenger, `AiThink_Minebot` @ 0x00456c50,
-  `FUN_0045b620` swarm) and the readers of `Actor::flags` bits 0x20 (`HUNTER`) and 0x40
+  unread think procs (`AiThink_Scavenger` @ 0x004556e0, `AiThink_Minebot` @ 0x00456c50,
+  `AiThink_Swarm` @ 0x0045b620) and the readers of `Actor::flags` bits 0x20 (`HUNTER`) and 0x40
   (`FLARE FIRER`) are where to look.
 - **The flare's own reveal.** Bit 0x80 -> role `"flare"` is measured; a 0xb6 broadcast tied
   to the flare projectile is not. The 25 m / 60 s reveal in update case 0x46 fires on
@@ -509,7 +523,7 @@ nothing else.
 - **`MobileActor+0x150`**, the `== -1` guard on clearing concealment when standing up.
 - **`Unit+0x127`**, the second gate on the concealed draw branch, and `Unit+0x118` bits
   0x8 / 0x10 which choose between the two fog samplers.
-- **`DAT_006ab970`** (max grid dimension) and `DAT_00738ff4` (the "full-rect update this
+- **`MaxTextureDimension`** @ 0x006ab970 (the grid-dimension clamp) and `DAT_00738ff4` (the "full-rect update this
   frame" flag) are zero-init `.data`; their runtime values were not read.
 - Which `Unit` subclass returns 1 from `Unit_GetFogStampIsPartial` (slot 38 @ 0x004cf520) —
   i.e. which kind of defogger only half-reveals.

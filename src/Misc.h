@@ -49,7 +49,7 @@ static_assert(offsetof(GLKeysSettings, IsAutoCrouchOn) == 0x50);
 //
 // **Both are single bytes**, and they are adjacent: every access in the binary
 // is a `byte ptr` one (CommandGodMode, CommandInfiniteAmmo, ApplyDamage,
-// SyncPositionAndBroadcast, ApplyUpdateMessage, LoadLevel). They were modelled
+// Actor::Update, ApplyUpdateMessage, LoadLevel). They were modelled
 // as two `int`s here, which put IsInfiniteAmmo on 0x007b9c74 - that address is
 // RenderStateFlags, so writing the cheat corrupted the renderer's state word.
 struct Cheats {

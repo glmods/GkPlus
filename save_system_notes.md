@@ -151,7 +151,7 @@ snapshots every actor whose team is carry-over-eligible (`DAT_006a67b8[team_id]`
 
 Two independent actor lists are stored, matching the game's two-thread design (see
 `threading_model_notes.md`): the executor/"server" list (`actors`) and the client-side list
-(`DAT_007b68f0`, whose objects are `Unit`s built by `0x004b4620`, not `Actor`s).
+(`UnitsTable`, whose objects are `Unit`s built by `0x004b4620`, not `Actor`s).
 
 ```
 u32  num_actors            // the global next-actor-id counter
@@ -285,7 +285,7 @@ APIs, so the linked lists are reconstructed rather than restored byte-for-byte.
 >
 > **The `str script` above now carries a JSON document, so saves written by GkPlus will not load
 > correctly in an unpatched Gunlok.** This is deliberate and was decided explicitly, not stumbled
-> into. `TriggerData::script_name` @ +0x54 is written by `RegisterTriggers`, which
+> into. `TriggerData::script_name` @ +0x54 is written by `AddTriggerToGlobalList`, which
 > `ScriptQueueSystem` hooks so that a bare `.gcs` name is stored as the envelope
 > `{"kind":"file","body":"crtbaa.gcs"}` — see `src/ScriptQueue.h`. That string is what lands in the
 > save, verbatim, and an unpatched game would try to `fopen` it braces and all, so **every trigger

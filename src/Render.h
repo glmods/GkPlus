@@ -247,8 +247,11 @@ struct SceneNode : AwFrame {
   // record, and null disables culling for this node. SceneNode_Render reads the
   // radius from its +0x0c directly when the item carries no scale, and otherwise
   // rescales it per axis first.
-  // +0x11c the node's name, and the key SceneNode_FindByName matches
-  // case-insensitively before recursing into `children`. It is the same string a
+  // +0x11c the node's name, and the key SceneNode_GetWorldPositionByName
+  // @ 0x0059ab20 matches case-insensitively before recursing into `children`.
+  // That function returns bool and writes the matched node's world position into
+  // an out-parameter, which is why it is not just a lookup - it was named
+  // SceneNode_FindByName here until it was read. The name is the same string a
   // RIF OBJHIERD node binding carries, which is how a hierarchy binds at runtime.
   char *name;             // +0x11c
   BoundingSphere *bounds; // +0x120
@@ -532,7 +535,9 @@ struct LightSet : AwRefCounted {
   Vec4 diffuse;   // +0x18
   Vec4 ambient;   // +0x28
   Vec4 specular;  // +0x38
-  Vec4 emissive;  // +0x48 what GetAmbientLight / SetAmbientLight read and write
+  // +0x48 what LightSet_SetEmissiveColour @ 0x00579ef0 writes (and what the
+  // `AMBIENT` console command therefore sets - it is emissive, not ambient).
+  Vec4 emissive;  // +0x48
   float power;    // +0x58 seeded to 1.0 by the constructor
 };
 static_assert(sizeof(LightSet) == 0x5c);
