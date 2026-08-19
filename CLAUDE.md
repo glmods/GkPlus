@@ -856,17 +856,25 @@ something, write your understanding back into the database instead of keeping it
 Anything reusable (offsets, struct layouts, subsystem behavior) should also land in this file or
 the relevant `*_notes.md`.
 
-**Writing is one agent's job, and reading is everyone else's.** All Ghidra work is delegated (see
-`.claude/skills/ghidra-recon`): any number of `ghidra-explorer` agents read the binary in parallel
-through `create_readonly_context`, and a single `ghidra-consolidator` afterwards applies what they
-found — to the DB, the `src/` mirror and the notes together, per the renaming convention above.
-Read-only used to be advisory, and a subagent told not to write renamed functions and globals
-anyway; it is now structural at three layers — a read-only context refuses the transaction, the
-explorer's `tools:` allowlist does not offer it `create_context` at all, and
-`.claude/hooks/gate-ghidra-access.sh` denies that tool to it by name. An explorer also has no
-`Write`/`Edit` and no `Agent`, so it cannot touch the repo or fan out further. Two consolidators at once
-is the arrangement that is still unsafe — the DB is shared mutable state with no merge — so run them
-one at a time, over areas that share no type, function, `src/` file or notes section.
+**Writing is one agent's job, and reading is everyone else's.** All Ghidra work is delegated, and the
+skill plus both agents now come from the **`ghidra-jython-mcp` plugin** rather than from this repo —
+so they are `ghidra-jython-mcp:ghidra-recon`, `ghidra-jython-mcp:ghidra-explorer` and
+`ghidra-jython-mcp:ghidra-consolidator`, and the local `.claude/skills/ghidra-recon`,
+`.claude/agents/ghidra-*.md` and `.claude/hooks/gate-ghidra-access.sh` that used to provide them are
+gone. Any number of explorers read the binary in parallel through `create_readonly_context`, and a
+single consolidator afterwards applies what they found — to the DB, the `src/` mirror and the notes
+together, per the renaming convention above.
+
+Read-only used to be advisory, and a subagent told not to write renamed functions and globals anyway.
+It is now structural in two layers: a read-only context refuses the transaction, and the explorer's
+`tools:` allowlist does not offer it `create_context` or `save_program` at all. The third layer was
+the gate hook, which denied the write context to an explorer by name; the plugin's allowlist covers
+the same ground, so nothing was lost with it, but note that the enforcement is now entirely in the
+agent definitions — a brief that hands an explorer the wrong tool has no backstop. An explorer also
+has no `Write`/`Edit` and no `Agent`, so it cannot touch the repo or fan out further. Two
+consolidators at once is the arrangement that is still unsafe — the DB is shared mutable state with
+no merge — so run them one at a time, over areas that share no type, function, `src/` file or notes
+section.
 
 ### Analysis Traps
 
@@ -1005,13 +1013,20 @@ one at a time, over areas that share no type, function, `src/` file or notes sec
   because the program moved under one of them — and that snapshot is taken from the program **as
   last saved in Ghidra**.
 - **A consolidator's edits are invisible to every explorer spawned afterwards until the program is
-  saved in the GUI**, and this is measured, not inferred: a consolidator wrote a plate comment, and
-  the next `create_readonly_context` came back with `The program has unsaved changes in Ghidra. This
-  snapshot reflects the last saved state, so those changes are not visible here.` So an explorer in
-  a later round will report the *old* name for something already renamed. Two consequences: put
-  names applied in an earlier round **in the brief**, since the DB will not carry them, and treat
-  that warning in a context's response as the signal that a round of consolidation has not been
-  saved yet. The reports, not the database, are the record of what a round found.
+  saved**, and this is measured, not inferred: a consolidator wrote a plate comment, and the next
+  `create_readonly_context` came back with `The program has unsaved changes in Ghidra. This snapshot
+  reflects the last saved state, so those changes are not visible here.` So an explorer in a later
+  round reports the *old* name for something already renamed. **The plugin's `save_program` is the
+  fix** — it is File > Save from inside the agent, so the cycle is: read from snapshots, write from
+  one read-write context, `save_program`, then take fresh snapshots to see the result. **End every
+  consolidator pass with it.** It is only on the consolidator's allowlist, which is the point.
+  Before that tool existed the save had to be done by hand in the GUI, and the cost was real: one
+  session needed three manual saves, and a repo pass that could not open a context wrote ~45
+  function names taken from explorer recommendations rather than from confirmed reads — several of
+  which the consolidators had deliberately deviated from — which then needed a whole audit round to
+  find. Treat that warning in a context's response as the signal that a round of consolidation has
+  not been saved yet, and remember that the reports, not the database, are the record of what a
+  round found.
 - `execute_command` runs in a **persistent** Jython context — globals survive between calls, so
   accumulate into a global and process in batches. Always `close_context` when done; for a read-only
   context that is what lets the shared snapshot be freed.
