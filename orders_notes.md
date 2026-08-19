@@ -553,7 +553,66 @@ exactly like `actors`:
 sentinel skipped, filtered by vslot 71. There is no separate "player character" array.
 
 Every selection mutator opens with `CMP byte ptr [0x007b3f51],0` → `ExitFlareMode(CL=0)` @ 0x004a17b0, which is
-presumably "close the open command wheel"; that was not confirmed.
+presumably "close the open command wheel"; that was not confirmed. One step of that guess can now
+be sharpened without being closed: the command-wheel mode **is** `CursorMode == 1`, set by
+`OpenCommandWheel` @ 0x004a11bd (§10.1) — but that is a **different global**, a dword at
+0x007b3f78, not the byte at 0x007b3f51. Do not conflate the two; 0x007b3f51's writers were not
+read, so what that byte means remains unconfirmed.
+
+### 10.1 The cursor-mode dispatcher
+
+This belongs with selection rather than with the `PendingOrder` FIFO: it reads
+`SelectedUnits.n_entries` through `GetSelectionCount` @ 0x0049f310 and iterates the selection table
+@ 0x007b46d8 in its case 0, and its mode 2 is the mode `BeginAttackGroundTargeting` and
+`EnterFlareMode` both enter — the family named at the end of §7. It touches **none** of the 11
+order kinds.
+
+- **`UpdateCursorForMode` @ 0x00498140** (was `FUN_00498140`), `void __cdecl(void)`, called every
+  frame from `RunInGameFrame` at 0x0046ea01 and twice from `ToggleReconMode`. Picks one of ten
+  cursor objects and applies it. **No bound check** on its index.
+- **`CursorMode` @ 0x007b3f78** is an `int` with exactly **one writer** — `SetCursorMode`
+  @ 0x004a28e0 (`__fastcall`, mode in ECX), storing at 0x004a2a57. The seven values are pinned by
+  the ECX constant at each of that setter's 26 call sites, and independently by a **stride-7 index
+  computation in four unrelated readers** (`ECX = EAX*7 + CursorMode`).
+
+| value | name | set by | cursor chosen | confidence |
+|---|---|---|---|---|
+| 0 | `Normal` | reset from 14 sites | the full context-sensitive pick | CONFIRMED by its body |
+| 1 | `CommandWheel` | `OpenCommandWheel` @ 0x004a11bd | "standard" (inert) | PROPOSED — empty body |
+| 2 | `GroundTarget` | `BeginAttackGroundTargeting`, `EnterFlareMode`, `CommitPendingOrderTarget` | "attack ground" | CONFIRMED by its body |
+| 3 | `InventoryScreen` | `FUN_0049f350` @ 0x0049f48c | "drop" / "pass" | PROPOSED-strong |
+| 4 | `PauseMenu` | `ToggleInGamePauseMenu` @ 0x004a0e50 | "standard" (inert) | PROPOSED — empty body |
+| 5 | `UnitFollow` | `ToggleReconMode` @ 0x004977bd | "standard" (inert) | PROPOSED — empty body |
+| 6 | `Suspended` | `SuspendCursorMode` @ 0x004a0d70 (console `CommandCursor`, `CutsceneCamera_Enter`) | none — dispatches to the epilogue | CONFIRMED by its body |
+
+The confidence column is load-bearing: modes 1, 4 and 5 have **empty** case bodies, so their names
+come from their setters' names, one inference step beyond the rest.
+
+The addresses in the "set by" column are as recovered and are **not uniformly function entries** —
+0x004a11bd and 0x004977bd sit inside `OpenCommandWheel` and `ToggleReconMode`, whose entries §11
+and §10 record as 0x004a0fa0 and 0x004976d0, so those two are presumably the `SetCursorMode` call
+site rather than the function. Not re-checked here; treat the pairing of name to value as the
+measured part.
+
+- The ten cursors are named by the developers themselves. `LoadCursorHierarchies` @ 0x0049c4d0
+  builds each from `user interface/game_cursor.rif` by hierarchy name — `"unselected"`,
+  `"standard"`, `"attack"`, `"attack ground"`, `"pick up"`, `"activate"`, `"drop"`, `"pass"`,
+  `"cameralock"`, `"heal character"` — into the globals 0x007b470c..0x007b4730 (now `Cursor_*`).
+- **`CurrentCursor` @ 0x007b4738** and **`CursorVariant` @ 0x007b4734** (0/1/2, a **target-valid**
+  flag: `ApplyWin32CursorShape` @ 0x004a2140 — formerly named `SetCursor` — uses it to choose
+  `IDC_NO` vs `IDC_CROSS` for the attack cursor).
+- **Case 0 is the interesting one.** With an empty selection it uses `ActorUnderCursor`
+  (0x007b68e8) -> "unselected"; otherwise a hostility test via `TeamSlots` (0x007b3ec4, stride
+  0xc4, bytes +0x6a/+0x6b selected on `GameMode == 1`) plus `IsFriendlyFireEnabled`, and a
+  `FogOfWar_SampleTotal` visibility test, yielding "activate", "pick up", or "attack" with variant
+  1 (in range) or 0 (out of range) after comparing `|target − unit|²` against a per-unit threshold.
+- What it is **not**: mode 6's body is the bare epilogue, which is what makes "suspended" mean *the
+  cursor is left exactly as it was*. And the guard at the top of the function
+  (`CMP byte [0x006a5b34],0` / `JZ`) **is never taken** — 0x006a5b34's image value is 1 and its only
+  writer also writes 1. That global is deliberately left unnamed: six other references take its
+  **address**, and its neighbours are the constant 2 and pointers to
+  `"gunlok"`/`"elint"`/`"frend"`/`"maskelyn"`, so it is probably the head of a record rather than a
+  flag. **PROPOSED.**
 
 **No box/marquee select was found.** `ToggleReconMode` @ 0x004976d0 (the Recon Mode toggle
 of line 103, and the master gate on the cone renderer; see `ai_behaviour_notes.md` §7) and

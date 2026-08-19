@@ -173,7 +173,7 @@ Node".
   levels.start({script: "level02.gls", console: "level02.gcs"})
   ```
 
-  173 actors / 294 roles, against level01's 158 / 259. Only reach for `level01` when the thing
+  178 actors / 294 roles, against level01's 158 / 259. Only reach for `level01` when the thing
   under test *is* level01 — an existing measurement being reproduced, or the cutscene path
   itself. Every "measured on level01" number in the notes stays as it is; it records what was
   run, not what to run next.
@@ -719,7 +719,7 @@ code still live here under Conventions:
 **The gameplay layer** - recovered from the binary against the shipped manual, which documents
 several features the retail build cannot actually execute:
 
-- `ai_behaviour_notes.md` - enemy perception and the alert state machine: the **vision cone is a swept ray**, not a cone (it detects only on the tick it crosses a target's bearing), the five alert states on `Actor+0x80`, alert propagation whose radius collapses over its own window, and the orange "reacquiring" state that **nothing in the binary can enter**
+- `ai_behaviour_notes.md` - enemy perception and the alert state machine: the **vision cone is a swept ray**, not a cone (it detects only on the tick it crosses a target's bearing), the five alert states on `Actor+0x80`, alert propagation whose radius collapses over its own window, and the orange "reacquiring" state — which was recorded here as unenterable until the write was found at 0x00453e3f, inside `AiThink_Bot` bytes that were **undefined in the database** at the time (behaviour handler 6 @ 0x00453e2b sets `alert_state = 1` with a 17-second deadline and broadcasts update 0x63, 0x62 on expiry). **A sweep over `.text` is a statement about the disassembly** — see the Analysis Trap below
 - `combat_notes.md` - there is **no hitscan**; every shot builds a `ProjectileActor`. The damage arithmetic end to end, the ballistic solve and the SHIFT lob, `aim` as a spread, armour as a flat absorb threshold, splash with no falloff, and the ammo/weapon compatibility test
 - `orders_notes.md` - the 0x28-byte `PendingOrder` FIFO and its 11 kinds (**nothing on the client ever pushes one** - the executor builds it from a wire command), standing orders, selection, Active Pause, and the 71-action key-binding table. **Formations have no geometry**
 - `navigation_notes.md` - flat A\* over the level's own triangles with *squared* distance as both cost and heuristic, so paths are non-optimal; a 200-500 node budget that emits a partial path; no smoothing; and walkability that is **per-agent**, not global
@@ -788,7 +788,9 @@ several features the retail build cannot actually execute:
 - `gls.txt` - Game Level Structure file format quick field list (superseded by gls_system_notes.md)
 - `<Gunlok>\html manual\manual.htm` - the shipped manual (Italian). Not RE, but the best
   inventory of what the gameplay layer is *supposed* to do. Treat it as claims to verify:
-  formations have no geometry, flares are dead code, and the orange alert state is unreachable
+  formations have no geometry, and flares are dead code. Verification runs both ways — the manual's
+  orange alert state was recorded here as unreachable and is not; the code that enters it was
+  sitting in undefined bytes (`ai_behaviour_notes.md`)
 
 ### Shipped game data: the developers' own commented source
 
@@ -883,6 +885,48 @@ section.
   reachable from the main thread. Cut it; treat thread procs as roots.
 - "No xrefs" often means the *referencing data was never defined* (vtables sitting as raw bytes).
   Scan for the little-endian pointer before concluding a virtual has no callers.
+- **A sweep over `.text` is a statement about the disassembly, not about the binary.** The sibling
+  of the trap above: a sweep for writes to a field, or for calls to a function, only ever sees what
+  is *disassembled*. Two measured cases, both inside `AiThink_Bot`, whose 8,400 bytes sat outside
+  the function body behind four unresolved jump tables:
+  `ai_behaviour_notes.md` concluded `alert_state = 1` has no writer anywhere and the manual's orange
+  cone is therefore unreachable — the write is at 0x00453e3f, in bytes that were undefined at the
+  time; and `IsWithinElevationLimit` @ 0x005420a0 was recorded as having no xrefs at all and
+  possibly dead — it has two call sites, both in the same undefined region. So before concluding a
+  field has no writer or a function no caller, check that the *containing* functions are fully
+  disassembled — in practice, that no function in the area has undiscovered bytes inside its
+  address range.
+- **Defining the referencing data is sufficient to recover the code — and you cannot opt out.**
+  Measured: defining an undefined pointer table also **disassembles its targets**. Across 360 runs
+  / 3,394 entries, with **no `DisassembleCommand` run and no function created**, 1,866 of 1,868
+  distinct targets became instructions, the function count rose 12,826 -> 12,845 and the `.text`
+  undefined-byte census fell by 32,427 — Ghidra's auto-analysis acts on the new reference.
+  `AutoAnalysisManager.setIgnoreChanges(True)` was tested and **does not suppress it**. So a
+  two-phase plan ("define the tables now, disassemble later") does not exist; budget the analysis
+  into the define step.
+- **The decompiler does not consult `COMPUTED_JUMP` references.** Also measured. Creating correct
+  `COMPUTED_JUMP` references at an unresolved switch site makes the *listing* and the function body
+  right — edge counts, body size and the byte census all reconcile — but the decompiler
+  **re-derives the jump table itself** and ignores those references. Where it cannot, it emits
+  `Could not recover jumptable at <site>. Too many branches` and **`Treating indirect jump as
+  call`**, which also starves any downstream switch in the same function, whose blocks are then
+  never reached by the CFG. Two consequences: `getJumpTables()` returning 0 is **not** evidence
+  that the references are wrong; and the fix is a **jump-table override**,
+  `ghidra.program.model.pcode.JumpTable(site, dests, True).writeOverride(func)`. In this binary
+  that was needed at the three sites with **no bound check** on the index (0x00563c67, 0x00498185,
+  0x004524b1) — a switch with a `CMP`+`JA` bound decompiled correctly from the references alone.
+  Applying the override to the `InGameMenu` outer switch also unlocked three inner tables the
+  decompiler then recovered unaided. Note too that `getCases()` may report fewer cases than the
+  table has slots when two indices share a body; the override's persistent artifact still stores
+  each `case_N`, so that is render-time coalescing, not data loss.
+- **4-aligned is not sufficient to call a dword a pointer.** A 16-bit array whose value is >= 0x0063
+  in both halves reads as a valid `.text` pointer: the worked case is 0x006a4b70-0x006a4b97, a run
+  of the constant 0x0063 where every dword reads `0x00630063`. Require **distinct values** as well
+  as alignment — specifically, reject a run whose values are all identical. Low distinctness alone
+  is normal inside a vtable region, where shared base slots and `__purecall` repeat legitimately.
+  And **`.reloc` cannot be used as the absolute-vs-RVA oracle in this database**: all 4,884 recorded
+  relocations are confined to `.text` 0x00400000-0x0043ffff, with none in `.rdata`/`.data`, so "this
+  dword has no relocation" carries no information.
 - Reachability and gate counts must be **transitive**: `CommandSpawn` looks ungated but delegates
   to `DoSpawn`, which holds the gate. Converges around depth 2.
 - Read **disassembly** for computed sizes/arguments — the decompiler folds constants differently
@@ -1056,6 +1100,11 @@ section.
   taking args in ECX *and* EDX is `__fastcall` — model it that way and check
   `getVariableStorage()` on each param afterwards. `updateFunction("__thiscall", ...)` also
   auto-inserts its own `this`, shifting your explicit params by one.
+- **`setPlateComment` overwrites silently.** Two consolidator passes destroyed a pre-existing plate
+  comment before the pattern was caught; one was recoverable only from an earlier session's report,
+  and had to be restored marked as a reconstruction. Read comment type 3
+  (`CodeUnit.PLATE_COMMENT`) first and append after a separator rather than writing over it. The
+  same applies to `setComment` on any comment type.
 - After renaming in Ghidra, `grep` the `*.md` files for the old `FUN_`/`DAT_` name.
 - A big function's decompilation can exceed the MCP result token cap (it auto-saves to a
   `tool-results` file needing chunked reads). Instead write it to the scratchpad via Jython

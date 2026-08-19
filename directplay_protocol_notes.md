@@ -470,8 +470,8 @@ and the producing function (name conveys semantics). `R` = sent reliably (guaran
 | `0x5a` | 12 | `MobileActor::AssignToTeamSlot` @ `0x00532d40` | **team-slot assignment / recruit**, `{u32 0x5a, u32 actorId, u32 team_slot}` `R`. Not CTF. It also sets `TeamSlots[n]+0xa0` and `+0x74`, calls `Actor` slot 26 `SetField0x18c`, and — for the role named `Hark` specifically — ORs `0x1000` into `nav_agent->traversal_flags` (`NavAgent+0x2c`), a character-specific nav capability grant |
 | `0x5b`-`0x5d` | 12 | `0x00532e80` / `0x00532fe0` / `OnFlagCaptured` | CTF/objective state updates; `0x5d` is **flag captured** `{actorId, playerIdx}` `R` |
 | `0x5f` | 60 | `MobileActor::AddWalkingSpeed` @ `0x00539ed0` | `{u32 0x5f, u32 actorId, s32 speed_delta, MotionSnapshot[0x30]}` `R`. **Never sent by the shipped binary** — the sender has no callers and no pointer to it exists anywhere in `.rdata`/`.data`, so it is not a vtable slot either |
-| `0x60`/`0x61`/`0x63` | 8 | `AiThink_Bot` @ `0x00451220` | bot AI-state notifications. **Payloads not decoded** — what is established is the sender (the bot AI think proc) and the 8-byte size, and nothing more. To settle: read the three `BroadcastToPlayers` sites inside `0x00451220` and the matching `ApplyUpdateMessage` arms |
-| `0x62` | 8 | `SyncPositionAndBroadcast` | position (short) |
+| `0x60`/`0x61`/`0x63` | 8 | `AiThink_Bot` @ `0x00451220` | bot AI-state notifications. `AiThink_Bot` has **11** `BroadcastToPlayers` sites, not the 8 an earlier sweep saw — three more were recovered from the 8,400 bytes of the function that sat behind unresolved jump tables: 0x00453ed6 and 0x00453f46 (id **0x63**) and 0x00454055 (id **0x62**). At all three the payload is `{u32 id, u32 actor_id = [EBX+0xc]}` with `EDX = 8`, unreliable, plus a by-value `Vec3` stack argument — a shape **inferred from the call site**, not confirmed against `BroadcastToPlayers`' own body. Semantically: **`0x63` is emitted on entering `alert_state = 1`** (the 17-second reacquire state) and **`0x62` on leaving it**, which is what the ids' association with alert states used to rest on and is now measured. `ai_behaviour_notes.md` §11 / §2.1.1. `0x60`/`0x61`'s payloads are still not decoded |
+| `0x62` | 8 | `SyncPositionAndBroadcast`; also `AiThink_Bot` @ 0x00454055 | position (short) — **and** the reacquire-window expiry above. Note that description is not consistent with `ai_behaviour_notes.md` §5.1, which reads the client arm at 0x005005bc as `Unit+0x24 = 0` plus a sound, i.e. an alert-state clear rather than a position; the handler decides it and was not re-read here |
 | `0x65` | 8 | `ExecutorThreadProc` (case 0x26) | team notification |
 | `0x66` | 8 | `FUN_004bdf90`, `MobileActor::ReleaseHoldMarkerOrder` @ `0x00538930` | hold-marker order released `{u32 0x66, u32 actorId}` |
 | `0x67` | var | `QueueScriptExecution` | **run script file** `'g'` + filename `R` (see §8.11) |
@@ -1023,7 +1023,11 @@ Loopback queues, events, and thread details: see `threading_model_notes.md`.
     `arg0 >= 1` the write lands at `0x007b70f8 + (arg0-1)*20 + arg1*4` — and `0x007b70f8 + 4*20`
     is exactly `0x007b7148`, hinting at an `int[4][5]` reached through a base biased by one row.
     Not proved.
-  - Update ids `0x60`/`0x61`/`0x63` — sender identified (`AiThink_Bot`), payloads not decoded.
+  - Update ids `0x60`/`0x61` — sender identified (`AiThink_Bot`), payloads not decoded. `0x63` is
+    settled at three of its sites: `{id, actor_id}`, emitted on entering the bot's reacquire state,
+    paired with `0x62` on leaving it (see the row in §7 and `ai_behaviour_notes.md` §11). What is
+    left there is the header/payload split — the `Vec3` those calls pass by value was read off the
+    call shape, not out of `BroadcastToPlayers` — and whether `0x60`/`0x61` carry the same pair.
   - Update ids `0x3f`/`0x40` — the PROPOSED attack-position pair; see the end of §7.
   - Command `0x17` — whether it is *give item* (`inventory_notes.md` §12) or *board*
     (`orders_notes.md` §8, kind 6, `QueueBoardOrder` @ `0x0050a2e8`). The two files disagree and

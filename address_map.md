@@ -115,6 +115,7 @@ floats with **no readers**.
 | 0x007b7270 | int* | InGameMenuIndex |
 | 0x006a89b4 | int* | InGameMenuSelectedItem |
 | 0x007ba1dc | void*[7] | InGameMenuPanels |
+| 0x007ba1f0 / 0x007ba1f4 | HudWidget** | InGameDialogA / InGameConfirmDialog — the same two objects as `InGameMenuPanels[5]` and `[6]` |
 | 0x007b74dc | LevelList | levelList — `List<LevelInfo>`; a node is 0x18 with `{title, script, console}` at +0x0c/+0x10/+0x14 |
 | 0x007b74ec | float | MouseYNormalized |
 | 0x007b74d0 | float | MouseXNormalized |
@@ -210,6 +211,23 @@ CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84
 | 0x007b6dc0 | float* | LoadingProgressFraction (`DrawLoadingProgressBar` clamps a percent into it) |
 | 0x007b6dd9 | bool* | LevelSessionLoaded — `UnloadLevel`'s early-out guard, cleared at its end. Distinct from `LevelSessionStarted` @ 0x007b6dd8 |
 
+**The mouse cursor:** (the ten shapes are the developers' own `game_cursor.rif` hierarchy names)
+
+| Offset | Type | Name |
+|--------|------|------|
+| 0x007b3f78 | CursorMode* | CursorMode — typed with the `CursorMode` enum, 7 values. **One writer in the image**, `SetCursorMode` @ 0x004a28e0 |
+| 0x007b476c | CursorMode* | SavedCursorMode — where `SuspendCursorMode` stashes the prior mode |
+| 0x007b4738 | void** | CurrentCursor — the selected hierarchy; written only by `SetCurrentCursor` @ 0x004ad1a0 |
+| 0x007b4734 | int* | CursorVariant — 0/1/2, a **target-valid** flag, not a shape index |
+| 0x007b470c .. 0x007b4730 | void*[10] | Cursor_Unselected, Cursor_Standard, Cursor_Attack, Cursor_AttackGround, Cursor_PickUp, Cursor_Activate, Cursor_Drop, Cursor_Pass, Cursor_CameraLock, Cursor_HealCharacter — consecutive dwords, all built by `LoadCursorHierarchies` @ 0x0049c4d0 |
+| 0x007b4740 | int* | InventoryDragState — **PROPOSED**: written 0/1/2/3 by `FUN_004a5210`, read by `DrawInventoryItemPanel` |
+
+**0x006a5b34 is deliberately left unnamed.** `UpdateCursorForMode`'s guard reads it, but its image
+value is **1** and its only writer also writes 1, so that branch is **never taken**; six further
+references take its **address**, and its neighbours are the constant 2 and pointers to
+`"gunlok"`/`"elint"`/`"frend"`/`"maskelyn"`. So it is probably the head of a record rather than a
+flag, and naming it as one would be a guess — **PROPOSED**.
+
 **Window and video mode:** (see `src/WindowPlacement.h`)
 
 | Offset | Type | Name |
@@ -223,6 +241,26 @@ CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84
 | 0x007c1270 / 0x007c1274 | int* | ClientRight / ClientBottom — the client rect's **far corner**, `GameWindowX + width` / `GameWindowY + height`. Named `OrigX`/`OrigY` in the DB until the arithmetic was read; every consumer subtracts the origin back off to recover the size |
 | 0x007c1278 | RECT | DesktopRect — `GetClientRect(GetDesktopWindow())` when windowed, `{0, 0, width, height}` otherwise. Its one reader takes only the width and height from it |
 | 0x007c1288 / 0x007c128c | int* | ClientWidth / ClientHeight (18 readers, all pixel comparisons — `HudItem_DrawByKind`, `DrawInventoryItemPanel`, `ApplyShadowQuality`) |
+
+### `.rdata` / `.data` landmarks
+
+The bands that are structure rather than content — worth knowing before reading anything as a
+pointer, and the source of most of the code that was undiscovered.
+
+| Range | What |
+|-------|------|
+| 0x0064d000-0x0064d380 | the **import address table**, holding on-disk name-table RVAs; already typed |
+| 0x0064d384 | `__guard_check_icall_fptr` — retyped `undefined4` -> `pointer`; its value is `_guard_check_icall` and it has 105 references. *Not* part of the array below |
+| 0x0064d38c-0x0064dc47 | the **MSVC C++ static-initializer array, 559 entries**, bounded by `__xc_a` @ 0x0064d388 and `__xc_z` @ 0x0064dc48 (NULL sentinels, one reference each, from `_initterm` in `_cinit`). **309 of its targets were undiscovered code** |
+| 0x0064dc50-0x0064dc64 | `.CRT$XI*` C initializers (6 pointers) |
+| 0x0064dc78-0x0064dc80 | `.CRT$XP*` pre-terminators (3) |
+| 0x0066e000-0x00672000 | the **RIF/chunk vtable band** — 245 sub-tables; see `rif_chunk_format.md` |
+| 0x006a0000-0x006a2c00 | x86 `__except_handler4` **`_EH4_SCOPETABLE`** tables — 82 headers + 84 records |
+| 0x006aabe8-0x006aade7 | a **128-entry** dispatch array (0x00571c10 -> 0x005745f0). **Nothing in the image references it** — the base is computed at runtime |
+
+0x0064dc50-0x0064dc80 is the CRT initializer/terminator run above and **not** a SafeSEH
+`SEHandlerTable`: no `SEHandlerTable` / `__safe_se_handler_table` symbol exists in the database at
+all.
 
 ### Key Function Addresses (offsets from base)
 
@@ -297,6 +335,20 @@ CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84
 | 0x00578f30 | FastCall<void, void*, int, unsigned, void**> | LoadResourceStringTable — `WinMain` @ 0x0046b355 passes (res dll, 0, 0x7532, 0x00725664) |
 | 0x00725664 | void* | **LocalizedStrings** — the string table, null until the above. `gk::ResourceString`'s readiness test, for the same reason as ConsoleInitialized: it is filled after the engine's first file open |
 
+**The mouse cursor:**
+
+| Offset | Signature | Name |
+|--------|-----------|------|
+| 0x00498140 | CDecl<void> | UpdateCursorForMode — per-frame cursor selector, was `FUN_00498140`. Bare `RET`; body `[0x00498140, 0x004985df]` = 1,184 bytes once its jump table was resolved |
+| 0x004a28e0 | FastCall<void, CursorMode> | SetCursorMode(mode /*ECX*/) — the **sole** writer of `CursorMode` |
+| 0x004a0d70 | — | SuspendCursorMode — saves the prior mode to `SavedCursorMode` and sets 6 |
+| 0x004a0da0 | — | RestoreCursorMode |
+| 0x004a0d50 | — | ResetCursorModeAndRefresh — `SetCursorMode(0)` then a tail `JMP UpdateCursorForMode` |
+| 0x004ad1a0 | FastCall<void, void*> | SetCurrentCursor(cursor /*ECX*/) — stores to `CurrentCursor`, tail-jumps to the below |
+| 0x004a2140 | — | ApplyWin32CursorShape — maps `CurrentCursor` to a `LoadCursorA` id, and does nothing else. **Was named `SetCursor`**, which is now the USER32 import thunk at 0x005712e1 |
+| 0x0049c4d0 | — | LoadCursorHierarchies — builds all ten cursors from `user interface/game_cursor.rif` |
+| 0x0049f340 | FastCall<char> | IsInventoryScreenOpen — `CMP dword [0x007b6e50],0; SETNZ AL; RET` |
+
 **In-game menus:**
 
 | Offset | Signature | Name |
@@ -309,6 +361,16 @@ CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84
 | 0x0056a120 | FastCall<void, const char*, void*, void*> | OpenInGameConfirmDialog |
 | 0x005691f0 | FastCall<void, int> | CloseInGameMenu (kind 0/1/2/3/0x41/0x42/0x43) |
 | 0x00569550 | FastCall<char> | IsAnyInGameMenuOpen |
+| 0x0055a410 | ThisCall (member) | HudWidget_Ctor — writes `HudWidget_vtbl` and sets `+0x60` (the widget kind) from its first stack argument. The base constructor behind all 81 construction sites |
+| 0x0055f8d0 | ThisCall (member) | HudWidget_Dtor |
+| 0x005658d0 | ThisCall (member, RET 0x8) | HudMenuWidget_Ctor |
+| 0x00565910 | ThisCall (member) | HudMenuWidget_Dtor — 2 instructions, tail-jumps to `HudWidget_Dtor` |
+| 0x0056c280 | ThisCall (member) | InGameDialogButton_Ctor |
+| 0x0056c380 | ThisCall (member) | InGameDialogButton_OnActivated — slot 4 of `InGameDialogButton_vtbl`, and the **actual** target of all three slot-4 dispatches in the image |
+| 0x0056c5f0 | ThisCall (member) | InGameDialogLabel_Ctor |
+| 0x0056c920 | ThisCall (member) | InGameDialogA_Ctor |
+| 0x0056a2b0 | — | ActivateInGameDialogA_Default — reads `InGameDialogA`, calls slot 18, tail-jumps to slot 4 of the result |
+| 0x0056a2d0 | — | ActivateInGameConfirmDialog_Default — the same shape on `InGameConfirmDialog` |
 
 **Window and video mode:** (see `src/WindowPlacement.h`)
 
@@ -390,7 +452,7 @@ linked-list chases over the game's own pool heap, touching no D3D object)
 |--------|-----------|------|
 | 0x0055fb20 | CDecl<void> | RenderHudItems — walks `HudItemList` @ 0x007ba250, makes `Camera_Hud` current, calls slot 2 on each item. **Exactly one call site** (0x0046e8c1) and zero literal references anywhere in the image |
 | 0x0055fbd0 | ThisCall<void, HudItem*, int, int> | HudItem_DrawByKind — draws **one** HUD element, dispatched on `this->kind` (`+0x60`, 0..0x43; index table 0x00563928, jump table 0x005638f8). 11 `RenderQueue_Submit` sites, **all passing `Camera_Hud`**, then a run of immediate 2D quads. Was `DrawHud`, which described the caller rather than this |
-| 0x0056a7b0 | ThisCall<void, HudItem*, int, int> | HudItem_Draw — vtable slot 2 of the vtable at 0x006697a4; forwards to the above |
+| 0x0056a7b0 | ThisCall<void, HudItem*, int, int> | HudItem_Draw — slot 2 of the vtable at 0x006697a4, which is **`ParticleTester_vtbl`**, not a HUD-item table: its two writers agree on one class (`ParticleTester::Ctor` @ 0x0056a310 constructs it, `FUN_0056a6e0` is its destructor and chains to `HudWidget_Dtor`, so `HudWidget` is the **base** — calling this table `HudItem_vtbl` would file a derived table under its base). Object size 0x190, confirmed twice: `PUSH 0x190` in `SpawnParticleTester`, `free_sized(this, 400)` in slot 0. Forwards to the above |
 | 0x005695a0 | CDecl<void> | Hud2D_BeginBatch — `RenderBatch_Begin` + bind `HudPlatesTexture`. 2 call sites, both in `RunInGameFrame` (0x0046e87a inventory / 0x0046e8b8 in-level) |
 | 0x005695c0 | FastCall<void, float*, float*, uint, float> | Hud2D_DrawQuad — `(rect_px, uv, diffuse, z)`; 4 verts (stride 0x20) + 6 indices into `ImmediateBatch`. Writes the caller's `z` **verbatim** and `rhw = 1/z`. Wrappers: `Hud2D_DrawQuadNormalized` 0x00569e00, `Hud2D_DrawMeterBar` 0x00569ef0, `Hud2D_DrawNumber` 0x0056d390 |
 | 0x00569ed0 | CDecl<void> | Hud2D_FlushBatch — `RenderBatch_End` + `RenderBatch_Draw(D3DPT_TRIANGLELIST, indexed)`. One call site (0x0046e8cf), no literal references |
@@ -403,7 +465,7 @@ linked-list chases over the game's own pool heap, touching no D3D object)
 | 0x005774c0 | ThisCall<void, Camera*> | Camera_Apply — the three `SetTransform`s (world `+0xc4`, view `+0x84`, projection `+0x44`) and nothing else. **One** parameter: the DB had a second, which was an uninitialised-register artefact |
 | 0x00576470 | ThisCall<Camera*, Camera*> | Camera_Ctor — vptr 0x0066cc9c, `sizeof(base Camera) == 0x26c`. Writes ZFUNC `D3DCMP_LESSEQUAL` to `+0x1cc`/`+0x1d0`, which nothing ever changes |
 | 0x004b04e0 | ThisCall<void, Camera*, float*, float*> | Camera_SetOrthographic — clears `+0x250` (`is_perspective`) and fills `+0x240`..`+0x24c`. `InitRenderCameras` runs it over every camera except `Camera_World` and the sky camera |
-| 0x004b0190 / 0x004b0450 | ThisCall | CameraData_Ctor / _Dtor — the derived class, vptr 0x006644a0, `sizeof == 0x2a0`. **Reached only from a CRT static-initialiser table sitting as undefined bytes**, so neither has an xref |
+| 0x004b0190 / 0x004b0450 | ThisCall | CameraData_Ctor / _Dtor — the derived class, vptr 0x006644a0, `sizeof == 0x2a0`. **Reached only from the C++ static-initializer array** at 0x0064d38c, which sat as undefined bytes — so neither had an xref at all until that array was defined |
 | 0x007c146c / 0x007c1470 | Camera** / bool* | CurrentCamera / CurrentCameraIsPerspective |
 
 Camera globals and their depth slices — the object lives *at* the address (the HUD submits push it
@@ -473,6 +535,14 @@ as the camera pointer), and a `D3DVIEWPORT8` sits at `+0x254` with `MinZ` at `+0
 | 0x0044e1a0 | FastCall<char*, char*> | `strdup` — game-written, allocates via the malloc thunk |
 | 0x00601f4a / 0x00601f2d | — | the *real* CRT malloc/free. Only pool_alloc/pool_free and a few file/rif paths (`ToMap`, `LoadOrGetRifFile`) call them — no field in any mirrored struct holds this memory |
 
+**The IFF chunk registry:** (the IFF-side registry, distinct from `Chunk::Register` — see
+`rif_chunk_format.md`)
+
+| Offset | Signature | Name |
+|--------|-----------|------|
+| 0x005e1d00 | FastCall<void, RifRegEntryCreateFn*, uint32, uint32> (RET 0x8) | IffChunk_Register(create_fn /*ECX*/, container_id, chunk_id) — corrected from `unknown` with 2 stack params, per its `RET 0x8`. **PROPOSED** that the two stack dwords are separate arguments rather than one 8-byte by-value id struct: MSVC `__fastcall` puts no aggregate in a register and EDX carries no argument at any of the 13 call sites, which the struct reading would equally explain |
+| 0x0043c530 / 0x0043c5c0 / 0x0043c670 / 0x0043c740 | — | IffChunkRegistry_AssertNotReadOnly_1..4 — four structurally identical guard stubs, `if (DAT_00838b08) { Error("IFF_READ_ONLY definition not consistent"); exit(-0x2d); }` |
+
 **Misc:**
 
 | Offset | Signature | Name |
@@ -528,6 +598,21 @@ as the camera pointer), and a `D3DVIEWPORT8` sits at `+0x254` with `MinZ` at `+0
 | 0x004dad40 | ThisCall<int, void*, HANDLE> | WriteTeamCarryOverState |
 | 0x004da980 | CDecl<int, HANDLE> | ReadTeamCarryOverState |
 | 0x0044c8d0 | FastCall<int, const char*> | strlen_plus1 (length **includes** NUL) |
+
+### Recovered switch-table function bodies
+
+Four functions whose real extent was hidden behind unresolved MSVC switch tables. Recorded with
+their tables so a later byte census or reader can tell each one is now **complete** rather than
+truncated. All four needed a **jump-table override** (`JumpTable(...).writeOverride`) before the
+decompiler would render them as switches — creating `COMPUTED_JUMP` references is not sufficient;
+see the trap in `CLAUDE.md`.
+
+| Function | Body | Tables |
+|----------|------|--------|
+| `AiThink_Bot` @ 0x00451220 | `[0x00451220, 0x00455228]` = **0x4009 (16,393)** bytes, was 0x1f39 | 0x0045522c (9 entries, site 0x0045244b, `ai_state` remap); 0x00455250 (9, site 0x004524b1, behaviour dispatch); 0x00455274 (4, site 0x00452fdb); 0x00455284 (4, site 0x0045359a). Data map 0x00455229-0x0045529f: a 3-byte alignment NOP, the four tables, then 12 bytes of `cccccccc` up to `AiThink_Mine` @ 0x004552a0. See `ai_behaviour_notes.md` §2.1.2 |
+| `InGameMenu__OnItemActivated` @ 0x00563c30 | `[0x00563c30, 0x0056495b]` = 3,372 bytes / 773 instructions, `void __thiscall(HudWidget *this)`, bare `RET` | five tables: outer pointer 0x0056495c (**23** slots, slot 22 a genuine NULL), byte index 0x005649b8 (66 bytes), inner 0x005649fc (7), 0x00564a18 (24), 0x00564a78 (6). They tile exactly up to `FUN_00564a90`. See `menu_system_notes.md` and `game_defects_notes.md` §17 |
+| `UpdateCursorForMode` @ 0x00498140 | `[0x00498140, 0x004985df]` = 1,184 bytes | 0x004985e0, 7 entries, **no bound check** on the index, then a 4-byte `cccccccc` pad |
+| `D3DFormatToString` @ 0x005a44b0 | `[0x005a44b0, 0x005a4600]` = 337 bytes, `char * __fastcall(int fmt)` | byte table 0x005a468c (103 bytes, indices 0..102) selecting pointer table 0x005a4604 (34 entries); 0x005a4601 is a 3-byte alignment NOP and 0x005a46f3-0x005a46ff is `0xcc`. **Zero callers in the image** — dead debug code; see `rif_chunk_format.md` |
 
 ### Actor Class Hierarchy
 
@@ -673,3 +758,14 @@ is inside the next class's table. Slot counts and the identified slots are in
 
 Key external libraries: BINKW32.DLL (video), STEAM_API.DLL, D3D8.DLL,
 KERNEL32/USER32/GDI32/ADVAPI32/OLE32/WINMM (Windows API).
+
+The import thunks live in **one contiguous run of 82 six-byte `JMP dword ptr [mem]` thunks at
+0x0057115b-0x00571346** (492 bytes), all now defined as thunk functions carrying their bare
+imported symbol names — KERNEL32 35, USER32 33, STEAM_API 5, ADVAPI32 5, OLE32 3, GDI32 1. That
+matters beyond the DB: `utils/symdump/gl_symbols.py` exports database names as the profiler's symbol
+map, so an import now resolves by name in a sampled stack instead of as hex. `SetCursor`
+@ 0x005712e1 is one of them, which is why the game function that used to hold that name is now
+`ApplyWin32CursorShape`.
+
+Two lone 1-byte `RET` functions sit just past the run at 0x00571350 and 0x00571360, in `0xcc` fill,
+with **0 references** each.

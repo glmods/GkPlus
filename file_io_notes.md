@@ -192,8 +192,9 @@ usable:
   (+0x0c) it builds a memory-backed byte source (`ImageSource_Memory_vtbl` @ 0x0066efe0)
   instead of the Win32 one (`ImageSource_Win32Handle_vtbl` @ 0x0066efb8) and decodes from
   the buffer. `req->+0x10` is a third path: a pre-built image object, skipping all I/O.
-  Both sources implement the same **10-slot** vtable — the tables at 0x0066efb8, 0x0066efe0
-  and 0x0066f008 are spaced 0x28 apart — with read at slot 3, tell at 8 and seek at 9;
+  Both sources implement the same **10-slot** vtable — the tables at 0x0066ef90 (the abstract
+  base, `ImageSource_vtbl_abstract`), 0x0066efb8, 0x0066efe0 and 0x0066f008 are spaced 0x28
+  apart — with read at slot 3, tell at 8 and seek at 9;
   bodies in 0x005dc300..0x005dc9f0. (An earlier revision of this section said the dispatch
   was on `req->handle` and the vtable was 8 slots. Both were wrong.)
 
@@ -218,8 +219,10 @@ bytes one at a time through slot 3, walks the trie keeping the **last** factory 
 No match sets `RimLoadErrorCode = 7`.
 
 Seven codecs are registered, from tail-jump thunks whose addresses sit in the C++ static-init
-table at 0x0064dbe8..0x0064dc04. Each is three instructions — `MOV EDX,factory ; MOV ECX,magic ;
-JMP 0x005c8360`:
+table at 0x0064dbe8..0x0064dc04 — which is the **tail** of the MSVC static-initializer array at
+0x0064d38c-0x0064dc47, **559 entries** bounded by `__xc_a` @ 0x0064d388 and `__xc_z` @ 0x0064dc48;
+the seven codec thunks are entries 535-542 of it. Each is three instructions —
+`MOV EDX,factory ; MOV ECX,magic ; JMP 0x005c8360`:
 
 ```
 0x0043c520  "BM"     -> 0x005dd3f0      0x0043c590  "P4"   -> 0x005e02c0
@@ -234,6 +237,11 @@ for a function with seven. All seven are defined now and the query returns seven
 is the confirmation this section was written to predict. A zero-xref count on a registration
 function is evidence about the *database*, not about the binary — the same trap as an undefined
 vtable (CLAUDE.md, Analysis Traps).
+
+**Seven is the complete set**, and that is now confirmed rather than assumed: a survey went looking
+for further image codecs and found none. The 17 static-init entries immediately after the seven are
+**13 `IffChunk_Register` thunks plus 4 guard stubs — not codecs** (`rif_chunk_format.md`, "The IFF
+chunk classes the binary registers"), so the run of registrations ends there.
 
 | Magic | Factory | Object |
 |---|---|---|
@@ -443,7 +451,18 @@ process exit.
 `ImageSource_Win32Handle_vtbl` @ 0x0066efb8 and `ImageSource_Memory_vtbl` @ 0x0066efe0
 (plus a size-tracking wrapper at 0x0066f008) implement:
 `{ScalarDeletingDtor, BytesRemaining, BeginWrite, BeginRead, EndWrite, EndRead, WriteRaw,
-ReadRaw, Tell, Seek}`. Status flags live at `+0x04` (0x01 EOF, 0x02 short read, 0x04/0x08
+ReadRaw, Tell, Seek}`.
+
+There is a **fourth table in the run: the abstract base at 0x0066ef90**, now named
+`ImageSource_vtbl_abstract` — same 10 slots at the same 0x28 stride, and what identifies it as the
+base is that its **slots 8-9 are `__purecall`**. So the run is base, Win32, memory, size-tracking
+wrapper. The 24-slot image interface documented below is likewise now named `Image_vtbl_base`
+@ 0x00671154, ending exactly at the BMP codec's table 0x006711b4.
+
+Those four at a known stride were also the **validation case for the vtable-boundary method** — a
+real slot has zero references, a table start has some — before that method was applied across the
+245 sub-tables of the RIF vtable band. It returned 10/10/10 here, matching what had already been
+read out of the bodies. Status flags live at `+0x04` (0x01 EOF, 0x02 short read, 0x04/0x08
 Win32 error, 0x10 seek/unsupported, 0x20 read/write failed) and the engine tests them
 after slots 20 and 21.
 
@@ -547,6 +566,10 @@ shim or a materialized file:
 
 `.rdata` is not writable at run time; `VirtualProtect` first. Slots are absolute
 addresses in the default image; add `GetBaseAddress()` per the usual convention.
+
+**Re-verified** against the binary's actual import-thunk run (the 82 thunks at
+0x0057115b-0x00571346, `address_map.md` under "Imports"): all eleven slots that
+`src/FileHooks.cpp` and `src/WindowPlacement.cpp` patch match this table exactly.
 
 | API | Slot | Needed for |
 |---|---|---|

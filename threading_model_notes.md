@@ -595,7 +595,23 @@ re-syncs both on level load.
 Lagged-Fibonacci-style RNG with a 0x7C-byte state table per thread @ 0x006a8140
 (+ `i*0x7c`), and per-thread pointer arrays @ 0x006a8238 / 0x006a8240 / 0x006a8248
 indexed by `i = (GetCurrentThreadId() == ExecutingThread)`. Keeps simulation
-randomness (executor) independent from client-side randomness (main).
+randomness (executor) independent from client-side randomness (main). Those four are named
+`RngStateTables` / `RngStateEnd` / `RngPtrA` / `RngPtrB` in the database (6 / 3 / 11 / 11
+references).
+
+**There is a second set of four at the same shape, and it is the one the AI uses.**
+0x006a3130 / 0x006a3228 / 0x006a3230 / 0x006a3238 — exactly **0x5010 lower** than the named set,
+member for member, with the identical layout (a 0x7c-byte state per thread plus three pointer
+arrays of two dwords each). Every `AiThink_*` inlines *that* set: 28 / 14 / 56 / 56 references,
+from `AiThink_Bot`, `AiThink_Minebot`, `AiThink_Node`, `AiThink_Swarm` and `FUN_00457f80`. The two
+random 4-way picks inside `AiThink_Bot` (`ai_behaviour_notes.md` §2.1.2) read it.
+
+Whether these are **two independent RNGs, or the addresses above were recorded wrongly, is NOT
+ESTABLISHED.** What would settle it: the writers at 0x00504d3e-0x00504d90 and
+0x0050f999-0x0050fc83 reference the *named* set, so finding the analogous producer for the
+0x006a3130 set decides which of the two readings is right. What **is** settled is which set the AI
+draws from — 0x006a3130. Those four addresses are deliberately left as `DAT_` in the database for
+this reason; do not name them until the producer is found.
 
 ## Process-level
 
@@ -668,7 +684,8 @@ project database.
 | 0x00505310 | StdCall<void> | RunQueuedScript (per frame, host only) |
 | 0x00579700 / 0x005797c0 | ThisCall<void, bool> | RWLock Lock / Unlock |
 | 0x007c07a0 / 0x007c07d0 | 0x30-byte struct | executor / main game clock |
-| 0x006a8140 | 2 x 0x7c | per-thread RNG state |
+| 0x006a8140 | 2 x 0x7c | per-thread RNG state (`RngStateTables`; pointer arrays 0x006a8238 / 0x006a8240 / 0x006a8248) |
+| 0x006a3130 | 2 x 0x7c | a second set of the same shape, 0x5010 lower (arrays 0x006a3228 / 0x006a3230 / 0x006a3238) — the one every `AiThink_*` inlines. Left `DAT_`; whether it is a separate RNG is NOT ESTABLISHED, see above |
 | 0x007c066c / 0x007c0670 | byte / CS | pool-allocator lock enable (never set) / CS |
 | 0x00587b60 / 0x00587a90 / 0x00587bf0 | | PlayMusicTrack / PlayMusicThread / StopMusicTrack |
 | 0x0046a6d0 | FastCall<int, HANDLE*> | CheckSingleInstance ("GunLok") |

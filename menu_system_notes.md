@@ -9,7 +9,7 @@ container types but nothing else:
 | Current menu | `ChosenMenu` @ `0x007b732c` | `InGameMenuIndex` @ `0x007b7270` |
 | Current item | `ChosenMenuItem` @ `0x006a7d6c` | `InGameMenuSelectedItem` @ `0x006a89b4` |
 | Built by | `SetupMenus` @ `0x004e95e0` | one `OpenInGameXxxMenu` per menu, on demand |
-| Activation | `OnMenuItemClicked` @ `0x004ecf10` | `InGameMenu__OnItemActivated` @ `0x00563c30` |
+| Activation | `OnMenuItemClicked` @ `0x004ecf10` | `InGameMenu__OnItemActivated` @ `0x00563c30` — **nothing in the retail binary dispatches it**, `game_defects_notes.md` §17 |
 | Lifetime | built once at startup, persists | built on open, freed by `CloseInGameMenu` |
 | Rendering | front-end renderer | HUD renderer inside `HudItem_DrawByKind` |
 
@@ -754,9 +754,14 @@ Each open menu also owns a panel widget in `InGameMenuPanels[7]` @ `0x007ba1dc`.
 | 2 | 0x02 | `OpenInGameSaveMenu` @ `0x00568e40` | save-file list |
 | 3 | 0x03 | `OpenInGameMultiplayerFailedMenu` @ `0x00567830` | Load Game, Restart Level, Exit to Menu |
 | 4 | 0x41 | `OpenInGameOptionsMenu` @ `0x00567f00` | volumes, bandwidth, friendly fire/mines, hints, autocrouch, resume |
-| 5 | 0x42 | — | (unidentified) |
-| 6 | 0x43 | `OpenInGameConfirmDialog` @ `0x0056a120` | yes/no confirmation dialog |
+| 5 | 0x42 | `InGameDialogA_Ctor` @ `0x0056c920`, from `FUN_0056a030` | `InGameDialogA` @ `0x007ba1f0` — one label + one button |
+| 6 | 0x43 | `OpenInGameConfirmDialog` @ `0x0056a120` | yes/no confirmation dialog (`InGameConfirmDialog` @ `0x007ba1f4`) |
 
+- **Index 5** is the object at `0x007ba1f0`, now labelled `InGameDialogA`: a 0xb8-byte dialog of
+  vtable `0x00669878` (`InGameDialogA_vtbl`), built by `InGameDialogA_Ctor` @ `0x0056c920` from
+  `FUN_0056a030`, holding one kind-`0x42` label and one kind-`0x44` button, and activated by
+  Enter/Space through `ActivateInGameDialogA_Default` @ `0x0056a2b0`. Index 6 is `0x007ba1f4`,
+  `InGameConfirmDialog`.
 - `IsAnyInGameMenuOpen` @ `0x00569550` scans the panel array.
 - `CloseInGameMenu(kind)` @ `0x005691f0` maps kind `0/1/2/3/0x41/0x42/0x43` to index `0..6`,
   frees every `MenuListItem`, clears the panel slot, and resumes the executor thread once no
@@ -773,17 +778,64 @@ Each open menu also owns a panel widget in `InGameMenuPanels[7]` @ `0x007ba1dc`.
 
 ### In-game item dispatch — `InGameMenu__OnItemActivated` @ `0x00563c30`
 
-`__thiscall`, `this` = the panel. A two-level sparse switch:
+`void __thiscall(HudWidget *this)` — `this` = the panel, and the body is
+`[0x00563c30, 0x0056495b]` = **3,372 bytes / 773 instructions**, ending in a bare `RET` at
+0x00564956. **No dispatch of it was found anywhere in the retail binary** — proven over every x86
+form that can reach vtable slot 4, with one stated caveat, in `game_defects_notes.md` §17. A
+two-level sparse switch:
 
-- **Outer** on `this->kind` (`panel + 0x60`): bytemap @ `0x005649b8` covering ids `0x00..0x41`,
-  pointer table @ `0x0056495c` (23 slots). Ids `0x04`, `0x05`, `0x0d`-`0x0f` are unused.
+- **Outer** on `this->kind` (`panel + 0x60`): bytemap @ `0x005649b8`, **66 bytes**
+  (`0x005649b8`-`0x005649f9`) covering ids `0x00..0x41`; pointer table @ `0x0056495c`,
+  **23 slots** (`0x0056495c`-`0x005649b7`). There is **no bound check on `+0x60`** before the
+  dispatch.
 - **Inner** on `InGameMenuSelectedItem` @ `0x006a89b4`:
   - kind `0x00` (pause) -> table @ `0x00564a78`, 6 entries
   - kind `0x41` (options) -> table @ `0x00564a18`, 24 entries
   - selected ids `0x100`+ -> table @ `0x005649fc`, 7 entries
 
-Ghidra had left this whole region as undefined bytes; it needed explicit
-`DisassembleCommand` on each jump-table target before it would decompile.
+Both outer counts are re-checkable from structure rather than from the decompiler:
+`max(byte table) == 22`, so indices `0..22` are selectable; the pointer table is 92 bytes =
+exactly 23 dwords and **abuts** the byte table with no gap; the dword past its end reads
+`0x02010100`, which is literally the byte table's own first four bytes `[0,1,1,2]`; and bytes
+66/67 of the byte table are `66 90`, MSVC's two-byte alignment NOP, padding the first inner table
+to 4-aligned `0x005649fc`. The five tables tile exactly:
+`0x0056495c + 23*4 = 0x005649b8`; `+66 = 0x005649fa`; `+2 pad = 0x005649fc`;
+`+37*4 = 0x00564a90`, the next function.
+
+**The widget kind space is wider than this table.** `+0x60` is written by exactly one instruction
+in the image — `MOV dword ptr [EDI + 0x60],EBX` @ `0x0055a4a7` in the base constructor, now
+`HudWidget_Ctor` @ `0x0055a410`, from its first stack argument — and that constructor's own switch
+is bounded at `0x45`. So kinds run `0x00..0x45`, and the dialog kinds `0x42`-`0x45` fall off the
+*end* of this byte table as well as off the panel array.
+
+Ids `0x04`, `0x05`, `0x0d`-`0x0f` were previously recorded here as unused. They are **not**: those
+five are exactly the ids the byte table maps to index 22, whose pointer-table slot
+(`0x005649b4`) is a **genuine NULL dword**, and three of the five are really constructed:
+
+| kind | construction site(s) | final vtable | slot 4 |
+|---|---|---|---|
+| `0x04` | **none** | — | — |
+| `0x05` | `0x004a1d4a`, `0x004a1e4a`, `0x004a1fd5` (`FUN_004a1c60`) | `0x0066971c` (base, `HudWidget_vtbl`) | `InGameMenu__OnItemActivated` |
+| `0x0d` | `0x004b99c8` (`FUN_004b9860`), `0x004bd1f1` (`FUN_004bcfb0`) | `0x0066971c` | `InGameMenu__OnItemActivated` |
+| `0x0e` | `0x004b99f1`, `0x004bd193` | `0x0066971c` | `InGameMenu__OnItemActivated` |
+| `0x0f` | `0x0056a34c` | `0x006697a4` (`ParticleTester_vtbl`) | `FUN_0056b6d0` — **overridden** |
+
+Only `0x04` has no construction site anywhere. What makes the null slot unreachable is therefore
+not that the ids are unused but that **nothing dispatches this function at all** — see
+`game_defects_notes.md` §17, which is where that negative is proved.
+
+The probable origin of the old claim, so it is not re-derived: `CloseInGameMenu`'s seven-value map
+(kinds `0/1/2/3/0x41/0x42/0x43` -> indices `0..6`, above) describes the **panel array**, not the
+widget kind space. The two are different domains.
+
+Ghidra's state here was half-recovered rather than raw, and the accurate version is the more useful
+one: the three **inner** switches (`0x005649fc` / 7, `0x00564a18` / 24, `0x00564a78` / 6) were
+fully resolved — references, `pointer` types and `caseD_*` labels — while the **outer** switch had
+no references at all and the function body was still only 62 bytes. That earlier pass had also left
+`0x00563c6e`-`0x00563c8c` **misaligned**, nine bogus instructions re-syncing only at `0x00563c8d`;
+that range has now been re-cut correctly. The outer switch needed a **jump-table override** before
+the decompiler would render it as a switch at all, and applying it also unlocked three of the inner
+tables, which the decompiler now recovers as switches with no further help.
 
 Pause-menu actions (kind `0x00`):
 
@@ -798,6 +850,12 @@ Pause-menu actions (kind `0x00`):
 
 `LevelLoadReason` is the same global documented in `save_system_notes.md` (3 = loading a full
 savegame); **2 = restart current level**.
+
+If nothing dispatches `InGameMenu__OnItemActivated`, rows 1-3 of that table describe code that
+cannot run: `OpenInGameOptionsMenu`'s 16 callers, `InGameMenuAction_LoadGame`'s 2 and
+`OpenInGameLoadMenu`'s single one are all inside that body, so in-game Options, Load Game and Save
+Game would be unopenable. That consequence is **PROPOSED** — `game_defects_notes.md` §17 has the
+dispatch analysis, its caveat, and the one live check that would settle it.
 
 ### Confirm dialogs
 

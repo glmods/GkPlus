@@ -1668,9 +1668,22 @@ images; on the `S3TC` path it is never read at all, which is why it holds nonsen
 ### The IFF chunk classes the binary registers
 
 `IffChunk_Register` @ 0x005e1d00 is the IFF analogue of `Chunk::Register` @ 0x005d4ae0, with
-its own 13 static-init constructors at 0x0043c5f0..0x0043c7f0 (same
-`PUSH pfnCreate / MOV ECX,id / CALL` shape as the RIF ones, so they are invisible to an xref
-search until that range is disassembled).
+its own 13 static-init constructors at **0x0043c5f0..0x0043c7e9** (the last thunk starts at
+0x0043c7d0), which are invisible to an xref search until that range is disassembled.
+
+**The thunk shape stated here was inverted, and the table below is unaffected.** It read
+`PUSH pfnCreate / MOV ECX,id`; measured, it is the other way round — **ECX holds the create
+function** and the two ids are on the stack, `[ESP]` = container id and `[ESP+4]` = chunk id. That
+matches `IffChunk_Register`'s corrected signature,
+`void __fastcall(RifRegEntryCreateFn *create_fn /*ECX*/, uint32 container_id, uint32 chunk_id)`,
+purge 8, per its `RET 0x8`. This was an imprecise description of the route, not a wrong reading of
+the destination: the id / parent / create table below was re-derived from those 13 thunks and
+**reproduces it exactly**, which makes it an independent confirmation of the table rather than a
+correction to it.
+
+Four byte-adjacent guard stubs in the same band are
+`if (DAT_00838b08) { Error("IFF_READ_ONLY definition not consistent"); exit(-0x2d); }`, now named
+`IffChunkRegistry_AssertNotReadOnly_1..4` (0x0043c530 / 0x0043c5c0 / 0x0043c670 / 0x0043c740).
 
 | Id | Parent | Create | Class size | Purpose |
 |----|--------|--------|-----------|---------|
@@ -1752,6 +1765,14 @@ So the choice is only ever DXT1 vs DXT3: **DXT1** for opaque or 1-bit-alpha (4 b
 `D3DFormatToString` @ 0x005a44b0 *names* all five DXT variants - it is a debug log table, not
 a capability list, and `rimutil`'s `case 'DXT5':` in `decompressS3tc` is likewise a decoder
 convenience that no shipped file reaches.
+
+That warning is now stronger on both halves, and is also a plate comment in the DB. The function has
+**zero callers in the image**: it is unreachable dead debug code, so nothing it names has ever been
+asked of the device. And its mapping is right about the *names* — with its switch tables resolved
+(byte table 0x005a468c selecting the 34-entry pointer table 0x005a4604), the 33 recovered bodies emit
+exactly the D3D8 `D3DFORMAT` names at exactly the right enum values, with a separate fourcc ladder
+handling UYVY/YUY2/DXT1..DXT5. So it is an accurate and complete `D3DFORMAT` name table that says
+nothing whatsoever about support.
 
 #### The fourcc picks the surface format, through the alpha-depth rule
 
@@ -2276,6 +2297,33 @@ parent, so these are genuinely distinct functions:
 | `SUBSHPHD` | `SUBSHAPE`                  |
 
 Note `CONSHAPE` is a parent id that is never itself registered.
+
+### Every registered chunk class's vtable
+
+All **105** registered chunk types now have their vtable identified, and the route is the part worth
+keeping, because it is reproducible: `Chunk::Register` @ 0x005d4ae0 has **118 thunks, all named
+`RifLoad_*`**, and each `RifLoad_<ID>` — or the constructor it calls one hop down — carries **two
+0x0066xxxx immediates, the id string and the vtable**. All 105 were derived that way, and **99 have
+been renamed `<ID>_Chunk_Vtbl`** in the database (six already had real names).
+
+**The string pool preceding a vtable run is not a 1:1 name map**, and taking a name from an
+adjacent string is a trap: 30 chunk-id strings precede 34 vtables at 0x0066e6f4, and 14 precede 16
+at 0x0066e2d8. A vtable's name has to come from the `RifLoad_*` route, never from the string sitting
+before it.
+
+Slot counts are almost uniform — **100 classes x 12 slots**, plus:
+
+| Slots | Classes |
+|-------|---------|
+| 15 | `RBOBJECT` @ 0x0066e3b4, `REBENVDT` @ 0x0066f1b0 |
+| 21 | `BMPNAMES` @ 0x0066f734, `BMPLSTST` @ 0x0066f788, `SHBMPNAM` @ 0x0066f8d8 |
+
+**The AvP cross-check disagrees, and that is informative.** AvP Gold's `3dc/win95/Chunk.hpp`
+declares **11** virtuals on `Chunk`, and `Chunk_With_Children` adds none — but Gunlok measures
+**12**, so Gunlok's `3dc` is a later revision of the library with one virtual added. The +3 and +9
+extensions on the 15- and 21-slot subclasses are Gunlok-specific, and the intermediate class they
+belong to is **NOT ESTABLISHED**: decompiling the callee chain under `RifLoad_BMPNAMES`
+@ 0x005d1870 would name it.
 
 ### Gunlok-only chunks (17)
 

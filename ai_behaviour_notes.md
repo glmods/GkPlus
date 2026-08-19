@@ -21,7 +21,7 @@ pointer, `ai_think` @ `Actor+0x34`, installed once from `role->ai`.
 | 0x00450550 | `Actor_SetAiBehaviour` | `__fastcall`, `RET 0x8`. Installs `ai_think` (`Actor+0x34`) and, for `AIType::Mine` only, the on-placed hook at `Actor+0x38`, from `AIType` |
 | 0x0044f560 | `AiExecutorTick` | `__stdcall(uint time_lo, int time_hi)`, `RET 0x8`. Only caller is `ExecutorThreadProc` @ 0x00509050 |
 | 0x00457f30 | `RunAiForTeamGroup` | `__thiscall`, `RET 0x8`. Walks one `TeamActorLists[]` entry |
-| 0x00451220 | **`AiThink_Bot`** | `__thiscall void(Actor*, uint time_lo, int time_hi)`, `RET 0x8`, 0x1f39 bytes |
+| 0x00451220 | **`AiThink_Bot`** | `__thiscall void(Actor*, uint time_lo, int time_hi)`, `RET 0x8`, **0x4009 (16,393) bytes**, one contiguous range `[0x00451220, 0x00455228]` — see §2.1 |
 
 `Actor_SetAiBehaviour` dispatches through a 21-entry byte table at `0x0045069c` and a 10-entry
 jump table at `0x00450674`. The full map (`AIType` -> think function):
@@ -83,19 +83,79 @@ Two separate integers, both on `Actor`, and they are **not** the same thing.
 
 | Value | Meaning | Written at |
 |---|---|---|
-| 0 | **alerted** — an alarm named a position, head for `alert_position` | 0x00454a15 / 0x00454fff (alarm propagation, on the *neighbour*) |
+| 0 | **alerted** — an alarm named a position, head for `alert_position` | 0x00454a15 / 0x00454fff (alarm propagation, on the *neighbour*); 0x00452b69 (handler 0) |
 | 1 | **engaging** — has an `attack_target` | 0x004534bf (behaviour handler 1) |
-| 3 | idle / hold | `Actor_SetAiBehaviour` @ 0x00450567; console `SET ACTIVITY STOP` @ 0x00445a70 |
+| 3 | idle / hold | `Actor_SetAiBehaviour` @ 0x00450567; console `SET ACTIVITY STOP` @ 0x00445a70; and four sites inside `AiThink_Bot` — 0x00453856 (handler 5), 0x00453fc8 (handler 6, on expiry), 0x0045443d (handler 2, unreachable — see below), 0x00454579 (handler 8, empty waypoint list) |
 | 4 | **investigating** a stimulus | 0x00452422 |
-| 7 | **investigating an object** — the retained object is `Actor+0x40` | `AiBeginInvestigate` @ 0x0045e090; tested by `AiThink_Minebot` @ 0x0045719a and `AiThink_Bot` @ 0x004513e5 |
-| 8 | patrol / move order | console `SET ACTIVITY PATROL` @ 0x00445a39 and `GOTO` @ 0x0043ee05 |
-| 6 | (tested at 0x0045459e / 0x004545c5, never written in this module) | — |
+| 6 | **reacquiring** — the target was lost; paired with `alert_state == 1` for a 17 s window (§2.2, §11) | **0x00453e32** (handler 6); tested at 0x0045459e / 0x004545c5 |
+| 7 | **investigating an object** — the retained object is `Actor+0x40` | `AiBeginInvestigate` @ 0x0045e090; 0x0045442b (handler 2, unreachable); tested by `AiThink_Minebot` @ 0x0045719a and `AiThink_Bot` @ 0x004513e5 |
+| 8 | patrol / move order | console `SET ACTIVITY PATROL` @ 0x00445a39 and `GOTO` @ 0x0043ee05; 0x004524cb / 0x0045273b / 0x00452b15 (handler 3, the random wander) |
 
 `AiThink_Bot` chooses a behaviour index 0..8 and tail-dispatches through the jump table at
 **0x00455250** (`{0x452b2d, 0x453486, 0x45441c, 0x4524b8, 0x453d23, 0x45384d, 0x453e2b,
 0x454588, 0x45455a}`) after remapping it through `ai_state` (0x00452492): `ai_state` 0/6 forces
 index 6 unless the index was 5; 1 forces index 1 when `GetAttackTarget()` is non-NULL, else 6;
 4 forces index 4; 8 forces index 8 when the index was 3 (the default).
+
+**Which indices can actually be produced.** Enumerating all 7 predecessors of the dispatch
+preamble at 0x004524ab: index 1 from 0x00451c8a (`MOV EAX,0x1`, an attack target is present) and
+index **0** from 0x00451c9d (`XOR EAX,EAX`, a stimulus actor is present) — both of which reach the
+dispatch **bypassing the `ai_state` remap entirely**; 8 from 0x0045245d; 6 from 0x0045246f; 1 from
+0x0045248e; 4 from 0x0045249a; and the fallthrough at 0x004524a5, where `EAX = [EBP-0x164]`, a
+local with exactly two writers in the whole function (`0x00451411 = 3`, `0x004522a3 = 5`). The
+reachable set is therefore **{0,1,3,4,5,6,8}**: **indices 2 and 7 have no producer**. Index 7 is
+0x00454588, the common tail, which is reached by 43 direct jumps regardless, so the only genuinely
+dead body is **case 2** (0x0045441c, 318 bytes).
+
+That deadness carries one caveat: it rests on the predecessor enumeration being complete for the
+current instruction map, and that map is itself derived from the four jump tables below. Not
+circular, but one level of inference deep.
+
+### 2.1.1 The nine behaviour handlers
+
+All nine were read; the bodies below are measured, not inferred from the writes.
+
+| idx | entry | bytes | what it does |
+|---|---|---|---|
+| 0 | 0x00452b2d | 1,729 | React to a newly perceived actor. Stops movement (`StopAndBroadcast`, `SetMoveState`), zeroes `+0x74`; copies the stimulus actor's position into `alert_position` (+0x64..+0x6c), clears `alert_flag` (+0x70) and bit 0x80 of `+0x7c`, sets `ai_state = 0`; then a random 4-way pick |
+| 1 | 0x00453486 | 325 | Engage the attack target. Same stop-movement preamble; copies the *target's* position into `alert_position`; sets `ai_state = 1`; vtable slot `+0xf8` gate; resets the miss counter `+0x74` if positive; then a random 4-way pick |
+| 2 | 0x0045441c | 318 | Investigate an object — `+0x78` bool plus a local flag -> `ai_state = 7`, else `alert_flag` -> `ai_state = 3`, else sets `+0x78 = 1`. **Unreachable: no producer for index 2** |
+| 3 | 0x004524b8 | 4,880 incl. shared tail | Idle / hold -> **random wander**. A `GetGameTimeSeconds` deadline on `+0x140`/`+0x144`; `ClearAuthoredWaypoints`; two 4096-entry trig tables (`SinTable` @ 0x007f5f78, `CosTable` @ 0x007faf78, indexed `int & 0xfff`) build a direction, scaled by **20.0** and added to the current position; `FindNavPolygonUnder` + a walkability test; two `PushRouteWaypoint` from either `+0xa0` or `+0x1dc` depending on `+0x184`; sets `ai_state = 8` at three sites |
+| 4 | 0x00453d23 | 264 | Stimulus investigation; a 3-float delta and a 9.0 constant. Falls into case 6 at 0x00453d2a |
+| 5 | 0x0045384d | 1,238 | Copies a *local* `Vec3` into `alert_position`, clears `alert_flag`, `StopAndBroadcast`; sets `ai_state = 3` |
+| 6 | 0x00453e2b | 1,521 | The reacquire handler — `alert_state = 1`, the 17 s window, updates 0x63/0x62 (§11) |
+| 7 | 0x00454588 | 3,233 | The common tail / alarm state machine (`alert_state` 2/3/4, updates 0x60/0x63, §4). Reached from everywhere |
+| 8 | 0x0045455a | 3,267 incl. tail | Vtable `+0xf8` gate; if the waypoint list `+0x208` is empty sets `ai_state = 3`; falls into the tail |
+
+`SinTable` / `CosTable` in handler 3 are **pre-existing user-defined names in the database, not
+verified** — the read of the wander code could not determine which of the pair is sine. Treat the
+pairing as a label, not a measurement; what *is* measured is that both are 4096-entry tables
+indexed by `int & 0xfff` and that the result is scaled by 20.0 and added to the actor's own
+position.
+
+### 2.1.2 The four jump tables
+
+`AiThink_Bot` switches four times, and all four entry counts are **CONFIRMED by a perfect
+tiling**: recursive descent from the function entry, resolving exactly these four tables at exactly
+these counts, covers 16,393 of 16,393 bytes with zero gaps and zero overlaps and terminates exactly
+where the table data begins. One entry more or fewer anywhere breaks the tiling.
+
+| table | site | entries | switches on |
+|---|---|---|---|
+| 0x0045522c | 0x0045244b | 9 | `ai_state` (`Actor+0x54`) -> behaviour-index remap |
+| 0x00455250 | 0x004524b1 | 9 | the behaviour dispatch (§2.1.1) |
+| 0x00455274 | 0x00452fdb | 4 | `(per-thread RNG word >> 1) & 3` — the random pick inside handler 0 |
+| 0x00455284 | 0x0045359a | 4 | the same idiom inside handler 1 |
+
+Both random picks are `switch (rand() >> 1 & 3)` whose signed-modulo sign fixup is **dead code**:
+the `SHR` always leaves the value non-negative. (The RNG they draw from is the 0x006a3130 set, not
+the named one — see `threading_model_notes.md`.)
+
+**This is why the function was recorded as 0x1f39 bytes.** 8,400 bytes sat outside the function
+body behind these tables — 8,075 of them undefined bytes, plus 325 bytes of already-disassembled
+instructions attached to no function. The table at 0x00455274 was invisible to every earlier sweep
+because *its own dispatch instruction* was inside the undefined bytes of handler 0: it only became
+findable once table 0x00455250 had been resolved, so the recovery took two passes.
 
 ### 2.2 `Actor::alert_state` @ +0x80 — the alarm, and the cone colour
 
@@ -105,7 +165,7 @@ network updates 0x60/0x61/0x62/0x63 (§5).
 | Value | Meaning | Cone colour |
 |---|---|---|
 | 0 | no alarm | **green** |
-| 1 | reacquiring (17 s window) — **never written server-side**, see §11 | **orange ramp** |
+| 1 | reacquiring (17 s window) — written by behaviour handler 6 @ 0x00453e3f, see §11 | **orange ramp** |
 | 2 | broadcasting the alarm (1 s window) | **blue** |
 | 3 | alarm spent | **red** |
 | 4 | alarm pending (`alarm delay` counting down) | **red** |
@@ -244,7 +304,7 @@ Actor *self @ +0x1c}`:
 `StaticInit_AiEyeOffset` @ 0x00436b80. Gunlok's +Y points down (the navmesh rule is `normal.y < 0` for walkable), so
 this is one metre **up** — the eye height for every ray above.
 
-### 3.2.1 The acquisition call site, and a second dead branch
+### 3.2.1 The acquisition call site, and the reacquire range
 
 `AiThink_Bot` @ **0x00451ba2**:
 
@@ -258,10 +318,13 @@ if (!FindNearestVisibleEnemy(range, &out, &best))           // 0x00451c42
 ```
 
 **`FindNearestVisibleEnemy` @ 0x004591e0** (`__thiscall`, `RET 0xc`) is range plus LOS only —
-**no cone at all** — and it skips **team 0** as well as the actor's own team. Because
-`alert_state == 1` is unreachable (§11), its range in the shipped build is always
-**1.0** — one square metre. So it fires only for an enemy standing essentially on top of the
-actor, and **the swept ray is what actually detects anything**.
+**no cone at all** — and it skips **team 0** as well as the actor's own team. Its range is
+**1.0** — one square metre — in every state but one, so outside that state it fires only for an
+enemy standing essentially on top of the actor, and **the swept ray is what actually detects
+anything**. The `4.0 * sight_range²` branch **is** reachable: `alert_state == 1` is written by
+behaviour handler 6 (§2.1.1, §11), so a bot that has just lost its target spends the 17-second
+reacquire window with a range-and-LOS acquisition four times its own sight range and no cone
+constraint at all. That is the mechanic the manual describes as reacquiring, and it is live.
 
 Both take the scan context in ECX from **`CharacterActor+0x28c`**.
 
@@ -303,8 +366,10 @@ alert_state 0  ─────────────────────�
   calling thread's tick rate: `MULSS xmm0, [EBX+0x30]` at 0x004546a0 against
   `ClockTicksPerSecond` / `...Executor` selected by `GetCurrentThreadId() == ExecutingThread`.
   It is *not* the reacquire timeout the brief guessed at.
-- The **1 second** at 0x004547c1 is `ticks_per_sec` exactly; the **17 seconds** in the dead
-  state-1 arm is `0x11 * ticks_per_sec` (0x00454b4d: `SHL ECX,4; ADD ECX,EDX`).
+- The **1 second** at 0x004547c1 is `ticks_per_sec` exactly; the **17 seconds** in the state-1 arm
+  is `0x11 * ticks_per_sec` (0x00454b4d: `SHL ECX,4; ADD ECX,EDX`). That arm was recorded here as
+  dead while `alert_state == 1` was believed unwritten; it is not (§11), and handler 6 arms the
+  same window at 0x00453e71.
 - Entering state 2 also calls `MobileActor::AppendAuthoredWaypoint(this->coords, 0, 0)` @ 0x0053a830 when `MobileActor+0x218` is 0.
 
 ---
@@ -347,11 +412,14 @@ for (Actor *a : TeamActorLists[this->team_id])            // OWN team only
 |---|---|---|
 | 0x60 | `AiThink_Bot` 0x004546e0 | 0x005004e2: `Unit+0x24 = 4`, plays sound 0x24 |
 | 0x61 | `AiThink_Bot` 0x004547c3 | 0x00500515: `Unit+0x24 = 2`, `Unit+0x88 = now + 1 s` |
-| 0x62 | `CharacterActor::Update` 0x0053f7ee, carrying the **attack target's** id | 0x005005bc: `Unit+0x24 = 0`, plays sound 0x25 / 0x4e |
-| 0x63 | `AiThink_Bot` 0x00454b82 / 0x0045511c | 0x00500664: `Unit+0x24 = 1`, `Unit+0x88 = now + 17 s` |
+| 0x62 | `CharacterActor::Update` 0x0053f7ee, carrying the **attack target's** id; and `AiThink_Bot` 0x00454055, when the reacquire window expires (§11) | 0x005005bc: `Unit+0x24 = 0`, plays sound 0x25 / 0x4e |
+| 0x63 | `AiThink_Bot` 0x00454b82 / 0x0045511c, and 0x00453ed6 / 0x00453f46 on **entering** `alert_state = 1` (§11) | 0x00500664: `Unit+0x24 = 1`, `Unit+0x88 = now + 17 s` |
 
-All four are 8 bytes `{id, actor_id}`, unreliable. The client also makes the 2 -> 3 transition
-itself (§7), so state 3 needs no message.
+All four are 8 bytes `{id, actor_id}`, unreliable — at the three handler-6 sites the id pairs with
+`[EBX+0xc]`, and a by-value `Vec3` goes to `BroadcastToPlayers` alongside the payload rather than
+inside it (that header/payload split is **inferred from the call shape**, not confirmed against
+`BroadcastToPlayers`' own body; see `directplay_protocol_notes.md`). The client also makes the
+2 -> 3 transition itself (§7), so state 3 needs no message.
 
 ---
 
@@ -395,7 +463,10 @@ hears further**. A stimulus inside range with the right bearing sets `ai_state =
 
 Drawn from `DrawOrderMenu` @ 0x00498610 (a 0x3c21-byte function that is far more than a menu).
 It is called **every frame, unconditionally**, from `RunInGameFrame` @ 0x0046e8ca — the name is
-misleading — and it walks the client Units table **twice**. The cones and circles are in the
+misleading — and it walks the client Units table **twice**. The function immediately preceding it
+in the same band, previously `FUN_00498140`, is **`UpdateCursorForMode`**, the per-frame
+mouse-cursor selector, which `RunInGameFrame` also calls, at 0x0046ea01; it is documented in
+`orders_notes.md` §10. The cones and circles are in the
 *second* walk, and that whole walk is gated on one global that none of the rest of this section
 mentions:
 
@@ -412,7 +483,14 @@ mentions:
   Measured in the running game: pressing the bound key with **nothing selected does nothing**, and
   with a character selected it takes level02's start frame from 278 draws to 147 and moves the
   camera to the overhead green view. So a selection is a further precondition somewhere on
-  `ToggleReconMode`'s path; where was not chased.
+  `ToggleReconMode`'s path — and it is **not** the selection test at 0x00497786, which covers only
+  the `:= 0` direction (§11). It also has **3 writers / 21 reads**, not one: both stores in
+  `ToggleReconMode` (0x00497798 and 0x00497968) plus the `LoadGame` restore above.
+
+  On the same path, `ToggleReconMode` sets `CursorMode` 5 on the `:= 0` branch and 0 on the other,
+  and clears `MousePickingEnabled` @ 0x006ac628 on the `:= 0` branch — which is why the cursor is
+  inert in the follow-unit view. The cursor dispatcher itself is
+  `orders_notes.md` §10's `UpdateCursorForMode`.
 
 `orders_notes.md` line 103 already listed that binding; nothing had connected it to the cone
 renderer. Then two more gates:
@@ -492,7 +570,10 @@ Two `Character` fields, both BAM after `ToCharacter`'s `deg * 4096 / 360`:
 
 - **`elevation_angle`** (`Character+0x44`) is tested by **`IsWithinElevationLimit`
   @ 0x005420a0** — `slot 10 GetCharacterData()`, then `|pitch delta| <= elevation_angle`,
-  returning a bool. No direct xref was found to this function (see §11).
+  returning a bool. It has **two call sites**, 0x00452ff8 and 0x004535b7, both inside
+  `AiThink_Bot`: `case 0` of each of the two random 4-way picks (§2.1.1, §2.1.2), whose `case 1` is
+  `IsAnyEnemyWithinSightRange`. It was previously recorded as having no xrefs at all because the
+  calling bytes were undefined.
 
 The angles the turret actually integrates are `CharacterActor+0x2f0` / `+0x2f4` (see
 `actor_vtable_notes.md`), not `TurretActor+0x318`/`+0x31c`.
@@ -507,7 +588,7 @@ The angles the turret actually integrates are `CharacterActor+0x2f0` / `+0x2f4` 
 | Blue = Alarm, has detected one of your characters | `alert_state == 2`, `{0.1,0.1,1.0}` |
 | "every other enemy within this signal's radius is also alerted" | §5, radius from `alert radius`, own team, `AIType::Bot` only |
 | Red = has detected and is targeting | `alert_state` 3 **and** 4, both `{1.0,0.1,0.1}` |
-| Orange = lost lock, reacquiring, a few seconds | `alert_state == 1`, a 17 s ramp — **and nothing ever enters that state** (§11) |
+| Orange = lost lock, reacquiring, a few seconds | `alert_state == 1`, a 17 s ramp — entered by behaviour handler 6 @ 0x00453e3f, which also broadcasts 0x63 (§11) |
 | "may go to the target's last known position" | `Actor::alert_position` @ +0x64, propagated with the alarm |
 | Purple = alternative scanning technology you cannot hide from | `draw vision cone no` + `draw hearing range yes` -> the omnidirectional circle at 0x0049bc3e, `{0.7,0.1,0.6}`; `Chr_Adversor` and `Chr_Walking_Mine` |
 | Explosions make noise that attracts enemies | `PostAiStimulus` from `ProjectileActor::OnPrePhysics`, tested against `hearing range` (§6) |
@@ -542,22 +623,46 @@ are `Character` bools, and `src/Roles.h` already mirrors them correctly at 0x81/
 
 ## 11. Not established
 
-- **`alert_state == 1` (orange) is unreachable.** A sweep of every write to `Actor+0x80` in
-  `.text` finds only `0` (`Actor::Ctor` 0x0052d35a, `ReadActorFixups` 0x00530a06), `2`, `3`
-  and `4` (all six in `AiThink_Bot`). Nothing writes 1, so neither the 17-second reacquire
-  window nor update 0x63 nor the orange ramp can occur in the shipped build. Either the manual
-  documents a cut feature, or the entry point is data-driven in a way this sweep cannot see.
-  What would settle it: a live `render`/REPL observation of a cone turning orange, or a
-  savegame containing `alert_state == 1`.
-  It has a second consequence beyond the colour: the acquisition range at 0x00451bb3 is
-  `4.0*sight_range²` only in that state and `1.0` otherwise (§3.2.1).
-- **"returns to its original coordinates."** No home-position field was found. `Actor+0x64`
-  is the *alert* position, not a spawn point; patrol points come from `ADD PATROLPOINT`
-  (handler 0x00442140 -> `CommandAddWaypointOrPatrolPoint` @ 0x0044c760) into the `MobileActor` waypoint list at +0x204. The
-  return-home behaviour, if it exists, is inside one of the nine behaviour handlers at
-  0x00455250, which were not read.
-- **`ai_state` 6** is tested (0x0045459e / 0x004545c5) but no writer has been found; its meaning
-  is unknown. (7 is settled — see §2.1.)
+- **`alert_state == 1` (orange) is reachable, and this entry used to say the opposite.** The
+  earlier sweep of every write to `Actor+0x80` in `.text` found only `0` (`Actor::Ctor`
+  0x0052d35a, `ReadActorFixups` 0x00530a06), `2`, `3` and `4`, and concluded that nothing writes 1
+  — so neither the 17-second reacquire window nor update 0x63 nor the orange ramp could occur in
+  the shipped build. **The write exists**; it sat in bytes that were undefined in the database, so
+  the sweep could not see it. **Behaviour handler 6 @ 0x00453e2b** — one of the nine this section
+  used to list as unread — does exactly what the manual describes:
+
+  ```
+  00453e2b  CMP dword ptr [EBX + 0x80],0x1      ; already reacquiring?
+  00453e32  MOV dword ptr [EBX + 0x54],0x6      ; ai_state = 6
+  00453e39  JZ  0x00453f57
+  00453e3f  MOV dword ptr [EBX + 0x80],0x1      ; alert_state = 1
+  00453e71  MOV dword ptr [EBX + 0x90],ECX      ; alert_timer_end = now + 17 s
+  00453e9f  MOV dword ptr [EBP + -0x30],0x63    ; update id 0x63
+  00453ed6  CALL 0x00504bf0                     ; BroadcastToPlayers
+  ```
+
+  and the expiry is further down the same handler: 0x00453fc8 sets `ai_state = 3`, 0x00453fed sets
+  `alert_state = 0`, 0x00453ff7 loads update id **0x62**, 0x00454055 broadcasts. So **0x63 is
+  emitted on entering the state and 0x62 on leaving it**, the client mirror at `Unit+0x24` and its
+  17-second orange ramp (§7) both run, and the acquisition range at 0x00451bb3 really is
+  `4.0*sight_range²` while reacquiring (§3.2.1).
+
+  The lesson is worth more than the fact: **a sweep over `.text` is only as good as the
+  disassembly.** 8,400 bytes of this one function were outside its body behind four unresolved
+  jump tables (§2.1.2), and every claim of the form "nothing writes X" made over that region was
+  a statement about the database rather than about the binary. Two other entries in this section
+  fell to the same trap (`IsWithinElevationLimit`, and `ai_state` 6's missing writer).
+- **"returns to its original coordinates" — a measured negative.** All nine behaviour handlers
+  have now been read, and an inventory of every `[EBX + disp]` access across all 3,977 instructions
+  of `AiThink_Bot` (45 distinct offsets) finds the only positional memory to be `alert_position`
+  (+0x64..+0x6c, 5 writes / 3 reads), the actor's own position (+0xa0..+0xa8, read-only), and
+  `+0x1dc` used as a route origin when `+0x184` is set. **No spawn or home field is read
+  anywhere**, and the idle behaviour is not a return to a stored point but a bounded **random
+  wander** — current position plus 20 units on a random bearing (handler 3, §2.1.1). `Actor+0x64`
+  is the *alert* position; patrol points come from `ADD PATROLPOINT` (handler 0x00442140 ->
+  `CommandAddWaypointOrPatrolPoint` @ 0x0044c760) into the `MobileActor` waypoint list at +0x204.
+  The one positional field still unidentified is **`Actor+0x1dc`** — plausibly the current path
+  destination, and the only thing anyone might mistake for a home position.
 - **`scan acceptance angle` and `alertable`** have no reader in anything read here.
 - **`TeamSlots+0x6a` / `+0x6b`** gate which actors get AI at all (`AiExecutorTick`,
   `AiThink_Bot`'s enemy scans). Their meaning is a separate open question — no writer has been
@@ -565,14 +670,18 @@ are `Character` bools, and `src/Roles.h` already mirrors them correctly at 0x81/
   measurement.
 - **`DAT_007ba058`**, the list `PostAiStimulus` walks to wake listeners, is not identified; it
   is a `List<Actor*>` but its membership rule was not read.
-- The **selection precondition on Recon Mode** is not located. Pressing the bound key with nothing
-  selected leaves `ReconModeActive` clear (measured in the running game); which of
-  `ToggleReconMode`'s six callers or which test inside it enforces that was not read.
-- **`IsWithinElevationLimit` @ 0x005420a0 has no xrefs at all** — not a vtable slot in any of
-  the five Actor vtables checked, and no call site. It may be dead.
-- The **behaviour dispatch table at 0x00455250** (nine handlers) was not decompiled; the
-  `ai_state` values in §2.1 come from the writes and the remap switch, not from reading what
-  each handler does.
+- The **selection precondition on Recon Mode** is still not located, but its polarity is now
+  settled and the obvious candidate is ruled out. The selection gate is
+  `CMP dword ptr [0x007b46dc],0` / `JZ 0x00497bbd` at **0x00497786**, and it covers only the
+  `ReconModeActive := 0` direction. The `:= 1` store at 0x00497968 is **unconditional on its
+  path** — the `CMP` at 0x00497961 is the instruction immediately before it, and the `JZ` that
+  consumes it only skips the camera-target block. So the in-game measurement (pressing the bound
+  key with nothing selected leaves `ReconModeActive` clear, §7) is **not** enforced by the
+  selection test. What is still open: which of the three earlier guards at 0x0049773d /
+  0x0049774e / 0x0049775f enforces it, and what the globals 0x007b48bc / 0x007b48c4 / 0x007b48cc
+  are — each compares one against `[TLS+0x20]`, read as camera-transition deadlines against the
+  thread tick, **not confirmed**. Two independent sessions converged on the same three
+  instructions.
 - `AiThink_Scavenger`, `AiThink_Mine`, `AiThink_Minebot`, `AiThink_Node`, `AiThink_Swarm` and
   `AiThink_Waiting` were identified and named but **not analysed**.
 - The exact byte layout of the client `Unit` (`Unit::Unit_Ctor` @ 0x004b4620's product) beyond +0x24, +0x7c/+0x7d,

@@ -26,6 +26,7 @@ Gunlok*, which is an appendix and not a defect — and never renumber an existin
 | 14 | `InventoryInfo_Ctor` leaves `pickup_radius` uninitialised on both paths | every role with an inventory |
 | 15 | `SoundSample_ReadWholeFile` leaks the file `HANDLE` when the read fails | a truncated or unreadable sound file |
 | 16 | `AiBeginInvestigate` builds its deadline with no clock read (PROPOSED) | a minebot spotting something |
+| 17 | the in-game pause menu's Options / Load / Save cannot be opened (PROPOSED; live check INCONCLUSIVE, §17.3) | the pause menu, every level |
 
 ---
 
@@ -162,6 +163,41 @@ because it is reached from almost everywhere and it presents as a plain access
 violation in `gl.exe` with no other clue. Likely more reachable on a non-English
 install, where `glres<lang>.dll` may hold a different set of ids (see the localized
 command-name hazard in `console_command_notes.md`).
+
+### A deterministic repro: `MAIN MENU` from inside a level
+
+**Measured 2026-08-19**, in the same run as §17.3's live check. With level02 up —
+started over the REPL with
+`levels.start({script: "level02.gls", console: "level02.gcs"})`, **178 actors**, camera
+settled — `screen.main_menu()`, i.e. the console **`MAIN MENU`** command, crashes the
+process immediately. WER `APPCRASH`, faulting application **and** faulting module both
+`gl.exe`, exception code **0xc0000005**, fault offset **0x00179009** — this section's own
+signature (gl.exe's default 0x00400000 image base, so address 0x00579009).
+
+What it contributes is that it is the first repro here that is neither opportunistic nor
+on exit: it is scriptable, it fires from a **known live state** rather than during
+teardown, and for *this* instance it narrows the caller from "~400 call sites" to the
+`MAIN MENU` console path. That path's command *name* is itself a localized string —
+GkPlus reaches it as `GK_LOCALIZED_COMMAND(ScreenMainMenu, 10002)` in
+`src/JsCommands.cpp`, and the game's own `SetupConsoleCommands` registers the same
+command through `GetResourceString` (it is the `MENU` entry in the list of fifteen
+resource-named commands in `console_command_notes.md` §1) — so a missing id somewhere on
+that path is the natural suspect, which ties this repro to the localized-command-name
+hazard cited just above. Id 10002 itself did resolve: `RunLocalizedCommandImpl` throws a
+JS error instead of dispatching when its name resource is absent, so the fault is
+**downstream of the name lookup**, in whatever the return to the front end asks for next.
+
+**What this does not establish, plainly: the specific string id was not identified, and
+no dump was symbolized. It is a repro, not a diagnosis.** The paragraphs above stand
+exactly as written — ~400 call sites, not narrowed to a caller *in general*, and the
+evidence that it is not GkPlus's is still the fault address plus its firing with and
+without mods. One narrowed path does not settle the general case.
+
+It is also a **worked instance of the practical consequence above**, which is why it is
+worth a sentence: the session that measured this crash first filed it under §4 as a
+second fault on the teardown/exit path and reasoned from that before checking the offset
+against this section. The offset was the whole answer, and it was already written down
+here.
 
 ---
 
@@ -940,6 +976,134 @@ writer, so the mark stays PROPOSED - keep it that way until someone reads it.
 
 ---
 
+## 17. The in-game pause menu's Options, Load and Save cannot be opened (PROPOSED)
+
+Two halves plus a test. The first is a proposed defect that turned out to be **refuted**; the second
+is what refuting it implies, and it is the part that matters. 17.3 records the live check that was
+supposed to settle the second and **could not**.
+
+### 17.1 The null dispatch slot is real and unreachable
+
+The proposal was: `InGameMenu__OnItemActivated` @ 0x00563c30 switches on `this->kind`
+(`HudWidget+0x60`) with **no bound check**, its byte table @ 0x005649b8 maps widget kinds
+0x04/0x05/0x0d/0x0e/0x0f to index 22, and index 22's pointer-table slot at 0x005649b4 is a
+**genuine null dword** - so any of those five widgets, activated, would `JMP 0`. Every part of that
+is true as far as it goes, and `menu_system_notes.md`'s former claim that those five ids are
+"unused" is **not** the reason it is safe: three of the five (0x05, 0x0d, 0x0e) are constructed at
+six sites and keep the base vtable 0x0066971c, whose slot 4 *is* this function.
+
+It is refuted because **the function has no caller.** Four sweeps, in increasing order of
+paranoia:
+
+- 0x00563c30 appears as a dword in exactly **two** places across every initialized block, found by
+  a raw 4-byte-stride scan of all blocks rather than by `getReferencesTo` (which returns 0 here -
+  the undefined-vtable trap at the end of this file): 0x0066972c and 0x00669770, i.e. **slot 4** of
+  `HudWidget_vtbl` and `HudMenuWidget_vtbl`. It is a vtable slot and nothing else.
+- A raw `E8`/`E9 rel32` scan over all **167,364 undefined bytes** of `.text` finds no call or jump
+  to it, nor to `OpenInGameOptionsMenu`, `InGameMenuAction_LoadGame`, `OpenInGameLoadMenu` or
+  `OpenInGameSaveMenu`.
+- Every x86 form that can dispatch vtable slot 4 was enumerated over defined **and** undefined
+  regions: `CALL/JMP [reg+0x10]` - 117 raw encodings, 112 at defined instruction starts, 5 in
+  undefined regions and none of those in HUD/menu/inventory code; `MOV reg,[reg+0x10]; CALL/JMP reg`
+  - 30 defined, 0 undefined; `ADD reg,0x10; CALL/JMP [reg]` - 854 `ADD reg,0x10` in `.text`, **none**
+  followed by such a call; `CALL/JMP [reg+reg*4]` - none in `.text`.
+- Of all of those, exactly **three** dispatch slot 4 on this widget family: the tail-jumps at
+  0x0056a2c3, 0x0056a2e3 and 0x0056a303 (callers `HandleKeyPress3` on DIK 0x1c Enter / 0x39 Space,
+  and `ToggleInGamePauseMenu`, whose second body block *is* 0x0056a2f0). All three land on vtable
+  0x006697e8, whose slot 4 is **`InGameDialogButton_OnActivated`** @ 0x0056c380 - not this
+  function.
+
+**The caveat, honestly:** this is a proven negative over dispatch *forms*, not over data flow. It
+was **not** proved that no object of those two vtables can reach one of the other 109
+`CALL [reg+0x10]` sites. The supporting argument is arity - `InGameMenu__OnItemActivated` ends in a
+**bare `RET`**, so zero stack arguments, and 56 of the 109 push an argument first, making those
+structurally a different slot-4 signature; the remaining 53 are all nav-mesh/pathfinding,
+executor-thread, chunk-I/O, cutscene and image-format code, none of which holds a HUD widget.
+
+### 17.2 The consequence: three in-game menu entries are dead (PROPOSED)
+
+`OpenInGameOptionsMenu` @ 0x00567f00 has **16 callers and every one of them is inside that dead
+body**. `InGameMenuAction_LoadGame` @ 0x004a0e70 has 2, both inside it. `OpenInGameLoadMenu`
+@ 0x005686b0 has exactly **1** caller - `InGameMenuAction_LoadGame`. So in the retail build the
+in-game pause menu's **Options, Load Game and Save Game cannot be opened at all**: the pause menu
+draws all six rows, and three of them do nothing.
+
+The front-end route is separate and unaffected - `Menus[36]` reaches `MenuSaveGame` @ 0x004e6d30 and
+`MenuLoadGame` @ 0x004e6be0 through `OnMenuItemClicked`, so saving and loading **from the main menu
+work**. It is only the in-game path that is dead.
+
+**This half is PROPOSED and needs one cheap live confirmation before it is stated as fact.** A live
+check has been **attempted and came back INCONCLUSIVE** - see §17.3. It stays PROPOSED. If in-game
+Options *does* open when someone finally actuates it, the dispatch analysis in §17.1 is wrong
+somewhere and this verdict must be re-derived from whichever site actually reached slot 4.
+
+This is stock-Gunlok behaviour, reproducible with **no GkPlus loaded** - nothing in the framework
+hooks that path. `menu_system_notes.md`'s in-game menu section carries the table counts and the
+widget-kind construction sites.
+
+### 17.3 The live check: INCONCLUSIVE, because the harness cannot actuate the wheel
+
+**Run 2026-08-19.** Setup: Steam running in **session 1** (per `CLAUDE.md`'s session-0 rule); Debug
+`d3d8.dll` deployed; `Start-Gunlok -Renderer d3d9 -Port 9222`; then
+`levels.start({script: "level02.gls", console: "level02.gcs"})` over the REPL. **178 actors /
+274-279 draws**, matching `utils/rendertest`'s documented level02 figures, so the level was genuinely
+up and being drawn.
+
+**Verdict: INCONCLUSIVE. §17.2 stays PROPOSED.** The in-game wheel's only actuator is a real mouse
+click, and no synthetic click reaches this game - so the in-game nulls this run produced carry no
+weight in either direction. That the failure is in the **actuator rather than in the game** is
+demonstrated rather than assumed: the same four click methods also failed on the **front-end** menu,
+whose activation is independently known to work (point 4 below).
+
+What the run *did* establish, all measured:
+
+1. **The wheel opens.** ESC -> `DeselectOrActivateMenu` @ 0x00496f70 -> (selection empty) ->
+   `ToggleInGamePauseMenu`. All six rows render exactly as `menu_system_notes.md` documents: Resume
+   Play / Options / Load Game / Save Game / Restart level / Exit to Menu. **ESC is a toggle** - a
+   second press closes it again.
+2. **Mouse *position* reaches the wheel.** Hovering moves the highlight between rows, so
+   `InGameMenuSelectedItem` is being updated and the wheel's per-frame hit-test is running.
+3. **The wheel takes no keyboard input at all.** With the wheel verifiably open, DOWN does not move
+   the highlight, and neither ENTER nor SPACE activates the selected row. It is **mouse-only**.
+4. **The positive control passed, on the keyboard.** At the front end, two DOWNs then ENTER
+   activated "Exit Game" and the process **exited cleanly** - `<Gunlok>\scripts\GLkeys.cfg` was
+   rewritten (`CLAUDE.md`'s documented clean-exit signal) and **no WER entry** was produced. So
+   `OnMenuItemClicked` @ 0x004ecf10 is live and the synthetic *keyboard* path is real.
+5. **No synthetic mouse click reaches either menu.** Four methods, each failing at the **front-end
+   control** as well as in-game:
+   - `SendInput` LEFTDOWN+LEFTUP instantaneous;
+   - `SendInput` with the button **held 250 ms** (~15 frames, so not a polling-edge miss);
+   - `PostMessage WM_LBUTTONDOWN`/`WM_LBUTTONUP` at **physical** client coords;
+   - the same at **virtualized** coords (gl.exe is not DPI aware - window DPI 144, scale 1.5,
+     physical client 3060x1716, so the two coordinate spaces differ and both were tried).
+
+   Consistent with `input_notes.md`: the mouse is on **Raw Input**, so the window procedure ignores
+   `WM_LBUTTON*` entirely, and this game evidently does not accept injected raw button events
+   either.
+
+**One bonus finding, filed under §3.** Ending this run with `screen.main_menu()` from the live level
+crashed the process at fault offset `0x00179009`, which is **§3**'s documented `GetResourceString`
+signature rather than a teardown fault — so it is recorded there, as §3's deterministic repro, and
+not here or under §4.
+
+**A caution for whoever runs the next one, which is the most reusable part of this run.** The first
+attempt pressed DOWN/ENTER/SPACE **after** a second ESC had already closed the wheel - ESC is a
+toggle - so those three "nothing happened" observations were **void**, and they looked exactly like
+a confirmation of §17.2. Re-running with the wheel verifiably open produced the same nulls, but by
+then the control in point 4/5 had shown the actuator itself was dead. **A null result plus an
+untested actuator reads identically to a confirmed defect**, which is how this nearly got recorded
+as CONFIRMED. Establish that your input method can activate *something* that is known to work,
+in the same session, before reading any silence as evidence.
+
+**What would settle it now.** Two options remain, and neither is another scripted run:
+
+- **A human physically clicks "Options" in the pause menu.** Five seconds, and decisive.
+- Or a **temporary GkPlus detour on `InGameMenu__OnItemActivated` @ 0x00563c30 that logs on entry**,
+  plus one physical click. That additionally distinguishes "never called" from "called but its
+  case body is inert" - which no screenshot can.
+
+---
+
 ## Dead code: things that look reachable and are not
 
 Not defects. Recorded so nobody analyses them twice.
@@ -971,6 +1135,15 @@ dword, because the referencing data had never been defined. The image-codec regi
 undisassembled bytes, reported as zero. Before calling anything dead, scan `.rdata`/`.data` for the
 address as raw bytes and look for a thunk that jumps to it. A reference count is a fact about the
 database, not about the binary.
+
+A third case has since been added: **`IsWithinElevationLimit` @ 0x005420a0** was recorded in
+`ai_behaviour_notes.md` as having no xrefs at all and possibly dead, and has **two** call sites
+(0x00452ff8, 0x004535b7) inside `AiThink_Bot` - both in bytes that were undefined because 8,400
+bytes of that function sat behind unresolved jump tables. The same undefined region hid the only
+write of `Actor::alert_state = 1`, which the same file had concluded was never written. The rule
+generalises past xref counts: **a sweep over `.text` is a statement about the disassembly**, so
+before asserting "nothing writes X" or "nothing calls Y", check how much of the region the sweep
+covered is actually defined.
 
 ---
 
