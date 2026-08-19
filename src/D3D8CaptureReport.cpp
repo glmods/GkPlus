@@ -940,6 +940,7 @@ void NoteLightRun(const vulkan::GpuLight *lights, uint32_t count, uint64_t frame
     std::memcpy(key.position, light.position, sizeof(key.position));
     std::memcpy(key.direction, light.direction, sizeof(key.direction));
     std::memcpy(key.diffuse, light.diffuse, sizeof(key.diffuse));
+    std::memcpy(key.specular, light.specular, sizeof(key.specular));
     std::memcpy(&key.range, &light.attenuation[3], sizeof(key.range));
     std::memcpy(key.attenuation, light.attenuation, sizeof(key.attenuation));
     std::memcpy(&key.theta, &light.spot[0], sizeof(key.theta));
@@ -1329,7 +1330,7 @@ std::string FormatFrameLights() {
         (unsigned long long)LightCensusFramesWithLights);
   }
   out += "  type   draws  frames    position                  range   diffuse           "
-         "attenuation\n";
+         "specular          attenuation\n";
   for (const auto &[key, entry] : LightCensusLastFrame) {
     const auto found = LightCensusSession.find(key);
     const uint64_t frames = found != LightCensusSession.end() ? found->second.frames : 0;
@@ -1339,9 +1340,14 @@ std::string FormatFrameLights() {
     char diffuse[32];
     std::snprintf(diffuse, sizeof(diffuse), "%.2f %.2f %.2f", as_float(key.diffuse[0]),
                   as_float(key.diffuse[1]), as_float(key.diffuse[2]));
-    add("  %-5s  %5llu  %6llu    %-24s  %6.2f  %-16s  %.3f %.4f %.5f\n", type_name(key.type),
-        (unsigned long long)entry.draws, (unsigned long long)frames, position,
-        key.type == D3DLIGHT_DIRECTIONAL ? 0.0f : as_float(key.range), diffuse,
+    // The fog-of-war scale lands here and nowhere else, so this column is what moves when a
+    // light is covered - see the comment on LightKey.
+    char specular[32];
+    std::snprintf(specular, sizeof(specular), "%.3f %.3f %.3f", as_float(key.specular[0]),
+                  as_float(key.specular[1]), as_float(key.specular[2]));
+    add("  %-5s  %5llu  %6llu    %-24s  %6.2f  %-16s  %-16s  %.3f %.4f %.5f\n",
+        type_name(key.type), (unsigned long long)entry.draws, (unsigned long long)frames, position,
+        key.type == D3DLIGHT_DIRECTIONAL ? 0.0f : as_float(key.range), diffuse, specular,
         as_float(key.attenuation[0]), as_float(key.attenuation[1]), as_float(key.attenuation[2]));
   }
   return out;

@@ -80,9 +80,37 @@ float GetFogValue();      void SetFogValue(float value);       // +0xa4
 float GetFogUpdateRate(); void SetFogUpdateRate(float rate);   // +0xa8
 float GetFogTransition(); void SetFogTransition(float metres); // +0xac, +0xb0
 
-// FUN_00469270 @ 0x00469270, __thiscall(FogSystem, float rgba[4]), RET 0x4:
-// stores the colour at +0xb8..+0xc4, rebuilds the packed D3D texture factor and
-// pushes it as a render state. Components run 0..1.
+// `FogOfWar_SetColour` @ 0x00469270, __thiscall(FogSystem, float rgba[4]),
+// RET 0x4: stores the colour at +0xb8..+0xc4, rebuilds the packed D3D texture
+// factor and pushes it as a render state. Components run 0..1, unclamped.
+//
+// **Do not call this per frame.** It is not a setter - it also marks the whole
+// 256x256 fog grid dirty (+0x90..+0x9c) and calls `FogOfWar_UploadTexture`,
+// which re-expands all 65,536 cells into a locked `D3DPOOL_SYSTEMMEM` surface
+// and `CopyRects` the whole surface onto the managed video texture. Measured at
+// **~85 us a call** (80-90 us under `GKPLUS_RENDERER=d3d8`, 90-100 us under
+// `vulkan` - the two agreeing is the reading: the cost is the CPU expansion
+// loop, not the upload path), about 0.5% of a 16.6 ms frame. Nothing in the
+// shipped game calls it per frame; its only two callers are the `FOGCOLOUR`
+// console command and `FogOfWar_BuildTextures` at level load / device reset.
+//
+// And with the `D3DFMT_A8` texture the game normally gets, none of that
+// re-upload changes a pixel: `FogOfWar_ExpandRect8bpp` writes alpha only and
+// never reads the packed colour at +0xb4, so the colour reaches the screen
+// through `D3DRS_TEXTUREFACTOR` alone. See `stealth_and_fog_notes.md` 6.4.
+//
+// It also overwrites the **global backbuffer clear colour** `ClearColour`
+// @ 0x007c1204, which `ClearBackBufferAndZ` passes to `Clear()` - so changing
+// the fog colour changes what the whole frame is cleared to.
+//
+// PROPOSED, not implemented: a cheap path would reimplement steps 1-3 of
+// `FogOfWar_SetColour` here (store, pack `ClearColour` + `SetRenderState`,
+// rebuild +0xb4) and skip the upload, guarded on
+// `*(int *)(*(int **)(FogSystem + 0xc8) + 0x20) == 28` (D3DFMT_A8) with a
+// fallback to the game's own function on any other format. The guard is the
+// load-bearing part: at 16/32 bpp the expanders do OR the packed colour into
+// every texel, so skipping the upload there would leave the old colour on
+// screen.
 void GetFogColor(float *rgba);
 void SetFogColor(float r, float g, float b, float a);
 } // namespace gk

@@ -566,7 +566,15 @@ std::string ArmViewportProbe(bool armed, int32_t x, int32_t y, uint32_t width, u
 std::string FormatFrameDraws(uint32_t first, uint32_t last);
 
 // `render.frame_lights` - the D3D lights of the last complete frame, deduplicated by CONTENTS,
-// with how many draws each reached and how many frames it has survived.
+// with how many draws each reached and how many frames it has survived. **Vulkan mode only** -
+// the census is fed from `ResolveLightRun`, which is on the Vulkan draw path; see `GetFrameLights`
+// in `src/JsRender.cpp`.
+//
+// **`specular` is in the key, and it is the column that moves.** Gunlok scales every point and
+// spot light by the fog of war at the light's own position and writes the result into
+// `D3DLIGHT8.Specular` alone (`rendering_notes.md`, `SceneLightSet_SelectLightsForBounds`), so a
+// key without it reports one immortal row per light however the fog changes - which is what this
+// census did while exactly that question was being asked of it.
 //
 // The reading phase 5 needs and nothing had: a `GpuLight` is deduplicated by enable mask *within*
 // a frame and carries no identity at all across one, so "how many distinct point and spot lights

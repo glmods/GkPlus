@@ -181,7 +181,15 @@ Six slots at 0x0066ccd0:
 ```
 
 (0x0066ccc4 is a *different*, 3-slot vtable that happens to sit immediately before it — do not
-read the two as one table.)
+read the two as one table. It is `vtbl_AwLight`, and it is what `Light`'s constructor installs; see
+"`Light`, `SceneLight`, and the single `SetLight` call site" below. The table before *that*,
+`TextDrawNode_vtbl` @ 0x0066ccc0, is one slot, not three — the database had it as a `pointer[3]`
+overlapping `vtbl_Light` until 2026-08, which `address_map.md` had already recorded correctly.)
+
+The object is `{vptr, int refcount, List<Light *> lights @ +0x08, D3DMATERIAL8 material @ +0x18}`
+= 0x5c, and `LightSet::AddLight` @ 0x0057aa20 takes **one argument** — a `const D3DLIGHT8 *`, copied
+whole into the new light by a `REP MOVSD` of 0x68 bytes (both it and `SceneLightSet`'s override are
+`RET 0x4`). `src/Render.h` declared that slot as `AddLight()` with no parameter until 2026-08.
 
 `LightSet_Apply` walks the light list at +0x08, calls `Light_Apply` into D3D light slots 0..n,
 `LightEnable(false)` on the remaining slots up to `MaxD3DLights` @ 0x006ab97c, calls
@@ -196,24 +204,39 @@ from a bounding volume — but **only while `CurrentLightSet == SceneLightSet`**
 draw item has overridden the lighting.
 
 `SceneLightSet` is a **subclass**, not the base object: 0x6c bytes = `LightSet` (0x5c) plus its own
-`List<Light *>` at +0x5c, with vtable **0x006523b8** and three overrides. `WinMain` builds it inline
+`List<SceneLight *>` at +0x5c, with vtable **0x006523b8** and three overrides. `WinMain` builds it inline
 (`PUSH 0x6c; CALL malloc` @ 0x0046b815, base ctor, `MOV dword ptr [ESI],0x6523b8` @ 0x0046b83f, a
 fresh 0xc-byte list sentinel into +0x5c, then `InstallSceneLightSet`).
 
 ```
 +0x00  0x0046c140                                   (base 0x0057ac50, the deleting dtor)
 +0x04  SceneLightSet_SelectLightsForBounds 0x00488400   override — base 0x0057ac80 is an empty RET 0xc
-+0x08  0x00488640                                   override of LightSet_RemoveLight 0x0057a6d0
++0x08  SceneLightSet::RemoveLight 0x00488640        override of LightSet_RemoveLight 0x0057a6d0
 +0x0c  LightSet_Apply                               inherited
 +0x10  Light_Disable                                inherited
-+0x14  0x00488740                                   override of LightSet_AddLight 0x0057aa20
++0x14  SceneLightSet::AddLight 0x00488740           override of LightSet_AddLight 0x0057aa20
 ```
+
+**Those two overrides exist to split the lights into two lists by type**, and that is the fact the
+rest of this section rests on. Both call `Light::IsDirectional` @ 0x005799b0 (`d3d.Type == 3`): a
+directional light goes in the **inherited** list at +0x08, everything else in `SceneLightSet`'s
+**own** list at +0x5c. Only the +0x5c list is walked by the per-mesh selection below, so a
+directional light is never fog-attenuated at all; and because the D3D slot index starts at +0x0c —
+the inherited list's *count* — directional lights own slots `0..n-1` and selected point lights start
+at `n`. (The base `LightSet::AddLight` does no such thing: it puts every light in +0x08 regardless.)
+`SceneLightSet::AddLight` also gates on `DynamicLightsOn` @ 0x006abdfc: with it clear, only a
+directional `src` is accepted at all.
+
+One defect, benign: `SceneLightSet::RemoveLight` frees the light with `operator delete(light, 0x6c)`
+at 0x0048872a — the *base* size — where `AddLight` allocated 0x90 at 0x00488787 and the destructor
+frees 0x90 at 0x0048831a. Gunlok's pool allocator ignores the size argument.
 
 Because lighting is state-sorted through this interface, that slot-1 override — not the base stub —
 is **the** lighting path for world geometry, and it does something nothing else in the renderer
 does:
 
-- **Every light is attenuated by the fog of war at the light's own position.**
+- **Every point and spot light is attenuated by the fog of war at the light's own position — in
+  its `D3DLIGHT8.Specular`, and nowhere else.**
   `SceneLightSet_SelectLightsForBounds` @ 0x00488400 (`void __thiscall(SceneLightSet *, const Vec3
   *bounds_max, const Vec3 *bounds_min, const AwMatrix *world)`, `RET 0xc`) early-outs unless
   `direct3d_device != 0 && DynamicLightsOn @ 0x006abdfc`, then walks the light list at +0x5c testing
@@ -224,6 +247,30 @@ does:
   D3D slot indices start at `this+0xc`, wrap back to 1 at `MaxD3DLights`, and every unused slot up
   to `MaxD3DLights` gets `LightEnable(i, FALSE)` afterwards. Its only reference is the vtable entry
   at 0x006523bc; there are no direct callers.
+
+  Four details of that scaling are load-bearing, and the first was recorded wrongly here until
+  2026-08:
+
+  - Slot 3 is `SceneLight::SetFogScale` @ 0x00488250, and it writes **only**
+    `D3DLIGHT8.Specular.r/g/b` (light `+0x18/+0x1c/+0x20`, via `Light::SetSpecularRGB`
+    @ 0x005799c0). `Specular.a`, `Diffuse` and `Ambient` are untouched. The fog therefore dims
+    the *specular* response of a light and nothing else — which is visible because
+    `D3DRS_SPECULARENABLE` is TRUE for the whole session (set once at 0x0059047a in
+    `ResetDefaultRenderStates`, and none of the 105 `SetRenderState` sites touches it again) with
+    `D3DRS_SPECULARMATERIALSOURCE = D3DMCS_COLOR2` at 0x005908e7.
+  - **It floors at 0.5.** `FogOfWar_SampleTotal` returns 0..0x7f and the divisor is exactly 254, so
+    a fully fogged light is halved, never extinguished.
+  - **It never compounds.** `SetFogScale` multiplies the *authored* colour cached at
+    `SceneLight+0x6c` — seeded from the source `D3DLIGHT8.Specular` when the light is added, and
+    re-cached by the slot-2 override `SceneLight::SetSpecular` @ 0x00488200, which re-applies the
+    current scale immediately. Authored colour and fog scale are orthogonal, in either order.
+  - It runs **per mesh**, not per frame: `SceneMesh_Render` is the caller.
+
+  Measured in the running game, not just read: on level02 the two `Rol_OilFire` lights (which
+  author `specular 1.5 0.5 0` in `oilfire.gsh`) crossed `SetLight` at scales 0.53533, 0.52733 and
+  0.50000 — `1 - n/254` for n = 118, 120 and 127, the last being the fully-fogged cap — and the
+  scale changed when a defogging unit moved away with nothing else about the light changing. The
+  full evidence and the on-screen numbers are in `vulkan_renderer_notes.md` §4.90.
 - **A particle emitter attaches a dynamic light through `SceneLightSet_AddDynamicLight`**
   @ 0x0057a040 — `__thiscall`, `RET 0x1c`, i.e. seven stack dwords *plus* the receiver. All five
   call sites load `ECX` from `[0x007c18cc]`, so it is a method on the scene light set and not the
@@ -239,6 +286,53 @@ does:
   `SetD3DMaterial`, otherwise the colour reaches D3D lazily through `LightSet_Apply`. There is no
   ambient term anywhere in it. (`src/World.h` is not this file's to fix; the header's `AwColour`
   layout and its "flags == 2 means the four floats are authoritative" rule are both correct.)
+
+### `Light`, `SceneLight`, and the single `SetLight` call site
+
+A `Light` is **0x6c bytes and is a `D3DLIGHT8`**: `{+0x00 vptr, +0x04 D3DLIGHT8}`, with nothing else
+in it. (In Ghidra the type is `AwLight`, not `Light`: the root-category `Light` there is the
+0x1c-byte record `ToLight` @ 0x0047e220 builds from the GLS `light` section, and Ghidra resolves a
+`__thiscall` class name against the type manager by name alone — so a class called `Light` would
+have silently typed every method here with the 28-byte GLS struct. `src/Render.h` and this file call
+it `Light`; the functions are `AwLight::SetPosition` and so on.)
+
+Vtable **0x0066ccc4**, three slots, and **no virtual destructor** —
+`SetPosition3f(float,float,float)` 0x00579920, `SetPosition(const Vec3 *)` 0x005798f0,
+`SetSpecular(D3DCOLORVALUE)` 0x00579950. The layout is pinned five independent ways, of which the
+blunt one is `Light::SetAll` @ 0x00579a00: a `REP MOVSD` with `ECX = 0x1a`, i.e. 26 dwords = 0x68 =
+`sizeof(D3DLIGHT8)`, into `this+4`. Derived field offsets from the object base: `Type` +0x04,
+`Diffuse` +0x08, `Specular` +0x18, `Ambient` +0x28, `Position` +0x38, `Direction` +0x44, `Range`
++0x50, `Falloff` +0x54, `Atten0/1/2` +0x58/+0x5c/+0x60, `Theta` +0x64, `Phi` +0x68.
+
+A `SceneLight` is 0x90 and derives from it — vtable **0x00663e4c**, four slots: 0 and 1 inherited,
+**2 overridden** by `SetSpecular` 0x00488200, **3 new** = `SetFogScale` 0x00488250. Its extra fields
+are the authored specular colour at +0x6c, sixteen bytes at +0x7c with **no reader or writer
+anywhere in `.text`**, and `float fog_scale` at +0x8c, initialised to 1.0f at 0x004887b1. Only
+`SceneLightSet::AddLight` builds one, so only the +0x5c list holds them — which is what makes the
+slot-3 call in `SelectLightsForBounds` safe on a 3-slot base vtable.
+
+**`Light_Apply` @ 0x00579840 is the only `IDirect3DDevice8::SetLight` call site in `gl.exe`.** Its
+whole body is `SetLight(index, (D3DLIGHT8 *)((char *)this + 4))` followed by
+`LightEnable(index, TRUE)` — no marshalling, no copy, the light object's own bytes. Verified by
+scanning all 676,244 `.text` instructions for `CALL [reg+0xb0|0xb4|0xb8]`: seven hits — one
+`SetLight` (0x00579858), three `LightEnable` (0x004885fb, 0x0057a907, 0x0057a95c), two `GetLight`
+(0x0057a8a1, and 0x004b9fc7 which is a false positive — a `__thiscall` virtual on a `Unit`). Three
+call sites reach it: 0x004885c7 (the fog path), 0x0057a8e1 (`LightSet_Apply`) and 0x0057aade
+(`LightSet_AddLight`).
+
+That is worth stating in those terms because of what it buys: **wrapping `Direct3DCreate8` is a
+complete description of Gunlok's lighting.** Everything the fixed-function pipeline is ever told
+about a light crosses that one instruction, which is why GkPlus's Vulkan renderer reproduces the
+fog-of-war dimming exactly without implementing any of it — the attenuated `D3DLIGHT8` simply
+arrives at `SetLight` already scaled.
+
+Device vtable offsets confirmed along the way, by argument counts and by `SetD3DMaterial`'s
+`LEA [ECX+0x18]`: **+0xa8** `SetMaterial`, **+0xac** `GetMaterial`, **+0xb0** `SetLight`, **+0xb4**
+`GetLight`, **+0xb8** `LightEnable`, **+0xc8** `SetRenderState`. Note that **+0x88 is `BeginScene`,
+not `SetLight`**.
+
+`ReadBackD3DLightState` @ 0x0057a850 is the seventh hit and is dead: it reads the material and every
+light slot back into stack locals, discards all of it, and has no callers at all.
 
 ### The per-`DrawItem` callback pair
 
@@ -780,7 +874,9 @@ anything here.
 
 - `AwShape` and `AwObject` as classes — only their names are recovered, from two debug strings.
   `Renderable_CtorFromShape` / `Renderable_CtorFromObject` are the two ways in.
-- `LightSet` vtable slots +0x08 (0x0057a6d0) and +0x14 (0x0057aa20).
+- (`LightSet` vtable slots +0x08 and +0x14 were listed here: they are `LightSet_RemoveLight`
+  @ 0x0057a6d0 and `LightSet_AddLight` @ 0x0057aa20, both `RET 0x4`, and both are described in the
+  `LightSet` section above.)
 **The fields still carrying a `field0xNN` name are down to 29, and they divide into exactly two
 kinds** — worth stating, because neither is a matter of not having looked:
 

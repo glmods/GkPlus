@@ -344,11 +344,18 @@ inline std::map<LightingInputs, uint64_t> LightingByFvf;
 // cannot make two identical lights compare unequal. No quantisation: a light the game re-sets to
 // a slightly different position every frame SHOULD read as a new key, because that is exactly the
 // thing this measurement is asking about.
+// **`specular` is part of the key, and that is not symmetry.** It is the one channel Gunlok
+// modulates while a level runs: `SceneLightSet_SelectLightsForBounds` @ 0x00488400 scales every
+// point and spot light by `1 - FogOfWar_SampleTotal(lightPos)/254` and writes the result into
+// `D3DLIGHT8.Specular` alone, leaving `Diffuse` at its authored value. A key without it reports
+// one immortal row per light whatever the fog does, which is exactly what this census did while
+// the question "does the fog of war reach the lights" was being asked of it.
 struct LightKey {
   uint32_t type = 0;
   uint32_t position[3] = {0, 0, 0};
   uint32_t direction[3] = {0, 0, 0};
   uint32_t diffuse[3] = {0, 0, 0};
+  uint32_t specular[3] = {0, 0, 0};
   uint32_t range = 0;
   uint32_t attenuation[3] = {0, 0, 0};
   uint32_t theta = 0, phi = 0, falloff = 0;

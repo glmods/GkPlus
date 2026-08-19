@@ -1112,9 +1112,16 @@ JSValue FrameDraws(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
 }
 
 // `render.frame_lights` - the last complete frame's D3D lights, deduplicated by contents, with
-// how many draws each reached and how many frames it has survived. Mirror-side like `frame_draws`,
-// so it reads the same in every renderer mode. See FormatFrameLights in D3D8Capture.h for what
-// the two "distinct" counts mean together.
+// how many draws each reached and how many frames it has survived. See FormatFrameLights in
+// D3D8Capture.h for what the two "distinct" counts mean together.
+//
+// **Unlike `frame_draws`, this is NOT mirror-side: it reads empty under `GKPLUS_RENDERER=d3d8`
+// and `=d3d9`.** The comment here claimed otherwise until it was used to answer a question about
+// the reference and reported `0 distinct lights` on a level with eight of them. The census is fed
+// from `ResolveLightRun`, which allocates the frame's Vulkan light scratch and therefore only runs
+// on the Vulkan draw path - the *mirror* (`State.lights`) is filled by `SetLight` in every mode,
+// but nothing walks it otherwise. That is a limitation of the instrument and not of the game: the
+// values are the game's own, so a reading taken under `vulkan` describes what `d3d8` was handed too.
 JSValue GetFrameLights(JSContext *ctx, JSValueConst) {
   const std::string text = d3d8::FormatFrameLights();
   return JS_NewStringLen(ctx, text.data(), text.size());

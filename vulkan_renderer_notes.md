@@ -8840,3 +8840,152 @@ A loader that predates `vkEnumerateInstanceVersion` (Vulkan 1.1, 2018). It used 
 through a null check, which is meaningless now that `&vkEnumerateInstanceVersion` is a delay-load
 thunk and never null; such a loader fails at the stub instead, the same as any other missing
 export. The 1.3 floor makes that hypothetical anyway.
+
+## 4.90 The fog of war dims every light, the renderer already reproduces it, and the census could not see it
+
+Two behaviours recovered from the binary in an earlier session, neither recorded here, both asked
+of the running game rather than of the source. The first is the interesting one, and the answer is
+**there is no gap** — which is worth writing down precisely so nobody re-opens it.
+
+### What the game does
+
+`SceneLightSet_SelectLightsForBounds` @ 0x00488400 is `SceneLightSet`'s vtable slot-1 override and
+**is** the lighting path for world geometry: `rendering_notes.md` records `LightSet` as the
+renderer's one genuine 6-slot interface, through which lighting is state-sorted exactly as
+materials are, and `SceneMesh_Render` calls this slot with each mesh's own bounds. For every point
+and spot light whose sphere meets the mesh's AABB it computes
+
+```
+scale = 1.0 - FogOfWar_SampleTotal(lightPosition) / 254.0
+```
+
+and applies it before binding the light. So a world-lit draw in stock Gunlok carries per-light
+dimming that depends on fog-of-war coverage at each light's own position, re-evaluated **per mesh**.
+
+Three details decide whether this side has to do anything, and all three came out of the binary:
+
+- **It lands in `D3DLIGHT8.Specular` and nowhere else.** `SceneLight` (0x90 bytes) caches the
+  authored colour at `+0x6c` and vtable slot 3 (`SceneLight::SetFogScale` @ 0x00488250) writes
+  `authored * scale` into `+0x18/+0x1c/+0x20` — `Specular.r/g/b`. `Diffuse` is untouched, and is
+  written unscaled by the light's owner. So this is **not** a general dimming; it is a specular
+  term.
+- **A `Light` object *is* its `D3DLIGHT8`.** `Light` is `{vptr; D3DLIGHT8}` = 0x6c, and
+  `Light_Apply` @ 0x00579840 does `LEA EAX,[ECX+4]` and passes that pointer straight to
+  `SetLight` — no rebuild, no copy. That call site is **the only `SetLight` in the whole binary**.
+- **The scale is re-derived, never compounded**, and it floors at **0.5**: the sample is 0..0x7f
+  and the divisor is 254.
+
+Together those make the answer structural. **The game applies the attenuation above the seam, so
+the value that crosses `Direct3DCreate8` is already attenuated**, `CaptureDevice::SetLight` mirrors
+it, `StoreLight` copies `light.Specular` into `GpuLight::specular` verbatim, and `world.slang`'s
+light sum multiplies by exactly that field. The renderer reproduces the behaviour by construction,
+for the same reason §1 gives for choosing this seam over the AWAPI render queue.
+
+### The measurement, and the instrument that had to be fixed first
+
+The obvious test — read `render.frame_lights` at two fog states — returned *nothing changing*, on
+five separate levers, and the reason is that **`LightKey` did not include `specular`**. It keyed on
+type, position, direction, **diffuse**, range, attenuation and the spot terms: every field the fog
+leaves alone. A census blind to the one channel under test reports one immortal row per light
+whatever happens, which is indistinguishable from "the behaviour is not there". `specular` is now
+part of the key and a column in the report; that change is the reason the rest of this section
+exists.
+
+Two other levers wasted a run each and are worth naming:
+
+- **`world.fog.enabled = false` does not turn the fog off.** `SetIsFogEnabled` writes a fog *mode*
+  — measured: `false` leaves `world.fog.mode` at **1**, not 0 — and only mode 0 makes
+  `FogOfWar_SampleTotal` return 0. Reading `enabled` back after writing `false` still gives `true`.
+  It is a real mode change (mode 1 vs 2 differs over 73.8% of the frame at 4.95 MAD) but it never
+  stops the sampler.
+- **`world.fog.value` (`FOGVALUE`) does not reach the sampler either.** Swept 0 / 1 / 0.67 with
+  every light's key surviving unbroken.
+
+What does move it is **exploration**: a defogger unit standing near a light. Level02, one vulkan
+session, `render.frame_lights`:
+
+| light | diffuse | range | specular | scale vs authored | implied sample |
+|---|---|---:|---|---:|---:|
+| `-12.78 -1.72 9.71`, units at the start | 4.00 1.50 0.19 | 6.00 | 0.791 0.263 0.000 | 0.52733 | **120** |
+| `-17.22 -1.72 7.27`, units at the start | 4.00 1.50 0.19 | 6.00 | 0.803 0.267 0.000 | 0.53533 | **118** |
+| `-12.78 -1.72 9.71`, defogger teleported away | 4.00 1.50 0.19 | 6.00 | 0.750 0.250 0.000 | 0.50000 | **127** |
+
+The third row is a **new key at the same position** — the `frames` counter restarted at 300 while
+every other field stayed byte-identical — so the specular moved and nothing else did.
+
+The arithmetic closes exactly. Both are `Rol_OilFire`, and `oilfire.gsh` authors
+`red 4 / green 1.5 / blue 0.2`, `specular red 1.5 / green 0.5 / blue 0`, `range 6` — which is the
+diffuse and the range in the table. Dividing the observed specular by the authored `1.5 0.5 0`
+gives 0.52733, 0.53533 and 0.50000, and `254 * (1 - scale)` gives **120, 118 and 127**: integers,
+with 127 being `FogOfWar_SampleTotal`'s documented fully-fogged cap. The direction is right too —
+the defogger leaving drove that light to the cap, because `current` is re-stamped from the static
+layer every update while only `explored` is a min-accumulate.
+
+**And that reading is taken out of `vulkan::GpuLight`, not out of the mirror**: `NoteLightRun`
+receives the array `StoreLight` filled, i.e. the record the fragment shader itself indexes. So this
+is a direct measurement of the renderer's own input, not an inference from the API.
+
+### On screen, and against the original
+
+Level02, the fire camera (`camera.position = -15.0 -1.7 8.5`, `distance 16`, `roll 341`), settled
+and paused, 178 actors and 140 draws in every run, `render.stock = true`:
+
+| | whole-frame MAD | changed |
+|---|---:|---:|
+| d3d8 vs d3d8, two launches — **the floor** | 4.787 | 24.0% |
+| d3d8 vs vulkan | **3.868** | 36.0% |
+
+The cross-renderer number is **below** the cross-launch floor, so nothing here is attributable to
+the renderer. That floor is enormous by this file's standards and the difference image says why:
+it is the two oil fires' particle animation phase, which is not pinned across launches — §4.27's
+rule about judging a feature on its region, and the plan's warning that a number without a floor is
+unreadable, both apply, and this camera is the worst in the game for a cross-process shot. It is
+also the only camera in level02 where the behaviour is live at all, because the three purple lights
+at `z ~ -20` author `specular 0 0 0` and their scale multiplies zero.
+
+Which is the honest summary of what this behaviour is worth here: **two lights in level02 carry a
+non-zero specular for it to scale, and the scale runs 0.50 to 0.54.** The 0.13/255 whole-frame
+residual of §4.38 is not hiding it, and neither is a uniformly-fogged test scene — the scene tested
+had partial coverage by construction, with the start area revealed and everything past it fogged.
+
+### 4.90.1 `FogOfWar_SetColour` re-uploads the whole fog texture, and in this configuration for nothing
+
+`FogOfWar_SetColour` @ 0x00469270 — `world.fog.color` in script — ends by setting the dirty
+rectangle to the entire grid (`+0x90 = +0x94 = 0`, `+0x98 = +0x9c = grid_dim - 1`) and calling
+`FogOfWar_UploadTexture` unconditionally. There is no incremental path and no early-out. One call
+is a full CPU re-expansion of all **65,536** cells into a locked `D3DPOOL_SYSTEMMEM` surface
+(~1.25 M instructions, 128 KB read, 64 KB written, with the format record and both shift fields
+reloaded per texel), a `LockRect`/`UnlockRect` pair, two `GetSurfaceLevel`/`Release` round trips,
+and a full-surface `CopyRects` into the managed texture.
+
+**Measured from the REPL, 200 calls against a 200-iteration property-read control:**
+
+| | per call |
+|---|---:|
+| `GKPLUS_RENDERER=d3d8` (the original runtime) | **80-90 us** |
+| `GKPLUS_RENDERER=vulkan` | **90-100 us** |
+
+The two agreeing is itself the reading: the cost is the CPU expansion loop, not the upload path, so
+it does not go away on a faster one. At ~85 us it is about 0.5% of a 16.6 ms frame — not ruinous,
+but it is a second full upload stacked on the one `FogOfWar_Update` already performs each frame
+with a small accumulated rect, and nothing in the shipped game calls it per frame (its only two
+callers are the `FOGCOLOUR` console command and `FogOfWar_BuildTextures`, i.e. level load and
+device reset).
+
+**And in the configuration the game actually runs in, none of it changes a pixel.** The format
+selector prefers `D3DFMT_A8`, and `FogOfWar_ExpandRect8bpp` writes alpha only — it never reads the
+packed colour at `+0xb4`. The colour reaches the screen entirely through `D3DRS_TEXTUREFACTOR`,
+which `SetColour` has already written 0x90 bytes earlier. Confirmed live rather than assumed:
+`render.textures` on level02 lists the fog grid as index 8, **unnamed, 256x256, 1 level,
+`format 28` = `D3DFMT_A8`, 65536 bytes** — which also matches what §4.51 saw at texture stage 1.
+The re-upload is only *necessary* on a device with no `A8`, where the 16- and 32-bpp expanders `OR`
+`+0xb4` into every texel.
+
+So the cost is **incidental, not inherent**, and a cheap path exists if a per-frame colour knob is
+ever wanted — store the floats, recompute `+0xb4`, write `ClearColour`, issue the
+`SetRenderState` — **guarded on `*(int *)(*(int **)(FogSystem + 0xc8) + 0x20) == 28`**, falling back
+to the game's own function on any other format. That guard is the load-bearing part.
+
+One side effect to know about before calling it at all: `SetColour` also overwrites the global
+`ClearColour` @ 0x007c1204, whose only reader is `ClearBackBufferAndZ`. `FOGCOLOUR` therefore
+changes what the whole backbuffer is cleared to, not just the fog.

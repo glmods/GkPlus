@@ -248,6 +248,7 @@ and still forwards every call to d3d8to9 so the A/B stays available.
 | Line lists and triangle strips | ✅ §4.21, §4.27 — **on by default** now that stencil exists |
 | **Upload ordering** — two copies to one arena slot in one batch | ✅ §4.24 |
 | Fog | — measured absent, §4.19 and §4.25; nothing to do |
+| **The fog of war dimming every light** — `SceneLightSet_SelectLightsForBounds` scaling each point and spot light by `1 - FogOfWar_SampleTotal(lightPos)/254` | ✅ §4.90 — **reproduced with no code, and that is structural**: the game applies it above the seam, into `D3DLIGHT8.Specular` alone, and `Light` *is* its `D3DLIGHT8`, so the attenuated value is what crosses `SetLight`. Confirmed by reading it back out of `GpuLight` — level02's two `Rol_OilFire` lights at `1.5 0.5 0` authored, observed at scales 0.53533 / 0.52733 / 0.50000, i.e. samples **118 / 120 / 127** exactly. The whole frame is **3.868 against a 4.787 cross-launch floor**. What had to be fixed was the *instrument*: `LightKey` keyed on diffuse and not specular, so the census could not see the one channel the fog touches |
 | **The real light sum** — the whole D3D8 equation, per vertex | ✅ §4.26 — within 1/255 on four of six regions |
 | **`GpuDrawRecord`** — per-draw data in an array, push constants 120 → 72 bytes | ✅ §4.26 |
 | **Stencil shadows** — depth format with a stencil aspect, stencil in `PipelineState` | ✅ §4.27 — the shadow region matches d3d9 to 0.5/255 |

@@ -498,9 +498,77 @@ static_assert(offsetof(AwTexture, translucent) == 0x18);
 static_assert(offsetof(AwTexture, refcount) == 0x1c);
 static_assert(offsetof(AwTexture, path) == 0x2c);
 
-// The 0x6c-byte record LightSet_AddLight allocates. Only its size and its owner
-// are established here.
-struct Light;
+// The D3DLIGHT8 the engine hands to IDirect3DDevice8::SetLight, spelled out
+// rather than pulled in from d3d8.h - the same choice LightSet's material makes.
+struct D3DLight8 {
+  int type; // +0x00 D3DLIGHTTYPE; 1 point, 2 spot, 3 directional
+  Vec4 diffuse;   // +0x04
+  Vec4 specular;  // +0x14
+  Vec4 ambient;   // +0x24
+  Vec3 position;  // +0x34
+  Vec3 direction; // +0x40
+  float range;    // +0x4c
+  float falloff;  // +0x50
+  float attenuation0; // +0x54
+  float attenuation1; // +0x58
+  float attenuation2; // +0x5c
+  float theta;        // +0x60
+  float phi;          // +0x64
+};
+static_assert(sizeof(D3DLight8) == 0x68);
+static_assert(offsetof(D3DLight8, specular) == 0x14);
+static_assert(offsetof(D3DLight8, position) == 0x34);
+static_assert(offsetof(D3DLight8, range) == 0x4c);
+
+// The 0x6c-byte record LightSet::AddLight allocates: a vptr and then a whole
+// D3DLIGHT8, which is the entire object. Vtable 0x0066ccc4, three slots, and
+// NO virtual destructor - LightSet::RemoveLight frees the bytes directly.
+//
+// Light_Apply @ 0x00579840 is the reason this layout matters: its whole body is
+// SetLight(index, (D3DLIGHT8 *)((char *)this + 4)) followed by
+// LightEnable(index, TRUE), with no marshalling and no copy - and 0x00579858 is
+// the *only* SetLight call site in gl.exe. Everything Gunlok's fixed-function
+// lighting ever tells Direct3D crosses that one instruction, which is why
+// wrapping Direct3DCreate8 is a complete description of it.
+//
+// In Ghidra this type is `AwLight`, not `Light`: the root-category `Light` there
+// is the 0x1c-byte record ToLight @ 0x0047e220 builds from the GLS `light`
+// section, and Ghidra resolves a __thiscall class name by name alone.
+struct Light {
+  virtual void SetPosition3f(float x, float y, float z) = 0; // slot 0
+  virtual void SetPosition(const Vec3 *pos) = 0;             // slot 1
+  // Slot 2. Writes d3d.specular and nothing else. SceneLight overrides it.
+  virtual void SetSpecular(Vec4 colour) = 0;
+
+  D3DLight8 d3d; // +0x04
+};
+static_assert(sizeof(Light) == 0x6c);
+static_assert(offsetof(Light, d3d) == 0x04);
+
+// A Light in SceneLightSet's point_lights list: 0x90 bytes, vtable 0x00663e4c,
+// four slots (0 and 1 inherited, 2 overridden, 3 new).
+//
+// This is where the fog of war reaches Direct3D. SceneLightSet's per-mesh light
+// selection calls SetFogScale with 1 - FogOfWar_SampleTotal(light position)/254,
+// which rewrites *only* d3d.specular.{x,y,z} as authored_specular * fog_scale -
+// never diffuse, never ambient, and never specular.w. Because the product is
+// re-derived from the cached authored colour every time, neither repeated
+// selection nor a mid-level colour change makes the attenuation compound.
+struct SceneLight : Light {
+  // Slot 3. Also called by the constructor's initial 1.0f.
+  virtual void SetFogScale(float scale) = 0;
+
+  // +0x6c the specular colour as authored, seeded from the source D3DLIGHT8 in
+  // AddLight and re-cached by the slot-2 override. The fog scale multiplies
+  // this, not the currently bound value.
+  Vec4 authored_specular;
+  // +0x7c no reader and no writer anywhere in .text.
+  uint8_t field0x7c[0x10];
+  float fog_scale; // +0x8c 1.0f at construction; floors at 0.5 under full fog
+};
+static_assert(sizeof(SceneLight) == 0x90);
+static_assert(offsetof(SceneLight, authored_specular) == 0x6c);
+static_assert(offsetof(SceneLight, fog_scale) == 0x8c);
 
 // The one genuinely polymorphic interface in the renderer: six slots, and
 // lighting is state-sorted through it exactly the way materials and textures are.
@@ -516,7 +584,9 @@ struct LightSet : AwRefCounted {
   // when no draw item has overridden the lighting.
   virtual void SelectLightsForBounds(const Vec3 *bounds_a, const Vec3 *bounds_b,
                                      const float *world) = 0;
-  // Slot 2. Unlinks `light` from the list and frees its 0x6c bytes.
+  // Slot 2. Unlinks `light` from the list and frees its 0x6c bytes. Note that
+  // SceneLightSet's override frees a *SceneLight* with the base's 0x6c size -
+  // see the note there.
   virtual void RemoveLight(Light *light) = 0;
   // Slot 3. Fills D3D light slots 0..n from `lights`, LightEnable(false) on the
   // rest up to MaxD3DLights, applies the D3D material, then publishes itself as
@@ -524,11 +594,18 @@ struct LightSet : AwRefCounted {
   // light set differs from the current one.
   virtual void Apply() = 0;
   virtual void Disable() = 0;
-  // Slot 5. Appends a new 0x6c-byte Light, or returns null once the list already
-  // holds MaxD3DLights of them - the cap is enforced here, not at bind time.
-  virtual Light *AddLight() = 0;
+  // Slot 5. Copies `src` into a new 0x6c-byte Light and appends it, or returns
+  // null once the list already holds MaxD3DLights of them - the cap is enforced
+  // here, not at bind time. The argument is measured, not assumed: both this
+  // (0x0057aa20) and SceneLightSet's override (0x00488740) are RET 0x4, and the
+  // base copies all 0x68 bytes of `src` into the new light with a REP MOVSD.
+  // This header declared it as AddLight() with no parameter until 2026-08.
+  virtual Light *AddLight(const D3DLight8 *src) = 0;
 
-  List<Light *> lights; // +0x08
+  // +0x08 every light this set owns. On a SceneLightSet it holds *only* the
+  // directional ones - see SceneLightSet::point_lights - and its count is then
+  // also the first D3D light index the per-mesh selection is free to use.
+  List<Light *> lights;
 
   // +0x18 a D3DMATERIAL8, laid out exactly as D3D declares it. Named rather than
   // typed so this header does not have to pull in d3d8.h.
@@ -545,6 +622,21 @@ static_assert(offsetof(LightSet, lights) == 0x08);
 static_assert(offsetof(LightSet, diffuse) == 0x18);
 static_assert(offsetof(LightSet, emissive) == 0x48);
 static_assert(offsetof(LightSet, power) == 0x58);
+
+// The scene-wide light set @ 0x007c18cc, built inline by WinMain. It adds no
+// vtable slots - it overrides three (SelectLightsForBounds, RemoveLight,
+// AddLight) - and one list, which is the whole point:
+//
+//   AddLight and RemoveLight split on the light's type. A directional light
+//   (d3d.type == 3) goes in the inherited `lights`; everything else goes here.
+//   Only `point_lights` is walked by the per-mesh selection, so a directional
+//   light is never fog-attenuated, and the directional count is where the D3D
+//   slot allocation starts.
+struct SceneLightSet : LightSet {
+  List<SceneLight *> point_lights; // +0x5c
+};
+static_assert(sizeof(SceneLightSet) == 0x6c);
+static_assert(offsetof(SceneLightSet, point_lights) == 0x5c);
 
 // The per-DrawItem callback pair the engine supplies to itself: slot 1 runs
 // immediately before the geometry and slot 2 immediately after, both with the

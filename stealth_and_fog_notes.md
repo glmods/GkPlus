@@ -266,19 +266,19 @@ executor side reads it.
 | 0x10 | `float` | `1 / extent` |
 | 0x14 | `float` | `gridDim / extent` (world units -> grid cells) |
 | 0x18 | `int` | enabled level: 0 = off, 1 or 2 (3 on Voodoo 2/3). `FogOfWar_SetEnabledLevel` @ 0x004697d0. **0 makes every sample return 0** |
-| 0x1c | `byte *` | **explored** grid, `gridDim^2`. Persistent minimum; this is the one that is saved |
-| 0x20 | `byte *` | **current** grid, `gridDim^2`. Rebuilt every frame |
+| 0x1c | `byte *` | **explored** grid, `gridDim^2`. Persistent minimum; this is the one that is saved. `malloc`'d in `FogOfWar_Ctor` |
+| 0x20 | `byte *` | **current** grid, `gridDim^2`. The per-frame working grid — `FogOfWar_StampDefoggerUnits` opens with `memcpy(+0x20, +0x24, dim*dim)` |
 | 0x24 | `byte *` | **static layer** snapshot, `gridDim^2` — the defog areas only |
-| 0x28..0x5b | | fog system texture record ("Fog System Texture" name at +0x54) |
-| 0x5c..0x8f | | fog video texture record ("Fog Video Texture" name at +0x88) |
-| 0x90,0x94,0x98,0x9c | `int` | dirty rect `x0, y0, x1, y1` (also used as a `RECT` for `CopyRects`) |
-| 0xa0 | `int` | `gridDim`, clamped to `MaxTextureDimension` @ 0x006ab970 |
+| 0x28 | `IDirect3DTexture8 *` | **"Fog System Texture"**, `D3DPOOL_SYSTEMMEM`, `gridDim x gridDim`. First field of a 0x34-byte texture record (name pointer at +0x54, whole record `memset` in `FogOfWar_BuildTextures`). This is the one `FogOfWar_UploadTexture` `LockRect`s |
+| 0x5c | `IDirect3DTexture8 *` | **"Fog Video Texture"**, `D3DPOOL_MANAGED`, same size. First field of a second 0x34-byte record (name at +0x88). The `CopyRects` destination — this is the one that is sampled |
+| 0x90,0x94,0x98,0x9c | `int` | dirty rect `left, top, right, bottom`, **inclusive bounds** (both expander loops terminate on `JLE`). `UploadTexture` `INC`s `+0x98`/`+0x9c` at 0x0046712d-0x00467142 to build the exclusive `RECT` `CopyRects` wants, then resets the rect to empty |
+| 0xa0 | `int` | `gridDim`, clamped to `MaxTextureDimension` @ 0x006ab970. `LoadLevel` passes literal 0x100 at 0x004e0df4, and both D3D textures are created `gridDim x gridDim` |
 | 0xa4 | `float` | `FOGVALUE` — fog level in discovered areas, 0..1 |
 | 0xa8 | `float` | `FOGUPDATE` — complete updates per second |
 | 0xac / 0xb0 | `float` | `FOGTRANSITION` metres / its reciprocal |
-| 0xb4 | `unsigned` | fog colour packed into the surface format |
-| 0xb8..0xc4 | `float[4]` | `FOGCOLOUR` RGBA (also drives `D3DRS_TEXTUREFACTOR` and `ClearColour`) |
-| 0xc8 | ptr | chosen surface-format record (bit shifts used by the texture expanders) |
+| 0xb4 | `unsigned` | fog colour packed into the surface format — **RGB only, no alpha**, duplicated into the high word when the format is 16 bpp. Read by the 16bpp and 32bpp expanders; **the 8bpp expander never reads it** |
+| 0xb8..0xc4 | `float[4]` | `FOGCOLOUR` RGBA, **unclamped** (also drives `D3DRS_TEXTUREFACTOR` and `ClearColour`). `ClearColour` @ 0x007c1204 is the **backbuffer** clear colour, not a fog-local value: its only writer is `FogOfWar_SetColour` (0x004692d8) and its only reader `ClearBackBufferAndZ` (0x00574e81), which passes it as the `Color` argument of `Clear(0, NULL, D3DCLEAR_TARGET\|D3DCLEAR_ZBUFFER, ClearColour, 1.0f, 0)`. So `FOGCOLOUR` changes what the whole frame is cleared to |
+| 0xc8 | `SurfaceFormatRec *` | chosen surface-format record, picked by `FogOfWar_BuildTextures`. 0x24 bytes: `0x00 shiftR, 0x04 posR, 0x08 shiftG, 0x0c posG, 0x10 shiftB, 0x14 posB, 0x18 shiftA, 0x1c posA, 0x20 D3DFORMAT`, where `shift = 8 - channel bits` and `pos = trailing zeros of the mask`. Built by `FillSurfaceFormatChannelTable` @ 0x005a48f0 from `SurfaceFormatChannelMasks` @ 0x006ac380 (`dword[11][4]` of `{Rmask,Gmask,Bmask,Amask}`, indexed by `format - 20`) via `ChannelMaskToShiftAndPos` @ 0x005a5200 |
 | 0xcc..0xd8 | `List` | **defog areas** (sentinel ptr, count, cache, cache_valid) |
 | 0xdc..0xe8 | `List` | **defogger units** |
 | 0xec / 0xf0 | `AwMaterial *` | fog material / fog video material |
@@ -303,6 +303,24 @@ rect) when `DAT_00738ff4` is set, otherwise `FogOfWar_Update` @ 0x004688f0 direc
 3. `FogOfWar_UploadTexture` @ 0x00467080 — expands `explored + current` into the fog
    texture (`FogOfWar_ExpandRect8bpp/16bpp/32bpp` @ 0x004674b0 / 0x00467330 / 0x00467220)
    and `CopyRects` onto the video texture; then resets the dirty rect to empty.
+
+   **Which expander runs is not a field of `FogOfWar`.** It is
+   `BitsPerPixelOfFormatRecord(FogOfWar+0xc8)` @ 0x005a4d50 — literally
+   `MOV ECX,[ECX+0x20]; JMP BitsPerPixelOfD3DFormat` — so it is the `D3DFORMAT` at **+0x20 of
+   the `SurfaceFormatRec` in `FogOfWar+0xc8`**, mapped to 8/16/24/32 bpp: `8 -> 8bpp`,
+   `0x10 -> 16bpp`, `0x20 -> 32bpp`. Anything else — in practice only 24 (`D3DFMT_R8G8B8`) —
+   runs **no expansion at all but still does the `CopyRects`**. That is a latent hole and is
+   currently unreachable: `R8G8B8` has zero alpha bits and `FogOfWar_BuildTextures` skips
+   every zero-alpha candidate.
+
+   `FogOfWar_BuildTextures` @ 0x00467580 picks the record with the **most alpha bits**
+   (`8 - shiftA`), tie-broken by the **fewest bits per pixel**, over formats 20..30. That is
+   **`D3DFMT_A8` (28)** — 8 alpha bits, 8 bpp — on any device that offers it; runner-up is
+   `D3DFMT_A8R8G8B8` (21, 32 bpp), and `A8R3G3B2` (29) ties on alpha and loses on bpp.
+   Confirmed live: `render.textures` on level02 reports the fog grid as 256x256, 1 level,
+   **`format 28`**, 65536 bytes. So the 8 bpp expander is the one that actually runs. Both
+   textures are created by `CreateTextureOfFormat` @ 0x005a4460 — `+0x28` with pool flag 2
+   (`D3DPOOL_SYSTEMMEM`), `+0x5c` with 1 (`D3DPOOL_MANAGED`).
 4. Ages the timed defog areas by the elapsed ticks and drops the expired ones; if any
    expired, `FogOfWar_RebuildStaticLayer` @ 0x00468c80.
 
@@ -331,6 +349,58 @@ not saved; they are rebuilt from the live defoggers and defog areas.
 `FogOfWar_SetEnabledLevel`, whose only caller is `SetIsFogEnabled` @ 0x00472230, whose only
 caller is the **`FOG` console command** `CommandFog` @ 0x004e2ec0. So a level has no fog of
 war unless its `.gcs` (or a script) turns it on.
+
+### 6.4 `FOGCOLOUR` re-uploads the whole texture
+
+`FogOfWar_SetColour` @ **0x00469270**, `void __thiscall(FogOfWar *this, const float rgba[4])`,
+`RET 0x4` — is **not a setter**. It does four things, in order:
+
+1. `MOVUPS` the four floats to `+0xb8..0xc4`. No clamping.
+2. Pack `ARGB(0xff, r*255, g*255, b*255)` into the global `ClearColour` @ 0x007c1204 and, when
+   `direct3d_device` @ 0x007c121c is non-null, `SetRenderState(D3DRS_TEXTUREFACTOR /*0x3c*/, …)`
+   through device vtable +0xc8.
+3. Rebuild the format-packed colour at `+0xb4` from the shift/pos table at `+0xc8`, duplicating
+   it into the high word when the format is 16 bpp.
+4. `+0x90 = +0x94 = 0; +0x98 = +0x9c = gridDim - 1;` then **`FogOfWar_UploadTexture`**.
+
+There is **no incremental path and no early-out**. Step 4 is a full re-expansion of every cell
+in the grid, and at `gridDim` 256 (inclusive bounds, so 256 x 256 = 65,536 cells) it costs:
+
+| format picked | iterations | instrs/iter | expand instrs | grid bytes read | surface written | `CopyRects` bytes |
+|---|---|---|---|---|---|---|
+| `D3DFMT_A8` (8 bpp) — **what the game gets** | 65,536 | 19 | ~1.25 M | 131,072 | 65,536 | 65,536 |
+| 16 bpp fallback | 32,768 | 42 | ~1.38 M | 131,072 | 131,072 | 131,072 |
+| `A8R8G8B8` fallback | 65,536 | 20 | ~1.31 M | 131,072 | 262,144 | 262,144 |
+
+plus, per call and regardless of format: one `LockRect` + `UnlockRect`, two `GetSurfaceLevel`
+and two `Release`, one full-surface `CopyRects` into a `D3DPOOL_MANAGED` texture, and one
+`SetRenderState`. The 8 bpp loop reloads `shiftA` and `posA` from `+0xc8` on **every texel**.
+
+**Measured in the running game: ~85 us a call** — 80-90 us under `GKPLUS_RENDERER=d3d8` (the
+original runtime), 90-100 us under `vulkan`, over 200 REPL-driven calls against a 200-iteration
+property-read control. The two renderers agreeing is the reading: the cost is the **CPU
+expansion loop**, not the upload path, so a faster upload path does not remove it. That is about
+**0.5% of a 16.6 ms frame**. Full write-up in `vulkan_renderer_notes.md` §4.90.1.
+
+**And in the `D3DFMT_A8` configuration the game actually runs in, every byte of that is wasted.**
+`FogOfWar_ExpandRect8bpp` writes `((explored[i] + current[i]) >> shiftA) << posA` — **alpha
+only** — and never reads `+0xb4` at all. The colour is not baked into the texels; it reaches the
+screen through the `D3DRS_TEXTUREFACTOR` set in step 2. So the re-upload is **incidental, not
+inherent**: it is only load-bearing at 16 or 32 bpp, where the expanders do `OR` `+0xb4` into
+each texel. (This round documents the cost; it does not optimise it. `src/World.h` carries a
+proposed cheap path, guarded on the format being 28.)
+
+**Nothing in the shipped game calls it per frame.** It has exactly two call sites: 0x004e2f6b in
+`CommandFocColor` @ 0x004e2ee0 (the `FOGCOLOUR` console command) and 0x0046769f, the tail call in
+`FogOfWar_BuildTextures` — reached from `FogOfWar_Ctor` (level load, 0x00467958) and from
+`FogOfWar_RecreateDeviceObjects` @ 0x00468dc0 (device reset / alt-tab, via `SetVideoMode` and
+`OnActivateApp`). That tail call is what restores `D3DRS_TEXTUREFACTOR` after
+`ResetDefaultRenderStates` @ 0x005906b6 has zeroed it.
+
+Compare the per-frame path: `FogOfWar_Update` @ 0x004688f0 uploads with an **accumulated** dirty
+rect and only forces the full rect when a timed defog area expires. It also brackets that call
+with `AccumulateThreadClock()` into the counter at 0x00803c18, read by `RunGameFrame` at
+0x0046e237 — the engine already instruments exactly this call.
 
 ---
 
@@ -431,7 +501,7 @@ flares"). What was *not* found is code linking the flare projectile or its light
 | Command | Handler | Effect |
 |---|---|---|
 | `FOG` | `CommandFog` @ 0x004e2ec0 | `SetIsFogEnabled` -> `FogSystem+0x18` |
-| `FOGCOLOUR` | `CommandFocColor` | `FogSystem+0xb8..0xc4`, via `FogOfWar_SetColour` @ 0x00469270 |
+| `FOGCOLOUR` | `CommandFocColor` @ 0x004e2ee0 | `FogSystem+0xb8..0xc4`, via `FogOfWar_SetColour` @ 0x00469270 — **also re-uploads the whole fog texture and overwrites the backbuffer clear colour, ~85 us; see §6.4** |
 | `FOGVALUE` | `CommandFogValue` @ 0x004e2f80 | `FogSystem+0xa4`, clamped 0..1 |
 | `FOGUPDATE` | `CommandFogUpdate` @ 0x004e30d0 | `FogSystem+0xa8` |
 | `FOGTRANSITION` | `CommandFogTransition` @ 0x004e3020 | `FogSystem+0xac` (m) and `+0xb0` (1/m) |
@@ -461,6 +531,12 @@ The result is written as a 0..1 fade factor into the render node's `+0x38`
 targeting, no selection, no AI — reads the fog: the whole object is allocated, updated and
 sampled on the client. Selection and targeting of a fogged enemy are therefore **not**
 blocked by fog; visibility of an enemy in fog is a rendering consequence only.
+
+Two of those rendering consumers are worth naming, because neither is a per-unit fade:
+`FogOfWar_SetColour` @ 0x00469270, which pushes the fog colour to the device as
+`D3DRS_TEXTUREFACTOR` and to the global backbuffer `ClearColour` (§6.4), and the **per-light
+specular scale** in `SceneLightSet_SelectLightsForBounds` @ 0x00488400 — see
+`rendering_notes.md` for the mechanism, which is not restated here.
 
 The one non-render consumer of the fog *system* is `SubmitAndFlushMapGeometry`, which uses
 the fog material (`FogSystem+0xec`) as the map's material when fog is on.
@@ -563,6 +639,14 @@ nothing else.
 | 0x004694e0 / 0x00469700 | `FogOfWar_AddDefogArea` / `_RemoveDefogArea` |
 | 0x004693c0 / 0x00469450 | `FogOfWar_AddDefoggerUnit` / `_RemoveDefoggerUnit` |
 | 0x00467080 | `FogOfWar_UploadTexture` |
+| 0x00469270 | `FogOfWar_SetColour` (§6.4 — full re-upload, ~85 us) |
+| 0x00467580 / 0x00468dc0 | `FogOfWar_BuildTextures` / `_RecreateDeviceObjects` |
+| 0x004674b0 / 0x00467330 / 0x00467220 | `FogOfWar_ExpandRect8bpp` / `_16bpp` / `_32bpp` |
+| 0x007c1204 | `ClearColour` (backbuffer clear; written only by `FogOfWar_SetColour`) |
+| 0x006ac380 | `SurfaceFormatChannelMasks` (`dword[11][4]`, formats 20..30) |
+| 0x005a48f0 / 0x005a5200 | `FillSurfaceFormatChannelTable` / `ChannelMaskToShiftAndPos` |
+| 0x005a4d50 / 0x005a4700 | `BitsPerPixelOfFormatRecord` / `BitsPerPixelOfD3DFormat` |
+| 0x005a4460 | `CreateTextureOfFormat` |
 | 0x004697d0 / 0x00472230 | `FogOfWar_SetEnabledLevel` / `SetIsFogEnabled` |
 | 0x00442a10 / 0x00442b10 | `CommandDefogger` (0xb7) / `CommandFogger` (0xb8) |
 | 0x0050e55d | DEFOG trigger -> update 0xb6 |
