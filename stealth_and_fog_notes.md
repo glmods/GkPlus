@@ -67,7 +67,9 @@ publishes to resync its crouch state.
 - `ExecutorThreadProc` @ 0x0050a074, 0x0050b29b (other order kinds).
 - `MobileActor::Update` (slot 70) @ 0x00535167 / 0x00535176, `ReceiveObject` @ 0x0053937b.
 - HUD/order-menu callers `EnterFlareMode` @ 0x004a17e0 / `ExitFlareMode` @ 0x004a17b0 /
-  `CommitPendingOrderTarget` @ 0x004a4250 (that last name is **PROPOSED**).
+  `OnCommandWheelClick` @ 0x004a4250 (renamed from `CommitPendingOrderTarget`: it is the LMB click
+  handler registered for cursor mode `CommandWheel`, and cases 0, 1 and 4 of its state machine are
+  cursor-mode changes and cancel rather than order-target commits).
 
 ---
 
@@ -161,9 +163,14 @@ operation in the two trees, joined by update **0x97**.
 
 ## 3. How concealment enters detection: a hard skip, not a modifier
 
-Every AI target-acquisition loop in the binary reads slot 8 on the **candidate** and drops
-it outright. The call is compiled as `MOV EAX,[reg+0x20]` + `CALL EAX`, not
+Every AI target-acquisition loop that keys on **`sight` range** reads slot 8 on the **candidate**
+and drops it outright. The call is compiled as `MOV EAX,[reg+0x20]` + `CALL EAX`, not
 `CALL dword ptr [reg+0x20]`, which is why a naive scan for the latter finds nothing.
+
+**That qualifier is load-bearing and was added after the fact.** This section used to say *every*
+acquisition loop, without restriction, and that is false: the two **hearing-range** consumers do not
+test slot 8 at all, and neither does `AiThink_Swarm`. See §4, which now resolves rather than defers
+the question.
 
 | Site | Enclosing function | Shape |
 |---|---|---|
@@ -193,9 +200,10 @@ consults slot 8 — it has **zero references, code or data**, i.e. dead code.
 
 ---
 
-## 4. The bypass ("alternative scanning you cannot hide from") — NOT ESTABLISHED
+## 4. The bypass ("alternative scanning you cannot hide from") — ESTABLISHED
 
-No perception path was found that ignores `is_concealed`. What was checked and ruled out:
+**There are two, and the useful distinction is the sensory modality, not the proc.** What was checked
+and ruled out first:
 
 - All eight consult sites above (every AI think proc that acquires targets at all).
 - The AI-think dispatch `Actor_SetAiBehaviour` @ 0x00450550 assigns only: `AiThink_Bot`
@@ -205,9 +213,8 @@ No perception path was found that ignores `is_concealed`. What was checked and r
   `Actor` slots 79 and 81 off the `+0x24` / `+0x2c` float deadlines, no perception),
   `AiThink_Pathfinder` @ 0x004556d0, `AiThink_Node` @ 0x0045a850, `AiThink_Swarm` @ 0x0045b620,
   and nothing for blocker/pickup/tumbleweed/background creature.
-  The three that never touch slot 8 (`AiThink_Scavenger`, `AiThink_Minebot`, `AiThink_Swarm`)
-  were not read in full, so a concealment-ignoring acquisition inside one of them cannot be
-  excluded — that is the place to look next.
+  The three that never touch slot 8 have now been read, and **they resolve to three different
+  verdicts** — see §4.1. Two are genuine bypasses and one is inapplicable.
 - Two `Actor::flags (+0x7c)` bits set by console commands look like AI-capability flags and
   are the other plausible home for it: **0x20** set by `CommandHunter` @ 0x004492d1, and
   **0x40** set by `CommandFlareFirer` @ 0x00449301. Neither has a reader that this pass
@@ -218,8 +225,40 @@ No perception path was found that ignores `is_concealed`. What was checked and r
 
 The recon-mode strings and the `character` GLS fields `scan delay` (0x0e), `scan acceptance
 angle` (0x0f) and `angular scan rate` (0x10) all belong to the sweep scanner, which — as
-shown above — **does** respect concealment. So the manual's claim has no counterpart found
-in the perception layer as it stands.
+shown above — **does** respect concealment.
+
+### 4.1 The three procs that never touch slot 8, resolved
+
+Measured with a backward-register-walk detector (the `MOV EAX,[reg+0x20]` + `CALL EAX` form),
+**validated against both known positives first** — `AiThink_Bot` @ 0x00451a27 and
+`CollectDetectableEnemies` @ 0x00459535 — and then applied to each body. All three bodies are fully
+disassembled, so the silence is a statement about the binary and not about the listing.
+
+| proc | verdict | keyed on | evidence |
+|---|---|---|---|
+| `AiThink_Swarm` @ 0x0045b620 | **CONFIRMED bypass — sight** | `sight_range_squared`, `MobileActor+0x168` | its candidate loop is `AiThink_Bot`'s with the six-instruction slot-8 test **deleted**. Indirect-call offsets present: 0x18, 0x30, 0x38, 0x48, 0x4c, 0x58, 0xf8, 0x110, 0x13c, 0x144, 0x168 — **no 0x20** |
+| `AiThink_Minebot` @ 0x00456c50 | **CONFIRMED bypass — hearing** | `hearing_range_squared`, `Character+0x34` @ 0x00456f09 | omnidirectional, no bearing or facing test. Offsets: 0x18, 0x28, 0x38, 0x48, 0x4c, 0x110, 0x13c, 0x144 — **no 0x20**; the single `+0x191` read @ 0x00456d5d is on `this` |
+| `AiThink_Scavenger` @ 0x004556e0 | **INAPPLICABLE — not a bypass** | nothing | it acquires no *actor*. It walks `AiStimulusList` @ 0x006af824 for 0x30-byte **stimulus records** within 6 m, so there is no candidate for slot 8 to be asked about. Offsets: 0x28, 0x38, 0x13c, 0x144 only. **Its authored `sight angle` / `sight range` / `hearing range` are inert** and it has no state machine at all |
+
+**Hearing looks like an exempt modality by design, not a per-proc oversight.** The engine's other
+hearing consumer, `PostAiStimulus` @ 0x0044f960, reads the **same** `Character+0x34` and likewise has
+no slot-8 test (its only indirect-call offsets are 0x18, 0x1c, 0x28 = slots 6, 7, 10). Two
+independent hearing paths behaving identically is a pattern; one would have been a bug. What is *not*
+settleable from the binary is whether concealment was **intended** to suppress hearing — so §3's
+sentence is a counterexample to itself, but not necessarily to the design.
+
+**Gameplay statement — crouching does not hide you from these roles:**
+
+- the six `ai swarm` `Chr_Scuttler` variants in `scuttler.gsh` (aggression 1) — the **Scuttlers**;
+- `Rol_Smartbot` and `Rol_mini_Smartbot`, also `ai swarm`;
+- `Rol_Walking_Mine` (identifier `"minebot"`) and `Rol_Mini_Minebot` (`"mini_minebot"`), the two
+  `ai minebot` roles.
+
+Note those are the **roles**, not the characters: `Chr_Walking_Mine` and `Chr_Mini_Minebot` back both
+the `ai minebot` and the `ai swarm` pairs, so the same character definition appears on this list for
+two different reasons. And because `Chr_Walking_Mine` authors `sight range 15` and `hearing range 15`
+**equal**, the sight/hearing distinction above is **unobservable in play** for that family — it
+matters for reading the code, not for predicting behaviour.
 
 ---
 
@@ -269,8 +308,8 @@ executor side reads it.
 | 0x1c | `byte *` | **explored** grid, `gridDim^2`. Persistent minimum; this is the one that is saved. `malloc`'d in `FogOfWar_Ctor` |
 | 0x20 | `byte *` | **current** grid, `gridDim^2`. The per-frame working grid — `FogOfWar_StampDefoggerUnits` opens with `memcpy(+0x20, +0x24, dim*dim)` |
 | 0x24 | `byte *` | **static layer** snapshot, `gridDim^2` — the defog areas only |
-| 0x28 | `IDirect3DTexture8 *` | **"Fog System Texture"**, `D3DPOOL_SYSTEMMEM`, `gridDim x gridDim`. First field of a 0x34-byte texture record (name pointer at +0x54, whole record `memset` in `FogOfWar_BuildTextures`). This is the one `FogOfWar_UploadTexture` `LockRect`s |
-| 0x5c | `IDirect3DTexture8 *` | **"Fog Video Texture"**, `D3DPOOL_MANAGED`, same size. First field of a second 0x34-byte record (name at +0x88). The `CopyRects` destination — this is the one that is sampled |
+| 0x28 | **`AwTexture` (embedded, 0x34 bytes)** | **"Fog System Texture"**, `D3DPOOL_SYSTEMMEM`, `gridDim x gridDim`, occupying 0x28..0x5b. **Not a pointer** — see below. `d3d_texture` is its first field, which is the one `FogOfWar_UploadTexture` `LockRect`s; `name` is at +0x2c into the record, i.e. 0x54 |
+| 0x5c | **`AwTexture` (embedded, 0x34 bytes)** | **"Fog Video Texture"**, `D3DPOOL_MANAGED`, same size, occupying 0x5c..0x8f (name at 0x88). The `CopyRects` destination — this is the one that is sampled |
 | 0x90,0x94,0x98,0x9c | `int` | dirty rect `left, top, right, bottom`, **inclusive bounds** (both expander loops terminate on `JLE`). `UploadTexture` `INC`s `+0x98`/`+0x9c` at 0x0046712d-0x00467142 to build the exclusive `RECT` `CopyRects` wants, then resets the rect to empty |
 | 0xa0 | `int` | `gridDim`, clamped to `MaxTextureDimension` @ 0x006ab970. `LoadLevel` passes literal 0x100 at 0x004e0df4, and both D3D textures are created `gridDim x gridDim` |
 | 0xa4 | `float` | `FOGVALUE` — fog level in discovered areas, 0..1 |
@@ -281,7 +320,30 @@ executor side reads it.
 | 0xc8 | `SurfaceFormatRec *` | chosen surface-format record, picked by `FogOfWar_BuildTextures`. 0x24 bytes: `0x00 shiftR, 0x04 posR, 0x08 shiftG, 0x0c posG, 0x10 shiftB, 0x14 posB, 0x18 shiftA, 0x1c posA, 0x20 D3DFORMAT`, where `shift = 8 - channel bits` and `pos = trailing zeros of the mask`. Built by `FillSurfaceFormatChannelTable` @ 0x005a48f0 from `SurfaceFormatChannelMasks` @ 0x006ac380 (`dword[11][4]` of `{Rmask,Gmask,Bmask,Amask}`, indexed by `format - 20`) via `ChannelMaskToShiftAndPos` @ 0x005a5200 |
 | 0xcc..0xd8 | `List` | **defog areas** (sentinel ptr, count, cache, cache_valid) |
 | 0xdc..0xe8 | `List` | **defogger units** |
-| 0xec / 0xf0 | `AwMaterial *` | fog material / fog video material |
+| 0xec | `AwMaterial *` | `fog_material` — the opaque one, cloned from `Mat_Opaque` |
+| 0xf0 | `AwMaterial *` | `fog_material_blended` — cloned from `Mat_Translucent` and installed as `fog_material->blended_variant` (`AwMaterial+0x34`) |
+
+**Two corrections to the two texture rows and the two material rows** (measured; the earlier
+pointer typing was wrong):
+
+- `+0x28` and `+0x5c` are **embedded `AwTexture` objects, not pointers.** `FogOfWar_BuildTextures`
+  @ 0x00467580 does `memset(this+0x28, 0, 0x34)` then `*(char**)(this+0x54) = "Fog System Texture"`,
+  and `0x54 - 0x28 = 0x2c` is **exactly** `AwTexture.name`'s offset while `0x34` is exactly
+  `sizeof(AwTexture)`; same shape at `+0x5c`/`+0x88`. The decisive evidence is
+  `FogOfWar_MakeFogMaterial` @ 0x00468ef0 doing `*(int *)(mat + 0x3c) = this + 0x5c` —
+  `AwMaterial.stages[0].texture = &this->video_texture`, **taking the address**, which a pointer
+  field could not supply.
+- **`FogOfWar_BuildTextures` never touches `+0xf0`.** Its source is `FogOfWar_Ctor` @ 0x00467820:
+  `PUSH [Mat_Opaque]; CALL 0x00468ef0; MOV [ESI+0xec],EAX` then
+  `PUSH [Mat_Translucent]; CALL 0x00468ef0; MOV [ESI+0xf0],EAX`, followed by
+  `MOV EAX,[ESI+0xf0]; MOV [ECX+0x34],EAX` — the blended variant hookup.
+  `FogOfWar_RecreateDeviceObjects` @ 0x00468dc0 compiles both. So anyone tracing a fog material
+  through `BuildTextures` will not find where `+0xf0` comes from.
+- `FogOfWar_MakeFogMaterial` @ 0x00468ef0 is `AwMaterial * __thiscall(FogOfWar *this,
+  AwMaterial *template)`: it clones the template, sets `this->enabled_level` from the capability
+  global `DAT_006ab974` (0 -> 0, 1 -> 2, >= 2 -> 1, with a Voodoo 2/3 three-stage path), binds
+  `&this->video_texture` into a stage, compiles, and retries once at a lower level on compile
+  failure.
 
 **Cell encoding: 0 = fully revealed, 0x7f (127) = fully fogged.** `FogOfWar_SampleTotal`
 returns `current[i] + explored[i]`, so the sampled range is 0..254 and `Unit_Draw` divides
@@ -487,12 +549,23 @@ Four producers:
 | `ApplyUpdateMessage` **case 0x46** (spawn projectile / weapon fire) @ 0x004ff... — built inline when `msg[4] != LocalPlayerTeam` @ 0x006a58e0, i.e. when the shooter is *not* on the local player's team. Centre is the fire position `msg[6..8]` | **25.0** | 1, **60 s** |
 | `ApplyUpdateMessage` **case 0x47** — same shape, centre `msg[4..6]` | **20.0** | 1, **60 s** |
 
-**The manual's "firing a flare reveals a zone" is only partly pinned down.** The flare
-itself is `Actor::flags (+0x7c)` bit **0x80** ("fire a flare now"), consumed at
+**The manual's "firing a flare reveals a zone" is only partly pinned down — but the flare itself is
+NOT dead code, and this paragraph used to be scoped as though it were.** Everything below concerns
+the **executor/AI** route, which *is* dead. The **player** flare is a separate and fully live
+feature: the `GL_CONTROLS_FIREFLARE` key binding (default DIK_F) calls `EnterFlareMode` @ 0x004a17e0,
+which sends wire command 0x19 so that `SetWeaponAmmoType` @ 0x004b1da0 rewrites
+`weapon->projectile_role` to `Rol_Flare`, after which an ordinary left click discharges it
+(`orders_notes.md` §8.5, `gadgets_notes.md` §6). **So the manual entry is not describing dead code.**
+What is still open is only the second half — whether the flare *projectile* drives a fog reveal.
+
+The dead AI route: `Actor::flags (+0x7c)` bit **0x80** ("fire a flare now"), consumed at
 0x0053e645 in `CharacterActor` slot 70 @ 0x0053d8d0, which does
 `GetRoleByName("flare")` (string @ 0x0066958c; `"flare_light"` @ 0x006695a8 is used at
 0x005454e8). `CommandFlareFirer` @ 0x004492e0 sets bit **0x40** ("this actor fires
-flares"). What was *not* found is code linking the flare projectile or its light to a
+flares"). Note bit 0x80 is not merely unwritten but **redundant**: `Rol_Flare` carries
+`identifier "flare"` and `ammo Ammo_PlasmaPistol_Flares` names `projectile Rol_Flare`, so the dead
+AI path and the live player path resolve to the *same role object*. What was *not* found is code
+linking the flare projectile or its light to a
 0xb6 broadcast — the reveal that accompanies an investigation is the 20 m / 3 s one from
 `AiBeginInvestigate`, and the two 60 s ones come off weapon fire generally. See "unknown" below.
 

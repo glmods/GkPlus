@@ -120,7 +120,7 @@ All nine were read; the bodies below are measured, not inferred from the writes.
 | 0 | 0x00452b2d | 1,729 | React to a newly perceived actor. Stops movement (`StopAndBroadcast`, `SetMoveState`), zeroes `+0x74`; copies the stimulus actor's position into `alert_position` (+0x64..+0x6c), clears `alert_flag` (+0x70) and bit 0x80 of `+0x7c`, sets `ai_state = 0`; then a random 4-way pick |
 | 1 | 0x00453486 | 325 | Engage the attack target. Same stop-movement preamble; copies the *target's* position into `alert_position`; sets `ai_state = 1`; vtable slot `+0xf8` gate; resets the miss counter `+0x74` if positive; then a random 4-way pick |
 | 2 | 0x0045441c | 318 | Investigate an object — `+0x78` bool plus a local flag -> `ai_state = 7`, else `alert_flag` -> `ai_state = 3`, else sets `+0x78 = 1`. **Unreachable: no producer for index 2** |
-| 3 | 0x004524b8 | 4,880 incl. shared tail | Idle / hold -> **random wander**. A `GetGameTimeSeconds` deadline on `+0x140`/`+0x144`; `ClearAuthoredWaypoints`; two 4096-entry trig tables (`SinTable` @ 0x007f5f78, `CosTable` @ 0x007faf78, indexed `int & 0xfff`) build a direction, scaled by **20.0** and added to the current position; `FindNavPolygonUnder` + a walkability test; two `PushRouteWaypoint` from either `+0xa0` or `+0x1dc` depending on `+0x184`; sets `ai_state = 8` at three sites |
+| 3 | 0x004524b8 | 4,880 incl. shared tail | Idle / hold -> **random wander**. A `GetGameTimeSeconds` deadline on `+0x140`/`+0x144`; `ClearPatrolPoints`; two 4096-entry trig tables (`SinTable` @ 0x007f5f78, `CosTable` @ 0x007faf78, indexed `int & 0xfff`) build a direction, scaled by **20.0** and added to the current position; `FindNavPolygonUnder` + a walkability test; two `PushRouteWaypoint` from either `+0xa0` or `+0x1dc` depending on `+0x184`; sets `ai_state = 8` at three sites |
 | 4 | 0x00453d23 | 264 | Stimulus investigation; a 3-float delta and a 9.0 constant. Falls into case 6 at 0x00453d2a |
 | 5 | 0x0045384d | 1,238 | Copies a *local* `Vec3` into `alert_position`, clears `alert_flag`, `StopAndBroadcast`; sets `ai_state = 3` |
 | 6 | 0x00453e2b | 1,521 | The reacquire handler — `alert_state = 1`, the 17 s window, updates 0x63/0x62 (§11) |
@@ -161,6 +161,24 @@ findable once table 0x00455250 had been resolved, so the recovery took two passe
 
 This is the field the manual's colours come from. It is mirrored to the client `Unit+0x24` by
 network updates 0x60/0x61/0x62/0x63 (§5).
+
+**The whole state machine is replicated, not just the field.** `Unit+0x24` mirrors
+`Actor+0x80` and `Unit+0x88` mirrors `Actor+0x90`, and the executor sets state *and* deadline
+immediately before each broadcast, so both sides can be read against each other. Confirmed pairings,
+with the client arms:
+
+| update | executor sites | sets | client arm | client effect |
+|---|---|---|---|---|
+| 0x60 | 0x0045473e, 0x00454d25 | `alert_state = 4`, no deadline | 0x005004e2 | `Unit+0x24 = 4`, `PlaySoundOnObject(0x24)` |
+| 0x61 | 0x00454854, 0x00454e3b | `alert_state = 2`, `now + 1*rate` | 0x00500515 | `Unit+0x24 = 2`, same 1 s |
+| 0x62 | 0x00454055 | `alert_state = 0`, `ai_state = 3` | 0x005005bc | `Unit+0x24 = 0`, `PlaySoundOnObject(0x25)` if still alerted |
+| 0x63 | 0x00453ed6, 0x00453f46 | `alert_state = 1`, `ai_state = 6`, `now + 17*rate` | 0x00500664 | `Unit+0x24 = 1`, **same 17 s deadline** |
+
+The 17-second state-1 window is therefore confirmed on **both** sides. Note the two 0x63 broadcast
+sites share **one** `alert_state = 1` write, at 0x00453e3f — the second site is the
+already-in-state-1 path, which re-broadcasts without rewriting the field (`JZ` @ 0x00453e39).
+`Unit+0x24` and `Unit+0x88` are still `undefined` in the DB and the mirror inference is behavioural,
+so those two client field names are PROPOSED.
 
 | Value | Meaning | Cone colour |
 |---|---|---|
@@ -203,18 +221,75 @@ into `Actor+0x40` — release the old attachment through slot 0, retain the new 
 `INC dword ptr [ESI+0x4]`. So `Actor+0x40` in state 7 is the object being investigated, and
 `Actor+0x04` is a reference count.
 
-**Suspected defect — PROPOSED, not confirmed.** The 17-line tail that computes the state's
-deadline into `+0x90/+0x94` contains **no clock read at all**: no `ReadScaledClock64`, no
-`Clock::ReadScaled32` @ 0x00571b60. It reads the tick rate (`0x007c07e0`, or `0x007c07b0` when the caller is the
-executor thread), scales `seconds` by it, then `0045e1c6 MOV EDI,[0x007c07dc] / ADD EDI,EAX /
-MOV [EBX+0x90],EDI`. Every sibling reads the clock first — `Decoy_Dismiss` @ 0x00450f60
-(`clock + 60*ticks_per_second`), `Mine_OnDeployed` (`now + 10*ticks_per_second`), `PostAiStimulus`
-(`ReadScaledClock64(&GameTimeClock)`). If `0x007c07dc` is ticks-per-second, as `Decoy_Dismiss`'s
-`* 0x3c` use implies, then the deadline is `ticks_per_second + seconds*rate` rather than
-`now + seconds*rate` — a deadline already in the past, so the investigate window would expire on
-the tick it is set. **What would settle it**: an independent identification of `0x007c07dc`, and an
-in-game observation of a minebot holding state 7 for longer than one tick. It has not been
-reproduced in the running game, so it does not yet belong in `game_defects_notes.md`.
+**Defect — now CONFIRMED, and it belongs in `game_defects_notes.md` §16.** The 17-line tail that
+computes the state's deadline into `+0x90/+0x94` contains **no clock read at all**: no
+`ReadScaledClock64`, no `Clock::ReadScaled32` @ 0x00571b60. It reads the tick rate (`0x007c07e0`, or
+`0x007c07b0` when the caller is the executor thread), scales `seconds` by it, then
+`0045e1c6 MOV EDI,[0x007c07dc] / ADD EDI,EAX / MOV [EBX+0x90],EDI`. Every sibling reads the clock
+first — `Decoy_Dismiss` @ 0x00450f60 (`clock + 60*ticks_per_second`), `Mine_OnDeployed`
+(`now + 10*ticks_per_second`), `PostAiStimulus` (`ReadScaledClock64(&GameTimeClock)`).
+
+**`0x007c07dc` is settled: it is ticks-per-second, a rate** (`MainClock+0x0c`; see §2.5). So the
+deadline is `rate + seconds*rate`, with **no `now` term at all**.
+
+**But the consequence is neither "expires instantly" nor "never expires", and the earlier phrasing
+above was wrong to reach for the first.** The `ai_state == 7` handler in `AiThink_Minebot`
+@ 0x00456f86 compares the deadline against `now` as a signed 64-bit value, and its **expired branch
+@ 0x00456fa6 does not transition out — it re-arms to `now + rate*1`** (0x00456fb3-0x00456fd2) and
+yields `remaining = rate` via `SUB ECX,EAX` @ 0x00456fde. So the first state-7 tick always takes the
+expired branch and **the investigate window is silently replaced by ~1 second, re-armed**. The
+`seconds` argument still reaches `GotoObject` @ 0x0045e168, so **movement is unaffected — only the
+timer is**, which is exactly why this was never noticed in play and why an in-game observation would
+*not* have settled it.
+
+Nor is it uptime-dependent: `Clock+0x18`, the accumulator, is zeroed **once** at static init by
+`Clock_Ctor` @ 0x00571830 and never reset (`LoadLevel`'s `MainClock -> ExecutorClock` copy carries
+the total across), so a level load guarantees the bogus deadline is in the past. **Uniformly wrong.**
+
+Two other things this function does that matter elsewhere: it **retains its target in
+`Actor+0x40` `held_actor`** (so that field is not an "attachment" — `AiThink_Swarm` @ 0x0045b8b4 does
+the same for `ai_state = 8`), and `ai_state = 8` itself is written by `AiThink_Swarm` @ 0x0045b88a,
+which §2.1's enumeration did not cover.
+
+### 2.4 `MobileActor+0x214` is the patrol-point list, and patrol dwell is `+0x140`/`+0x144`
+
+This closes a standing gap: handler 3's line in §2.1.1 already cited `+0x140`/`+0x144` without
+knowing what they were.
+
+`AiThink_Bot` picks the nearest entry of the **patrol-point list at `MobileActor+0x214`** (walked at
+0x0045264b) and reads that record's `+0x10` `float wait_time` @ 0x00452696, then arms
+`patrol_wait_until = GetGameTimeSeconds() + wait_time` into **`MobileActor+0x140`** @ 0x004526e1,
+latched by the bool **`patrol_waiting` @ MobileActor+0x144** (set 0x004526b5/0x004526ca, cleared on
+expiry 0x004526f2). Both names are PROPOSED; the behaviour is measured.
+
+The authoring side is the console command **`ADD PATROLPOINT <x> <y> <z> [seconds]`**: the optional
+fourth token is that `wait_time`, parsed with a 0.0 default by `ConsoleParseFloat` @ 0x004d6860 and
+pushed as slot 90's fourth argument. `CommandAddPatrolPoint` @ 0x00442140 and `CommandAddWaypoint`
+@ 0x0043e860 share one body (0x0044c760) and differ **only** in the `CL` they pass — `1` versus `0` —
+which is precisely the flag that selects `AppendPatrolPoint` (the `+0x214` list) over the route list
+at `+0x204`. So a *waypoint* and a *patrol point* are the same record in two different lists, and
+only the patrol list has a dwell consumer.
+
+### 2.5 The `Clock` facts, because this area has now turned on them twice
+
+Both §2.3's defect and §4's deadlines depend on telling two globals apart, and confusing them
+re-opens §16 from scratch:
+
+- **`Clock+0x0c` is a RATE — ticks per second.** `ClockTicksPerSecond` @ 0x007c07dc for `MainClock`
+  @ 0x007c07d0, `ClockTicksPerSecondExecutor` @ 0x007c07ac for `ExecutorClock` @ 0x007c07a0. Its
+  **only** writer is `MulDiv(delta_ticks, 1000, elapsed_ms)` inside `Clock::Calibrate` @ 0x00571931,
+  called from `WinMain` @ 0x0046b934 and `LoadLevel` @ 0x004e1420 **only** — never per frame. 133
+  reads, zero writes.
+- **`Clock+0x18` is the running accumulator**, read via `AccumThreadClock64` @ 0x0044df20 (wrapped by
+  `Clock::ReadScaled32` @ 0x00571b60 and `Clock::ReadScaledClock64` @ 0x00571bb0). `Clock_Ctor`
+  @ 0x00571830 zeroes it once, at static init; `Clock_Dtor` @ 0x005718a0 is a bare `RET`.
+- **The correct deadline idiom is `now + rate*N`**, where `now` is the think proc's own
+  `now_lo`/`now_hi` parameters. Worked examples: `AiThink_Bot` case 6 @ 0x00453e55 (`rate*17 + now`),
+  `Mine_OnDeployed` @ 0x0045a75f, `AiThink_Minebot` @ 0x00456fb3, `Decoy_Dismiss` @ 0x00450fd8.
+- `Clock::ReadScaled32` / `ReadScaledClock64` are **mistyped in the DB** as taking `Clock *`: the
+  `Decoy_Dismiss` call site passes `MOV ECX,0x6aaab8` (`GameTimeClock`) and the bodies do a 64x64
+  multiply against `[this]`/`[this+4]`, which is not a `Clock` field pair's meaning. Flagged because
+  it misleads.
 
 ## 3. Perception: the vision "cone" is a **sweeping ray**, not a cone
 
@@ -328,6 +403,34 @@ constraint at all. That is the mechanic the manual describes as reacquiring, and
 
 Both take the scan context in ECX from **`CharacterActor+0x28c`**.
 
+### 3.2.2 A third acquisition shape: the minebot's omnidirectional hearing radius
+
+The swept ray (§3.1) and the reacquire range above are not the only two shapes. **`AiThink_Minebot`
+@ 0x00456c50 acquires on the `hearing` radius, with no bearing or facing test anywhere.** Its loop A
+(0x00456e20-0x00456f64, gated on `ai_state != 7`) walks `TeamActorLists` @ 0x007ba038 over all
+`NumTeamSlots`, and its filters are only:
+
+1. skip the minebot's own `team_id` (0x00456e20);
+2. **skip team 0 outright** (0x00456e2c) — a flat hostility test, so it consults neither
+   `TeamSlot+0x6b` `not_enemy_source` (as `AiThink_Bot` does @ 0x00451ba7) nor slot 8;
+3. slot 6 `IsAlive` (0x00456e52);
+4. `dist² < character->hearing_range_squared` — `Character+0x34`, fetched via slot 10
+   `GetCharacterData` @ 0x00456de8 and compared `COMISS` @ 0x00456f09;
+5. nearest-so-far (0x00456f1e).
+
+An accepted actor goes to `AiBeginInvestigate` @ 0x00456f7c, so the minebot **walks to it and
+detonates on it**. Unlike `AiThink_Swarm` it has no `ai_think == AiThink_Mine` skip, so **a minebot
+will acquire and walk onto another team's deployed mine**.
+
+The roles are `Rol_Walking_Mine` (identifier `"minebot"`) and `Rol_Mini_Minebot`
+(`"mini_minebot"`) — the *roles*, not the characters `Chr_Walking_Mine` / `Chr_Mini_Minebot`, which
+also back the `ai swarm` `Rol_Smartbot` / `Rol_mini_Smartbot`. And `Chr_Walking_Mine` authors
+`sight range 15` and `hearing range 15` **equal**, so for this family the sight/hearing distinction
+is unobservable in play.
+
+See `stealth_and_fog_notes.md` §4 for the concealment consequence, which is the reason the modality
+matters: this is a **hearing** bypass, and hearing looks exempt by design rather than broken here.
+
 ### 3.3 Consequences for the shipped data
 
 - `sight angle 0` (13 shipped uses) makes `scan_angle` start and end at 0, so
@@ -370,7 +473,7 @@ alert_state 0  ─────────────────────�
   is `0x11 * ticks_per_sec` (0x00454b4d: `SHL ECX,4; ADD ECX,EDX`). That arm was recorded here as
   dead while `alert_state == 1` was believed unwritten; it is not (§11), and handler 6 arms the
   same window at 0x00453e71.
-- Entering state 2 also calls `MobileActor::AppendAuthoredWaypoint(this->coords, 0, 0)` @ 0x0053a830 when `MobileActor+0x218` is 0.
+- Entering state 2 also calls `MobileActor::AppendPatrolPoint(this->coords, 0, 0)` @ 0x0053a830 when `MobileActor+0x218` is 0. (Renamed from `AppendAuthoredWaypoint`; `MobileActor+0x214` is the **patrol-point list** — see §2.4.)
 
 ---
 

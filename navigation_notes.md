@@ -249,7 +249,7 @@ if (pathLength < budget + waypointIndex) accept this waypoint;
 i.e. "is this waypoint reachable in few enough polygons" — a reachability filter, not a route.
 Waypoints that pass are consumed off the front of the list; the polygons of the accepted path
 are turned into actor waypoints one-for-one by `MobileActor::PushRouteWaypoint` @ 0x0053a640,
-which **pushes a 0x18-byte record `{Vec3 pos, int @0x0c, int @0x10}` onto the *front*** of the
+which **pushes a 0x18-byte record onto the *front*** of the
 route list (+0x204). Push-front, not append: the body is AvP's `add_entry_start` —
 `new->prev = sentinel; new->next = sentinel->next; sentinel->next->prev = new;
 sentinel->next = new` — and it then refreshes the cursor at +0x224. That is what makes the A\*
@@ -257,11 +257,27 @@ backtrack, which is produced goal-first, come out in travel order. The record is
 and the node `pool_alloc(0x10)` (`List_Member<Waypoint*>`, vptr `DAT_00652188`).
 So the unit walks **polygon centre to polygon centre**, with no corner optimisation at all.
 
+The record is the `Waypoint` struct, and **both of its trailing dwords have readers** - this file
+previously said they were written and never read:
+
+| Off | Type | Meaning |
+|---|---|---|
+| +0x00 | `Vec3` | `pos` |
+| +0x0c | `int` | `keep_on_arrival`. Read at 0x0053a2cf by `MobileActor::AdvanceWaypointRoute` @ 0x0053a1d0: **zero** pops the node and `free_sized(rec, 0x18)` through `MobileActor::PopCurrentWaypoint` @ 0x0053a340, **non-zero** advances the cursor and keeps the record. Every writer in the shipped binary passes literal 0 - including the console path, which pushes an immediate 0 at 0x0044c86c - so the retain branch is a **dead branch, not dead code**. (Do not mistake 0x0053a1fd `CMP [ECX+0xc],0` for this reader; that is the `List_Member`'s own data-pointer null check.) |
+| +0x10 | `float` | `wait_time`, the dwell in seconds. Read at 0x00452696 by `AiThink_Bot`, off the **patrol** list, to set the dwell deadline `MobileActor+0x140` latched by `+0x144`. |
+| +0x14 | - | **never written by any of the three allocators.** `pool_alloc(0x18)` with no `memset`, and both savegame paths move the full 0x18 bytes (`PUSH 0x18` @ 0x0053210d in `WriteActorFixups`, @ 0x00531060 in `ReadActorFixups`), so four bytes of uninitialised pool memory reach every `.sav` holding a waypoint. Nothing reads it; the only consequence is that saves are not byte-for-byte reproducible. |
+
 `MobileActor` carries **two** waypoint lists, and they are not interchangeable: **+0x204** is the
 route this function pushes (count +0x208, cache +0x20c/+0x210, cursor +0x224), and **+0x214** is
-the authored/queued list that `MobileActor::AppendAuthoredWaypoint` @ 0x0053a830 and the
-`ADD WAYPOINT` console path fill. `MobileActor+0x228` holds `&this->+0x204`, i.e. a pointer back
-to the route list's own header.
+the **patrol-point** list - which is what it is *for*, a question this file and the DB both used to
+leave open. It is filled by `MobileActor::AppendPatrolPoint` @ 0x0053a830 (was
+`AppendAuthoredWaypoint`) and drained by `MobileActor::ClearPatrolPoints` @ 0x0053a550. What settles
+it: `ADD WAYPOINT` and `ADD PATROLPOINT` are **one implementation**
+(`CommandAddWaypointOrPatrolPoint` @ 0x0044c760, reached by a `JMP` from either registration with
+only a `CL` flag between them), that flag is slot 90's `is_patrol_point` argument, and it is exactly
+what gates the append to +0x214. `AiThink_Bot` then walks the list at 0x0045264b, picks the nearest
+point by position and reads its `wait_time` to dwell there.
+`MobileActor+0x228` holds `&this->+0x204`, i.e. a pointer back to the route list's own header.
 
 Two other tests in the same function:
 
@@ -355,11 +371,59 @@ It is *inferred* that this is what the manual is describing — no comparison of
 
 ### 5.5 `Map::MoveNavAgent` @ 0x00472e30
 
-The 4164-byte sweep underneath all of it. Sets
-`agent->velocity = (dest - agent->position) / (untilTime - agent->update_time)`, integrates
-across polygon boundaries, and re-snaps `agent->nav_poly` with `FindNavPolygonAt` /
-`FindNavPolygonUnder` as it crosses. Called from `MobileActor::Update`, `TurretActor::Update`
-and three 0x004bxxxx/0x004cxxxx callers.
+The 4164-byte sweep underneath all of it.
+`bool __thiscall(Map *this, Vec3 *pos, NavAgent *agent, uint clock_lo)`, `RET 0xc`.
+
+**The 3rd argument is a `uint` game-clock tick, not a `float until_time`** - this file's own §5.5
+was where that `float` came from, and the DB believed it. `dt` is an **integer** subtract that is
+then `FILD`-converted:
+
+```
+00472edb  MOV  ECX,[EBP+0x10]      ; arg3
+00472ee9  SUB  ECX,[EDI]           ; minus NavAgent+0x00 update_time, an integer already
+00472ef3  FILD [EBP-0xac]          ; the difference is FILD'd, so it was not a float
+00472f08  DIVSS XMM0,<that dt>     ; ... and then used as the divisor
+```
+
+so it sets `agent->velocity = (dest - agent->position) / (float)(clock_lo - agent->update_time)`,
+stores `agent->update_time = clock_lo` (@ 0x00473b91, @ 0x00473e07), integrates across polygon
+boundaries, and re-snaps `agent->nav_poly` with `FindNavPolygonAt` / `FindNavPolygonUnder` as it
+crosses. `NavAgent+0x00` was already `uint update_time` in the DB, which is the consistency check.
+All six call sites pass their own `[EBP+0x8]`, i.e. `ExecutorActorTick`'s `clock_lo`. Called from
+`MobileActor::Update`, `TurretActor::Update` and three 0x004bxxxx/0x004cxxxx callers.
+
+The tick's **unit** is still open: `Clock+0x0c` is ticks-per-second (a rate, written only by
+`MulDiv` inside `Clock::Calibrate` @ 0x005718b0) and `Clock+0x18` is the running accumulator read
+through `AccumThreadClock64` @ 0x0044df20, so it is knowable, but it affects neither the type nor
+the name.
+
+### 5.6 The nav grid's two scale vectors, and what neither of them is
+
+`Map+0x58` and `Map+0x70` are both per-axis float triples that `MapGrid_WorldToCell` @ 0x004922b0
+only ever uses **multiplied together**, which made it look as though one of them was `1/cell_size`
+and the other some unit conversion. **Neither is.** `Map::BuildNavGrid` @ 0x0048a0a0 (was
+`FUN_0048a0a0`) settles it in eleven instructions:
+
+```
+0048a390  MOVSS XMM1,[0x006521b8]      ; = 0x3f800000 = 1.0f
+0048a39e  DIVSS XMM0,[EBP-0x1c]        ; extent.x = bb_max.x - bb_min.x
+0048a3ba  MOV   [EDI+0x58],EAX         ; +0x58 = 1.0f / extent.x   (inv_grid_extent)
+0048a3d8  MOV   [EDI+0x64],ECX         ; +0x64 = nx  (int, grid_cells_i)
+0048a3e4  FILD  [EBP-0x2c]             ; (float)nx
+0048a3f7  MOV   [EDI+0x70],EAX         ; +0x70 = (float)nx         (grid_cells_f)
+```
+
+so `+0x58` is `1/extent`, `+0x70` is `(float)cell_count`, and their product is `1/cell_size`.
+`MapGrid_WorldToCell` using only the product is therefore **arithmetically redundant, not a missing
+distinction**. Independent confirmation comes from the same function's plane loops, which divide the
+extent **by** `+0x70` to obtain the cell size (`DIVSS XMM3,[EDI+0x70]` @ 0x0048a5d8) before emitting
+`plane[i] = origin + i*cell_size`. `Map+0x4c` is the AABB max (`grid_bounds_max`), stored beside
+`grid_origin` at `+0x40`.
+
+The grid is built by `Map::RebuildNavGrid` @ 0x0048a700 (was `FUN_0048a700`,
+`void __thiscall(Map *this, uint nx, uint ny, uint nz)`), which min/max-reduces the level geometry
+into an AABB seeded with +/-FLT_MAX and delegates to `BuildNavGrid`; its sole caller is
+`LoadOrBuildSectionAdjacency` @ 0x0044fef0.
 
 ## 6. Dynamic collision and blockers
 

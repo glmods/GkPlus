@@ -474,12 +474,36 @@ Recovered from the byte map at **0x0050bae0** (indexed `cmd - 4`) and the pointe
 | `0x11` | 12 | 0x0050a2fb | `UseInventoryItem(actor, item_id, 1)` |
 | `0x13` | 12 | 0x0050a34d | `DropItem(actor, item_id)` |
 | `0x15` | 12 | 0x0050a39d | **unequip** — walk `inventory_list` for `slot->item->id == arg`, `UnequipSlot` |
-| `0x17` | 24 | 0x0050a22f | **give item** `{giver, recipient, item_id, ?, amount}` — sets the pending give state and issues the walk |
+| `0x17` | 24 | 0x0050a22f | **give item**, immediate `{giver, recipient, item_id, f32 game_time, amount}` — sets the pending give state and issues the walk |
+| `0x18` | 24 | 0x0050a2b7 | **give item**, queued — same payload; calls `QueueGiveItemOrder` @ 0x00538f80 (at 0x0050a2e8) to build `PendingOrder` kind 6 |
 
-**`directplay_protocol_notes.md` has `0x17` as "board / attach (escort) — actor id + carrier +
-slot".** The body at 0x0050a22f is unambiguously the give-item request (it addrefs the recipient
-into `Actor+0x40`, stores the item id at `Actor+0x44` and the amount at `MobileActor+0x124`, and
-issues a move order). The other four ids in that table match the notes.
+**This is now settled, and `directplay_protocol_notes.md` has been corrected to match.** It read
+`0x17` as "board / attach (escort) — actor id + carrier + slot"; there is no board or attach command
+anywhere in the executor table. The body at 0x0050a22f is unambiguously the give-item request (it
+addrefs the recipient into `Actor+0x40`, stores the item id at `Actor+0x44` and the amount at
+`MobileActor+0x124`, and issues a move order), and the client-side sender — read this round, having
+been left unread when §11 was written — is `Unit::Unit_SendGiveItem` @ 0x004c0d50, renamed from
+`Unit_SendBoard`. `RET 0x10` = 16 argument bytes = `(int item_id, int recipient_actor_id,
+uint amount, bool queued)`, with `queued` selecting between the two ids exactly as the other `Unit`
+slot 100-104 senders do. The other four ids in that table match the notes.
+
+**The `?` field at wire `+0x10` is an `f32` game-time stamp**, not a payload field. The `0x17` arm
+passes it straight to `GotoObject(giver, recipient->slot12(), now)` @ 0x005394d0 as the `now`
+argument (`MOVSS XMM0,[EBP+0xc]` then `COMISS` against `MobileActor+0x1e8`), so the full 24-byte
+layout is `{u32 id, u32 giver_id, u32 recipient_id, u32 item_id, f32 game_time, u32 amount}` — note
+the wire order is not the sender's C argument order.
+
+**What settles the give reading is the payoff site, not the arm.** `MobileActor::Update` @ 0x00533f5c,
+gated on a squared distance `< 16.0` (within 4 world units of the recipient), calls `GiveItemTo`
+@ 0x00537db0 at 0x00533f6d with `item_id = [EDI+0x44]`, `recipient_actor_id = [[EDI+0x40]+0xc]`,
+`amount = [EDI+0x124]`, then clears the pending state (`+0x124 = -1`, `+0x44 = -1`, `+0x40 = 0`). The
+queued form reaches the identical code: kind 6 pops at 0x00535195 and repeats the `0x17` arm
+instruction-for-instruction.
+
+`Actor+0x40` is the pending-give recipient, a refcounted `Actor *`. **`Actor+0x44` is not an item-id
+field** — it carries the item id on this path, but it is a pending-order parameter reinterpreted per
+order kind: at 0x00534fae it is passed to `GetActorById` (gated on `+0x40 == 0`), and the kind-2
+`GotoObject` arm at 0x0053515d also writes it. Treat it as "order argument", not "item id".
 
 ### 8.2 Updates (server -> clients)
 
@@ -487,7 +511,7 @@ issues a move order). The other four ids in that table match the notes.
 |---|---|---|---|
 | `0x76` / `0x77` | 24 | `ReceiveObject` | item picked up `{actor, class, role_id, item_id, amount}`; `0x76` when `say` |
 | `0x78` | 12 | `ReceiveObject`, `GiveItemTo` | inventory full `{actor, class}` |
-| `0x79` / `0x7a` | 16 | `EquipItemInSlot` | equipped `{actor, slot, item_id}`; `(silent ^ 1) + 0x79` |
+| `0x79` / `0x7a` | 16 | `EquipItemInSlot` | equipped `{actor, slot, item_id}`; `id = 0x79 + (play_ui_sound ^ 1)`, so **`0x79` is the audible form and `0x7a` the silent one** — both mean equip |
 | `0x7b` / `0x7c` | 12 | `UseInventoryItem` | item used `{actor, item_id}` |
 | `0x7d` | 12 | `UseInventoryItem`, `DropItem`, `CommandRemoveItem` | item removed `{actor, item_id}` |
 | `0x81` | 24 | `GiveItemTo` | transfer `{giver, recipient, item_id, amount, new_item_id}` |
@@ -498,6 +522,27 @@ issues a move order). The other four ids in that table match the notes.
 
 The client side is `ApplyUpdateMessage` @ 0x004fde70, which calls `Inventory::AddItemFromRole`,
 `BuildDisplayGrid` and `ClearDisplayGrid` directly.
+
+**The third parameter of `EquipItemInSlot` was named `silent`, and that name is inverted.** It is now
+`play_ui_sound` in the Ghidra DB. The measurement is on the client: the shared arm for `0x79`/`0x7a`
+at 0x00500107 pushes `1` when the id is `0x79` and `0` otherwise, and inside
+`Unit_EquipItemInSlot` @ 0x004bcfb0 (the client mirror, renamed from `FUN_004bcfb0`) that flag gates
+**nothing but three `PlayUiSound` calls** — ids `0x1b`, `0x23` and `0x1c`, each behind
+`if (param_3 != 0)`. Everything else that function does happens either way: it walks the unit's
+inventory for the item, re-applies the same `item->limit & role->limit` deny mask the executor
+checks, `pool_alloc(0x18)`s the `EquipSlot`, links it into the equipment list, and for pickup classes
+0/1/2 builds a 0xa8-byte `HudWidget` when the unit is on `LocalPlayerTeam`. Since
+`id = 0x79 + (arg3 ^ 1)`, `arg3 == 1` produces `0x79` and therefore **plays** the sound — and the
+wire command `0x0f`/`0x10` arm passes 1, which is right for a user interact action. So the argument
+means "play the UI sound", and any reading of `(silent ^ 1) + 0x79` that infers `0x79` is the quiet
+one has the two ids the wrong way round.
+
+Note this pair is **not** equip-versus-unequip. `MobileActor::UnequipSlot` @ 0x00536ec0 broadcasts
+nothing at all — no `BroadcastToPlayers` call anywhere in its body, verified both by its absence from
+all 186 call sites of 0x00504bf0 and by a direct instruction scan — so **no update id carries an
+unequip**. `directplay_protocol_notes.md` had update `0x72` as "unequip"; `0x72` is a bare
+`PlayUiSound(0x28)` broadcast by `UseInventoryItem` @ 0x005370d0 (site 0x00537d36), carrying no actor
+id at all, and that row has been corrected.
 
 ---
 
@@ -711,15 +756,28 @@ from the Ghidra plate.
 - **`OpenUpgradeScreen` @ 0x004e5ad0** (2874 bytes) writes `InventoryScreenEntity` and
   `InventorySelectedItem` and references the `"slota"` table. Its body was not read, so what it
   does beyond opening the Upgrade screen is not established.
-- **`0x0050a22f` is command `0x17`** was derived from the byte map + pointer table, not from a
-  client-side sender. The sender `Unit::Unit_SendBoard` @ 0x004c0d50 was not read.
+- ~~**`0x0050a22f` is command `0x17`** was derived from the byte map + pointer table, not from a
+  client-side sender.~~ **Resolved.** The sender was read: `Unit::Unit_SendGiveItem` @ 0x004c0d50
+  (renamed from `Unit_SendBoard`), `RET 0x10`, `queued` picking `0x17` versus `0x18`. The byte map
+  and pointer table were also re-walked (`0x0050bae0` index `cmd - 4` -> slot 15 -> `0x0050ba3c`), and
+  the executor arm, the queued order kind and the transfer site all agree. §8.1.
 
 ---
 
 ## 12. Corrections to existing notes
 
 - **`directplay_protocol_notes.md`**, command table: `0x17` is **give item to another actor**
-  (24 bytes `{giver, recipient, item_id, ?, amount}`), not "board / attach (escort)". §8.1 above.
+  (24 bytes `{giver, recipient, item_id, f32 game_time, amount}`), not "board / attach (escort)".
+  §8.1 above. **Applied** — that file's row now reads give-item and carries the resolved layout, and
+  the `?` field is the `f32` game-time stamp the arm hands to `GotoObject` as `now`. Confirmed from
+  the executor side (arm 0x0050a22f), from the client sender (`Unit_SendGiveItem` @ 0x004c0d50) and
+  from the payoff site (`GiveItemTo` @ 0x00537db0, called at 0x00533f6d). The DB names that carried
+  the wrong reading are gone: `Unit_SendBoard` -> `Unit_SendGiveItem`, `QueueBoardOrder` @ 0x00538f80
+  -> `QueueGiveItemOrder`. **There is no board or attach command anywhere in the executor table**, so
+  `orders_notes.md`'s `PendingOrder` kind 6 is `GiveItem`, not `Board`.
+- **`directplay_protocol_notes.md`**, update table: `0x72` was "unequip" and is `PlayUiSound`; the
+  equip pair is `0x79`/`0x7a`, differing only in that sound. `MobileActor::UnequipSlot` @ 0x00536ec0
+  broadcasts nothing. §8.2 above. **Applied.**
 - **`role_system_notes.md` §7**: pickup class 2 is the authored *"nothing"* pickup **and** the
   no-`character` fallback of `Role::GetPickupType`; "default / non-pickup" understates it. The
   conversion is `FISTP` (round-to-nearest-even), not floor or truncate.

@@ -172,15 +172,32 @@ Values 0..10, no gaps.
 | 3 | `HoldMarker` | `MobileActor::PushHoldMarkerOrder` 0x00538a30, bare `RET` — **prepended** | none: the jump table maps kind 3 to the *exit* label, so it blocks the queue |
 | 4 | `CrouchToggle` | `MobileActor::QueueCrouchOrder` 0x00538be0, bare `RET` | MobileActor slot 70 → slot 83 `ToggleCrouchAndCamouflage` |
 | 5 | `Interact` | `MobileActor::QueueInteractOrder` 0x00538e80, `RET 0x8` | MobileActor slot 70 → `EquipItemInSlot(arg_c, arg_b, 1)` @ 0x00536ba0 |
-| 6 | `Board` | `MobileActor::QueueBoardOrder` 0x00538f80, `RET 0xc` | MobileActor slot 70 → `GetActorById(arg_a)`, `this+0x40 = target` (refcounted), `+0x44 = arg_b`, `+0x124 = arg_d` |
+| 6 | `GiveItem` | `MobileActor::QueueGiveItemOrder` 0x00538f80, `RET 0xc` | MobileActor slot 70 → `GetActorById(arg_a)`, `this+0x40 = target` (refcounted), `+0x44 = arg_b`, `+0x124 = arg_d` |
 | 7 | `Equip` | `MobileActor::QueueEquipOrder` 0x00538ca0, `RET 0x4` | MobileActor slot 70 → `UseInventoryItem(arg_b, 1)` @ 0x005370d0 |
 | 8 | `Drop` | `MobileActor::QueueDropOrder` 0x00538d40, `RET 0x4` | MobileActor slot 70 → `MobileActor::DropItem(arg_b)` @ 0x00538240 |
 | 9 | `UseItem` | `MobileActor::QueueUseItemOrder` 0x00538de0, `RET 0x4` | MobileActor slot 70 → walk `inventory_list` for `entry+0x24 == arg_b`, `MobileActor::UnequipSlot(entry)` @ 0x00536ec0, broadcast **0x80** |
 | 10 | `SetAmmoType` | `CharacterActor::QueueOrderKind10` 0x00541980, `RET 0x4` | CharacterActor slot 70 → slot 99 `SetAmmoType(arg_b)` |
 
 Names for 5/6/7 are taken from the *immediate* console/wire twin that reaches the same callee
-(§8); `Board` for 6 follows `directplay_protocol_notes.md`'s reading of command 0x17
-("board / attach (escort)") and is the least certain of them. Kind 8 is **`Drop`**: its consumer is
+(§8) — **and that provenance has now cost one name, so treat the other three as open.** Kind 6 was
+called `Board` on `directplay_protocol_notes.md`'s reading of command 0x17 ("board / attach
+(escort)"); the consumer is `GiveItemTo`, so it is **`GiveItem`**, and both it and its client twin
+`Unit_SendGiveItem` @ 0x004c0d50 have been renamed. (Breadcrumb: outside write-ups still say
+`Board` / `Unit_SendBoard` / `QueueBoardOrder`.)
+
+**Kinds 5, 7 and 9 may be misnamed on exactly the same provenance — recorded as an open doubt, not
+acted on.** Each name comes from the wire twin, and each arm's *callee* says something else:
+
+| kind | current name | what its arm actually calls |
+|---|---|---|
+| 5 | `Interact` | `EquipItemInSlot(arg_c, arg_b, 1)` @ 0x00536ba0 |
+| 7 | `Equip` | `UseInventoryItem(arg_b, 1)` @ 0x005370d0 |
+| 9 | `UseItem` | walk `inventory_list`, `UnequipSlot(entry)` @ 0x00536ec0, broadcast 0x80 |
+
+The three look **rotated by one** relative to their callees, which is suggestive and is *not*
+evidence. **UNMEASURED — do not rename on the strength of this table.** Settling it needs the
+0x13/0x14/0x19-family wire arms read against these three callees, which is what would say whether the
+wire names or the callees are the mislabelled side. Kind 8 is **`Drop`**: its consumer is
 `MobileActor::DropItem` @ 0x00538240 and its client producer is `Unit::Unit_SendDropItem`
 @ 0x004c0cf0, whose 12-byte payload is `{id, actor_id, item_id}` with the id chosen by
 `CMP byte [EBP+0xc],0` — 0x14 queued, 0x13 immediate.
@@ -231,6 +248,27 @@ JMP dword ptr [EAX*4 + 0x00535aa0]
 Jump table 0x00535aa0, eight entries: `2→0x00535125, 3→0x0053533c (the exit label),
 4→0x00535172, 5→0x00535181, 6→0x00535195, 7→0x00535329, 8→0x00535204, 9→0x00535213`.
 Every arm falls through to `PopFrontOrder` at 0x00535337.
+
+Re-verified arm by arm, with the payoff and whether the order is actually dequeued. **Kind 3 is the
+odd one and the table's bound-fail target both**, and because it sits *after* `PopFrontOrder`
+@ 0x00535335 the order is never dequeued — which is the mechanism behind "HoldMarker blocks the
+queue":
+
+| kind | arm | payoff | dequeued? |
+|---|---|---|---|
+| 2 | 0x00535125 | slot 63 test; false → `GotoObject`, `+0x44 = arg_a`; true → slot 83 | conditional |
+| 3 | 0x0053533c | **none** — the default / bound-fail target, sitting *after* `PopFrontOrder` | **no** |
+| 4 | 0x00535172 | slot 83 on `this` | yes |
+| 5 | 0x00535181 | `EquipItemInSlot(arg_c, arg_b, 1)` | yes |
+| 6 | 0x00535195 | `GetActorById(arg_a)`, `GotoObject`, then `held_actor` / `pending_action_id` / `pending_action_amount` | yes |
+| 7 | 0x00535329 | `UseInventoryItem(arg_b, 1)` | yes |
+| 8 | 0x00535204 | `DropItem(arg_b)` | yes |
+| 9 | 0x00535213 | slot 34 walk, `UnequipSlot(entry)`, broadcast **0x80** | yes |
+
+One thing this settles about kind 6: **`QueueGiveItemOrder` @ 0x00538f80 writes no field of `this`
+at all** — it only allocates the record and appends it. So the `+0x40`/`+0x44`/`+0x124` writes in
+§3's table belong to the **Consumer** column, i.e. to tick time in this arm, which is where that
+table already put them. Only the *name* `Board` was ever wrong.
 
 Gates, all immediately above the dispatch and all `JNZ skip`:
 
@@ -358,11 +396,11 @@ them is movement, AI, pathing or order-issuing code:
 | `WaitCond_FriendliesUseAbreastFormation` @ 0x00570840, read @ 0x00570858 | `== 1`; a `WAIT FOR` script predicate, table entry @ 0x0066a40c |
 | `0x004d3280` (vtable 0x006664c4 slot 17), read @ 0x004d32d5 | the order menu's "is this order currently in effect?" query |
 
-The move path is offset-free end to end: `IssueMoveOrderToSelection` @ 0x0049f010 hands **the
-identical `Vec3 *`** to every selected unit (the pushed pointer is loop-invariant across the
-selection walk), `Unit` slot 75 @ 0x004c3c90 copies it verbatim into the 0x18-byte command, and the
-executor arm copies it verbatim into `CharacterActor+0x2dc`. No per-member index, no perpendicular
-or trailing basis, no spacing constant, no unit-radius term.
+The ground-click path is offset-free end to end: `IssueGroundTargetOrderToSelection` @ 0x0049f010
+(renamed — see §8.4) hands **the identical `Vec3 *`** to every selected unit (the pushed pointer is
+loop-invariant across the selection walk), `Unit` slot 75 @ 0x004c3c90 copies it verbatim into the
+0x18-byte command, and the executor arm copies it verbatim into `CharacterActor+0x2dc`. No per-member
+index, no perpendicular or trailing basis, no spacing constant, no unit-radius term.
 
 One branch of that function is **not** a movement order at all: with `DecoyTargetPending` set it
 dispatches slot 80 `Unit_SendThrowDecoy` instead of slot 75, and with `queued` also set it
@@ -381,6 +419,16 @@ exactly 8 are in the two-register TeamSlot form. The rebased idiom (`ADD reg,[0x
 `+0xb0` off a parameter. `ClearRouteWaypoints` / `PushRouteWaypoint` / `ExitFlareMode` / `EnterFlareMode` are
 excluded by that sweep and are not worth reading for this.
 
+One thing the waypoint side *did* settle, since it bears on whether any of this could be formation
+state: the waypoint record's `+0x0c` is **`keep_on_arrival`**, and **no waypoint the shipped game
+creates is ever retained on arrival.** All four `PushRouteWaypoint` call sites (0x005398ea,
+0x0053c633, 0x00452ae4, 0x00452b0d) and both `AppendPatrolPoint` sites (0x0045489a, 0x00454e8f)
+`PUSH 0x0`; only slot 90 `AddWaypoint` forwards a caller-supplied value, and it is reachable only
+through the client/executor vtables, i.e. from the wire. The reader at 0x0053a2cf pops and frees on
+zero and retains on non-zero, so the retain path exists and is unreachable in practice — a dead
+*branch*, not dead code. Full write-up, including the record's uninitialised `+0x14`, in
+`game_defects_notes.md` §19.
+
 ---
 
 ## 8. Replication — orders are wire messages, always
@@ -392,7 +440,7 @@ different classes** — the earlier reading, "table base 0x00664ac8", filed both
 descendant, which is the shallowest-owner error CLAUDE.md warns about. Measured ownership
 (`rendering_notes.md` §5.1):
 
-* slots **100-104** (`Unit_SendInteract`, `Unit_SendEquip`, `Unit_SendDropItem`, `Unit_SendBoard`,
+* slots **100-104** (`Unit_SendInteract`, `Unit_SendEquip`, `Unit_SendDropItem`, `Unit_SendGiveItem`,
   `Unit_SendUseItem`) are **added by `MobileUnit`, table base 0x0066491c** — not by
   `CharacterUnit`. `MobileUnit` also adds 92 `Unit_IsCrouched` and 93
   `Unit_SetCrouchedAndConcealed`, and overrides 33 `Unit_SetTeamWithInventory`,
@@ -403,7 +451,7 @@ descendant, which is the shallowest-owner error CLAUDE.md warns about. Measured 
 * slots **74, 75, 76, 78, 79 and 80** are **`CharacterUnit`'s overrides of base slots**, table base
   0x00664ac8, which also **adds** extension slots 108 `Unit_SetAttackTarget`,
   109 `Unit_SetAttackPosition`, 110 and 111. They are 0x004c3da0, `Unit` slot 75 @0x004c3c90,
-  0x004c3e40, `Unit_SendAttackTarget`, `Unit_SendAttackPosition`, and 0x004c4040 — which is **not**
+  0x004c3e40, `Unit_SendAttackTarget`, `Unit_SendAttackPositionQueued`, and 0x004c4040 — which is **not**
   a sixth movement variant but `Unit_SendThrowDecoy` — see §8.3. The other five take **no
   `queued` argument**. They
   read `TEST byte ptr [KeyModifierState @0x007b6ddc],0x2` — the **CTRL** bit — and their second id
@@ -424,12 +472,12 @@ descendant, which is the shallowest-owner error CLAUDE.md warns about. Measured 
 | Immediate | Queued | Kind | Client producer (`Unit` slot) | Server handler |
 |---|---|---|---|---|
 | `0x1e` | `0x20` | 0 `AttackTarget` | `Unit_SendAttackTarget` 0x004c3fc0 (slot 0x138) | vslot 87 `QueueOrderTarget` @0x00509e7d |
-| `0x1d` | `0x1f` | 1 `AttackPosition` | `Unit_SendAttackPosition` 0x004c3e90 (slot 0x13c) | vslot 86 `QueueOrderPosition` @0x00509e48 |
+| `0x1d` | `0x1f` | 1 `AttackPosition` | `Unit_SendAttackPositionQueued` 0x004c3e90 (slot 0x13c) | vslot 86 `QueueOrderPosition` @0x00509e48 |
 | — | `0x08`, `0x21` | 2 `GotoObject` | (map-section move; `0x21` is the multi-actor batch) | `QueueGotoObjectOrder` @0x00509463/0x00509492/0x00509906 |
 | — | `0x26` push / `0x25` pop | 3 `HoldMarker` | `ActivateUnitAndResume` 0x0046ef50 | `PushHoldMarkerOrder` @0x0050a10c / `ReleaseHoldMarkerOrder` @0x0050a0b0 |
 | `0x1c` | `0x22` | 4 `CrouchToggle` | `Unit_SendCrouchToggle` 0x004c09d0 (slot 0x134) | `QueueCrouchOrder` @0x00509dc9 |
 | `0x0f` | `0x10` | 5 `Interact` | `Unit_SendInteract` 0x004c0bc0 (slot 0x190) | `QueueInteractOrder` @0x0050a21c |
-| `0x17` | `0x18` | 6 `Board` | `Unit_SendBoard` 0x004c0d50 (slot 0x19c) | `QueueBoardOrder` @0x0050a2e8 |
+| `0x17` | `0x18` | 6 `GiveItem` | `Unit_SendGiveItem` 0x004c0d50 (slot 0x19c) | `QueueGiveItemOrder` @0x0050a2e8 |
 | `0x11` | `0x12` | 7 `Equip` | `Unit_SendEquip` 0x004c0c90 (slot 0x194) | `QueueEquipOrder` @0x0050a33a |
 | `0x13` | `0x14` | 8 `Drop` | `Unit::Unit_SendDropItem` 0x004c0cf0 (slot 0x198) | `QueueDropOrder` @0x0050a38a |
 | `0x15` | `0x16` | 9 `UseItem` | `Unit_SendUseItem` 0x004c0dc0 (slot 0x1a0) | `QueueUseItemOrder` @0x0050a4af |
@@ -473,6 +521,15 @@ attack-ground order — and the consequence *is* now known: that fourth argument
 immediate path the same argument is supplied correctly as `(command_id == 0x0c)` at 0x00509eab,
 with the third argument a literal 0.
 
+**Now confirmed from the jump table rather than by inspection of the ids.** Decoding
+`ExecutorThreadProc`'s switch — byte index table @ 0x0050bae0 into targets @ 0x0050ba3c, index
+`id - 4`, bounded `CMP EAX,0x39 / JA` — gives the arm at 0x00509e14 an id set of **exactly
+{`0x1d`, `0x1f`}**, so `ZF` provably can never be set there. The full decode also confirms the
+neighbours: 0x00509e5c ← {`0x1e`, `0x20`}, 0x00509e91 ← {`0x0a`, `0x0c`}, 0x00509fae ←
+{`0x0b`, `0x0d`}. Cross-referenced as `game_defects_notes.md` §18. The general lesson is in
+CLAUDE.md's Analysis Traps: an arm's compare against a constant means nothing until you know which
+ids reach the arm.
+
 ### 8.3 Slot 80 is the decoy throw, not a movement order
 
 `0x004c4040` was `Unit_SendUseAbilityAtPosition` here and in the slot tables; it is
@@ -481,7 +538,7 @@ with the third argument a literal 0.
 GetGameTimeSeconds, Vec3 pos}`, and `directplay_protocol_notes.md` already documented `0x2b` as
 "throw decoy at a position → `MobileActor::ThrowDecoy` @ 0x00541170", so both ends now agree.
 
-**The gate is in the caller, not under the slot.** `IssueMoveOrderToSelection` @ 0x0049f06f loads
+**The gate is in the caller, not under the slot.** `IssueGroundTargetOrderToSelection` @ 0x0049f06f loads
 `DecoyTargetPending` @ 0x007b3f52 (set when the player arms a decoy — `gadgets_notes.md` §2) and
 picks:
 
@@ -495,6 +552,78 @@ picks:
 So a **queued** decoy click — Active Pause, or shift-click — is silently dropped: no command, no
 error, and the flag stays armed. That is a game defect, and it is why §7's move path never sees the
 decoy branch as a movement order.
+
+### 8.4 None of these is a *move* order, and three names had to change
+
+**No arm anywhere in the 41-slot command table calls `MobileActor::Goto` (slot 88), the actual move
+primitive.** The four position/target arms pair up as (immediate, queued) x (position, target):
+
+| ids | Actor slot | body |
+|---|---|---|
+| `0x0a` / `0x0c` | 97 | `CharacterActor::AttackPosition` — **immediate fire at a point** |
+| `0x0b` / `0x0d` | 96 | `CharacterActor::AttackTarget` |
+| `0x1d` / `0x1f` | 86 | `CharacterActor::QueueOrderPosition` — queue order kind 1 |
+| `0x1e` / `0x20` | 87 | `CharacterActor::QueueOrderTarget` — queue order kind 0 |
+
+That made three client-side names actively misleading, and all three are **renamed in the Ghidra DB**
+(breadcrumbs left, because `directplay_protocol_notes.md` and other write-ups still use the old ones):
+
+| was | now | why |
+|---|---|---|
+| `Unit_SendMoveOrder` @ 0x004c3c90 (slot 75) | **`Unit_SendAttackPositionImmediate`** | sends 0x0a/0x0c → slot 97, which clears `attack_target`, sets `is_attacking = 1`, breaks concealment and broadcasts 0x3f. It is an attack |
+| `Unit_SendAttackPosition` @ 0x004c3e90 (slot 79) | **`Unit_SendAttackPositionQueued`** | sends 0x1d/0x1f → slot 86, the *queued* variant. The old name did not distinguish it from slot 75 |
+| `IssueMoveOrderToSelection` @ 0x0049f010 | **`IssueGroundTargetOrderToSelection`** | its three dispatch targets are attack-position, queued-attack-position and throw-decoy; it ends by setting `Cursor_AttackGround` |
+
+**`0x0c` is not a queued variant** — it is the **close-range lob**, chosen on
+`KeyModifierState & 2` (LCTRL), and the client pre-computes the same
+`muzzle_speed * CloseRangeSpeedFactor` the callee will. `Actor` slot 97 itself is **not** misnamed;
+that question, left open in the DB plate on slot 75, is now closed.
+
+### 8.5 The client's mouse dispatch: the interface handler matrix
+
+This is where a ground click *comes from*, and it is what makes every `SetCursorMode` call a
+statement about which handler set is live.
+
+There are **three registry objects, one per mouse button**, selected by the `msg - 0x201` jump table
+@ 0x00470c3c inside `HandleKeyPress3`: `LeftButtonInterface` @ 0x007b41f8,
+`RightButtonInterface` @ 0x007b4498, `MiddleButtonInterface` @ 0x007b3f88. Each holds **three 6x7
+handler matrices** — click `+0x40`, drag `+0xe8`, button-down `+0x190`, each `6*7*4 = 0xa8` bytes,
+tiling to `0x238` (so `0x40 + 6*0x1c == 0xe8` is a coincidence, not a two-matrix layout):
+
+```
+cell = registry + base + target_class*0x1c + cursor_mode*4
+```
+
+**The 7-valued dimension (stride 4) is `CursorMode`; the 6-valued dimension (stride 0x1c) is the
+cursor target class.** Measured from both dispatchers' index arithmetic
+(`LEA ECX,[EAX*8]; SUB ECX,EAX; ADD ECX,ESI` = `col*7 + mode`, where `EAX` is
+`ClassifyCursorTarget()` and `ESI` is `CursorMode` @ 0x007b3f78) and independently from the
+registrars' loop bounds. Registration masks encode it as: **bits 0..6 = `CursorMode` rows,
+bits 7..12 = target-class columns**, and a cell is written iff *both* its bits are set.
+
+`CursorTargetClass` (the column, from `ClassifyCursorTarget` @ 0x004a77a0): 0 nothing under cursor,
+1 world location only, 2 hostile unit, 3 a unit whose `TeamSlot+0x6b` `not_enemy_source` flag is set,
+4 own/allied unit, 5 HUD element.
+
+Everything is installed in one place — `RegisterAllInterfaceHandlers` @ 0x0049c290, whose sole caller
+is `BeginLevelSession` @ 0x004e25c7 — as 6 clears (mask `0x1fff`) plus **22** registrations, and
+**registration order matters**: a later write overwrites an earlier cell, which is what makes
+`FUN_004a4100` dead (registered for row 2 / column 1 at 0x0049c3bd, overwritten at 0x0049c421 by
+`OnGroundTargetClick`'s all-columns registration for the same row). Two structural facts worth
+keeping: **`CursorMode` 6 (`Suspended`) is never filled in any matrix of any registry**, and the only
+configuration-dependent cells in the whole table are one drag pair keyed on `RightMouseScrollMode`
+@ 0x007b9cbc (a GLkeys.cfg / Options setting) at 0x0049c348-0x0049c359.
+
+**Flare mode is the worked example, end to end.** Entry is *not* a matrix cell — it is the
+`GL_CONTROLS_FIREFLARE` key binding (default DIK_F) calling `EnterFlareMode` @ 0x004a17e0, which
+arms each selected unit (`Unit+0x284 = 1`, prior loadout saved to `+0x27c`/`+0x280` with `0x21` as the
+"nothing saved" sentinel) and ends with `SetCursorMode(GroundTarget)`. The matrix owns the other two
+thirds: **commit** is `OnGroundTargetClick` @ 0x004a4420 (LMB click matrix, row `GroundTarget`, all
+six columns) → `IssueGroundTargetOrderToSelection`, and **cancel** is `CancelGroundTargeting`
+@ 0x004a44c0 (the RMB cell in the same row) → `ExitFlareMode`. In flare mode
+`IssueGroundTargetOrderToSelection` additionally requires each unit's `+0x284`, so **only
+flare-armed units respond at all**. See `gadgets_notes.md` §6 for why the *AI* half of the flare
+feature is nonetheless dead.
 
 ---
 
@@ -617,7 +746,7 @@ order kinds.
 |---|---|---|---|---|
 | 0 | `Normal` | reset from 14 sites | the full context-sensitive pick | CONFIRMED by its body |
 | 1 | `CommandWheel` | `OpenCommandWheel` @ 0x004a11bd | "standard" (inert) | PROPOSED — empty body |
-| 2 | `GroundTarget` | `BeginAttackGroundTargeting`, `EnterFlareMode`, `CommitPendingOrderTarget` | "attack ground" | CONFIRMED by its body |
+| 2 | `GroundTarget` | `BeginAttackGroundTargeting`, `EnterFlareMode`, `OnCommandWheelClick` | "attack ground" | CONFIRMED by its body |
 | 3 | `InventoryScreen` | `FUN_0049f350` @ 0x0049f48c | "drop" / "pass" | PROPOSED-strong |
 | 4 | `PauseMenu` | `ToggleInGamePauseMenu` @ 0x004a0e50 | "standard" (inert) | PROPOSED — empty body |
 | 5 | `UnitFollow` | `ToggleReconMode` @ 0x004977bd | "standard" (inert) | PROPOSED — empty body |
@@ -625,6 +754,17 @@ order kinds.
 
 The confidence column is load-bearing: modes 1, 4 and 5 have **empty** case bodies, so their names
 come from their setters' names, one inference step beyond the rest.
+
+`CommitPendingOrderTarget` in the row above is now **`OnCommandWheelClick`** @ 0x004a4250: it is the
+LMB click handler registered for row `CursorMode::CommandWheel`, all six columns, and cases 0, 1 and
+4 of its state machine are cursor-mode changes and cancel rather than order-target commits. (Its
+former open question — whether cases 0-3 were dead — is settled: `PendingCommandWheelAction`
+@ 0x007b4448 has six writers, five of them the command-wheel entry classes' vtable slots.)
+
+**Mode 5's name `UnitFollow` is now itself suspect.** It is the only mode owning a *complete*
+LMB+RMB x {button-down, click, drag} handler set in the matrices of §8.5, which reads much more like
+a dedicated ability-aiming mode than a follow toggle. Not renamed — the evidence is structural, not a
+measured engine word.
 
 The addresses in the "set by" column are as recovered and are **not uniformly function entries** —
 0x004a11bd and 0x004977bd sit inside `OpenCommandWheel` and `ToggleReconMode`, whose entries §11
@@ -666,10 +806,20 @@ proven absent.
 
 - **The formation geometry.** `TeamSlot+0xb0` has four writers and no reader was located. Neither
   the per-member offsets for Cluster / Side-by-side / Single file nor the anchor rule was found.
-- **Kind 6's exact meaning.** "Board / attach" is carried over from `directplay_protocol_notes.md`
-  rather than measured; what `Actor+0x40`/`+0x44`/`+0x124` mean was not established.
-- **Kinds 5 and 7.** Named from their immediate wire twins (`MobileActor::EquipItemInSlot`
-  @ 0x00536ba0, `MobileActor::UseInventoryItem` @ 0x005370d0), whose bodies were not read here.
+- ~~**Kind 6's exact meaning.**~~ **SETTLED: kind 6 is `GiveItem`**, and the three fields are named.
+  `Actor+0x40` is `held_actor` (a general retained reference to another actor — "the actor I am moving
+  toward or holding", *not* the pending-give recipient, and its savegame encoding `target->id + 1`
+  is what settles the kind); `Actor+0x44` is `pending_action_id`, an id whose **namespace depends on
+  the pending action** — an actor id for the kind-2 goto arm and the goto-object command, an item id
+  for the kind-6 give arm; and `+0x124` is `pending_action_amount`, whose every measured use is the
+  give amount. The latter two names are PROPOSED (the *overloading* on `+0x44` is confirmed); see
+  their field comments in the Ghidra DB for the full writer/reader enumeration. Note `MobileActor` is
+  a **flat** struct that redeclares the base layout rather than inheriting `Actor`, so the same three
+  fields exist twice and both declarations now carry the names.
+- **Kinds 5, 7 and 9.** Still named from their immediate wire twins, and now a recorded doubt rather
+  than a footnote — see the table in §3. Their callees are `EquipItemInSlot` @ 0x00536ba0,
+  `UseInventoryItem` @ 0x005370d0 and `UnequipSlot` @ 0x00536ec0 respectively, none of which matches
+  its kind's name.
 - **`PendingOrder::flag` for kinds other than 0/1.** On the slots 96/97 path it is `close_range`
   (§8.2); what the field means for the remaining kinds was not decoded.
 - **Command Wheel / Standing Orders Menu contents.** `OpenCommandWheel` 0x004a0fa0,

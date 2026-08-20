@@ -823,7 +823,7 @@ descriptive name, not a recovered one.
 | draw hearing range | 0x3e | B | dflt yes |
 | status window u | 0x3f | I | dflt 0, 0..1024 |
 | status window v | 0x40 | I | dflt 0, 0..1024 |
-| blob shadow | 0x5a | I | dflt 0, 0..1 |
+| blob shadow | 0x5a | I | dflt 0, 0..1 — but the shipped headers write **`spider`** for 1 (see below) |
 | radius | 0x6b | F | dflt 0 |
 | height | 0x6c | F | dflt 0 |
 | size | 0x6d | F | dflt 1.0 |
@@ -838,6 +838,19 @@ descriptive name, not a recovered one.
 | max module | 0x85 | I | dflt 0 |
 | initial first person range | 0x86 | F | dflt 5, 5..100 |
 | maximum first person range | 0x87 | F | dflt 5, 5..100 |
+
+**`blob shadow` (0x5a) — a type question this table may be answering wrongly.** The row says `I`
+(integer, 0..1), and the *consumer* agrees it is an integer: `Unit_BuildShadowNode` @ 0x005525b0 reads
+`Character+0x8c` as an `int` and does `SUB EAX,0 / JZ` then `SUB EAX,1 / JNZ` (see
+`role_subobjects_notes.md`). But **the shipped headers write it as a bare keyword**, not a number —
+`blob shadow		spider` appears 10 times across `archore.gsh`, `mplay_archore.gsh`,
+`pres_arrow.gsh` and `walking_mine.gsh`, and no shipped header writes `blob shadow 1`.
+
+So either this field's parse rule is not plain `I`, or the parser maps that keyword to 1 somewhere
+this table does not record. **NOT SETTLED — the field's entry in the `character` parse table was not
+re-read for this.** Do not "fix" the type on the strength of the `.gsh` evidence alone; a `.gsh`
+author sees a keyword, which is the practical fact worth knowing, and the resolution is one read of
+the parse-table entry away. Note also that value 1's effect is inert unless `ShadowQuality == 1`.
 
 ### ammo (`DoParseAmmo` / `ParseAmmo`)
 | Field | ID | Type | Rules |

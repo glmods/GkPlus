@@ -42,13 +42,30 @@ is constructed at 0x00540649, not through `SpawnProjectileActor`.
 ### 2.1 Order to fire
 
 `CharacterActor::AttackTarget` @ 0x00540c60 - vtable slot 96,
-`__thiscall void(CharacterActor *this, Actor *target, int range, char mode, char close_range)`,
+`__thiscall void(CharacterActor *this, Actor *target, float order_time, char attack_mode, bool close_range)`,
 `RET 0x10`.
 `CharacterActor::AttackPosition` @ 0x00540a10 - slot 97, same shape with a `Vec3 *`.
 
+**The 2nd argument is a `float` game-time order timestamp, not a range.** It was `int range` here,
+which is where the field name `attack_range` came from, and both were wrong: `+0x290` is
+`float attack_order_time` and `+0x2f8` (previously `attack_stop_reason`) is `float attack_state_time`.
+Both slots store *the same argument into both fields*. `AiThink_Bot` re-issues the order when
+`now - attack_order_time >= 6.0f` (`SUBSS [EBX+0x290]` @ 0x0045346e), and `+0x290` is also `COMISS`ed
+against `move_start_time` @ 0x0053f4da - a float against a float. The constructor zeroes `+0x2f8`
+with `MOVSS` @ 0x0053c92a. Call sites push `*Clock::GetGameTimeSeconds()` or the executor tick's
+`now_seconds` (`PUSH [EBP+0x10]` @ 0x0053dba7), and the client mirror
+`CharacterUnit::Unit_SetAttackPosition` already named the argument `order_time`. Nothing anywhere
+reads `+0x2f8`'s value, so its `float` type is measured and its name is inferred from its writers.
+
+Slot 98 `StopAttacking` @ 0x00540f20 takes the same thing: `void __thiscall(float order_time)`, not
+a reason code.
+
+**So there is no per-order range parameter in this path at all** - range comes from the weapon and
+from `weapon_range` (+0x2ec), never from the order.
+
 It stores `attack_target` (+0x2d8, refcounted), `attack_mode_param` (+0x261),
-`close_range_attack` (+0x288), `attack_range` (+0x290), sets `is_attacking` (+0x2d4), zeroes
-`Actor+0x74`, and computes the launch speed:
+`close_range_attack` (+0x288), `attack_order_time` (+0x290) and `attack_state_time` (+0x2f8), sets
+`is_attacking` (+0x2d4), zeroes `Actor+0x74`, and computes the launch speed:
 
 ```
 speed = weapon->muzzle_speed                     // Weapon+0x04
@@ -194,6 +211,14 @@ Call sites, all inside `CharacterActor::Update`:
 
 So the SHIFT-modified attack order does two things at once, and only for the grenade launcher does
 the second one exist:
+
+**Where the flag comes from on the wire.** `close_range_attack` is not a queue flag: the immediate
+ground-click command is **`0x0a`, or `0x0c` when `KeyModifierState` @ 0x007b6ddc has bit 2 (LCTRL)**,
+and the executor arm derives it as `CMP EDI,0xc / SETZ CL` @ 0x00509ea8 before calling `Actor` slot 97.
+So **`0x0c` is the close-range lob variant of `0x0a`**, and the client pre-computes the same
+`muzzle_speed * CloseRangeSpeedFactor` the callee will. The queued pair `0x1d`/`0x1f` is meant to
+carry the same flag and **cannot** — see `game_defects_notes.md` §18: a queued attack-ground order can
+never be a close-range one.
 
 1. `AttackTarget`/`AttackPosition` scale the muzzle speed by **0.65**, which raises the arc for any
    gravity projectile;
@@ -357,6 +382,16 @@ only reselect flares, and a weapon on anything else will never reselect flares:
 ```
 (item->ammo_type != 1) != (weapon->ammo_type == 1)
 ```
+
+**That segregation is what makes the player's flare mode work, and it is the whole mechanism.**
+`EnterFlareMode` @ 0x004a17e0 sends wire command **0x19** (`SetAmmoType`, ammo type 1), whose
+executor arm reaches `SetWeaponAmmoType` @ 0x004b1da0; that copies the entire `Ammo` record into the
+`Weapon`, **including `w+0x00 = Ammo::role` at 0x004b1f0c**. So the weapon's *projectile role* becomes
+`Rol_Flare`, and the ordinary fire path (§2) discharges a flare with no flare-specific code in it —
+`CharacterActor::Update` reads `weapon->projectile_role` at 0x0053e602/0x0053e60c and hands it
+straight to `ProjectileActor::Ctor`. The reselect rule above is then what stops the weapon silently
+dropping back to normal ammo mid-flare-mode, and `ExitFlareMode` is what restores the saved loadout.
+(`gadgets_notes.md` §6 covers the separate, dead AI-side flare mechanism.)
 
 ### 6.2 The magazine model
 
@@ -581,6 +616,31 @@ dist2`) and the direct victim is excluded, so nothing is double-damaged.
 
 A broadcast 0x37 (0x14 bytes) `{id, strength, shield, armor}` follows each application; the
 reliable flag depends on `BandwidthUse` and on whether the victim's team is player-controlled.
+
+#### 7.3.1 Worked example: the minebot detonation
+
+The clearest instance of every property above, and it adds one the projectile path does not have —
+**no team filter at all**. `AiThink_Minebot` @ 0x00456c50 uses **two different radii**:
+
+- **trigger**, loop C @ 0x00457270-0x0045738a: any live actor **not on the minebot's own team**
+  (note: *no* team-0 skip here, unlike its acquisition loop) within `dist² < DAT_006521c8 = 2.25`,
+  i.e. radius **1.5**, jumps to the detonation block @ 0x004573c7. Otherwise it chases via
+  `SetMoveDestinationAndBroadcast` @ 0x004573bd.
+- **damage**, loop D @ 0x00457b33-0x00457df8: walks the **global actors hash table** @ 0x007ba0d8
+  (copied in via `HashTable_Actor_CopyCtor` @ 0x00457a78) with **NO TEAM FILTER WHATSOEVER**, taking
+  every live actor within `dist² < 16.0` — radius **4.0** — through `ScaleDamageForResistance`
+  @ 0x00457c8d and then the victim's slot 68. **So own-team and neutral actors are hit.**
+
+The damage value comes from `Role+0x54` and is charged as **weapon type 0x21**, which is exactly the
+case `ScaleDamageForResistance`'s plate comment describes for a blast. The detonation block also
+broadcasts **0x68**, posts a stimulus of kind **0x14** @ 0x004574ea, and spawns **four**
+`GetRoleByName("frag projectile")` projectiles @ 0x0045796d (loop count set @ 0x0045755a, decremented
+@ 0x00457a2b) — so the visible frags are *separate* from the arithmetic above, not the carrier of it.
+
+Caution on the constant: `DAT_006521c8 = 2.25` was **not renamed**, because its xrefs were not
+enumerated and its neighbour 0x006521cc (value 3.0) already carries the unrelated name
+`PauseRequestInterval` and is used here only as the bias in the
+`AND 0x7fffff` / `OR 0x40000000` random-float idiom — almost certainly MSVC constant-pool sharing.
 
 ### 7.4 The `0x200` dissociate flag
 

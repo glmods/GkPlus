@@ -668,7 +668,8 @@ zero-init, so editing the cfg by hand is the only way to set it.
 function pointers. `ReadGLKeys` loads the word and immediately calls `ApplyShadowQuality`,
 which reads the *global* `ShadowQuality` — still the pre-load default at that point — so both
 the file value and that call are wasted. It comes out right anyway because `WinMain` ->
-`InitBuiltinEffectObjects` -> `CreateAlphaJunkSprites` re-runs `ApplyShadowQuality` at `0x0046b9c3`, well
+`InitBuiltinEffectObjects` -> `CreateBlobShadowSprites` (renamed from `CreateAlphaJunkSprites`)
+re-runs `ApplyShadowQuality` at `0x0046b9c3`, well
 after the copy-out at `0x0046b667`.
 
 #### The load guard: a new graphics card wipes everything
@@ -831,7 +832,7 @@ five are exactly the ids the byte table maps to index 22, whose pointer-table sl
 |---|---|---|---|
 | `0x04` | **none** | — | — |
 | `0x05` | `0x004a1d4a`, `0x004a1e4a`, `0x004a1fd5` (`FUN_004a1c60`) | `0x0066971c` (base, `HudWidget_vtbl`) | `InGameMenu__OnItemActivated` |
-| `0x0d` | `0x004b99c8` (`FUN_004b9860`), `0x004bd1f1` (`FUN_004bcfb0`) | `0x0066971c` | `InGameMenu__OnItemActivated` |
+| `0x0d` | `0x004b99c8` (`FUN_004b9860`), `0x004bd1f1` (`Unit_EquipItemInSlot`) | `0x0066971c` | `InGameMenu__OnItemActivated` |
 | `0x0e` | `0x004b99f1`, `0x004bd193` | `0x0066971c` | `InGameMenu__OnItemActivated` |
 | `0x0f` | `0x0056a34c` | `0x006697a4` (`ParticleTester_vtbl`) | `FUN_0056b6d0` — **overridden** |
 

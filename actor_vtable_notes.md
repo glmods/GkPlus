@@ -170,7 +170,7 @@ Only the class that *introduces* the override appears here; its descendants inhe
 | Slot | Addr | Name | Base behaviour |
 |---|---|---|---|
 | 51 | 0x0052dcc0 | `InitPositionAndTiming` | timing fields + spatial lookup, caches the nav poly into `+0x118` |
-| 52 | 0x0052de60 | `ReleaseAttachment` | ref-counted release of `+0x40` |
+| 52 | 0x0052de60 | `ReleaseHeldReferences` | **a reference-cycle breaker**: "drop every retained reference I hold", `void __thiscall(void)`, bare `RET`. Named `ReleaseAttachment` until the whole override chain was read, and both replacement candidates offered - `ReleasePendingGiveRecipient` and `ReleaseHeldActor` - were also wrong: the five overriders release **three unrelated fields**, two of which are not actor references at all. `Actor` @ 0x0052de60 -> `held_actor` (+0x40); `MobileActor` @ 0x00532d10 -> the route object at `+0x1cc`; `CharacterActor` @ 0x005409e0 -> `attack_target` (+0x2d8); `ProjectileActor` @ 0x00542ad0 and `TrackObjectActor` @ 0x00547cc0 are pure forwarding thunks (a single `JMP 0x0052de60`). Each body runs the release idiom then nulls its own field, and `MobileActor`'s/`CharacterActor`'s tail-`JMP` to the base so the whole chain runs. The **contract comes from the caller**: `ReleaseAllActorReferences` @ 0x005301b0 (`void __cdecl(void)`, no arguments - it pushes the actors table 0x007ba0d8 as a literal) walks every actor, calls this slot (`CALL [EAX+0xd0]` @ 0x00530216) and only *then* drops each actor's own refcount (@ 0x00530220) - it breaks the cycles so the counts can reach zero. Called from `ExecutorThreadProc` @ 0x0050b8af and `FUN_005046c0` @ 0x005046cc |
 | 53 | 0x0052ded0 | `SetPositionAndOrientation` | coords + quaternion + timing |
 | 54 | 0x0054f4f0 | `SetField0x188(bool)` | `RET 4`, discards |
 | 55 | 0x0054f270 | `OnPrePhysics` | no-op |
@@ -277,7 +277,7 @@ typed as plain `ActorVtbl` in the DB.
 | 87 | 0x0054e5e0 | `QueueOrderTarget` | was `OnPreUpdate`; appends a tag-0 record |
 | 88 | 0x00539450 | `Goto` | move order, gated on `can_turn`, strength and priority |
 | 89 | 0x0053a020 | `Die` | broadcasts 0x3d (destructible) or 0x48 (not), then slots 82 and 64 |
-| 90 | 0x0053a760 | `AddWaypoint` | 0x18-byte record pushed onto the `+0x204` list |
+| 90 | 0x0053a760 | `AddWaypoint` | `void __thiscall(Vec3 *pos, int keep_on_arrival, bool is_patrol_point, float wait_time)`, `RET 0x10`. Pushes a 0x18-byte `Waypoint` record onto the `+0x204` route list, and onto `patrol_points` (`+0x214`) as well when `is_patrol_point` is set. The console reaches it through one shared body: `ADD WAYPOINT` (`CommandAddWaypoint` @ 0x0043e860, `XOR CL,CL`) and `ADD PATROLPOINT` (`CommandAddPatrolPoint` @ 0x00442140, `MOV CL,0x1`) both `JMP` to `CommandAddWaypointOrPatrolPoint` @ 0x0044c760, whose `CL` becomes this slot's `is_patrol_point` (`MOV EDI,ECX` @ 0x0044c78a, `PUSH EDI` @ 0x0044c86b) and whose optional trailing float becomes `wait_time` (`ConsoleParseFloat` @ 0x0044c82f with a 0.0 default, `PUSH [EBP-0x28]` @ 0x0044c863). `keep_on_arrival` is pushed as a **literal 0** there @ 0x0044c86c |
 | 91 | 0x0053b560 | `GetNavigationTarget` | fills a 0x24-byte descriptor |
 | 92 | 0x0054eaa0 | `GetField0x198` | returns `+0x198`, a `Hierarchy*` override |
 | 93 | 0x0053baa0 | `PlayActionAnimation` | gated on a busy flag and a timestamp |
@@ -293,9 +293,40 @@ orders survive a save/load. Slot 32 tests its count.
 | Slot | Addr | Name | Notes |
 |---|---|---|---|
 | 95 | 0x0054f430 | `SetField0x304` | setter for the cannot-fire gate |
-| 96 | 0x00540c60 | `AttackTarget` | broadcast id is computed: `0x41 + close_range` |
-| 97 | 0x00540a10 | `AttackPosition` | broadcast id is computed: `0x3f + close_range` |
-| 98 | 0x00540f20 | `StopAttacking` | broadcast 0x44 |
+| 96 | 0x00540c60 | `AttackTarget` | `void __thiscall(Actor *target, float order_time, char attack_mode, bool close_range)`, `RET 0x10`; broadcast id is computed: `0x41 + close_range` |
+| 97 | 0x00540a10 | `AttackPosition` | `void __thiscall(Vec3 *position, float order_time, char attack_mode, bool close_range)`, `RET 0x10`; broadcast id is computed: `0x3f + close_range`. `MOV ESI,ECX` @ 0x00540a3a and **EDX is never read**, so `__thiscall` rather than `__fastcall`. The name is right - what was wrong was one level down, in the 2nd parameter |
+| 98 | 0x00540f20 | `StopAttacking` | `void __thiscall(float order_time)`; broadcast 0x44 |
+
+**The 2nd parameter of slots 96/97 (and the only parameter of 98) is a `float` game-time order
+timestamp, not a range and not a reason code.** It was typed `int` here and in `src/Actors.h`, and
+the two `CharacterActor` fields it writes were named for the wrong reading: `+0x290` was
+`attack_range` and is `float attack_order_time`; `+0x2f8` was `attack_stop_reason` and is
+`float attack_state_time`. Both slots 96 and 97 store *the same argument into both fields*
+(@ 0x00540b56 / @ 0x00540e63 for `+0x290`, @ 0x00540a6b / @ 0x00540d4c for `+0x2f8`), and slot 98
+writes `+0x2f8` @ 0x00540f54.
+
+What pins the `float`: the constructor zeroes `+0x2f8` with `MOVSS` @ 0x0053c92a; `+0x290` is
+`COMISS`ed against `move_start_time` (`MobileActor+0x1ec`, a known float timestamp) @ 0x0053f4da;
+and `AiThink_Bot` does `SUBSS XMM0,[EBX+0x290]` @ 0x0045346e then compares against `6.0f`
+(0x006521e0) - i.e. re-issue the attack order when `now - attack_order_time >= 6 s`. The argument's
+*source* agrees: 0x0053dba7 pushes `[EBP+0x10]`, which `ExecutorActorTick` supplies as
+`now_seconds`, and every `StopAttacking` call site pushes `*Clock::GetGameTimeSeconds()`
+(0x0053cb99, 0x0053086f, 0x00535fd5). The client mirror `CharacterUnit::Unit_SetAttackPosition`
+already named the same argument `order_time`.
+
+`+0x2f8` has **no interpreting reader anywhere in `.text`** - nothing reads its value - so its
+`float` type is measured but the name `attack_state_time` is inferred from its three writers.
+
+This was a live GkPlus defect and not just a naming slip: `src/JsActors.cpp` converted the
+argument with `JS_ToInt32` through an `int` parameter, so the integer bit pattern reached a callee
+reading a float and `attack_position(pos, 123)` delivered ~1.7e-43. It appeared to work only for
+0, whose bit pattern is also `0.0f`. Fixed in the same pass.
+
+One suspected minor protocol defect falls out, recorded but **not asserted**: slot 97 broadcasts
+`Actor+0x88` (`last_update_time`) in the 0x3f/0x40 payload's `+0x08` slot, whereas slot 96
+broadcasts its own `order_time` in the 0x41/0x42 payload's `+0x08` - and both client arms feed
+`msg[+0x08]` into a parameter named `order_time`. Both values are game times, so the practical
+effect is small, but it is not the value the caller passed.
 | 99 | 0x00541b90 | `SetAmmoType` | was `ExecuteSpecialAbility`; sets the weapon's ammo type (ECX = `weapon_data`, EDX = ammo id), reselects ammo, broadcasts 0x82 |
 
 ### TurretActor, slots 100-104

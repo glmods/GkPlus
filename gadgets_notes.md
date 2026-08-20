@@ -216,7 +216,7 @@ pickup class 5 (minelayer) with a sub-type. Sub-type **3** is the decoy, and its
 `SetCursorMode(GroundTarget)`. Both cursor-mode cancels clear it beside `FlareModeActive`
 @ 0x007b3f51 (0x004a449e in `OnGroundTargetClick`, 0x004a44fd in `CancelGroundTargeting`).
 
-The next **ground click** is what fires it: `IssueMoveOrderToSelection` @ 0x0049f06f reads that
+The next **ground click** is what fires it: `IssueGroundTargetOrderToSelection` @ 0x0049f06f reads that
 byte and dispatches client `Unit` vtable slot **80**, `CharacterUnit::Unit_SendThrowDecoy`
 @ 0x004c4040, instead of the slot-75 move order — which sends command **`0x2b`**, 24 bytes
 `{0x2b, unit_number, f32 GetGameTimeSeconds, Vec3 pos}`, to `MobileActor::ThrowDecoy`
@@ -538,6 +538,32 @@ freed here, and the `Role` field is what dangles.
 
 ## 6. Flares
 
+> **Read this first: there are TWO flare mechanisms, on two different class trees, and only one of
+> them is dead.** Everything in this section is about the **executor-side `Actor` tree** — the AI
+> firing a flare at a noise — and its conclusion (a bit nothing reads, and a bit nothing writes) is
+> correct and stands.
+>
+> The **player** flare is a separate, fully **live** feature on the client `Unit` tree, and nothing
+> below bears on it. Its chain is: the `GL_CONTROLS_FIREFLARE` key binding (default **DIK_F**,
+> registered from `WinMain` by `RegisterAllKeyBindings` @ 0x004effc0, with a rebindable Controls row)
+> -> `EnterFlareMode` @ 0x004a17e0, which saves each selected unit's loadout to `Unit+0x27c`/`+0x280`
+> (sentinel `0x21` = nothing saved), sets the arm flag `Unit+0x284 = 1` and `FlareModeActive`
+> @ 0x007b3f51, and switches the cursor to `GroundTarget` -> the LMB cell of that cursor-mode row
+> commits via `OnGroundTargetClick` @ 0x004a4420, the RMB cell cancels via `ExitFlareMode`.
+> **What makes it actually fire** is that `EnterFlareMode` sends wire command **0x19**
+> (`SetAmmoType`, ammo type 1 = flares), whose executor arm reaches `SetWeaponAmmoType`
+> @ 0x004b1da0; that function copies the whole ammo record into the weapon **including
+> `w+0x00 = Ammo::role` at 0x004b1f0c**, so the plasma pistol's projectile role *becomes* `Rol_Flare`
+> and the ordinary ground click (command 0x0a -> `Actor` slot 97 `AttackPosition`) discharges it with
+> no flare-specific code on the firing path at all. Shipped data closes the compatibility gate:
+> `plasma.gsh:499` `ammo Ammo_PlasmaPistol_Flares { ammo type flares; projectile Rol_Flare }`.
+>
+> **The consequence for the paragraph below**: bit 0x80 is not just unwritten, it is **redundant**.
+> `Rol_Flare` carries `identifier "flare"`, so `GetRoleByName("flare")` and the ammo table resolve to
+> the *same role object* — the dead AI shortcut and the live player path would have produced
+> identical projectiles. See `orders_notes.md` §8.5 for the cursor-mode/handler-matrix side, and note
+> that `CLAUDE.md`'s old "flares are dead code" line has been corrected accordingly.
+
 `CommandFlareFirer` @ 0x004492e0 is four lines: `IsExecutorRunning` -> `SuspendExecutor` ->
 `ConsoleParseActorName` -> `OR [actor+0x7c], 0x40` -> `ResumeExecutor`. `CommandHunter`
 @ 0x004492b0 is the same with `0x20`. Neither broadcasts, so neither replicates -
@@ -558,8 +584,9 @@ binary scan finds exactly two instructions touching `Actor+0x7c` with 0x40 or 0x
 writer of 0x80 anywhere in `gl.exe`.**
 
 So, on the evidence: **`FLARE FIRER` sets a bit nothing reads**, and the bit that actually swaps
-the projectile to a flare is never set by the shipped binary. Whether flares "require a plasma
-weapon" is therefore not a live gate at all - see §9 for the one adjacent test that is
+the projectile to a flare is never set by the shipped binary — *on this path*. (The player path in
+the box at the top of this section does not use either bit; it changes the weapon's projectile role
+outright.) Whether flares "require a plasma weapon" is therefore not a live gate at all here - see §9 for the one adjacent test that is
 (`weapon_object->+8 == 0xd` at 0x0053e667, i.e. weapon type 13 `repair arm`, which selects a
 different branch entirely).
 
@@ -640,9 +667,12 @@ None of the laser-fence or electricity commands broadcasts, confirming
   absurd value in a `.gsh` and time the lay animation.
 - **The `0x8e` payload constant `0x2f3a`** (mine laid, remote/decoy only) was not identified -
   resource id or sound id.
-- **`Actor::flags` bit 0x80 has no writer** and bit 0x40 has no reader (§6). Either the flare
-  path is dead code in the shipped build, or one of the two bits is written through a
-  computed/OR'd mask this scan's literal-operand pattern misses.
+- **`Actor::flags` bit 0x80 has no writer** and bit 0x40 has no reader (§6). **This is settled and
+  it does *not* mean "flares are dead":** the *AI* flare path is dead, the *player* flare path is
+  live and never touches either bit (§6's lead box). Bit 0x80 is additionally **redundant** — it
+  would have selected the same `Rol_Flare` that `Ammo_PlasmaPistol_Flares` already names — so nothing
+  is lost by its absence. What remains genuinely unknown is only whether either bit is written
+  through a computed/OR'd mask this scan's literal-operand pattern misses.
 - **The pickup branch of `HEAP` does not obviously replicate.** It overwrites `actor->entity` and
   calls `vtbl+0x148`; whether that slot broadcasts was not checked. The drop branch definitely
   does (0xb9).

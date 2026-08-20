@@ -225,6 +225,38 @@ The save format copes in three ways:
    roles and entities go to disk as `id + 1` with `0` reserved for NULL, and strings as
    length-prefixed text with `-1` for NULL. The loader turns them back into pointers via
    `GetRoleById` / `GetActorById` against the freshly loaded level.
+
+   **`Actor+0x40` (`held_actor`) is the worked example, and its encoding is what settled what that
+   field is.** The writer is nine instructions:
+
+   ```
+   00531d3c  MOV  EAX,[EBX+0x40]
+   00531d3f  TEST EAX,EAX
+   00531d41  JZ   0x00531d49
+   00531d43  MOV  EAX,[EAX+0xc]     ; actor->id
+   00531d46  INC  EAX               ; ... + 1, so 0 means "none"
+   00531d49  XOR  EAX,EAX
+   00531d5b  CALL EDI               ; WriteFile, 4 bytes
+   ```
+
+   `ReadActorFixups` reads it straight back into `&actor->held_actor` @ 0x00530ad7, and
+   `Actor_FixupAfterLoad` decodes it: `LEA EDI,[EAX-1]` @ 0x00531803, hash through the actors table
+   (buckets 0x007ba0e8, mask 0x007ba0e4), compare `entry->+0xc == id`, then store the found pointer
+   **with a retain** @ 0x0053183a-41. A field with a savegame encoding and a rehydration pass of its
+   own is not transient per-order state, which is why `Actor+0x40` is a general retained actor
+   reference (`held_actor`) rather than the pending-give recipient it used to be named for.
+
+   `Actor+0x44` (`pending_action_id`) is by contrast a **plain persisted int** - copied as part of
+   the blob @ 0x00530a67 and never touched by `Actor_FixupAfterLoad`, which is exactly consistent
+   with its already being an id rather than a pointer. Its *namespace* varies with the pending
+   action (an actor id for the goto/walk-to/receive paths, an item id for the give paths), so what
+   the number means after a restore depends on the order that was in flight; the sentinel is -1.
+
+   One defect the fixups carry rather than cause: the 0x18-byte `Waypoint` record moved by
+   `WriteActorFixups` (`PUSH 0x18` @ 0x0053210d) and `ReadActorFixups` (@ 0x00531060) has a trailing
+   dword that **none of its three allocators ever writes**, so every `.sav` containing a waypoint
+   carries four bytes of uninitialised pool memory. Nothing reads it, but it means two saves of
+   identical game state are not byte-identical.
 2. **The reader is a field-by-field copy, not a `memcpy`.** `ReadActorFixups` copies roughly 35
    individually named offsets out of the scratch blob and **never touches offset 0**. The saved
    vtable pointer is read into the scratch buffer and then silently dropped; the live vtable is

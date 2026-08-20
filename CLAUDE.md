@@ -788,9 +788,18 @@ several features the retail build cannot actually execute:
 - `gls.txt` - Game Level Structure file format quick field list (superseded by gls_system_notes.md)
 - `<Gunlok>\html manual\manual.htm` - the shipped manual (Italian). Not RE, but the best
   inventory of what the gameplay layer is *supposed* to do. Treat it as claims to verify:
-  formations have no geometry, and flares are dead code. Verification runs both ways — the manual's
-  orange alert state was recorded here as unreachable and is not; the code that enters it was
-  sitting in undefined bytes (`ai_behaviour_notes.md`)
+  formations have no geometry. Verification runs both ways, and **two entries this file once called
+  dead have turned out to be live** — the manual's orange alert state was recorded here as
+  unreachable and is not (the code that enters it was sitting in undefined bytes,
+  `ai_behaviour_notes.md`); and **flares are not dead code either**. The *player* flare is fully
+  reachable and functional — the `GL_CONTROLS_FIREFLARE` key binding (default DIK_F, a rebindable
+  Controls row) calls `EnterFlareMode` @ 0x004a17e0, which sends wire command 0x19 so
+  `SetWeaponAmmoType` rewrites `weapon->projectile_role` to `Rol_Flare`, after which an ordinary
+  left click discharges it. What *is* dead is only the **executor-side** mechanism: `Actor::flags`
+  bit 0x80's auto-flare and `CommandFlareFirer`'s bit 0x40 — and bit 0x80 is merely a **redundant**
+  route to the same `Rol_Flare` the ammo table already supplies. `gadgets_notes.md` §6 is correct
+  for the AI mechanism it describes; the split is in its lead paragraph. Both cases share one cause:
+  a negative conclusion drawn from a sweep that could not see what it needed to see
 
 ### Shipped game data: the developers' own commented source
 
@@ -929,6 +938,21 @@ section.
   dword has no relocation" carries no information.
 - Reachability and gate counts must be **transitive**: `CommandSpawn` looks ungated but delegates
   to `DoSpawn`, which holds the gate. Converges around depth 2.
+- **Reverse basic-block reachability is worthless inside a dispatch loop — use dominators.** Every
+  arm of `ExecutorThreadProc`'s command switch ends in a `JMP` back to the loop head at 0x00509150,
+  so the back edge makes *every* arm appear to reach *every* tail block, and a "which arm can get
+  here?" query returns all of them. That is what made the `AssignToTeamSlot` /
+  `BroadcastStopAtPosition` question look malformed for a whole prior attempt: both sites are in the
+  executor's **periodic tick** (entered on a `WaitForMultipleObjects` timeout or a null dequeue, not
+  from the switch at all), and reverse reachability could not distinguish that from "reached by
+  every command". Ask which blocks **dominate** the site instead. The same shape appears in any
+  message pump, `WndProc` or `AiThink_*` tick loop.
+- **A jump table settles which ids reach an arm, and the answer can be a defect.** Decode the table
+  rather than reasoning from the arm's own compares: `ExecutorThreadProc`'s byte-index table
+  @ 0x0050bae0 into targets @ 0x0050ba3c (index `id - 4`, bounded `CMP EAX,0x39`) shows arm
+  0x00509e14 is reached by **exactly** ids 0x1d and 0x1f — which is what proves its
+  `CMP EDI,0x20 / SETZ CL` can never fire (`game_defects_notes.md` §18). An arm's compare against
+  a constant is only meaningful once you know the id set that reaches it.
 - Read **disassembly** for computed sizes/arguments — the decompiler folds constants differently
   (`iVar + 0x48` vs the actual `LEA EDX,[EDI + 0x49]`).
 - When extracting call arguments in bulk, take literals from the **same source line** as the

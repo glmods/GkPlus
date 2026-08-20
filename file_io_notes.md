@@ -446,6 +446,31 @@ There is also **no unregistration** - the trie has no removal - so a detach woul
 factory pointer into an unloaded module. Tolerable only because `d3d8.dll` goes away at
 process exit.
 
+**But the trie is torn down at exit, and the node holding our factory is freed with it.**
+`RegisterImageCodec` registers its own `_atexit` handler (`_atexit(&LAB_0064c9c0)`), and that handler
+walks the 0x400-byte static root array **`ImageCodecTrieRoot` @ 0x00838c58** (256 dwords,
+`CMP ESI,0x400`), calling `ImageCodecTrie_FreeSubtree` @ **0x005c8690** on each non-null child and
+then `free_sized(child, 0x408)`:
+
+```
+        MOV EDI,dword ptr [ESI + 0x838c58]   ; root[i]
+        TEST EDI,EDI / JZ next
+        MOV ECX,EDI
+        CALL 0x005c8690                      ; recursively free the subtree
+        PUSH 0x408 / PUSH EDI / CALL free_sized
+next:   ADD ESI,0x4 / CMP ESI,0x400 / JC loop
+```
+
+`ImageCodecTrie_FreeSubtree` is `void __fastcall(void **node)`: it iterates all 0x100 child dwords,
+recursing then `free_sized(child, 0x408)` for each non-null one, and **does not free the node handed
+to it** — which is why the caller does that itself. Node layout is confirmed identical to the
+insert's: `{void *child[256]; void *factory /*+0x400*/; void *_pad /*+0x404*/}` = 0x408 bytes.
+
+Ordering consequence for `src/ImageCodec.cpp`: the node carrying our `DdsImage` factory is freed by
+this handler at process exit, i.e. **by the CRT's atexit chain rather than by our detach**. Since
+`d3d8.dll` is an implicit-load dependency it is still mapped at that point, so this is benign — but
+it is the reason a "we never unregister, nothing ever frees it" reading of this section is wrong.
+
 #### The byte source: 10 slots, and only four mean the same thing on both
 
 `ImageSource_Win32Handle_vtbl` @ 0x0066efb8 and `ImageSource_Memory_vtbl` @ 0x0066efe0

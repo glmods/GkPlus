@@ -110,8 +110,30 @@ struct Actor {
   // instruction inside its Mine case, which is what this used to cite).
   void(__thiscall *on_placed)(Actor *, unsigned now_lo, int now_hi);
   int field0x3c;              // 0x3c gates the team-list move - see JsActors.cpp
-  void *attachment;           // 0x40 ref-counted; released by slot 52
-  int field0x44;
+  // 0x40 a **general** retained reference to another actor - "the actor I am
+  // moving toward or holding" - released by slot 52 `ReleaseHeldReferences`.
+  // This was `attachment`, on a reading that had it as the pending-give
+  // recipient; that reading is refuted. The give path is one of five writers,
+  // and the two AI writers have nothing to do with items: `AiBeginInvestigate`
+  // @ 0x0045e186 (ai_state 7) and `AiThink_Swarm` @ 0x0045b8b4 (ai_state 8) both
+  // store here immediately after a `GotoObject` call. The finding that settles
+  // the kind is that it has a **savegame encoding of its own**:
+  // `WriteActorFixups` @ 0x00531d3c writes `target->id + 1` with 0 meaning none,
+  // and `Actor_FixupAfterLoad` @ 0x005317f6 decodes it back through the actors
+  // hash into a retained pointer. Transient give state would not need that.
+  // Sentinel is 0.
+  Actor *held_actor;          // 0x40 ref-counted; released by slot 52
+  // 0x44 an id whose **namespace depends on the pending action**, which is why
+  // it is not `item_id` and not actor-specific either. Sentinel -1 (note
+  // `held_actor`'s is 0 - the differing sentinels are themselves evidence the
+  // two are different kinds). It is an **actor** id for the kind-2 goto arm
+  // (order+0x4 @ 0x0053515d), the wire goto-object command (cmd+0xc
+  // @ 0x005094a5), the walk-to-actor tick (@ 0x00534f6f, gated on
+  // `+0x44 != -1 && held_actor == 0`) and the receive arm (@ 0x00535373); it is
+  // an **item** id for the kind-6 give arm (order+0x8 @ 0x005351ed), wire
+  // command 0x17 (@ 0x0050a29d) and the give completion (@ 0x00533f6a, which
+  // feeds it to `GiveItemTo` and then resets to -1). Persisted verbatim.
+  int pending_action_id;      // 0x44
   char pad0x48[8];
   int ai_type;                // 0x50
   int field0x54;
@@ -272,8 +294,19 @@ struct Actor {
   // 51  stamp the create/update timestamps, resolve the nav poly under the actor
   //     into +0x118, and fire the +0x38 callback if one is installed.
   virtual void InitPositionAndTiming(int, int, float) = 0;
-  // 52  refcounted release of the attachment at +0x40.
-  virtual void ReleaseAttachment() = 0;
+  // 52  drop every retained reference this actor holds - a **reference-cycle
+  //     breaker**, not a release of one particular thing. Was
+  //     `ReleaseAttachment`, which read it as being about `Actor+0x40` alone;
+  //     the five overriders release three unrelated fields and chain by
+  //     tail-JMP: `Actor` @ 0x0052de60 -> `held_actor` (+0x40),
+  //     `MobileActor` @ 0x00532d10 -> the route object at +0x1cc (not an actor),
+  //     `CharacterActor` @ 0x005409e0 -> `attack_target` (+0x2d8), and
+  //     `ProjectileActor`/`TrackObjectActor` are pure forwarding thunks. The
+  //     contract comes from the caller: `ReleaseAllActorReferences`
+  //     @ 0x005301b0 walks the actors table, calls this on every actor
+  //     (@ 0x00530216) and only then drops each actor's own refcount
+  //     (@ 0x00530220) - it breaks the cycles so the counts can reach zero.
+  virtual void ReleaseHeldReferences() = 0;
   // 53  set coords + orientation quaternion + timing.
   virtual void SetPositionAndOrientation(Vec3 *, Vec4 *, int) = 0;
   // 54  base RET 4 (discards); MobileActor stores it to +0x188. Setter for slot 30.
@@ -515,19 +548,34 @@ struct MobileActor : Actor {
   List<void *> order_queue;    // 0x1f0 (size() @ 0x1f4 is slot 32)
   NavAgent *nav_agent;         // 0x200 slot 24 (see NavAgent above)
   // 0x204 the *route* list - the waypoints the navigation solve produces.
-  // PushRouteWaypoint @ 0x0053a640 push-FRONTs a pool_alloc'd 0x18-byte
-  // {Vec3 pos; u32; u32} record onto it (which is what makes the A* backtrack
-  // come out in travel order), ClearRouteWaypoints @ 0x0053a450 drains it.
+  // PushRouteWaypoint @ 0x0053a640 push-FRONTs a pool_alloc'd 0x18-byte record
+  // onto it (which is what makes the A* backtrack come out in travel order),
+  // ClearRouteWaypoints @ 0x0053a450 drains it. The record is
+  // `{Vec3 pos; int keep_on_arrival; float wait_time; u32 uninitialised}` and
+  // **both trailing fields have readers** - the notes' predecessor claim that
+  // they were written and never read is wrong. `keep_on_arrival` is read at
+  // 0x0053a2cf by `MobileActor::AdvanceWaypointRoute` @ 0x0053a1d0: zero pops
+  // and frees the record, non-zero advances the cursor and keeps it - and every
+  // writer in the shipped binary passes literal 0, so the retain path is a dead
+  // *branch*. `wait_time` is read at 0x00452696 by AiThink_Bot, off the patrol
+  // list below. The last dword is never written by any of the three allocators
+  // and both savegame paths move the full 0x18, so four bytes of uninitialised
+  // pool memory reach every `.sav` holding a waypoint.
   List<void *> waypoints;      // 0x204
-  // 0x214 a SECOND List<void *>, of authored waypoints. MobileActor::Ctor
+  // 0x214 a SECOND List<void *>: the **patrol points**. MobileActor::Ctor
   // initialises it as a list at 0x005327b4-0x005327da, exactly as it does the
-  // one above; AppendAuthoredWaypoint @ 0x0053a830 push-BACKs onto it and
-  // ClearAuthoredWaypoints @ 0x0053a550 drains it. Slot 90 AddWaypoint pushes to
-  // both. Nothing in the binary reads an element's payload - the only read is
-  // `CMP [EBX+0x218],0`, i.e. the count, used by AiThink_Bot as a "have I
-  // recorded anything yet" latch. This was `void *field0x214` plus 0xc of
-  // padding here until the constructor was read.
-  List<void *> waypoints_authored; // 0x214
+  // one above; AppendPatrolPoint @ 0x0053a830 push-BACKs onto it and
+  // ClearPatrolPoints @ 0x0053a550 drains it. Slot 90 AddWaypoint pushes to
+  // both when its `is_patrol_point` argument is set - and that argument is
+  // exactly what distinguishes the console's ADDPATROLPOINT (CL=1) from
+  // ADDWAYPOINT (CL=0), which are one shared implementation @ 0x0044c760. This
+  // was `waypoints_authored`, with a comment claiming nothing read an element's
+  // payload; AiThink_Bot walks the list at 0x0045264b, reads each record's
+  // position to pick the nearest and its `wait_time` at 0x00452696 to set a
+  // dwell deadline at MobileActor+0x140 (latched by +0x144). The count-only
+  // test at 0x00454865 is real but is not the only read. This was
+  // `void *field0x214` plus 0xc of padding here until the constructor was read.
+  List<void *> patrol_points;  // 0x214
   void *waypoint_ptr;          // 0x224 cursor into the route list
   // 0x228 -> &waypoints, confirmed by `MOV [EDI+0x228],ESI` in the constructor
   // with ESI = EDI + 0x204. It points at the route list, never at the authored
@@ -570,8 +618,13 @@ struct MobileActor : Actor {
   // and has no vector destructor, and MobileActor::PathToTarget @ 0x00539930
   // pushes the pointer a position getter just returned. The last argument is a
   // float, not an int - the one in-binary caller pushes 0.0f. Arguments 2 and 4
-  // land at record+0x0c and +0x10; that caller passes 0 for both, so what they
-  // mean is not established.
+  // land at record+0x0c and +0x10, and both are now settled: arg2 is
+  // `keep_on_arrival` (0 = pop and free the record on arrival, which is what
+  // every shipped writer passes) and arg4 is `wait_time`, the patrol dwell in
+  // seconds. Arg3 is `is_patrol_point` - set, it also appends to `patrol_points`
+  // (+0x214) via AppendPatrolPoint @ 0x0053a830, and it is what the console's
+  // ADDPATROLPOINT passes where ADDWAYPOINT passes 0, the two being one shared
+  // implementation @ 0x0044c760 whose optional trailing float becomes wait_time.
   virtual void AddWaypoint(Vec3 *, int, char, float) = 0;
   // 91  fill a 0x24-byte navigation-target descriptor.
   virtual void GetNavigationTarget(int *) = 0;
@@ -593,7 +646,7 @@ static_assert(offsetof(MobileActor, move_cmd_time) == 0x1e8);
 // 0x214 - without them the 0x230 size assert alone would pass for the old
 // `void *field0x214` + `char pad0x218[0xc]` spelling too.
 static_assert(offsetof(MobileActor, waypoints) == 0x204);
-static_assert(offsetof(MobileActor, waypoints_authored) == 0x214);
+static_assert(offsetof(MobileActor, patrol_points) == 0x214);
 static_assert(offsetof(MobileActor, waypoint_ptr) == 0x224);
 static_assert(offsetof(MobileActor, waypoint_list) == 0x228);
 
@@ -711,7 +764,14 @@ struct CharacterActor : MobileActor {
   char close_range_attack;    // 0x288
   char attack_active_flag;    // 0x289
   char pad0x28a[6];
-  int attack_range;           // 0x290
+  // 0x290 the game time at which the attack order was issued - **not** a range,
+  // which is what `attack_range` claimed. Slots 96 and 97 both store their 2nd
+  // argument here (@ 0x00540e63, @ 0x00540b56) and that argument is a float
+  // timestamp: it is `COMISS`ed against `move_start_time` (+0x1ec) @ 0x0053f4da,
+  // and AiThink_Bot does `SUBSS [EBX+0x290]` then compares against 6.0f
+  // @ 0x0045346e - i.e. re-issue the order when `now - attack_order_time >= 6s`.
+  // Call sites push `Clock::GetGameTimeSeconds()` or the executor tick's `now`.
+  float attack_order_time;    // 0x290
   char pad0x294[0x10];
   int weapon_type;            // 0x2a4
   char pad0x2a8[0x10];
@@ -727,7 +787,13 @@ struct CharacterActor : MobileActor {
   char pad0x2e8[4];           // 0x2e8..0x2ea animation-complete flags
   float weapon_range;         // 0x2ec (TurretActor uses it as muzzle speed)
   char pad0x2f0[8];           // 0x2f0/0x2f4 gun yaw/pitch, float despite the int typing
-  int attack_stop_reason;     // 0x2f8
+  // 0x2f8 a game time, not a reason code - `attack_stop_reason` was wrong on
+  // both counts. All three of slots 96, 97 and 98 write their order-time
+  // argument here (@ 0x00540d4c, @ 0x00540a6b, @ 0x00540f54) and the constructor
+  // zeroes it with `MOVSS` @ 0x0053c92a, which is the float proof. The float
+  // type is confirmed; the *name* is inferred from its writers, because nothing
+  // in the binary ever reads this field's value.
+  float attack_state_time;    // 0x2f8
   float target_cycle_delay;   // 0x2fc
   void *selected_ammo;        // 0x300
   int field0x304;             // 0x304 slots 23/95; cannot-fire gate
@@ -735,12 +801,26 @@ struct CharacterActor : MobileActor {
   // CharacterActor extension slots 95-99.
   // 95  write the cannot-fire gate (+0x304). Setter for slot 23.
   virtual void SetField0x304(int) = 0;
-  // 96  attack an actor; broadcast id is computed 0x41 + close_range.
-  virtual void AttackTarget(Actor *, int, char, char) = 0;
-  // 97  attack a position; broadcast id is computed 0x3f + close_range.
-  virtual void AttackPosition(Vec3 *, int, char, char) = 0;
-  // 98  stop attacking, broadcast 0x44.
-  virtual void StopAttacking(int) = 0;
+  // All three of the attack slots take the order time as their **`float`**
+  // argument - a game time in seconds, as `attack_order_time` (+0x290) and
+  // `attack_state_time` (+0x2f8) record. They were declared `int` here, and that
+  // was a live defect rather than cosmetics: `JsActors.cpp` converted the
+  // argument with `JS_ToInt32` and the integer bit pattern arrived where the
+  // callee reads a float, so `attack_position(pos, 123)` delivered 1.7e-43. It
+  // appeared to work only for 0, whose bit pattern is also `0.0f`. The width is
+  // 4 bytes either way, so there was never any ESP risk to give it away - the
+  // same shape of mistake as the `LoadLevel` return type.
+  // 96  attack an actor; broadcast id is computed 0x41 + close_range. Also
+  //     retains the target into `attack_target` (+0x2d8).
+  virtual void AttackTarget(Actor *, float, char, char) = 0;
+  // 97  attack a position; broadcast id is computed 0x3f + close_range. Note it
+  //     puts `Actor+0x88` (last_update_time) on the wire in the payload slot the
+  //     client reads as the order time, where slot 96 puts its own argument - a
+  //     suspected minor protocol defect, not asserted.
+  virtual void AttackPosition(Vec3 *, float, char, char) = 0;
+  // 98  stop attacking, broadcast 0x44. Its argument is the order time too, not
+  //     a reason code; every call site pushes `Clock::GetGameTimeSeconds()`.
+  virtual void StopAttacking(float) = 0;
   // 99  set the weapon's ammo type, reselect ammo, broadcast 0x82.
   virtual void SetAmmoType(int) = 0;
 };

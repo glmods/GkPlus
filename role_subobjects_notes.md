@@ -85,6 +85,34 @@ applies the unit conversions below. The full GLS field table (ids, ranges, defau
 Angle unit: the game uses a 4096-step circle (sin/cos tables are 0x1000 entries).
 `CharacterDtor` frees only `customisation_hierarchy` (0x84) and `shadow_hierarchy` (0x88).
 
+### What `blob_shadow` (0x8c) actually selects
+
+It picks between **two sprite quads on the same texture**, both built at startup by
+`CreateBlobShadowSprites` @ 0x0054f900 (renamed this round from `CreateAlphaJunkSprites`) as
+`pool_alloc(0x98)` objects sampling `AlphaJunkTexture` @ 0x007ba1a4 = `units\alpha junk.rim`. They
+differ **only in UV rect**:
+
+| value | shape global | u range | v range | shape |
+|---|---|---|---|---|
+| 0 | `BlobShadowShapeDefault` @ 0x007ba198 | 0.4395 .. 0.4971 | 0.5059 .. 0.5498 | 0.0576 x 0.0439 — **wider than tall** |
+| 1 | `BlobShadowShapeSpider` @ 0x007ba19c | 0.375 .. 0.4385 | 0.5596 .. 0.6230 | 0.0635 x 0.0635 — **square** |
+
+The selection happens in `Unit_BuildShadowNode` @ 0x005525b0 at 0x005539f2, walking
+`Unit+0xb8` (`Role *`) -> `Role+0x60` (`Character *`) -> `Character+0x8c`. Two things there are worth
+knowing:
+
+- **A missing role or character falls back to value 0**, but a value that is neither 0 nor 1 produces
+  **no shadow renderable at all** (`SUB EAX,0x1 / JNZ 0x005540ba` bails out). The GLS range
+  `0..1` is therefore load-bearing, not decorative.
+- **It is only consulted when `ShadowQuality` @ 0x006abdf4 == 1.** Quality 0 bails immediately;
+  qualities 2 and 3 take the stencil/projected path and never look at this field. So on most settings
+  the field has no effect whatsoever.
+
+The developers' own word for value 1 is **`spider`** — 10 occurrences of `blob shadow spider` across
+`archore.gsh`, `mplay_archore.gsh`, `pres_arrow.gsh` and `walking_mine.gsh`. `pres_arrow.gsh` has a
+commented-out `shadow hierarchy Hcy_archore_shadow` immediately above one of them, which corroborates
+that the blob is the cheap alternative to `shadow_hierarchy` (0x88) rather than an addition to it.
+
 ### 0x94/0x98/0x9c are derived geometry, not scratch
 
 Earlier revisions of this file called them "runtime AI scratch, not set by the converter".

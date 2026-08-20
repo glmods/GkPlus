@@ -375,11 +375,26 @@ declare module "gk" {
 
   /** Members CharacterActor adds. */
   export interface CharacterMembers {
-    /** The three trailing arguments are unidentified engine parameters; the
-     *  engine's own callers pass 0 for an ordinary ranged attack. */
-    attack_target(actor: Actor, a?: number, b?: number, c?: number): void;
-    attack_position(position: Vec3Like, a?: number, b?: number, c?: number): void;
-    stop_attacking(reason?: number): void;
+    /** `order_time` is a **game time in seconds** - the moment the order was
+     *  issued, not a range and not a reason code. Pass
+     *  `world.game_time`-style seconds, or omit it for 0. The AI compares
+     *  `now - order_time` against 6 s to decide whether to re-issue an attack
+     *  order, so a stale value makes the order look old. `attack_mode` and
+     *  `close_range` are the engine's own two trailing flags; its callers pass
+     *  0 for an ordinary ranged attack.
+     *
+     *  Until this was measured the binding converted `order_time` with
+     *  `JS_ToInt32` into an `int` parameter, so the integer bit pattern reached
+     *  a callee reading a float and any non-zero value arrived as ~1.7e-43. It
+     *  only ever behaved for 0. */
+    attack_target(actor: Actor, order_time?: number, attack_mode?: number,
+                  close_range?: number): void;
+    attack_position(position: Vec3Like, order_time?: number,
+                    attack_mode?: number, close_range?: number): void;
+    /** The argument is the order time in seconds, as above - it was declared
+     *  `reason` on the reading that `CharacterActor+0x2f8` held a reason code,
+     *  and it does not. */
+    stop_attacking(order_time?: number): void;
     set_ammo_type(type: number): void;
   }
 
@@ -1050,8 +1065,15 @@ declare module "gk" {
     set_ai(actor: string, ai: string): void;
     alert_node(node: string): void;
     set_activity(actor: string, activity: "PATROL" | "STOP" | "GOTO"): void;
-    add_waypoint(where?: Point): void;
-    add_patrol_point(where?: Point): void;
+    /** `ADD WAYPOINT` and `ADD PATROLPOINT` are **one implementation**
+     *  (`CommandAddWaypointOrPatrolPoint` @ 0x0044c760, reached by a `JMP` from
+     *  either registration with only a `CL` flag to tell them apart), and both
+     *  accept an optional trailing float that the shared body parses with a
+     *  default of 0.0. It becomes the waypoint record's `wait_time`, the dwell
+     *  in seconds - but only the patrol list is ever walked for it, so on
+     *  `add_waypoint` the argument is accepted and inert. */
+    add_waypoint(where?: Point, wait_time?: number): void;
+    add_patrol_point(where?: Point, wait_time?: number): void;
     new_node_waypoint_list(node: string): void;
     make_hunter(actor: string): void;
     make_flare_firer(actor: string): void;

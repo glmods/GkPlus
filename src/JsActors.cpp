@@ -752,9 +752,28 @@ JSValue ActorSetWeapon(JSContext *ctx, JSValueConst self, int argc,
   return JS_UNDEFINED;
 }
 
-// The three trailing arguments of slots 96/97 are unidentified; they are passed
-// through as-is and default to 0, which is what the engine's own callers use for
-// an ordinary ranged attack.
+// The three trailing arguments of slots 96/97 are identified now, and the first
+// of them **must** go through JS_ToFloat64: it is a game time in seconds, which
+// the engine reads as a `float`. Converting it with JS_ToInt32 through an `int`
+// parameter - which is what this file did - delivered the integer bit pattern to
+// a callee expecting a float, so `attack_position(pos, 123)` arrived as 1.7e-43.
+// It looked correct only because 0 is the one value whose bit pattern is also
+// `0.0f`, and 0 is what the engine's own callers and every example passed. The
+// two trailing arguments really are small integers (attack mode, close range)
+// and stay on JS_ToInt32.
+static bool OrderTimeArg(JSContext *ctx, int argc, JSValueConst *argv, int index,
+                         float *out) {
+  *out = 0.0f;
+  if (argc <= index) {
+    return true;
+  }
+  double seconds = 0.0;
+  if (JS_ToFloat64(ctx, &seconds, argv[index])) {
+    return false;
+  }
+  *out = static_cast<float>(seconds);
+  return true;
+}
 JSValue ActorAttackTarget(JSContext *ctx, JSValueConst self, int argc,
                           JSValueConst *argv) {
   CharacterActor *c = ResolveCharacter(ctx, self);
@@ -773,14 +792,18 @@ JSValue ActorAttackTarget(JSContext *ctx, JSValueConst self, int argc,
   if (!target->ptr) {
     return JS_ThrowTypeError(ctx, "actor %d has been destroyed", target->id);
   }
-  int32_t args[3] = {0, 0, 0};
-  for (int i = 0; i < 3; ++i) {
-    if (argc > i + 1 && JS_ToInt32(ctx, &args[i], argv[i + 1])) {
+  float order_time = 0.0f;
+  if (!OrderTimeArg(ctx, argc, argv, 1, &order_time)) {
+    return JS_EXCEPTION;
+  }
+  int32_t args[2] = {0, 0};
+  for (int i = 0; i < 2; ++i) {
+    if (argc > i + 2 && JS_ToInt32(ctx, &args[i], argv[i + 2])) {
       return JS_EXCEPTION;
     }
   }
-  c->AttackTarget(target->ptr, args[0], static_cast<char>(args[1]),
-                  static_cast<char>(args[2])); // slot 96
+  c->AttackTarget(target->ptr, order_time, static_cast<char>(args[0]),
+                  static_cast<char>(args[1])); // slot 96
   return JS_UNDEFINED;
 }
 
@@ -798,14 +821,18 @@ JSValue ActorAttackPosition(JSContext *ctx, JSValueConst self, int argc,
   if (!ToVec3(ctx, argv[0], &position)) {
     return JS_EXCEPTION;
   }
-  int32_t args[3] = {0, 0, 0};
-  for (int i = 0; i < 3; ++i) {
-    if (argc > i + 1 && JS_ToInt32(ctx, &args[i], argv[i + 1])) {
+  float order_time = 0.0f;
+  if (!OrderTimeArg(ctx, argc, argv, 1, &order_time)) {
+    return JS_EXCEPTION;
+  }
+  int32_t args[2] = {0, 0};
+  for (int i = 0; i < 2; ++i) {
+    if (argc > i + 2 && JS_ToInt32(ctx, &args[i], argv[i + 2])) {
       return JS_EXCEPTION;
     }
   }
-  c->AttackPosition(&position, args[0], static_cast<char>(args[1]),
-                    static_cast<char>(args[2])); // slot 97
+  c->AttackPosition(&position, order_time, static_cast<char>(args[0]),
+                    static_cast<char>(args[1])); // slot 97
   return JS_UNDEFINED;
 }
 
@@ -815,11 +842,12 @@ JSValue ActorStopAttacking(JSContext *ctx, JSValueConst self, int argc,
   if (!c) {
     return JS_EXCEPTION;
   }
-  int32_t reason = 0;
-  if (argc > 0 && JS_ToInt32(ctx, &reason, argv[0])) {
+  // Slot 98's argument is the order time as well, not a reason code.
+  float order_time = 0.0f;
+  if (!OrderTimeArg(ctx, argc, argv, 0, &order_time)) {
     return JS_EXCEPTION;
   }
-  c->StopAttacking(reason); // slot 98
+  c->StopAttacking(order_time); // slot 98
   return JS_UNDEFINED;
 }
 

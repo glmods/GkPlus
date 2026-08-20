@@ -518,6 +518,41 @@ Three things about it are worth knowing before hooking anything on the buffer pa
   flags are the only thing that distinguishes them. `vulkan_renderer_notes.md` §4.84 is the whole
   story, and `address_map.md` has the scratch-set globals and the `VertexBufferSet` API.
 
+## 4.3.1 The spark system: a fifth path, hanging off the shadow pass
+
+Worth recording because it is invisible to every producer census in §5 — it is not a producer, and it
+is not called from the frame's producer sweep at all.
+
+`Spark_UpdateAndDraw` @ **0x00558550** (`void(void)`, no register args) is called from **exactly one
+place: `ScenePass_Shadows` @ 0x00552059.** It is gated on `ParticleFx != 0 && Mat_AdditiveOneOne != 0`,
+fetches `D3DTS_VIEW`, walks the emitter `List` at `DAT_007ba1b4` firing one-shot emitters, calls
+`SparkSystem_Simulate`, then does `ApplyMaterial` / `SetStageTexture` / `FUN_00559680` (the draw
+half). So a hook on the render queue never sees it, and a hook on the shadow pass sees it by accident.
+
+`SparkSystem_Simulate` @ **0x00558d30** (`void __thiscall(SparkSystem *, float dt)`, `RET 0x4`) runs
+a **two-generation particle model whose recursion is bounded at one level**:
+
+- The live list is `this+0x10`, `next` at `particle+0x78`; the free list is `this+0x14`; particles are
+  `pool_alloc(0x7c)`.
+- Gravity and life drain are chosen by the particle's **generation byte at `+0x74`**: generation 0
+  gets **9.81** and `dt*0.25`; generation 1 gets **5.0** and `dt*2.25`.
+- When a **generation-0** particle dies it spawns exactly **four** generation-1 children with
+  `rand()`-derived spherical directions, each with death time `now + |2*vy| / 9.81` — a ballistic
+  time-of-flight. **Generation-1 particles spawn nothing**, so the cascade cannot run away.
+- Emitter spawning is gated on **both** fog-of-war (`FogOfWar_SampleTotal(...) == 0xfe`) **and**
+  `SceneNode_TestVisibility`, and accumulates a fractional budget (rate `emitter+0x18`, accumulator
+  `+0x1c`, mode `+0x20`, where mode 2 is a one-shot burst of `rate + 0.5`) up to the cap at
+  `this+0x04`.
+
+The system object is `TheSparkSystem` @ 0x007ba1c4 (`pool_alloc(0x68)`), created lazily by
+`Spark_EnsureSystem` @ 0x00558400 (from `WinMain` at video init, and from `FUN_004f7de0`) and freed by
+`Spark_DestroySystem` @ 0x00558490. `SparkSystemTime` @ 0x007ba1cc is its float seconds accumulator.
+Confirmed fields: system `+0x00` live generation-0 count, `+0x04` cap, `+0x10` live head, `+0x14` free
+head, `+0x18` a float subtracted from spawn Z; particle `+0x48` spawn time, `+0x4c` death time,
+`+0x70` life scalar, `+0x74` generation, `+0x78` next. **Not** confirmed: the vectors at particle
+`+0x00`/`+0x0c`/`+0x18`/`+0x24` and the colour ramp at `+0x50..+0x6c` are inferred from arithmetic
+rather than from a consumer — `FUN_00559680` would settle them.
+
 ## 4.4 2D layer order is a camera per depth slice, and the HUD's meters miss theirs
 
 **There is no per-draw "layer" anywhere in the render queue.** What decides whether a 2D element
@@ -755,7 +790,7 @@ latches a deferred remove-me on `+0x1a8`.
 
 Ownership of the *order-sending* slots also moved a level up, and `orders_notes.md` §8 has the
 corrected version: slots **100–104** (`Unit_SendInteract`, `Unit_SendEquip`, `Unit_SendDropItem`,
-`Unit_SendBoard`, `Unit_SendUseItem`) are added by `MobileUnit` @ 0x0066491c, not by
+`Unit_SendGiveItem`, `Unit_SendUseItem`) are added by `MobileUnit` @ 0x0066491c, not by
 `CharacterUnit`. `MobileUnit` also adds 92 `Unit_IsCrouched` and 93
 `Unit_SetCrouchedAndConcealed`, and overrides 33, 55, 57, 73, 77, 83 and 91; `CharacterUnit`
 overrides base slots 74, 75, 76, 78, 79, 80 and adds 108–111.

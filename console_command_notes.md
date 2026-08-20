@@ -21,6 +21,26 @@ and `STOP TRACKING` twice in `SetupConsoleCommands` with two different help stri
 are aliases: distinct names sharing one handler (`ADD PP` / `ADD PATROLPOINT`, `QUEUE SIZE` /
 `QUEUE LENGTH`, the four spellings of `SET CAMERA POS`). 255 distinct handler addresses in all.
 
+**`ADD WAYPOINT` and `ADD PATROLPOINT` are one implementation, and a fourth argument nobody
+documented.** They are not merely aliases in the `ADD PP` sense - they are two registrations whose
+handlers are a single instruction each before a `JMP` into one shared body:
+
+```
+0043e860  XOR CL,CL   ; CommandAddWaypoint
+00442140  MOV CL,0x1  ; CommandAddPatrolPoint
+          both -> JMP CommandAddWaypointOrPatrolPoint @ 0x0044c760
+```
+
+That `CL` becomes `MobileActor::AddWaypoint`'s (vtable slot 90) `is_patrol_point` argument
+(`MOV EDI,ECX` @ 0x0044c78a, `PUSH EDI` @ 0x0044c86b), which is exactly what decides whether the
+point also lands on `MobileActor+0x214`, the **patrol-point** list. The shared body also parses an
+**optional trailing float** with `ConsoleParseFloat` @ 0x0044c82f (whose pushed argument is the
+default, 0.0) and passes it as slot 90's `wait_time` (`PUSH [EBP-0x28]` @ 0x0044c863) - the dwell in
+seconds that `AiThink_Bot` reads off the patrol list at 0x00452696. So the real syntax of both is
+`<x> <y> <z> [seconds]`, and the `seconds` is inert on `ADD WAYPOINT` because only the patrol list is
+ever walked for it. `keep_on_arrival`, slot 90's other flag, is pushed as a literal 0 here
+(@ 0x0044c86c) - as it is by every other caller in the binary.
+
 Two things make the extraction less mechanical than it looks:
 
 - **Fifteen names are not in the executable.** `SetupConsoleCommands` passes
@@ -167,9 +187,9 @@ re-classify; do not hand-edit a row without re-running the check.
 | `ADD MULTI MISSION` | `screen.add_multiplayer_mission(...)` |
 | `ADD MULTIMISSION` | `screen.add_multiplayer_mission(...)` |
 | `ADD OBJECTIVE` | `objectives.add(...)` |
-| `ADD PATROLPOINT` | `units.add_patrol_point(where?)` |
-| `ADD PP` | `units.add_patrol_point(where?)` |
-| `ADD WAYPOINT` | `units.add_waypoint(where?)` |
+| `ADD PATROLPOINT` | `units.add_patrol_point(where?, wait_time?)` |
+| `ADD PP` | `units.add_patrol_point(where?, wait_time?)` |
+| `ADD WAYPOINT` | `units.add_waypoint(where?, wait_time?)` |
 | `ADDMISSION` | `screen.add_mission(script, console?)` |
 | `ADDMULTIMISSION` | `screen.add_multiplayer_mission(...)` |
 | `AI` | `units.set_ai(actor, ai)` |

@@ -788,6 +788,27 @@ generated - the `.gls` names no nav data and the `.rif` carries none. `BuildNavP
 @ 0x004888d0 turns the map geometry into an array of 0x40-byte nav polygons, and the
 walkable subset of *those* is the navmesh.
 
+There *is* a nav **grid**, and it is a spatial index over those polygons rather than a second
+walkable surface. It is built during the load by `Map::RebuildNavGrid` @ 0x0048a700 (was
+`FUN_0048a700`, `void __thiscall(Map *this, uint nx, uint ny, uint nz)`), whose sole caller is
+`LoadOrBuildSectionAdjacency` @ 0x0044fef0: it min/max-reduces the level geometry into a world AABB
+seeded with +/-FLT_MAX and delegates to `Map::BuildNavGrid` @ 0x0048a0a0 (was `FUN_0048a0a0`,
+`RET 0x14`, five stack arguments). `BuildNavGrid` fills the whole descriptor on `Map`:
+
+| Off | Field | Value |
+|-----|-------|-------|
+| 0x40 | `grid_origin` | `bb_min` |
+| 0x4c | `grid_bounds_max` | `bb_max` (was 12 bytes of undefined padding) |
+| 0x58 | `inv_grid_extent` | `1.0f / (bb_max - bb_min)` per axis (was `grid_scale_a`) |
+| 0x64 | `grid_cells_i/j/k` | `nx, ny, nz` as ints |
+| 0x70 | `grid_cells_f` | `nx, ny, nz` as floats (was `grid_scale_b`) |
+
+So **cell size is `extent / cell_count` per axis, and neither scale vector is `1/cell_size`** - the
+product of the two is. `MapGrid_WorldToCell` @ 0x004922b0 multiplies them together and uses only the
+product, which is arithmetically redundant rather than a missing distinction; the same function's
+plane loops divide the extent *by* `grid_cells_f` to recover the cell size (`DIVSS XMM3,[EDI+0x70]`
+@ 0x0048a5d8). Full derivation in `navigation_notes.md` §5.6.
+
 ### The nav polygon (0x40 bytes)
 
 `NavPolygon_Ctor` @ 0x0048dbb0, vtable 0x00663e60. Filled by `BuildNavPolygons`:

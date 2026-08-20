@@ -152,6 +152,75 @@ above and the DB name were both deliberately left as they are.
 | 0x006a7d2c | int[] | PlayerTeam — indexed by player index; its only two accessors are `GetPlayerTeam` @ 0x004fc0e0 (`MOV EAX,[ECX*4 + 0x6a7d2c]`) and `SetPlayerTeam` @ 0x004fc340 |
 | 0x007b70dc | int[6] | MaxUnitsPerTeam — `ApplyUpdateMessage` copies `msg+0x04..+0x18` into it as one run (0x004fe221-0x004fe24c); indexed 1..5 when a team assignment is validated |
 | 0x006abe24 | int* | BandwidthUse — 0..9, an **index into the relevance-radius table** `IsRelevantToPlayer` uses, not a byte count: radius 120, 110, 100, 90, 80, 70, 60, 50, 40, 30 units (the ten `FILD` immediates at 0x00511284-0x00511365 are the squares 14400 … 900), fetched as `table[BandwidthUse + 4]`. Higher setting = larger radius = more traffic |
+| 0x007b7148 | byte[4] | **PlayerSlotFlags** — the per-player lobby "ready" flag. Exactly four contiguous bytes at 0x007b7148..0x007b714b, bounded by `NumPlayerSlots` @ 0x007b714c (= 4). Wire command 0x2d sets one, 0x2e clears one; `StartMultiplayerGameWhenReady` ANDs across them; `FUN_004f6dd0` compacts with `flags[i] = flags[i+1]` on slot removal, which is what pins contiguity and ascending order. **The 0x007b7145-0x007b7148 reading is REFUTED** — nothing in the binary touches 0x007b7145 or 0x007b7146 at any width. See the note below |
+| 0x007b714c | int* | NumPlayerSlots (= 4) |
+| 0x007b70e0 | int[5] | TeamUnitCounts — the five dwords `TotalUnitsAcrossTeams` @ 0x004fb8f0 sums |
+| 0x007b70f4 | int* | LobbyRosterIndex |
+| 0x006b0298 | — | PictureScreenDeadline — shared by all six static-picture screen states (see the picture-screen table below) |
+| 0x007ba3c0 | — | PictureScreenImage — likewise |
+
+**A displacement one below an array base is not evidence about where the array starts.** This is the
+trap that produced the refuted `PlayerSlotFlags` reading, and it recurs. Command 0x2d's arm is
+`MOV byte [EAX + 0x7b7147],1` with `EAX` **1-based** off the wire — a *1-based index rebase* of the
+array at 0x007b7148, not an array beginning at 0x007b7147. The identical shape appears on the
+unrelated per-slot string array one over: written `MOV byte [EDX + 0x7b714f],AL` with `EDX`
+pre-incremented (0x004fc1d0-0x004fc1d9) and read 0-based as `MOV CL,byte [EAX + 0x7b7150]`
+(0x00503450). It is simply this compiler's output for a pre-incremented pointer loop. (The same two
+instructions are also a remotely-triggerable unchecked write — `game_defects_notes.md` §13.)
+
+**The static-picture screen states** — six `GameState` values sharing `PictureScreenImage`
+@ 0x007ba3c0 and `PictureScreenDeadline` @ 0x006b0298. **Only state 1 is reachable**; the rest are
+dead because `WinMain` opens with `PlayFmvAndSetState(10)` and the FMV chain replaced the original
+4 -> 2 -> 1 boot sequence (`game_defects_notes.md`, "Dead code"):
+
+| state | setter | image | frame handler | draw handler | key handler |
+|---|---|---|---|---|---|
+| 1 | `EnterTitleScreen` 0x0056dc50 | `bitmaps\Title.rim` | `RunTitleScreenFrame` 0x0046edd0 | `DrawTitleScreen` 0x0056e2f0 | `HandleTitleScreenKeyPress` 0x00470e00 |
+| 2 | `Enter2000ADSplashScreen` 0x0056def0 | `bitmaps\2000AD splash screen.rim` | `Run2000ADSplashFrame` 0x0046cc80 | `Draw2000ADSplashScreen` 0x0056e030 | `Handle2000ADSplashKeyPress` 0x00470e80 |
+| 3 | `EnterBlankPictureScreen` 0x0056e080 | (none) | `RunBlankPictureScreenFrame` 0x0046ec50 | `DrawBlankPictureScreen` 0x0056e2d0 | `HandleBlankPictureScreenKeyPress` 0x00470e40 |
+| 4 | `EnterRebellionLogoScreen` 0x0056e350 | `bitmaps\REBLOGO.rim` | `RunRebellionLogoScreenFrame` 0x0046e540 | `DrawRebellionLogoScreen` 0x0056e470 | `HandleRebellionLogoScreenKeyPress` 0x0046f6c0 |
+| 9 | `EnterHiscoreScreen` 0x0056e4c0 | `bitmaps\Hiscore.bmp` | `RunHiscoreScreenFrame` 0x0046e4f0 | `DrawHiscoreScreen` 0x0056e5e0 | 0x0046f291 |
+| 20 | `EnterSplashScreen` 0x0056dd90 | `bitmaps\splashscreen.rim` | `RunSplashScreenFrame` 0x0046d0f0 | (none) | `HandleSplashScreenKeyPress` 0x0046f020 |
+
+**Three `GameState` dispatchers**, all indexed `GameState - 1`: `WinMain`'s 20-entry table
+@ 0x0046bec8; the per-frame **draw** dispatcher `FUN_0046a710` (byte index table @ 0x0046aab0 into
+targets @ 0x0046aa84, 11 arms over states 1-19 — **state 20 is outside its range**); and
+`HandleKeyPress2`'s @ 0x0046f2f0. Plus `PlayFmvAndSetState` @ 0x004b0570, whose own 4-entry table
+@ 0x004b0724 is indexed `state - 10` and covers the FMV states: 10 `Logos.bik`, 11 `Intro_FMV.bik`,
+12 `Outro_FMV.bik`, 13 `Fail Out final.bik`; its frame handler is `RunFmvStateFrame` @ 0x0046d2e0.
+
+**Blob shadows and the spark system:**
+
+| Offset | Type | Name |
+|--------|------|------|
+| 0x007ba198 | — | BlobShadowShapeDefault — sprite quad for `blob shadow 0`, `units\alpha junk.rim` |
+| 0x007ba19c | — | BlobShadowShapeSpider — sprite quad for `blob shadow 1` (`spider`) |
+| 0x007ba1a4 | — | AlphaJunkTexture — the shared `units\alpha junk.rim` both quads sample |
+| 0x007ba1ac | — | Unit_BuildShadowNode_StaticGuard — **not data**: the MSVC magic-static guard for a function-local static in `Unit_BuildShadowNode` @ 0x005525b0 |
+| 0x007ba1c4 | SparkSystem* | TheSparkSystem — 0x68 bytes, `Spark_EnsureSystem` @ 0x00558400 / `Spark_DestroySystem` @ 0x00558490 |
+| 0x007ba1b4 | List | the spark emitter list (count 0x1b8, cache 0x1bc/0x1c0) |
+| 0x007ba1cc | float* | SparkSystemTime — the system's seconds accumulator |
+| 0x00838c58 | void*[256] | ImageCodecTrieRoot — the image-codec magic-byte trie; freed at exit by `_atexit(&LAB_0064c9c0)` via `ImageCodecTrie_FreeSubtree` @ 0x005c8690 |
+
+**The interface handler matrices** (see `orders_notes.md` §8.5) — one registry per mouse button, each
+holding three 6x7 handler matrices at +0x40 (click), +0xe8 (drag) and +0x190 (button-down), indexed
+`[CursorTargetClass][CursorMode]`, total size 0x238:
+
+| Offset | Name |
+|--------|------|
+| 0x007b41f8 | LeftButtonInterface |
+| 0x007b4498 | RightButtonInterface |
+| 0x007b3f88 | MiddleButtonInterface |
+| 0x007b4448 | PendingCommandWheelAction |
+| 0x007b4444 | PendingCommandWheelPayload |
+
+**Clocks:** `MainClock` @ 0x007c07d0 and `ExecutorClock` @ 0x007c07a0, both 0x24 bytes, built by
+`Clock_Ctor` @ 0x00571830 from static initialisers at 0x0043a2c0 / 0x0043a2e0 (`Clock_Dtor`
+@ 0x005718a0 is a bare `RET`). **`Clock+0x0c` is a RATE** — `ClockTicksPerSecond` @ 0x007c07dc and
+`ClockTicksPerSecondExecutor` @ 0x007c07ac, written only by `MulDiv` inside `Clock::Calibrate`
+@ 0x00571931, itself called only from `WinMain` @ 0x0046b934 and `LoadLevel` @ 0x004e1420.
+**`Clock+0x18` is the running accumulator**, read via `AccumThreadClock64` @ 0x0044df20. Confusing the
+two is what produced `game_defects_notes.md` §16.
 
 **PRNG** (BSD `random()`, additive LFG DEG_3=31 / SEP_3=3; the generator is inlined at call
 sites as `(*fptr += *rptr) >> 1`): there are **two** state tables selected per-call by

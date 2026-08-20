@@ -913,6 +913,48 @@ responsible for checking its own payload. Two do not.
 Consequence for GkPlus: none of this is ours to fix, but anything that *exposes* the wire to script
 would make all three script-reachable, which is the reason to keep them written down.
 
+### 13.1 What a later pass added to the two index writes
+
+Re-measured from the disassembly; the two entries above are correct and this only sharpens them.
+
+- **The only gate ahead of either arm is a non-zero sender.** `CMP dword [EBP-0x2f8],0 / JZ <default>`
+  @ 0x005091a2. The `[0x007b9df2]` gate @ 0x00509282 sits **after** all of this if-chain and covers
+  none of it.
+- **`0x2a`'s effective address covers the whole address space.** The arm is
+  `MOV EAX,[EBX+4]` / `LEA ECX,[EAX + EAX*4]` / `MOV EAX,[EBX+0xc]` / `ADD ECX,[EBX+8]` /
+  `MOV [ECX*4 + 0x7b70e4],EAX` — the index is a full 32-bit `a*5 + b` scaled by 4, so it is an
+  **arbitrary 32-bit write with a fully controlled value**, not a write confined to one table.
+  For the *intended* range `a` in 1..4 and `b` in 0..5 it lands in **0x007b70f8..0x007b7144**, which
+  makes `a` **1-based**, matching its sibling commands. Its neighbours are `TeamUnitCounts`
+  @ 0x007b70e0 (the 5 dwords `TotalUnitsAcrossTeams` @ 0x004fb8f0 sums), `LobbyRosterIndex`
+  @ 0x007b70f4 and `PlayerSlotFlags` @ 0x007b7148. Whether that span is the per-player unit-selection
+  table or the `MaxUnitsPerTeam` region named above is **not settled** — `FUN_004f10b0` (23 KB) was
+  never decompiled — and the defect does not depend on which it is.
+- **`0x2d`'s array is now typed.** `PlayerSlotFlags` is `byte[4]` at **0x007b7148..0x007b714b**,
+  bounded by `NumPlayerSlots` @ 0x007b714c (= 4). The `0x007b7145-0x007b7148` reading that once
+  competed with it is **refuted**: nothing in the binary touches 0x007b7145 or 0x007b7146 at any
+  width. The `+0x7b7147` displacement in the arm is a **1-based index rebase**, not an array start —
+  and the same idiom appears on the unrelated per-slot string array one over (written
+  `MOV byte [EDX+0x7b714f],AL` with `EDX` pre-incremented @ 0x004fc1d0, read 0-based @ 0x00503450).
+  **So a displacement one below an array base is this compiler's output for a pre-incremented pointer
+  loop, and is not evidence about where an array begins.**
+
+### 13.2 Command `0x34` leaks its message buffer
+
+**Status:** confirmed, remotely triggerable, unbounded over a session.
+
+Every other path through `ExecutorThreadProc` frees the dequeued message with `PUSH EBX; CALL free`
+(0x005e3f7b). The `0x34` arm does not. `CMP dword [EBX],0x34 / JZ 0x0050adea` @ 0x00509279 jumps into
+the block 0x0050adea..0x0050af16, which broadcasts (`CALL BroadcastToPlayers` @ 0x0050aeef) and then
+**falls through into the periodic tick at 0x0050af17** — and 0x0050af1d immediately reloads `EBX`
+from `[EBP-0x2f0]`, so the pointer is gone. A scan of 0x0050adea..0x0050af16 finds **no call to
+`free` at all**. `0x34` is the only id that falls into the tick this way.
+
+### 13.3 The `0x1d`/`0x1f` `append` flag is always 0
+
+See §18 — kept with the order system rather than here, because it is an arithmetic slip rather than
+a memory-safety one.
+
 ---
 
 ## 14. `InventoryInfo_Ctor` @ 0x00483390 leaves `pickup_radius` uninitialised
@@ -947,10 +989,11 @@ ignores the size argument.)
 
 ---
 
-## 16. `AiBeginInvestigate` @ 0x0045e050 sets its deadline with no clock read (PROPOSED)
+## 16. `AiBeginInvestigate` @ 0x0045e050 sets its deadline with no clock read (CONFIRMED)
 
-**Status:** proposed, not settled. The mechanism is measured; the interpretation rests on one
-global's meaning.
+**Status:** **CONFIRMED.** The one global this used to rest on has been measured, and the *stated
+consequence has changed* — see "What it actually costs" below. It is neither "expires instantly" nor
+"never expires".
 
 Every sibling that arms a deadline reads the clock first - `Decoy_Dismiss` @ 0x00450f60 uses
 `clock + 60 * ClockTicksPerSecond`, `Mine_OnDeployed` uses `now + 10 * ClockTicksPerSecond`,
@@ -966,13 +1009,53 @@ tail is
           ADD EDI,EAX / MOV [EBX+0x90],EDI                  ; deadline = that global + the delta
 ```
 
-so `+0x90` becomes `[0x007c07dc] + seconds * tick_rate` rather than `now + seconds * tick_rate` -
-a deadline in the distant past if 0x007c07dc holds the ticks-per-second constant it appears to,
-which would make the investigate state expire on the tick it is entered.
+so `+0x90` becomes `[0x007c07dc] + seconds * tick_rate` rather than `now + seconds * tick_rate`.
 
-**What would settle it** is the writer of 0x007c07dc: if that global is a per-thread copy of the
-*current* time, the code is correct and merely reads oddly. Nothing in this pass identified the
-writer, so the mark stays PROPOSED - keep it that way until someone reads it.
+**0x007c07dc is settled: it is ticks-per-second, a RATE.** It is `MainClock+0x0c` (`MainClock`
+@ 0x007c07d0; the executor's copy is `ClockTicksPerSecondExecutor` @ 0x007c07ac =
+`ExecutorClock+0x0c`), and the DB already names it `ClockTicksPerSecond`. Its **only** writer is
+`MulDiv(delta_ticks, 1000, elapsed_ms)` inside `Clock::Calibrate` @ 0x00571931, and `Calibrate` is
+called from **`WinMain` @ 0x0046b934 and `LoadLevel` @ 0x004e1420 only** — never per frame. A
+reference sweep gives **133 reads and zero writes** (the one write goes through `ECX`). The *running*
+clock is `Clock+0x18`, read through `AccumThreadClock64` @ 0x0044df20. So the rate is sitting where
+the `now` term belongs, and the defect is real.
+
+Every sibling gets it right by adding the think proc's own `now_lo`/`now_hi`: `AiThink_Bot` case 6
+@ 0x00453e55 (`rate*17 + now`), `Mine_OnDeployed` @ 0x0045a75f (`rate*10 + now`), `AiThink_Minebot`
+@ 0x00456fb3 (`rate*1 + now`), `Decoy_Dismiss` @ 0x00450fd8 (`now + rate*60`).
+
+### What it actually costs — **not** "expires instantly"
+
+Both call sites are inside `AiThink_Minebot` (0x00456f7c on itself, 0x004571b0 propagating onto
+another actor), and its **`ai_state == 7` handler @ 0x00456f86** is what consumes the deadline. It
+does a signed 64-bit compare against `now`, and its **expired branch @ 0x00456fa6 does not
+transition out — it re-arms**:
+
+```
+00456f92  CMP dword [ESI+0x94],EAX     ; deadline_hi vs now_hi   (signed 64-bit compare)
+00456fa4  JNC 0x00456fde               ; not expired -> use it
+00456fa6  CALL GetCurrentThreadId ...
+00456fb3  MOV ECX,[ClockTicksPerSecond] / CMOVZ ECX,[...Executor]
+00456fc0  ADD ECX,dword [EBP+now_lo]   ; <- re-arm to now + rate*1
+00456fc6  MOV [ESI+0x90],ECX
+00456fde  SUB ECX,EAX                  ; remaining = rate, i.e. ONE SECOND
+```
+
+So the first `ai_state == 7` tick always takes the expired branch and **the investigate window is
+silently replaced by ~1 second, re-armed every time**. The `seconds` argument still reaches
+`GotoObject` @ 0x0045e168, so **movement is unaffected — only the timer is.**
+
+**An uptime framing does not survive contact.** The deadline is an absolute position roughly
+`1 + seconds` seconds after the accumulator's zero, and `Clock+0x18` is zeroed **once**, by
+`Clock_Ctor` @ 0x00571830 at static init, and never reset — `LoadLevel`'s field-by-field
+`MainClock -> ExecutorClock` copy carries the accumulated total across rather than resetting it. It
+would land in the *future* only in a session that reached gameplay within `1 + seconds` seconds of
+process start, which a level load makes impossible. **The behaviour is uniformly wrong, not
+uptime-dependent.**
+
+**Scope:** the `ai minebot` roles — `Rol_Walking_Mine` (identifier `"minebot"`) and
+`Rol_Mini_Minebot` (`"mini_minebot"`) — plus whatever the propagation site 0x004571b0 pushes the
+same broken deadline onto.
 
 ---
 
@@ -1104,16 +1187,147 @@ in the same session, before reading any silence as evidence.
 
 ---
 
+## 18. A queued attack-ground order can never be a close-range one
+
+**Status:** **cause CONFIRMED, effect CONFIRMED.** (This entry was going to be filed as
+"cause measured, effect unknown"; the consumer had already been read — see "What it costs" — so both
+halves are settled. `orders_notes.md` §8.2 is the same finding from the order system's side.)
+
+`ExecutorThreadProc`'s arm at 0x00509e14 computes `CharacterActor::QueueOrderPosition`'s `append`
+argument from the command id:
+
+```
+00509e2b  CMP EDI,0x20        ; EDI = the wire command id
+00509e33  SETZ CL             ; append = (id == 0x20)
+00509e39  PUSH ECX
+00509e48  CALL dword [EDX + 0x158]    ; Actor slot 86 QueueOrderPosition
+```
+
+**That arm is reached by exactly ids `0x1d` and `0x1f` — never `0x20`.** Decoded from the fully
+resolved switch: byte index table @ 0x0050bae0 into targets @ 0x0050ba3c, index `id - 4`, bounded
+`CMP EAX,0x39 / JA`. So `ZF` can never be set there and **`append` is always 0**: a queued *position*
+order can never set its append byte.
+
+It is a **copy-paste of the constant from the sibling arm**. The four arms and their compares:
+
+| ids | arm | compare | correct? |
+|---|---|---|---|
+| `0x0a`/`0x0c` | 0x00509e91 | `CMP EDI,0xc` @ 0x00509ea8 | yes |
+| `0x1d`/`0x1f` | 0x00509e14 | `CMP EDI,0x20` @ 0x00509e2b | **no — always false** |
+| `0x1e`/`0x20` | 0x00509e5c | `CMP EDI,0x20` @ 0x00509e6e | yes |
+| `0x0b`/`0x0d` | 0x00509fae | — | — |
+
+The queued *target* arm (`0x1e`/`0x20`) is the one where `CMP EDI,0x20` belongs, and it is correct
+there.
+
+### What it costs
+
+The flag lands in `PendingOrder+0x20`, and the **kind-1 consumer passes it straight through as
+`AttackPosition`'s `close_range`** — `CharacterActor` slot 70 @ 0x0053d8d0:
+
+```
+0053db9e  MOVZX EAX,byte ptr [ECX + 0x20]   ; rec->flag
+0053dba4  PUSH EAX                          ; -> close_range
+0053dba5  PUSH 0x0
+0053dba7  PUSH dword ptr [EBP + 0x10]       ; order time
+0053dbaf  PUSH EAX                          ; &rec->position
+0053dbb0  CALL dword ptr [EDX + 0x184]      ; Actor slot 97 AttackPosition
+```
+
+So **a queued attack-ground order can never be a close-range (lobbed) one.** The immediate path is
+unaffected: it supplies `close_range` correctly as `(id == 0x0c)` at 0x00509eab. Kind 0 does the same
+through slot 96 at 0x0053dbdd, and *its* arm's compare is correct, so only the position variant is
+affected.
+
+Worth noting the naming trap this defect sits on: the argument is `close_range`, not `append`. The
+executor arm looks like it is computing "should this be appended to the queue" — and if it were, an
+always-0 flag would be far more visible. It is not; the record is appended unconditionally.
+
+---
+
+## 19. Four uninitialised bytes reach every savegame containing a waypoint
+
+**Status:** confirmed, harmless, but it makes saves non-reproducible.
+
+The waypoint record is `pool_alloc(0x18)` and has three allocators, all writing the same shape:
+
+| function | list | RET |
+|---|---|---|
+| `MobileActor::PushRouteWaypoint` @ 0x0053a640 | push-**front** onto `+0x204` | `RET 0xc` |
+| `MobileActor::AddWaypoint` @ 0x0053a760 (slot 90) | push-**back** onto `+0x204` | `RET 0x10` |
+| `MobileActor::AppendPatrolPoint` @ 0x0053a830 | push-**back** onto `+0x214` | `RET 0xc` |
+
+Layout: `+0x00 Vec3f pos`, `+0x0c int keep_on_arrival`, `+0x10 float wait_time`, and **`+0x14` —
+which none of the three ever writes.** Verified by reading all three bodies: each stores `[EBP+0xc]`
+into `record+0x0c` and `[EBP+0x10]`/`[EBP+0x14]` into `record+0x10`, and there is no store to
+`record+0x14` anywhere.
+
+Both savegame paths move **the full 0x18 bytes**: `WriteActorFixups` @ 0x0053210d
+(`PUSH 0x18; PUSH [EAX+0xc]`) and `ReadActorFixups` @ 0x00531060 (`PUSH 0x18` … `LEA ECX,[ESI+0x204]`).
+So **4 bytes of uninitialised pool memory are written into every `.sav` holding a waypoint.** Nothing
+reads the field, so the effect is bounded at "saves are not byte-reproducible" — which matters only
+if anything ever diffs two saves of the same state.
+
+### 19.1 And `keep_on_arrival` is a dead branch
+
+The reader is `FUN_0053a1d0` @ 0x0053a2cf: zero pops the record and `free_sized(rec, 0x18)`; non-zero
+advances the cursor and **retains** it. **Every direct writer in the shipped binary passes literal
+0** — all four `PushRouteWaypoint` call sites (0x005398ea, 0x0053c633, 0x00452ae4, 0x00452b0d) and
+both `AppendPatrolPoint` call sites (0x0045489a, 0x00454e8f) `PUSH 0x0`. The only allocator that does
+not hardcode it is `AddWaypoint` (slot 90), which forwards its own argument, and slot 90 is reachable
+only through the seven client/executor vtables — i.e. from the wire. **So no waypoint the shipped game
+creates is ever retained on arrival: the retain path exists and is unreachable in practice.** Not
+dead *code* — a dead *branch*, and the name describes what the reader does with it rather than a
+feature anyone can trigger.
+
+---
+
 ## Dead code: things that look reachable and are not
 
 Not defects. Recorded so nobody analyses them twice.
 
-- **`GameState` 4 and 20 are unreachable.** `WinMain` @ 0x0046aef0 ends in a 20-entry jump table at
-  **0x0046bec8** indexed by `GameState - 1` (`MOV EAX,[GameState 0x006b02b4]; DEC EAX;
-  CMP EAX,0x13; JA <loop>; JMP dword [EAX*4 + 0x0046bec8]`). A sweep of every writer of `GameState`
-  shows that the functions which would set 4 and 20 have **zero xrefs of any kind**, so those two
-  arms never run - which makes `RunSplashScreenFrame` @ 0x0046d0f0 (state 20) and
-  `HandleSplashScreenKeyPress` @ 0x0046f020 dead.
+- **`GameState` 2, 3, 4, 9 and 20 are all unreachable, and 14 has no writer at all.** This entry
+  used to cover 4 and 20 and to rest on "the functions which would set them have zero xrefs". The
+  verdict holds, the **evidence is now positive rather than an absence**, and the **scope is wider**.
+
+  `WinMain` @ 0x0046aef0 ends in a 20-entry jump table at **0x0046bec8** indexed by `GameState - 1`
+  (`MOV EAX,[GameState 0x006b02b4]; DEC EAX; CMP EAX,0x13; JA <loop>;
+  JMP dword [EAX*4 + 0x0046bec8]`). There are **three** such dispatchers, all indexed the same way:
+  that one, the per-frame draw dispatcher `FUN_0046a710` (byte index table @ 0x0046aab0 into targets
+  @ 0x0046aa84, 11 arms over states 1-19, so **state 20 is out of its range entirely**), and
+  `HandleKeyPress2`'s @ 0x0046f2f0.
+
+  Six states are **static-picture screens** sharing one image global `PictureScreenImage`
+  @ 0x007ba3c0 and one deadline global `PictureScreenDeadline` @ 0x006b0298:
+
+  | state | setter | image | frame handler | draw handler | key handler | setter reachable |
+  |---|---|---|---|---|---|---|
+  | 1 | `EnterTitleScreen` 0x0056dc50 | `bitmaps\Title.rim` | `RunTitleScreenFrame` 0x0046edd0 | `DrawTitleScreen` 0x0056e2f0 | `HandleTitleScreenKeyPress` 0x00470e00 | **yes** (4 refs) |
+  | 2 | `Enter2000ADSplashScreen` 0x0056def0 | `bitmaps\2000AD splash screen.rim` | `Run2000ADSplashFrame` 0x0046cc80 | `Draw2000ADSplashScreen` 0x0056e030 | `Handle2000ADSplashKeyPress` 0x00470e80 | no — **transitively** |
+  | 3 | `EnterBlankPictureScreen` 0x0056e080 | (none, 60 s deadline) | `RunBlankPictureScreenFrame` 0x0046ec50 | `DrawBlankPictureScreen` 0x0056e2d0 | `HandleBlankPictureScreenKeyPress` 0x00470e40 | no — 0 refs |
+  | 4 | `EnterRebellionLogoScreen` 0x0056e350 | `bitmaps\REBLOGO.rim` | `RunRebellionLogoScreenFrame` 0x0046e540 | `DrawRebellionLogoScreen` 0x0056e470 | `HandleRebellionLogoScreenKeyPress` 0x0046f6c0 | no — 0 refs |
+  | 9 | `EnterHiscoreScreen` 0x0056e4c0 | `bitmaps\Hiscore.bmp` | `RunHiscoreScreenFrame` 0x0046e4f0 | `DrawHiscoreScreen` 0x0056e5e0 | 0x0046f291 | no — 0 refs |
+  | 20 | `EnterSplashScreen` 0x0056dd90 | `bitmaps\splashscreen.rim` | `RunSplashScreenFrame` 0x0046d0f0 | (none) | `HandleSplashScreenKeyPress` 0x0046f020 | no — 0 refs |
+
+  **State 2 is dead transitively**, which is the part a per-function xref count could never show:
+  `Enter2000ADSplashScreen` has exactly two callers, 0x0046e571 and 0x0046f6f8, and *both* sit inside
+  the **state-4** handlers. So the original boot sequence was REBLOGO (4) -> 2000AD splash (2) ->
+  Title (1), and only Title survived.
+
+  **The cause**: `WinMain`'s first screen action is `PlayFmvAndSetState(10 /* Logos.bik */)`
+  @ 0x0046bc81. The FMV chain replaced the static logo screens — states 10-13 are `Logos.bik`,
+  `Intro_FMV.bik`, `Outro_FMV.bik`, `Fail Out final.bik`, driven by `PlayFmvAndSetState` @ 0x004b0570
+  (`void __fastcall(uint state, char set_video_mode)`) and framed by `RunFmvStateFrame` @ 0x0046d2e0.
+
+  **Nothing can reintroduce a dead value.** `PlayFmvAndSetState` writes `GameState = param_1` and
+  dispatches through a **4-entry** table @ 0x004b0724 on `param_1 - 10`, so any other value is a wild
+  jump — and all four of its call sites pass a literal 10, 11, 12 or 13. The only three *variable*
+  writers of `GameState` are likewise closed: `WinMain` @ 0x0046bd48 (`7 -> 5`, via `CMOVZ`),
+  `MenuLoadGame` @ 0x004e6d0a (`0x11` or `0x12` only), and `FUN_004b0a30` @ 0x004b0a7a-0x004b0aef
+  (saves the value, writes 0xf, restores it).
+
+  **Also dead, as a consequence:** `Run2000ADSplashFrame` @ 0x0046cc80, the four frame handlers for
+  states 3/4/9/20, the four key handlers, and all five draw handlers.
 - **`MobileActor::AddWalkingSpeed` @ 0x00539ed0 is dead, and so is update `0x5f`.** It adds a delta
   into `MobileActor+0x178`, calls `UpdateSpeedAndTurnRadius` and broadcasts `0x5f` (60 bytes,
   reliable). It has no callers, and a byte scan of the whole 0x00600000+ range for its
@@ -1144,6 +1358,33 @@ write of `Actor::alert_state = 1`, which the same file had concluded was never w
 generalises past xref counts: **a sweep over `.text` is a statement about the disassembly**, so
 before asserting "nothing writes X" or "nothing calls Y", check how much of the region the sweep
 covered is actually defined.
+
+**And here is the negative control that makes the rule usable.** The `GameState` pass above is the
+first dead-code verdict in this file that ran the sweep *and* recorded that the sweep can fire, which
+is what makes it different in kind from the four that collapsed:
+
+- `GameState` @ 0x006b02b4 has a **complete, enumerable writer set**. A byte scan for its
+  little-endian address over 0x00400000-0x0083ba00 returned **90 hits, 22 of them writes, all
+  accounted for** — including two that sat in undefined bytes and had to be hand-decoded
+  (0x0044c0a0 `A1 B4 02 6B 00` = a *read* in an undisassembled console handler, and 0x004b067e
+  `89 3D B4 02 6B 00` = the write inside `PlayFmvAndSetState`'s undefined arms). A second scan for
+  rebased `[reg+disp]` forms over bases 0x006b02a4-0x006b02b7 found only those same two sites, and
+  the global's **address is never taken** (no `LEA`, no `PUSH`). So there is no route to it that a
+  reference count would miss.
+- For each of the two setters, three independent negatives: zero Ghidra references; zero occurrences
+  of the little-endian address anywhere in initialized memory (so **not** a vtable slot or
+  function-pointer table entry — the trap that resurrected `BuildModemCompoundAddress`); and **zero
+  `E8`/`E9` rel32 whose target is either address across all 7,128 undefined ranges / 111,809
+  undefined bytes of `.text`** (982 rel32 candidates examined, ±4-byte margin) — the trap that
+  resurrected the image-codec registry.
+- **The rel32 sweep demonstrably fires.** The same scan found three genuinely hidden call edges that
+  no database reference showed: 0x0046cba0 `CALL PlayFmvAndSetState` and 0x0046cbbb / 0x0046cc12
+  `CALL EnterTitleScreen`, all inside `RunFmvStateFrame`'s undisassembled arms at
+  0x0046cb92-0x0046cc7b. A sweep that finds nothing is only evidence if you have shown it finds
+  something.
+
+The generalisation: **report what your sweep would have caught, not just what it caught.** A negative
+control turns "I found no callers" into "I found no callers with an instrument I proved works here".
 
 ---
 

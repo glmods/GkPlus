@@ -74,6 +74,65 @@ for raw input; the keyboard is not.**
 - The mouse wheel arrives as a registered `WM_MOUSEWHEEL` in the WndProc and dispatches
   `state = 0x20a`.
 
+### Where a mouse button actually goes: the `msg - 0x201` table
+
+Raw Input supplies the *button transitions*, but the routing to game behaviour happens back on the
+message side, and it was not recorded here. `HandleKeyPress3` @ 0x00470990 carries a jump table at
+**0x00470c3c** indexed by `msg - 0x201`, which selects one of **three interface registry objects —
+one per mouse button** — and calls a thin wrapper that supplies it as `this`:
+
+| registry | button | down wrapper | up wrapper |
+|---|---|---|---|
+| `LeftButtonInterface` @ 0x007b41f8 | left | `OnLeftButtonDown` @ 0x00496e30 | `OnLeftButtonUp` @ 0x00496e50 |
+| `RightButtonInterface` @ 0x007b4498 | right | `OnRightButtonDown` @ 0x00496f30 | `OnRightButtonUp` @ 0x00496f50 |
+| `MiddleButtonInterface` @ 0x007b3f88 | middle | `OnMiddleButtonDown` @ 0x00496e80 | `OnMiddleButtonUp` @ 0x00496ea0 |
+
+Each wrapper tail-calls the shared dispatchers `InterfaceRegistry_OnButtonDown` @ 0x004a25d0 and
+`InterfaceRegistry_OnButtonUp` @ 0x004a2700 (the latter computes a **20-unit drag threshold in
+640x400 space** and then picks the drag or click matrix). Those dispatchers index a **6x7 handler
+matrix by `[cursor target class][CursorMode]`** — the full mechanism, including why the matrix
+dimensions were documented backwards for a while, is in `orders_notes.md` §8.5. The point for *this*
+file is that the six wrappers above are the boundary: everything upstream is input plumbing,
+everything downstream is cursor-mode-dependent game behaviour.
+
+### `HandleGameKeyAction` is an if-else chain over `.data`, not a switch
+
+`HandleGameKeyAction` @ 0x0046f700 is reached from `HandleKeyPress3` @ 0x00470b43 (gated at
+0x00470b2c on `ConsoleStatus != 0`, i.e. the console is not capturing) and requires
+`event->[0x00] == 0x100` (`WM_KEYDOWN`). It then runs a **linear if-else chain** comparing
+`event->[0x10]` (the DIK) and the current modifier state against **pairs of dwords in `.data`**
+spanning roughly 0x007b72xx-0x007b74xx — one `{key, modifier_mask}` pair per bindable action. There is
+no jump table, so the number of comparisons is the number of bindings.
+
+Each pair is installed by `RegisterKeyBinding` @ 0x004f7360, which stores `[EDI] = key`
+(0x004f737b) and `[EDI+4] = modifier` (0x004f7380) — exactly the two dwords the chain compares — and
+files the binding into a `List<T>` at **0x007b74f0 + category*0x10**, which is what the Controls
+screen enumerates. All of them are registered by `RegisterAllKeyBindings` @ 0x004effc0, called from
+`WinMain`.
+
+A worked example, because it settled a standing "is this feature dead?" question: the **flare** key.
+
+```
+004f0521  PUSH 0x2 / PUSH 0x0 / PUSH 0x21          ; category 2, modifier 0, DIK 0x21 = DIK_F
+004f0527  MOV EDX,0x2340                           ; GL_CONTROLS_FIREFLARE
+004f052c  MOV ECX,0x725664 / CALL GetResourceString
+004f0538  MOV ECX,0x7b73cc / CALL RegisterKeyBinding
+```
+
+and the matching arm of the chain:
+
+```
+0046ffe4  CMP ESI,dword ptr [0x007b73cc]   ; the key
+0046ffee  JNZ ...
+0046ffee  CALL 0x004e3e60                  ; current modifier state
+0046fff3  CMP EAX,dword ptr [0x007b73d0]   ; the modifier mask
+0046fffb  CALL EnterFlareMode              ; @0x004a17e0
+```
+
+That single call site is `EnterFlareMode`'s **only** reference in the whole database, which is what
+proves the player flare feature is reachable — a rebindable Controls row, default **F**. Sibling
+registrations pin the scancode space (`0x0b` = DIK_0, `0x39` = DIK_SPACE, `0xd3` = DIK_DELETE).
+
 ## Data structures
 
 `KeyPressData` (0x1c bytes) - the universal input record fed to `HandleKeyPress4`:
