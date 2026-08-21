@@ -1554,10 +1554,105 @@ bool TonemapReady();
 void RecordTonemap(void *command_buffer, uint64_t dest_view, uint32_t source_width,
                    uint32_t source_height, uint32_t dest_width, uint32_t dest_height);
 
+// --- bloom: three layers over the HDR target (§4.99) -------------------------------------------
+//
+// `render.bloom` extracts the over-range part of the world image, blurs it at three separate
+// scales, and adds it back inside the tonemap pass. It is the second feature here whose goal is not
+// reproduction, and it is in `render.stock`'s set.
+//
+// **It requires `render.hdr` and does nothing without it**, which is a structural dependency rather
+// than a policy: a threshold is a statement about light, and the 8-bit target has none to make -
+// every value in it is already clamped to 1, so "brighter than white" cannot be asked of it. With a
+// float target that question has an answer, and in this game it is the additive fires, the flares
+// and whatever a `diffuse 4.0` light lands on (§4.48). `RecordBloom` returns immediately when the
+// colour format is not the float one, so `bloom = true` under SDR costs nothing and changes nothing.
+//
+// Three layers, and each is independent - it reads the HDR target itself rather than the layer above
+// it. A downsample chain would be cheaper and is what most engines do, but it makes a per-layer
+// threshold impossible: layer 2 would be thresholding layer 1's output, so its number would mean
+// something different from layer 0's. Per-layer thresholds are the whole point of asking for three,
+// so each layer pays for its own extract.
+//
+// **A layer's resolution is a fixed line count, not a fraction of the frame** - 240, 120 and 60 - so
+// a radius means the same thing at 640x480 as it does at 3072x1728. That is the same rule
+// `ao_screen_radius` follows and for the same measured reason: a pixel-denominated default is wrong
+// by 3.6x between the two machines in these notes, in the direction that makes the feature invisible
+// rather than obviously broken. Bloom is a low-frequency effect, so a fixed absolute resolution
+// costs it nothing and buys exact resolution independence.
+constexpr uint32_t kBloomLayers = 3;
+
+// What a layer does to the pixel it lands on. All three are meaningful in unbounded linear light,
+// which is what rules out most of the Photoshop list - those are defined on [0,1]. The formulae are
+// in `apply_bloom` in src/shaders/tonemap.slang, and the numbers here are checked against the
+// shader's own constants by src/gen-shader-abi.py.
+enum class BloomBlend : uint32_t {
+  // Skipped entirely: the composite branches past it and `RecordBloom` records neither of its two
+  // passes. That is what makes the per-layer off switch free rather than merely inert, and it is
+  // what a three-layer feature needs, since most looks want one or two.
+  Off = 0,
+  // `c + b`. What a lens actually does.
+  Add = 1,
+  // `c + b * max(1 - c, 0)`. The classic screen wherever the base is in [0,1], and well-behaved
+  // above it, where `1 - (1 - c)(1 - b)` starts *reducing* the result instead of raising it.
+  Screen = 2,
+  // `max(c, b)`. The only one of the three that cannot make a bright area brighter.
+  Max = 3,
+};
+
+struct BloomLayer {
+  // Linear luminance (Rec.709) at which a pixel starts to contribute. **1.0 is the meaningful
+  // default and not a round number**: under `render.linear_input` an opaque surface lit to full
+  // white is exactly 1, so a threshold there selects precisely what the 8-bit pipeline could not
+  // represent.
+  float threshold = 1.0f;
+  // The half-width of the soft ramp around the threshold, in the same units. Not decoration: a hard
+  // compare pops a surface's whole contribution on and off between two frames as the camera drifts
+  // across it.
+  float knee = 0.5f;
+  // The Gaussian's sigma, **as a fraction of the frame height** - see the resolution note above.
+  // Converted to the layer's own texels at record time, where a large value costs more taps; the
+  // kernel is capped at `kBloomMaxTaps` either side, which a default never reaches.
+  float radius = 0.006f;
+  // The linear multiplier applied at composite time. Zero is not the same as `Off`: it still records
+  // the layer's two passes, so it is the setting to reach for while sweeping a value rather than the
+  // one to leave a layer at.
+  float intensity = 0.5f;
+  BloomBlend blend = BloomBlend::Add;
+};
+
+// Off by default, for the reason every departure in this header is: a default run has to keep the
+// residual claim against `GKPLUS_RENDERER=d3d8` true. `GKPLUS_VK_BLOOM=1` is the launch-time form.
+void SetBloom(bool on);
+bool Bloom();
+
+// Per layer, and out of range is ignored on the way in and returns the defaults on the way out -
+// there is no failure channel here and a throw would make a slider an exception generator.
+void SetBloomLayer(uint32_t index, const BloomLayer &layer);
+BloomLayer BloomLayerAt(uint32_t index);
+
+// The three layers with the size each is actually running at, for `render.bloom_layers` and the
+// report. Includes the sizes because a radius is only interpretable next to them.
+std::string DescribeBloom();
+
+// Whether the pass is up. False on a device that could not build it, where the knob reads back as
+// asked and the frame simply has no bloom in it - the same "lose the feature, not the frame" rule
+// every other optional pass here follows.
+bool BloomReady();
+
+// Record the whole thing: per live layer, one extract off the HDR target and two blur passes over
+// the layer's own ping-pong pair. It begins and ends its own rendering and owns the layout
+// transitions on its own images, leaving each finished layer in SHADER_READ_ONLY_OPTIMAL for the
+// tonemap. **The caller must have already made the HDR target readable** - which it has, since the
+// tonemap needs the same barrier.
+//
+// Must run before `RecordTonemap` and after the world pass. Records nothing at all when the knob is
+// off, the pass did not build, the colour format is not the float one, or every layer is `Off`.
+void RecordBloom(void *command_buffer);
+
 // --- the stock-look preset (§4.87) ------------------------------------------------------------
 //
 // Every deliberate departure from D3D8, switched together. `render.stock = true` is the setup a
-// fidelity comparison against `GKPLUS_RENDERER=d3d8` needs, in one write instead of eleven;
+// fidelity comparison against `GKPLUS_RENDERER=d3d8` needs, in one write instead of twelve;
 // `false`
 // puts back what was there before.
 //
@@ -1570,9 +1665,9 @@ void RecordTonemap(void *command_buffer, uint64_t dest_view, uint32_t source_wid
 // The set is exactly what this header already documents as "off is the build before it existed":
 // `per_pixel_lighting`, `map_lighting` and `lighting_maps` - §4.60's "three departures to switch
 // off" - plus the four shadow systems the game never had (`sun_shadows`, `map_shadows`,
-// `dynamic_shadows`, `local_shadows`), plus `ao`, `tessellation`, `msaa` and `hdr`. The last four
-// are off by default already and are here anyway, so that a session which turned them on is not a
-// session this lies about.
+// `dynamic_shadows`, `local_shadows`), plus `ao`, `tessellation`, `msaa`, `hdr` and `bloom`. The
+// last five are off by default already and are here anyway, so that a session which turned them on
+// is not a session this lies about.
 //
 // `msaa` is the one member that is not a bool, and it is in the set for the plainest reason of
 // all: the original rasterised one sample per pixel, so any other count is a departure and a
@@ -1588,22 +1683,27 @@ void RecordTonemap(void *command_buffer, uint64_t dest_view, uint32_t source_wid
 //     `tonemap_white` describe how a float target is presented, and with `hdr` off there is no
 //     float target for them to describe. Putting them in the set would restore five values that
 //     were already inert, and would make an operator the user chose part of what "stock" means.
+//   - **The bloom layers are outside it for exactly that reason**, one level down: `bloom` is in the
+//     set because the original could not do it at all, and the fifteen numbers under it describe how
+//     it looks. With `bloom` off - or with `hdr` off, which makes it inert whatever it says - none of
+//     them does anything, so restoring them would put back values that were already dead and would
+//     make a look somebody tuned part of what "the stock look" means.
 //   - **The fidelity knobs are untouched** - `half_pixel`, `rhw_depth_raw`, `viewport_rect`,
 //     `shade_mode`, `local_lights`, `map_light_cull`. For every one of those ON *is* the
 //     reproduction, so switching them would move the frame away from D3D8 rather than towards it.
 //     `stock` is not "turn the renderer off"; it is "draw what the original drew".
 //
-// **It restores the session, not the build's defaults.** Switching to stock snapshots the eleven
+// **It restores the session, not the build's defaults.** Switching to stock snapshots the twelve
 // first, so switching back returns a `local_shadows` that was off before to off. The snapshot is
 // taken only on a transition *into* stock, so writing `true` twice cannot overwrite it with the
 // values it just wrote; with no snapshot to restore - a fresh session's first `false` - it applies
 // the defaults, which is the shipped pipeline with `ao` and `tessellation` still off.
 //
-// Only the eleven switches move. Every parameter under them - `shadow_bias`, `map_light_gain`,
+// Only the twelve switches move. Every parameter under them - `shadow_bias`, `map_light_gain`,
 // `bump_scale`, the AO radius - is left exactly as it was, so a tuned value survives the round
 // trip without being part of the snapshot at all.
 //
-// Reads back **derived**: true iff all eleven are currently configured off, so turning one back
+// Reads back **derived**: true iff all twelve are currently configured off, so turning one back
 // on by hand makes it read false rather than leaving a mode flag that disagrees with the frame. It is
 // the *wanted* value of each that is compared, not the effective one - `ao` reads false until its
 // pass exists and `tessellation` false on a device without the feature, and a preset that could

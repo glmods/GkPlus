@@ -851,11 +851,144 @@ JSValue SetTonemapWhiteValue(JSContext *ctx, JSValueConst, JSValueConst value) {
   return JS_UNDEFINED;
 }
 
-// `render.stock` - all eleven deliberate departures from D3D8 at once, and back again (VkDraw.h,
+// --- bloom (VkDraw.h's "bloom: three layers over the HDR target") -----------------------------
+//
+// `render.bloom` - the master switch. Off by default, in `render.stock`'s set, and **inert without
+// `render.hdr`**: a threshold is a statement about light and an 8-bit target has none to make. It
+// reads back as REQUESTED for the same reason `render.hdr` does, so a checkbox can bind to it
+// directly; `render.bloom_layers` says in words when a request is not being served.
+JSValue GetBloom(JSContext *ctx, JSValueConst) { return JS_NewBool(ctx, vulkan::Bloom()); }
+
+JSValue SetBloomValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetBloom(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+const char *BlendName(vulkan::BloomBlend blend) {
+  switch (blend) {
+  case vulkan::BloomBlend::Add: return "add";
+  case vulkan::BloomBlend::Screen: return "screen";
+  case vulkan::BloomBlend::Max: return "max";
+  default: return "off";
+  }
+}
+
+// `render.bloom_layer(index, spec?)` - one layer's five parameters.
+//
+// **A function taking an object rather than fifteen flat accessors**, which is the one place this
+// namespace departs from its own convention (`ao_radius`, `tess_edge_pixels`, ... are all flat).
+// Three layers times five parameters is where that convention stops paying: `bloom1_threshold`
+// through `bloom3_blend` is fifteen names to remember and no way to read a layer as one thing.
+// `render.material_override` is the precedent for the shape - a spec object, partial, with the
+// readback as the return value.
+//
+// It **returns the layer as it now stands**, so a caller sees what the clamps did, and it reads
+// without writing when the spec is absent. Every field of the spec is optional and an absent one is
+// left alone, which is what makes `bloom_layer(0, {intensity: 0.8})` a one-parameter edit rather
+// than a four-parameter reset.
+JSValue BloomLayerFn(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+  uint32_t index = 0;
+  if (argc < 1 || JS_ToUint32(ctx, &index, argv[0]) != 0) {
+    return JS_ThrowTypeError(ctx, "bloom_layer(index, spec) needs a layer index (0, 1 or 2)");
+  }
+  if (index >= vulkan::kBloomLayers) {
+    return JS_ThrowRangeError(ctx, "bloom_layer: index must be 0, 1 or 2");
+  }
+  vulkan::BloomLayer layer = vulkan::BloomLayerAt(index);
+
+  if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+    if (!JS_IsObject(argv[1])) {
+      return JS_ThrowTypeError(ctx, "bloom_layer(index, spec): spec is "
+                                    "{threshold, knee, radius, intensity, blend}");
+    }
+    // The four numbers, read through one helper so an absent key and a bad value cannot be
+    // confused: absent leaves the current value, present and unconvertible throws.
+    struct NumberField {
+      const char *name;
+      float *target;
+    };
+    const NumberField numbers[] = {{"threshold", &layer.threshold},
+                                   {"knee", &layer.knee},
+                                   {"radius", &layer.radius},
+                                   {"intensity", &layer.intensity}};
+    for (const NumberField &field : numbers) {
+      JSValue value = JS_GetPropertyStr(ctx, argv[1], field.name);
+      if (JS_IsException(value)) {
+        return JS_EXCEPTION;
+      }
+      if (JS_IsUndefined(value) || JS_IsNull(value)) {
+        JS_FreeValue(ctx, value);
+        continue;
+      }
+      double number = 0.0;
+      const int failed = JS_ToFloat64(ctx, &number, value);
+      JS_FreeValue(ctx, value);
+      if (failed != 0) {
+        return JS_EXCEPTION;
+      }
+      *field.target = static_cast<float>(number);
+    }
+
+    JSValue blend = JS_GetPropertyStr(ctx, argv[1], "blend");
+    if (JS_IsException(blend)) {
+      return JS_EXCEPTION;
+    }
+    if (!JS_IsUndefined(blend) && !JS_IsNull(blend)) {
+      const char *name = JS_ToCString(ctx, blend);
+      if (name == nullptr) {
+        JS_FreeValue(ctx, blend);
+        return JS_EXCEPTION;
+      }
+      const std::string text = name;
+      JS_FreeCString(ctx, name);
+      // **Refused rather than approximated**, the same rule `render.tonemap` follows: a typo
+      // silently behaving as `off` would read as "bloom does nothing on this machine", which is the
+      // one diagnosis that sends someone looking in the wrong place.
+      if (text == "off") {
+        layer.blend = vulkan::BloomBlend::Off;
+      } else if (text == "add") {
+        layer.blend = vulkan::BloomBlend::Add;
+      } else if (text == "screen") {
+        layer.blend = vulkan::BloomBlend::Screen;
+      } else if (text == "max") {
+        layer.blend = vulkan::BloomBlend::Max;
+      } else {
+        JS_FreeValue(ctx, blend);
+        return JS_ThrowTypeError(ctx, "bloom_layer: blend must be off, add, screen or max");
+      }
+    }
+    JS_FreeValue(ctx, blend);
+    vulkan::SetBloomLayer(index, layer);
+    layer = vulkan::BloomLayerAt(index);
+  }
+
+  JSValue out = JS_NewObject(ctx);
+  if (JS_IsException(out)) {
+    return out;
+  }
+  JS_SetPropertyStr(ctx, out, "threshold", JS_NewFloat64(ctx, layer.threshold));
+  JS_SetPropertyStr(ctx, out, "knee", JS_NewFloat64(ctx, layer.knee));
+  JS_SetPropertyStr(ctx, out, "radius", JS_NewFloat64(ctx, layer.radius));
+  JS_SetPropertyStr(ctx, out, "intensity", JS_NewFloat64(ctx, layer.intensity));
+  JS_SetPropertyStr(ctx, out, "blend", JS_NewString(ctx, BlendName(layer.blend)));
+  return out;
+}
+
+// `render.bloom_layers` - all three layers, the size each is running at, and whether the pass is
+// actually doing anything. A string and not a structure, for the reason `material_overrides` is one:
+// the interesting part is what a caller cannot compute from the knobs - the layer extents, the
+// sigma in texels, whether a kernel hit its cap, and which of "off", "unavailable" and "inert
+// without hdr" is the case.
+JSValue GetBloomLayers(JSContext *ctx, JSValueConst) {
+  const std::string text = vulkan::DescribeBloom();
+  return JS_NewStringLen(ctx, text.data(), text.size());
+}
+
+// `render.stock` - all twelve deliberate departures from D3D8 at once, and back again (VkDraw.h,
 // notes §4.87). `true` is the setup a comparison against `GKPLUS_RENDERER=d3d8` needs; `false`
 // restores what the session had, not the build's defaults.
 //
-// **The point of it is that the A/B is one write on a paused frame.** Eleven by hand is eleven
+// **The point of it is that the A/B is one write on a paused frame.** Twelve by hand is twelve
 // frames of drift on anything that moves, and the comparison this exists to serve is the one with
 // the zero noise floor.
 //
@@ -1876,6 +2009,9 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("exposure", GetExposure, SetExposureValue),
     JS_CGETSET_DEF("tonemap_knee", GetTonemapKnee, SetTonemapKneeValue),
     JS_CGETSET_DEF("tonemap_white", GetTonemapWhite, SetTonemapWhiteValue),
+    JS_CGETSET_DEF("bloom", GetBloom, SetBloomValue),
+    JS_CFUNC_DEF("bloom_layer", 2, BloomLayerFn),
+    JS_CGETSET_DEF("bloom_layers", GetBloomLayers, nullptr),
     JS_CGETSET_DEF("stock", GetStock, SetStockValue),
     JS_CGETSET_DEF("per_pixel_lighting", GetPerPixelLighting, SetPerPixelLightingValue),
     JS_CGETSET_DEF("map_light_report", GetMapLightReport, nullptr),

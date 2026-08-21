@@ -84,6 +84,7 @@ PAIRS = [
     ("ao.slang", "GpuDrawRecord", "GpuDrawRecord", {}),
     ("ao.slang", "AoPush", "AoPushConstants", {}),
     ("tonemap.slang", "TonemapPush", "TonemapPushConstants", {}),
+    ("bloom.slang", "BloomPush", "BloomPushConstants", {}),
 ]
 
 # size and the two alignments: (bytes, scalar align, std430 align).
@@ -109,6 +110,15 @@ CONSTANTS = [
     ("world.slang", "kDynShadowFace", "kDynShadowFace"),
     ("world.slang", "kDynShadowTilesPerRow", "kDynShadowTilesPerRow"),
     ("world.slang", "kNoTexture", "kNoTexture"),
+    # The bloom layer count and the three blend modes (4.99). The count is an array extent in
+    # `TonemapPush`, so a disagreement there would already be caught by the struct asserts - the
+    # blend modes would not be: they are compared against a push field, and a shader that read
+    # `screen` where the C++ wrote `max` has no size and no offset to preserve.
+    ("tonemap.slang", "kBloomLayers", "kBloomLayers"),
+    ("tonemap.slang", "kBloomBlendOff", "static_cast<uint32_t>(BloomBlend::Off)"),
+    ("tonemap.slang", "kBloomBlendAdd", "static_cast<uint32_t>(BloomBlend::Add)"),
+    ("tonemap.slang", "kBloomBlendScreen", "static_cast<uint32_t>(BloomBlend::Screen)"),
+    ("tonemap.slang", "kBloomBlendMax", "static_cast<uint32_t>(BloomBlend::Max)"),
 ]
 
 SCALARS = {

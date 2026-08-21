@@ -89,6 +89,13 @@ BoolRow Rows[] = {
     // below, which has to read `MsaaWanted` to get the same property.
     {"HDR", "core.render.hdr", "GKPLUS_VK_HDR", vulkan::Hdr, vulkan::SetHdr,
      AvailableUnderVulkan},
+    // Bloom needs HDR and is inert without it, but the row stays visible either way - for the
+    // reason the Tone Mapping row above does: a setting that vanishes when its companion is off is
+    // harder to find than one that reads as inert. Only the master switch is here; the fifteen
+    // per-layer numbers behind `render.bloom_layer` are a script and a panel's business, exactly as
+    // `shadow_bias` and the AO radius are.
+    {"Bloom", "core.render.bloom", "GKPLUS_VK_BLOOM", vulkan::Bloom, vulkan::SetBloom,
+     AvailableUnderVulkan},
 };
 
 constexpr const char *MsaaKey = "core.render.msaa";

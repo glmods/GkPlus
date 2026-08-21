@@ -300,6 +300,17 @@ constexpr uint32_t kAoNormalSlot = 4089;   // ... and its normal
 // every path that walks the image list - and it is the only one of these written by VkRenderer
 // rather than by VkDraw, because VkRenderer owns that image.
 constexpr uint32_t kTonemapSourceSlot = 4088;
+// The bloom layers' ping-pong buffers (notes 4.99), which take `2 * kBloomLayers` slots counting
+// DOWN from here - 4087..4082 - for the same reason `kDynShadowMapSlot` counts down: the images are
+// created and destroyed together, so one base and an index is one fact instead of six.
+//
+// Buffer 0 of a layer is the one the tonemap composites, always: the extract writes 0, the
+// horizontal blur writes 1, and the vertical blur writes 0 again. So `kBloomSlotBase - 2 * layer` is
+// the finished layer and nothing has to track which side of the ping-pong the last pass landed on.
+constexpr uint32_t kBloomSlotBase = 4087;
+constexpr uint32_t BloomSlot(uint32_t layer, uint32_t buffer) {
+  return kBloomSlotBase - (layer * 2 + buffer);
+}
 void WriteBindlessView(uint32_t index, uint64_t view);
 
 // The set and its layout, as opaque handles so this header keeps mentioning no Vulkan type

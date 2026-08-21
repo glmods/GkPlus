@@ -414,7 +414,7 @@ Read these before changing the draw path; each cost real time to establish.
 
 ## In progress: HDR, as a linear-light pipeline with an SDR tonemap
 
-**Phases 1-4 are in and measured (§4.91); phase 5, bloom, is not started.** `render.hdr` draws
+**Phases 1-5 are in and measured** (§4.91, and §4.99 for bloom). `render.hdr` draws
 the world into `R16G16B16A16_SFLOAT`, sRGB-decodes every albedo on the way in, lifts the D3DCOLOR
 clamps and tonemaps to the swapchain through a full-screen pass. Off by default and in
 `render.stock`'s set. On level02's settled camera it reaches ~84% of the frame - that is how far it
@@ -565,10 +565,42 @@ any of this - it is already its own pass on the swapchain image, downstream of t
    `render.msaa` is on, and a pass may not mix sample counts - validation caught that), and
    `PipelineState::ldr_target` so its pipelines declare the right attachment format.
 
-5. **Bloom** - the thing over-range actually buys, and the reason phase 1 puts a shader between
-   the world pass and the swapchain rather than keeping the blit. Not started, not designed.
+5. ~~**Bloom.**~~ **Done** (§4.99). `render.bloom` plus
+   `render.bloom_layer(index, spec)` - three layers, each with its own `threshold`, `knee`,
+   `radius`, `intensity` and `blend`, extracted from the float target, blurred separably, and
+   composited **inside the tonemap pass** before exposure and the operator. Which is the reason
+   phase 1 put a shader between the world pass and the swapchain rather than keeping the blit: the
+   composite rides in a shader that was running anyway, so it costs no extra pass and no extra
+   full-resolution image.
 
-Two things phases 1-4 left, both cheap and both worth doing before phase 5:
+   Four of its decisions are worth knowing before touching it, and §4.99 argues each. **Each layer
+   extracts for itself rather than from a downsample chain**, because in a chain layer 2 would be
+   thresholding layer 1's output and a per-layer threshold would mean three different things.
+   **A layer's resolution is a fixed line count** - 240/120/60 - not a fraction of the frame, which
+   is §4.86's `ao_screen_radius` rule one level on: it is what makes `radius`, a fraction of the
+   frame height, mean the same thing at 640x480 and at 3072x1728. **The extract's box tap count
+   follows the downsample ratio**, because a single bilinear tap over a 7.2-texel footprint presents
+   as bright pixels flickering rather than as aliasing. And **it requires HDR structurally**: an
+   8-bit target has no over-range to threshold, so there is nothing for a threshold to select on but
+   albedo.
+
+   **Measured at the fire camera** (§4.99), which is the frame to use - the settled start reaches
+   0.56% of itself, being a dark interior with no over-range in it. Against a masked noise floor of
+   max 1: `off -> on -> off` comes back at **max 2**, i.e. at the floor for the interval; the three
+   layers measure as three different effects (max 29 over 8.8% for the tight one against max 8 over
+   11.5% for the wide); the difference image is the two fires and nothing else; the **HUD panel's
+   interior is max 0**, so §4.92's split holds exactly; and the frame cost is **16.62 ms against a
+   healthy 16.63**. Two traps got in the way first and both are written up: unpaused, the fires put
+   the floor at MAD 5.44 over 26% of the frame, and the blinking `ACTIVE PAUSE` text accounts for
+   every difference over 16 in every pair including the ones that should be identical.
+
+   Also checked: the push block and the four constants through `src/gen-shader-abi.py` (§4.67 - and
+   the three blend values are the half the struct asserts could *not* have caught), and the panel
+   under Node against a stub `gk`. **What is still open is the look**, which no residual answers -
+   the defaults behave as designed on the one frame they have been seen on, and whether they are
+   right is settled by playing it.
+
+Two things phases 1-4 left, both cheap and both worth doing before judging phase 5:
 
 - **Measure the range, not just the pipeline.** Everything in §4.91 was taken on a frame with no
   over-range in it. A fire camera and a flare are what would say whether the lifted clamps are

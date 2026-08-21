@@ -1321,6 +1321,13 @@ void DrawFrame() {
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
             VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    // Bloom, between the two: it reads the float target the barrier above just made readable and
+    // writes its own small images, which the tonemap then composites (notes 4.99). **Here and not
+    // after the tonemap**, which is the whole placement argument - bloom is light reaching the
+    // sensor, so it has to be in the frame before the operator compresses it, and it has to be out
+    // of the frame before the 2D layers are drawn on top. It records nothing when the knob is off or
+    // the target is not the float one, so this call costs a function call on a stock frame.
+    RecordBloom(frame.cmd);
     Barrier(frame.cmd, LdrImage, VK_IMAGE_LAYOUT_UNDEFINED,
             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,

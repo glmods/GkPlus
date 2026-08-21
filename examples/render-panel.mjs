@@ -42,6 +42,12 @@ const MSAA_LABELS = ["off", "2x", "4x", "8x"];
  *  @type {Array<"clamp" | "rolloff" | "reinhard" | "aces" | "filmic" | "agx">} */
 const TONEMAP_OPS = ["clamp", "rolloff", "reinhard", "aces", "filmic", "agx"];
 
+/** The blend names, in the order the per-layer combo lists them. Annotated for
+ *  the same reason TONEMAP_OPS is: without it the element type is `string`, and
+ *  `BloomLayerSpec.blend` is a union of the four literals.
+ *  @type {Array<"off" | "add" | "screen" | "max">} */
+const BLOOM_BLENDS = ["off", "add", "screen", "max"];
+
 /** The count asked for while the frame that adopts it has not run yet, or null.
  *  `render.msaa` reads back what is IN FORCE, so a control bound straight to it
  *  would show the old value for one frame and write it back over the request.
@@ -466,6 +472,97 @@ export function draw_render_panel(ImGui) {
     slider(ImGui, "white", "tonemap_white", 1.0, 16.0,
       "What reinhard maps to exactly 1.0. Read by that operator alone.", "%.1f");
     ImGui.EndDisabled();
+    ImGui.TreePop();
+  }
+
+  // --- bloom -----------------------------------------------------------------
+  //
+  // Nested under its own node rather than inside the HDR one, but disabled by the
+  // same flag: bloom is inert without a float target, and a control that silently
+  // does nothing is worse than a greyed-out one.
+  //
+  // **`render.bloom_layer` is a function, so the write-on-changed rule needs
+  // stating again here rather than being carried by the helpers.** Each layer is
+  // read once per frame - which is cheap, five numbers out of a struct - and
+  // written only from a widget's own `changed`, one field at a time, because the
+  // spec is partial. Writing all five back on every frame would work and would
+  // also mean a slider you are dragging fights any other writer of the same
+  // layer.
+  if (ImGui.TreeNode("Bloom")) {
+    const bloomHdr = render.hdr === true;
+    const bloom = toggle(ImGui, "bloom", "bloom",
+      "Extract the over-range part of the world image, blur it at three scales, and " +
+        "add it back inside the tonemap pass. Needs hdr: an 8-bit target has nothing " +
+        "over 1 in it to threshold.");
+    if (!bloomHdr) {
+      ImGui.TextWrapped("hdr is off, so this is inert - there is no over-range light to find.");
+    }
+    ImGui.BeginDisabled(!bloom || !bloomHdr);
+    for (let index = 0; index < 3; index += 1) {
+      const layer = render.bloom_layer(index);
+      const width = ["tight", "mid", "wide"][index];
+      // **`##${index}` on the node's label, and the five widgets inside need no
+      // suffix of their own.** An open TreeNode pushes its own id, so its
+      // children are already scoped per layer - which is what saves three
+      // identical `threshold` sliders from being one widget. The suffix is on
+      // this label because everything before it is *display* text that changes
+      // when the blend does, and an id that moves collapses the node the moment
+      // you use it.
+      if (ImGui.TreeNode(`layer ${index} - ${width} (${layer.blend})##${index}`)) {
+        const blend = ImGui.Combo("blend", Math.max(0, BLOOM_BLENDS.indexOf(layer.blend)),
+          BLOOM_BLENDS);
+        if (blend.changed) {
+          render.bloom_layer(index, { blend: BLOOM_BLENDS[blend.current_item] });
+        }
+        ImGui.SetItemTooltip(
+          "off skips the layer's two GPU passes entirely. add is what a lens does; " +
+            "screen puts the glow only where the frame is not already lit, which is what " +
+            "keeps a wide layer from reading as fog; max cannot brighten a bright area."
+        );
+        const threshold = ImGui.SliderFloat("threshold", layer.threshold, 0.0, 4.0,
+          { format: "%.2f" });
+        if (threshold.changed) {
+          render.bloom_layer(index, { threshold: threshold.value });
+        }
+        ImGui.SetItemTooltip(
+          "Linear luminance at which a pixel starts to contribute. 1.0 is exactly a " +
+            "fully lit opaque surface, so at or above it only over-range light glows."
+        );
+        const knee = ImGui.SliderFloat("knee", layer.knee, 0.0, 2.0, { format: "%.2f" });
+        if (knee.changed) {
+          render.bloom_layer(index, { knee: knee.value });
+        }
+        ImGui.SetItemTooltip(
+          "Half-width of the soft ramp around the threshold. Zero pops a surface's whole " +
+            "contribution on and off between two frames as the camera drifts."
+        );
+        const radius = ImGui.SliderFloat("radius", layer.radius, 0.0, 0.15,
+          { format: "%.4f" });
+        if (radius.changed) {
+          render.bloom_layer(index, { radius: radius.value });
+        }
+        ImGui.SetItemTooltip(
+          "The blur's sigma as a fraction of the FRAME HEIGHT, so it means the same at " +
+            "any resolution. render.bloom_layers says what it works out to in texels."
+        );
+        const intensity = ImGui.SliderFloat("intensity", layer.intensity, 0.0, 2.0,
+          { format: "%.2f" });
+        if (intensity.changed) {
+          render.bloom_layer(index, { intensity: intensity.value });
+        }
+        ImGui.SetItemTooltip(
+          "The multiplier at composite time. Zero still records both passes - use " +
+            "blend: off to switch a layer off for free."
+        );
+        ImGui.TreePop();
+      }
+    }
+    ImGui.EndDisabled();
+    readoutButton(ImGui, "bloom layers", () => render.bloom_layers);
+    ImGui.SetItemTooltip(
+      "Each layer's size, the sigma its radius works out to in that layer's own texels, " +
+        "and whether the pass built on this device."
+    );
     ImGui.TreePop();
   }
 

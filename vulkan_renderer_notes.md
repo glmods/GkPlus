@@ -9868,3 +9868,233 @@ declarations, slangc compiles `world.slang`, and both type-checks are clean.
 It is a *departure*, so what settles it is the screen rather than the residual (the plan's "What a
 residual can and cannot say"): 0.308 MAD says the diffuse half now reaches 4.4% of the frame, and
 the reason to prefer it is the crop.
+
+## 4.99 Bloom, three layers deep, and why each of them extracts for itself
+
+HDR bought an over-range. §4.97 settled what fills it: `linear_input` decodes the fragment's final
+colour, so the framebuffer blend runs on light and Gunlok's additive fires, flares and
+`diffuse 4.0` surfaces accumulate past 1 instead of clipping. Until now the only thing downstream
+that read that headroom was the tonemap, which compresses it back. Bloom is the other thing worth
+doing with it, and the request was specific: **three layers with their own thresholds, blur sizes
+and blend modes.**
+
+`render.bloom`, off by default, in `render.stock`'s set, `GKPLUS_VK_BLOOM=1` at launch.
+`src/shaders/bloom.slang` plus a composite in `tonemap.slang`; `RecordBloom` in `src/VkDraw.cpp`,
+called from `src/VkRenderer.cpp` between the world pass and the tonemap.
+
+### It requires HDR, and that is structural rather than a policy
+
+A threshold is a statement about light, and **an 8-bit target has none to make**: every value in it
+was already clamped to 1 by the time it landed, so "brighter than white" is not a question that can
+be asked of it. Thresholding one anyway gives the effect every 2003 game shipped - a glow on
+whatever happens to be pale - because the only thing left to select on is albedo.
+
+With the float target the question has an answer, and in this game it is a short and correct list:
+the additive particle draws, the flares, and whatever a light over 1.0 lands on. §4.48 measured
+level02's key light at `diffuse 4.0`, so a threshold at 1.0 selects **exactly what the 8-bit
+pipeline could not represent** and nothing else. That is why 1.0 is the first layer's default rather
+than a tuned number: under `linear_input` a fully lit opaque surface is 1.0 by construction.
+
+So `RecordBloom` returns on `ColourFormat != kHdrFormat` - the format and not `Hdr()`, the same
+request-versus-answer distinction the tonemap's `flags` makes - and `render.bloom` under SDR is
+reported as INERT rather than quietly doing something.
+
+### Three independent extracts, not a downsample chain
+
+The cheap way to build a multi-scale bloom, and what most engines ship, is a chain: threshold once
+at half resolution, then downsample that repeatedly, so each level costs a quarter of the one above
+it. **It is incompatible with a per-layer threshold**, which is the thing that was asked for: layer
+2 would be thresholding layer 1's *output*, so its number would mean something different from layer
+0's, and the two could not be reasoned about together. A threshold of 1.6 on the wide layer is only
+meaningful if 1.6 refers to scene light.
+
+So each layer reads the float target itself and pays for its own extract. What that costs is one
+full-resolution read per layer instead of one for the set - and the read is what the extract is
+doing anyway, so at three layers it is three reads of a 640x480 fp16 image, which is 2.4 MB apiece.
+
+### A layer's resolution is a fixed line count, and the radius is a fraction of the frame
+
+`kBloomLayerHeights = {240, 120, 60}`. **Absolute lines, not a fraction of the render extent.**
+
+This is §4.86's rule about `ao_screen_radius` applied one level further. The AO note says a
+pixel-denominated default is wrong by 3.6x between the 640x480 machine every number in these notes
+came from and the 3072x1728 machine they were written on, "and wrong in the direction that makes the
+feature invisible rather than obviously broken". A bloom radius has the same problem and one more:
+if the layer's *size* also scales with the frame, then a sigma expressed in layer texels covers a
+different fraction of the screen at each resolution, and a sigma expressed in screen fractions needs
+a tap count that grows with the resolution - which either costs more on a big screen or hits its cap
+and silently stops widening.
+
+Pinning the layer's line count fixes both ends at once. `radius` is a fraction of the frame height,
+the layer covers the whole frame in `height` texels, so `sigma = radius * layer_height` is the whole
+conversion and it is resolution-independent by construction. The tap counts that fall out of the
+defaults are 1.4, 2.4 and 3.6 texels - all cheap, none near `kBloomMaxTaps = 24`.
+
+Bloom is a low-frequency effect, so a fixed absolute resolution costs it nothing. The one thing it
+does cost is that the *downsample ratio* varies: 2x at 480 lines, 7.2x at 1728. Which is the next
+point.
+
+### The extract's box has to follow that ratio
+
+**A single bilinear tap over a 7.2-texel footprint is a point sample of a moving image**, and it
+does not present as aliasing - it presents as individual bright pixels flickering in and out as the
+camera moves, which reads as the whole effect being broken rather than as one pass being
+under-sampled. So the extract takes an NxN box, N derived on the CPU from the ratio: one linear
+fetch covers about two source texels, so `N = clamp((ratio + 1) / 2, 1, 4)`. At 480 lines that is 1
+and the pass is exactly a bilinear downsample; at 1728 it is 4, covering ~8 texels of a 7.2-texel
+footprint through 16 fetches of a 427x240 target.
+
+Thresholding happens **after** the average, not before. Before it, one over-range pixel inside the
+footprint would pass at full strength and then be dimmed by the tap count - the same answer by a
+longer route on the common case, and the wrong one wherever the knee is doing its job, since the
+ramp would be evaluated on values the frame does not contain.
+
+### The composite is in the tonemap pass, before exposure
+
+Not a fourth full-screen pass. The tonemap is already reading the float target at full resolution
+and writing the LDR one, so the three layer fetches ride along in a shader that was running anyway -
+no extra pass, no extra full-resolution image, no extra barrier.
+
+**Before `exposure` and before the operator**, which is the placement argument and not a
+convenience: bloom is light reaching the sensor, so the sensor's response applies to it. Compositing
+after the operator would mean adding display-referred values to a display-referred image and then
+not compressing the result, which clips - the exact mistake §4.94-§4.97 spent four rounds on in a
+different guise.
+
+It also inherits §4.92's split for free: **the composite happens before the 2D layers are drawn**, so
+no glow reaches Gunlok's menus, briefing screens, HUD or inventory. Those were authored final and
+have nothing to bloom.
+
+### The three blend modes, and why not the familiar list
+
+The Photoshop blend list is defined on [0,1]. This composite runs on unbounded linear light, where
+most of it misbehaves - `1 - (1 - c)(1 - b)` starts *reducing* the result once `c > 1`. Three that
+do work:
+
+- **`add`** - `c + b`. What a lens does: light lands on top of light.
+- **`screen`** - `c + b * max(1 - c, 0)`. Exactly the classic screen wherever the base is in [0,1],
+  and well-behaved above it. Bloom fills in what is not already lit and leaves a blown highlight
+  alone.
+- **`max`** - `max(c, b)`. The only one that cannot make a bright area brighter.
+
+Plus **`off`**, which is not a fourth formula but a real skip: `RecordBloom` records neither of that
+layer's two passes and the composite branches past the fetch, so an off layer costs one not-taken
+branch and nothing on the GPU. That matters at three layers, because most looks want one or two.
+
+The defaults pair `add` with the two tight layers and **`screen` with the widest**, and that is the
+one default here that is a judgement about this game rather than about arithmetic: a 6%-of-height
+blur reaches most of the frame, so adding it raises the whole image's black level - which is exactly
+what makes a bloom read as fog. Screen puts it only where the frame is not already lit.
+
+Order is index order, which is also scale order, so the wide layers see what the tight ones
+contributed. It matters for `screen` and `max` and not for `add`.
+
+### The knee is not decoration
+
+A hard `luminance > threshold` pops a surface's entire contribution on and off between two frames as
+the camera drifts across it. The quadratic ramp over `[threshold - knee, threshold + knee]` - Unity's
+and Call of Duty's, the same curve - is C1 at both ends, so a pixel crossing it fades. The colour is
+*scaled* rather than replaced, which is what keeps the glow the same hue as the thing glowing: only
+the amount passed through is decided by luminance.
+
+The luminance is Rec.709 on linear values, which is what makes those coefficients right rather than
+habitual - they describe the eye's response to linear light. With `linear_input` off the buffer holds
+gamma-encoded values and they over-weight the dark end; it is still the best available answer there,
+and it is one more reason that sub-knob defaults to on.
+
+### What is checked, and by what
+
+- **The struct pair and the four constants** go through `src/gen-shader-abi.py`, per §4.67:
+  `BloomPush` against `BloomPushConstants`, and `kBloomLayers` plus the three blend values against
+  `BloomBlend`. The count would have been caught by the struct asserts anyway - it is an array extent
+  in `TonemapPush` - but **the blend values would not have been**: they are compared against a push
+  field, so a shader reading `screen` where the C++ wrote `max` has no size and no offset to
+  preserve. That is the §4.67 hazard exactly, and it is now a compile error.
+- **`off -> on -> off` is bit-identical by construction**, not by inspection: with the knob off
+  nothing is recorded and every `bloom_blend` word is `Off`, so the composite loop takes no fetch.
+  There is no state left behind to differ.
+- **`examples/render-panel.mjs` is driven under Node** against a stub `gk` and a recording ImGui
+  (`harness_testing_notes.md`), in three passes - everything open, every widget reporting an edit,
+  and nothing expanded. What that checks is what neither `tsc` nor a screenshot can: the id stack
+  comes back balanced (a dropped `TreePop` disables `draw_gui` for the whole session, and removing
+  one was confirmed to fail the check), every layer write carries exactly **one** field so a partial
+  spec stays partial, a collapsed section queries nothing, and `bloom_layers` - a formatted page - is
+  never read per frame.
+
+### Measured in the game, on level02 at the fire camera
+
+Driven through the REPL over one session at 3060x1716, `render.hdr` on throughout. **The settled
+start is the wrong frame for this** and the plan already said so: the defaults reach 0.56% of it,
+because it is a dark interior with almost no over-range in it. The fire camera
+(`camera.position = -15.0 -1.7 8.5`, `distance 16`, `roll 341`, §4.45) is where the over-range lives.
+
+**The first two attempts at a reading were worthless, and for two different reasons.** Unpaused, two
+shots with *nothing changed* differ by MAD 5.44 over 26% of the frame - the fires are animating, so
+the floor is an order of magnitude above anything being looked for. Paused, the floor drops to
+**max 1 level over 1.0% of pixels** at 1.4 s apart - but a knob change plus its settle is nearer ten
+seconds, and over that interval the floor is **max 2 at 9 s, 4 at 18 s, 6 at 27 s**, rising linearly:
+a paused Gunlok frame drifts by about a level per nine seconds over 4% of pixels. Every number below
+is quoted against that.
+
+And one element had to be masked. **A 12-row strip at the bottom left blinks between pure green and
+the floor behind it** - it is the `ACTIVE PAUSE` text - and it accounted for *every* difference over
+16 in *every* pair, in both directions, uncorrelated with the knobs (present in 6 of 11 shots). It is
+0.21% of the frame. Left in, it puts `max 231` on the bit-identity check and on the comparison of two
+blend modes alike, which is exactly the shape of reading that gets published as a defect.
+
+With that masked:
+
+| pair | MAD | max | pixels |
+|---|---|---|---|
+| noise floor, nothing changed | 0.0035 | **1** | 1.0% |
+| **`off -> on -> off`** | 0.0107 | **2** | 3.1% |
+| the defaults | 0.111 | 44 | 8.5% |
+| layer 0 alone - tight, `add` | 0.070 | 29 | 8.8% |
+| layer 1 alone - mid, `add` | 0.064 | 18 | 10.7% |
+| layer 2 alone - wide, `screen` | 0.052 | 8 | 11.5% |
+| all three, intensities 1.0 / 0.7 / 0.5 | 0.251 | 75 | 17.0% |
+
+Four things in that table are the answers this feature owed:
+
+- **`off -> on -> off` is at the floor.** Max 2 levels over an interval whose own floor is 2 to 4, so
+  nothing of the feature survives switching it off. The construction says bit-identical - nothing is
+  recorded and every blend word is `off`, so the composite loop takes no fetch - and the measurement
+  is consistent with it to the limit a drifting frame allows.
+- **The three layers do three different things**, which is the whole claim of asking for three. The
+  tight layer is the brightest and the most local (max 29 over 8.8%), the wide one the dimmest and
+  the broadest (max 8 over 11.5%), and the mid layer sits between them on both axes. Those are
+  independent measurements of the same frame, not a re-scaling of one curve.
+- **The reach does not exceed the description.** The difference image is the two fires and nothing
+  else: a bright halo at the base of each, spilling onto the ground plane and up the wall behind, with
+  the fire silhouettes faintly outlined. Every dark part of the frame stays dark. That is the check
+  §4.92 was caught by and this one passes.
+- **The 2D layers are untouched, exactly (max 0).** The HUD panel's interior is bit-identical between
+  bloom off, the defaults and the strong set. §4.92's split gives this for free - the composite is
+  inside the tonemap and the 2D pass runs after it - but it is the standing check for anything that
+  touches this pipeline, and it is worth having the number.
+
+Two more, from the same session:
+
+- **`bloom = true` under SDR changes nothing** and reports `INERT - needs render.hdr`, which is the
+  gate working rather than a coincidence.
+- **The extract's tap count came out at 4 per axis**, from a 1728-line frame into a 240-line layer -
+  which is the ratio arithmetic above landing where it was designed to, on the machine that has the
+  problem. The layers were 427x240, 213x120 and 107x60, and the sigmas 1.43, 2.39 and 3.59 texels at
+  5, 8 and 11 taps: nowhere near the 24-tap cap.
+- **16.62 ms/frame with bloom on**, against this file's own healthy figure of 16.63 for the same
+  camera. Six extra passes over images of at most 427x240 do not register.
+
+`screen` and `add` are within max 2 of each other on the wide layer here, and that is the formula
+being right rather than the mode being inert: `screen` is `c + b * max(1 - c, 0)`, and in the dark
+regions where the wide glow actually lands `c` is near zero, so the two agree by construction. Where
+they part company is over an already-lit surface, and this frame has almost none under that glow.
+`max` differs from both by 16, as it must - it replaces rather than accumulates.
+
+### What has not been measured
+
+**The look, which is the only thing that matters and the one thing none of the above says.** The
+defaults were chosen from the arithmetic - thresholds at and just above 1.0 so that a frame with no
+over-range in it gets no bloom at all - and they behave as intended on the one frame they have been
+looked at. Whether they are *right* is a judgement to be made by playing the game, and the levels
+with the most to gain (the fire cameras, the flares, the muzzle flashes) are exactly the ones a
+paused A/B cannot hold still.

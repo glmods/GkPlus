@@ -2527,6 +2527,60 @@ declare module "gk" {
     hide?: boolean;
   }
 
+  /** How one bloom layer combines with the pixel it lands on. All three are
+   *  meaningful in unbounded linear light, which is what rules out most of the
+   *  familiar blend list - those are defined on 0..1.
+   *
+   *  - `off` - the layer is skipped entirely, and so are its two GPU passes, so
+   *    this is genuinely free rather than merely inert.
+   *  - `add` - `c + b`. What a lens actually does: light lands on top of light.
+   *  - `screen` - `c + b * max(1 - c, 0)`. The classic screen wherever the base
+   *    is in 0..1, and well-behaved above it, where `1 - (1 - c)(1 - b)` starts
+   *    *reducing* the result. Bloom fills in what is not already lit.
+   *  - `max` - `max(c, b)`. The only one that cannot make a bright area
+   *    brighter. */
+  export type BloomBlend = "off" | "add" | "screen" | "max";
+
+  /** One bloom layer, as `render.bloom_layer` returns it. */
+  export interface BloomLayer {
+    threshold: number;
+    knee: number;
+    radius: number;
+    intensity: number;
+    blend: BloomBlend;
+  }
+
+  /** What to change about one bloom layer. Every field is optional and an absent
+   *  one leaves the current value alone. */
+  export interface BloomLayerSpec {
+    /** Linear (Rec.709) luminance at which a pixel starts to contribute. **1.0
+     *  is the meaningful value rather than a round number**: under
+     *  `render.linear_input` a fully lit opaque surface is exactly 1, so a
+     *  threshold there selects precisely what the 8-bit pipeline could not
+     *  represent. Defaults are 1.0, 1.2 and 1.6 by layer. */
+    threshold?: number;
+    /** The half-width of the soft ramp around the threshold, in the same units.
+     *  Not decoration: a hard compare pops a surface's whole contribution on and
+     *  off between two frames as the camera drifts across it. 0.5, 0.7, 1.0. */
+    knee?: number;
+    /** The Gaussian's sigma, **as a fraction of the frame height** - so 0.02 is
+     *  a blur two hundredths of the screen's height wide at any resolution. It
+     *  becomes texels of this layer's own image at record time, where a large
+     *  value costs more taps; the kernel is capped either side, which no default
+     *  comes near. 0.006, 0.02, 0.06. */
+    radius?: number;
+    /** The linear multiplier applied at composite time. **Zero is not the same
+     *  as `blend: "off"`**: it still records the layer's two passes, so it is
+     *  what to use while sweeping a value and not what to leave a layer at.
+     *  0.5, 0.35, 0.22. */
+    intensity?: number;
+    /** How this layer combines with the frame. `add` for the two tight layers
+     *  and `screen` for the widest, because a 6%-of-height blur reaches most of
+     *  the frame and adding it would raise the whole image's black level -
+     *  which is what makes a bloom look like fog. */
+    blend?: BloomBlend;
+  }
+
   /** The Vulkan renderer, under `GKPLUS_RENDERER=vulkan`.
    *
    *  Only the material override is declared here. The rest of the namespace is
@@ -2877,24 +2931,82 @@ declare module "gk" {
      *  exposure convention. */
     tonemap_white: number;
 
+    /** Bloom: the over-range part of the world image, blurred at three
+     *  separate scales and added back inside the tonemap pass. Off by default
+     *  and in {@link stock}'s set.
+     *
+     *  **It needs {@link hdr} and does nothing without it.** That is structural
+     *  rather than a policy: a threshold is a statement about light, and every
+     *  value in an 8-bit target is already clamped to 1, so "brighter than
+     *  white" cannot be asked of it. With a float target the question has an
+     *  answer, and in this game it is the additive fires, the flares and
+     *  whatever a `diffuse 4.0` light lands on. {@link bloom_layers} says so in
+     *  words when this reads `true` and the frame is still 8-bit.
+     *
+     *  It applies to the **world alone**, for free rather than by design: the 2D
+     *  layers are drawn after the tonemap, which is where the composite happens,
+     *  so no glow reaches the menus, the briefing screens or the HUD.
+     *
+     *  Reads back as *requested*, like {@link hdr} - so a checkbox can bind here
+     *  directly. `GKPLUS_VK_BLOOM=1` is the launch-time form. */
+    bloom: boolean;
+
+    /** One bloom layer's five parameters. Three layers, indices 0, 1 and 2, in
+     *  increasing scale - 240, 120 and 60 lines tall respectively, which is a
+     *  **fixed line count and not a fraction of the frame**, so a radius means
+     *  the same thing at 640x480 as it does at 3072x1728.
+     *
+     *  Every field of `spec` is optional and an absent one is left alone, so
+     *  `bloom_layer(0, {intensity: 0.8})` is a one-parameter edit. With no
+     *  `spec` at all it reads without writing. It returns the layer **as it now
+     *  stands**, so the return value shows what the clamps did.
+     *
+     *  Each layer extracts from the HDR target itself rather than from the layer
+     *  above it, which is what makes a per-layer `threshold` mean the same thing
+     *  in all three: in a downsample chain, layer 2 would be thresholding layer
+     *  1's output.
+     *
+     *      render.bloom = true;
+     *      render.bloom_layer(0, {threshold: 1.0, intensity: 0.6});
+     *      render.bloom_layer(2, {blend: "off"});
+     *      render.bloom_layer(1).radius;   // reads, writes nothing
+     *
+     *  @throws if `index` is not 0, 1 or 2, or if `blend` is not one of the four
+     *  names - a typo behaving as `off` would read as "bloom does nothing on
+     *  this machine". */
+    bloom_layer(index: number, spec?: BloomLayerSpec | null): BloomLayer;
+
+    /** The three layers, the size each is running at, the sigma each radius
+     *  works out to in that layer's own texels, and whether the pass is doing
+     *  anything at all.
+     *
+     *  A string, because the interesting part is what a caller cannot compute
+     *  from the knobs: the layer extents, whether a kernel hit its tap cap, and
+     *  which of "off", "the pass did not build on this device" and "inert - it
+     *  needs {@link hdr}" is the case. */
+    readonly bloom_layers: string;
+
     /** Every deliberate departure from D3D8, switched together.
      *
      *  `true` is the setup a fidelity comparison against
-     *  `GKPLUS_RENDERER=d3d8` needs, in one write rather than eleven - which is
+     *  `GKPLUS_RENDERER=d3d8` needs, in one write rather than twelve - which is
      *  the whole point, because the comparison worth making is on a *paused*
-     *  frame and eleven writes is eleven frames of drift on anything that
+     *  frame and twelve writes is twelve frames of drift on anything that
      *  moves.
      *
      *  The set is exactly what each knob already documents as "off is the build
      *  before it existed": `per_pixel_lighting`, `map_lighting`,
      *  `lighting_maps`, the four shadow systems the game never had
      *  (`sun_shadows`, `map_shadows`, `dynamic_shadows`, `local_shadows`), and
-     *  `ao`, `tessellation`, `msaa` and `hdr` - the last four off by default
-     *  already, and here so a session that turned them on is not one this lies
-     *  about. `hdr`'s own sub-knobs (`linear_input`, `tonemap`, `exposure`,
-     *  `tonemap_knee`, `tonemap_white`) are deliberately **not** in the set:
-     *  with `hdr` off none of them does anything, and an operator the user
-     *  chose has no business being part of what "the stock look" means.
+     *  `ao`, `tessellation`, `msaa`, `hdr` and `bloom` - the last five off by
+     *  default already, and here so a session that turned them on is not one
+     *  this lies about. `hdr`'s own sub-knobs (`linear_input`, `tonemap`,
+     *  `exposure`, `tonemap_knee`, `tonemap_white`) are deliberately **not** in
+     *  the set: with `hdr` off none of them does anything, and an operator the
+     *  user chose has no business being part of what "the stock look" means.
+     *  The bloom layers are out for the same reason one level down - `bloom` is
+     *  in the set because the original could not do it at all, and the fifteen
+     *  numbers under it only describe how it looks.
      *
      *  The fidelity knobs are **not** in it - `half_pixel`, `rhw_depth_raw`,
      *  `viewport_rect`, `shade_mode`, `local_lights`, `map_light_cull`. For
@@ -2903,12 +3015,12 @@ declare module "gk" {
      *  real one.
      *
      *  **`false` restores the session, not the defaults.** Switching to stock
-     *  snapshots the eleven first, so a `local_shadows` that was off before
-     *  returns to off. Only those eleven switches move - `shadow_bias`,
+     *  snapshots the twelve first, so a `local_shadows` that was off before
+     *  returns to off. Only those twelve switches move - `shadow_bias`,
      *  `map_light_gain`, `bump_scale` and every other parameter under them
      *  survive the round trip untouched.
      *
-     *  Reads back derived: `true` only while all eleven are configured off, so
+     *  Reads back derived: `true` only while all twelve are configured off, so
      *  turning one back on by hand makes this read `false` rather than leaving
      *  a mode flag that disagrees with the frame.
      *  `GKPLUS_VK_STOCK=1` is the launch-time form. */

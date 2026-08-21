@@ -93,6 +93,13 @@ ENTRY_POINTS = [
     # build and this one still has to run, so borrowing its module would couple the two.
     ("tonemap.slang", "tonemap_fullscreen_vertex", "vertex"),
     ("tonemap.slang", "tonemap_fragment", "fragment"),
+    # Bloom (4.99). Three entry points for two passes: the extract downsamples and thresholds the
+    # float target, and the blur runs over one axis at a time - the same fragment for both, since the
+    # axis is a push constant. The composite is not here at all; it is in tonemap.slang, which is
+    # already reading that target.
+    ("bloom.slang", "bloom_fullscreen_vertex", "vertex"),
+    ("bloom.slang", "bloom_extract_fragment", "fragment"),
+    ("bloom.slang", "bloom_blur_fragment", "fragment"),
 ]
 
 SLANGC_ARGS = [

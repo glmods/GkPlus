@@ -5,10 +5,33 @@
 // there is not a lazy default - the original's windowed stretch preserves a 4-bit texture's
 // sixteen distinct values, so D3D drops columns rather than mixing them. This pass has to do that
 // same scale, so it does it the same way rather than approximately: `Load` at
-// `floor((dst + 0.5) * src / dst)`, which is what the spec says nearest blitting resolves to. No
-// sampler is involved, which is also why this pass needs nothing from the sampler array.
+// `floor((dst + 0.5) * src / dst)`, which is what the spec says nearest blitting resolves to. The
+// source is therefore never filtered; the only filtered fetches in this file are the bloom layers,
+// which are smaller than the frame and have to be.
 //
-// Everything else it does is per pixel and in that order: exposure, the operator, the sRGB encode.
+// Everything else it does is per pixel and in that order: the bloom composite, exposure, the
+// operator, the sRGB encode.
+
+// How many layers, and it is the shape of the feature rather than a tuning value: three is what
+// covers a tight halo, a mid-range glow and a wide bloom in one frame. Checked against the C++
+// `kBloomLayers` by src/gen-shader-abi.py.
+static const uint kBloomLayers = 3;
+
+// The blend modes, checked against C++ the same way. Each one is a different answer to "what does
+// added light do to a pixel that is already bright", and all three are meaningful in unbounded
+// linear light - which rules out most of the Photoshop list, since those are defined on [0,1].
+//
+//   off     the layer is skipped entirely, here and in RecordBloom
+//   add     `c + b`. What a lens actually does: light lands on top of light.
+//   screen  `c + b * max(1 - c, 0)`. Identical to the classic `1 - (1 - c)(1 - b)` wherever the
+//           base is in [0,1], and well-behaved above it, where the classic form starts *reducing*
+//           the result. Bloom fills in what is not already lit and leaves a blown highlight alone.
+//   max     `max(c, b)`. No accumulation at all - a halo that reaches a given brightness and stops,
+//           which is the one of the three that cannot make a bright area brighter.
+static const uint kBloomBlendOff = 0;
+static const uint kBloomBlendAdd = 1;
+static const uint kBloomBlendScreen = 2;
+static const uint kBloomBlendMax = 3;
 
 // Must match `TonemapPushConstants` in src/VkDraw.cpp - and every field is a 4-byte scalar on
 // purpose, so the scalar and std430 layouts agree and src/gen-shader-abi.py can check the pair.
@@ -31,6 +54,25 @@ struct TonemapPush {
     float knee;
     // What `reinhard` maps to exactly 1.0.
     float white;
+
+    // --- bloom (src/shaders/bloom.slang) ------------------------------------------------------
+    //
+    // The three layers are composited here rather than in a pass of their own, for the reason
+    // bloom.slang gives: this pass already reads the HDR target at full resolution and writes the
+    // LDR one, so a fourth full-screen pass would buy nothing. It happens **before `exposure` and
+    // before the operator**, which is where added light belongs - bloom is light reaching the
+    // sensor, so the sensor's response applies to it too.
+    //
+    // A layer whose blend is `kBloomBlendOff` is skipped, and `RecordBloom` skips its two passes as
+    // well, so an off layer costs one not-taken branch here and nothing at all upstream. The
+    // texture index is still valid in that case: the images exist for the life of the target.
+    uint bloom_texture[kBloomLayers];
+    uint bloom_blend[kBloomLayers];
+    float bloom_intensity[kBloomLayers];
+    // The layers are lower-resolution than this pass's output, so unlike the source they are
+    // *sampled* rather than loaded - a point fetch of a 60-line image stretched over the frame is
+    // visibly blocky, and a smooth glow is the entire point of the effect.
+    uint bloom_sampler;
 };
 
 // The buffer holds LINEAR light and the swapchain wants sRGB, so encode on the way out. Off when
@@ -41,9 +83,8 @@ static const uint kEncodeSrgb = 0x1u;
 [[vk::push_constant]]
 ConstantBuffer<TonemapPush> pc;
 
-// The bindless set, exactly as world.slang and ao.slang declare it. The sampler array is declared
-// but unused - the binding numbers have to match the shared layout, and dropping binding 0 would
-// renumber binding 1.
+// The bindless set, exactly as world.slang and ao.slang declare it. Both arrays are used here: the
+// source is `Load`ed out of `textures` and the bloom layers are sampled through `samplers`.
 [[vk::binding(0, 0)]] SamplerState samplers[];
 [[vk::binding(1, 0)]] Texture2D textures[];
 
@@ -167,6 +208,30 @@ float3 agx(float3 c) {
     return pow(max(v, float3(0, 0, 0)), float3(2.2, 2.2, 2.2));
 }
 
+// The three layers, in index order - which matters for `screen` and `max` and does not for `add`.
+// Index order is also scale order (layer 0 is the tightest), so the wide layers see what the tight
+// ones already contributed, which is the way round that keeps a wide `max` from erasing a tight
+// halo.
+float3 apply_bloom(float3 c, float2 uv) {
+    for (uint i = 0u; i < kBloomLayers; ++i) {
+        const uint mode = pc.bloom_blend[i];
+        if (mode == kBloomBlendOff) {
+            continue;
+        }
+        const float3 b =
+            textures[pc.bloom_texture[i]].SampleLevel(samplers[pc.bloom_sampler], uv, 0.0).rgb *
+            pc.bloom_intensity[i];
+        if (mode == kBloomBlendScreen) {
+            c = c + b * max(1.0 - c, float3(0, 0, 0));
+        } else if (mode == kBloomBlendMax) {
+            c = max(c, b);
+        } else {
+            c = c + b;
+        }
+    }
+    return c;
+}
+
 float3 apply_operator(float3 c) {
     switch (pc.op) {
     case 1u: return rolloff(c, pc.knee);
@@ -200,7 +265,13 @@ float4 tonemap_fragment(float4 position: SV_Position) : SV_Target {
                                  float2(float(pc.source_width - 1u), float(pc.source_height - 1u))));
 
     const float4 texel = textures[pc.source_texture].Load(int3(source, 0));
-    float3 colour = apply_operator(texel.rgb * pc.exposure);
+    // The bloom layers cover the same scene as the source, so their uv is this pixel's position in
+    // the DESTINATION - which is the same normalised coordinate whether or not the two extents
+    // match, and therefore does not repeat the nearest-blit mapping above.
+    float3 colour =
+        apply_bloom(texel.rgb, position.xy / float2(float(max(pc.dest_width, 1u)),
+                                                    float(max(pc.dest_height, 1u))));
+    colour = apply_operator(colour * pc.exposure);
     if ((pc.flags & kEncodeSrgb) != 0u) {
         colour = srgb_encode(colour);
     }

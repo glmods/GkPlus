@@ -653,7 +653,7 @@ still shipped in SysWOW64.
 
 **The 0.13/255 is a reproduction claim, and it is not how a new feature is judged.** Everything
 below this paragraph - the shadow systems, per-pixel lighting, lighting maps, AO, tessellation,
-MSAA, HDR - exists to make the game look *different from* the original, so a residual against the
+MSAA, HDR, bloom - exists to make the game look *different from* the original, so a residual against the
 baseline says how far it reaches and never whether it is any good. A change that made the game
 uglier would produce the same number, or a bigger one. Keep quoting residuals for the *fidelity*
 work, where matching D3D8 is the goal and smaller really is better; for a departure, quote it as
@@ -710,6 +710,33 @@ of clipping, the tonemap gets a real over-range, and an opaque draw is bit-exact
 2D layers are drawn after the tonemap and nothing re-encodes them; that cost a 44%-dark HUD once,
 and the standing check is the in-level HUD panel with `render.hdr` off vs on, which passes at
 0.027 MAD.
+
+It also does **bloom, in three independent layers** (`render.bloom`, off by default, plus
+`render.bloom_layer(index, spec)` for each layer's `threshold`, `knee`, `radius`, `intensity` and
+`blend` — `off`/`add`/`screen`/`max`). §4.99. **It requires `render.hdr` structurally rather than by
+policy**: a threshold is a statement about light and every value in an 8-bit target was already
+clamped to 1, so the only thing left to select on there is albedo — which is exactly the 2003 bloom
+everybody remembers. With the float target a threshold at 1.0 selects precisely what the 8-bit
+pipeline could not hold, and in this game that is the additive fires, the flares and whatever a
+`diffuse 4.0` light lands on. Four of its decisions are measurements or arguments rather than taste.
+**Each layer extracts from the float target itself** and not from a downsample chain, which is what
+most engines ship and is incompatible with a per-layer threshold — in a chain, layer 2 thresholds
+layer 1's *output*. **A layer's resolution is a fixed line count** (240/120/60), not a fraction of
+the frame, which is `ao_screen_radius`'s rule one level on: it is what makes `radius`, a fraction of
+the frame *height*, mean the same at 640x480 and at 3072x1728. **The extract's box tap count follows
+the downsample ratio**, because a single bilinear tap over a 7.2-texel footprint presents as bright
+pixels flickering rather than as aliasing. And **the composite is inside the tonemap pass, before
+exposure and the operator** — bloom is light reaching the sensor, so the sensor's response applies to
+it — which costs no extra pass, no extra full-resolution image, and inherits §4.92's split for free,
+so no glow reaches the menus, the HUD or the briefing screens. `off -> on -> off` is bit-identical by
+construction: with the knob off nothing is recorded and every blend word is `off`, so the composite
+loop takes no fetch, and it measures at the noise floor. **Measure it at level02's fire camera, not
+at the settled start** — the defaults reach 0.56% of the settled frame because that frame has almost
+no over-range in it, which reads as the feature being inert. Two things there will waste a run:
+unpaused, the animating fires put the noise floor at MAD 5.44 over 26% of the frame, and the blinking
+`ACTIVE PAUSE` text at the bottom left accounts for **every** difference over 16 levels in every pair
+— including two that should be identical. Masked and paused, the numbers are in §4.99, and the one
+worth re-running after any change here is that the **HUD panel's interior is max 0**.
 
 It also draws **ambient occlusion with no blur pass** (`render.ao`, off by default): the sample
 offsets are generated in 2D from one fixed lattice disc shared by every pixel and the 3D position of
