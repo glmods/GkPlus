@@ -79,6 +79,20 @@ struct LightingMapParams {
   // normal, which is exact only where the material's ambient and diffuse colours agree; see
   // world.slang.
   float bump_diffuse = 1.0f;
+  // How far the ratio above may carry a pixel from the colour the game lit it with, as a factor
+  // either way: the ratio is clamped to `[1 / limit, limit]`.
+  //
+  // **4 is where the ceiling always was, and the floor is what this adds.** An unbounded ratio
+  // brightens a pixel the geometric normal leaves unlit by however much the bumped one catches,
+  // which is what the 4x cap was for; unbounded the other way it reaches **0**, and 0 is not a
+  // dark surface but a black one. A near-vertical surface sits near the terminator of an overhead
+  // light, so at `bump_scale 1` the tilt takes the bumped lambert to exactly zero over the whole
+  // of it - measured on Gunlok's face at the start of level02, which went black at any
+  // `bump_diffuse` near 1. What the ratio scales is the entire colour the game lit the fragment
+  // with, so 0 also deletes the ambient term, the emissive and the baked `SHPVTINT` the bump has
+  // no claim on. Lower it towards 1 for a gentler map; 1 turns the diffuse half off and leaves
+  // the highlight.
+  float bump_diffuse_limit = 4.0f;
   // A global multiplier on the added highlight.
   //
   // **0.25 and not 1.0, and the number comes from the game.** Gunlok over-drives its lights:

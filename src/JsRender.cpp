@@ -521,7 +521,7 @@ JSValue GetLightingMapReport(JSContext *ctx, JSValueConst) {
   return JS_NewStringLen(ctx, text.data(), text.size());
 }
 
-// The five knobs, each a plain float on LightingMapParams. Separate accessors rather than one
+// The knobs, each a plain float on LightingMapParams. Separate accessors rather than one
 // object so each can be swept from the REPL with `render.bump_scale = x` on a paused frame, which
 // is the only comparison here with a noise floor worth having.
 #define GK_LIGHTING_KNOB(name)                                                                  \
@@ -539,6 +539,7 @@ JSValue GetLightingMapReport(JSContext *ctx, JSValueConst) {
 
 GK_LIGHTING_KNOB(bump_scale)
 GK_LIGHTING_KNOB(bump_diffuse)
+GK_LIGHTING_KNOB(bump_diffuse_limit)
 GK_LIGHTING_KNOB(specular_scale)
 GK_LIGHTING_KNOB(specular_from_diffuse)
 GK_LIGHTING_KNOB(gloss_min)
@@ -1907,6 +1908,8 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("lighting_map_report", GetLightingMapReport, nullptr),
     JS_CGETSET_DEF("bump_scale", Getbump_scale, Setbump_scaleValue),
     JS_CGETSET_DEF("bump_diffuse", Getbump_diffuse, Setbump_diffuseValue),
+    JS_CGETSET_DEF("bump_diffuse_limit", Getbump_diffuse_limit,
+                   Setbump_diffuse_limitValue),
     JS_CGETSET_DEF("specular_scale", Getspecular_scale, Setspecular_scaleValue),
     JS_CGETSET_DEF("specular_from_diffuse", Getspecular_from_diffuse,
                    Setspecular_from_diffuseValue),

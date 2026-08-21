@@ -218,12 +218,18 @@ struct GpuFrameData {
     // with a pinned `offsetof` in src/VkDraw.h is above here, and the end is the only place a
     // field can go without moving one of them.
     uint colour_flags;
-    // **Three words of padding and not one**, and it is the same constraint the tessellation block
+    // How far the lighting map's diffuse ratio may carry a pixel from the colour the game lit it
+    // (§4.98): the ratio is clamped to `[1 / limit, limit]`, so 4 lets a bump brighten or darken a
+    // surface fourfold and 1 turns the diffuse half off without touching the highlight.
+    // **This was one of the three `pad_colour` words**, so it costs no size change and every
+    // pinned offset in src/VkDraw.h stays where it is.
+    float bump_diffuse_limit;
+    // **Two words of padding and not one**, and it is the same constraint the tessellation block
     // above records: `cascades` is a `float4[]`, so std430 aligns the whole struct to 16 while the
     // scalar rule aligns it to 8, and the two only agree on a size that is a multiple of 16.
     // `src/gen-shader-abi.py` refuses a struct whose two layouts disagree, which is what caught
     // this rather than a wrong picture later.
-    uint pad_colour[3];
+    uint pad_colour[2];
 };
 
 // **56 bytes of a guaranteed 128.** It reached exactly 128 with the light grid (§4.56), and
@@ -1435,6 +1441,14 @@ Stage stage_at(GpuMaterial m, uint index) {
     return s;
 }
 
+// The floor on both halves of the lighting map's diffuse ratio, in the light sum's own units
+// (§4.98). Its job is that `0 / 0` is 1 rather than 0 - any positive value does that - and the
+// magnitude only decides how far into the near-dark band the ratio is softened before
+// `bump_diffuse_limit` clamps it. 0.05 is well under a twentieth of what level02's key light
+// contributes at normal incidence (`diffuse 4.0`, and `k` near 1 in its own room), so it cancels
+// wherever the dynamic lights are what is lighting a surface.
+static const float kBumpRatioFloor = 0.05;
+
 // --- lighting maps ----------------------------------------------------------------------------
 //
 // What a `<texture> lighting.dds` beside a `.RIM` adds, and the one thing in this shader the game
@@ -1592,12 +1606,35 @@ LightingMapShade shade_lighting_map(GpuMaterial material, GpuDrawRecord draw, fl
     }
 
     out.specular = specular_sum * metallic * pc.frame[0].specular_scale;
-    // Clamped to 4x: where the geometric normal faces away from every light the denominator is
-    // just the ambient term, and an unbounded ratio would make a bumped pixel there many times
-    // brighter than anything around it.
-    const float3 ratio = clamp((ambient_sum + diffuse_bumped) /
-                                   max(ambient_sum + diffuse_flat, float3(1e-3, 1e-3, 1e-3)),
-                               float3(0, 0, 0), float3(4, 4, 4));
+    // The diffuse ratio, and both of its ends are load-bearing (§4.98).
+    //
+    // **The floor term is on BOTH halves, so a fragment no light reaches is INERT and not black.**
+    // This function's header says the ambient term keeps a surface facing away from every light
+    // from dividing by nothing, and it does - but the same term is in the numerator, so where the
+    // ambient really is zero, which §4.55 records as the usual case in this game, the pair was
+    // `0 / 1e-3` and the scale came out **0**. Every surface outside every light's reach was
+    // therefore painted black by a feature that had nothing to say about it. `kBumpRatioFloor`
+    // added to both halves makes that case exactly 1, and it cancels wherever there is real light
+    // to divide - it is a conditioning term, not a look parameter, which is why it is a constant
+    // here and `bump_diffuse_limit` is the knob.
+    //
+    // **Clamped both ways.** The ceiling was already here: where the geometric normal faces away
+    // from every light, an unbounded ratio would make a bumped pixel many times brighter than
+    // anything around it. The floor is that same argument's other half, and it was missing. A
+    // near-vertical surface sits near the terminator of an overhead light, so `bump_scale 1`'s
+    // 26-degree tilt takes `lambert_bumped` to exactly zero across the whole of it while the
+    // geometric normal still faces the light - and a *ratio* of zero is a black surface rather
+    // than a dark one. What the scale multiplies is the whole colour the game lit this fragment
+    // with, ambient, emissive and a baked `SHPVTINT` alike, and none of those is a term a height
+    // field is entitled to delete: this is a bump shaping a lit surface, not a visibility test. It
+    // may deepen a crevice; it may not put a hole in one.
+    const float3 floor_term = float3(kBumpRatioFloor, kBumpRatioFloor, kBumpRatioFloor);
+    const float limit = max(pc.frame[0].bump_diffuse_limit, 1.0);
+    const float3 ratio = clamp((ambient_sum + diffuse_bumped + floor_term) /
+                                   max(ambient_sum + diffuse_flat + floor_term,
+                                       float3(1e-3, 1e-3, 1e-3)),
+                               float3(1.0 / limit, 1.0 / limit, 1.0 / limit),
+                               float3(limit, limit, limit));
     out.diffuse_scale = lerp(float3(1, 1, 1), ratio, saturate(pc.frame[0].bump_diffuse));
     return out;
 }

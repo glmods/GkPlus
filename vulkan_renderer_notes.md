@@ -9772,3 +9772,99 @@ still brighter than stock - 46.5 mean against 35.0 at the fire camera. That is `
 the fixed function's D3DCOLOR clamp, which is deliberate and is where the over-range comes from,
 and `linear_input` accounts for barely any of it (10.5 MAD with it off, 11.5 with it on).
 `render.exposure` is the rebalance.
+
+## 4.98 The lighting map's diffuse ratio reached zero, and zero is black rather than dark
+
+A play report, and a specific one: with a lighting map loaded, **`bump_diffuse` anywhere near 1
+turned Gunlok's face and every other near-vertical surface completely black at the start of
+level02**. At 0 the same frame is correct, which places it entirely in
+`shade_lighting_map`'s diffuse half.
+
+That half is a *ratio* rather than a re-lighting, for the reason §4.48 gives: the fragment does not
+know which colour `D3DRS_DIFFUSEMATERIALSOURCE` selected, so the map returns the same light sum
+taken with the bumped normal over the same sum taken with the geometric one, and the unknown
+material colour cancels. `diffuse_scale` then multiplies whatever the game lit the fragment with.
+It was
+
+    ratio = clamp((ambient + diffuse_bumped) / max(ambient + diffuse_flat, 1e-3), 0, 4)
+
+and both of the failures below are in that line rather than in the normal it is fed.
+
+**Failure one: `0 / 0` came out 0, not 1.** The comment on the function says the ambient term is in
+both halves "to keep a surface facing away from every light from dividing by nothing", and it does
+stop the division - but it is in the *numerator* too, so where the ambient is genuinely zero the
+whole expression is `0 / 1e-3` and the scale is **0**. Zero ambient is not a corner case here:
+§4.55 already records that this game's ambient "is usually zero", which is why the occlusion work
+had to scale the direct terms to be visible at all. So every fragment outside every light's reach -
+`light_geometry` culls on range and cone, never on facing, so an away-facing surface reaches the
+sum and contributes `max(0, N.L) = 0` to both halves - was multiplied by zero by a feature that had
+nothing to say about it. Under `per_pixel_lighting = 0` the colour being zeroed is the object's own
+`SHPVTINT` bake, which is bright there.
+
+**Failure two: the clamp had a ceiling and no floor.** `[0, 4]` caps the brightening at 4x - the
+comment explains why, and it is the right instinct - while leaving the darkening unbounded all the
+way to 0. That is what makes the artefact pick out *near-vertical* surfaces specifically. A
+near-vertical surface sits near the terminator of an overhead light, so `lambert_flat` there is
+small but positive (level02's key light at 80 degrees of incidence is `4.0 * 0.17`), and
+`bump_scale 1` tilts the normal by up to 26 degrees - a full-contrast step across one texel, which
+is what the central difference's +-0.5 range means - so `lambert_bumped` goes to **exactly** zero
+across the whole of it. A ratio of zero. On a floor, where `lambert_flat` is near 1, the same tilt
+is a few percent.
+
+### The fix
+
+Both ends of that one line, plus a knob for the second:
+
+- **`kBumpRatioFloor = 0.05` added to both halves.** Any positive value makes `0 / 0` exactly 1;
+  the magnitude only decides how far into the near-dark band the ratio is softened before the clamp
+  takes over. 0.05 is under a twentieth of what level02's key light contributes at normal
+  incidence, so it cancels wherever the dynamic lights are what is lighting the surface. It is a
+  conditioning term and not a look parameter, which is why it stayed a shader constant.
+- **`render.bump_diffuse_limit`, default 4**, clamping the ratio to `[1 / limit, limit]`. The
+  default is exactly the old ceiling, so nothing on the bright side moves; the floor is new. 1
+  turns the diffuse half off and leaves the highlight, which makes it a second A/B for this half
+  alone. It took one of the three `pad_colour` words in `GpuFrameData`, so `sizeof` stays 352 and
+  every pinned `offsetof` in `src/VkDraw.h` is where it was - the same trick `local_shadow_taps`
+  and `pn_max_offset` used, and added to both declarations in one commit per §4.67.
+
+The floor is not a fudge over an otherwise-correct term. What `diffuse_scale` multiplies is the
+*whole* colour the game lit the fragment with - the ambient term, the emissive and the baked vertex
+colour along with the diffuse - while the ratio only ever measured the draw's D3D lights. A height
+field is entitled to shape a lit surface and is not entitled to delete the parts of it that are not
+directional. The limit is where that ends: a bump may deepen a crevice fourfold; it may not put a
+hole in one.
+
+### Verified
+
+Reproduced and fixed on the play report's own frame: level02 from the start under `vulkan` with
+`gkplus-lightmaps` enabled (41 maps, `units/gunlok_mk2_1024` among them), the settled camera, the
+old ratio restored in one build and the new one in another. Both builds report the same camera to
+the digit and the same frame at `bump_diffuse = 0` (0.004 MAD, the animation floor), so the
+comparison below is the knob and nothing else. `lit(>20) -> near-black(<4)` counts pixels the
+diffuse half drove out of the picture:
+
+| `bump_diffuse` 0 -> 1 | MAD | frame differing | lit -> near-black |
+|---|---|---|---|
+| pre-fix | 2.470 | 19.37% | **131,274 px** |
+| fixed | 0.308 | 4.40% | **0 px** |
+
+The mask of those 131,274 pixels is the diagnosis drawn out: the overhanging rock slab at the top
+of the frame, the wall down the left edge, the digger, the crates at the right - **and Gunlok's
+face**, which is a black hole in the pre-fix crop and intact in the post-fix one with the bump
+still visibly shaping his armour. Every patch in it is a near-vertical surface, and the frame mean
+goes 22.49 -> 20.36 pre-fix against 22.49 -> 22.49 after.
+
+Two self-checks passed on the same frame. **`bump_diffuse_limit = 1` is bit-identical to
+`bump_diffuse = 0`** - 0.000 MAD, max difference 0 over the whole frame - which is what the clamp
+collapsing to `[1, 1]` has to mean and is a check the knob is reaching the shader at all. And at
+the fixed build's own settings, `limit = 1e6` against `limit = 4` differs over 0.01% of the frame
+(372 pixels darkened): at this camera it is the **floor term** that rescues the face, not the
+clamp, which is failure one being the one that fired here and failure two being the one waiting for
+a brighter light at a shallower angle.
+
+Also verified: it builds, `src/gen-shader-abi.py` agrees the new field is at offset 340 in both
+declarations, slangc compiles `world.slang`, and both type-checks are clean.
+
+It is a *departure*, so what settles it is the screen rather than the residual (the plan's "What a
+residual can and cannot say"): 0.308 MAD says the diffuse half now reaches 4.4% of the frame, and
+the reason to prefer it is the crop.

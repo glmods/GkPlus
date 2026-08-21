@@ -2984,6 +2984,13 @@ declare module "gk" {
      *  the map only shapes highlights, which leaves a bump invisible wherever
      *  `metallic` is 0; 1 (the default) relights the surface per pixel. */
     bump_diffuse: number;
+    /** How far that ratio may carry a pixel from the colour the game lit it with,
+     *  as a factor either way - the ratio is clamped to `[1 / limit, limit]`. The
+     *  default is **4**, which is where the ceiling always was; the floor is what
+     *  keeps a near-vertical surface near a light's terminator dark rather than
+     *  black, since the ratio also scales the ambient, the emissive and the baked
+     *  vertex colour. Lower it towards 1 for a gentler map. */
+    bump_diffuse_limit: number;
     /** A multiplier on the added highlight. The default is **0.25**, not 1.0,
      *  because Gunlok over-drives its lights - level02's key light is `4.0 4.0
      *  4.0` - so a fully-metallic texel at 1.0 saturates to white. */

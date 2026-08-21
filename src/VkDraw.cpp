@@ -3792,6 +3792,7 @@ void UploadFrameData() {
   const LightingMapParams &lighting = LightingParams();
   frame->bump_scale = lighting.bump_scale;
   frame->bump_diffuse = lighting.bump_diffuse;
+  frame->bump_diffuse_limit = lighting.bump_diffuse_limit;
   frame->specular_scale = lighting.specular_scale;
   frame->gloss_min = lighting.gloss_min;
   frame->gloss_max = lighting.gloss_max;

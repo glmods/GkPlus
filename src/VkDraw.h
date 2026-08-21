@@ -318,10 +318,14 @@ struct GpuFrameData {
   // below pins a field at or before `split_corners`, and the end is the only place a field can be
   // added without moving one of them.
   uint32_t colour_flags;
-  // Three and not one: `cascades` is a `float4[]`, so std430 aligns this struct to 16 where the
+  // The lighting map's diffuse ratio is clamped to `[1 / limit, limit]` (§4.98). **This was one of
+  // the three `pad_colour` words**, exactly as `local_shadow_taps` was `pad1` and `pn_max_offset`
+  // was `pad_tess`, so it costs no size change and nothing an `offsetof` below pins moves.
+  float bump_diffuse_limit;
+  // Two and not one: `cascades` is a `float4[]`, so std430 aligns this struct to 16 where the
   // scalar rule aligns it to 8, and only a multiple of 16 satisfies both. See the same note in
   // world.slang - `src/gen-shader-abi.py` is what enforces it.
-  uint32_t pad_colour[3];
+  uint32_t pad_colour[2];
 };
 static_assert(sizeof(GpuFrameData) == 352, "the scratch stride is part of the shader ABI");
 static_assert(offsetof(GpuFrameData, cascades) == 176, "std430 puts a float4 array on 16");

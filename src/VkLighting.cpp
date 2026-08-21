@@ -385,10 +385,10 @@ std::string DescribeLightingMaps() {
     out += line;
   };
   add("lighting maps: %s\n", Enabled ? "on" : "OFF (render.lighting_maps = true)");
-  add("  bump_scale %.3f  bump_diffuse %.3f  specular_scale %.3f  gloss %.1f..%.1f  "
-      "specular_from_diffuse %.3f\n",
-      Params.bump_scale, Params.bump_diffuse, Params.specular_scale, Params.gloss_min,
-      Params.gloss_max, Params.specular_from_diffuse);
+  add("  bump_scale %.3f  bump_diffuse %.3f (limit %.2f)  specular_scale %.3f  "
+      "gloss %.1f..%.1f  specular_from_diffuse %.3f\n",
+      Params.bump_scale, Params.bump_diffuse, Params.bump_diffuse_limit, Params.specular_scale,
+      Params.gloss_min, Params.gloss_max, Params.specular_from_diffuse);
   add("  chrome_scale %.3f  chrome_blur %.1f  chrome_texgen %s  (%zu slot%s hold "
       "units\\reflect.rim)\n",
       Params.chrome_scale, Params.chrome_blur, Params.chrome_texgen ? "on" : "off",

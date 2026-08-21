@@ -310,6 +310,10 @@ export function draw_render_panel(ImGui) {
     slider(ImGui, "bump_diffuse", "bump_diffuse", 0, 1,
       "A bump that only shapes highlights is invisible wherever metallic is 0, " +
         "which is why the derived normal reaches the diffuse too.", "%.2f");
+    slider(ImGui, "bump_diffuse_limit", "bump_diffuse_limit", 1, 8,
+      "How far the diffuse ratio may carry a pixel either way. 4 is the old " +
+        "ceiling; the floor stops a surface near a light's terminator going black.",
+      "%.2f");
     slider(ImGui, "specular_scale", "specular_scale", 0, 1,
       "0.25 because level02's key light is diffuse 4.0 and 1.0 saturates a floor to white.",
       "%.2f");
