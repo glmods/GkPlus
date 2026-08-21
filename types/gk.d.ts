@@ -334,7 +334,7 @@ declare module "gk" {
     clear_target(): void;
     /** Moves the actor to another team. Read the current one with `actor.team`.
      *
-     *  Goes through `ChangeOwnerAndTeam` (slot 80) rather than the raw
+     *  Goes through `BeginTeamOverride` (slot 80, formerly `ChangeOwnerAndTeam`) rather than the raw
      *  `SetTeamId`, which fixes two things at once: the raw setter writes the
      *  field and nothing else, leaving the actor on its **old team's actor
      *  list**, and it broadcasts nothing. Slot 80 does the list move and sends
