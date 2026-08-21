@@ -2806,9 +2806,25 @@ declare module "gk" {
      *  pass. */
     linear_input: boolean;
 
-    /** The tonemap operator: `"clamp"`, `"rolloff"`, `"reinhard"` or `"aces"`.
-     *  Anything else throws rather than falling back, because a typo behaving
-     *  as `clamp` would read as "HDR does nothing on this machine".
+    /** The tonemap operator. Anything not in the union throws rather than
+     *  falling back, because a typo behaving as `clamp` would read as "HDR does
+     *  nothing on this machine".
+     *
+     *  - `clamp` - what the 8-bit target did by itself. The bisect setting.
+     *  - `rolloff` - exactly the identity below {@link tonemap_knee},
+     *    compressing only above it, asymptotic to 1. The default.
+     *  - `reinhard` - extended Reinhard, exactly 1.0 at {@link tonemap_white}.
+     *    Nowhere the identity, so it lifts the whole world image.
+     *  - `aces` - Narkowicz's fit to the ACES filmic curve. A toe and a
+     *    shoulder; contrasty, and it warms saturated highlights.
+     *  - `filmic` - the Uncharted 2 (Hable) curve, normalised so
+     *    {@link tonemap_white} lands on 1.0. Gentler shoulder than ACES.
+     *  - `agx` - Troy Sobotka's AgX. What it buys over the two curves above is
+     *    **hue stability at the top end**: a bright saturated light desaturates
+     *    towards white instead of clipping one channel at a time and sliding
+     *    towards a primary. It reads neither {@link tonemap_knee} nor
+     *    {@link tonemap_white} - its range is fixed by its own log window, so
+     *    {@link exposure} is its only control.
      *
      *  **Every operator is safe for the 2D half of the game.** The menus, the
      *  briefing and debrief screens, the HUD, the inventory and the upgrade
@@ -2823,7 +2839,7 @@ declare module "gk" {
      *
      *  `clamp` is what the 8-bit target did by itself; with `linear_input` off
      *  it makes the pass a reproduction of the blit it replaced. */
-    tonemap: "clamp" | "rolloff" | "reinhard" | "aces";
+    tonemap: "clamp" | "rolloff" | "reinhard" | "aces" | "filmic" | "agx";
 
     /** A linear multiplier applied **before** the operator, which is the only
      *  place it can go - after it, it would brighten an already-compressed
@@ -2831,14 +2847,16 @@ declare module "gk" {
     exposure: number;
 
     /** Where `rolloff` stops being the identity, 0.75 by default. Read by that
-     *  operator alone. Below it the curve is exactly `y = x`; above it the
+     *  operator alone (`agx` reads no parameter but {@link exposure}). Below it the curve is exactly `y = x`; above it the
      *  remaining headroom is compressed with a C1 join, asymptotic to 1, so no
      *  finite input ever clips and there is no crease at the knee. */
     tonemap_knee: number;
 
-    /** What `reinhard` maps to exactly 1.0, 4.0 by default - the magnitude of
-     *  the over-range that actually reaches the pass in this game. Read by that
-     *  operator alone. */
+    /** The linear value that maps to exactly 1.0, 4.0 by default - the
+     *  magnitude of the over-range that actually reaches the pass in this game.
+     *  Read by `reinhard` and by `filmic`, which mean the same thing by it.
+     *  Hable's own default for the latter is 11.2, which belongs to a different
+     *  exposure convention. */
     tonemap_white: number;
 
     /** Every deliberate departure from D3D8, switched together.

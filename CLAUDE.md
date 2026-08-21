@@ -687,7 +687,12 @@ before the split ACES recoloured 99.61% of it. The classifier is the engine's ow
 `CurrentCameraIsPerspective`, because `InitRenderCameras` makes every camera orthographic except
 `Camera_World` and the sky camera; **`depth_clamp` is not it** (that is `FVF & XYZRHW`, true of 2
 of level02's 268 draws) and neither is a depth-slice threshold (one orthographic camera runs
-0.06..0.30 and overlaps the world's 0.10..1.00). And the decode is **albedo only** - textures and
+0.06..0.30 and overlaps the world's 0.10..1.00). That is also what makes the film curves usable at
+all: `render.tonemap` takes six operators (`clamp`, `rolloff`, `reinhard`, `aces`, `filmic`, `agx`
+- §4.93), and **`agx` is the one suited to this game's content**, because it keeps hue at the top
+end where ACES turns a `diffuse 4.0` light on a red surface orange. Its matrices are written as
+**rows**, the transpose of every GLSL copy of those numbers, and the check that catches a wrong
+transpose is that each row sums to 1. And the decode is **albedo only** - textures and
 unpacked D3DCOLOR vertex colours, never light or material colours, which are intensities rather
 than pictures and several of which exceed 1. It reaches 83% of level02
 at 9.56/255 - coverage, not a score - and what that reach *is* on screen is shadow detail rather

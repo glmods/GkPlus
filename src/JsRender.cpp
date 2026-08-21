@@ -764,6 +764,8 @@ const char *TonemapName(uint32_t op) {
   case 1: return "rolloff";
   case 2: return "reinhard";
   case 3: return "aces";
+  case 4: return "filmic";
+  case 5: return "agx";
   default: return "clamp";
   }
 }
@@ -790,8 +792,13 @@ JSValue SetTonemapValue(JSContext *ctx, JSValueConst, JSValueConst value) {
     vulkan::SetTonemap(2);
   } else if (text == "aces") {
     vulkan::SetTonemap(3);
+  } else if (text == "filmic") {
+    vulkan::SetTonemap(4);
+  } else if (text == "agx") {
+    vulkan::SetTonemap(5);
   } else {
-    return JS_ThrowTypeError(ctx, "render.tonemap must be clamp, rolloff, reinhard or aces");
+    return JS_ThrowTypeError(
+        ctx, "render.tonemap must be clamp, rolloff, reinhard, aces, filmic or agx");
   }
   return JS_UNDEFINED;
 }

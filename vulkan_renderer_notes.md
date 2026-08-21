@@ -9329,3 +9329,71 @@ default because it is the conservative choice for a game whose content is almost
 is the identity below the knee, so it only ever touches what actually exceeds it - but it is now a
 taste, not a guard. **ACES and Reinhard are usable looks** rather than things that wreck the front
 end, which is what they were when that section was written.
+
+## 4.93 Two more operators: Hable's filmic curve and AgX
+
+Cheap to add now that §4.92 has taken the 2D layers out of the pipeline - before that, every
+operator with a toe was a trap rather than a choice. `render.tonemap` takes six names:
+
+| name | what it is | reads |
+|---|---|---|
+| `clamp` | what the 8-bit target did by itself; the bisect setting | - |
+| `rolloff` | identity below the knee, compressing above it, asymptotic to 1. The default | `tonemap_knee` |
+| `reinhard` | extended Reinhard, exactly 1.0 at the white point | `tonemap_white` |
+| `aces` | Narkowicz's fit to the ACES filmic curve | - |
+| `filmic` | the Uncharted 2 (Hable) curve, normalised so the white point lands on 1.0 | `tonemap_white` |
+| `agx` | Troy Sobotka's AgX | **nothing but `exposure`** |
+
+**`filmic` and `reinhard` share `tonemap_white` because they mean the same thing by it** - the
+linear value that maps to exactly 1.0 - so the knob keeps one meaning rather than acquiring a
+second. Hable's own default is 11.2, which belongs to a different exposure convention; 4.0 is this
+game's over-range and is what both start at.
+
+**AgX reads no parameter at all beyond exposure**, and that is the operator's design rather than a
+gap in this implementation: its range is fixed by a log window of -12.47 to +4.03 EV around mid
+grey, and moving the image within that window is exactly what exposure does. What it buys over the
+two curves above is **hue stability at the top end** - a bright saturated light desaturates towards
+white the way film does, instead of clipping one channel at a time and sliding towards whichever
+primary survives longest. That is the failure mode this game has most of, since a `diffuse 4.0`
+light on a red surface goes orange under ACES.
+
+### The one thing in it that is easy to get wrong silently
+
+**The AgX matrices are written as ROWS here, which is the transpose of how every GLSL copy of those
+numbers reads.** A GLSL `mat3(...)` constructor is column-major and `m * v` treats `v` as a column;
+Slang's `float3x3(a, b, c)` takes rows and `mul(m, v)` does the same product. Transposing an inset
+matrix does not produce anything obviously broken - it is still a plausible colour transform, just
+the wrong one - so the check that settles it is that **each row must sum to 1**, which is what makes
+the inset preserve white. Both matrices do, to five decimal places; the columns as listed in the
+GLSL sources do not (0.927 for the first).
+
+Two smaller ones. `log2(0)` is `-inf` and an inf through the sigmoid comes out as a NaN pixel rather
+than as black, so the input is clamped to 1e-10 first. And AgX's sigmoid output is
+**display-referred**, so it is raised to 2.2 on the way out - everything else in `tonemap.slang`
+hands `srgb_encode` a linear value and this has to as well, or the frame is encoded twice. A 2.2
+power and not the exact sRGB inverse, because that is what the reference uses and the polynomial
+constants were fitted against it.
+
+### What they look like
+
+Four operators on one paused level02 frame, against `hdr = false`. **These are difference figures,
+not scores** - the rule at the top of this file - and all four are meant to change the look, so what
+they say is how far apart the looks are and nothing about which is right. That is a matter for the
+eye, and the frame they were taken on is a dark interior with almost no over-range in it, which is
+the least informative place to judge a tonemap.
+
+| operator | MAD vs off | coverage | mean level |
+|---|---|---|---|
+| `rolloff` | 9.385 | 79.03% | 28.221 |
+| `aces` | 6.981 | 79.49% | 22.829 |
+| `filmic` | 3.780 | 79.18% | 19.645 |
+| `agx` | 9.416 | 79.50% | 26.706 |
+
+Pairwise they are 4.2 to 9.5 MAD apart, so they are genuinely four different looks rather than four
+spellings of one. `filmic` at this white point sits *below* the untonemapped mean, which is Hable's
+toe doing what a toe does; `tonemap_white` is the control if that is not wanted.
+
+**The 2D half is untouched by all of them, which is the §4.92 property holding.** At the main menu
+`filmic` and `agx` produce frames that are **byte-identical to each other** (max channel difference
+0) and both sit at 0.567 MAD against `hdr = false`, under that screen's animation floor of 1.137.
+Validation is clean across all six.

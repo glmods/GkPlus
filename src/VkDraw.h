@@ -1481,8 +1481,12 @@ void SetHdr(bool on);
 bool Hdr();
 void SetLinearInput(bool on);
 bool LinearInput();
-// 0 clamp, 1 rolloff, 2 reinhard, 3 aces. Out of range is stored as asked and behaves as clamp,
-// the same way `SetMsaa` stores a count the device cannot serve.
+// 0 clamp, 1 rolloff, 2 reinhard, 3 aces, 4 filmic (Hable), 5 agx. Out of range is stored as asked
+// and behaves as clamp, the same way `SetMsaa` stores a count the device cannot serve.
+//
+// `tonemap_white` is read by `reinhard` and `filmic`, `tonemap_knee` by `rolloff` alone, and
+// **`agx` reads neither** - its range is fixed by its own log window, so `exposure` is its only
+// control.
 void SetTonemap(uint32_t op);
 uint32_t Tonemap();
 void SetExposure(float value);

@@ -102,8 +102,9 @@ constexpr const char *MsaaEnv = "GKPLUS_VK_MSAA";
 // is harder to find than one that reads as inert.
 constexpr const char *TonemapKey = "core.render.tonemap";
 
-const char *TonemapLabels[] = {"Clamp", "Rolloff", "Reinhard", "ACES"};
-constexpr uint32_t TonemapCount = 4;
+const char *TonemapLabels[] = {"Clamp",  "Rolloff", "Reinhard",
+                               "ACES",   "Filmic",  "AgX"};
+constexpr uint32_t TonemapCount = 6;
 
 void BoolClicked(CustomMenuItem *item, void *user) {
   const BoolRow *row = static_cast<const BoolRow *>(user);

@@ -534,8 +534,13 @@ any of this - it is already its own pass on the swapchain image, downstream of t
    exempt from this as well as from the operator (§4.92).
 3. ~~**Lift the clamps.**~~ **Done** (§4.91). The `saturate`s in `resolve_lit_colour` and the specular, behind the same
    knob, so the authored `diffuse 4.0` survives to the tonemap.
-4. ~~**Exposure and the operator.**~~ **Done** (§4.91). `render.exposure`, `render.tonemap`
-   (`clamp` / `rolloff` / `reinhard` / `aces`), `render.tonemap_knee`.
+4. ~~**Exposure and the operator.**~~ **Done** (§4.91, §4.93). `render.exposure`,
+   `render.tonemap_knee`, `render.tonemap_white`, and `render.tonemap` with six operators:
+   `clamp` / `rolloff` / `reinhard` / `aces` / `filmic` / `agx`. `filmic` is Hable's Uncharted 2
+   curve and shares `tonemap_white` with `reinhard`, both meaning "the linear value that maps to
+   1.0"; **`agx` reads no parameter but `exposure`**, which is its design rather than a gap - its
+   range is a fixed log window. AgX is the one worth reaching for on this game's content: it keeps
+   hue at the top end, where ACES turns a `diffuse 4.0` light on a red surface orange.
 4a. ~~**Keep the 2D layers out of it.**~~ **Done** (§4.92). The frame is three steps under HDR -
    world layer into the float target, tonemap into an LDR target at the render extent, 2D layer on
    top of that - and the existing NEAREST blit still does the scale last, because §4.37 requires 2D

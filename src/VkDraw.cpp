@@ -3095,7 +3095,9 @@ bool HdrEnvRead = false;
 // fixed, so the interesting configuration is the one that fixes it. Off makes `hdr` the
 // extended-range design instead, which is the bisect.
 bool LinearInputEnabled = true;
-// 1 = rolloff. See `apply_operator` in tonemap.slang for why the default is not a film curve.
+// 1 = rolloff. 0 clamp, 2 reinhard, 3 aces, 4 filmic (Hable), 5 agx - see `apply_operator` in
+// tonemap.slang. It is the default as the conservative choice; since §4.92 no operator reaches the
+// 2D layers, so the film curves are looks rather than traps.
 uint32_t TonemapOp = 1;
 float ExposureValue = 1.0f;
 // Where the rolloff stops being the identity. 0.75 leaves three quarters of the range untouched,
@@ -7706,6 +7708,8 @@ std::string FormatDrawStats() {
         TonemapOp == 1   ? "rolloff"
         : TonemapOp == 2 ? "reinhard"
         : TonemapOp == 3 ? "aces"
+        : TonemapOp == 4 ? "filmic"
+        : TonemapOp == 5 ? "agx"
                          : "clamp",
         ExposureValue, TonemapKneeValue, TonemapWhiteValue);
   }

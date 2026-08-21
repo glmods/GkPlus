@@ -95,11 +95,85 @@ float3 aces(float3 c) {
     return saturate((c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14));
 }
 
+// The Uncharted 2 filmic curve (Hable), which is what "Filmic" means in almost every game that
+// offers it. A toe, a linear midsection and a shoulder, from six constants nobody has ever had a
+// reason to change.
+//
+// `white` is the linear value the curve maps to exactly 1.0, so it means the same thing here as it
+// does for `reinhard` and shares `render.tonemap_white`. Hable's own default is 11.2, which
+// belongs to a different exposure convention; this game's over-range is around 4.
+float3 hable_curve(float3 x) {
+    const float A = 0.15, B = 0.50, C = 0.10, D = 0.20, E = 0.02, F = 0.30;
+    return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+}
+
+float3 filmic(float3 c, float white) {
+    const float w = max(white, 1e-3);
+    // Normalised by the curve at the white point, so `white` really does land on 1.0 rather than
+    // wherever the unnormalised curve happens to put it.
+    return saturate(hable_curve(c) / hable_curve(float3(w, w, w)));
+}
+
+// --- AgX ---------------------------------------------------------------------------------------
+//
+// Troy Sobotka's, in the form everyone ships: an inset matrix that desaturates towards the
+// achromatic axis, a log2 encode over a fixed exposure window, a sigmoid, and the inverse matrix.
+// What it buys over the two curves above is **hue stability at the top end** - a bright saturated
+// light desaturates towards white the way film does, instead of clipping one channel at a time and
+// sliding towards whichever primary survives longest. That is the failure mode this game has most
+// of: a `diffuse 4.0` light on a red surface goes orange under ACES and stays red under AgX.
+//
+// It ignores `render.tonemap_white` and `render.tonemap_knee`. Its range is fixed by the log
+// window below, so **`render.exposure` is the only control it answers to** - which is the point of
+// AgX rather than a limitation of this implementation.
+
+// The 6th-order fit to AgX's sigmoid that every shader implementation uses (mean error^2 3.67e-6).
+float3 agx_contrast(float3 x) {
+    const float3 x2 = x * x;
+    const float3 x4 = x2 * x2;
+    return 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 +
+           0.1191 * x - 0.00232;
+}
+
+float3 agx(float3 c) {
+    // **Written as ROWS, which is the transpose of how every GLSL copy of these numbers reads.**
+    // A GLSL `mat3(...)` constructor is column-major and `m * v` treats v as a column; Slang's
+    // `float3x3(a, b, c)` takes rows and `mul(m, v)` does the same product. Getting it the other
+    // way round is not obviously broken on screen - it is still a plausible colour transform - so
+    // the check that matters is that each ROW sums to 1, which is what makes the inset preserve
+    // white. These do, to five decimal places.
+    const float3x3 inset = float3x3(float3(0.842479062253094, 0.0784335999999992, 0.0792237451477643),
+                                    float3(0.0423282422610123, 0.878468636469772, 0.0791661274605434),
+                                    float3(0.0423756549057051, 0.0784336, 0.879142973793104));
+    const float3x3 outset = float3x3(float3(1.19687900512017, -0.0980208811401368, -0.0990297440797205),
+                                     float3(-0.0528968517574562, 1.15190312990417, -0.0980434501171241),
+                                     float3(-0.0529716355144438, -0.0980434501171241, 1.15107367264116));
+    // The log window, in stops either side of mid grey. Fixed, and the reason exposure is AgX's
+    // only knob: everything below -12.47 EV is black and everything above +4.03 EV is white.
+    const float min_ev = -12.47393, max_ev = 4.026069;
+
+    float3 v = mul(inset, max(c, float3(0, 0, 0)));
+    // 1e-10 rather than 0: log2(0) is -inf, and an inf that survives the sigmoid comes out as a
+    // NaN pixel rather than as black.
+    v = clamp(log2(max(v, float3(1e-10, 1e-10, 1e-10))), min_ev, max_ev);
+    v = (v - min_ev) / (max_ev - min_ev);
+    v = agx_contrast(saturate(v));
+    v = mul(outset, v);
+    // **Back to linear, because the sigmoid's output is display-referred.** Everything else in
+    // this file hands `srgb_encode` a linear value and this has to as well, or the frame is
+    // encoded twice. A 2.2 power and not the exact sRGB inverse: that is what the AgX reference
+    // uses, and matching it matters more here than internal consistency with the encode - the
+    // constants above were fitted against it.
+    return pow(max(v, float3(0, 0, 0)), float3(2.2, 2.2, 2.2));
+}
+
 float3 apply_operator(float3 c) {
     switch (pc.op) {
     case 1u: return rolloff(c, pc.knee);
     case 2u: return reinhard(c, pc.white);
     case 3u: return aces(c);
+    case 4u: return filmic(c, pc.white);
+    case 5u: return agx(c);
     // 0, and anything unrecognised: what the 8-bit target did by itself. The bisect setting - with
     // `render.linear_input` off it makes this pass a reproduction of the blit it replaced, so a
     // visible change at this setting is a defect in the pass rather than in the colour work.

@@ -37,9 +37,10 @@ const MSAA_LABELS = ["off", "2x", "4x", "8x"];
 
 /** The operator names, in the order the combo lists them.
  *  Annotated rather than inferred: without it the element type is `string`, and
- *  `render.tonemap` is a union of the four literals - so the assignment below is
- *  exactly what the type check catches. @type {Array<"clamp" | "rolloff" | "reinhard" | "aces">} */
-const TONEMAP_OPS = ["clamp", "rolloff", "reinhard", "aces"];
+ *  `render.tonemap` is a union of the six literals - so the assignment below is
+ *  exactly what the type check catches.
+ *  @type {Array<"clamp" | "rolloff" | "reinhard" | "aces" | "filmic" | "agx">} */
+const TONEMAP_OPS = ["clamp", "rolloff", "reinhard", "aces", "filmic", "agx"];
 
 /** The count asked for while the frame that adopts it has not run yet, or null.
  *  `render.msaa` reads back what is IN FORCE, so a control bound straight to it
