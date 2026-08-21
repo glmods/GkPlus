@@ -484,7 +484,7 @@ three are being crushed today:
 ### The four decisions this rests on
 
 **1. Linear input, not extended-range gamma** - and it has to be *every* colour, not just the
-albedos (§4.94). The cheaper design keeps the numbers exactly as they
+albedos (§4.94), and it has to be per **layer** rather than per frame (§4.95). The cheaper design keeps the numbers exactly as they
 are and only widens the container, so nothing but over-range changes and the off path is
 bit-identical by construction. That is *not* what is being built. Gunlok's textures and vertex
 colours are gamma-encoded, and every multiply and every framebuffer blend in the frame currently

@@ -700,7 +700,18 @@ alone and changes only the sums, which is the whole point. Decoding one lifts a 
 under half light by 44% and under quarter light by 105% - contrast destroyed from the bottom up.
 The albedos are decoded in the shader (per pixel), the light and material colours on the CPU in
 `StoreColour` (per draw and per light); **above 1.0 the decode is the identity**, because sRGB maps
-[0,1] onto [0,1] and extending the formula would turn a `diffuse 4.0` light into 25.3. It reaches 83% of level02
+[0,1] onto [0,1] and extending the formula would turn a `diffuse 4.0` light into 25.3.
+
+**The decode is per LAYER, not per frame** (§4.95, the immediate sequel and a second play report).
+`LinearInputActive()` alone is a statement about the frame; the CPU half has to be
+`LinearInputActive() && !item.ui`, or the 2D layers get decoded colours with nothing to re-encode
+them and the HUD comes out 44% dark. `StoreColour`/`StoreLight` take the flag as a **parameter** so
+no call site can decide for itself, the light-run cache is keyed by the layer as well as the mask,
+and the map rig is uploaded twice. **The standing check is the in-level HUD panel with `render.hdr`
+off vs on** — §4.20 established those panels carry no vertex colour at all, so their colour comes
+entirely from the material through the draw record, which makes them the sharpest probe on any
+change to how it is filled. 0.027 MAD passes. The main-menu test does *not* cover this: the menu
+takes the `kLitCollapse` path, whose colour is computed from `State.material` directly. It reaches 83% of level02
 at 9.56/255 - coverage, not a score - and what that reach *is* on screen is shadow detail rather
 than range: the dark half of the frame becomes legible, the characters get darker because they were
 blowing out, and that frame has almost no over-range in it at all. The fire cameras are where the

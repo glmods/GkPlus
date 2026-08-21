@@ -9451,8 +9451,11 @@ not by what:
   rather than per pixel, so a `pow` in the fragment shader's light loop would be paid eight times
   over for a value that is constant across the draw.
 
-Both halves gate on one thing, `vulkan::LinearInputActive()` - the request AND a float target to
-decode into - and `vulkan::SrgbToLinear` is the one implementation, which must agree with
+Both halves gate on the same condition and `vulkan::SrgbToLinear` is the one implementation.
+**`LinearInputActive()` alone is not that condition, and §4.95 is what it cost**: it is a statement
+about the frame, and the decode is per *layer* - the CPU half is `LinearInputActive() && !item.ui`,
+because the 2D layers are drawn after the tonemap and nothing re-encodes them. The curve must agree
+with
 `srgb_decode` in `world.slang` and be the inverse of `srgb_encode` in `tonemap.slang`. Three copies
 of one curve across three files; a discrepancy shows up as a brightness shift rather than as
 anything obviously wrong.
@@ -9504,3 +9507,77 @@ more** - `clamp` and `rolloff` produce identical output (5.001 vs 4.999 MAD agai
 where before the fix they differed over 0.04% of pixels. The over-range that HDR exists to carry is
 now entirely in the places §4.91 said to look and still has not: the fire cameras, flares, and
 additive effects.
+
+## 4.95 The decode had a second gate, and §4.94 put the 2D layers back through it
+
+Another play report - "this has messed up the 2D elements" - one commit after §4.94, and correct.
+§4.92 exempted the 2D layers from the HDR pipeline; §4.94 moved half the decode to the CPU and did
+not carry the exemption with it.
+
+### Why one gate was not one gate
+
+§4.92's exemption is a **second `GpuFrameData` with `colour_flags` cleared**, which the 2D pass's
+draws point at. That covers everything the *shader* decodes - the albedos - and nothing else.
+§4.94 then decoded the light and material colours on the CPU, in `StoreColour`, gated on
+`vulkan::LinearInputActive()`, which is a statement about the **frame** and knows nothing about
+layers. So a 2D draw got:
+
+- its albedos **not** decoded (frame block says so), and
+- its material and light colours **decoded** (the CPU decided for itself), and
+- **no re-encode at all**, because the 2D pass writes straight into the LDR target.
+
+The damage lands hardest exactly where §4.20 said it would: Gunlok's HUD panels **carry no vertex
+colour at all** (FVF 0x112 and 0x212), so the material is the only thing that colours them. A green
+of 0.75 came out at `decode(0.75) = 0.52`. Measured on level02, the HUD panel crop went from
+0.027 MAD against `hdr = false` to **4.463**, its mean 10.23 to 5.77 - **44% dark**.
+
+### The main-menu test did not catch it, and that is worth knowing
+
+§4.92's acceptance test is that the main menu is byte-identical with HDR on, and it **passed
+throughout** - 0.577 MAD against a 0.554 off-vs-off floor. The menu's draws take the `kLitCollapse`
+path, where the colour is computed on the CPU by `LitVertexColour()`, which reads `State.material`
+**directly** rather than through the record - so it never saw a decoded value. A test that covers
+the front end does not cover the HUD.
+
+**The standing check for this class is the in-level HUD panel, `hdr` off vs on.** It is the one
+element in the game whose colour comes entirely from `material_emissive` and
+`material_ambient * global_ambient` through the draw record, so it is the sharpest available probe
+on any change to how those are filled. 0.027 MAD is the passing value; the residual is the panel's
+own edge pixels sitting over world that legitimately changed.
+
+### The fix
+
+The decode is now per **layer** everywhere, and the way it is enforced is that nothing reads the
+global for itself:
+
+- `StoreColour`, `StorePackedColour` and `StoreLight` take `bool linear` as a **parameter**. There
+  is no `LinearInputActive()` call left inside any of them, so a call site cannot forget to think
+  about which layer it is filling.
+- `BuildDrawRecord` is the one place that decides, because it is the one place with the draw in
+  hand: `const bool linear = vulkan::LinearInputActive() && !item.ui;`. `item.ui` is set by
+  `ResolvePipeline` earlier in the same draw, so it is always available there.
+- **The light-run cache is keyed by the layer as well as the mask.** The same eight lights produce
+  two different runs - decoded for the world, raw for the 2D pass - and `LightRunByMask` would
+  otherwise hand whichever was built first to both. The layer bit goes above the mask's eight.
+- **The map light rig is uploaded twice**, decoded and raw, as one contiguous run of 2N; the 2D
+  layer's frame block points at the raw half. In practice no 2D draw reaches `map_light_sum` - it
+  needs two texture stages and the HUD has one - but "in practice" is what produced this section,
+  and 51 lights is 2.4 KB. The light *grid* is built from the decoded half and holds indices rather
+  than colours, so it is shared.
+
+### What still changes in the 2D layer, and should
+
+Text is alpha-blended, so a glyph over something the tonemap moved moves with it. Split by what is
+behind them, the objectives panel's glyphs measure:
+
+| | pixels | MAD, `hdr` off vs on |
+|---|---|---|
+| glyphs over the panel's own black backdrop | 1,658 | **0.046** |
+| glyphs over the world crate behind the panel | 794 | 16.713 |
+
+The first row is the exemption working. **The second row is not a leak - it is the reason §4.92
+chose a separate pass over a pixel mask.** A translucent 2D element blends against final LDR
+colour, which is what it does on the original; a mask would have frozen the world underneath it
+instead. Both halves of that table are the design behaving.
+
+Validation clean across a sweep of both knobs, both MSAA counts and HDR toggled twice.

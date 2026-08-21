@@ -2421,8 +2421,12 @@ uint32_t LitVertexColour() {
 //
 // Alpha is never decoded - it is coverage, not light - which also keeps `material_specular[3]`
 // safe, since the caller overwrites it with `D3DMATERIAL8::Power` right afterwards.
-void StoreColour(float *out, const D3DCOLORVALUE &colour) {
-  const bool linear = vulkan::LinearInputActive();
+// **`linear` is a parameter and not a read of `vulkan::LinearInputActive()`**, which is the whole
+// correction in §4.95: the decode is per LAYER, not per frame. The 2D layers are drawn after the
+// tonemap and nothing re-encodes them, so decoding their colours leaves the HUD 44% dark - which
+// is what happened when this function decided for itself. Every caller now has to say which layer
+// it is filling, and the only place that knows is `BuildDrawRecord`, which has the draw in hand.
+void StoreColour(float *out, const D3DCOLORVALUE &colour, bool linear) {
   out[0] = linear ? vulkan::SrgbToLinear(colour.r) : colour.r;
   out[1] = linear ? vulkan::SrgbToLinear(colour.g) : colour.g;
   out[2] = linear ? vulkan::SrgbToLinear(colour.b) : colour.b;
@@ -2431,8 +2435,7 @@ void StoreColour(float *out, const D3DCOLORVALUE &colour) {
 
 // A D3DCOLOR as four floats, for D3DRS_AMBIENT - which is a packed colour where every other
 // lighting input is a float quad.
-void StorePackedColour(float *out, uint32_t packed) {
-  const bool linear = vulkan::LinearInputActive();
+void StorePackedColour(float *out, uint32_t packed, bool linear) {
   const auto channel = [linear](uint32_t p, int shift) {
     const float v = static_cast<float>((p >> shift) & 0xff) / 255.0f;
     return linear ? vulkan::SrgbToLinear(v) : v;
@@ -2533,7 +2536,8 @@ uint64_t LightRunGeneration = UINT64_MAX;
 
 // `frame` is only for the shadow-slot key below (§4.65): the stability gate counts frames,
 // and a light enabled on forty draws of one frame has held still for one frame.
-void StoreLight(vulkan::GpuLight &out, const D3DLIGHT8 &light, uint64_t frame) {
+void StoreLight(vulkan::GpuLight &out, const D3DLIGHT8 &light, uint64_t frame,
+                bool linear) {
   out.position[0] = light.Position.x;
   out.position[1] = light.Position.y;
   out.position[2] = light.Position.z;
@@ -2568,9 +2572,9 @@ void StoreLight(vulkan::GpuLight &out, const D3DLIGHT8 &light, uint64_t frame) {
     out.direction[3] = static_cast<float>(vulkan::AcquireLocalShadowSlot(key, frame));
     out.position[3] = static_cast<float>(vulkan::RegisterDynamicShadowLight(key, frame));
   }
-  StoreColour(out.diffuse, light.Diffuse);
-  StoreColour(out.specular, light.Specular);
-  StoreColour(out.ambient, light.Ambient);
+  StoreColour(out.diffuse, light.Diffuse, linear);
+  StoreColour(out.specular, light.Specular, linear);
+  StoreColour(out.ambient, light.Ambient, linear);
   out.attenuation[0] = light.Attenuation0;
   out.attenuation[1] = light.Attenuation1;
   out.attenuation[2] = light.Attenuation2;
@@ -2586,7 +2590,7 @@ void StoreLight(vulkan::GpuLight &out, const D3DLIGHT8 &light, uint64_t frame) {
 // Writes this draw's enabled lights into the frame's array and returns where they landed.
 // `count` comes back 0 when nothing is enabled, which is a legitimate and common state - the
 // draw is then lit by the emissive and global ambient terms alone.
-void ResolveLightRun(uint64_t frame, uint32_t &offset, uint32_t &count) {
+void ResolveLightRun(uint64_t frame, bool linear, uint32_t &offset, uint32_t &count) {
   offset = 0;
   count = 0;
   uint32_t mask = 0;
@@ -2605,7 +2609,11 @@ void ResolveLightRun(uint64_t frame, uint32_t &offset, uint32_t &count) {
     LightRunFrame = frame;
     LightRunGeneration = LightGeneration;
   }
-  const auto found = LightRunByMask.find(mask);
+  // **Keyed by the layer as well as the mask.** The same eight lights produce two different runs
+  // depending on which layer is asking - decoded for the world, raw for the 2D pass - and handing
+  // one to the other is the defect this whole section is about. The bit is above the mask's eight.
+  const uint32_t key = mask | (linear ? 0x100u : 0u);
+  const auto found = LightRunByMask.find(key);
   if (found != LightRunByMask.end()) {
     offset = found->second.offset;
     count = found->second.count;
@@ -2630,7 +2638,7 @@ void ResolveLightRun(uint64_t frame, uint32_t &offset, uint32_t &count) {
       // Into the local copy first and then into the scratch: the scratch is host-visible memory
       // the GPU reads and this side never does, so building the value here is what keeps the
       // census off a read of it.
-      StoreLight(run.lights[written], State.lights[i], frame);
+      StoreLight(run.lights[written], State.lights[i], frame, linear);
       lights[written] = run.lights[written];
       ++written;
     }
@@ -2639,7 +2647,7 @@ void ResolveLightRun(uint64_t frame, uint32_t &offset, uint32_t &count) {
   count = written;
   run.offset = offset;
   run.count = written;
-  LightRunByMask[mask] = run;
+  LightRunByMask[key] = run;
   NoteLightRun(run.lights, written, frame);
 }
 
@@ -2668,6 +2676,13 @@ bool BuildDrawRecord(vulkan::DrawItem &item, const float *mvp, uint64_t frame) {
   if (pre_transformed || State.render_states[D3DRS_LIGHTING] == 0) {
     return true;
   }
+
+  // **Which layer this draw belongs to decides whether its colours are decoded**, and that is the
+  // correction in §4.95. `LinearInputActive()` alone is a statement about the FRAME; the 2D layers
+  // are drawn after the tonemap and nothing re-encodes them, so their colours must stay exactly as
+  // the game authored them. Decoding them left level02's HUD panels 44% dark, because §4.20 found
+  // those panels carry no vertex colour at all and are coloured entirely by the material.
+  const bool linear = vulkan::LinearInputActive() && !item.ui;
 
   // D3D8 documents no default material, and every colour in the equation comes from one - so a
   // draw issued before the game's first SetMaterial would light to black rather than to
@@ -2702,12 +2717,12 @@ bool BuildDrawRecord(vulkan::DrawItem &item, const float *mvp, uint64_t frame) {
   StoreEye(record.eye, State.have_view ? State.view : identity);
   StoreViewRotation(record.view_rotation, State.have_view ? State.view : identity);
 
-  StoreColour(record.material_ambient, State.material.Ambient);
-  StoreColour(record.material_diffuse, State.material.Diffuse);
-  StoreColour(record.material_specular, State.material.Specular);
+  StoreColour(record.material_ambient, State.material.Ambient, linear);
+  StoreColour(record.material_diffuse, State.material.Diffuse, linear);
+  StoreColour(record.material_specular, State.material.Specular, linear);
   record.material_specular[3] = State.material.Power;
-  StoreColour(record.material_emissive, State.material.Emissive);
-  StorePackedColour(record.global_ambient, State.render_states[D3DRS_AMBIENT]);
+  StoreColour(record.material_emissive, State.material.Emissive, linear);
+  StorePackedColour(record.global_ambient, State.render_states[D3DRS_AMBIENT], linear);
 
   uint32_t lighting = vulkan::kLightSum;
   if (State.render_states[D3DRS_NORMALIZENORMALS] != 0) {
@@ -2765,7 +2780,7 @@ bool BuildDrawRecord(vulkan::DrawItem &item, const float *mvp, uint64_t frame) {
   // host-visible memory the GPU reads and this side never does"); this was the site that broke it.
   uint32_t light_offset = 0;
   uint32_t light_count = 0;
-  ResolveLightRun(frame, light_offset, light_count);
+  ResolveLightRun(frame, linear, light_offset, light_count);
   record.light_offset = light_offset;
   record.light_count = light_count;
   ++vulkan::MutableDrawStats().lit_draws;
