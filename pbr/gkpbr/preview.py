@@ -27,6 +27,7 @@ under Vulkan. The honest A/B is still mod-in against mod-out.
 than assumed -- see :data:`DEFAULT_FORMATS` and ``pbr/README.md``.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -121,6 +122,62 @@ def target_path(game_dir, texture, mod=DEFAULT_MOD, index=None):
                         *mod_relative_path(texture, index).split("/"))
 
 
+#: What every mod is expected to carry, and the one directory in a mod that is
+#: *not* game content -- the engine has no ``metadata`` category, so nothing an
+#: engine open asks for can land in it (``mod_loading_notes.md``).
+#:
+#: A mod without it still loads and still enables; ``mods.load`` reports what is
+#: missing in ``mod.problems`` and falls back to the name on disk. This is written
+#: anyway because the preview mod is one of ours, and because a mod that names
+#: itself in the load order is one less thing to wonder about when a leftover turns
+#: up (the failure :data:`DEFAULT_MOD` is named for).
+METADATA_DIR = "metadata"
+
+README = """\
+# gkpbr preview
+
+A **throwaway** mod, written by `gkpbr preview` to put one generated PBR map in
+front of the running game. It is not a distributable mod and holds whichever
+texture was last previewed.
+
+Remove it with:
+
+    gkpbr preview --remove
+
+Everything about why the preview is a mod rather than a `render.material_override`,
+and why a normal map does not go through DXT, is in `pbr/README.md`.
+"""
+
+# No `website`: every info.json field is optional, and inventing a URL for a
+# throwaway mod would put a wrong one in front of whoever reads the load order.
+
+
+def mod_root(game_dir, mod=DEFAULT_MOD):
+    """The absolute path ``mods.load`` has to be given, with forward slashes.
+
+    Absolute rather than profile-relative on purpose -- see :data:`REPL_HINT`.
+    """
+    return os.path.join(game_dir, "gkplus", "mods", mod).replace(os.sep, "/")
+
+
+def write_metadata(game_dir, mod=DEFAULT_MOD):
+    """Writes the preview mod's ``metadata`` directory. Returns its path."""
+    root = os.path.join(game_dir, "gkplus", "mods", mod, METADATA_DIR)
+    os.makedirs(root, exist_ok=True)
+    info = {
+        "name": "gkpbr preview",
+        "author": "gkpbr",
+        "license": "same as GkPlus",
+        "version": "1",
+    }
+    with open(os.path.join(root, "info.json"), "w") as handle:
+        json.dump(info, handle, indent=2)
+        handle.write("\n")
+    with open(os.path.join(root, "README.md"), "w") as handle:
+        handle.write(README)
+    return root
+
+
 def format_for(kind, explicit=None):
     return explicit or DEFAULT_FORMATS.get(kind, "dxt1")
 
@@ -154,7 +211,21 @@ def remove(game_dir, mod=DEFAULT_MOD):
 #: What to paste into the REPL once the mod is in place. Printed rather than run:
 #: this module has no business owning a socket, and the operator is going to be
 #: driving `utils/rendertest` anyway.
+#:
+#: **The first line is not optional.** Nothing scans for mods and there is no mods
+#: directory - a mod is only ever enabled by being named (``mod_loading_notes.md``)
+#: - so writing the files does not put them in front of the engine.
+#: ``enable(...mods, x)`` keeps whatever was already enabled and puts this on top,
+#: where it wins.
+#:
+#: The **absolute** path is used rather than a profile-relative one, because a
+#: relative path resolves against ``GKPLUS_PROFILE`` while this tool always writes
+#: under ``<Gunlok>\\gkplus``; the two coincide only for the default profile, and a
+#: hint that is wrong under a non-default one is worse than a long line.
+#:
+#: Takes ``(mod root, texture)``.
 REPL_HINT = """\
+  mods.enable(...mods, mods.load(String.raw`%s`))
   levels.start({script: "level02.gls", console: "level02.gcs"})
   mods.served                       // the count must go up by one
   mods.recent                       // and name %s

@@ -2197,41 +2197,79 @@ declare module "gk" {
 
   // --- mods ------------------------------------------------------------------
 
-  /** One mounted mod: an archive or a directory under `<profile>\mods`. */
+  /** One mod: an archive or a directory that has been `load()`ed, whether or not
+   *  it is enabled.
+   *
+   *  A wrapper is a **live view, not a snapshot**: the record behind it is
+   *  interned per path and never freed, so `enabled` and `order` change under a
+   *  wrapper a script is holding. Two wrappers of one mod are two objects
+   *  though - like every other collection here, each lookup builds a fresh one -
+   *  so `path` is what to compare, not `===`. */
   export interface Mod {
-    /** The entry name inside the mods directory, e.g. `"20-tweaks.zip"`. */
+    /** The display name: what `metadata/info.json` says, falling back to `entry`
+     *  when it says nothing (or when there is no info.json). */
     readonly name: string;
-    /** Absolute path on disk. */
+    /** The entry name on disk, e.g. `"20-tweaks.zip"`. */
+    readonly entry: string;
+    /** Absolute path on disk. This is the mod's identity - `load()` interns by
+     *  it, and `enable()` accepts it in place of the object. */
     readonly path: string;
     /** False for a plain directory. */
     readonly archive: boolean;
-    /** Search-path position: 0 wins a conflict. Same as the collection index. */
-    readonly priority: number;
-  }
+    /** Whether this mod is in the enabled set right now. */
+    readonly enabled: boolean;
+    /** Position in the load order, weakest first, so the **highest number wins**
+     *  a file conflict. -1 when this mod is loaded but not enabled. */
+    readonly order: number;
 
-  /** A mod that is merely *present*, as `discover()` reports it. It has no
-   *  `priority` because it is in no search path: nothing is mounted until
-   *  something mounts it. */
-  export interface ModCandidate {
-    readonly name: string;
-    readonly path: string;
-    readonly archive: boolean;
+    /** From `metadata/info.json`, `""` when it does not say. */
+    readonly author: string;
+    readonly website: string;
+    readonly license: string;
+    readonly version: string;
+    /** `metadata/README.md`, with CRLF normalised to LF, or `""`. */
+    readonly readme: string;
+    /** What is wrong with this mod's metadata - a missing `info.json` or
+     *  `README.md`, a malformed one, a field of the wrong type, an icon that is
+     *  not a PNG. Empty means the contract is met.
+     *
+     *  A mod with problems still loads and still enables: being strict would
+     *  mean every mod predating the metadata contract stopped working rather
+     *  than reading as incomplete. This is what a manager UI shows, not what
+     *  stops anything. */
+    readonly problems: string[];
+
+    readonly has_icon_small: boolean;
+    readonly has_icon_big: boolean;
+    /** `metadata/icon_small.png` (or `icon_big.png`) as bytes, or null when the
+     *  mod ships none.
+     *
+     *  A **method** rather than a property because each call copies the whole
+     *  file: reached from a per-frame panel, a getter would allocate the PNG
+     *  every frame and nothing would say so. Test `has_icon_small`, and read the
+     *  bytes once. */
+    icon_small(): ArrayBuffer | null;
+    icon_big(): ArrayBuffer | null;
   }
 
   export interface ModsMembers {
+    /** How many mods are enabled. */
     readonly count: number;
     [Symbol.iterator](): IterableIterator<Mod>;
 
-    /** `<profile>\mods\`, with a trailing backslash. Need not exist. */
-    readonly dir: string;
     /** Where `gl.exe` lives, with a trailing backslash. Every VFS path is
-     *  relative to this. */
+     *  relative to this - but a relative path given to `load` is not: that
+     *  resolves against the profile directory. */
     readonly game_dir: string;
-    /** False only if the mod filesystem could not start at all. Having no mods
-     *  installed is not the same thing and reports true. */
+    /** False only if the mod filesystem could not start at all. Having nothing
+     *  enabled is not the same thing and reports true. */
     readonly available: boolean;
+    /** Everything `load()` has been given, enabled or not, in load-call order.
+     *  The collection itself is the *enabled* set, so this is the other half -
+     *  the list a manager shows with a checkbox against each row. */
+    readonly loaded: Mod[];
     /** How many file opens have been answered from a mod rather than from disk.
-     *  The only way to tell "mounted" from "actually being read", since a
+     *  The only way to tell "enabled" from "actually being read", since a
      *  replaced asset looks identical from outside the game. */
     readonly served: number;
     /** The VFS paths behind the last 64 of those, newest first. Answers "is my
@@ -2262,47 +2300,71 @@ declare module "gk" {
     /** Zeroes the above, so a single level load can be measured on its own. */
     reset_read_stats(): void;
 
-    /** Mounts an archive or directory at the highest priority - above
-     *  everything mounted before it. Throws if PhysicsFS cannot read it.
+    /** Reads a mod's `metadata` directory and interns it, without putting a
+     *  single file in front of the engine - that is `enable`. This is how a
+     *  script or a manager finds out what a named mod *is* before deciding
+     *  anything.
      *
-     *  This, or `mount_all`, is the **only** way a mod ends up loaded: nothing
-     *  mounts on its own. Both belong in the profile's boot module
-     *  (`core.boot`), which runs before the engine reads its first asset; a
-     *  mount from anywhere later is only seen by files opened after it. */
-    mount(path: string): void;
-    /** Mounts everything in `dir` (`mods.dir` if omitted), ascending by name so
-     *  a later name wins, and returns how many mounted. An entry PhysicsFS
-     *  cannot read is skipped, not thrown on - so this does not equal
-     *  `discover(dir).length`.
+     *  A mod can live **anywhere**: `path` is absolute, or relative to the
+     *  profile directory. There is no mods directory and nothing scans for one -
+     *  a relative path resolving against the profile is what lets a list in
+     *  `settings.json` (`"mods/hi-res.zip"`) follow `GKPLUS_PROFILE` instead of
+     *  hard-coding a location that exists on one machine.
      *
-     *  One line of a boot module, and the whole of what the loader used to do
-     *  before the decision became the script's:
+     *  Loading the same path twice describes the same mod and re-reads nothing:
+     *  the record behind the wrapper is interned by canonical path, so the
+     *  archive is opened once and every wrapper of it reports the same state.
+     *  Like every other collection here it hands out a **fresh wrapper object**
+     *  each time, so compare `path` rather than `===`.
      *
-     *      import { mods } from "gk";
-     *      mods.mount_all();
+     *  Throws when there is nothing loadable there: no such path, nothing
+     *  PhysicsFS can open as an archive, or **the game directory itself**, which
+     *  is not a mod - it is already what every lookup miss falls through to.
+     *  Absent or malformed metadata is not a failure and lands in `problems`.
+     *
+     *      const tweaks = mods.load("mods/tweaks.zip");      // in the profile
+     *      const other  = mods.load("D:/gunlok-mods/big.zip"); // anywhere else
+     *      console.log(tweaks.name, tweaks.author, tweaks.problems.length);
      */
-    mount_all(dir?: string): number;
-    /** What is sitting in `dir` (`mods.dir` if omitted), ascending by name,
-     *  mounted or not and readable or not. Nothing is opened. This is the list
-     *  a boot module filters when it wants some of the directory rather than
-     *  all of it:
+    load(path: string): Mod;
+    /** Declares the enabled set, in load order, so the **last** argument wins a
+     *  file conflict. Returns how many mods are enabled.
      *
-     *      for (const m of mods.discover())
-     *        if (!m.name.startsWith("off-")) mods.mount(m.path);
+     *  It **replaces** rather than adds: enabling a shorter list is how a mod is
+     *  switched off, and enabling the same list in a different order is how one
+     *  is reordered. So the load order is stated in one place instead of being
+     *  accumulated by a sequence of calls whose order is then its only record.
+     *
+     *  Each argument may be a `Mod`, a path, or an array of either - the array
+     *  form being what a list out of `settings` looks like. A path never loaded
+     *  is loaded here.
+     *
+     *  This, or nothing: no mod is ever in front of the engine unless something
+     *  enabled it *by name*. It belongs in the profile's boot module
+     *  (`core.boot`), which runs before the engine reads its first asset; a call
+     *  from anywhere later is only seen by files opened after it.
+     *
+     *      const hiRes  = mods.load("mods/hi-res.zip");
+     *      const tweaks = mods.load("mods/tweaks");
+     *      mods.enable(tweaks, hiRes);         // hiRes wins
+     *      mods.enable(tweaks);                // hiRes switched off
+     *      mods.enable();                      // the unmodified game
+     *      mods.enable(settings.boot.mods);    // a list of paths from config
      */
-    discover(dir?: string): ModCandidate[];
+    enable(...mods: (Mod | string | (Mod | string)[])[]): number;
     /** The VFS path the engine would get if it opened `gamePath` right now, or
      *  null if no mod provides it. Resolved against the process's current
      *  directory exactly as a game open is, so prefer `mods.game_dir + ...`. */
     resolve(gamePath: string): string | null;
-    /** Whether a mod provides this VFS path. */
+    /** Whether an enabled mod provides this VFS path. */
     exists(vpath: string): boolean;
     /** The file's contents decoded as UTF-8, or null. Use `read_bytes` for
      *  anything the engine would read as ANSI bytes. */
     read(vpath: string): string | null;
     read_bytes(vpath: string): ArrayBuffer | null;
     /** Every regular file at or below `dir` (the whole VFS if omitted), as VFS
-     *  paths, sorted. */
+     *  paths, sorted. The base install is not in here: it is never mounted, so
+     *  nothing enumerates it. */
     files(dir?: string): string[];
   }
 
@@ -2310,30 +2372,46 @@ declare module "gk" {
    *  tree, so a mod can add or replace any file the engine loads without
    *  touching the base install.
    *
-   *  A mod is a `.zip` (or any archive PhysicsFS reads) or a directory under
-   *  `<profile>\mods`, and **its contents mirror the game's own directory
+   *  A mod is a `.zip` (or any archive PhysicsFS reads) or a directory,
+   *  **anywhere on disk**, and **its contents mirror the game's own directory
    *  tree** - `rif/units/bug.rif`, `scripts/defaults.gsh`, `sound/robots.dat`.
-   *  That is forced by the engine rather than chosen: every loader chdirs to one
-   *  of its seven configured directories and then opens a relative name, so
-   *  "where in the game tree" is the only thing an interception can reconstruct.
+   *  That internal layout is forced by the engine rather than chosen: every
+   *  loader chdirs to one of its seven configured directories and then opens a
+   *  relative name, so "where in the game tree" is the only thing an
+   *  interception can reconstruct. The one exception is `metadata/`, which is
+   *  not game content at all - see `Mod`.
    *
-   *  **Nothing mounts on its own.** The profile's boot module decides, with
-   *  `mount_all()` for the whole directory or `mount()` per mod; a profile with
-   *  no boot module runs the base game whatever is sitting in `mods`.
-   *  `mount_all` goes in ascending name order and **a later name wins**, so
-   *  `20-tweaks.zip` overrides `10-base.zip`. Index 0 is the highest priority.
+   *  Where the mod itself sits is nobody's convention: there is no mods
+   *  directory. A path given to `load` is absolute or relative to the profile.
+   *
+   *  **Two steps, because they answer different questions.** `load` reads a
+   *  mod's metadata and nothing else; `enable` declares the active set, in
+   *  order, and is the only thing that puts a file in front of the engine:
+   *
+   *      const hiRes  = mods.load("mods/hi-res.zip");
+   *      const tweaks = mods.load("D:/gunlok-mods/tweaks");
+   *      mods.enable(tweaks, hiRes);           // hiRes wins a conflict
+   *
+   *  **Nothing enables on its own, and nothing is discovered on its own.** A mod
+   *  is named by a script or by something a script read out of config; there is
+   *  no directory scan, so a mod sitting next to one that is named does not
+   *  load, and a profile with no boot module runs the unmodified game.
+   *
+   *  The collection **is the enabled set in load order**, weakest first, so the
+   *  last index wins a conflict - the same direction `enable`'s arguments read
+   *  in. The base install is not in it: it is never a mount, and a lookup miss
+   *  is what makes the engine read the real file.
    *
    *  Paths are case- and separator-insensitive. Music and FMV are the one gap:
    *  Bink opens those inside its own DLL, out of reach of the interception.
    *
-   *      for (const mod of mods) console.log(mod.priority, mod.name);
+   *      for (const mod of mods) console.log(mod.order, mod.name);
    *      mods.files("scripts").filter(p => p.endsWith(".gsh"));
    */
   export type Mods = ModsMembers & {
     readonly [index: number]: Mod | undefined;
     readonly [name: string]: Mod | undefined;
   };
-
   // --- settings ----------------------------------------------------------------
 
   /** `<profile>\settings.json` - one JSON file for anything that has to outlive

@@ -367,9 +367,10 @@ a *second* output beside the `.rif`, so the export has its own **Textures** drop
 | **Changed only** | the images whose pixels no longer match the `.RIM` they were imported from |
 | **All** | every texture the file names |
 
-Point the folder at a **mod**, not at the install — `<Gunlok>\gkplus\mods\<yours>\graphics` — and a
-name like `Units\baddies3.RIM` lands at `graphics\Units\baddies3.RIM`, which is exactly where
-GkPlus's mod loader looks for it. Pointing it at the install overwrites the real assets, which is
+Point the folder at a **mod**, not at the install — `<Gunlok>\gkplus\mods\<yours>\graphics` is a
+fine place for one — and a name like `Units\baddies3.RIM` lands at `graphics\Units\baddies3.RIM`,
+which is exactly where GkPlus's mod loader looks for it once the mod is enabled. (A mod can live
+anywhere and loads only if a boot script names it: `mods.enable(mods.load("mods/<yours>"))`.) Pointing it at the install overwrites the real assets, which is
 allowed but is your call to make; nothing here asks twice.
 
 Written textures are **palettized, not DXT** (`CMAP` + `BODY`), which the engine reads first and

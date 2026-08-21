@@ -3,13 +3,13 @@
 #include <string>
 
 // The **profile**: one directory holding everything a launch is configured by -
-// `settings.json`, the boot and entry scripts it names, and the `mods` the boot
-// script mounts.
+// `settings.json` and the boot and entry scripts it names - and the anchor a
+// relative mod path is resolved against.
 //
 //     <profile>/settings.json   the shared settings repository (src/Settings.h)
 //     <profile>/boot.mjs        `core.boot`  - runs inside WinMain, mounts mods
 //     <profile>/main.mjs        `core.script` - the entry module, at SetupMenus
-//     <profile>/mods/           what a boot script mounting by name looks in
+//     <profile>/mods/           only a convention - see below
 //
 // `GKPLUS_PROFILE` selects it; with the variable unset it is `gkplus` beside
 // this DLL, which is where all four of those already lived, so a stock install
@@ -22,6 +22,13 @@
 // and splitting them let a run take its settings from one place and its script
 // from another - which is not a configuration anybody wanted, and it left the
 // mods directory behind in the install either way.
+//
+// **The profile does not own a mods directory.** `src/Vfs` has no notion of where
+// a mod lives; a boot script names paths, and a *relative* one is resolved against
+// this directory - which is what makes a mod list in `settings.json` follow
+// GKPLUS_PROFILE instead of hard-coding a location. `<profile>/mods/` above is
+// therefore whatever layout a profile's own config chose, not a path anything here
+// knows.
 //
 // Nothing here touches game memory or reads a file, so it is safe from DllMain
 // and harness-testable.

@@ -816,6 +816,8 @@ def cmd_preview(args):
     fmt = preview.format_for(args.map, args.format)
     dest = preview.target_path(game, rec["name"], args.mod, index)
     said = preview.pack(rimutil, png, dest, fmt)
+    # Every mod is expected to say who it is; see preview.write_metadata.
+    preview.write_metadata(game, args.mod)
 
     print("%s -> %s" % (args.map, rec["name"]))
     print("  %s" % said)
@@ -828,7 +830,7 @@ def cmd_preview(args):
         print("  NOTE this sheet has alpha and `body` cannot carry it -- use dxt3")
     print()
     print("now, with GKPLUS_REPL_PORT set (utils/rendertest):")
-    print(preview.REPL_HINT % rec["name"])
+    print(preview.REPL_HINT % (preview.mod_root(game, args.mod), rec["name"]))
     print("  gkpbr preview --remove   # when you are done, ALWAYS")
     return 0
 

@@ -119,8 +119,8 @@ for (const [name, value] of Object.entries(tokens)) console.print(`${name}=${val
 console.log("actors:", actors.count);               // the host's own logging - no global console
 console.execute("GOD ON");                          // and the game's command surface
 tokens["score"] = 0;                                // upsert; actors/roles throw
-mods.mount_all();                                   // in a boot module: nothing mounts on its own
-for (const mod of mods) console.log(mod.priority, mod.name);   // what is mounted
+mods.enable(settings.boot.mods);                    // in a boot module: nothing enables, or is found, on its own
+for (const mod of mods) console.log(mod.order, mod.name, mod.author);  // the load order, weakest first
 console.log(mods.served, mods.recent[0]);           // ... and what it actually served
 settings.mymod = {window: {x: 10, y: 20}};          // <profile>/settings.json, under a key of your own
 settings.mymod.window.x = 40;                       // a live view of the document, saved for you

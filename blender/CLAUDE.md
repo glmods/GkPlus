@@ -311,10 +311,13 @@ These pin the design, in roughly decreasing order of how much everything else re
   stock, where two *stock* runs differ by 7.35 — inside the noise. The control (every camera path
   moved 3 m) renders at 24.62. Three things made earlier versions of this test lie, all worth
   knowing before running another:
-  - **Renaming a mod directory does not disable it.** PhysFS mounts every entry under
-    `<Gunlok>\gkplus\mods`, so `cutscene-test.disabled` is still mounted and still serves. The
-    "baseline" ran the mod for several rounds; `mods.served` read 3 with the folder renamed and 0
-    only once it was moved out of the tree entirely. Move it, don't rename it.
+  - **Renaming a mod directory did not disable it**, back when the loader mounted every entry
+    under `<Gunlok>\gkplus\mods`: `cutscene-test.disabled` was still mounted and still served, so
+    the "baseline" ran the mod for several rounds — `mods.served` read 3 with the folder renamed
+    and 0 only once it was moved out of the tree. **That whole failure mode is gone**: nothing
+    scans for mods any more, so a mod is in play only if something named it, and `mods.enable()`
+    with no arguments is the baseline (`mod_loading_notes.md`). What survives is the lesson
+    below — check `mods.served`, never assume.
   - **`mods.served` is 0 until something has been asked of the VFS**, so querying it before
     `levels.start` reports 0 whether or not the mod is mounted — which makes any comparison built
     on it vacuous. Query after the level load, and read `mods.recent` for the actual paths.

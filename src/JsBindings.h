@@ -222,10 +222,13 @@ JSValue NewTriggersNamespace(JSContext *ctx);
 JSValue NewLevelsNamespace(JSContext *ctx);
 JSValue NewGlsNamespace(JSContext *ctx);
 JSValue NewMakeNamespace(JSContext *ctx);
-// The mod filesystem (src/Vfs.h): which archives are mounted, and what they
-// provide. Read-only apart from mount()/mount_all(), which are how anything gets
-// mounted at all - the interception is installed long before any script runs, but
-// the search path it consults starts empty and the profile's boot module fills it.
+// The mod filesystem (src/Vfs.h): which mods are loaded, which are enabled and in
+// what order, and what they provide. Read-only apart from load()/enable() - the
+// interception is installed long before any script runs, but the search path it
+// consults starts empty and only the profile's boot module fills it, by naming
+// paths - absolute, or relative to the profile. There is no mods directory and
+// nothing here enumerates one, and the base install is not a mod: a lookup miss is
+// what makes the engine read the real file.
 JSValue NewModsNamespace(JSContext *ctx);
 // The settings file (src/Settings.h): `<profile>\settings.json`, shared by
 // GkPlus (under `core`) and by whatever else wants a section of it. Values cross

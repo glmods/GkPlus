@@ -424,11 +424,13 @@ place before the renderer initialises rather than a frame or a menu later.
 ### The profile (`src/Profile.h/cpp`)
 
 **`GKPLUS_PROFILE` is the only launch-time path knob**, and it names a directory holding
-`settings.json`, the two scripts that file points at (`core.boot`, `core.script`) and the `mods`
-those scripts mount. Unset, the profile is `gkplus` beside `d3d8.dll` — where all of that already
-lived — so a stock install is unchanged and two setups are two directories rather than a file swap.
-It replaced `GKPLUS_SETTINGS` and `GKPLUS_SCRIPT`, which were the two halves of the same idea and
-left the mods directory behind in the install either way. `script_host_notes.md` has the rest.
+`settings.json` and the two scripts that file points at (`core.boot`, `core.script`). It is also
+what a **relative mod path resolves against**, which is what keeps a mod list portable — but the
+profile does not *own* a mods directory, and `src/Vfs` has no notion of one. Unset, the profile is
+`gkplus` beside `d3d8.dll` — where all of that already lived — so a stock install is unchanged and
+two setups are two directories rather than a file swap. It replaced `GKPLUS_SETTINGS` and
+`GKPLUS_SCRIPT`, which were the two halves of the same idea and left the mods directory behind in
+the install either way. `script_host_notes.md` has the rest.
 
 ### Settings (`src/Settings.h/cpp`, `src/JsSettings.cpp`)
 
@@ -505,17 +507,51 @@ Nothing a custom level needs is ever written to disk. `custom_levels_notes.md` h
 that pin the design; `level_loading_notes.md` sections 6.5 and 7 are the measurements.
 ### Mod loading (`src/Vfs.h/cpp`, `src/FileHooks.h/cpp`)
 
-Archives and directories layered over Gunlok's data tree, from `<profile>\mods`, later name wins.
-The interception is **gl.exe's import table**, not Detours on kernel32, which is what makes it
+Archives and directories layered over Gunlok's data tree, from **anywhere on disk**. The
+interception is **gl.exe's import table**, not Detours on kernel32, which is what makes it
 non-recursive.
 
-**Nothing mounts on its own.** `vfs::Initialize` starts PhysicsFS with an empty search path and
-every mount comes from the profile's boot script — `mods.mount_all()` for the whole directory,
-`mods.discover()` + `mods.mount()` to pick — which runs at `FileHookSystem`'s first intercepted
-open, the last instant at which the decision still applies to every file the game will load. A
-profile with no boot module runs the base game whatever is sitting in `mods`. `mod_loading_notes.md`
-has the six decisions that shape it and the three that are easy to get wrong later;
-`file_io_notes.md` sections 1 and 5 are the measurement - read those before touching either file.
+**Two steps, and a script drives both.** `mods.load(path)` reads a mod's `metadata` directory
+and nothing else; `mods.enable(a, b, ...)` declares the active set **in load order, the last
+one winning**, and is the only thing that puts a file in front of the engine. It *replaces*
+rather than adds, so switching a mod off is enabling the rest, reordering is enabling the same
+list differently, and `mods.enable()` is the honest un-modded baseline. An argument may be a
+`Mod`, a path, or an array of either — the array being what a list out of `settings.json` looks
+like.
+
+**Nothing enables on its own, and nothing is discovered on its own.** `vfs::Initialize` starts
+PhysicsFS with an empty search path and every enabled mod comes from the profile's boot script
+*naming a path*, which runs at `FileHookSystem`'s first intercepted open — the last instant at
+which the decision still applies to every file the game will load. **There is no directory scan
+and no mods directory**: a mod sitting next to one that is named does not load, and a profile
+with no boot module runs the unmodified game. That is what rules out "it was enabled because it
+was in the folder", which has bitten this repo twice — a renamed-to-disable directory that was
+still served, and a leftover `gkpbr-preview` mod quietly replacing an asset. A tool that writes
+a mod tree therefore has to tell its operator to enable it (`pbr` and `lightmap` both do).
+
+**A path is absolute, or relative to the profile.** That anchor is what keeps a mod list
+portable — a `settings.json` naming `mods/hi-res.zip` follows `GKPLUS_PROFILE` instead of
+hard-coding a machine — and it is *not* the process's current directory, which at that moment
+is whichever GLDir the engine chdir'd into. `<profile>\mods` is therefore a convention a
+config may or may not follow, not a path GkPlus knows.
+
+**The base install is not a mod and is not in the load order** — only mod content is mounted,
+so a lookup miss is what makes the engine read the real file, and that is what "the base game
+underneath everything" means here. `vfs::Load` **refuses the game directory by name**, because
+mounting it would cost an index walk over every shipped asset and change nothing; an earlier
+revision that presented the install as a `Mod` at the bottom of the order ended up mounting the
+whole install, which is why the refusal is explicit.
+
+**Every mod is expected to carry `metadata/`** — `info.json` (name, author, website, license,
+version; all strings, all optional), `README.md`, and optionally `icon_small.png` /
+`icon_big.png`. A mod that fails any of that **still loads and still enables**: `mod.name`
+falls back to the name on disk and `mod.problems` lists what was wrong, because being strict
+would have stopped every mod predating the contract rather than reporting it.
+
+`mod_loading_notes.md` has the metadata contract, the private inspection mount it is read
+through, the interning rule, the six decisions that shape the rest and the three that are easy
+to get wrong later, plus the 66-check in-game verification; `file_io_notes.md` sections 1 and 5
+are the measurement - read those before touching either file.
 ### The game window and the taskbar (`src/WindowPlacement.h/cpp`)
 
 `WinMain` @ 0x0046aef0 passes **literal 0, 0** as X/Y to both of the binary's `CreateWindowExA`
@@ -675,7 +711,7 @@ reference. Test invocations are under "Running the test suites" above.
 | `src/Menus.inc.h` | X-macro listing all 36 Gunlok menus: `GUNLOK_MENU(Name, Id, TitleResourceId, "English title")`. There are no gaps - ids 11 and 14-20 are identified in `menu_system_notes.md`. Also counted into `gk::MenuCount` |
 | `imgui-quickjs/` | Static library: the ImGui bindings, linked into `d3d8.dll`. **Not a QuickJS module** — `js_imgui_new_namespace(ctx)` builds a plain object the host passes to `draw_gui`, since an ImGui call outside that frame does not work. `JS_SetPropertyFunctionList` handles the whole export list, `JS_DEF_CGETSET` included (see the QuickJS conventions). **`types/imgui.d.ts` is generated from this file** — run `python3 types/gen-imgui-dts.py` after touching it and check the `any` count it prints is still 0, since it infers each parameter's type from the `JS_To*` the wrapper actually calls |
 | `examples/main.mjs` | A working entry module, JSDoc-annotated against `types/`. Install it in a profile as `main.mjs` (i.e. `<Gunlok>\gkplus\main.mjs` by default); `examples/jsconfig.json` is what type-checks it. **It imports `levels/` which imports `headers/`, so install all three** — a module the host cannot find takes the whole entry module with it and registers no hooks at all, so the symptom is that nothing happens rather than that one level is missing |
-| `examples/boot.mjs` | A working **boot** module — `mods.mount_all()` and the two shapes that replace it when a profile wants some of the directory rather than all of it. Install as `<profile>\boot.mjs`. Without one, no mod is mounted at all, which is the single most likely reason a previously-working install stops picking up its mods |
+| `examples/boot.mjs` | A working **boot** module — it names its mods from a list in `settings.json` (`boot.mods`), since nothing scans the directory, survives an entry that is not a mod, and reports each one's metadata and problems. Install as `<profile>\boot.mjs`. Without one, no mod is enabled at all, which is the single most likely reason a previously-working install stops picking up its mods |
 | `examples/render-panel.mjs` | Every `render` knob as ImGui, in collapsing sections, drawn into the caller's window. Its own module because it is longer than the rest of the example put together and is the piece most worth copying. **Its one rule is write-on-`changed`**: `draw_gui` runs every frame, and `lighting_maps = true` re-reads every file while `map_shadow_rate` re-bakes the shadow atlas |
 | `examples/prof-panel.mjs` | The profiler as ImGui, in the same shape as `render-panel.mjs` — frame graph, zones, sampled profile, stacks, the trigger and its captures, and the ring configuration. **Its rule is query-on-a-cadence**: `zones`/`samples`/`stacks` build one JS object per row and reading them per frame would cost more than the frame they describe, invisibly — `overhead_ms` cannot see time spent on our side of the binding. So each section snapshots, and a collapsed one queries nothing. The other trap is the trigger: an options object with no `enabled` *arms* it, so every write passes the current value explicitly |
 | `examples/levels/arena.mjs` | A working level module for `levels.add` — `map` + `includes` + `define` + `populate` + `setup` |

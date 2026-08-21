@@ -10,9 +10,11 @@ own surface is `js_bindings_notes.md`; the binding *conventions* that govern edi
 
 ```
 <profile>/settings.json   the shared settings repository (src/Settings.h)
-<profile>/boot.mjs        core.boot   — inside WinMain, mounts mods
+<profile>/boot.mjs        core.boot   — inside WinMain, enables mods
 <profile>/main.mjs        core.script — the entry module, at SetupMenus
-<profile>/mods/           what mods.mount_all() looks in
+<profile>/mods/           a convention, nothing more: mods.load resolves a
+                          relative path against the profile, but nothing scans
+                          for mods and a mod may live anywhere
 ```
 
 With the variable unset the profile is `gkplus` beside `d3d8.dll`, which is where all four of

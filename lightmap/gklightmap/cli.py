@@ -185,12 +185,60 @@ def cmd_pack(args):
     return 0
 
 
+METADATA_README = """\
+# gklightmap preview
+
+A **throwaway** mod, written by `gklightmap install` to put a generated
+`<stem> lighting.dds` in front of the running game. It is not a distributable mod
+and holds whichever texture was last installed.
+
+Remove it with:
+
+    gklightmap install --remove --mod %s
+
+The three channels are `src/VkLighting.h`'s and two do not mean what their names
+mean elsewhere: R is a height field, G is highlight intensity, B is highlight
+sharpness. See `lightmap/README.md`.
+"""
+
+
+def _write_metadata(game_dir, mod):
+    """Writes the mod's ``metadata`` directory: every mod is expected to have one.
+
+    A mod without it still loads and still enables -- ``mods.load`` reports what is
+    missing in ``mod.problems`` and falls back to the name on disk -- but this one
+    is ours, and a mod that names itself in the load order is one less thing to
+    wonder about when a leftover preview turns up. No ``website``: every field is
+    optional and inventing a URL would put a wrong one in front of whoever reads
+    it.
+    """
+    root = os.path.join(game_dir, "gkplus", "mods", mod, "metadata")
+    os.makedirs(root, exist_ok=True)
+    with open(os.path.join(root, "info.json"), "w") as handle:
+        json.dump({"name": "gklightmap preview", "author": "gklightmap",
+                   "license": "same as GkPlus", "version": "1"}, handle, indent=2)
+        handle.write("\n")
+    with open(os.path.join(root, "README.md"), "w") as handle:
+        handle.write(METADATA_README % mod)
+    return root
+
+
 def _install(game_dir, mod, rel, built):
     target = _install_path(game_dir, mod, rel)
     os.makedirs(os.path.dirname(target), exist_ok=True)
     shutil.copyfile(built, target)
+    _write_metadata(game_dir, mod)
     print("installed -> %s" % target)
-    print("  the engine finds it by name alone; nothing registers it. Check with")
+    # Nothing scans for mods and there is no mods directory - a mod is only ever
+    # enabled by being named (mod_loading_notes.md) - so writing the file does not
+    # put it in front of the engine. enable(...mods, x) keeps what was enabled and
+    # puts this on top. The absolute path is used because a relative one resolves
+    # against GKPLUS_PROFILE while this always writes under <Gunlok>\gkplus.
+    root = os.path.join(game_dir, "gkplus", "mods", mod).replace(os.sep, "/")
+    print("  ENABLE IT FIRST, in the REPL -- nothing scans for mods:")
+    print("    mods.enable(...mods, mods.load(String.raw`%s`))" % root)
+    print("  then the engine finds the file by name alone; nothing registers it.")
+    print("  Check with")
     print("  `render.lighting_maps` / `render.describe_lighting()` in the REPL, and")
     print("  REMOVE IT AFTERWARDS: `install --remove --mod %s`." % mod)
     return target

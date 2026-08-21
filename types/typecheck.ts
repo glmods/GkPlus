@@ -51,6 +51,7 @@ import type {
   LevelModule,
   Menus,
   MenuItem,
+  Mod,
   Role,
   SetupMenus,
   TurretActor,
@@ -689,23 +690,54 @@ screen.stats();
 // --- mods ----------------------------------------------------------------------
 
 const modCount: number = mods.count;
-const modsDir: string = mods.dir;
 const modsGameDir: string = mods.game_dir;
 const modsUp: boolean = mods.available;
 const modsServed: number = mods.served;
 const modsRecent: string[] = mods.recent;
-mods.mount("C:/mods/extra.zip");
+
+// load, then enable: two steps, because they answer different questions. Nothing
+// scans for mods and there is no mods directory - a mod is named, by a script or
+// out of config, absolute or relative to the profile.
+const loadedMod: Mod = mods.load("mods/extra.zip");
+const modAnywhere: Mod = mods.load("D:/gunlok-mods/extra.zip");
+const enabledCount: number = mods.enable(loadedMod);
+const enabledFromPaths: number = mods.enable("C:/mods/a.zip", loadedMod, [
+  "C:/mods/b.zip",
+  loadedMod,
+]);
+const fromConfig: string[] = ["mods/10-alpha", "mods/20-beta.zip"];
+const enabledFromConfig: number = mods.enable(fromConfig);
+const unmodded: number = mods.enable();
+
 const resolved: string | null = mods.resolve(mods.game_dir + "rif/units/bug.rif");
 const modHas: boolean = mods.exists("rif/units/bug.rif");
 const modText: string | null = mods.read("scripts/defaults.gsh");
 const modBytes: ArrayBuffer | null = mods.read_bytes("rif/units/bug.rif");
 const modFiles: string[] = mods.files();
 const modScripts: string[] = mods.files("scripts");
+
+// The collection is the enabled set in load order, weakest first: the last index
+// wins a conflict.
+const allLoaded: Mod[] = mods.loaded;
 for (const mod of mods) {
   const name: string = mod.name;
+  const entry: string = mod.entry;
   const path: string = mod.path;
   const isArchive: boolean = mod.archive;
-  const priority: number = mod.priority;
+  const isEnabled: boolean = mod.enabled;
+  const order: number = mod.order;
+  const author: string = mod.author;
+  const website: string = mod.website;
+  const license: string = mod.license;
+  const version: string = mod.version;
+  const readme: string = mod.readme;
+  const problems: string[] = mod.problems;
+  if (mod.has_icon_small) {
+    const icon: ArrayBuffer | null = mod.icon_small();
+  }
+  if (mod.has_icon_big) {
+    const bigIcon: ArrayBuffer | null = mod.icon_big();
+  }
 }
 if (mods[0] !== undefined) {
   const first: string = mods[0].name;
@@ -713,10 +745,21 @@ if (mods[0] !== undefined) {
 if (mods["20-tweaks.zip"] !== undefined) {
   const byName: string = mods["20-tweaks.zip"].path;
 }
-// @ts-expect-error - mounting is an action with a result, not an assignment
-mods[0] = { name: "x", path: "y", archive: true, priority: 0 };
+// @ts-expect-error - enabling is an ordered declaration of the whole set, not an
+// assignment through the indexer
+mods[0] = loadedMod;
 // @ts-expect-error - `served` is a count the host owns
 mods.served = 0;
+// @ts-expect-error - the enabled set is `enable`'s to declare
+mods.loaded = [];
+// @ts-expect-error - there is no directory scan
+mods.discover();
+// @ts-expect-error - and no mods directory: a mod can live anywhere
+mods.dir.length;
+// `mods.base` cannot be asserted away: the name index signature that makes
+// mods["20-tweaks.zip"] work types any unknown property as `Mod | undefined`, so
+// reading one is legal for every name. Calling one is not, which is what the line
+// above actually catches.
 
 // --- settings ------------------------------------------------------------------
 //

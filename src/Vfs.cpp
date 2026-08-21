@@ -1,6 +1,7 @@
 #include "Vfs.h"
 
 #include "Core.h"
+#include "Json.h"
 #include "Profile.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -12,6 +13,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -37,9 +39,25 @@ std::atomic<bool> g_ready{false};    // ... and PhysicsFS is up
 std::atomic<bool> g_has_mods{false}; // ... with at least one mod mounted
 
 bool g_initializing = false;
-std::vector<Mod> g_mods;
+
+// Every Load()ed mod, in load-call order, and the map that interns them by
+// canonical path. **Records are never freed and never move** - the JS layer wraps
+// a `Mod *` with no finalizer and treats it as an identity, and Enable() holds
+// raw pointers into this - which is why it is a vector of unique_ptr rather than
+// a vector of Mod.
+std::vector<std::unique_ptr<Mod>> g_loaded;
+std::unordered_map<std::string, Mod *> g_by_key; // Lower(path) -> record
+// The enabled set in **load order**, so the last entry wins a conflict.
+std::vector<Mod *> g_enabled;
+
 std::string g_game_dir;
-std::string g_mods_dir;
+// Lower(g_game_dir) with no trailing separator: what Load() refuses, because the
+// install is what every lookup miss already falls through to.
+std::string g_game_dir_key;
+// The profile directory, backslashed and with a trailing backslash - what a
+// relative path given to Load() is resolved against. Read once here rather than
+// per call so AbsolutePath is a string join under the lock.
+std::string g_profile_dir;
 std::string g_temp_dir;
 // Lowercased vpath -> absolute path of the materialized copy.
 std::unordered_map<std::string, std::string> g_materialized;
@@ -215,38 +233,10 @@ bool CreateDirectoryTree(const std::string &dir) {
   return true;
 }
 
-// Everything directly inside `mods_dir` (which ends with a backslash), ascending
-// by name, case-insensitively. Sorting here rather than trusting FindFirstFile
-// is what makes the documented "a later name wins" rule hold: the directory
-// order is whatever NTFS feels like, and on a FAT volume it is creation order.
-std::vector<Mod> DiscoverMods(const std::string &mods_dir) {
-  std::vector<Mod> found;
-  if (mods_dir.empty()) {
-    return found;
-  }
-  WIN32_FIND_DATAA find{};
-  HANDLE handle = FindFirstFileA((mods_dir + "*").c_str(), &find);
-  if (handle == INVALID_HANDLE_VALUE) {
-    return found;
-  }
-  do {
-    if (std::strcmp(find.cFileName, ".") == 0 ||
-        std::strcmp(find.cFileName, "..") == 0) {
-      continue;
-    }
-    Mod mod;
-    mod.name = find.cFileName;
-    mod.path = mods_dir + find.cFileName;
-    mod.archive = (find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
-    found.push_back(std::move(mod));
-  } while (FindNextFileA(handle, &find));
-  FindClose(handle);
-
-  std::sort(found.begin(), found.end(), [](const Mod &a, const Mod &b) {
-    return _stricmp(a.name.c_str(), b.name.c_str()) < 0;
-  });
-  return found;
-}
+// **There is deliberately no directory walk here.** A mod is named by a script or
+// by something a script read out of config; nothing enumerates anything looking
+// for candidates, and there is no mods directory to enumerate, so a mod nobody
+// names does not load. See Vfs.h for what that rules out.
 
 void RebuildIndex();
 
@@ -256,14 +246,22 @@ bool DoInitialize() {
     DebugWrite("gkplus vfs: cannot locate the game directory; mods disabled\n");
     return false;
   }
-  // `mods` inside the profile, not inside the install: a profile is meant to be
-  // a complete description of a launch, and a mod set that did not travel with
-  // GKPLUS_PROFILE would leave the most consequential half of one behind. With
-  // the variable unset the profile *is* <Gunlok>\gkplus, so this is the path it
-  // has always been.
-  g_mods_dir = ToBackslashes(profile::Dir());
-  if (!g_mods_dir.empty()) {
-    g_mods_dir += "\\mods\\";
+  // **There is no mods directory.** This layer knows nothing about where a mod
+  // lives: a mod is whatever path something names, anywhere on disk. A blessed
+  // directory would be back to "it was enabled because of where it sat", one
+  // indirection further away.
+  //
+  // A *relative* path is resolved against the profile, which is what makes a
+  // profile portable: the same settings.json listing `mods/hi-res.zip` follows
+  // GKPLUS_PROFILE to another directory instead of naming a location that only
+  // exists on the machine it was written on. profile::Dir() is itself pinned to
+  // the install when GKPLUS_PROFILE is relative, so this is stable however the
+  // launch was configured - unlike the process's current directory, which at this
+  // point is whichever GLDir the engine chdir'd into to open the file that got us
+  // here.
+  g_profile_dir = ToBackslashes(profile::Dir());
+  if (!g_profile_dir.empty() && g_profile_dir.back() != '\\') {
+    g_profile_dir.push_back('\\');
   }
 
   char module[MAX_PATH * 2];
@@ -282,13 +280,27 @@ bool DoInitialize() {
     SweepStaleTempDirs(temp_root, pid);
   }
 
-  // **Nothing is mounted here.** Which mods a launch gets is the profile's boot
+  // The bottom of every load order, and the only Mod that is not a mount. See
+  // Vfs.h: a lookup miss *is* "read the base install", so describing it as a mod
+  // costs nothing and means a manager listing the load order does not have to
+  // special-case the bottom of it.
+  // Normalized exactly as AbsolutePath returns a path - no trailing separator -
+  // so Load() can compare against it directly. Mounting the install as a mod
+  // would add an index walk over every shipped asset and change nothing about
+  // what the engine reads, so Load refuses it; and it is a real risk rather than
+  // a hypothetical, since `mods.game_dir` is right there in the same namespace.
+  g_game_dir_key = g_game_dir;
+  while (g_game_dir_key.size() > 3 && g_game_dir_key.back() == '\\') {
+    g_game_dir_key.pop_back();
+  }
+  g_game_dir_key = Lower(g_game_dir_key);
+
+  // **Nothing is enabled here.** Which mods a launch gets is the profile's boot
   // script's decision, not this file's - see the header. The search path starts
-  // empty and stays that way until something calls Mount() or MountAll(), which
-  // for a profile with no boot module means the game runs unmodified.
+  // empty and stays that way until something calls Enable(), which for a profile
+  // with no boot module means the game runs unmodified.
   RebuildIndex();
-  DebugWrite("gkplus vfs: ready, nothing mounted yet (mods live in {})\n",
-             g_mods_dir);
+  DebugWrite("gkplus vfs: ready, nothing enabled yet\n");
   g_has_mods.store(false, std::memory_order_release);
   return true;
 }
@@ -320,7 +332,10 @@ bool Ensure() {
   g_initializing = false;
   if (!ok) {
     PHYSFS_deinit();
-    g_mods.clear();
+    g_enabled.clear();
+    // g_by_key first: its values point into g_loaded.
+    g_by_key.clear();
+    g_loaded.clear();
     g_has_mods.store(false, std::memory_order_release);
   }
   g_ready.store(ok, std::memory_order_release);
@@ -386,6 +401,306 @@ const std::string *Canonical(const char *vpath) {
   return it == g_index.end() ? nullptr : &it->second;
 }
 
+// --- metadata ------------------------------------------------------------------
+//
+// `<mod>/metadata/` is where a mod says who it is, and it is the one directory in
+// a mod that is *not* game content: the engine has no `metadata` category, so
+// nothing an engine open asks for can ever land in it. info.json and README.md
+// are expected of every mod and their absence is a Mod::problem; the two icons
+// are optional.
+
+constexpr const char *kMetadataDir = "metadata";
+constexpr const char *kInfoFile = "info.json";
+constexpr const char *kReadmeFile = "README.md";
+constexpr const char *kIconSmallFile = "icon_small.png";
+constexpr const char *kIconBigFile = "icon_big.png";
+
+// The mount point Load() reads a mod's metadata through, and it has to be a
+// mount point rather than the ordinary search path for two reasons. The mod is
+// being inspected *before* anything decides to enable it, so it must not be
+// visible to Resolve() while that happens - and every mod has a
+// metadata/info.json, so reading one through the merged view would find whichever
+// mod is on top rather than the one being asked about. Nothing rebuilds g_index
+// for this mount, so it is invisible to every other entry point here.
+constexpr const char *kInspectMount = "gkplus-inspect";
+
+// A file this big is a mistake or an attack rather than a mod's identity, and
+// these bytes are cached in the record for the life of the process.
+constexpr PHYSFS_sint64 kMaxMetadataBytes = 4 * 1024 * 1024;
+
+// The eight bytes every PNG starts with. An icon that does not is reported rather
+// than handed to whatever ends up decoding it.
+constexpr unsigned char kPngSignature[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+
+struct ChildSearch {
+  const char *want;
+  std::string found;
+};
+
+PHYSFS_EnumerateCallbackResult MatchChild(void *data, const char *,
+                                          const char *fname) {
+  auto *search = static_cast<ChildSearch *>(data);
+  if (_stricmp(fname, search->want) == 0) {
+    search->found = fname;
+    return PHYSFS_ENUM_STOP;
+  }
+  return PHYSFS_ENUM_OK;
+}
+
+// The child of `dir` named `want` case-insensitively, or "". Enumerating rather
+// than stat'ing the name we want is the same problem g_index solves and has the
+// same cause: PhysicsFS is case-sensitive inside an archive, so a mod shipping
+// `Metadata/Info.json` would otherwise have no metadata at all. A `metadata`
+// directory holds four entries, so the walk is free.
+std::string FindChild(const std::string &dir, const char *want) {
+  ChildSearch search{want, {}};
+  PHYSFS_enumerate(dir.c_str(), MatchChild, &search);
+  return search.found;
+}
+
+// Reads one metadata file by its exact PhysicsFS path. `why` is only filled for a
+// file that is there and unreadable - a missing one is not an error here, because
+// three of the four are allowed to be absent.
+bool ReadMetadataFile(const std::string &path, std::vector<char> *out,
+                      std::string *why) {
+  PHYSFS_File *file = PHYSFS_openRead(path.c_str());
+  if (!file) {
+    *why = PhysfsError();
+    return false;
+  }
+  const PHYSFS_sint64 length = PHYSFS_fileLength(file);
+  if (length < 0) {
+    *why = "the archive does not report its size";
+    PHYSFS_close(file);
+    return false;
+  }
+  if (length > kMaxMetadataBytes) {
+    *why = "it is larger than 4 MB";
+    PHYSFS_close(file);
+    return false;
+  }
+  out->resize(static_cast<size_t>(length));
+  PHYSFS_sint64 got = 0;
+  if (length > 0) {
+    got = PHYSFS_readBytes(file, out->data(),
+                           static_cast<PHYSFS_uint64>(length));
+  }
+  PHYSFS_close(file);
+  if (got != length) {
+    *why = PhysfsError();
+    out->clear();
+    return false;
+  }
+  return true;
+}
+
+// One field of info.json. Every field is a string and every field is optional, so
+// an absent one is silent and anything of another type leaves the field empty and
+// says so.
+//
+// **A number is reported rather than tolerated**, which was measured rather than
+// chosen: an unquoted `"version": 1.3` read back through Document::Get as
+// "1.2999999999999998", because the text is whatever the JSON codec's number
+// formatter produces and quickjs-ng 0.15.1's is not shortest-round-trip here
+// (V8 prints the same double as "1.3"). Silently reporting a version nobody wrote
+// is worse than an empty one beside a problem saying why.
+void ReadInfoField(const json::Document &doc, const char *key, std::string *out,
+                   std::vector<std::string> *problems) {
+  const json::Kind kind = doc.KindAt(key);
+  if (kind == json::Kind::Invalid) {
+    return;
+  }
+  if (kind != json::Kind::String) {
+    problems->push_back(std::string("metadata/") + kInfoFile + ": `" + key +
+                        "` must be a string");
+    return;
+  }
+  json::Classify(doc.Get(key).c_str(), out);
+}
+
+void ReadIcon(const std::string &dir, const char *want, std::vector<char> *out,
+              std::vector<std::string> *problems) {
+  const std::string name = FindChild(dir, want);
+  if (name.empty()) {
+    return; // both icons are optional
+  }
+  std::string why;
+  if (!ReadMetadataFile(dir + "/" + name, out, &why)) {
+    problems->push_back(std::string("metadata/") + want + ": " + why);
+    return;
+  }
+  if (out->size() < sizeof(kPngSignature) ||
+      std::memcmp(out->data(), kPngSignature, sizeof(kPngSignature)) != 0) {
+    problems->push_back(std::string("metadata/") + want + " is not a PNG");
+    out->clear();
+  }
+}
+
+// Fills `mod`'s info, readme, icons and problems from its `metadata` directory.
+//
+// False only when PhysicsFS cannot open the mod **at all**, which is what makes a
+// stray readme.txt sitting in the mods directory a skipped candidate rather than
+// a nameless mod. Metadata that is absent or malformed is a Mod::problem and a
+// successful load - see ModInfo in Vfs.h for why that is not strictness misplaced.
+bool ReadMetadata(Mod *mod, std::string *error) {
+  if (!PHYSFS_mount(mod->path.c_str(), kInspectMount, 0)) {
+    if (error) {
+      *error = PhysfsError();
+    }
+    return false;
+  }
+
+  const std::string root = kInspectMount;
+  const std::string metadata_name = FindChild(root, kMetadataDir);
+  std::string dir;
+  if (!metadata_name.empty()) {
+    dir = root + "/" + metadata_name;
+    PHYSFS_Stat stat{};
+    if (!PHYSFS_stat(dir.c_str(), &stat) ||
+        stat.filetype != PHYSFS_FILETYPE_DIRECTORY) {
+      mod->problems.push_back("metadata is not a directory");
+      dir.clear();
+    }
+  }
+
+  if (dir.empty()) {
+    mod->problems.push_back(std::string("metadata/") + kInfoFile + " is missing");
+    mod->problems.push_back(std::string("metadata/") + kReadmeFile +
+                            " is missing");
+  } else {
+    const std::string info_name = FindChild(dir, kInfoFile);
+    if (info_name.empty()) {
+      mod->problems.push_back(std::string("metadata/") + kInfoFile +
+                              " is missing");
+    } else {
+      std::vector<char> data;
+      std::string why;
+      if (!ReadMetadataFile(dir + "/" + info_name, &data, &why)) {
+        mod->problems.push_back(std::string("metadata/") + kInfoFile + ": " +
+                                why);
+      } else {
+        // Parse refuses anything that is not one complete JSON *object*, which
+        // is exactly the test wanted here: an array or a bare number is a
+        // document no field name can address.
+        const std::string text(data.begin(), data.end());
+        json::Document doc;
+        if (!doc.Parse(text.c_str())) {
+          mod->problems.push_back(std::string("metadata/") + kInfoFile +
+                                  " is not a JSON object");
+        } else {
+          ReadInfoField(doc, "name", &mod->info.name, &mod->problems);
+          ReadInfoField(doc, "author", &mod->info.author, &mod->problems);
+          ReadInfoField(doc, "website", &mod->info.website, &mod->problems);
+          ReadInfoField(doc, "license", &mod->info.license, &mod->problems);
+          ReadInfoField(doc, "version", &mod->info.version, &mod->problems);
+        }
+      }
+    }
+
+    const std::string readme_name = FindChild(dir, kReadmeFile);
+    if (readme_name.empty()) {
+      mod->problems.push_back(std::string("metadata/") + kReadmeFile +
+                              " is missing");
+    } else {
+      std::vector<char> data;
+      std::string why;
+      if (!ReadMetadataFile(dir + "/" + readme_name, &data, &why)) {
+        mod->problems.push_back(std::string("metadata/") + kReadmeFile + ": " +
+                                why);
+      } else {
+        // CRLF and lone CR both become LF. The field is Markdown *text* whose
+        // only consumer is something that displays it, and a mod authored on
+        // Windows or zipped from a Windows tree carries CRLF - so normalising
+        // once here is the alternative to every consumer doing it, and a stray
+        // \r renders as a box in ImGui.
+        mod->readme.clear();
+        mod->readme.reserve(data.size());
+        for (size_t i = 0; i < data.size(); ++i) {
+          if (data[i] == '\r') {
+            if (i + 1 < data.size() && data[i + 1] == '\n') {
+              continue; // the \n right after it is the newline
+            }
+            mod->readme.push_back('\n');
+            continue;
+          }
+          mod->readme.push_back(data[i]);
+        }
+      }
+    }
+
+    ReadIcon(dir, kIconSmallFile, &mod->icon_small, &mod->problems);
+    ReadIcon(dir, kIconBigFile, &mod->icon_big, &mod->problems);
+  }
+
+  // Every file above is closed, so this cannot fail for the one reason
+  // PHYSFS_unmount ever refuses. Reported rather than ignored because a leaked
+  // inspection mount would hold the archive open for the whole session.
+  if (!PHYSFS_unmount(mod->path.c_str())) {
+    DebugWrite("gkplus vfs: cannot release the inspection mount of {} ({})\n",
+               mod->path, PhysfsError());
+  }
+
+  mod->name = mod->info.name.empty() ? mod->entry : mod->info.name;
+  return true;
+}
+
+// `path` made absolute and backslashed, with no trailing separator - the form
+// every record keeps and every PHYSFS_mount/PHYSFS_unmount pair is given, since
+// PhysicsFS matches a mount by strcmp on that exact string. It is also what makes
+// a record an identity: two spellings of one archive intern to one entry, where
+// two mounts of differing spellings would have mounted it twice.
+//
+// A **relative** path is resolved against the **profile** (g_profile_dir), never
+// against the process's current directory. Two reasons, and neither is a
+// convenience: the current directory when this layer is first reached is
+// whichever GLDir the engine chdir'd into to open the file that triggered it, so
+// a CWD-relative path would land somewhere the caller could not predict; and the
+// profile is what makes a mod list portable, since a settings.json naming
+// `mods/hi-res.zip` follows GKPLUS_PROFILE instead of hard-coding a location that
+// only exists on the machine it was written on. An absolute path is untouched,
+// which is what a mod living anywhere else needs.
+//
+// With no profile directory to resolve against a relative path is **refused**
+// rather than resolved against the CWD - the wrong answer there is a mod loaded
+// from an asset directory, which would be baffling.
+std::string AbsolutePath(const char *path) {
+  std::string given = path;
+  const bool relative = !(given.size() >= 2 && given[1] == ':') &&
+                        given[0] != '\\' && given[0] != '/';
+  if (relative) {
+    if (g_profile_dir.empty()) {
+      return {};
+    }
+    given = g_profile_dir + given; // g_profile_dir carries its trailing backslash
+  }
+
+  char full[MAX_PATH * 2];
+  const DWORD n = GetFullPathNameA(given.c_str(), sizeof(full), full, nullptr);
+  if (n == 0 || n >= sizeof(full)) {
+    return {};
+  }
+  std::string out(full, n);
+  while (out.size() > 3 && (out.back() == '\\' || out.back() == '/')) {
+    out.pop_back();
+  }
+  return ToBackslashes(std::move(out));
+}
+
+std::string LeafName(const std::string &path) {
+  const size_t slash = path.find_last_of('\\');
+  return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+void AppendError(std::string *error, const std::string &line) {
+  if (!error) {
+    return;
+  }
+  if (!error->empty()) {
+    *error += "; ";
+  }
+  *error += line;
+}
+
 } // namespace
 
 bool Initialize() { return Ensure(); }
@@ -400,7 +715,15 @@ void Shutdown() {
   if (!g_temp_dir.empty()) {
     RemoveTree(g_temp_dir);
   }
-  g_mods.clear();
+  // The mounts went with PHYSFS_deinit, so the enabled set is emptied and every
+  // record's order reset - but **g_loaded is deliberately left alone**. A Mod *
+  // is documented as good for the life of the process and the JS layer wraps one
+  // with no finalizer, so freeing the records here would trade a leak that ends
+  // with the process for a dangling pointer.
+  for (Mod *mod : g_enabled) {
+    mod->order = -1;
+  }
+  g_enabled.clear();
   g_materialized.clear();
   g_index.clear();
   g_has_mods.store(false, std::memory_order_release);
@@ -411,102 +734,157 @@ void Shutdown() {
   g_tried.store(true, std::memory_order_release);
 }
 
-const std::vector<Mod> &Mods() {
-  Ensure();
-  return g_mods;
-}
-
 const std::string &GameDir() {
   Ensure();
   return g_game_dir;
 }
 
-const std::string &ModsDir() {
-  Ensure();
-  return g_mods_dir;
-}
-
-std::vector<Mod> Discover(const char *dir) {
-  std::string root = (dir && *dir) ? ToBackslashes(dir) : std::string{};
-  if (root.empty()) {
-    if (!Ensure()) {
-      return {};
+const Mod *Load(const char *path, std::string *error) {
+  if (!path || !*path) {
+    if (error) {
+      *error = "no path given";
     }
-    std::lock_guard lock(g_mutex);
-    root = g_mods_dir;
-  } else if (root.back() != '\\') {
-    root.push_back('\\');
+    return nullptr;
   }
-  return DiscoverMods(root);
+  if (!Ensure()) {
+    if (error) {
+      *error = "the mod filesystem is not available";
+    }
+    return nullptr;
+  }
+  std::lock_guard lock(g_mutex);
+
+  const std::string absolute = AbsolutePath(path);
+  if (absolute.empty()) {
+    if (error) {
+      *error = "the path cannot be resolved";
+    }
+    return nullptr;
+  }
+  // Interned by canonical path, so loading the same mod twice hands back the
+  // same record and re-reads nothing. That is also what keeps the inspection
+  // mount from ever colliding with a real one: a path in the search path is by
+  // construction already in here, so ReadMetadata below only ever runs for a
+  // path PhysicsFS has never been given.
+  std::string key = Lower(absolute);
+  auto existing = g_by_key.find(key);
+  if (existing != g_by_key.end()) {
+    return existing->second;
+  }
+  // The install is not a mod: it is what every lookup miss already falls through
+  // to, so mounting it would cost an index walk over every shipped asset and
+  // change nothing about what the engine reads.
+  if (key == g_game_dir_key) {
+    if (error) {
+      *error = "that is the game directory, which is not a mod";
+    }
+    return nullptr;
+  }
+
+  const DWORD attributes = GetFileAttributesA(absolute.c_str());
+  if (attributes == INVALID_FILE_ATTRIBUTES) {
+    if (error) {
+      *error = "no such file or directory";
+    }
+    return nullptr;
+  }
+
+  auto mod = std::make_unique<Mod>();
+  mod->path = absolute;
+  mod->entry = LeafName(absolute);
+  mod->archive = (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+  if (!ReadMetadata(mod.get(), error)) {
+    return nullptr;
+  }
+
+  Mod *record = mod.get();
+  g_loaded.push_back(std::move(mod));
+  g_by_key.emplace(std::move(key), record);
+  DebugWrite("gkplus vfs: loaded {} ({}{})\n", record->entry, record->name,
+             record->problems.empty() ? "" : ", incomplete metadata");
+  return record;
 }
 
-int MountAll(const char *dir, std::string *error) {
+std::vector<const Mod *> Loaded() {
+  Ensure();
+  std::lock_guard lock(g_mutex);
+  std::vector<const Mod *> out;
+  out.reserve(g_loaded.size());
+  for (const auto &mod : g_loaded) {
+    out.push_back(mod.get());
+  }
+  return out;
+}
+
+int Enable(const std::vector<std::string> &paths, std::string *error) {
   if (!Ensure()) {
     if (error) {
       *error = "the mod filesystem is not available";
     }
     return -1;
   }
-  // Ascending, because Mount() prepends: the alphabetically last entry is
-  // mounted last and therefore ends up first in the search path, which is the
-  // "a later name wins" rule Vfs.h documents.
-  //
-  // Anything PhysicsFS does not recognize as an archive is reported and skipped
-  // rather than filtered by extension, so a format a future PhysicsFS learns
-  // works with no change here - and a stray readme is a log line, not a failure
-  // of the whole call.
-  int mounted = 0;
-  for (const Mod &mod : Discover(dir)) {
+
+  // Everything is loaded *before* anything is unmounted, so a path that turns
+  // out not to be a mod cannot leave the previous set torn down. Load takes the
+  // same recursive lock this function does.
+  std::vector<Mod *> wanted;
+  for (const std::string &path : paths) {
     std::string why;
-    if (!Mount(mod.path.c_str(), &why)) {
-      DebugWrite("gkplus vfs: skipping {} ({})\n", mod.name, why);
+    const Mod *mod = Load(path.c_str(), &why);
+    if (!mod) {
+      DebugWrite("gkplus vfs: skipping {} ({})\n", path, why);
+      AppendError(error, path + ": " + why);
       continue;
     }
-    DebugWrite("gkplus vfs: mounted {}\n", mod.name);
-    ++mounted;
+    Mod *record = const_cast<Mod *>(mod);
+    // A path listed twice keeps its **last** position, because that is the one
+    // that decides what wins.
+    wanted.erase(std::remove(wanted.begin(), wanted.end(), record),
+                 wanted.end());
+    wanted.push_back(record);
   }
-  return mounted;
+
+  std::lock_guard lock(g_mutex);
+  for (Mod *mod : g_enabled) {
+    if (!PHYSFS_unmount(mod->path.c_str())) {
+      DebugWrite("gkplus vfs: cannot unmount {} ({})\n", mod->entry,
+                 PhysfsError());
+    }
+    mod->order = -1;
+  }
+  g_enabled.clear();
+
+  // appendToPath 0: every mount outranks the one before it, so walking the list
+  // forward makes the **last** entry win a conflict - which is the load order
+  // Vfs.h documents, and the direction a mod manager reads in.
+  for (Mod *mod : wanted) {
+    if (!PHYSFS_mount(mod->path.c_str(), nullptr, 0)) {
+      const std::string why = PhysfsError();
+      DebugWrite("gkplus vfs: cannot mount {} ({})\n", mod->entry, why);
+      AppendError(error, mod->entry + ": " + why);
+      continue;
+    }
+    g_enabled.push_back(mod);
+  }
+  for (size_t i = 0; i < g_enabled.size(); ++i) {
+    g_enabled[i]->order = static_cast<int>(i);
+  }
+
+  g_has_mods.store(!g_enabled.empty(), std::memory_order_release);
+  RebuildIndex();
+  DebugWrite("gkplus vfs: {} mod(s) enabled\n", g_enabled.size());
+  return static_cast<int>(g_enabled.size());
 }
 
-bool Mount(const char *path, std::string *error) {
-  if (!path || !*path) {
-    if (error) {
-      *error = "no path given";
-    }
-    return false;
-  }
-  if (!Ensure()) {
-    if (error) {
-      *error = "the mod filesystem is not available";
-    }
-    return false;
-  }
+std::vector<const Mod *> Enabled() {
+  Ensure();
   std::lock_guard lock(g_mutex);
-  // appendToPath 0: every mount outranks the one before it. That is what makes
-  // MountAll's plain ascending walk produce the documented "a later name wins",
-  // and it means a mount at run time beats everything a boot script did.
-  if (!PHYSFS_mount(path, nullptr, 0)) {
-    if (error) {
-      *error = PhysfsError();
-    }
-    return false;
+  std::vector<const Mod *> out;
+  out.reserve(g_enabled.size());
+  for (Mod *mod : g_enabled) {
+    out.push_back(mod);
   }
-
-  Mod mod;
-  mod.path = path;
-  const char *slash = std::strrchr(path, '\\');
-  const char *fwd = std::strrchr(path, '/');
-  if (fwd && (!slash || fwd > slash)) {
-    slash = fwd;
-  }
-  mod.name = slash ? slash + 1 : path;
-  DWORD attrs = GetFileAttributesA(path);
-  mod.archive =
-      attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
-  g_mods.insert(g_mods.begin(), std::move(mod));
-  g_has_mods.store(true, std::memory_order_release);
-  RebuildIndex();
-  return true;
+  return out;
 }
 
 std::optional<std::string> Resolve(const char *engine_path) {
