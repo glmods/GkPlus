@@ -434,7 +434,7 @@ reference to within 0.34. What does not come back at any exposure is the shadow 
 4-5 against 9), which is exactly the contrast the first version had thrown away. The default stays
 at 1.0 because the right value belongs to the level, not to the renderer.
 
-**The 2D layers are out of it entirely** (§4.92). The first cut ran the tonemap over the whole
+**The 2D layers are out of it entirely** (§4.92, §4.95). The first cut ran the tonemap over the whole
 frame, so it ran over the menus, the briefing screens, the HUD and the inventory - all drawn by the
 same world pass, all authored final - and ACES recoloured **99.61% of the main menu**. Making
 `rolloff` the default hid that rather than fixing it. They are now drawn *after* the tonemap and
@@ -483,10 +483,14 @@ three are being crushed today:
 
 ### The four decisions this rests on
 
-**1. Linear input, not extended-range gamma** - and it has to be *every* colour, not just the
-albedos (§4.94), per **layer** rather than per frame (§4.95), and **not** through the fixed-function
-texture combiner, which is a fixed-point unit whose biased ops only mean what they mean on encoded
-values (§4.96). Three domain decisions, each found by a play report rather than by a number. The cheaper design keeps the numbers exactly as they
+**1. Linear OUTPUT, not linear input** - and the name is now a misnomer this file is keeping,
+because that is what the knob is called. §4.94-§4.97 tried decoding the inputs and retracted it over
+four play reports: the albedos crushed chrome, the light colours flattened every falloff, and each
+fix exposed the next term still in the other domain. **No partial decode of a display-referred
+lighting equation preserves what was balanced in it**, and a light multiplying a surface is `a * S`
+in either domain anyway - only sums differ, and every sum here was balanced in the other one. So the
+fixed function runs untouched and one decode at the end puts its result into light, which is where
+the blend and the tonemap want it. The cheaper design keeps the numbers exactly as they
 are and only widens the container, so nothing but over-range changes and the off path is
 bit-identical by construction. That is *not* what is being built. Gunlok's textures and vertex
 colours are gamma-encoded, and every multiply and every framebuffer blend in the frame currently

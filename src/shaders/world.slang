@@ -292,29 +292,26 @@ static const uint kColourVertex = 0x20u;
 
 // GpuFrameData::colour_flags - must match src/VkDraw.h.
 //
-// `kLinearInput` is `render.linear_input`: every colour the pipeline reads is sRGB-decoded on the
-// way in, so the texture cascade, the light sum and the framebuffer blend all run on light rather
-// than on its encoding, and the tonemap pass encodes once on the way out.
+// `kLinearInput` is `render.linear_input`, and after §4.97 it means exactly one thing: **the
+// fragment's final colour is sRGB-decoded on the way out**, at the bottom of `fragment_main`.
+// Everything above that point - the light sum, the material terms, the whole texture cascade -
+// runs on the values Gunlok authored, in the domain it authored them in, untouched.
 //
-// **EVERY colour, and this bit only covers the shader's half of them.** Here that is the unpacked
-// D3DCOLOR vertex colours, which feed the lighting equation. The light and material colours are
-// decoded on the CPU instead, in `StoreColour` in src/D3D8Capture.cpp and in `UploadMapLights`,
-// because they are per draw and per light rather than per pixel and a `pow` in the fragment
-// shader's light loop would be paid eight times over for a value that never changes across a draw.
-// Both halves are gated on `vulkan::LinearInputActive() && !item.ui` - per LAYER, not per frame
-// (§4.95) - which is also what this flag is set from.
+// It got there by three play reports. Decoding the albedos on the way IN crushed the chrome pass,
+// because `ADDSIGNED` is a biased sum and a sum does not survive a decode (§4.96). Decoding the
+// light colours flattened every light's falloff, because the attenuation constants shape a
+// display-referred gradient and applying them in linear then encoding raises their ratio to 1/2.2
+// (§4.97). The pattern is that this game's shading was balanced against a display-referred
+// renderer and **no partial decode of it preserves what was balanced**.
 //
-// **A texture is not decoded on its own**, and §4.96 is why: the fixed-function combiner it feeds
-// is a fixed-point unit on encoded values, so the cascade re-encodes and runs there. What this
-// flag therefore describes is: the lighting equation in linear, the texture stages in the fixed
-// function's own domain, and the framebuffer blend and the tonemap in linear again.
+// What the decode is FOR is downstream of the shading: the framebuffer blend runs on light, so
+// additive fires and flares accumulate past 1 instead of clipping, and the tonemap gets a real
+// over-range. An opaque draw is bit-exact against stock, since the tonemap re-encodes with the
+// inverse curve.
 //
-// **Decoding only the albedos was the first cut and it was wrong** (notes §4.94). The fixed
-// function's job is `albedo * light`, and for a power-law curve `encode(decode(a) * decode(b))` is
-// exactly `a * b` - so decoding both operands leaves a multiply alone and changes only the sums,
-// which is the entire point of a linear pipeline. Decoding one leaves `encode(decode(a) * b)`,
-// which lifts a mid-grey surface under half light by 44% and under quarter light by 105%. That
-// reads as a washed-out image, and it was reported as one.
+// Alpha is never decoded - it is coverage, not light - which also leaves the alpha test's 0..255
+// comparison alone. The **2D layers never take this path at all**: they are drawn after the
+// tonemap and their frame block has `colour_flags` clear (§4.92, §4.95).
 static const uint kLinearInput = 0x1u;
 // `render.hdr` itself. The clamps that reproduce the fixed function's D3DCOLOR output stage come
 // off, so an over-range light survives to the tonemap instead of dying at the last multiply. It is
@@ -330,31 +327,10 @@ float3 srgb_decode(float3 encoded) {
     return select(c <= 0.04045, c / 12.92, pow((c + 0.055) / 1.055, 2.4));
 }
 
-// The exact inverse of `srgb_decode`, and the same curve `tonemap.slang` encodes with. Used for
-// the round trip around the fixed-function texture cascade below - see `encode_for_stages`.
-//
-// Deliberately no clamp at 1 on either side of that pair: `srgb_decode(srgb_encode(x))` has to be
-// x for **any** positive x, including the over-range a lit surface carries under `render.hdr`, and
-// a special case above 1 in one of them would break exactly those values. (`vulkan::SrgbToLinear`
-// on the CPU *does* clamp there, and for a different job - undoing an authoring encoding, which
-// only ever existed in [0,1].)
-float3 srgb_encode_exact(float3 linear_colour) {
-    const float3 c = max(linear_colour, float3(0, 0, 0));
-    return select(c <= 0.0031308, c * 12.92, 1.055 * pow(c, 1.0 / 2.4) - 0.055);
-}
-
-// Applied to a vertex colour, and only when the knob is on. Alpha is never touched anywhere: it is
-// coverage rather than light, it is not gamma-encoded, and the alpha test compares it in 0..255
-// units where a curve would move every threshold in the game.
-//
-// No `>= 1` branch here where `vulkan::SrgbToLinear` has one: a D3DCOLOR cannot exceed 1, where an
-// authored light can and does.
-float4 decode_albedo(float4 c) {
-    return (pc.frame[0].colour_flags & kLinearInput) != 0u ? float4(srgb_decode(c.rgb), c.a) : c;
-}
-
 // The fixed function's output stage, which clamps to a D3DCOLOR. Under `render.hdr` there is a
-// float target to clamp into instead of an 8-bit one, so it does not.
+// float target to clamp into instead of an 8-bit one, so it does not - and that is where the
+// over-range the tonemap compresses comes from. Still clamps at zero: a negative colour is not a
+// quantity the fixed function can produce and would survive into the blend as one.
 float3 clamp_output(float3 c) {
     return (pc.frame[0].colour_flags & kUnclamped) != 0u ? max(c, float3(0, 0, 0)) : saturate(c);
 }
@@ -1078,7 +1054,7 @@ VertexOut shade_surface(float3 local_pos, float3 local_normal, float4 uv, float4
         // the only comparison with a noise floor small enough to see this (§4.21). Neither set
         // means lighting is off, and D3D's lighting-off result is the vertex colour itself.
         output.color = (draw.lighting & kLitCollapse) != 0u
-                           ? decode_albedo(unpack_colour(draw.lit_colour))
+                           ? unpack_colour(draw.lit_colour)
                            : vertex_colour;
         return output;
     }
@@ -1125,7 +1101,7 @@ VertexOut shade_surface(float3 local_pos, float3 local_normal, float4 uv, float4
 VertexOut vertex_main(uint vertex_id: SV_VertexID) {
     Vertex v = pc.vertices[pc.base_vertex + vertex_id];
     VertexOut output = shade_surface(v.pos.xyz, v.normal_and_color.xyz, v.uv,
-                                     decode_albedo(unpack_colour(asuint(v.normal_and_color.w))));
+                                     unpack_colour(asuint(v.normal_and_color.w)));
     // The same values, differing only in how they are interpolated. Mirrored here, at the one
     // exit there is, rather than at each exit of the body above - which is the whole reason the
     // body is a separate function.
@@ -1211,7 +1187,7 @@ ControlPoint tess_vertex_main(uint vertex_id: SV_VertexID) {
     // Unpacked here rather than in the domain shader because the tessellator interpolates it: a
     // packed D3DCOLOR cannot be blended as an integer, and unpacking after interpolation would
     // mean interpolating the *bits*.
-    cp.colour = decode_albedo(unpack_colour(asuint(v.normal_and_color.w)));
+    cp.colour = unpack_colour(asuint(v.normal_and_color.w));
     cp.split = is_split_corner(pc.base_vertex + vertex_id) ? 1u : 0u;
     return cp;
 }
@@ -1767,31 +1743,6 @@ float4 fragment_main(VertexOut input) : SV_Target {
             chrome_texgen = chrome && pc.frame[0].chrome_texgen != 0.0;
         }
     }
-    // --- into the fixed function's own domain for the texture stages ---------------------------
-    //
-    // **The combiner is a fixed-point unit on ENCODED values, and its ops only mean what they mean
-    // there.** A product commutes with the transfer curve - `decode(a) * decode(b)` is
-    // `decode(a * b)` for a power law - so `MODULATE`, which is 267 of level02's 268 stage-0 ops,
-    // does not care which domain it runs in. Nothing else in the set commutes: `ADDSIGNED` is
-    // `a1 + a2 - 0.5` and a sum does not survive a non-linear transform, and neither does
-    // `BLENDTEXTUREALPHA`'s lerp.
-    //
-    // §4.96: running the cascade on decoded operands crushed the chrome pass. Chrome is `ADDSIGNED`
-    // at stage 1 on **90 of level02's 268 draws**, and decoding both operands moves the reflect
-    // level at which a surface goes black from 0.25 to 0.44 - 20% of the chrome pixels clipped to
-    // black against 1.5% before, which a play report described as the effect being clipped under
-    // ACES and filmic. Correcting the bias constant alone is not enough and cannot be: the
-    // *relationship* between the two operands is what the decode changed.
-    //
-    // So the operands go back to where the op was defined, and the RESULT comes out. That also
-    // means a texture is never decoded on its own any more - it enters the cascade as it was
-    // sampled - and the round trip is exact for over-range values because `srgb_encode_exact` and
-    // `srgb_decode` are a true inverse pair with no clamp in either.
-    const bool stages_encoded = (pc.frame[0].colour_flags & kLinearInput) != 0u;
-    if (stages_encoded) {
-        diffuse = float4(srgb_encode_exact(diffuse.rgb), diffuse.a);
-    }
-
     // With every stage disabled the fixed function outputs the diffuse colour alone. That is
     // 2,160 draws a frame on level01 and used to sample whatever texture happened to still be
     // bound at stage 0, because the old path keyed off the binding rather than off COLOROP.
@@ -1844,10 +1795,6 @@ float4 fragment_main(VertexOut input) : SV_Target {
                              ? textures[s.texture].SampleBias(samplers[s.sampler_index], uv,
                                                               chrome_lod)
                              : textures[s.texture].Sample(samplers[s.sampler_index], uv));
-            // **Not decoded here.** It goes into the cascade exactly as sampled, because the
-            // cascade now runs in the encoded domain - see the note above `stages_encoded`. The
-            // decode happens once, on the cascade's result, which is both cheaper and the only
-            // way `ADDSIGNED` means what D3D means by it.
         }
 
         // The fog of war, read as it goes past: `BLENDTEXTUREALPHA(TEXTURE, CURRENT)` on an
@@ -1924,12 +1871,6 @@ float4 fragment_main(VertexOut input) : SV_Target {
     // `fog_visibility` is 1 on every draw with no fog stage - which is every unit, every effect
     // and the whole HUD - so this multiply changes nothing outside the map's own geometry, and
     // nothing at all on a level whose fog is off.
-    // ...and out of the fixed function's domain again, once, on the result. Everything from here
-    // on - the specular add, the tint, the framebuffer blend and the tonemap - is linear.
-    if (stages_encoded) {
-        current = float4(srgb_decode(current.rgb), current.a);
-    }
-
     const float4 lit =
         float4(current.rgb + specular_in + map_specular * fog_visibility, current.a);
 
@@ -1946,7 +1887,36 @@ float4 fragment_main(VertexOut input) : SV_Target {
     // it - including the half the restriction is about to throw away - is the point of looking.
     if ((pc.frame[0].ao_flags & kAoDebug) != 0u && pc.frame[0].ao_texture != kNoTexture) {
         const float value = textures[pc.frame[0].ao_texture].Load(int3(int2(input.position.xy), 0)).x;
-        return float4(value, value, value, lit.a);
+        const float3 grey = float3(value, value, value);
+        // Through the same decode as everything else, so what the tonemap re-encodes is the value
+        // the prepass wrote rather than a curve of it.
+        return float4((pc.frame[0].colour_flags & kLinearInput) != 0u ? srgb_decode(grey) : grey,
+                      lit.a);
     }
-    return lit * tint;
+    // --- and out of the fixed function's domain, once, at the very end -------------------------
+    //
+    // **This single line is what `render.linear_input` now is** (§4.97). Everything above it - the
+    // light sum, the material terms, the texture cascade, the specular add, the override's tint -
+    // has run exactly as Gunlok's fixed function runs it, on the values the game authored, in the
+    // domain they were authored in. What comes out is display-referred, and this turns it into
+    // light so that the framebuffer blend and the tonemap can work on light.
+    //
+    // The reason it is one line and not a decode at each input is the whole of §4.94-§4.97: this
+    // game's shading was balanced by people watching a display-referred renderer, and there is no
+    // *partial* decode of it that preserves what they balanced. Decoding the albedos crushed the
+    // chrome pass, decoding the light colours flattened every light's falloff, and each fix only
+    // exposed the next term still in the other domain. The arithmetic says why linear lighting was
+    // never going to pay here either: `encode(decode(a) * decode(S))` is exactly `a * S` for a
+    // power law, so a light multiplying a surface is the *same* in both domains. Only sums differ,
+    // and every sum in this game was balanced in the other one.
+    //
+    // What is left is what HDR is actually for: the **blend** is linear, so additive fires, flares
+    // and muzzle flashes accumulate past 1 instead of clipping, and the tonemap gets a real
+    // over-range to compress. An opaque draw round-trips `encode(decode(x)) == x` and comes out
+    // bit-exact against the stock renderer.
+    const float4 output_colour = lit * tint;
+    if ((pc.frame[0].colour_flags & kLinearInput) == 0u) {
+        return output_colour;
+    }
+    return float4(srgb_decode(output_colour.rgb), output_colour.a);
 }

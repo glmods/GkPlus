@@ -2790,31 +2790,27 @@ declare module "gk" {
      *  In {@link stock}'s set. `GKPLUS_VK_HDR=1` is the launch-time form. */
     hdr: boolean;
 
-    /** sRGB-decode every colour the pipeline reads. On by default, inert
-     *  without {@link hdr}.
+    /** sRGB-decode the fragment's **final** colour, so the framebuffer blend
+     *  and the tonemap run on light. On by default, inert without {@link hdr}.
      *
-     *  **Every colour, and that has to be all of them**: the albedos (texture
-     *  fetches and unpacked D3DCOLOR vertex colours) and the light and material
-     *  colours alike. The fixed function computes `albedo * light`, and for a
-     *  power curve `encode(decode(a) * decode(b))` is exactly `a * b` - so
-     *  decoding both operands leaves a multiply alone and changes only the
-     *  sums, which is the entire point of a linear pipeline. Decoding only the
-     *  albedos lifts a mid-grey surface under half light by 44% and under
-     *  quarter light by 105%, which reads as a washed-out image; it shipped
-     *  that way once. Above 1.0 the decode is the identity, since sRGB maps
-     *  [0,1] onto [0,1] and Gunlok authors lights well past 1. Alpha is never
-     *  decoded, which leaves the alpha test's 0..255 comparison alone.
+     *  **It decodes the output, not the inputs.** The light sum, the material
+     *  terms, the texture cascade and the specular add all run exactly as
+     *  Gunlok's fixed function runs them, on the values the game authored, in
+     *  the domain it authored them in. Decoding the inputs was tried and
+     *  retracted: no partial decode of a display-referred lighting equation
+     *  preserves what was balanced in it - it crushed the chrome pass, then
+     *  flattened every light's falloff - and a light multiplying a surface is
+     *  the same in either domain regardless. Only sums differ, and every sum in
+     *  this game was balanced in the other one.
      *
-     *  **Expect the frame to get darker, not just more contrasty.** A sum of
-     *  decoded lights is much smaller than the same sum of encoded ones, and
-     *  level02's rig is 51 lights balanced against a gamma-space renderer.
-     *  {@link exposure} is the rebalance - about 1.3 for that level - and it is
-     *  left at 1.0 by default because the right value belongs to the content.
+     *  What it buys is downstream: additive fires, flares and muzzle flashes
+     *  accumulate past 1 instead of clipping at the framebuffer, and the
+     *  tonemap gets a real over-range to compress. An **opaque draw is
+     *  bit-exact against stock**, since the tonemap re-encodes with the inverse
+     *  curve.
      *
-     *  Off is the **bisect**: `hdr` with this off is the same numbers in a
-     *  wider container, nothing but over-range changed - so anything that
-     *  differs between the two settings is the colour work rather than the
-     *  pass. */
+     *  Off is the bisect: `hdr` with this off differs only in that the blend
+     *  stays where it always was. */
     linear_input: boolean;
 
     /** The tonemap operator. Anything not in the union throws rather than

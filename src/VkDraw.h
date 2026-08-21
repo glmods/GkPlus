@@ -1461,16 +1461,16 @@ void ApplySampleCount(uint32_t samples);
 // Three sub-knobs, and they exist so the feature can be bisected on one paused frame rather than
 // argued about:
 //
-//   - `render.linear_input` sRGB-decodes **every** colour the pipeline reads: the albedos in the
-//     shader (`decode_albedo` in world.slang) and the light and material colours on the CPU
-//     (`StoreColour` in src/D3D8Capture.cpp, `UploadMapLights` here), both gated on
-//     `LinearInputActive()`. It has to be all of them - decoding one operand of `albedo * light`
-//     and not the other lifts a mid-grey surface under half light by 44%, which is §4.94 and was
-//     reported as a washed-out image. With it off, `hdr` is the extended-range design: the same
-//     numbers in a wider container, nothing but over-range changed. On by default, since running
-//     the arithmetic on gamma-encoded values is the thing being fixed. **Expect the frame to get
-//     darker** - a sum of decoded lights is smaller than the same sum of encoded ones, and
-//     `render.exposure` is the rebalance.
+//   - `render.linear_input` sRGB-decodes the fragment's **final** colour, one line at the bottom of
+//     `fragment_main`, and nothing else. The light sum, the material terms, the texture cascade and
+//     the specular add all run exactly as Gunlok's fixed function runs them, on the values it
+//     authored, in the domain it authored them in. **Decoding the inputs instead was tried and
+//     retracted over §4.94-§4.97**, four play reports deep: no partial decode of a display-referred
+//     lighting equation preserves what was balanced in it, and a light multiplying a surface is
+//     `a * S` in either domain anyway - only sums differ, and every sum in this game was balanced
+//     in the other one. What the decode is for is downstream: the framebuffer blend runs on light,
+//     so additive draws accumulate past 1 instead of clipping, and the tonemap gets a real
+//     over-range. An opaque draw is bit-exact against stock. On by default.
 //   - `render.tonemap` picks the operator, and **it applies to the world alone**: the 2D layers are
 //     drawn after the tonemap (see `Layer` above, notes §4.92), so no operator reaches Gunlok's
 //     menus, briefing screens, HUD or inventory. That was not always so - before the split ACES

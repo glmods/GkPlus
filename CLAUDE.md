@@ -692,41 +692,24 @@ all: `render.tonemap` takes six operators (`clamp`, `rolloff`, `reinhard`, `aces
 - §4.93), and **`agx` is the one suited to this game's content**, because it keeps hue at the top
 end where ACES turns a `diffuse 4.0` light on a red surface orange. Its matrices are written as
 **rows**, the transpose of every GLSL copy of those numbers, and the check that catches a wrong
-transpose is that each row sums to 1. And the decode covers **every colour the fixed
-function reads**, not just the albedos - §4.94, which was a play report ("it washes the image out")
-and a real defect. The fixed function computes `albedo * light`, and for a power curve
-`encode(decode(a) * decode(b))` is exactly `a * b`, so decoding both operands leaves a multiply
-alone and changes only the sums, which is the whole point. Decoding one lifts a mid-grey surface
-under half light by 44% and under quarter light by 105% - contrast destroyed from the bottom up.
-The albedos are decoded in the shader (per pixel), the light and material colours on the CPU in
-`StoreColour` (per draw and per light); **above 1.0 the decode is the identity**, because sRGB maps
-[0,1] onto [0,1] and extending the formula would turn a `diffuse 4.0` light into 25.3.
-
-**The texture combiner runs in the fixed function's own domain, not in linear** (§4.96, a third
-play report — "linear mode clips the chrome effect"). A product commutes with the transfer curve so
-`MODULATE` does not care where it runs, but `ADDSIGNED` is a biased *sum* and does not survive a
-decode: chrome is `ADDSIGNED` on 90 of level02's 268 draws, and decoding its operands took 20% of
-the chrome pixels to pure black against a reference 0.5%. Correcting the `0.5` bias to
-`srgb_decode(0.5)` is the obvious fix and is **measurably insufficient** — the decode changed the
-relationship between the operands, not just the midpoint. So `fragment_main` re-encodes on the way
-into the stage loop and decodes the result: lighting in linear, texture stages encoded, framebuffer
-blend and tonemap linear. The round trip needs an exact inverse pair with **no clamp above 1**,
-which is why `srgb_encode_exact`/`srgb_decode` in the shader differ from `vulkan::SrgbToLinear`.
-
-**The decode is per LAYER, not per frame** (§4.95, the immediate sequel and a second play report).
-`LinearInputActive()` alone is a statement about the frame; the CPU half has to be
-`LinearInputActive() && !item.ui`, or the 2D layers get decoded colours with nothing to re-encode
-them and the HUD comes out 44% dark. `StoreColour`/`StoreLight` take the flag as a **parameter** so
-no call site can decide for itself, the light-run cache is keyed by the layer as well as the mask,
-and the map rig is uploaded twice. **The standing check is the in-level HUD panel with `render.hdr`
-off vs on** — §4.20 established those panels carry no vertex colour at all, so their colour comes
-entirely from the material through the draw record, which makes them the sharpest probe on any
-change to how it is filled. 0.027 MAD passes. The main-menu test does *not* cover this: the menu
-takes the `kLitCollapse` path, whose colour is computed from `State.material` directly. It reaches 83% of level02
-at 9.56/255 - coverage, not a score - and what that reach *is* on screen is shadow detail rather
-than range: the dark half of the frame becomes legible, the characters get darker because they were
-blowing out, and that frame has almost no over-range in it at all. The fire cameras are where the
-range half still has to be looked at.
+transpose is that each row sums to 1. And **`linear_input` decodes the fragment's
+FINAL colour and not its inputs** (§4.94-§4.97, four play reports deep): the light sum, the material
+terms and the whole texture cascade run exactly as the fixed function runs them, in the domain the
+game authored them in, and one decode at the bottom of `fragment_main` puts the result into light
+so the framebuffer blend and the tonemap can work on it. Decoding the inputs was tried and
+retracted — **no partial decode of a display-referred lighting equation preserves what was balanced
+in it**: decoding the albedos crushed the chrome pass (`ADDSIGNED` is a biased sum and a sum does
+not survive a decode), decoding the light colours flattened every light's falloff by `4:1 → 1.9:1`
+(the attenuation constants shape a display-referred gradient and did not decode with them), and
+each fix only exposed the next term still in the other domain. The arithmetic says why it could
+never pay: `encode(decode(a) * decode(S))` is exactly `a * S`, so a light multiplying a surface is
+the same in either domain — only **sums** differ, and every sum in this game was balanced in the
+other one. What the decode buys is downstream: additive fires and flares accumulate past 1 instead
+of clipping, the tonemap gets a real over-range, and an opaque draw is bit-exact against stock.
+**If a decode is ever added back to `src/D3D8Capture.cpp` it needs the LAYER with it** (§4.95) — the
+2D layers are drawn after the tonemap and nothing re-encodes them; that cost a 44%-dark HUD once,
+and the standing check is the in-level HUD panel with `render.hdr` off vs on, which passes at
+0.027 MAD.
 
 It also draws **ambient occlusion with no blur pass** (`render.ao`, off by default): the sample
 offsets are generated in 2D from one fixed lattice disc shared by every pixel and the 3D position of

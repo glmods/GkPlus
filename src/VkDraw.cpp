@@ -2388,9 +2388,6 @@ bool MapLightingAllEnabled = false;
 float MapLightGainValue = 1.35f;
 // Refilled once a frame in RecordDraws, before any draw is recorded.
 uint64_t FrameMapLightAddress = 0;
-// The same rig with its colours left as authored, for the 2D layer's frame block (§4.95). Equal to
-// 0 whenever the decoded one is.
-uint64_t FrameMapLightRawAddress = 0;
 uint32_t FrameMapLightCount = 0;
 float FrameMapAmbience = 0.0f;
 // What the grid was last built for. The light set is identified by its address and count, which
@@ -3445,7 +3442,6 @@ namespace {
 // RotateFrameScratch would publish the next scene's slice.
 void UploadMapLights() {
   FrameMapLightAddress = 0;
-  FrameMapLightRawAddress = 0;
   FrameMapLightCount = 0;
   FrameMapAmbience = 0.0f;
   if (!MapLightingEnabled) {
@@ -3455,22 +3451,15 @@ void UploadMapLights() {
   if (lights.empty()) {
     return;
   }
-  // **Two copies, and the second is the 2D layer's** (§4.95). The rig is uploaded decoded for the
-  // world pass and raw for the pass that runs after the tonemap, because nothing re-encodes that
-  // one. In practice no 2D draw reaches `map_light_sum` - it needs two texture stages and the HUD
-  // has one - but "in practice" is what left the HUD 44% dark once already, and 51 lights is
-  // 2.4 KB, so the exemption is made exact rather than argued.
-  //
-  // Allocated as one run of 2N so the two are contiguous and the raw half is at a known offset;
-  // the light GRID is built from the decoded half and holds indices rather than colours, so it is
-  // shared by both.
+  // One copy. §4.95 uploaded two - decoded and raw - so the 2D layer could have an undecoded rig;
+  // §4.97 removed every CPU-side decode, so the rig the shader reads is the one the level authored
+  // and both layers want the same bytes.
   const auto count = static_cast<uint32_t>(lights.size());
-  const ScratchAlloc alloc = AllocateScratchMapLights(count * 2);
+  const ScratchAlloc alloc = AllocateScratchMapLights(count);
   if (!alloc.valid || alloc.mapped == nullptr) {
     return; // the slice is full; the frame draws without map lighting rather than half of it
   }
   auto *out = static_cast<GpuMapLight *>(alloc.mapped);
-  GpuMapLight *raw = out + count;
   for (size_t i = 0; i < lights.size(); ++i) {
     const MapLight &light = lights[i];
     GpuMapLight &gpu = out[i];
@@ -3480,19 +3469,8 @@ void UploadMapLights() {
     gpu.position[3] = light.range;
     // Premultiplied here so the shader's inner loop is a multiply-add and nothing else.
     //
-    // **The colour is sRGB-decoded under `render.linear_input` and the brightness is not**, which
-    // is the split the whole feature turns on: the colour is a picture of a light the level's
-    // author picked against a gamma-space renderer, and the brightness is a scalar they multiplied
-    // it by. Decoding one and not the other is what §4.94 was about, one level up.
-    const bool linear = LinearInputActive();
     for (int c = 0; c < 3; ++c) {
-      const float colour = linear ? SrgbToLinear(light.colour[c]) : light.colour[c];
-      gpu.colour[c] = colour * light.brightness;
-    }
-    // The 2D layer's copy: everything the same but the colour left as authored.
-    raw[i] = gpu;
-    for (int c = 0; c < 3; ++c) {
-      raw[i].colour[c] = light.colour[c] * light.brightness;
+      gpu.colour[c] = light.colour[c] * light.brightness;
     }
     gpu.colour[3] = static_cast<float>(light.flags);
     // Row 2 of the orientation - elements 6..8. §4.54 is why this row and not another.
@@ -3508,8 +3486,6 @@ void UploadMapLights() {
   }
   FrameMapLightAddress = ScratchMapLightAddress() + alloc.offset * sizeof(GpuMapLight);
   FrameMapLightByteOffset = ScratchMapLightSliceOffset() + alloc.offset * sizeof(GpuMapLight);
-  // The raw half, for the 2D layer's frame block. Directly after the decoded one.
-  FrameMapLightRawAddress = FrameMapLightAddress + count * sizeof(GpuMapLight);
   FrameMapLightCount = count;
   FrameMapAmbience = MapAmbience();
 }
@@ -3961,13 +3937,6 @@ void UploadFrameData() {
     auto *ui = static_cast<GpuFrameData *>(ui_alloc.mapped);
     *ui = *frame;
     ui->colour_flags = 0;
-    // ...and the map rig's undecoded copy with it. `colour_flags` covers the albedos the shader
-    // decodes; these were decoded on the CPU, so clearing the flag alone would not reach them
-    // (§4.95 - the same mistake, one level down). Falls back to the decoded address when the
-    // second copy did not get allocated, which costs exactness rather than the frame.
-    if (FrameMapLightRawAddress != 0) {
-      ui->map_lights = FrameMapLightRawAddress;
-    }
     UiFrameDataAddress = ScratchFrameAddress() + ui_alloc.offset * sizeof(GpuFrameData);
   }
 }

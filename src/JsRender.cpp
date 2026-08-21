@@ -738,15 +738,14 @@ JSValue SetHdrValue(JSContext *ctx, JSValueConst, JSValueConst value) {
   return JS_UNDEFINED;
 }
 
-// `render.linear_input` - sRGB-decode every colour the pipeline reads, albedos and lights alike.
-// On by default *within* HDR, and inert without it. Off is the bisect: `hdr` with `linear_input`
-// off is the same numbers in a wider container, so anything that changes between the two is the
-// colour work rather than the pass.
+// `render.linear_input` - sRGB-decode the fragment's FINAL colour, so the framebuffer blend and
+// the tonemap run on light. On by default *within* HDR, and inert without it.
 //
-// It decodes the lights as well as the albedos because decoding one operand of `albedo * light`
-// and not the other lifts a mid-grey surface under half light by 44% (notes §4.94). Expect the
-// frame to get **darker**, not just more contrasty - summing decoded lights gives less than
-// summing encoded ones - and `render.exposure` is the rebalance.
+// It decodes the output and not the inputs, which is the conclusion of notes §4.94-§4.97: the
+// shading runs exactly as Gunlok's fixed function runs it, because no partial decode of a
+// display-referred lighting equation preserves what was balanced in it. What this buys is the
+// blend - additive fires and flares accumulate past 1 instead of clipping - and a real over-range
+// for the tonemap. An opaque draw is bit-exact against stock.
 JSValue GetLinearInput(JSContext *ctx, JSValueConst) {
   return JS_NewBool(ctx, vulkan::LinearInput());
 }

@@ -9670,3 +9670,105 @@ decision - after which colours to decode (§4.94) and which *layer* to decode th
 the three together are the shape of the thing: a linear pipeline bolted onto a fixed-function
 renderer has a boundary, and every quantity that crosses it has to be asked which side it belongs
 on.
+
+## 4.97 Every light's falloff went flat, and the answer was to stop decoding the inputs at all
+
+Fourth play report in four commits: "linear_input makes any area influenced by a light
+overwhelmingly flat compared to disabling it". Correct, and this one ends the sequence, because the
+fix is to stop doing the thing the previous three were patching.
+
+### The measurement
+
+Level02 has two fire point lights at `(-12.78, -1.73, 9.71)` and `(-17.22, -1.73, 7.27)`,
+`diffuse 4.00 1.50 0.03`, range 6, attenuation `(0.959, 0.0333, 0.16666)` - read straight out of
+`render.frame_lights`. Put the camera on one and take the mean luminance of the fire-lit wall in
+eight horizontal bands, top to bottom:
+
+| | top → bottom | top/bottom |
+|---|---|---|
+| `hdr = false` | 22.5 22.9 23.1 23.1 23.6 23.4 25.0 **38.8** | 0.58 |
+| `hdr`, `linear_input` off | 23.1 23.8 24.1 24.1 24.9 24.8 27.1 **47.7** | 0.49 |
+| `hdr`, `linear_input` on | 37.2 37.3 37.3 37.1 37.1 36.2 36.2 **44.0** | **0.85** |
+
+The dim end lifts 23 → 37, **+60%**, while the bright end barely moves. The pool spreads out and
+the gradient collapses. On screen the wall stops being a lit surface and becomes a flat orange fill.
+
+### The mechanism, and why it was never going to be patchable
+
+A light's shape on a surface is `k(d)`, the attenuation. Gunlok's `a0/a1/a2` were chosen by
+somebody watching a **display-referred** renderer, where the displayed value is `albedo * k * L`
+directly - so a 4:1 attenuation ratio is a 4:1 ratio on screen. Apply the same `k` in linear and
+encode on output and the displayed ratio becomes `4^(1/2.2) = 1.87:1`. The falloff is compressed by
+the transfer curve, exactly, and there is no light colour to correct for it.
+
+That is the third term of the same equation to come back wrong, and the pattern is the point:
+
+- §4.94 decoded the **albedos** only → chrome's `ADDSIGNED` crushed (a biased sum does not survive
+  a decode).
+- §4.96 moved the **texture cascade** into the encoded domain → chrome fixed.
+- §4.94 also decoded the **light and material colours** → the falloff went flat, because the
+  attenuation that multiplies them did not, and could not.
+
+**No partial decode of a display-referred lighting equation preserves what was balanced in it.**
+Every term - the colours, the attenuation constants, the ranges, the material ambient and emissive,
+the per-stage combiner constants - was tuned against the same display, and decoding any subset puts
+that subset in a different space from the rest.
+
+And the arithmetic says linear lighting was never going to pay for itself here. For a power law
+`encode(decode(a) * decode(S))` is **exactly** `a * S`, so a light multiplying a surface gives the
+same answer in either domain. Only *sums* differ - and every sum in this game, the 51-light map rig
+included, was balanced in the other one. §4.94's own measurement said so and was read the other way:
+the frame went 20.3 to 16.4 because linear summation of a gamma-balanced rig is dimmer.
+
+### What `render.linear_input` is now
+
+**One line, at the bottom of `fragment_main`.** The light sum, the material terms, the whole texture
+cascade, the specular add and the material override's tint all run exactly as Gunlok's fixed
+function runs them, on the values the game authored, in the domain it authored them in. The
+fragment's final colour is sRGB-decoded on the way out, and that is the entire feature:
+
+    the fixed function      the game's own domain, unclamped
+    -> decode once          <- render.linear_input
+    framebuffer blend       linear
+    tonemap                 linear, and encodes
+
+What that keeps is what HDR is actually for. The **blend** is linear, so additive fires, flares and
+muzzle flashes accumulate past 1 instead of clipping at the framebuffer; the tonemap gets a real
+over-range to compress; and bloom has somewhere to live. An **opaque draw round-trips
+`encode(decode(x)) == x` and comes out bit-exact against stock**, which is why every one of the
+four play reports goes away at once.
+
+What it drops is linear multi-light summation, which produced the wash, the darkening and the flat
+falloff and never produced a picture anybody preferred.
+
+### What came out with it
+
+Three commits' worth of machinery is now unnecessary, and removing it is most of the diff:
+
+- **The whole CPU-side decode** - `StoreColour`, `StorePackedColour`, `StoreLight` are plain copies
+  again, and `BuildDrawRecord`'s `linear` no longer exists.
+- **§4.95's layer-aware CPU plumbing**: the `bool linear` parameters, the light-run cache's layer
+  key, and the map rig's second undecoded upload. §4.95's *finding* stands and is why there is a
+  warning comment on `StoreColour` - the 2D layers are drawn after the tonemap and nothing
+  re-encodes them, so a decode that ever comes back to that file needs the layer with it. The
+  exemption itself is unaffected: it is `colour_flags` on the 2D frame block, and the one decode
+  reads that flag like everything else did.
+- **§4.96's cascade round trip**, along with `decode_albedo` and `srgb_encode_exact`. The cascade is
+  in the fixed function's domain because *everything* is now; it needs no round trip to get there.
+  §4.96's finding stands too, and is now structural rather than enforced by a pair of calls.
+
+### Verified
+
+- **The gradient is back**: the wall reads 0.45 top/bottom against `linear_input` off at 0.47,
+  where it was 0.85.
+- **The 2D exemption holds**: the main menu under ACES is 0.566 MAD against `hdr = false`, under
+  its own 0.554 animation floor, and level02's HUD panel is 0.027.
+- **Chrome is exact**: pure-black chrome pixels read **0.51%** under `rolloff` against the
+  reference's **0.52%**. ACES's 5.15% is its toe.
+- Validation clean.
+
+One thing that is *not* the colour space and should not be read as one: with HDR on, the frame is
+still brighter than stock - 46.5 mean against 35.0 at the fire camera. That is `kUnclamped` lifting
+the fixed function's D3DCOLOR clamp, which is deliberate and is where the over-range comes from,
+and `linear_input` accounts for barely any of it (10.5 MAD with it off, 11.5 with it on).
+`render.exposure` is the rebalance.
