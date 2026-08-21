@@ -2790,15 +2790,26 @@ declare module "gk" {
      *  In {@link stock}'s set. `GKPLUS_VK_HDR=1` is the launch-time form. */
     hdr: boolean;
 
-    /** sRGB-decode every albedo the shader reads. On by default, inert without
-     *  {@link hdr}.
+    /** sRGB-decode every colour the pipeline reads. On by default, inert
+     *  without {@link hdr}.
      *
-     *  **Albedo only**: texture fetches and unpacked D3DCOLOR vertex colours,
-     *  which are gamma-encoded pictures of a surface. Deliberately *not* light
-     *  or material colours - those are intensities the game authored as
-     *  numbers, several of them greater than 1, and a curve would bend an
-     *  authored quantity it never went through. Alpha is never decoded
-     *  anywhere, which leaves the alpha test's 0..255 comparison alone.
+     *  **Every colour, and that has to be all of them**: the albedos (texture
+     *  fetches and unpacked D3DCOLOR vertex colours) and the light and material
+     *  colours alike. The fixed function computes `albedo * light`, and for a
+     *  power curve `encode(decode(a) * decode(b))` is exactly `a * b` - so
+     *  decoding both operands leaves a multiply alone and changes only the
+     *  sums, which is the entire point of a linear pipeline. Decoding only the
+     *  albedos lifts a mid-grey surface under half light by 44% and under
+     *  quarter light by 105%, which reads as a washed-out image; it shipped
+     *  that way once. Above 1.0 the decode is the identity, since sRGB maps
+     *  [0,1] onto [0,1] and Gunlok authors lights well past 1. Alpha is never
+     *  decoded, which leaves the alpha test's 0..255 comparison alone.
+     *
+     *  **Expect the frame to get darker, not just more contrasty.** A sum of
+     *  decoded lights is much smaller than the same sum of encoded ones, and
+     *  level02's rig is 51 lights balanced against a gamma-space renderer.
+     *  {@link exposure} is the rebalance - about 1.3 for that level - and it is
+     *  left at 1.0 by default because the right value belongs to the content.
      *
      *  Off is the **bisect**: `hdr` with this off is the same numbers in a
      *  wider container, nothing but over-range changed - so anything that

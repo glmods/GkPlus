@@ -2407,19 +2407,39 @@ uint32_t LitVertexColour() {
 
 // --- the light sum's inputs ------------------------------------------------------------------
 
+// **Every lighting colour the fixed function reads goes through here**, which is why the sRGB
+// decode lives here rather than at each of the eight call sites: the three on a `D3DLIGHT8` and
+// the four on a `D3DMATERIAL8`, plus `D3DRS_AMBIENT` through the packed twin below.
+//
+// Decoding these is not optional once the albedo is decoded, and getting that wrong is §4.94. The
+// fixed function's job is `albedo * light`, and for a power-law curve
+// `encode(decode(a) * decode(b))` is exactly `a * b` - so decoding BOTH operands leaves a multiply
+// alone and changes only the sums, which is the whole point of a linear pipeline. Decoding only
+// the albedo leaves `encode(decode(a) * b)`, which lifts a mid-grey surface under half light by
+// 44% and under quarter light by 105%: shadows lift most, contrast collapses, and the frame reads
+// as washed out.
+//
+// Alpha is never decoded - it is coverage, not light - which also keeps `material_specular[3]`
+// safe, since the caller overwrites it with `D3DMATERIAL8::Power` right afterwards.
 void StoreColour(float *out, const D3DCOLORVALUE &colour) {
-  out[0] = colour.r;
-  out[1] = colour.g;
-  out[2] = colour.b;
+  const bool linear = vulkan::LinearInputActive();
+  out[0] = linear ? vulkan::SrgbToLinear(colour.r) : colour.r;
+  out[1] = linear ? vulkan::SrgbToLinear(colour.g) : colour.g;
+  out[2] = linear ? vulkan::SrgbToLinear(colour.b) : colour.b;
   out[3] = colour.a;
 }
 
 // A D3DCOLOR as four floats, for D3DRS_AMBIENT - which is a packed colour where every other
 // lighting input is a float quad.
 void StorePackedColour(float *out, uint32_t packed) {
-  out[0] = static_cast<float>((packed >> 16) & 0xff) / 255.0f;
-  out[1] = static_cast<float>((packed >> 8) & 0xff) / 255.0f;
-  out[2] = static_cast<float>(packed & 0xff) / 255.0f;
+  const bool linear = vulkan::LinearInputActive();
+  const auto channel = [linear](uint32_t p, int shift) {
+    const float v = static_cast<float>((p >> shift) & 0xff) / 255.0f;
+    return linear ? vulkan::SrgbToLinear(v) : v;
+  };
+  out[0] = channel(packed, 16);
+  out[1] = channel(packed, 8);
+  out[2] = channel(packed, 0);
   out[3] = static_cast<float>((packed >> 24) & 0xff) / 255.0f;
 }
 

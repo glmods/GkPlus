@@ -692,9 +692,15 @@ all: `render.tonemap` takes six operators (`clamp`, `rolloff`, `reinhard`, `aces
 - §4.93), and **`agx` is the one suited to this game's content**, because it keeps hue at the top
 end where ACES turns a `diffuse 4.0` light on a red surface orange. Its matrices are written as
 **rows**, the transpose of every GLSL copy of those numbers, and the check that catches a wrong
-transpose is that each row sums to 1. And the decode is **albedo only** - textures and
-unpacked D3DCOLOR vertex colours, never light or material colours, which are intensities rather
-than pictures and several of which exceed 1. It reaches 83% of level02
+transpose is that each row sums to 1. And the decode covers **every colour the fixed
+function reads**, not just the albedos - §4.94, which was a play report ("it washes the image out")
+and a real defect. The fixed function computes `albedo * light`, and for a power curve
+`encode(decode(a) * decode(b))` is exactly `a * b`, so decoding both operands leaves a multiply
+alone and changes only the sums, which is the whole point. Decoding one lifts a mid-grey surface
+under half light by 44% and under quarter light by 105% - contrast destroyed from the bottom up.
+The albedos are decoded in the shader (per pixel), the light and material colours on the CPU in
+`StoreColour` (per draw and per light); **above 1.0 the decode is the identity**, because sRGB maps
+[0,1] onto [0,1] and extending the formula would turn a `diffuse 4.0` light into 25.3. It reaches 83% of level02
 at 9.56/255 - coverage, not a score - and what that reach *is* on screen is shadow detail rather
 than range: the dark half of the frame becomes legible, the characters get darker because they were
 blowing out, and that frame has almost no over-range in it at all. The fire cameras are where the

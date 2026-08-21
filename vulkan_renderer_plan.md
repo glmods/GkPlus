@@ -417,13 +417,22 @@ Read these before changing the draw path; each cost real time to establish.
 **Phases 1-4 are in and measured (§4.91); phase 5, bloom, is not started.** `render.hdr` draws
 the world into `R16G16B16A16_SFLOAT`, sRGB-decodes every albedo on the way in, lifts the D3DCOLOR
 clamps and tonemaps to the swapchain through a full-screen pass. Off by default and in
-`render.stock`'s set. On level02's settled camera the linear pipeline **reaches 83% of the frame at
-9.56 MAD** against an off-vs-off floor of 0.008 - that is how far it spreads, and it spreads
-everywhere because every lit pixel in the game is one multiply that changed. **What it looks like is
-the actual claim**: shadow detail. Mean level goes 20.3 to 28.3, the ground texture and debris in
-the dark half of the frame become legible where they were black, and the characters get darker
-because they were blowing out. `encode(decode(a) * L)` beats `a * L` everywhere `L < 1`, and
-Gunlok's interiors are lit almost entirely by `L < 1`.
+`render.stock`'s set. On level02's settled camera it reaches ~84% of the frame - that is how far it
+spreads, and it spreads everywhere because every lit pixel in the game is one multiply that changed.
+
+**What it looks like took two goes.** The first shipped decoding the albedos only, and a play report
+said it washed the image out; it did, and §4.94 is why - decoding one operand of `albedo * light`
+and not the other lifts a mid-grey surface under half light by 44% and under quarter light by 105%,
+which is contrast destroyed from the bottom up. Every colour is decoded now, lights and materials
+included, and the frame reads with deep shadows and saturated midtones instead.
+
+**It is now darker than stock rather than brighter**, and that is the sums rather than a second
+defect: a sum of decoded lights is much smaller than the same sum of encoded ones, and level02's rig
+is 51 lights balanced by somebody watching a gamma-space renderer add them up. Whole-frame mean goes
+20.3 to 16.4 at `exposure = 1.0`, and **1.25 to 1.5 puts it back** - at 1.5 the median matches the
+reference to within 0.34. What does not come back at any exposure is the shadow end (p25 stays at
+4-5 against 9), which is exactly the contrast the first version had thrown away. The default stays
+at 1.0 because the right value belongs to the level, not to the renderer.
 
 **The 2D layers are out of it entirely** (§4.92). The first cut ran the tonemap over the whole
 frame, so it ran over the menus, the briefing screens, the HUD and the inventory - all drawn by the
@@ -474,7 +483,8 @@ three are being crushed today:
 
 ### The four decisions this rests on
 
-**1. Linear input, not extended-range gamma.** The cheaper design keeps the numbers exactly as they
+**1. Linear input, not extended-range gamma** - and it has to be *every* colour, not just the
+albedos (§4.94). The cheaper design keeps the numbers exactly as they
 are and only widens the container, so nothing but over-range changes and the off path is
 bit-identical by construction. That is *not* what is being built. Gunlok's textures and vertex
 colours are gamma-encoded, and every multiply and every framebuffer blend in the frame currently

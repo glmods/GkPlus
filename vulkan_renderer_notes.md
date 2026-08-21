@@ -9035,7 +9035,14 @@ blend currently runs on the encoding rather than on the light. `render.linear_in
 knob precisely so the two can be told apart on one paused frame — `hdr` with it off *is* the
 extended-range design.
 
-**2. Albedo only.** A texture fetch and an unpacked D3DCOLOR are gamma-encoded pictures of a
+**2. Albedo only. THIS IS WRONG and §4.94 corrects it** - decoding one operand of a multiply and
+not the other lifts a mid-grey surface under half light by 44%, which was reported as a washed-out
+image. The reasoning below is left because the *shape* of it survives - alpha is still never
+decoded, the lighting maps are still exempt, and the above-1.0 case still needs an answer - but the
+conclusion it reaches about light and material colours is reversed there. What follows is the
+argument as it was made:
+
+A texture fetch and an unpacked D3DCOLOR are gamma-encoded pictures of a
 surface, so they are decoded. A light's colour and a material's are not: they are intensities the
 game authored as numbers, several greater than 1 — `diffuse 4.0` is not a colour in any encoding —
 so decoding them would bend an authored quantity through a curve it never went through. The
@@ -9397,3 +9404,103 @@ toe doing what a toe does; `tonemap_white` is the control if that is not wanted.
 `filmic` and `agx` produce frames that are **byte-identical to each other** (max channel difference
 0) and both sit at 0.567 MAD against `hdr = false`, under that screen's animation floor of 1.137.
 Validation is clean across all six.
+
+## 4.94 "Linear input washes the image out" - it did, and "albedo only" was the reason
+
+A play report, and the fifth in this file to be a real defect: with `render.linear_input` on the
+frame looked washed out. §4.91 had recorded the same effect as a feature - "mean level goes 20.3 to
+28.3 ... on screen it reads as shadow detail" - which was reading a defect as a result.
+
+### The arithmetic
+
+§4.91 decoded the **albedos only**: texture fetches and unpacked D3DCOLOR vertex colours. Light and
+material colours were deliberately left alone, on the reasoning that they are intensities rather
+than pictures and that several exceed 1. That reasoning is wrong, and the way to see it is what the
+fixed function actually computes, which is `albedo * light`.
+
+For a power-law transfer curve, `encode(decode(a) * decode(b))` is **exactly** `a * b`:
+`(a^g · b^g)^(1/g) = a·b`. So decoding *both* operands of a multiply leaves the multiply alone and
+changes only the **sums** - which is the entire point of a linear pipeline, and the only place it
+was ever going to help. Decoding *one* operand leaves `encode(decode(a) * b)`, which is a different
+function entirely:
+
+| albedo | light | was | with albedo-only decode | |
+|---|---|---|---|---|
+| 0.50 | 1.00 | 0.500 | 0.500 | +0% |
+| 0.50 | 0.75 | 0.375 | 0.437 | **+17%** |
+| 0.50 | 0.50 | 0.250 | 0.361 | **+44%** |
+| 0.50 | 0.25 | 0.125 | 0.256 | **+105%** |
+
+Neutral light is unchanged and everything darker is lifted, the more so the darker it is. That is
+not a brightness offset, it is **contrast being destroyed from the bottom up**, and "washed out" is
+the correct description of it. Decoding both operands gives the same table within a few percent of
+the original everywhere - the residual being the linear toe of the piecewise sRGB curve, which a
+pure power does not have.
+
+### The fix
+
+Every colour the fixed function reads is decoded, not just the albedos. The split is by **where**,
+not by what:
+
+- **The shader** decodes the albedos, which are per pixel: the stage fetches and the unpacked
+  vertex colours (`decode_albedo` in `world.slang`).
+- **The CPU** decodes the light and material colours, which are per light and per draw:
+  `StoreColour` in `src/D3D8Capture.cpp` - the one choke point all eight of them pass through, the
+  three on a `D3DLIGHT8` and the four on a `D3DMATERIAL8` - plus `StorePackedColour` for
+  `D3DRS_AMBIENT` and the `UploadMapLights` loop for the `STDLIGHT` rig. Per draw and per light
+  rather than per pixel, so a `pow` in the fragment shader's light loop would be paid eight times
+  over for a value that is constant across the draw.
+
+Both halves gate on one thing, `vulkan::LinearInputActive()` - the request AND a float target to
+decode into - and `vulkan::SrgbToLinear` is the one implementation, which must agree with
+`srgb_decode` in `world.slang` and be the inverse of `srgb_encode` in `tonemap.slang`. Three copies
+of one curve across three files; a discrepancy shows up as a brightness shift rather than as
+anything obviously wrong.
+
+**Above 1.0 the decode is the identity, and that is the rule rather than an edge case.** sRGB maps
+[0,1] onto [0,1]; a value greater than 1 was never encoded, so there is nothing to undo. It matters
+because Gunlok authors lights well over 1 - §4.48 measured level02's key light at `diffuse 4.0` -
+and extending the curve's formula past 1 turns 4.0 into **25.3**, which blows the level out. The
+identity keeps the authored over-range exactly as authored, and is continuous, since the curve
+passes through (1, 1).
+
+The one thing this costs is a **one-frame skew on a knob change**: the CPU half runs at capture time
+on the game thread and the shader's flag is derived in `UploadFrameData` inside `DrawFrame`, so the
+frame on which `render.linear_input` or `render.hdr` moves can have one half switched and not the
+other. Same class as `render.msaa` taking effect next frame, and it self-corrects.
+
+### What it looks like now, and the second half of the story
+
+Level02, settled and paused, whole-frame luminance percentiles. `p25` is the shadow end and is the
+number the complaint was about.
+
+| | mean | p25 | p50 | p75 | p95 |
+|---|---|---|---|---|---|
+| `hdr = false` (reference) | 20.33 | 9.00 | 19.33 | 29.00 | 45.33 |
+| before this section | 28.3 | - | - | - | - |
+| linear, exposure 1.0 | 16.38 | 4.00 | 14.67 | 24.67 | 40.00 |
+| linear, exposure 1.25 | 18.83 | 4.67 | 17.33 | 28.33 | 45.00 |
+| linear, exposure 1.5 | 21.03 | 5.00 | 19.67 | 31.67 | 49.67 |
+
+The wash is gone, and **the frame is now darker than the reference rather than brighter** - 16.4
+against 20.3 at exposure 1.0. That is not the same defect with the sign flipped; it is the *sums*
+doing what a linear pipeline makes them do, and it is expected. Level02's map rig is **51 lights**,
+and a sum of decoded values is much smaller than the same sum of encoded ones -
+`decode(0.5) + decode(0.5) = 0.43` where `0.5 + 0.5 = 1.0`. Those 51 lights were balanced by
+somebody watching a gamma-space renderer add them up, and no conversion preserves both the products
+and the sums of a rig authored that way.
+
+**`render.exposure` is the rebalance, and 1.25 to 1.5 puts level02 back at the reference's level**:
+at 1.5 the median matches to within 0.34 and p95 sits 4 above. What does *not* come back at any
+exposure is `p25`, which stays at 4-5 against the reference's 9 - and that is the point. The
+shadows are genuinely darker now, which is the contrast the albedo-only version had thrown away.
+
+**The default stays at 1.0.** An `exposure` that reads 1.0 and is not neutral would be a trap for
+anyone reading it back, and the right value is content-dependent - it is a property of how a given
+level's rig was balanced, not of the renderer. Level02 wants about 1.3.
+
+One consequence worth knowing: with the lights decoded, **nothing on that frame exceeds 1.0 any
+more** - `clamp` and `rolloff` produce identical output (5.001 vs 4.999 MAD against the reference),
+where before the fix they differed over 0.04% of pixels. The over-range that HDR exists to carry is
+now entirely in the places §4.91 said to look and still has not: the fire cameras, flares, and
+additive effects.

@@ -738,10 +738,15 @@ JSValue SetHdrValue(JSContext *ctx, JSValueConst, JSValueConst value) {
   return JS_UNDEFINED;
 }
 
-// `render.linear_input` - sRGB-decode every albedo the shader reads. On by default *within* HDR,
-// and inert without it. Off is the bisect: `hdr` with `linear_input` off is the same numbers in a
-// wider container, so anything that changes between the two is the colour work rather than the
-// pass.
+// `render.linear_input` - sRGB-decode every colour the pipeline reads, albedos and lights alike.
+// On by default *within* HDR, and inert without it. Off is the bisect: `hdr` with `linear_input`
+// off is the same numbers in a wider container, so anything that changes between the two is the
+// colour work rather than the pass.
+//
+// It decodes the lights as well as the albedos because decoding one operand of `albedo * light`
+// and not the other lifts a mid-grey surface under half light by 44% (notes §4.94). Expect the
+// frame to get **darker**, not just more contrasty - summing decoded lights gives less than
+// summing encoded ones - and `render.exposure` is the rebalance.
 JSValue GetLinearInput(JSContext *ctx, JSValueConst) {
   return JS_NewBool(ctx, vulkan::LinearInput());
 }

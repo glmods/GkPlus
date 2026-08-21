@@ -3464,8 +3464,15 @@ void UploadMapLights() {
     gpu.position[2] = light.position.z;
     gpu.position[3] = light.range;
     // Premultiplied here so the shader's inner loop is a multiply-add and nothing else.
+    //
+    // **The colour is sRGB-decoded under `render.linear_input` and the brightness is not**, which
+    // is the split the whole feature turns on: the colour is a picture of a light the level's
+    // author picked against a gamma-space renderer, and the brightness is a scalar they multiplied
+    // it by. Decoding one and not the other is what §4.94 was about, one level up.
+    const bool linear = LinearInputActive();
     for (int c = 0; c < 3; ++c) {
-      gpu.colour[c] = light.colour[c] * light.brightness;
+      const float colour = linear ? SrgbToLinear(light.colour[c]) : light.colour[c];
+      gpu.colour[c] = colour * light.brightness;
     }
     gpu.colour[3] = static_cast<float>(light.flags);
     // Row 2 of the orientation - elements 6..8. §4.54 is why this row and not another.
@@ -6111,6 +6118,8 @@ bool Hdr() {
 
 void SetLinearInput(bool on) { LinearInputEnabled = on; }
 bool LinearInput() { return LinearInputEnabled; }
+
+bool LinearInputActive() { return ColourFormat == kHdrFormat && LinearInputEnabled; }
 
 void SetTonemap(uint32_t op) { TonemapOp = op; }
 uint32_t Tonemap() { return TonemapOp; }

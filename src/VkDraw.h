@@ -19,6 +19,7 @@
 // GpuMaterial array (§4.30), each interned once a frame. The push constants carry four
 // addresses and three indices, and nothing else.
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -1460,12 +1461,16 @@ void ApplySampleCount(uint32_t samples);
 // Three sub-knobs, and they exist so the feature can be bisected on one paused frame rather than
 // argued about:
 //
-//   - `render.linear_input` sRGB-decodes every albedo the shader reads - textures and unpacked
-//     D3DCOLOR vertex colours, and deliberately NOT light or material colours, which are
-//     intensities rather than pictures (see kLinearInput in world.slang). With it off, `hdr` is
-//     the extended-range design: the same numbers in a wider container, nothing but over-range
-//     changed. On by default, since running the arithmetic on gamma-encoded values is the thing
-//     being fixed.
+//   - `render.linear_input` sRGB-decodes **every** colour the pipeline reads: the albedos in the
+//     shader (`decode_albedo` in world.slang) and the light and material colours on the CPU
+//     (`StoreColour` in src/D3D8Capture.cpp, `UploadMapLights` here), both gated on
+//     `LinearInputActive()`. It has to be all of them - decoding one operand of `albedo * light`
+//     and not the other lifts a mid-grey surface under half light by 44%, which is §4.94 and was
+//     reported as a washed-out image. With it off, `hdr` is the extended-range design: the same
+//     numbers in a wider container, nothing but over-range changed. On by default, since running
+//     the arithmetic on gamma-encoded values is the thing being fixed. **Expect the frame to get
+//     darker** - a sum of decoded lights is smaller than the same sum of encoded ones, and
+//     `render.exposure` is the rebalance.
 //   - `render.tonemap` picks the operator, and **it applies to the world alone**: the 2D layers are
 //     drawn after the tonemap (see `Layer` above, notes §4.92), so no operator reaches Gunlok's
 //     menus, briefing screens, HUD or inventory. That was not always so - before the split ACES
@@ -1481,6 +1486,31 @@ void SetHdr(bool on);
 bool Hdr();
 void SetLinearInput(bool on);
 bool LinearInput();
+
+// Whether the decode is actually happening this frame - `LinearInput()` AND a float target to
+// decode into. `LinearInput()` is the request; this is the answer, and it is what the CPU side
+// must gate on so that its half of the decode agrees with the shader's.
+bool LinearInputActive();
+
+// The sRGB decode, for the colours the CPU converts rather than the shader (see LinearInputActive).
+// **Must agree exactly with `srgb_decode` in world.slang and be the inverse of `srgb_encode` in
+// tonemap.slang** - the three are one curve split across three files, and a discrepancy between
+// them shows up as a brightness shift rather than as anything obviously wrong.
+//
+// **Above 1.0 it is the identity, and that is the whole rule rather than an edge case.** sRGB is a
+// mapping of [0,1] onto [0,1]; a value greater than 1 was never encoded, so there is nothing to
+// undo. It matters here because Gunlok authors lights well over 1 - notes §4.48 measured level02's
+// key light at `diffuse 4.0` - and extending the curve's formula past 1 would turn that into 25.3
+// and blow the level out. Continuous either way, since the curve passes through (1, 1).
+inline float SrgbToLinear(float c) {
+  if (c <= 0.0f) {
+    return 0.0f;
+  }
+  if (c >= 1.0f) {
+    return c;
+  }
+  return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
 // 0 clamp, 1 rolloff, 2 reinhard, 3 aces, 4 filmic (Hable), 5 agx. Out of range is stored as asked
 // and behaves as clamp, the same way `SetMsaa` stores a count the device cannot serve.
 //

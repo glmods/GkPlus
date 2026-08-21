@@ -292,17 +292,24 @@ static const uint kColourVertex = 0x20u;
 
 // GpuFrameData::colour_flags - must match src/VkDraw.h.
 //
-// `kLinearInput` is `render.linear_input`: every ALBEDO the shader reads is sRGB-decoded on the
+// `kLinearInput` is `render.linear_input`: every colour the pipeline reads is sRGB-decoded on the
 // way in, so the texture cascade, the light sum and the framebuffer blend all run on light rather
 // than on its encoding, and the tonemap pass encodes once on the way out.
 //
-// **Albedo only, and that is a decision rather than an omission.** A texture fetch and an unpacked
-// D3DCOLOR are gamma-encoded pictures of a surface, so they are decoded. A light's colour and a
-// material's are neither: they are intensities the game authored as numbers, several of them
-// greater than 1 - notes 4.48 measured level02's key light at `diffuse 4.0`, which is not a colour
-// in any encoding - so decoding them would bend an authored quantity through a curve it never went
-// through. The materials that *do* carry a picture reach the equation as a vertex colour anyway
-// (`D3DMCS_COLOR1` on every lit draw, see fragment_main), and are decoded there.
+// **EVERY colour, and this bit only covers the shader's half of them.** The albedos are here - the
+// stage fetches and the unpacked D3DCOLOR vertex colours. The light and material colours are
+// decoded on the CPU instead, in `StoreColour` in src/D3D8Capture.cpp and in `UploadMapLights`,
+// because they are per draw and per light rather than per pixel and a `pow` in the fragment
+// shader's light loop would be paid eight times over for a value that never changes across a draw.
+// The two halves are gated on one thing, `vulkan::LinearInputActive()`, which is also what this
+// flag is set from.
+//
+// **Decoding only the albedos was the first cut and it was wrong** (notes §4.94). The fixed
+// function's job is `albedo * light`, and for a power-law curve `encode(decode(a) * decode(b))` is
+// exactly `a * b` - so decoding both operands leaves a multiply alone and changes only the sums,
+// which is the entire point of a linear pipeline. Decoding one leaves `encode(decode(a) * b)`,
+// which lifts a mid-grey surface under half light by 44% and under quarter light by 105%. That
+// reads as a washed-out image, and it was reported as one.
 static const uint kLinearInput = 0x1u;
 // `render.hdr` itself. The clamps that reproduce the fixed function's D3DCOLOR output stage come
 // off, so an over-range light survives to the tonemap instead of dying at the last multiply. It is
@@ -321,6 +328,9 @@ float3 srgb_decode(float3 encoded) {
 // Applied to an albedo, and only when the knob is on. Alpha is never touched anywhere: it is
 // coverage rather than light, it is not gamma-encoded, and the alpha test compares it in 0..255
 // units where a curve would move every threshold in the game.
+//
+// No `>= 1` branch here where `vulkan::SrgbToLinear` has one: an albedo comes from a texel or a
+// D3DCOLOR and cannot exceed 1, where a light can and does.
 float4 decode_albedo(float4 c) {
     return (pc.frame[0].colour_flags & kLinearInput) != 0u ? float4(srgb_decode(c.rgb), c.a) : c;
 }

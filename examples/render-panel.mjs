@@ -441,8 +441,9 @@ export function draw_render_panel(ImGui) {
         "of it shadow detail. Off is the shipped renderer.");
     ImGui.BeginDisabled(!hdr);
     toggle(ImGui, "linear_input", "linear_input",
-      "sRGB-decode every albedo on the way in. On is the point of the feature; off " +
-        "is the bisect - same numbers, wider container, only over-range changed.");
+      "sRGB-decode every colour on the way in, lights as well as albedos. On is the " +
+        "point of the feature; off is the bisect. Expect a darker frame - summing " +
+        "decoded lights gives less than summing encoded ones. Exposure rebalances.");
     const op = render.tonemap;
     const picked = ImGui.Combo("tonemap", Math.max(0, TONEMAP_OPS.indexOf(op)), TONEMAP_OPS);
     if (picked.changed) {
