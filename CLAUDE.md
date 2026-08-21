@@ -702,6 +702,17 @@ The albedos are decoded in the shader (per pixel), the light and material colour
 `StoreColour` (per draw and per light); **above 1.0 the decode is the identity**, because sRGB maps
 [0,1] onto [0,1] and extending the formula would turn a `diffuse 4.0` light into 25.3.
 
+**The texture combiner runs in the fixed function's own domain, not in linear** (§4.96, a third
+play report — "linear mode clips the chrome effect"). A product commutes with the transfer curve so
+`MODULATE` does not care where it runs, but `ADDSIGNED` is a biased *sum* and does not survive a
+decode: chrome is `ADDSIGNED` on 90 of level02's 268 draws, and decoding its operands took 20% of
+the chrome pixels to pure black against a reference 0.5%. Correcting the `0.5` bias to
+`srgb_decode(0.5)` is the obvious fix and is **measurably insufficient** — the decode changed the
+relationship between the operands, not just the midpoint. So `fragment_main` re-encodes on the way
+into the stage loop and decodes the result: lighting in linear, texture stages encoded, framebuffer
+blend and tonemap linear. The round trip needs an exact inverse pair with **no clamp above 1**,
+which is why `srgb_encode_exact`/`srgb_decode` in the shader differ from `vulkan::SrgbToLinear`.
+
 **The decode is per LAYER, not per frame** (§4.95, the immediate sequel and a second play report).
 `LinearInputActive()` alone is a statement about the frame; the CPU half has to be
 `LinearInputActive() && !item.ui`, or the 2D layers get decoded colours with nothing to re-encode

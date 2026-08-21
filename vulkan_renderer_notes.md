@@ -9581,3 +9581,92 @@ colour, which is what it does on the original; a mask would have frozen the worl
 instead. Both halves of that table are the design behaving.
 
 Validation clean across a sweep of both knobs, both MSAA counts and HDR toggled twice.
+
+## 4.96 The texture combiner is a fixed-point unit, and a sum does not survive a decode
+
+Third play report in three commits, and correct again: under `render.linear_input` the chrome
+effect looked clipped, most obviously under `aces` and `filmic` whose toes make a crushed shadow
+end unmistakable.
+
+### The census first, because it makes the problem finite
+
+Every texture-stage op in a settled level02 frame, colour and alpha, all 268 draws:
+
+| stage | op | draws |
+|---|---|---|
+| 0 colour | `MODULATE` | 267 |
+| 0 alpha | `MODULATE` | 267 |
+| 1 colour | `ADDSIGNED` | **90** |
+| 1 colour | `BLENDTEXTUREALPHA` | 71 |
+| 1 alpha | `SELECTARG2` | 161 |
+
+Four ops, and nothing else - no `MODULATE2X`, no `MODULATE4X`, no `ADD`, no `SUBTRACT`. Stage 1's
+`ADDSIGNED` is the chrome pass and it is a third of the frame.
+
+### Why decoding the operands broke it
+
+**A product commutes with the transfer curve and nothing else in that list does.** For a power law
+`decode(a) * decode(b) == decode(a * b)`, so `MODULATE` - 267 of the 268 - genuinely does not care
+which domain it runs in. `ADDSIGNED` is `a1 + a2 - 0.5` and a *sum* does not survive a non-linear
+transform; `BLENDTEXTUREALPHA` is a lerp and neither does that.
+
+Concretely, for the chrome stage `current + reflect - 0.5`. A neutral reflect texel is encoded 0.5,
+where the op leaves the surface alone. Decoded it is 0.214, and the op still subtracts 0.5 - so
+every chrome surface loses 0.286 and a neutral reflect turns it black. The reflect level at which a
+surface survives moves from encoded **0.25 to 0.44**, which takes a large part of the map with it.
+
+**Correcting the bias constant is the obvious fix and it is not enough.** The first attempt made the
+constant follow the domain - `0.5` encoded, `srgb_decode(0.5) = 0.21404114` linear - which restores
+the neutral point exactly and is right as far as it goes. Measured, chrome pixels at pure black
+still ran **20.66%** under `rolloff` against the reference's 1.46%. The bias is only one of the
+three terms; what the decode changed is the *relationship* between the two operands, and no choice
+of constant repairs that.
+
+### The fix: run the cascade where the op was defined
+
+`fragment_main` re-encodes the diffuse on the way into the stage loop and decodes `current` on the
+way out. Textures are no longer decoded individually at all - they enter the cascade exactly as
+sampled. So:
+
+    lighting equation      linear      (the sums are the reason the pipeline exists)
+    texture stages         ENCODED     (the combiner's own domain; every constant means what D3D meant)
+    specular add, tint     linear
+    framebuffer blend      linear
+    tonemap                linear
+
+It is also *cheaper* than what it replaces: one encode and one decode per fragment instead of a
+decode per texture fetch per stage.
+
+**The round trip has to be exact for over-range values**, because a lit surface under `render.hdr`
+can exceed 1 going into the cascade. `srgb_encode_exact` and `srgb_decode` in `world.slang` are a
+true inverse pair with **no clamp on either side**, so `decode(encode(4.0))` is 4.0. That is
+deliberately different from `vulkan::SrgbToLinear` on the CPU, which *is* the identity above 1 -
+different job: that one undoes an authoring encoding, and an encoding only ever existed in [0,1].
+
+### The measurements
+
+Chrome pixels isolated by what `render.chrome_scale = 0` changes - 130,478 px, 2.48% of the frame.
+
+| | mean | pure black | blown |
+|---|---|---|---|
+| `hdr = false` (reference) | 53.83 | **0.52%** | 0.06% |
+| `rolloff` | 55.69 | **0.52%** | 0.02% |
+| `aces` | 53.13 | 5.08% | 0.00% |
+| `filmic` | 39.55 | 1.45% | 0.00% |
+
+`rolloff` matches the reference's black fraction exactly. Before the fix the same three read
+**20.66% / 18.41% / 23.06%**. What is left under `aces` is its toe doing what a toe does, and
+`filmic`'s lower mean is the same curve at `tonemap_white = 4` - both are the operator, not the
+combiner.
+
+Validation clean.
+
+### The rule worth carrying
+
+**Anything the fixed function does that is not a product belongs in the fixed function's domain.**
+That covers the combiner's biased and scaled ops, and it is the reason this cannot be fixed one
+constant at a time. It is also the third distinct place the linear pipeline needed a domain
+decision - after which colours to decode (§4.94) and which *layer* to decode them for (§4.95) - and
+the three together are the shape of the thing: a linear pipeline bolted onto a fixed-function
+renderer has a boundary, and every quantity that crosses it has to be asked which side it belongs
+on.
