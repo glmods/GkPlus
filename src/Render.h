@@ -466,6 +466,12 @@ static_assert(offsetof(AwMaterial, next_pass) == 0x38);
 
 // AwTexture IS the texture cache's record - the two are the same 0x34-byte
 // object, not the separate types an earlier revision of this file assumed. The
+// cache that owns it is the `TextureManager` singleton at 0x00803ce0, 0x2c
+// bytes, whose MRU list is 0xc-byte `{AwTexture *data; prev; next}` nodes over
+// an embedded `HashTable<AwTextureNode *>`. A record is **not immortal**: see
+// the eviction gates on `refcount` and `field0x20` below, and the comment on
+// `RimRecords` in src/D3D8Capture.cpp.
+// The
 // chain that proves it: AcquireRimTexture mints the record (path at +0x2c, flags
 // at +0x28), AwShape_TouchTextures looks each of a shape's textures up in the
 // same hash by that +0x2c path and bumps +0x1c, BuildShapeVertexBuffers stores
@@ -483,20 +489,36 @@ struct AwTexture {
   // +0x1c the cache's reference count: AcquireRimTexture bumps it on a hit, and
   // AwShape_TouchTextures bumps it when a shape's texture is found and RESETS it
   // to 0 when it is not - so it counts live users of a cached entry, and a miss
-  // deliberately starts the count over.
+  // deliberately starts the count over. It is also the first of the two gates
+  // eviction consults: TextureManager_EvictOneUnused skips any record whose
+  // value here is non-zero (CMP [ECX+0x1c],0 / JNZ @ 0x005a17f3).
   int refcount;    // +0x1c
   // +0x20 also incremented per use, by BuildShapeVertexBuffers. Only that one
-  // site is established, so it is kept apart from `refcount`.
+  // site is established, so it is kept apart from `refcount`. It is the second
+  // eviction gate: with it non-zero the record is kept and merely has +0x00,
+  // +0x04, +0x08 and +0x0c nulled (0x005a1854, 0x005a18b0).
   int field0x20;
-  uint8_t unk0x24[0x4];
+  // +0x24 read and written as a BYTE, not a dword. When it is set,
+  // TextureManager_EvictOneUnused subtracts (unk0x14 * unk0x10) >> 12 from the
+  // VRAM page counter at 0x006ab978 and clears it (0x005a1802-0x005a181a);
+  // AcquireRimTexture inits it with MOV byte ptr [ESI+0x24],0 @ 0x005a16aa.
+  bool vram_counted; // +0x24
+  uint8_t unk0x25[0x3];
   unsigned flags;  // +0x28 the flags AcquireRimTexture was called with
   char *path;      // +0x2c strdup'd, and the key the cache hashes
-  uint8_t unk0x30[0x4];
+  // +0x30 OWNED, like `path`: AcquireRimTexture inits it null, the loader
+  // TextureManager_LoadPending strdups the process cwd into it when it is null,
+  // and TextureManager_EvictOneUnused frees it (0x005a187e). Kept a raw pointer
+  // rather than `pool_string` only because `path` beside it already is one and
+  // has readers; both are the record's to free.
+  char *directory; // +0x30
 };
 static_assert(sizeof(AwTexture) == 0x34);
 static_assert(offsetof(AwTexture, translucent) == 0x18);
 static_assert(offsetof(AwTexture, refcount) == 0x1c);
+static_assert(offsetof(AwTexture, vram_counted) == 0x24);
 static_assert(offsetof(AwTexture, path) == 0x2c);
+static_assert(offsetof(AwTexture, directory) == 0x30);
 
 // The D3DLIGHT8 the engine hands to IDirect3DDevice8::SetLight, spelled out
 // rather than pulled in from d3d8.h - the same choice LightSet's material makes.

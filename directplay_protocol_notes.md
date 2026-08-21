@@ -216,9 +216,18 @@ else for each player p != server:
 
 Key transport behaviours:
 
-- **`coords`** is the world position used for *spatial relevance culling*. Callers that must reach
-  everyone pass `(0,0,0)` (the sentinel `FloatZero` @ `0x007f5f40`, zero in BSS); position updates pass the
-  entity's real position so far-away players can be skipped.
+- **`coords` is a spatial relevance filter and is NOT PAYLOAD.** It never crosses the wire: the
+  message size is `EDX` alone, and on the single-player loopback path (`[0x007b9dec] == 0`) the whole
+  function degenerates to `MsgQueue_Push(0x7ba38c, buf, size)` with `coords` **ignored entirely**.
+  Callers that must reach everyone pass `(0,0,0)` (the sentinel `FloatZero` @ `0x007f5f40`, zero in
+  BSS), which skips the test; otherwise `IsRelevantToPlayer` @ `0x00511250` culls per player, so
+  position updates pass the entity's real position and far-away players are skipped.
+  **Any row in §7 that reads a trailing `Vec3` as payload is wrong for that reason** — the by-value
+  `Vec3f` at `[EBP+0xc..0x14]` is this parameter, not the tail of the message. Worked example, the
+  three `AiThink_Bot` alert broadcasts: `0x00453ed6` -> `0x63` with `coords` = **the actor's own
+  position**, so it is proximity-culled; `0x00453f46` -> `0x63` with `coords` **zeroed**, so it reaches
+  all players; `0x00454055` -> `0x62` with `coords` zeroed. Same id, two different audiences,
+  8 bytes on the wire either way.
 - **Reliability** = the `guaranteed` byte -> `DPSEND_GUARANTEED`. Reliable messages ignore the
   backlog throttle.
 - **Backpressure/throttle**: per-player `PlayerMsgBacklog` counter; when a player is backed up,
@@ -287,13 +296,13 @@ lobby message, since no executor is running then.
 | `0x07` | - | (in-switch) | ready ping -> server replies via `Send` with a 4-byte `{2}` |
 | `0x08` | - | (in-switch) | inventory/pickup spawn batch (iterates vulnerability list) |
 | `0x09` | 12 | `Unit_SendStop` (slot 73) | **stop**: `MobileActor::StopAndBroadcast(actor, time)` then `ClearOrderQueue`, sets `Actor+0x12d`. Arm `0x00509ddc` |
-| `0x0a`/`0x0c` | 24 | `Unit_SendAttackPositionImmediate` (slot 75, was `Unit_SendMoveOrder`) | **immediate attack at a position — not a move order.** `Actor` slot 97 `AttackPosition(&pos, order_time, 0, close_range)` then `ClearOrderQueue`. `0x0c` is the **close-range lob**, selected by `KeyModifierState & 2`, not a queued variant. No arm in this table calls the move primitive `MobileActor::Goto` (slot 88) at all — see `orders_notes.md` §8.4. Arm `0x00509e91` |
-| `0x0b`/`0x0d` | 16 | `Unit_SendAttackTargetImmediate` (slot 74) | **immediate attack target** -> `Actor` slot 96 `AttackTarget` then `ClearOrderQueue`. Arm `0x00509fae` |
-| `0x0e` | 16 | `Unit_SendStopAttack` (slot 76) | **stop attacking** -> `Actor` slot 98 `StopAttacking` @ `0x00540f20`. Arm `0x0050a028` |
-| `0x0f`/`0x10` | 16 | `Unit_SendInteract` (slot 100) | interact -> `MobileActor::EquipItemInSlot(arg1, arg2, 1)` |
-| `0x11`/`0x12` | 12 | `Unit_SendEquip` (slot 101) | equip object |
+| `0x0a`/`0x0c` | 24 | `Unit_SendAttackPositionImmediate` (slot 75, was `Unit_SendMoveOrder`) | **immediate attack at a position — not a move order.** `Actor` slot 97 `AttackPosition(&pos, order_time, 0, close_range)` then `ClearOrderQueue`. `0x0c` is the **close-range lob**, selected by `KeyModifierState & 2`, not a queued variant. No arm in this table calls the move primitive `MobileActor::Goto` (slot 88) at all — see `orders_notes.md` §8.4. Arm `0x00509e91`; the dispatch is `CALL [EDX+0x184]` @ `0x00509eba` with 0x10 bytes pushed. **UNGUARDED SLOT DISPATCH — see `game_defects_notes.md`**: the arm resolves the wire id through `GetActorById` with no class check and calls the slot index unconditionally, so a class whose vtable is shorter dispatches out of range. |
+| `0x0b`/`0x0d` | 16 | `Unit_SendAttackTargetImmediate` (slot 74) | **immediate attack target** -> `Actor` slot 96 `AttackTarget` then `ClearOrderQueue`. Arm `0x00509fae`; the dispatch is `CALL [ESI+0x180]` @ `0x00509fe4` with 0x10 bytes pushed. **UNGUARDED SLOT DISPATCH — see `game_defects_notes.md`**: the arm resolves the wire id through `GetActorById` with no class check and calls the slot index unconditionally, so a class whose vtable is shorter dispatches out of range. |
+| `0x0e` | 16 | `Unit_SendStopAttack` (slot 76) | **stop attacking** -> `Actor` slot 98 `StopAttacking` @ `0x00540f20`. Arm `0x0050a028`; the dispatch is `CALL [EDX+0x188]` @ `0x0050a03f` with only **0x04** bytes pushed. **UNGUARDED SLOT DISPATCH — see `game_defects_notes.md`**: the arm resolves the wire id through `GetActorById` with no class check and calls the slot index unconditionally, so a class whose vtable is shorter dispatches out of range. This is the cheapest of the five to loop, and therefore the one to reach for when reproducing the drift. |
+| `0x0f`/`0x10` | 16 | `Unit_SendEquipItemInSlot` (slot 100) | **equip an item into a body slot**. `0x0f` immediate, arm `0x0050a1d7` -> `MobileActor::EquipItemInSlot(slot, item_id, 1)`; `0x10` queued, arm `0x0050a204` -> `PendingOrder` **kind 5**. Renamed from `Unit_SendInteract`; see `orders_notes.md` §3 |
+| `0x11`/`0x12` | 12 | `Unit_SendUseItem` (slot 101) | **use an inventory item**. `0x11` immediate, arm `0x0050a2fb` -> `MobileActor::UseInventoryItem(item_id, 1)`; `0x12` queued, arm `0x0050a325` -> `PendingOrder` **kind 7**. Renamed from `Unit_SendEquip` |
 | `0x13`/`0x14` | 12 | `Unit_SendDropItem` (slot 102) | **drop item** -> `MobileActor::DropItem` @ `0x00538240` |
-| `0x15`/`0x16` | 12 | `Unit_SendUseItem` (slot 104) | use/remove inventory item -> re-broadcasts update `0x80` |
+| `0x15`/`0x16` | 12 | `Unit_SendUnequipItem` (slot 104) | **unequip the body slot holding an item**. `0x15` immediate, arm `0x0050a39d`: walks the equipped list for the entry whose item id matches, calls `MobileActor::UnequipSlot` @ `0x00536ec0` and broadcasts update `0x80` from `0x0050a478`; `0x16` queued, arm `0x0050a49a` -> `PendingOrder` **kind 9**. Renamed from `Unit_SendUseItem` |
 | `0x17`/`0x18` | 24 | `Unit_SendGiveItem` (slot 103) | **give an inventory item to another actor** — see the subsection below. `0x17` arm `0x0050a22f` (immediate); `0x18` arm `0x0050a2b7` (queued), which calls `MobileActor::QueueGiveItemOrder` @ `0x00538f80` at `0x0050a2e8` |
 | `0x19` | 12 | `Unit_SendSetAmmoType` | select ammo type, **immediate** |
 | `0x1a` | - | (in-switch) | select ammo type, **queued** -> slot 85 |
@@ -322,11 +331,18 @@ Many rows carry two ids, and **the two spacings mean different things**. Getting
 made every `+2` pair read as a queued order that does not exist.
 
 - **`+1` pairs are immediate/queued.** The sender takes a trailing `bool queued` and picks the id
-  with a literal: `Unit_SendInteract` does `CMP byte [EBP+0x10],0` then `MOV [EBP-0x14],0x10`
-  (queued) or `0xf` (immediate), and the queued arm additionally calls a local order-queue helper.
+  with a literal: `Unit_SendEquipItemInSlot` (slot 100, was `Unit_SendInteract`) does
+  `CMP byte [EBP+0x10],0` then `MOV [EBP-0x14],0x10` (queued) or `0xf` (immediate), and the queued
+  arm additionally calls a local order-queue helper.
   This holds for the `Unit` slots 100-104 (`0x0f`/`0x10`, `0x11`/`0x12`, `0x13`/`0x14`,
   `0x15`/`0x16`, `0x17`/`0x18`) and for `0x19`/`0x1a`. The odd member is immediate, the even one
   queues a `PendingOrder`.
+  **That is more than a naming convention — it is the tool that settled order kinds 5, 7 and 9.**
+  Because the odd arm calls the callee *directly* while the even arm only enqueues, each immediate
+  arm is a literal statement of what its queued twin means, with no naming chain in between:
+  `0x0f` -> `EquipItemInSlot(slot, item, 1)` so kind 5 is **equip**; `0x11` -> `UseInventoryItem`
+  so kind 7 is **use item**; `0x15` -> the inventory walk + `UnequipSlot` + broadcast `0x80` so
+  kind 9 is **unequip**. `orders_notes.md` §3.
 - **`+2` pairs are one command, and the second id means `close_range`.** `0x0a`/`0x0c`,
   `0x0b`/`0x0d`, `0x1d`/`0x1f` and `0x1e`/`0x20` are each a *single* command; the sender has **no**
   `queued` argument at all and selects the id from `TEST byte ptr [KeyModifierState],0x2`, i.e.
@@ -566,39 +582,39 @@ and the producing function (name conveys semantics). `R` = sent reliably (guaran
 | `0x00` | var | (HUD) | on-screen/objective string (string at payload `+0x10`, GameState==5) |
 | `0x01` | var | (HUD) | on-screen/status string (string at payload `+0x10`) |
 | `0x03` | 8 | (per-actor) | **unit is now live on this client** -> `ClientActivateUnit` @ `0x004fde10`: sets `Unit+0x210 = 1`, and on the *first* one (`ObjectList_count == 0` and not single-player) also snaps `CameraCoords` onto `Unit+0x98` and `CameraDistance1 = CameraDistance2` |
-| `0x1e` | 16 | `SyncPositionAndBroadcast` | position/velocity update |
+| `0x1e` | 16 | `Update` | position/velocity update. **Client-side, this arm also dispatches `Unit` slot 96** — `CALL [EDX+0x180]` @ `0x004fe957`, 0x08 bytes pushed, on a `GetUnitById` result with no class check. See `game_defects_notes.md`. |
 | `0x37` | 20 | (`ApplyDamage`/case 0x27) | health/armor/shield status `{actorId, strength, shield, armor}` |
-| `0x39` | 80 | `MobileActor::SetMoveDestinationAndBroadcast` @ `0x00539540` | **move order issued**: `{id, actorId, MotionSnapshot[0x30], Vec3 destination, Vec3 current_waypoint}` (see §8.12). Unreliable |
+| `0x39` | 80 | `MobileActor::SetMoveDestinationAndBroadcast` @ `0x00539540` | **move order issued**: `{id, actorId, MotionSnapshot[0x30], Vec3 destination, Vec3 current_waypoint}` (see §8.12). Unreliable. **The client arm dispatches `Unit` slot 98** — `CALL [EDX+0x188]` @ `0x004fdf16`, 0x0c bytes pushed, on a `GetUnitById` result with no class check. See `game_defects_notes.md`. |
 | `0x3a` | 24 | `ExecutorThreadProc` | (session/turn-related state) |
-| `0x3b` | 56 | `MobileActor::BroadcastStopAtPosition` @ `0x00539d40` | **stop at own position**: `{id, actorId, MotionSnapshot[0x30]}`. Unreliable |
+| `0x3b` | 56 | `MobileActor::BroadcastStopAtPosition` @ `0x00539d40`; **also `MobileActor::Update` @ `0x00533720`**, sites `0x00534e9d` and `0x00534f19` | **stop at own position**: `{id, actorId, MotionSnapshot[0x30]}`. Unreliable. The two `Update` sites share one buffer and one **computed** id — see the note under "How this table was verified" |
 | `0x3c` | 56 | `MobileActor::StopAndBroadcast` @ `0x00539bd0` | **stop**: `{id, actorId, MotionSnapshot[0x30]}`. Unreliable |
-| `0x3d` | 56 | `CommandTeleport`, `CommandTeleportAndOrientate`, `EvaluateTriggers`, `MobileActor::Die` | teleport / full move+orient (also destructible death) |
+| `0x3d` | 56 | `CommandTeleport`, `CommandTeleportAndOrientate`, `EvaluateTriggers`, `MobileActor::Die`; **also `MobileActor::Update` @ `0x00533720`**, sites `0x00534e9d` and `0x00534f19` | teleport / full move+orient (also destructible death). Same computed-id note as `0x3b` |
 | `0x3e` | 12 | `Decoy_Dismiss` @ `0x00450f60`, `Mine_OnDeployed` @ `0x0045a640` | decoy dismissed / expiry reset `{actorId, 0x7fffffff}` |
 | `0x3f`/`0x40` | 24 | `CharacterActor::AttackPosition` @ `0x00540a10` | **attack a ground position** (`Actor` slot 97), `0x40` = `close_range_attack`. `RET 0x10`; broadcast site `0x00540c01`, `id = 0x3f + (this->close_range_attack != 0)`. Payload `{u32 id, u32 actor_id, f32 Actor+0x88, Vec3f pos @ +0x0c..+0x14}`. Shared client arm `0x004fe6a9` -> `Unit` slot `+0x1b4` (index 109) `SetAttackPosition`, with the flag recovered from the id (`CMP ESI,0x40 ; SETZ CL ; MOVZX EAX,CL ; PUSH EAX` -> last argument). **No longer PROPOSED.** See the note after this table for the `+0x08` asymmetry against `0x41`/`0x42` |
 | `0x41`/`0x42` | 16 | `CharacterActor::AttackTarget` @ `0x00540c60` (`Actor` slot 96) | **attack target**, `0x42` = `close_range`. `RET 0x10`; broadcast site `0x00540ede`, `id = 0x41 + (close_range_attack != 0)`. Payload `{u32 id, u32 attacker_id, f32 order_time, u32 target_id}`. The client applies it in `ApplyUpdateMessage` @ `0x004fe735` (shared arm `0x004fe6f2`): `CMP dword [EDI],0x42 ; SETZ CL` for the flag, `GetActorById(msg+0xc)` for the target, then `Unit` slot 108 (`+0x1b0`) `Unit_SetAttackTarget` @ `0x004c32a0`. Matches `actor_vtable_notes.md` slot 96's computed id `0x41 + close_range` |
 | `0x44` | 12 | `StopAttacking` | stop attacking |
-| `0x45` | 8 | `SyncPositionAndBroadcast` | position keyframe (short) |
+| `0x45` | 8 | `Update` | position keyframe (short) |
 | `0x46` | 64 | `SpawnProjectileActor` @ `0x00503bd0` | **spawn projectile / weapon fire** `'F'` (see §8.6) |
 | `0x48` | 56 | `MobileActor::Die` | **death** (non-destructible) `R` (see §8.5) |
 | `0x49` | 8 | `Delete` | delete actor |
 | `0x4d` | 9 | `Actor_FixupAfterLoad` @ `0x005317b0` | what a **restored** actor publishes: `{u32 0x4d, u32 actorId, u8 is_concealed}` (`MobileActor+0x186`), emitted only when `is_crouched` (`MobileActor+0x187`) is set. Unreliable |
-| `0x4f` | 25 | `MobileActor::UseInventoryItem` @ `0x005370d0`, `OnPickedUp`, `SyncPositionAndBroadcast` | equip + position; from `UseInventoryItem` this is the pickup-class-5 path (mine laid) |
-| `0x50` | 12 | `ChangeOwnerAndTeam`, `CommandGiveControl`, `ReleaseFromOwner`, `SyncPositionAndBroadcast`, `ReapDroppedPlayers` | owner/team change, `{u32 id, u32 actor_id, u32 team}`; on the `ReleaseFromOwner` path the team is the **literal 2** (`PUSH 2` @ 0x00530801). `ReapDroppedPlayers` emits one per actor it transfers off a dropped player's team, paired with `0x91`. Note `CommandGiveControl` and `ReapDroppedPlayers` reach this **without** calling slot 80: they write `Actor+0xbc` and call slot 33 directly, so they are *not* writers of `Actor+0x28`/`+0x2c`. The only slot-80 dispatch in the binary is 0x0053f78d |
-| `0x51` | 16 | `EvaluateTriggers`, `SyncPositionAndBroadcast` | position (trigger-driven) |
+| `0x4f` | 25 | `MobileActor::UseInventoryItem` @ `0x005370d0`, `OnPickedUp`, `Update` | equip + position; from `UseInventoryItem` this is the pickup-class-5 path (mine laid) |
+| `0x50` | 12 | `BeginTeamOverride`, `CommandGiveControl`, `EndTeamOverride`, `Update`, `ReapDroppedPlayers` | owner/team change, `{u32 id, u32 actor_id, u32 team}`; on the `EndTeamOverride` path the team is the **literal 2** (`PUSH 2` @ 0x00530801). `ReapDroppedPlayers` emits one per actor it transfers off a dropped player's team, paired with `0x91`. (Slots 80/81 were named `ChangeOwnerAndTeam`/`ReleaseFromOwner` until round 4; neither body touches an owner.) Note `CommandGiveControl` and `ReapDroppedPlayers` reach this **without** calling slot 80: they write `Actor+0xbc` and call slot 33 directly, so they are *not* writers of `Actor+0x28`/`+0x2c`. The only slot-80 dispatch in the binary is 0x0053f78d |
+| `0x51` | 16 | `EvaluateTriggers`, `Update` | position (trigger-driven) |
 | `0x52` | 8 | `EvaluateTriggers` | trigger event |
-| `0x53` | 16 | `SyncPositionAndBroadcast` | position |
-| `0x54` | 8 | `SyncPositionAndBroadcast` | position (short) |
+| `0x53` | 16 | `Update` | position |
+| `0x54` | 8 | `Update` | position (short) |
 | `0x55` | 12 | `SetHealth` | **set health** `{actorId, f32 health}` `R` (see §8.2) |
 | `0x56` | 16 | `SetTarget` | set attack target, `{u32 id, u32 actor_id, f32 now, f32 deadline}` - **no team field**. Buffer fills at `EBP-0x38` @ 0x005302bf/0x005302c6/0x005302c9/0x005302b3 |
 | `0x57` | 8 | `ClearTarget` | clear target, `{u32 id, u32 actor_id}` |
-| `0x58` | 20 | `ChangeOwnerAndTeam` | the **timed team override**: `{u32 id, u32 actor_id, u32 team, f32 now, f32 deadline}`. Measured from `EDX = 0x14` and the buffer fills at `EBP-0x48` (@ 0x005304c3 id, 0x005304ca actor_id, 0x005304d0 team, 0x005304cd `now`, 0x005304b7 `deadline`) - note **team precedes the two floats**. Both trailing dwords are `float` seconds (`Actor+0x28`/`+0x2c`) and no conversion happens anywhere on the send path, so the network image is the raw float bits. This row used to read "owner+team+extra" |
-| `0x59` | 8 | `ReleaseFromOwner` | release from owner, `{u32 id, u32 actor_id}`. Followed by an `0x50` carrying team = literal 2 |
+| `0x58` | 20 | `BeginTeamOverride` (slot 80) | the **timed team override**: `{u32 id, u32 actor_id, u32 team, f32 now, f32 deadline}`. Measured from `EDX = 0x14` and the buffer fills at `EBP-0x48` (@ 0x005304c3 id, 0x005304ca actor_id, 0x005304d0 team, 0x005304cd `now`, 0x005304b7 `deadline`) - note **team precedes the two floats**. Both trailing dwords are `float` seconds (`Actor+0x28`/`+0x2c`) and no conversion happens anywhere on the send path, so the network image is the raw float bits. This row used to read "owner+team+extra". **The receive path exists** — client arm **`0x004fe662`**, reached by id `0x58` alone: `GetUnitById(msg[+0x04])`, null-check, then `CALL [vtbl+0x164]` = `Unit` slot 89, `Unit_ChangeOwnerAndTeam` @ `0x004b8b00` (`TurretUnit` overrides it at `0x004ccbc0`, which calls `Deploy(0)` and tail-forwards). It writes `Unit+0x18 = now` and `Unit+0x1c = deadline` as **raw dwords** and plays sound `0x4d`. **The argument order is not the wire order**: the arm pushes `msg[+0x08]` (team) -> arg3, `msg[+0x10]` (deadline) -> arg2, `msg[+0x0c]` (now) -> arg1. **arg3, the team, is never read** — and that is redundancy, not a bug: the team is applied by the companion `0x50` (arm `0x004fe408` -> `Unit_SetTeam` @ `0x004cf3b0`), which is exactly why the sender emits a 20-byte `0x58` and then a 12-byte `0x50`. |
+| `0x59` | 8 | `EndTeamOverride` (slot 81) | the timed team override **expiring**, `{u32 id, u32 actor_id}`, unreliable. Followed by an `0x50` carrying team = literal 2. Client arm **0x004fe68a** -> `Unit` slot 90 (`Unit_ReleaseFromOwner` @ 0x004b8b30), which zeroes `Unit+0x1c`/`+0x18` and plays sound 0x4e. Expiry is **executor-driven**: no float read of `Unit+0x18`/`+0x1c` exists in the client outside the ctor, so the client waits for this message rather than timing out locally |
 | `0x5a` | 12 | `MobileActor::AssignToTeamSlot` @ `0x00532d40` | **team-slot assignment / recruit**, `{u32 0x5a, u32 actorId, u32 team_slot}` `R`. Not CTF. It also sets `TeamSlots[n]+0xa0` and `+0x74`, calls `Actor` slot 26 `SetField0x18c`, and — for the role named `Hark` specifically — ORs `0x1000` into `nav_agent->traversal_flags` (`NavAgent+0x2c`), a character-specific nav capability grant |
 | `0x5b`-`0x5d` | 12 | `0x00532e80` / `0x00532fe0` / `OnFlagCaptured` | CTF/objective state updates; `0x5d` is **flag captured** `{actorId, playerIdx}` `R` |
 | `0x5f` | 60 | `MobileActor::AddWalkingSpeed` @ `0x00539ed0` | `{u32 0x5f, u32 actorId, s32 speed_delta, MotionSnapshot[0x30]}` `R`. **Never sent by the shipped binary** — the sender has no callers and no pointer to it exists anywhere in `.rdata`/`.data`, so it is not a vtable slot either |
 | `0x60` | 8 | `AiThink_Bot` @ `0x00451220`, sites `0x0045473e` / `0x00454d25` | **alert state -> 4** ("alarm pending"), no deadline. Client arm `0x005004e2`: `MOV dword [EAX+0x24],4` @ `0x005004ff` + `PlaySoundOnObject(0x24)` |
 | `0x61` | 8 | `AiThink_Bot`, sites `0x00454854` / `0x00454e3b` | **alert state -> 2** ("broadcasting alarm"), deadline `now + 1 * ticks_per_second`. Client arm `0x00500515`: `Unit+0x24 = 2` @ `0x00500527`, the same 1 s written 64-bit into `Unit+0x88`/`+0x8c` (`MOV [EDI+0x88],EAX ; ADC EDX,0 ; MOV [EDI+0x8c],EDX` @ `0x00500553`/`0x0050055f`), clears bit 1 of `emitter_a[+0x08]`; if vtable slot `+0x90` returns true it also arms a 2 s timer at `Unit+0x138` |
-| `0x62` | 8 | `AiThink_Bot`, site `0x00454055`; **also `CharacterActor::Update` @ `0x0053d8d0`, site `0x0053f87b`** | **alert state -> 0** (clear), `ai_state = 3`. Client arm `0x005005bc`: `PlaySoundOnObject(0x25)` if still alerted, special-cases the role named `technobox` (9-byte compare) to sound `0x4e`, `Unit+0x24 = 0`, and **sets** bit 1 of `emitter_a[+0x08]`. This row previously read "position (short)" with `SyncPositionAndBroadcast` as the sender; both halves were wrong — see the correction note below the table |
+| `0x62` | 8 | `AiThink_Bot`, site `0x00454055`; **also `CharacterActor::Update` @ `0x0053d8d0`, site `0x0053f87b`** | **alert state -> 0** (clear), `ai_state = 3`. Client arm `0x005005bc`: `PlaySoundOnObject(0x25)` if still alerted, special-cases the role named `technobox` (9-byte compare) to sound `0x4e`, `Unit+0x24 = 0`, and **sets** bit 1 of `emitter_a[+0x08]`. This row previously read "position (short)" with `Update` as the sender; both halves were wrong — see the correction note below the table |
 | `0x63` | 8 | `AiThink_Bot`, sites `0x00453ed6` / `0x00453f46` | **alert state -> 1** (the orange "reacquiring" state), `ai_state = 6`, deadline `now + 17 * ticks_per_second`. Client arm `0x00500664`: `Unit+0x24 = 1` @ `0x00500676`, the same 17 s into `Unit+0x88`/`+0x8c` (@ `0x005006a9`/`0x005006b5`), clears bit 1 of `emitter_a[+0x08]`. The 17 s window is now confirmed on **both** sides |
 | `0x65` | 8 | `ExecutorThreadProc` (case 0x26) | team notification |
 | `0x66` | 8 | `FUN_004bdf90`, `MobileActor::ReleaseHoldMarkerOrder` @ `0x00538930` | hold-marker order released `{u32 0x66, u32 actorId}` |
@@ -606,17 +622,17 @@ and the producing function (name conveys semantics). `R` = sent reliably (guaran
 | `0x68` | 16 | `AiThink_Minebot` @ `0x00456c50`, `AiThink_Swarm` @ `0x0045b620` | (AI state update) |
 | `0x6b` | 12 | `Frag` | frag/score event |
 | `0x6e` | 20 | `AiThink_Node` @ `0x0045a850` | (AI state update) |
-| `0x6f` | 40 | `SyncPositionAndBroadcast`, `CommandTeleport` | **position+orientation state** `'o'` (see §8.1) |
-| `0x70` | 40 | `CommandTeleportAndOrientate` | teleport + orientation `R` |
-| `0x71` | 12 | `SyncPositionAndBroadcast` | position delta |
+| `0x6f` | 40 | `Actor::Update` @ `0x0052f8a0` (site `0x0052fa48`), `CommandTeleport` | **position+orientation state** `'o'` (see §8.1). Payload `{0x00 u32 id, 0x04 u32 actorId, 0x08 f32 time, 0x0c f32[3] pos, 0x18 f32[4] quat}` = 40, confirmed byte for byte from the sender; position from `Actor+0xa0`, orientation from `Actor+0xac`. Shares client arm `0x004ffb2c` with `0x70` — the only arm in the switch reached by two ids: `GetUnitById`, guard `Unit+0x127 == 0`, slot 30 predicate (`[vtbl+0x78]`), then `CALL [vtbl+0xd4]` = slot 53 with `(msg+0x0c, msg+0x18, msg[+0x08])` |
+| `0x70` | 40 | `CommandTeleportAndOrientate` | teleport + orientation `R`. Same arm and same payload as `0x6f`; the arm then additionally calls slots 73 (`[vtbl+0x124]`) and 76 (`[vtbl+0x130]`) on the `CMP dword [EDI],0x70` branch |
+| `0x71` | 12 | `Update` | position delta |
 | `0x72` | 8 | `MobileActor::UseInventoryItem` @ `0x005370d0`, site `0x00537d36` | **play a UI sound** — `PlayUiSound(msg[+0x04])`. Payload `{u32 id, u32 ui_sound_id}`, both literal immediates at the send site (`MOV dword [EBP-0x70],0x72` @ `0x00537cd9`, `MOV dword [EBP-0x6c],0x28` @ `0x00537ce1`, `EDX = 8`), so **there is no actor id in this message at all**. Client arm `0x004ffbc4`: `MOV ECX,[EDI+0x4] ; JMP 0x00502690` -> `PlayUiSound` @ `0x0058cdd0` — note it enters one instruction *past* the shared tail's `MOVZX ECX,byte [EDI+0x4]` @ `0x0050268c`, so `0x72` passes the sound id as a full dword where `0xa1` passes a byte. This row used to read "unequip"; see the correction note below the table |
 | `0x74`/`0x75` | 12/8 | `OnPickedUp` | animation/turret state |
 | `0x78` | 12 | `MobileActor::GiveItemTo` @ `0x00537db0`, `ReceiveObject` | receive/transfer object |
 | `0x79`/`0x7a` | 16 | `MobileActor::EquipItemInSlot` @ `0x00536ba0`, site `0x00536d8d` | **equip an item into a slot** — *both* ids, differing only in the UI sound. `id = 0x79 + (play_ui_sound ^ 1)` (`MOVZX EAX,byte [EBP+0x10] ; XOR EAX,0x1 ; ADD EAX,0x79` @ `0x00536d11`); payload `{u32 id, u32 actor_id = Actor+0x0c, u32 slot, u32 item_id}`, `EDX = 0x10`. Shared client arm `0x00500107`: `CMP ESI,0x79`, push `1` if equal else `0`, then `Unit_EquipItemInSlot` @ `0x004bcfb0` (calls at `0x00500126`/`0x00500138`), which builds the 0x18-byte `EquipSlot` with `pool_alloc(0x18)`, links it, spawns the `HudWidget`, and gates **only** its three `PlayUiSound` calls (`0x1b`, `0x23`, `0x1c`) on that flag. So `0x79` is the audible form and `0x7a` the silent one — the same distinction as `0x7b`/`0x7c`, **not** equip-vs-unequip |
 | `0x7b`/`0x7c` | 12 | (inventory) | **consume an inventory item**; both reach `Unit_ConsumeInventoryItem` on the client, `0x7c` being the same effect **without the UI sound** |
 | `0x7d` | 12 | `CommandRemoveItem`, `MobileActor::UseInventoryItem` @ `0x005370d0`, `MobileActor::DropItem` @ `0x00538240` | remove inventory item `{actorId, itemId}` `R` |
-| `0x7e`/`0x7f` | 12/16 | `SyncPositionAndBroadcast` | position variants |
-| `0x80` | 12 | `ExecutorThreadProc` (case 0x15), `SyncPositionAndBroadcast` | item removed / position |
+| `0x7e`/`0x7f` | 12/16 | `Update` | position variants |
+| `0x80` | 12 | `ExecutorThreadProc` (case 0x15) @ `0x0050a478`, `MobileActor::Update` @ `0x00533720` (site `0x00535313`, the kind-9 arm) | **the equipped slot holding `item_id` has been unequipped**: `{u32 0x80, u32 actor_id, u32 item_id}`, reliable. **Exactly two senders**, both the unequip path — resolve the `Update` one by address per the note below the table. Client arm `0x00500234` is the structural mirror of the cmd-`0x15` arm: `GetUnitById`, walk the equipped list via slot 34 (`[vtbl+0x88]`), find the entry whose item id (`[[entry+0x8]+0x24]`) equals `msg[+0x08]`, then `Unit_UnequipSlot` @ `0x004bd370` (call `0x00500286`). This row used to read "item removed / position"; the "position" half was invented from the id |
 | `0x81` | 24 | `MobileActor::GiveItemTo` @ `0x00537db0` | object transfer variant `R` |
 | `0x82` | 12 | `ExecuteSpecialAbility` | special ability |
 | `0x83` | 12 | `OnMobileDamageReceived` | damage taken notification |
@@ -629,16 +645,16 @@ and the producing function (name conveys semantics). `R` = sent reliably (guaran
 | `0x8b` | 16 | `PresidentActor::ApplyDamage` | death/gib effect `{actorId, seq, variant}` |
 | `0x8c` | 8 | `OnPickedUp` | (turret state) |
 | `0x8d` | 259 | `ExecutorThreadProc` (case 0x28), `EvaluateTriggers` | **chat / name broadcast** (255-byte string) |
-| `0x8e` | 8 | `SyncPositionAndBroadcast` | position (short) |
+| `0x8e` | 8 | `Update` | position (short) |
 | `0x91` | 24 | `ReapDroppedPlayers` @ `0x005046e0` | the whole **player -> team table**, 5 dwords out of `0x006a7d18`, rebuilt and re-broadcast after a player drops `R` |
 | `0x92` | 20 | `MobileActor::ThrowDecoy` @ `0x00541170` | decoy thrown `{u32 0x92, u32 actorId, Vec3 target}`, unreliable |
 | `0x93`/`0x95` | 12 | `CommandSetActorArmor`, `ApplyTeamCarryOverState` @ `0x004da4a0` | armor/attribute set |
-| `0x96` | 8 | `SyncPositionAndBroadcast` | position (short) |
+| `0x96` | 8 | `Update` | position (short) |
 | `0x97` | 8 | `Dissociate` | **dissociate objects** — the client applies it through `Unit` slot 55 `Dissociate` |
 | `0x98` | 32 | `ApplyTeamCarryOverState` | team carry-over roster entry `R` |
 | `0x99` | 12 | `ExecutorThreadProc` (case 0x31) | countdown start `{index, timer}` `R` |
 | `0x9a` | 4 | `ExecutorThreadProc` (case 0x32) | countdown tick/stop `R` |
-| `0x9b` | 8 | `ApplyDamage`, `OnFlagCaptured`, `SyncPositionAndBroadcast` | deathmatch frag credit `{killerId}` `R` |
+| `0x9b` | 8 | `ApplyDamage`, `OnFlagCaptured`, `Update` | deathmatch frag credit `{killerId}` `R` |
 | `0x9c` | 10 | `BroadcastMatchWinners` @ `0x00511150` | **match result**: 6 winner bytes `R`. The receiver (`0x004ffc36`) writes `TeamSlots[i]+0x78 = (msg[4+i] != 0)` for `i < NumTeamSlots`; the sender then calls `SetGameSpeed(0.0f)`, i.e. freezes the game |
 | `0x9d`/`0x9e` | 20/16 | `MobileActor::UseInventoryItem` @ `0x005370d0` | the pickup-class-10 path: hologram decoy / audio cloak (`inventory_notes.md` §8.2) |
 | `0x9f` | 8 | `AiThink_Mine` @ `0x004552a0` | (AI state update) |
@@ -673,6 +689,7 @@ and the producing function (name conveys semantics). `R` = sent reliably (guaran
 | `0xc1` | 68 | `CommandAddBlinkingLight` | add blinking light |
 | `0xc2` | 28 | `CommandAirstrike` | airstrike |
 | `0xc3` | 8 | `CommandPlayerSelect` | player select |
+| `0xc3` (update) | 8 | — | **adds a unit to the receiving client's selection.** Arm `0x00500ade` resolves `payload+4` through `GetUnitById` @ `0x0044e070` and calls `AddToSelection` @ `0x0049ed30` — a bare hash insert into `SelectedUnits` @ `0x007b46d8` with **no type filter of any kind**, so a peer can put any `Unit` subclass into another client's selection. The filter that keeps this benign is at *order-issue* time and is **not** the RTTI ladder: `IssueGroundTargetOrderToSelection` @ `0x0049f010` gates on `Unit` slot 11, which is `XOR EAX,EAX; RET` in every class except the five `CharacterUnit`-family ones, where it is `MOV EAX,[ECX+0x290]; RET` — a controllable flag. See `orders_notes.md`. |
 | `0xc4` | 8 | `CommandShadow` | shadow toggle |
 | `0xc8` | var | (client-only) | **full player-list / world resync** (player table, spawns) |
 | `0xc9` | var | (client-only) | session control: `GL_MULTIPLAYER_YOU_ARE_REMOVED` / `_HOST_HAS_QUIT` |
@@ -703,10 +720,34 @@ still needs bounding with the reference test rather than by adjacency.
 `Actor+0x290` / `Actor+0x2f8` instead. Both client arms then feed `msg[+0x08]` into the parameter the
 DB calls `order_time`. Both values are game times in seconds so the practical effect is small, but it
 is not the value the caller passed. Recorded as **PROPOSED**, not asserted: it is equally consistent
-with `Actor+0x88` being the intended source and the third parameter being misnamed. Note also that
-`Actor+0x2f8` has no interpreting reader at all, and that the Actor->Unit mirror shift is `0x28`
-across that cluster while `Actor+0x2f8` -> `Unit+0x2c8` would be `0x30`, so `+0x2f8` is probably not
-that mirror.
+with `Actor+0x88` being the intended source and the third parameter being misnamed.
+
+**What is settled is the parameter's name, and it is not `order_time`.** `Actor+0x2f8` **is** the
+mirror of `Unit+0x2c8` (shift `0x30`), established by **writer correspondence** function-for-function
+— ctor float init, attack-a-position, attack-a-target, stop-attacking, save fixup copy. The shift is
+genuinely **non-uniform within this cluster** (`Actor+0x2d8` -> `Unit+0x2b0` is `0x28`), and neither
+offset nor size arithmetic predicts it (`CharacterActor` `0x308` vs `CharacterUnit` `0x2e0`) — so the
+earlier inference from the uniform `0x28` shift, that `+0x2f8` was "probably not that mirror", was
+wrong and has been removed.
+
+The field is **write-only on both sides**: `Unit+0x2c8` likewise has four writers and **zero** reads,
+confirmed by an exhaustive `[reg+0x2c8]` sweep (18 hits — `Unit_RestoreFromSave`'s uninterpreted
+object-to-object copy, the `CharacterUnit` ctor's `MOVSS` float-0 init, and the three writers) with a
+**rebased** reader ruled out too: of the 46 `LEA`/`ADD` immediates in `0x200`-`0x2c8` across the client
+range, the four that could reach `0x2c8` all resolve elsewhere. So it is serialized dead weight — the
+save format carries it and nothing reads it.
+
+Its meaning comes from the third writer: `Unit` slot 110 (the attack-clear, `Unit_StopAttacking`
+@ `0x004c3530`) also writes `+0x2c8`, and its only **local, non-network** caller — `CharacterUnit::Update`
+@ `0x004c1ef7` — passes `Unit_Update`'s `now_seconds`, handled as a float in that same function. So it
+is a **state-change timestamp**, and both sides are now named `attack_state_time`; the client setters'
+second parameter is `float state_time`, not `int order_time`.
+
+**And the executor's real order time is a different field that *is* read**: `Actor+0x290`
+(`attack_order_time`), `COMISS` @ `0x0053f4da` in `CharacterActor::Update`. So the executor does use
+the order time it was given; what it *also* stashes in `+0x2f8` is vestigial. That narrows the
+PROPOSED `+0x08` asymmetry above rather than settling it — the asymmetry is about which value reaches
+the wire, and is untouched by this.
 
 **Two corrections to rows that had been written from the id alone**, both measured this round:
 
@@ -717,13 +758,27 @@ that mirror.
   verified two independent ways, by its absence from all 186 call sites of `0x00504bf0` and by a
   direct instruction scan of the body. Nothing about unequipping crosses the wire from that function.
   The equip pair is `0x79`/`0x7a`, added above.
-- **`0x62` was "position (short)" from `SyncPositionAndBroadcast`.** It is the alert-state clear. The
+- **`0x62` was "position (short)" from `Update`.** It is the alert-state clear. The
   client arm `0x005005bc` applies no position — it writes `Unit+0x24 = 0` and plays a sound — and
   there is exactly one arm per id, so the two readings could not both be right. The second sender is
   **`CharacterActor::Update` @ `0x0053d8d0`**, which builds `{0x62, actor_id}` at `0x0053f7ee` with
-  `EDX = 8` and broadcasts at `0x0053f87b`: the same 8-byte shape, not a position payload. Note also
-  that **no symbol named `SyncPositionAndBroadcast` exists in the Ghidra DB**, so every row in this
-  table crediting it is citing a name that cannot be checked; that column deserves a pass of its own.
+  `EDX = 8` and broadcasts at `0x0053f87b`: the same 8-byte shape, not a position payload.
+- **`0x80` was "item removed / position".** It is the unequip notification and nothing else:
+  `{u32 0x80, u32 actor_id, u32 item_id}`, 12 bytes, "the equipped slot holding `item_id` has been
+  unequipped". There are **exactly two senders binary-wide** and both are the unequip path
+  (`0x0050a478` in the cmd-`0x15` arm, `0x00535313` in `MobileActor::Update`'s order-kind-9 arm), and
+  the client arm `0x00500234` applies no position — it walks the equipped list and calls
+  `Unit_UnequipSlot`. The "position" half was invented from the id. Note the sender column here is
+  **not** an instance of the phantom-name problem below: `Update` @ `0x00533720` genuinely sends it,
+  which is why the row now carries the address. `orders_notes.md` §8's "a `UseItem` order consumed an
+  inventory entry" was the same misreading and is corrected there.
+- **The producer column used to credit a name that did not exist**, `SyncPositionAndBroadcast`. That
+  is now resolved: the functions were renamed to `Update` (Actor vtable **slot 70**, the per-tick
+  update) in an earlier pass, and what was left behind was the `Actor_SyncPositionAndBroadcast`
+  *funcdef* and the `ActorVtbl` slot-70 *field* — the two surfaces the audit does not usually reach.
+  Both now say `Update`, and every row in this table has been rewritten to match. So the column is
+  checkable again; it was not, for as long as the stale funcdef was the only place the old name
+  survived.
 
 The negative conclusions in the `0x60`-`0x63` rows rest on a disassembly census, which is the check
 the previous collapse in this area lacked: `AiThink_Bot`'s body is `[0x00451220, 0x00455228]`,
@@ -737,7 +792,7 @@ deadline immediately before each broadcast, so both sides corroborate every row.
 and should go.
 
 > **Producer names in this table are not unique.** Several are virtual overrides implemented once
-> per actor subclass, so the same name maps to many distinct functions: `SyncPositionAndBroadcast`
+> per actor subclass, so the same name maps to many distinct functions: `Update` (slot 70)
 > is **11** functions (`0x0052f8a0`, `0x00533720`, `0x0053d8d0`, `0x00544460`, `0x00546120`,
 > `0x00547520`, `0x00549cd0`, `0x0054a060`, `0x0054a8f0`, `0x0054b000`, `0x0054d4c0`), and `Frag`
 > (`0x0052e220`, `0x00548b00`) and `ApplyDamage` (`0x0052f3b0`, `0x00535ac0`) are two each. When a
@@ -756,7 +811,7 @@ Two methodology notes for anyone repeating this:
 - Take the size and `guaranteed` literals from the **same source line** as the buffer variable.
   An earlier pass read them from the decompiler's P-code and paired them to ids positionally,
   which desynchronised in the multi-site functions (`ExecutorThreadProc`,
-  `SyncPositionAndBroadcast`, `EvaluateTriggers`) and produced 10 false "size disagreements" —
+  `Update`, `EvaluateTriggers`) and produced 10 false "size disagreements" —
   all of which evaporated once the pairing was fixed.
 - Where the size is a computed expression, read the **disassembly**, not the decompiler.
   For `0xa9`/`0xaa` the decompiler renders `iVar + 0x48` / `iVar + 0x37` while the asm shows
@@ -764,8 +819,24 @@ Two methodology notes for anyone repeating this:
   all three coords slots), giving the true sizes 73 and 56.
 
 26 call sites still have an unresolved id — the constant is not a simple literal store into the
-buffer's first field. They cluster in `SyncPositionAndBroadcast`, `UseInventoryItem`, `OnPickedUp`
+buffer's first field. They cluster in `Update`, `UseInventoryItem`, `OnPickedUp`
 (3 each) and 17 functions with one apiece.
+
+**Two of those 26 are now resolved, and the shape is worth knowing before chasing the rest.**
+`MobileActor::Update` @ `0x00533720` broadcasts 56 bytes at `0x00534e9d` and again at
+`0x00534f19`. Neither is preceded by a `MOV dword [EBP+disp], imm`, which is why an id sweep
+sees nothing — the id is **computed once and shared**. At `0x00534e42`,
+`LEA EAX,[EAX*0x2 + 0x3b]` with `EAX` the result of `MOVZX EAX, byte [EBP-0x1a1]` @ `0x00534e2f`
+then `XOR EAX,0x1`, so `EAX` is 0 or 1 and **the id is `0x3b` or `0x3d`** — stored once into the
+shared buffer at `0x00534e49`, which *both* call sites then pass (`LEA ECX,[EBP-0x1a0]` at
+`0x00534e97` and `0x00534f13`). A scan of the whole function body confirms that displacement is
+written exactly once, so the second broadcast reuses the first's id rather than setting its own.
+`EDX = 0x38` at both. So 56 bytes does match rows already in this table, and the two sites are
+additional producers of the existing `0x3b`/`0x3d` pair rather than undocumented ids.
+
+The lesson for the remaining 24: **a computed id is not a missing id.** Look for `LEA` on a
+register base, and for a buffer whose first dword is written once and broadcast more than once —
+the same two patterns behind `0x79`/`0x7a` (`ADD EAX,0x79`) and `0x3f`/`0x40`.
 
 ---
 
@@ -773,7 +844,7 @@ buffer's first field. They cluster in `SyncPositionAndBroadcast`, `UseInventoryI
 
 ### 8.1 Position + orientation state - update `0x6f` ('o'), 40 bytes
 
-`Actor::SyncPositionAndBroadcast` @ `0x0052f8a0`. **Unreliable.** The workhorse entity-state msg.
+`Actor::Update` @ `0x0052f8a0`. **Unreliable.** The workhorse entity-state msg.
 
 ```
 +0x00 u32     id = 0x6f
@@ -842,7 +913,7 @@ for none, so the factory passes `owner_ref - 1` through.
 ```
 
 Related: `PresidentActor::ApplyDamage` also emits the death-effect `0x8b`
-`{actorId, seq(num_actors++), variant}` (16 B, unreliable) and, in Deathmatch, the frag-credit
+`{actorId, seq(NextActorId++), variant}` (16 B, unreliable) and, in Deathmatch, the frag-credit
 `0x9b` `{killerTeam/id}` (8 B, reliable).
 
 ### 8.6 Spawn projectile / weapon fire - update `0x46` ('F'), 64 bytes
@@ -1054,7 +1125,7 @@ inspection:
   dispatches to it**.
 - *Only `QueueScriptExecution` builds a `0x67`.* Of the 104 functions that call
   `BroadcastToPlayers`, exactly two contain an immediate `0x67`: `QueueScriptExecution`
-  (`0x005050db`, the `'g'` id byte) and `SyncPositionAndBroadcast` @ `0x00533720`. The latter is a
+  (`0x005050db`, the `'g'` id byte) and `Update` @ `0x00533720`. The latter is a
   false positive twice over — one is `PUSH 0x67` into a virtual call `[ESI+0x11c]`, and the other
   writes `0x67` at offset `+0x08` of a buffer whose leading dword is `0x4f`, sent as
   `(id 0x4f, 25 bytes, unreliable)`. Neither is a message id.
@@ -1079,7 +1150,7 @@ and every field is pinned to an instruction:
 ```
 
 `MotionSnapshot` is now a type in the Ghidra DB. `Actor+0xd8` is the **game time of this tick** in
-seconds, confirmed from its writer `Actor::SyncPositionAndBroadcast` @ `0x0052f91a`; `Actor+0xdc` is
+seconds, confirmed from its writer `Actor::Update` @ `0x0052f91a`; `Actor+0xdc` is
 the same value at the last broadcast (`0x0052fa66`), i.e. broadcast dirty-tracking. All four
 senders below end with `+0xdc = +0xd8`.
 
@@ -1231,19 +1302,24 @@ Loopback queues, events, and thread details: see `threading_model_notes.md`.
     only by `FUN_004f10b0` (the lobby draw, 23,110 bytes, not decompiled) and `FUN_004f6dd0`, so the
     row/column semantics are unread and a name there would assert more than is known. Decompiling
     `FUN_004f10b0` settles this bullet and the lobby ready-flag one above together.
-  - Update ids `0x60`-`0x63` are **settled** — the alert state machine, measured on both sides, with
-    a row each in §7. What is still open is only the header/payload split: the `Vec3` those calls
-    pass by value was read off the call shape, not out of `BroadcastToPlayers`' own body, which is
-    the same caveat every 8-byte broadcast in this file carries.
+  - Update ids `0x60`-`0x63` are **settled**, and the header/payload split that was open here is now
+    settled too — the alert state machine, measured on both sides, with a row each in §7. All four
+    messages are **8 bytes, `{u32 id, u32 actor_id}`**, and each client arm reads only `msg[+0x04]`.
+    The `Vec3` those calls pass by value is `BroadcastToPlayers`' **relevance-filter parameter**, read
+    out of its body this time and not off the call shape: it is compared against `FloatZero`
+    @ `0x007f5f40` and, on the loopback path, ignored entirely. §4.2. That retires the caveat for
+    *every* 8-byte broadcast in this file, not just these four.
   - Update ids `0x3f`/`0x40` are **settled** — the attack-position pair, row in §7. The `+0x08`
     asymmetry against `0x41`/`0x42` is the part that is still PROPOSED; see the end of §7.
-  - **How a receiving peer applies `0x58`.** The send side is now fully measured
-    (`{u32 id, u32 actor_id, u32 team, f32 now, f32 deadline}`, §7), but there is **no slot-80
-    call site anywhere in the binary for an incoming `0x58`** — the only dispatch through
-    `[vtbl+0x140]` in the whole image is 0x0053f78d, the local `Confusion` path in
-    `CharacterActor::Update`. So a peer receiving `0x58` must write `Actor+0x28`/`+0x2c` by some
-    other route, and that route was not located. Stated as an open question, not a finding: the
-    apply handler may be in the undefined-byte region of `ApplyUpdateMessage` noted above.
+  - **How a receiving peer applies `0x58` — CLOSED.** There is a receive handler after all, and the
+    "no receive path" premise was a **search-method artifact, not a disassembly gap**. Looking for a
+    *slot-80* call site was the error: `0x58` is applied through the **client `Unit` tree**, not by
+    re-entering the executor's `Actor` slot 80. Arm `0x004fe662` -> `Unit` slot 89
+    (`Unit_ChangeOwnerAndTeam` @ `0x004b8b00`), which writes `Unit+0x18`/`+0x1c` — the client mirrors
+    of `Actor+0x28`/`+0x2c` — as raw dwords. Row in §7. `ApplyUpdateMessage` has **no undefined bytes
+    at all** (see the census note in §7), so the region it was guessed to be hiding in does not exist.
+    The expiring half, `0x59` -> slot 90, is documented in the same rows, and expiry is
+    **executor-driven**: no float read of `Unit+0x18`/`+0x1c` exists in the client outside the ctor.
   - Command `0x17` is **settled: give item.** `inventory_notes.md` §12 was right and this file was
     wrong. Full write-up in §6 under "Commands `0x17`/`0x18`". The wire layout it already recorded —
     `{id, giver, arg_b, arg_a, f32 game_time, arg_c}`, wire order not the C argument order — held up

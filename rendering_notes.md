@@ -367,6 +367,22 @@ Notes that matter before hooking any of them:
   CLAUDE.md's REPL section, which has the focus behaviour in full.
 - `RenderQueue_Submit` is `__thiscall` with **nine stack arguments**; per CLAUDE.md's calling
   convention rule, check the `RET` operand (0x24) before declaring a mirror for it.
+- **`RenderQueue_Submit` returns nothing, and that is now a positive statement rather than a
+  census of its callers.** An earlier reading had it ending in `CALL dword ptr [EAX]`, "a vtable
+  slot, so EAX is a pass-through". It is not a dispatch: the same function writes that vptr
+  thirteen instructions earlier (`MOV dword ptr [ESI],0x66da04` @ 0x0059d785) and the call is
+  guarded by `ADD dword ptr [ESI+0x4],-0x1 / JNZ` @ 0x0059d7e6 — it is a conditional
+  refcount-release destructor on the `DrawItem` this call just allocated, so the receiver is
+  fixed and never polymorphic. What settles the return type is that **the two tail paths leave
+  different, unrelated values in EAX by construction**: reach 0x0059d7f4 through the `JNZ` and
+  EAX is whatever `RenderQueue_Add` left, fall through the destructor and it is the destructor's
+  `this`. A function whose EAX differs per path *as a matter of its own structure* has no return
+  value, whatever its callers do. The same test makes `RenderQueue_Add` @ 0x005a8eb0 `void`.
+  This is a better tool than "nobody reads EAX", which cannot distinguish a `void` function from
+  one whose callers happen to ignore it — `PlayUiSound` was the case where that distinction
+  mattered and the census got it wrong.
+- Both of them handle a `pool_alloc` failure by zeroing the destination register and then writing
+  through it unconditionally — `game_defects_notes.md` §21.
 - Hooking at level 1 or 2 is the only way to see a draw that is later *dropped*: the sorted list
   can divert an item (`MaterialBucket_AddItem` sends anything with a translucent texture and a
   `blended_variant` material to the global sorted list), and a `next_pass` material clones items,
@@ -525,9 +541,39 @@ is not called from the frame's producer sweep at all.
 
 `Spark_UpdateAndDraw` @ **0x00558550** (`void(void)`, no register args) is called from **exactly one
 place: `ScenePass_Shadows` @ 0x00552059.** It is gated on `ParticleFx != 0 && Mat_AdditiveOneOne != 0`,
-fetches `D3DTS_VIEW`, walks the emitter `List` at `DAT_007ba1b4` firing one-shot emitters, calls
-`SparkSystem_Simulate`, then does `ApplyMaterial` / `SetStageTexture` / `FUN_00559680` (the draw
-half). So a hook on the render queue never sees it, and a hook on the shadow pass sees it by accident.
+fetches `D3DTS_VIEW`, walks the emitter `List` at `SparkEmitters` @ 0x007ba1b4 firing one-shot
+emitters, calls `SparkSystem_Simulate`, then does `ApplyMaterial` / `SetStageTexture` /
+`FUN_00559680` (the draw half). So a hook on the render queue never sees it, and a hook on the
+shadow pass sees it by accident.
+
+### The emitters
+
+`SparkEmitters` @ **0x007ba1b4** is a 16-byte `List<SparkEmitter *>` header —
+`{sentinel, count @ +0x04, cached_array @ +0x08, cache_valid @ +0x0c}`, now labelled
+`SparkEmitters` / `SparkEmitterCount` / `SparkEmitterCache` / `SparkEmitterCacheValid` — over
+0x10-byte `List_Member<SparkEmitter *>` nodes (vtable 0x006696bc, `data` at `+0x0c`). Exactly two
+functions write it:
+
+- `Spark_AddEmitter` @ **0x00558820** (`void __fastcall(const Vec3f *pos /*ECX*/, int preset
+  /*EDX*/)`, bare `RET`, gated on `ParticleFx`) is the **sole constructor** of `SparkEmitter`:
+  `pool_alloc(0x50)` @ 0x00558837, vptr 0x00669690 (2 slots), then a per-preset field fill.
+- `Spark_Reset` @ **0x00558780** (`void(void)`, bare `RET`) does **both halves of a reset**, which
+  is why it is not `Spark_ClearEmitters`: it drains the emitter list *and* — in the
+  non-contiguous tail of its own body at 0x0055a170 — walks the live particle chain onto the free
+  chain, nulls the head and zeroes the live count.
+
+`SparkEmitter` is 0x50 bytes: `+0x00` vptr, `+0x04` `Vec3f position`, `+0x10` `float up_speed`
+(default 19.0, per-preset 16.0 / 12.0 / 10.0), `+0x14` `float lateral_speed` (2.5 / 3.3 / 5.0),
+`+0x18` `float spawn_rate` (10.0), `+0x1c` `float spawn_accumulator`, `+0x20` `int mode`
+(0 continuous, 1 timed, 2 one-shot burst), `+0x24` `longlong expire_time`, `+0x2c` `bool collide`,
+`+0x30` `float[4] color_start` (default `{1,1,1,1}`), `+0x40` `float[4] color_end`
+(`{1,0.25,0.25,1}`). The two colour vectors are written with a single `MOVUPS` from a 16-byte
+`.rdata` constant each, which is what pins them as `float[4]` rather than a `Vec3` plus a scalar.
+
+**`expire_time` has no reachable reader.** It is consulted only under `mode == 1`, and the sole
+constructor writes only 0 or 2 (0x0055889c, 0x00558954, 0x00558965) — so the ctor computes a
+deadline nothing can act on. Whether that is a removed feature or a defect is **not** established,
+and this is recorded as a fact about the code rather than as a defect entry.
 
 `SparkSystem_Simulate` @ **0x00558d30** (`void __thiscall(SparkSystem *, float dt)`, `RET 0x4`) runs
 a **two-generation particle model whose recursion is bounded at one level**:
@@ -548,10 +594,23 @@ The system object is `TheSparkSystem` @ 0x007ba1c4 (`pool_alloc(0x68)`), created
 `Spark_EnsureSystem` @ 0x00558400 (from `WinMain` at video init, and from `FUN_004f7de0`) and freed by
 `Spark_DestroySystem` @ 0x00558490. `SparkSystemTime` @ 0x007ba1cc is its float seconds accumulator.
 Confirmed fields: system `+0x00` live generation-0 count, `+0x04` cap, `+0x10` live head, `+0x14` free
-head, `+0x18` a float subtracted from spawn Z; particle `+0x48` spawn time, `+0x4c` death time,
-`+0x70` life scalar, `+0x74` generation, `+0x78` next. **Not** confirmed: the vectors at particle
-`+0x00`/`+0x0c`/`+0x18`/`+0x24` and the colour ramp at `+0x50..+0x6c` are inferred from arithmetic
-rather than from a consumer — `FUN_00559680` would settle them.
+head, `+0x18` **the sprite half-extent** (see below); particle `+0x48` spawn time, `+0x4c` death time,
+`+0x70` life scalar, `+0x74` generation, `+0x78` next.
+
+**The particle vectors are now confirmed at a consumer**, not inferred from arithmetic:
+`FUN_00559680`, the draw half, reads them. Particle `+0x00` position, `+0x0c` velocity, `+0x18`
+spawn_position, `+0x24` spawn_velocity, `+0x50` `float[4]` color_start, `+0x60` `float[4]`
+color_end. A spark is drawn as a **2-to-8-quad speed-proportional motion-blur streak** — the streak
+is swept between where the particle is and where it started — which is what the second position and
+velocity pair are for.
+
+**Correction to an earlier reading of `system+0x18`.** It was recorded here as "a float subtracted
+from spawn **Z**". It is subtracted from spawn **Y**: at the spawn site 0x00559306-0x00559329,
+`XMM1 = pos[+0x4]` (y), `SUBSS XMM1,[EDI+0x18]`, then `UNPCKLPS` with `pos[+0x0]` (x) and a `MOVQ`
+into `particle+0x18`, with `pos[+0x8]` (z) going to `particle+0x20` untouched. And `FUN_00559680`
+hoists the *same* `this+0x18` at 0x005596a7 and adds it back when building quad corners
+(0x00559a68) — so it is the **sprite half-size**, and the spawn point is lifted by exactly one
+half-sprite (up is −Y in Gunlok). One field, one meaning, used at both ends.
 
 ## 4.4 2D layer order is a camera per depth slice, and the HUD's meters miss theirs
 
@@ -646,7 +705,7 @@ out of the DLL's `RT_STRING` resources; string *id* N lives in block `N/16 + 1` 
 | `ShadowRenderer_Quality1` | 0x005520a0 | 1 | `ShadowRendererFn` |
 | `DrawTeamSelectOverlay` | 0x00566bd0 | 1 | `DrawInGameOverlay` |
 | `InGameMenuWidget_DrawLabelled` | 0x0056c6e0 | 1 | widget vtable slot 2 |
-| `SubmitSkyBackdrop` | 0x00588ad0 | 1 | `RenderSceneAndPresent` |
+| `SubmitCursorAndFinishCursorAnim` | 0x00588ad0 | 1 | `RenderSceneAndPresent` — submits the **3D mouse cursor** (`Cursor3DObject` @ 0x007f5e8c) with `Camera_Menu2D`, **not** a sky backdrop; it is also the completion handler for a one-shot cursor animation, writing `Cursor3DAnimIdle` back to 1 @ 0x00588b69. Named `SubmitSkyBackdrop` until round 4, when its plate comment was found to be describing something it never did |
 
 ### The five facts worth carrying
 
@@ -752,6 +811,15 @@ is shorter than 92**. Two things pin the numbers:
   *next* class's table.** That is not hypothetical: the shipped names `Unit_IsConcealed`
   @ 0x004cfe70 and `Unit_SetConcealed` @ 0x004cf5d0 were filed as slots 100 and 101 by exactly that
   arithmetic. They are slots **8 and 9**.
+- **That 92-slot bound is load-bearing for wire correctness, not only for hook safety.**
+  `ApplyUpdateMessage` @ 0x004fde70 dispatches slots **92, 93, 96, 98, 99, 106, 108, 110** and
+  **111** on the result of `GetUnitById` @ 0x0044e070 — which does no class check — so every one of
+  those is past the base table and only exists on some subclasses. Two of them
+  (slot 98 @ 0x004fdf16 for update 0x39, slot 96 @ 0x004fe957 for update 0x1e) are confirmed
+  reachable with a wire-supplied id on a class that need not have the slot; see
+  `game_defects_notes.md`. So "which class does this table actually reach to" is a question the
+  protocol asks, and getting the bound wrong here mis-describes a remote defect rather than merely
+  risking a bad hook.
 
 Slot 68 (`Draw`) is `Unit_Draw` @ 0x004b6ae0 / `Unit_DrawWithTeamState` @ 0x004be830 /
 `TumbleweedUnit::Draw` @ 0x004c96e0 / `PopupUnit::Draw` @ 0x004cc7d0 in every table, which is the
@@ -789,8 +857,9 @@ base body, in 11 tables, reached from update `0x49`) and `Unit_UpdateMovement` @
 latches a deferred remove-me on `+0x1a8`.
 
 Ownership of the *order-sending* slots also moved a level up, and `orders_notes.md` §8 has the
-corrected version: slots **100–104** (`Unit_SendInteract`, `Unit_SendEquip`, `Unit_SendDropItem`,
-`Unit_SendGiveItem`, `Unit_SendUseItem`) are added by `MobileUnit` @ 0x0066491c, not by
+corrected version: slots **100–104** (`Unit_SendEquipItemInSlot`, `Unit_SendUseItem`,
+`Unit_SendDropItem`, `Unit_SendGiveItem`, `Unit_SendUnequipItem`) are added by `MobileUnit`
+@ 0x0066491c, not by
 `CharacterUnit`. `MobileUnit` also adds 92 `Unit_IsCrouched` and 93
 `Unit_SetCrouchedAndConcealed`, and overrides 33, 55, 57, 73, 77, 83 and 91; `CharacterUnit`
 overrides base slots 74, 75, 76, 78, 79, 80 and adds 108–111.
@@ -899,11 +968,81 @@ as an earlier revision had it — `AwMaterial_ApplyStage` takes the D3D texture 
 straight off offset 0, so there is no vptr and no refcount at +0x04. It is in fact the texture
 **cache record itself**, 0x34 bytes with its path at +0x2c: `AcquireRimTexture` mints it,
 `AwShape_TouchTextures` looks it up by that path, `BuildShapeVertexBuffers` stores it into
-`SubMesh::texture`, and `ApplyStage` binds it. And `AwMaterial::state_block` was at +0x0c in the
+`SubMesh::texture`, and `ApplyStage` binds it. (The cache that owns it is `TextureManager` — see
+§6.1.) And `AwMaterial::state_block` was at +0x0c in the
 first draft, from reading the destructor's `param_1_00[0xc]` as a byte offset when it is a **dword
 index** — it is +0x30. That is an easy mistake to repeat: the decompiler indexes `undefined4 *`
 by element, so every offset in a decompiled body has to be multiplied by four before it means
 anything here.
+
+## 6.1 The texture cache is `TextureManager`, and its records are freed
+
+The object `AcquireRimTexture` takes in ECX is a **singleton at 0x00803ce0, 0x2c bytes**, and the
+Ghidra database already named it: five functions were `TextureManager_*` and four plate comments
+already wrote `TextureManager *this`. So the class was adopted rather than invented, and
+`AcquireRimTexture` keeps its name — it is load-bearing in three repo files. **The cache is not
+RIM-specific**: alongside `.rim` names it holds `bitmaps\maptest.bmp` and a synthetic
+`" NullTexture"`.
+
+It is a plain struct with **no vtable of its own**. The vptr at `+0x08` belongs to an **embedded
+`HashTable<AwTextureNode *>`**, whose derived vtable at 0x0066db0c overrides only the three
+node-allocation slots (`NewNode` 0x005a14d0, `DeleteNode` 0x005a14f0, `NewNode(T, Node*)`
+0x005a1510). Construction is a CRT static initializer, `TextureManager_StaticInit` @ 0x0043add0,
+which registers the destructor via `atexit` through the thunk at 0x0064c300.
+
+| offset | field |
+|---|---|
+| +0x00 | `uint create_flags` |
+| +0x04 | `float load_progress` |
+| +0x08 | embedded `HashTable<AwTextureNode *>` — vptr, `n_entries` +0x0c, `table_size` +0x10 (64), `mask` +0x14 (63), `chains` +0x18 |
+| +0x1c | `AwTextureNode mru_sentinel`, embedded (0xc bytes, taken by `LEA` — not a pointer) |
+| +0x28 | `bool recreate_pending` |
+
+`AwTextureNode` is 0xc: `{AwTexture *data; AwTextureNode *prev; AwTextureNode *next;}` —
+**payload first**, no vptr, `pool_alloc(0xc)`. A cache hit is relinked to `sentinel->next`
+(0x005a1706); eviction walks `sentinel->prev` (0x005a17e0), i.e. least-recently-used first.
+
+The nine members, all entered only via `MOV ECX,0x803ce0`: `AcquireRimTexture` 0x005a15b0,
+`TextureManager_LoadPending` 0x005a19a0, `TextureManager_RecreateAll` 0x005a1b80,
+`TextureManager_ReleaseAll` 0x005a1ca0, `TextureManager_SetCreateFlag0x400` 0x005a1d60,
+`TextureManager_TouchByRecord` 0x005a1240, `TextureManager_Dtor` 0x005a1540,
+`TextureManager_EvictOneUnused` 0x005a17d0, `TextureManager_PurgeReleasedEntries` 0x005a1900.
+The hash table's own methods are **not** members — they take the embedded table at `+0x08` in ECX,
+a different class: `HashTable_Ctor` 0x005a1d90, `HashTable_Dtor` 0x005a1e00, `HashTable_Remove`
+0x005a1ea0, plus the three vtable slots above.
+
+Three things here were previously believed and are wrong:
+
+- **`+0x0c` is not a refcount on the returned record.** It is the hash table's `n_entries`:
+  `INC [EDI+0xc]` fires only at the two *insert*-path exits (0x005a1775, 0x005a1787, with `EDI`
+  reloaded as `this` from `[EBP-0x4]`) and **never** at the cache-hit exit 0x005a1711. A refcount
+  incremented only on a miss would be meaningless. The record's refcount is `AwTexture+0x1c`,
+  bumped by `INC [EAX+0x1c]` @ 0x005a16e2 on the hit path — exactly where `src/Render.h` already
+  had it.
+- **Records are freed.** `TextureManager_EvictOneUnused`, for the first record with
+  `refcount == 0 && field0x20 == 0`, does hash-remove → `free(name)` → `free(directory)` →
+  `operator delete(record, 0x34)` @ 0x005a1887 → unlink → `operator delete(node, 0xc)`. Its
+  callers include **`LoadLevel` and `UnloadLevel`**, so this is a routine part of a level
+  transition and not an out-of-memory path. `src/D3D8Capture.cpp`'s `RimRecords` set assumed the
+  opposite and therefore holds dangling pointers after a level change — **git-bug 85bd09e**.
+- **The search key is a static, so acquire is not reentrant.** `AcquireRimTexture` writes its
+  `name` argument into the `name` field of a function-local static `AwTexture` at 0x00803d0c
+  (`MOV [0x00803d38],EAX` @ 0x005a15bf — that address is 0x00803d0c + 0x2c) and only then hashes
+  it. Labels: `TextureLookupKey` 0x00803d0c, `TextureLookupKeyPtr` 0x006ac120 (which holds
+  `&TextureLookupKey`), `TextureLookupKeyInitGuard` 0x00803d40.
+
+`AwTexture::flags` (+0x28) is **stored and never consumed** by either loader — both pass the
+*manager's* `create_flags | 5` to `ImageFile_Load` and never read the per-record word. No enum was
+invented for it; it may be vestigial.
+
+Two further record fields are now named from their consumers: `+0x24 vram_counted` is a **byte**
+gating the `(w * h) >> 12` subtraction from the VRAM page counter at 0x006ab978, and `+0x30
+directory` is an **owned** `char *` that `TextureManager_LoadPending` fills with the process cwd
+and eviction frees.
+
+**A hook on `AcquireRimTexture` sees every record minted and no other cache operation.** The
+lookup half is separately inlined at six sites out of `TextureManager_TouchByRecord`, none of which
+allocates.
 
 ## 7. Not yet mapped
 
@@ -990,8 +1129,13 @@ evidence:
 
 `SubmitDrawItem` wraps `RenderQueue_Submit`, whose nine stack arguments (`RET 0x24`) are **not**
 in the order their fields land in — the mapping was read off the prologue, and swapping the
-camera and the light set would not fault, it would just render with the wrong one. `AwTexture`
-deliberately carries no `sizeof` assert — its size is not established, and the 0x34-byte record
-`AcquireRimTexture` caches is a different, earlier object. It is also **not** one of the
-`AwRefCounted` family, which an earlier revision had it as: `AwMaterial_ApplyStage` takes the D3D
-texture as `**stage`, straight off offset 0, so there is no vptr and no refcount at +0x04.
+camera and the light set would not fault, it would just render with the wrong one. Two of them
+carry a sharper hazard than that: `arg7` (`DrawItem+0x20`) and `hooks` (`DrawItem+0x2c`) are
+**refcounted** by `RenderQueue_Add`, so a non-null garbage pointer in either increments a word
+inside whatever it points at rather than faulting, and the damage surfaces elsewhere.
+
+`AwTexture` **is** the 0x34-byte record `AcquireRimTexture` caches — the same object, not a
+different earlier one, which is what lets `src/Render.h` carry `static_assert(sizeof(AwTexture)
+== 0x34)`. It is **not** one of the `AwRefCounted` family, which an earlier revision had it as:
+`AwMaterial_ApplyStage` takes the D3D texture as `**stage`, straight off offset 0, so there is no
+vptr and no refcount at +0x04.

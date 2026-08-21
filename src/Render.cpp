@@ -119,6 +119,14 @@ unsigned GetRenderStateFlags() {
 // +0x18 (camera), [EBP+0x10] to +0x1c (light set) and [EBP+0x14] to +0x14
 // (material). Getting this wrong would swap the camera and the light set, which
 // both being pointers would not fault - it would just render with the wrong one.
+//
+// That mapping has been re-measured against the prologue and is exactly right.
+// Two of the arguments carry a sharper hazard than "renders with the wrong one",
+// though: `arg7` (DrawItem+0x20) and `hooks` (DrawItem+0x2c) are **refcounted**
+// by RenderQueue_Add, which addrefs the item's resources before routing it. So a
+// non-null garbage pointer in either does not fault here - it increments a word
+// at some offset inside whatever it points at, and the damage surfaces later and
+// elsewhere. Passing null is safe; passing a plausible-looking pointer is not.
 void SubmitDrawItem(Renderable *renderable, unsigned anim_time,
                     CameraData *camera, LightSet *light_set,
                     AwMaterial *material, int lod_level, unsigned flags,

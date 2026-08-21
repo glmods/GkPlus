@@ -117,7 +117,7 @@ ProjectileActor::Ctor(proj, team, projectile_role,
                       this->id,               // owner actor id -> ProjectileActor+0x12c
                       target_actor_id,        // -1 when none -> refcounted Actor* at +0x164
                       weapon->weapon_type,    // -> ProjectileActor+0x160
-                      num_actors)
+                      NextActorId)   // the monotonic actor-id counter @ 0x007b9ffc, was `num_actors`
 proj->slot 0xcc (timing)
 proj->SetTargetPosition(this->attack_position)          // slot 84
 proj->damage_scale (+0x130) = character->damage_multiplier   // Character+0x54
@@ -478,16 +478,28 @@ raw = this->damage_scale * projectile->damage
 **Step 2 - global scale and resistance**, `ScaleDamageForResistance` @ 0x004fc740:
 
 ```
-__fastcall float *ScaleDamageForResistance(float *out /*ECX*/, char shooter_is_player /*DL*/,
+__fastcall float *ScaleDamageForResistance(float *out /*ECX*/, char victim_on_player_team /*DL*/,
     float damage, int resistance, float resistance_factor, int weapon_type)   RET 0x10
 ```
 
-`shooter_is_player` is `TeamSlots[shooter_team].+0x6a`; `resistance` / `resistance_factor` are
-`Role+0x90` / `Role+0x94` **of the victim**.
+`victim_on_player_team` is `TeamSlots[victim_team].player_controlled` (`TeamSlot+0x6a`);
+`resistance` / `resistance_factor` are `Role+0x90` / `Role+0x94` **of the victim**.
+
+**This parameter was called `shooter_is_player` here until 2026-08, and that was wrong on two
+counts.** It is the **victim's** team, not the shooter's, and `+0x6a` is *any* player's team, not
+the local player's. At all seven call sites (0x00450c6a, 0x00457c8d, 0x0045c475, 0x004aa2ea,
+0x0052e623, 0x005436e3, 0x00543d14) the team index and the resistance pair are read from the **same
+actor** - verified by disassembly at three of them, e.g. `IMUL EAX,[ESI+0xbc],0xc4` then
+`MOV ECX,[ESI+0xc0]` then `PUSH [ECX+0x94] / PUSH [ECX+0x90]` then `MOV DL,byte [EAX+0x6a]`
+@ 0x0054368b-0x005436c1, and one register supplying both `[EAX+0xc0]` and `[EAX+0xbc]` in `Frag`
+@ 0x0052e5ed and `AiThink_Swarm` @ 0x0045c44d. Independent corroboration from what the gate does:
+the scalers are `DamageScalePlayerByDifficulty = [0.4, 0.4, 0.8, 1.0]` against
+`DamageScaleOtherByDifficulty = [0.85 x4]`, i.e. a **difficulty scaler on damage taken** - 0.4x on
+easy, 1.0x on hard - which only makes sense applied to the victim.
 
 ```
 if (damage <= 0) return damage
-damage *= shooter_is_player ? DamageScalePlayerTeam : DamageScaleOtherTeam
+damage *= victim_on_player_team ? DamageScalePlayerTeam : DamageScaleOtherTeam
 if (weapon_type is in the victim's resistance class)
     damage *= (1.0 - resistance_factor)
 ```
@@ -588,7 +600,14 @@ IsFriendlyFireEnabled()                                  // 0x00512a30, global I
 ```
 
 i.e. in single player / co-op a shot from team T hits an actor of team T only when one of the two
-teams is 0 or 2, or friendly fire is on. **Team 2 (the player squad) always damages itself.** The
+teams is 0 or 2, or friendly fire is on. **Team 2 always damages itself** - and team 2 is the **AI
+enemy team**, not the player squad. (This sentence read "Team 2 (the player squad)" until 2026-08.
+The team numbering is settled: `FUN_00503130` @ 0x005031f9 hands player *n* the team
+`(n == 0) ? 1 : n + 2`, so player teams are exactly {1, 3, 4, 5, ...}; team 0 is the neutral /
+scenery bucket and team 2 is the AI enemy team. The shipped scripts agree - `in team 1` x70, all
+GunLok/Hark/Frend/Elint, against `in team 2` x156, all `Rol_technocrate` / `Rol_pulsax` /
+`Rol_silo_*` / `Rol_baddie_*`. So what this gate really says is that the neutral and enemy buckets
+have no friendly-fire protection, while a *player* team does.) The
 same expression guards both the direct hit (0x00543c86) and the splash (0x00543c86 again, per
 victim).
 
@@ -679,7 +698,7 @@ broadcasts `0x51` (16 bytes). When `now >= Actor+0x108` it re-walks and dispatch
 | type | effect |
 |---|---|
 | 0 `Shutdown` | `target->+0x34 = 0`; if slot 14 (`IsMoving`) stop the movement; if slot 7 (`IsAttacking`) call slot 98 `StopAttacking` |
-| 1 `Confusion` | SP/Coop: slot 78 `SetTarget(float now, float now + vuln->duration)`; MP: slot 80 `ChangeOwnerAndTeam(float now, float deadline, int shooter_team)`. The receiver of both is **`this->attack_target`** (`CharacterActor+0x2d8`, `MOV ECX,[EDI+0x2d8]` @ 0x0053f76e), not `this`. The duration is `Vulnerability+0x0c` (`duration`), **not** `+0x08` (`delay`) - the call site reads `[ECX+0xc]` @ 0x0053f74c and converts it with `FILD`/`FSTP` then `ADDSS` onto `now` @ 0x0053f755-66. The SP/Coop-vs-MP test is `GameMode <= 1` (`GameMode` @ 0x007b9e28; `TEST EAX,EAX`/`JZ` @ 0x0053f743 and `CMP EAX,1`/`JZ` @ 0x0053f747), so modes 2-5 take slot 80. The "two times and a team" reading is confirmed; the `int` typing of those two times was **not** - both are `float` seconds (`Actor+0x28`/`+0x2c`), see `actor_vtable_notes.md` |
+| 1 `Confusion` | SP/Coop: slot 78 `SetTarget(float now, float now + vuln->duration)`; MP: slot 80 `BeginTeamOverride(float now, float deadline, int shooter_team)`. The receiver of both is **`this->attack_target`** (`CharacterActor+0x2d8`, `MOV ECX,[EDI+0x2d8]` @ 0x0053f76e), not `this`. The duration is `Vulnerability+0x0c` (`duration`), **not** `+0x08` (`delay`) - the call site reads `[ECX+0xc]` @ 0x0053f74c and converts it with `FILD`/`FSTP` then `ADDSS` onto `now` @ 0x0053f755-66. The SP/Coop-vs-MP test is `GameMode <= 1` (`GameMode` @ 0x007b9e28; `TEST EAX,EAX`/`JZ` @ 0x0053f743 and `CMP EAX,1`/`JZ` @ 0x0053f747), so modes 2-5 take slot 80. The "two times and a team" reading is confirmed; the `int` typing of those two times was **not** - both are `float` seconds (`Actor+0x28`/`+0x2c`), see `actor_vtable_notes.md` |
 | 2 `Destroy` | slot 64 `Frag` on the target, then stop |
 | 4 `Script` | broadcast `0x62` (8 bytes) with the target id, then `QueueScriptExecution(vuln->script)` under `GL_Scripts`, `free` the string and null the field |
 

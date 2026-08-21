@@ -639,11 +639,11 @@ JSValue ActorSetTeam(JSContext *ctx, JSValueConst self, int argc,
   // one of them is replication:
   //
   //   * SetTeamID is `this->team_id = team` and nothing else. Both engine call
-  //     sites that change a team (ChangeOwnerAndTeam, and CommandGiveControl,
+  //     sites that change a team (BeginTeamOverride, and CommandGiveControl,
   //     which reproduces its team half inline) bracket it with a removal from
   //     the old team's actor list and an insert into the new one, gated on
   //     +0x3c. Calling it bare leaves the actor on its old team's list.
-  //   * ChangeOwnerAndTeam broadcasts - update 0x58 with the two +0x28/+0x2c
+  //   * BeginTeamOverride broadcasts - update 0x58 with the two +0x28/+0x2c
   //     fields, then update 0x50 with the team, which is the one GIVE CONTROL
   //     sends. SetTeamID broadcasts nothing.
   //
@@ -651,7 +651,7 @@ JSValue ActorSetTeam(JSContext *ctx, JSValueConst self, int argc,
   // change: those are the only other things the slot writes. What those two
   // fields *are* is now measured rather than unknown - they are the start and
   // the expiry of a timed team override, both `float` seconds, written only by
-  // this slot and cleared only by slot 81 (`ReleaseFromOwner`). The round-trip
+  // this slot and cleared only by slot 81 (`EndTeamOverride`). The round-trip
   // below is bit-preserving because the field types and the slot-80 signature
   // moved to `float` **together**; a future edit must not touch one without the
   // other, or this line silently becomes a numeric conversion.
@@ -663,7 +663,7 @@ JSValue ActorSetTeam(JSContext *ctx, JSValueConst self, int argc,
   // chose. Passing 0,0 instead would cancel the override, which is different
   // behaviour and not something this call should silently start doing; the
   // behaviour is left as it is, and documented.
-  a->ChangeOwnerAndTeam(a->slot80_start_time, a->slot81_deadline, team); // slot 80
+  a->BeginTeamOverride(a->slot80_start_time, a->slot81_deadline, team); // slot 80
   return JS_UNDEFINED;
 }
 

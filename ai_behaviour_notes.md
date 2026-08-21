@@ -61,7 +61,7 @@ it loops or re-arms.
 **`AiExecutorTick`** does three things per executor tick:
 
 1. builds a temporary list of every actor whose `role->character->always_cpu_controlled`
-   (`Character+0xb4`) is set **and** whose `TeamSlots[team]+0x6a` is set, and calls
+   (`Character+0xb4`) is set **and** whose `TeamSlots[team].player_controlled` (`+0x6a`) is set, and calls
    `actor->ai_think(time_lo, time_hi)` on each;
 2. walks `AiTeamGroupList` @ `0x006af83c`, calling `RunAiForTeamGroup`, which walks
    `TeamActorLists[idx]` and calls `ai_think` on every live actor with a non-NULL one;
@@ -107,9 +107,37 @@ reachable set is therefore **{0,1,3,4,5,6,8}**: **indices 2 and 7 have no produc
 0x00454588, the common tail, which is reached by 43 direct jumps regardless, so the only genuinely
 dead body is **case 2** (0x0045441c, 318 bytes).
 
-That deadness carries one caveat: it rests on the predecessor enumeration being complete for the
-current instruction map, and that map is itself derived from the four jump tables below. Not
-circular, but one level of inference deep.
+**Case 2's deadness is now CONFIRMED, and the caveat above is discharged.** It used to rest on the
+predecessor enumeration being complete for the current instruction map, which is itself derived from
+the four jump tables below — not circular, but one level of inference deep. Three independent routes
+now settle it, and note that **this verdict is not a `.text` sweep**: the dispatch index is a stack
+local, not a parameter, so unlike the `alert_state` and `IsWithinElevationLimit` verdicts it does not
+depend on any other function's disassembly.
+
+- **Route A** — machine-level constant propagation over all seven flows into 0x004524ab. Six are
+  direct `JMP`s that set `EAX` themselves and therefore **bypass the `CMP EAX,0x8 / JA` bound check**
+  at 0x004524a2 (`MOV EAX,0x1` @ 0x00451c8f, `XOR EAX,EAX` @ 0x00451c9f, `MOV EAX,0x8` @ 0x00452462,
+  `MOV EAX,0x6` @ 0x00452474, `MOV EAX,0x1` @ 0x00452493, `MOV EAX,0x4` @ 0x0045249a); the seventh is
+  the fallthrough at 0x0045249c, which loads the index local. That local has exactly **five**
+  appearances in the whole function — two writes (`= 3` @ 0x00451411, `= 5` @ 0x004522a3) and three
+  reads — and **its address is never taken**, so no call can write it. Value set {0,1,3,4,5,6,8}; no 2.
+  The uninitialized-garbage hole is closed too: the block containing the `= 3` init **dominates** the
+  dispatch (removing it leaves 19 of 477 blocks reachable, none of them the dispatch).
+- **Route B** — 0x0045441c has exactly two references, the jump-table slot @ 0x00455258 and the
+  computed jump @ 0x004524b1, and the instruction immediately preceding it is an unconditional `JMP`
+  (0x00454417 `JMP 0x00454588`), so there is no fallthrough either.
+- **Route C** — the decompiler's own dataflow shows eight assignments to the index variable, values
+  3, 1, 0, 5, 6, 1, 4, 8, matching the disassembly one for one and containing no 2.
+
+The trap check passes cleanly: `AiThink_Bot`'s body [0x00451220, 0x00455228] contains **0
+non-instruction bytes** (re-measured), all four indirect jumps carry `COMPUTED_JUMP` references,
+three carry manual switch overrides, and the decompiler emits no `Could not recover jumptable` and
+no `Treating indirect jump as call`.
+
+**Dead only in `AiThink_Bot`.** The `+0x78` / `+0x64` mechanism itself is live: `AiThink_Scavenger`
+@ 0x00455a66 / 0x00455a71 sets the same pair from a scanned object's coords. All four `Actor+0x78`
+immediate-store sites binary-wide are 0x00450596 (`Actor_SetAiBehaviour`, `= 0`), 0x0045445a (the
+dead one, `= 1`), 0x00455a66 (`AiThink_Scavenger`, `= 1`) and 0x00459168 (`FUN_00457f80`, `= 0`).
 
 ### 2.1.1 The nine behaviour handlers
 
@@ -119,19 +147,49 @@ All nine were read; the bodies below are measured, not inferred from the writes.
 |---|---|---|---|
 | 0 | 0x00452b2d | 1,729 | React to a newly perceived actor. Stops movement (`StopAndBroadcast`, `SetMoveState`), zeroes `+0x74`; copies the stimulus actor's position into `alert_position` (+0x64..+0x6c), clears `alert_flag` (+0x70) and bit 0x80 of `+0x7c`, sets `ai_state = 0`; then a random 4-way pick |
 | 1 | 0x00453486 | 325 | Engage the attack target. Same stop-movement preamble; copies the *target's* position into `alert_position`; sets `ai_state = 1`; vtable slot `+0xf8` gate; resets the miss counter `+0x74` if positive; then a random 4-way pick |
-| 2 | 0x0045441c | 318 | Investigate an object — `+0x78` bool plus a local flag -> `ai_state = 7`, else `alert_flag` -> `ai_state = 3`, else sets `+0x78 = 1`. **Unreachable: no producer for index 2** |
-| 3 | 0x004524b8 | 4,880 incl. shared tail | Idle / hold -> **random wander**. A `GetGameTimeSeconds` deadline on `+0x140`/`+0x144`; `ClearPatrolPoints`; two 4096-entry trig tables (`SinTable` @ 0x007f5f78, `CosTable` @ 0x007faf78, indexed `int & 0xfff`) build a direction, scaled by **20.0** and added to the current position; `FindNavPolygonUnder` + a walkability test; two `PushRouteWaypoint` from either `+0xa0` or `+0x1dc` depending on `+0x184`; sets `ai_state = 8` at three sites |
+| 2 | 0x0045441c | 318 | **Flinch-and-investigate**, reacting to the remembered position at `Actor+0x64`. Guarded on `+0x78`; if a remembered position exists and a per-tick local flag is set it sets `ai_state = 7` (investigate) @ 0x0045442b; else if `+0x70` is set it holds (`ai_state = 3`); else it sets `+0x78 = 1` @ 0x0045445a and issues vtable slot 88 `goto` to **`2*position - Actor+0x64`** — i.e. retreat directly away from the remembered position by the same distance. **CONFIRMED DEAD: no producer for index 2** (see above) |
+| 3 | 0x004524b8 | 4,880 incl. shared tail | Idle / hold -> **random wander**. A `GetGameTimeSeconds` deadline on `+0x140`/`+0x144`; `ClearPatrolPoints`; `SinTable` @ 0x007f5f78 and `CosTable` @ 0x007faf78 (both indexed `int & 0xfff`) build a direction `(cos, 0, sin)`, scaled by **20.0** and added to the current position; `FindNavPolygonUnder` + a walkability test; two `PushRouteWaypoint` from either `+0xa0` or `goto_target` `+0x1dc` depending on `is_moving` `+0x184`; sets `ai_state = 8` at three sites |
 | 4 | 0x00453d23 | 264 | Stimulus investigation; a 3-float delta and a 9.0 constant. Falls into case 6 at 0x00453d2a |
 | 5 | 0x0045384d | 1,238 | Copies a *local* `Vec3` into `alert_position`, clears `alert_flag`, `StopAndBroadcast`; sets `ai_state = 3` |
 | 6 | 0x00453e2b | 1,521 | The reacquire handler — `alert_state = 1`, the 17 s window, updates 0x63/0x62 (§11) |
 | 7 | 0x00454588 | 3,233 | The common tail / alarm state machine (`alert_state` 2/3/4, updates 0x60/0x63, §4). Reached from everywhere |
 | 8 | 0x0045455a | 3,267 incl. tail | Vtable `+0xf8` gate; if the waypoint list `+0x208` is empty sets `ai_state = 3`; falls into the tail |
 
-`SinTable` / `CosTable` in handler 3 are **pre-existing user-defined names in the database, not
-verified** — the read of the wander code could not determine which of the pair is sine. Treat the
-pairing as a label, not a measurement; what *is* measured is that both are 4096-entry tables
-indexed by `int & 0xfff` and that the result is scaled by 20.0 and added to the actor's own
-position.
+**`SinTable` / `CosTable`: the pairing is CORRECT — but both types were wrong, and `CosTable` is
+not a table at all.** This paragraph used to say the pairing was an unverified pre-existing DB name.
+It is now measured, from the C++ static initializer `InitMathLookupTables` @ 0x0058f310 (was
+`FUN_0058f310`, registered from 0x0043abe0 with `this = SinTable`) that fills both at runtime:
+
+- **`SinTable` @ 0x007f5f78 is `float[0x1400]` = 5120 entries, not 4096.** `SinTable[j] =
+  sinf(j * 2*pi/4096)` for `j` in 0..0xfff, and entries 0x1000..0x13ff are a **wrap-around copy** of
+  0..0x3ff, so a read of `(i & 0xfff) + up to 0x400` stays in bounds. 0x1400 elements ends *exactly*
+  at `CosTable`.
+- **`CosTable` @ 0x007faf78 is a single `float *`, not an array.** Its one and only writer stores
+  `SinTable + 0x1000` bytes = `&SinTable[1024]` — a quarter turn, so indexing it yields
+  `sin(x + pi/2) == cos(x)`. Declaring it `float[4096]` was a live defect: `CosTable[0]` read out of
+  the database gave the *pointer bits*, and the bogus 16 KB array swallowed the acos table below.
+- It has **zero write references** in the reference manager, which is exactly what a computed
+  `*(int *)(param_1 + 0x5000) = ...` store looks like — that absence was never evidence of no writer.
+
+The discriminator is the **read shape**, and both appear side by side at the same angle with the
+same mask in this very handler:
+
+```
+0045298a  AND EDI,0xfff
+00452995  MOV EDI,dword ptr [EDI*0x4 + 0x7f5f78]   ; direct  -> SinTable IS an array
+004529ab  MOV ESI,dword ptr [0x007faf78]           ; load the POINTER
+004529c2  MOV ESI,dword ptr [ESI + EAX*0x4]        ; index through it
+```
+
+All 108 references to 0x007faf78 in `.text` are of the second shape; not one indexes it directly.
+The use site builds `(cos, 0, sin)` — X from cosine, Z from sine, the standard heading-from-+X
+convention — so there is no swap at the use site either.
+
+**Two more from the same initializer.** 0x007faf7c is a `float[4097]` **`ACosToTurnsTable`** (entry
+*k* covers cosine `-1 + k/2048` and holds `acosf(v) * 2048/pi`), 0x4004 bytes ending exactly at
+`RsqrtMantissaTable` @ 0x007fef80; and `DAT_007f5f74` is the float 4096.0, now
+**`TurnUnitsPerRevolution`**. **The angle unit throughout this binary is 4096 units per
+revolution.**
 
 ### 2.1.2 The four jump tables
 
@@ -148,8 +206,10 @@ where the table data begins. One entry more or fewer anywhere breaks the tiling.
 | 0x00455284 | 0x0045359a | 4 | the same idiom inside handler 1 |
 
 Both random picks are `switch (rand() >> 1 & 3)` whose signed-modulo sign fixup is **dead code**:
-the `SHR` always leaves the value non-negative. (The RNG they draw from is the 0x006a3130 set, not
-the named one — see `threading_model_notes.md`.)
+the `SHR` always leaves the value non-negative. (The RNG they draw from is `RngAi_State` @ 0x006a3130 —
+one of **fourteen** per-translation-unit instances of BSD `random()` TYPE_3, none of which is
+privileged and none of which is ever re-seeded; see `threading_model_notes.md`. This was once
+recorded as "not the named one", implying there was a named one to differ from.)
 
 **This is why the function was recorded as 0x1f39 bytes.** 8,400 bytes sat outside the function
 body behind these tables — 8,075 of them undefined bytes, plus 325 bytes of already-disassembled
@@ -247,7 +307,8 @@ Nor is it uptime-dependent: `Clock+0x18`, the accumulator, is zeroed **once** at
 the total across), so a level load guarantees the bogus deadline is in the past. **Uniformly wrong.**
 
 Two other things this function does that matter elsewhere: it **retains its target in
-`Actor+0x40` `held_actor`** (so that field is not an "attachment" — `AiThink_Swarm` @ 0x0045b8b4 does
+`Actor+0x40` `goto_actor`** (so that field is not an "attachment" — it is the actor being pursued,
+retained just after the `GotoObject` that set it; `AiThink_Swarm` @ 0x0045b8b4 does
 the same for `ai_state = 8`), and `ai_state = 8` itself is written by `AiThink_Swarm` @ 0x0045b88a,
 which §2.1's enumeration did not cover.
 
@@ -520,9 +581,15 @@ for (Actor *a : TeamActorLists[this->team_id])            // OWN team only
 
 All four are 8 bytes `{id, actor_id}`, unreliable — at the three handler-6 sites the id pairs with
 `[EBX+0xc]`, and a by-value `Vec3` goes to `BroadcastToPlayers` alongside the payload rather than
-inside it (that header/payload split is **inferred from the call shape**, not confirmed against
-`BroadcastToPlayers`' own body; see `directplay_protocol_notes.md`). The client also makes the
-2 -> 3 transition itself (§7), so state 3 needs no message.
+inside it. **That header/payload split is now CONFIRMED** — it was previously inferred from the call
+shape, and has since been read out of `BroadcastToPlayers`' own body: the `Vec3f` is a **spatial
+relevance filter**, compared against `FloatZero` @ 0x007f5f40 and, on the single-player loopback
+path, ignored entirely; only `EDX` bytes ever cross the wire. See
+`directplay_protocol_notes.md` §4.2. One consequence worth knowing here: the same id can reach
+different audiences, because two of the three `AiThink_Bot` 0x63 sites pass different coords —
+0x00453ed6 passes **the actor's own position**, so that broadcast is proximity-culled, while
+0x00453f46 (0x63) and 0x00454055 (0x62) pass **zeroes** and reach every player. The client also
+makes the 2 -> 3 transition itself (§7), so state 3 needs no message.
 
 ---
 
@@ -574,20 +641,48 @@ mouse-cursor selector, which `RunInGameFrame` also calls, at 0x0046ea01; it is d
 mentions:
 
 - **`ReconModeActive` @ 0x007b9ca1 must be non-zero.** Tested at 0x0049a063; a zero jumps clean
-  over the second walk to the epilogue, so **no cone or range circle is ever drawn outside Recon
-  Mode**. It is `.bss`, so it starts at 0, and the only way to set it is the key bound to
+  over the second walk to the epilogue. The *value* test is measured and certain. The gloss that
+  used to follow it — "**so no cone or range circle is ever drawn outside Recon Mode**" — is
+  **polarity-dependent and is now probably backwards**: see §11, where the shipped tutorial text
+  turns out to point the view cones out to the player *before* telling them to press ENTER. Treat
+  this bullet as "the cones are drawn on the non-zero side of the byte" and nothing more until §11's
+  question is settled.
+  It is `.bss`, so it starts at 0, and the only way to set it is the key bound to
   "Toggle Recon Mode on/off" (default **ENTER**, DIK 28) -> `ToggleReconMode` @ 0x004976d0.
   **No console command reaches it**, and `LoadGame` @ 0x00505b28 restores it from a save.
   `EnterCutsceneMode` @ 0x00487f3f forces it on. That the flag means *recon* rather than *normal*
-  is settled by the GLS wait-condition table: the records at 0x0066a1ec (`NORMAL VIEW MODE`) and
-  0x0066a200 (`RECON VIEW MODE`) share the predicate 0x0056fe40 and differ only in the expected
-  value, 0 and 1.
+  was previously called settled by the GLS wait-condition table — the records at 0x0066a1ec
+  (`NORMAL VIEW MODE`) and 0x0066a200 (`RECON VIEW MODE`) share the predicate 0x0056fe40 and differ
+  only in `+0x10`, 0 and 1. **That is now recorded as the one unverified step in an open question**:
+  it holds only if record `+0x10` is an *expected value*, which nobody has read the consumer of.
+  See §11 — the polarity is genuinely open, with measurements on both sides, and the gate in this
+  bullet is stated in terms of the byte's **value** so that it stands either way.
 
   Measured in the running game: pressing the bound key with **nothing selected does nothing**, and
   with a character selected it takes level02's start frame from 278 draws to 147 and moves the
-  camera to the overhead green view. So a selection is a further precondition somewhere on
-  `ToggleReconMode`'s path — and it is **not** the selection test at 0x00497786, which covers only
-  the `:= 0` direction (§11). It also has **3 writers / 21 reads**, not one: both stores in
+  camera to the overhead green view. That second half is a measurement of this gate and is on the
+  *supporting* side of §11's question — cones appear when the key press drives the byte to 1.
+  The first half's extension "…and leaves `ReconModeActive` clear" is an **inference, not a
+  measurement**, and the disassembly predicts the opposite; see below.
+
+  **A selection is a further precondition, and it IS the selection test at 0x00497786** — an
+  earlier version of this section concluded it was not, and that conclusion was wrong. The test
+  covers only the `:= 0` direction, which is correct; what was missing is that the game is *already
+  in* that direction's starting state whenever there is nothing selected. `RunInGameFrame` calls
+  `UpdateSelectedUnitCamera` @ 0x00497ca0 only when the byte is 0 (`CMP` @ 0x0046e6d9, call
+  @ 0x0046e733), and that function's **first test** after its SEH prologue is
+
+  ```
+  00497cca  CMP dword ptr [SelectedUnits count 0x007b46dc],0x0
+  00497cd1  JZ  0x004980b5          ; -> CALL ToggleReconMode
+  ```
+
+  so with an empty selection the game drives the flag itself on the very first such frame. The
+  player's key press then finds the byte already set, takes `ToggleReconMode`'s other branch, and
+  the gate at 0x00497786 aborts the transition. That is the "nothing happens". It also means the
+  byte is *not* left clear in that situation — re-measuring it live is the cheap confirmation.
+
+  It also has **3 writers / 21 reads**, not one: both stores in
   `ToggleReconMode` (0x00497798 and 0x00497968) plus the `LoadGame` restore above.
 
   On the same path, `ToggleReconMode` sets `CursorMode` 5 on the `:= 0` branch and 0 on the other,
@@ -764,27 +859,121 @@ are `Character` bools, and `src/Roles.h` already mirrors them correctly at 0x81/
   wander** — current position plus 20 units on a random bearing (handler 3, §2.1.1). `Actor+0x64`
   is the *alert* position; patrol points come from `ADD PATROLPOINT` (handler 0x00442140 ->
   `CommandAddWaypointOrPatrolPoint` @ 0x0044c760) into the `MobileActor` waypoint list at +0x204.
-  The one positional field still unidentified is **`Actor+0x1dc`** — plausibly the current path
-  destination, and the only thing anyone might mistake for a home position.
+
+  **`MobileActor+0x1dc` is now identified, and it makes this negative STRONGER rather than
+  weaker.** It is `goto_target`, the **current move destination** (it was `unk_coords`, and this
+  paragraph used to call it the last unidentified positional field, "the only thing anyone might
+  mistake for a home position"). `+0x184` is `is_moving`, and the `is_moving ? &+0x1dc : &+0xa0`
+  idiom is a general "where am I heading" accessor, not wander-specific. It is written from the
+  caller's destination by `SetMoveDestinationAndBroadcast` @ 0x005395b0 and read as the nav target
+  by `GetNavigationTarget` @ 0x0053b5d2; the arrival test in `Update` @ 0x00534246 is the
+  *horizontal* squared distance `(x-pos.x)^2 + (z-pos.z)^2`, which also pins the `Vec3` components
+  (x at 0x1dc, z at 0x1e4, y skipped). **Definitively not a home or spawn position**:
+  `BroadcastStopAtPosition` @ 0x00539d92 *overwrites it with the current position* on every stop,
+  as `is_moving` clears — a home field is exactly what that cannot be. Distinct from `Actor+0x40`
+  `goto_actor` and `MobileActor+0x1c0` `dest_node`. (The `[ECX+0x1dc]` writes in
+  `ToggleCrouchAndCamouflage` @ 0x00536353 / 0x005363b0 are false positives — `ECX` there is
+  `this->field_0xe0`, a different object with its own `Vec3` at `+0x1d4`.)
 - **`scan acceptance angle` and `alertable`** have no reader in anything read here.
-- **`TeamSlots+0x6a` / `+0x6b`** gate which actors get AI at all (`AiExecutorTick`,
-  `AiThink_Bot`'s enemy scans). Their meaning is a separate open question — no writer has been
-  found by any lane. Everything above that says "CPU team" is inference from usage, not
-  measurement.
+- ~~**`TeamSlots+0x6a` / `+0x6b`** gate which actors get AI at all, and their meaning is a separate
+  open question with no writer found.~~ **SETTLED.** `+0x6a` is `player_controlled` — the team
+  belongs to a **human player**, any player, not necessarily the local one — and `+0x6b` is
+  `not_enemy_source`, set for team 0 alone. Both writers are in one per-team init loop,
+  `FUN_00496420`; the team-index space is a three-way partition (player teams {1,3,4,5,...},
+  team 0 neutral/scenery, team 2 the AI enemy team). So "which actors get AI at all" is exactly
+  right, and it is the **complement** of `+0x6a`: `LoadLevel` @ 0x004e0d30 creates an AI team-group
+  for every team *without* the flag. See `address_map.md` under `TeamSlots` for the derivation.
+  Everything above that says "CPU team" is now measurement, not inference from usage.
 - **`DAT_007ba058`**, the list `PostAiStimulus` walks to wake listeners, is not identified; it
   is a `List<Actor*>` but its membership rule was not read.
-- The **selection precondition on Recon Mode** is still not located, but its polarity is now
-  settled and the obvious candidate is ruled out. The selection gate is
-  `CMP dword ptr [0x007b46dc],0` / `JZ 0x00497bbd` at **0x00497786**, and it covers only the
-  `ReconModeActive := 0` direction. The `:= 1` store at 0x00497968 is **unconditional on its
-  path** — the `CMP` at 0x00497961 is the instruction immediately before it, and the `JZ` that
-  consumes it only skips the camera-target block. So the in-game measurement (pressing the bound
-  key with nothing selected leaves `ReconModeActive` clear, §7) is **not** enforced by the
-  selection test. What is still open: which of the three earlier guards at 0x0049773d /
-  0x0049774e / 0x0049775f enforces it, and what the globals 0x007b48bc / 0x007b48c4 / 0x007b48cc
-  are — each compares one against `[TLS+0x20]`, read as camera-transition deadlines against the
-  thread tick, **not confirmed**. Two independent sessions converged on the same three
-  instructions.
+- ~~**The selection precondition on Recon Mode.**~~ **SETTLED — it is the selection gate at
+  0x00497786 after all**, and the three "camera-transition deadlines" were never deadlines.
+
+  The gate is `CMP dword ptr [0x007b46dc],0` / `JZ 0x00497bbd` at **0x00497786** and it does cover
+  only the `ReconModeActive := 0` direction; the `:= 1` store at 0x00497968 is unconditional on its
+  path. Both of those readings were right. What two prior sessions missed is that **the game puts
+  itself in the `:= 0` direction's starting state** whenever the selection is empty:
+  `RunInGameFrame` calls `UpdateSelectedUnitCamera` @ 0x00497ca0 only when the byte is 0 (`CMP`
+  @ 0x0046e6d9, call @ 0x0046e733), and that function's first test is
+  `CMP [0x007b46dc],0 / JZ 0x004980b5 → CALL ToggleReconMode`. So the flag is already set by the
+  time the player presses the key, `ToggleReconMode` takes the leaving branch, and 0x00497786 aborts
+  it. **Five of the six callers are `if (flag == 0) ToggleReconMode()`** —
+  `UpdateSelectedUnitCamera` @ 0x004980b5, `MobileUnit::LeaveWorld` @ 0x004c10bf, `FUN_0049f350`
+  @ 0x0049f471, `EnterCutsceneMode` @ 0x00487f3f, `HandleGameKeyAction` @ 0x0047009a — and only the
+  key binding at 0x0046fa0f calls it unconditionally. **No caller gates on the selection.**
+
+  Corollary: the §7 measurement's extension "and leaves `ReconModeActive` clear" is an **inference**
+  and the disassembly predicts the opposite. Re-measuring the byte live is the cheap confirmation.
+
+  **The three guards at 0x0049773d / 0x0049774e / 0x0049775f are MSVC thread-safe-static guards, not
+  deadlines.** `[TLS+0x20]` is `_Init_thread_epoch`, not a tick: `ESI` comes from the TLS array
+  (`MOV ESI,[EAX + ECX*4]`), and each `JG` target runs the out-of-line
+  `_Init_thread_header` @ 0x005e459e / `_atexit(<empty RET stub>)` / `_Init_thread_footer`
+  @ 0x005e4554 triple followed by a `CMP <guard>,-1` re-entrancy check (e.g. 0x00497bd8-0x00497c09).
+  Both helpers are `__cdecl void(int *guard)` with 37 call sites each, always paired.
+  **The real statics are the dword *before* each guard**, and each has exactly one write and one
+  read in the whole binary:
+
+  | static | guard | value | written | read |
+  |---|---|---|---|---|
+  | `ReconCameraSavedRoll` 0x007b48b8 | 0x007b48bc | `Camera_World.roll` 0x007b4dd4 | 0x00497924 | 0x00497a7c |
+  | `ReconCameraSavedPitch` 0x007b48c0 | 0x007b48c4 | `Camera_World.pitch` 0x007b4dd8 | 0x0049792e | 0x00497a93 |
+  | `ReconCameraSavedYaw` 0x007b48c8 | 0x007b48cc | `Camera_World.yaw` 0x007b4dd0 | 0x00497938 | 0x00497aa3 |
+
+  All three are `float`. The `:= 0` branch snapshots them from `Camera_World`; the `:= 1` branch
+  pushes them into the camera object at 0x007b4ba0. That is a carry-across, not a save/restore pair,
+  and it is **not** evidence for either polarity.
+
+- **The polarity of `ReconModeActive` @ 0x007b9ca1 is now itself the open question**, and it
+  replaces the one above. §7 used to call it settled. The evidence is split:
+
+  - **For the name as it stands (non-zero = recon view):** `RunInGameFrame`'s dispatch sends
+    non-zero to `UpdateMouseEdgeScroll` + `UpdateReconCamera` and zero to
+    `UpdateSelectedUnitCamera`; and the **vision-cone walk** in `DrawOrderMenu` is gated on
+    **non-zero** (`CMP` @ 0x0049a063), which pairs with §7's in-game measurement that the key press
+    is what makes the cones appear.
+  - **For the inverted reading (0 = recon view):** `DrawOrderMenu` calls `DrawTargetInfoPanel`
+    @ 0x004a86c0 — **39 `GL_RECON_*` resource ids, more than any other function in the binary** —
+    only when the byte is **0** (`CMP` @ 0x004987a2 / `JNZ`, call @ 0x004987b0); and `CursorMode` 5,
+    whose name `ReconView` is confirmed *from that panel*, is set on the `:= 0` branch at 0x004977c2,
+    the binary's only `SetCursorMode(5)` site.
+
+  So the cone view and the `GL_RECON_*` target panel sit on **opposite branches of the same byte**.
+
+  **The shipped English string table moves the balance, and it moves it toward "inverted".** This is
+  external evidence no prior pass had; all quotations are verbatim from `glreseng.dll`'s
+  training-level text (extracted from the `RT_STRING` resource, not from the manual):
+
+  1. *"Select Gunlok and press enter to go into Recon mode."* / *"You need to select Gunlok."* — a
+     non-empty selection is a documented precondition for **entering**. In the code that gate gates
+     the `:= 0` branch and only that branch. So `:= 0` is the entering direction.
+  2. *"You are now in Recon mode. In Recon mode, you are not able to move … You can look around
+     using the mouse. You can zoom in using the left mouse button. The right mouse button will zoom
+     back out."* — the LMB/RMB zoom belongs to recon mode, and its handlers are `CursorMode` 5's,
+     set on the `:= 0` branch. *"Not able to move"* also matches that branch clearing
+     `MousePickingEnabled` @ 0x006ac628.
+  3. The zoom is **integrated inside `UpdateSelectedUnitCamera`** (`ReconZoomFactor *= ReconZoomRate`
+     @ 0x00497dca), which `RunInGameFrame` runs on the byte-`== 0` side. So the function that applies
+     the recon zoom runs when the byte is 0, and `UpdateSelectedUnitCamera` /
+     `UpdateReconCamera` look like they have their **names swapped**.
+  4. *"The green triangle in front of the enemy is its view cone and the circles emitting from it are
+     its audio scan range … Now press the enter key to go into Recon mode."* — the cones are pointed
+     out to the player **before** entering recon mode. That reverses what was the strongest item on
+     the other side, and it is why §7's cone gloss is now flagged.
+
+  So four of the five items now line up on the inverted side, and the only datum left against it is
+  the one unverified step in §7's wait-condition argument. **Still not renamed**, deliberately: what
+  would settle it is reading `InstallWaitForCondition` and the per-frame evaluator to find the actual
+  consumer of wait-condition record `+0x10` (record size 0x14, table `WaitForConditionTable`
+  @ 0x0066a0c0, 28 entries). If that confirms the inversion then `ReconModeActive`,
+  `UpdateReconCamera` @ 0x00484e40, `UpdateSelectedUnitCamera` @ 0x00497ca0 and §7's cone claim all
+  have to change **together** — a coherent edit, not a one-name patch, which is the other reason not
+  to start it piecemeal. Every claim written in this round is phrased in terms of the byte's *value*
+  so that it survives either answer.
+
+  What does **not** depend on the answer: `CursorMode` 5 is `ReconView` (the evidence is the
+  39-`GL_RECON_*`-string panel plus the tutorial's own description of the LMB/RMB zoom), and the six
+  `OnReconView*` handler names and their zoom directions are confirmed by that same text.
 - `AiThink_Scavenger`, `AiThink_Mine`, `AiThink_Minebot`, `AiThink_Node`, `AiThink_Swarm` and
   `AiThink_Waiting` were identified and named but **not analysed**.
 - The exact byte layout of the client `Unit` (`Unit::Unit_Ctor` @ 0x004b4620's product) beyond +0x24, +0x7c/+0x7d,

@@ -826,7 +826,15 @@ The split is sharp and worth remembering:
   `HashTable<T>` (`Hash_tem.hpp`, mirrored in `src/HashTable.h` — and it reaches further into
   the game layer than the "not shared" rule below suggests: the actors and roles tables are
   both this template),
-  `Chunk`/`Chunk::Register` (`Chunk.hpp`), and the load-side consumers
+  `Chunk`/`Chunk::Register` (`Chunk.hpp`), **and the chunk class tree above `Chunk` —
+  `Lockable_Chunk_With_Children` (`win95/MISHCHNK.HPP`) and `Chunk_With_BMPs`
+  (`win95/BMPNAMES.HPP`)**, which are Gunlok's 15- and 21-slot intermediates and are *siblings*
+  rather than a chain (the second derives from `Chunk` directly). Listing only `Chunk` here
+  previously led two separate investigations to assume the tree above it was Gunlok-specific and
+  unnameable; it is neither. Gunlok is on a **later revision** of the library that appends exactly
+  **one** base slot (11, a "is this a chunk with children" predicate) with the intermediates
+  otherwise unchanged — which is why the base vtable is 12 slots against AvP's 11.
+  Also the load-side consumers
   `avp/win95/Projload.cpp` + `Objsetup.cpp` (AvP's counterpart to `ToMap`).
   `list_tem.hpp` is the ground truth for every `{sentinel, count, cached_array,
   cache_valid}` header in Gunlok: the header is `List<T>`, nodes are
@@ -930,12 +938,57 @@ section.
   each `case_N`, so that is render-time coalescing, not data loss.
 - **4-aligned is not sufficient to call a dword a pointer.** A 16-bit array whose value is >= 0x0063
   in both halves reads as a valid `.text` pointer: the worked case is 0x006a4b70-0x006a4b97, a run
-  of the constant 0x0063 where every dword reads `0x00630063`. Require **distinct values** as well
-  as alignment — specifically, reject a run whose values are all identical. Low distinctness alone
+  of the constant 0x0063 where every dword reads `0x00630063`. **The "require distinct values" test
+  this bullet used to prescribe is measured insufficient and has been replaced**: ten runs deferred
+  as suspected switch tables all had distinct values and passed it anyway, and every one turned out
+  to be an interior slice of the GLS parser's 16-bit yacc tables (`gls_system_notes.md` has the map).
+  The worked case above is not an isolated curiosity either — it is a slice of `GshParse_yytable`,
+  where 0x0063 is parser state 99 repeated. Two tests that do work:
+  1. **Byte shape** — reject a dword whose bytes are `XX 00 YY 00` with both `< 0x80`. A genuine
+     `.text` pointer here (0x00401000-0x0064cfff) always has a nonzero byte[1] or byte[2]; a pair of
+     small `short`s never does.
+  2. **Decisive and cheap: require the candidate base to appear as a `disp32` somewhere in `.text`.**
+     A jump table nothing dispatches through is not a jump table. This is immune to the
+     undisassembled-code trap, because a dispatch *must* encode its base in the `JMP` or a `LEA`
+     whether or not that code is defined — so it settles the question without needing the referencing
+     code recovered first.
+  Two cheaper tells, both free: MSVC **never puts a jump table in a writable section**, so a
+  candidate in `.data` is already refuted; and a run whose targets span **more than one function** is
+  not a single switch. Low distinctness alone
   is normal inside a vtable region, where shared base slots and `__purecall` repeat legitimately.
   And **`.reloc` cannot be used as the absolute-vs-RVA oracle in this database**: all 4,884 recorded
   relocations are confined to `.text` 0x00400000-0x0043ffff, with none in `.rdata`/`.data`, so "this
   dword has no relocation" carries no information.
+- **A `CMP <global>,[TLS+0x20]` followed by `JG` to an out-of-line block is an MSVC thread-safe-static
+  guard, not domain data.** `[TLS+0x20]` is `_Init_thread_epoch`. The tell is the triple
+  `_Init_thread_header` @ 0x005e459e / `_atexit(<empty RET stub>)` / `_Init_thread_footer`
+  @ 0x005e4554, and **the real static is the dword *before* the guard**. This cost two independent
+  sessions: 0x007b48bc/c4/cc were read as "camera-transition deadlines against the thread tick" and
+  are guards, while the actual statics at 0x007b48b8/c0/c8 are the saved recon camera roll/pitch/yaw.
+  Reading a guard as a domain value invents a quantity that does not exist.
+- **An MSVC `__finally` funclet has two entry points, and the scope table names the wrong one for
+  Ghidra's purposes.** `_EH4_SCOPETABLE_RECORD.HandlerFunc` points at a 1-4 instruction
+  enclosing-frame register reload that **falls through** into a body the parent also `CALL`s a few
+  bytes later — and Ghidra has already made a function at *that* inner address. So "the scope table
+  points at an address with no function" is **not** a missing function: `createFunction` there yields
+  a stub that falls through into a foreign body. Rename the inner function and *label* the scope-table
+  address. Measured at 56 of 72 `__finally` records here. The sibling shape is the `__except`
+  handler — a bare `MOV ESP,[EBP-0x18]` rejoining the parent's `__try` resume point — which must
+  never become a function at all. Generalises past the CRT and fails silently.
+- **A Function ID "Library Function - Single Match" can be flatly wrong**, which is a different trap
+  from the multi-match hole below. FID matches on body *shape*, and the MSVC scalar deleting
+  destructor is four instructions of boilerplate around `CALL <dtor>` / `operator delete(this, N)` —
+  generic enough that it filed two RIF chunk destructors under
+  `std::basic_stringbuf<...>::'scalar deleting destructor'`. The cheap test is the **reference set**:
+  a real library function is reached from library code, and these were each reached from exactly one
+  chunk vtable slot. The `operator delete` size is the second test and doubles as a free `sizeof`
+  measurement (`(this, 0xac)` pinned `Object_Chunk`, `(this, 0x44)` pinned two others).
+- **A receiver's provenance must be read at the dispatch site, not inferred from what an honest
+  sender does.** An executor arm was framed for a whole prior attempt as taking its receiver from the
+  client's selection; the arm actually opens `MOV ECX,[EBX+0x4]` / `CALL GetActorById`, an id straight
+  off the wire, and the selection constrains only the client. Related tell: **`GetUnitById` vs
+  `GetActorById` decides which of the two class trees a slot number belongs to** — a `Unit` receiver
+  makes the `Actor` slot counts inapplicable.
 - Reachability and gate counts must be **transitive**: `CommandSpawn` looks ungated but delegates
   to `DoSpawn`, which holds the gate. Converges around depth 2.
 - **Reverse basic-block reachability is worthless inside a dispatch loop — use dominators.** Every
@@ -1103,8 +1156,16 @@ section.
   **zero** declared parameters, so neither its `this` nor its return exists in the decompiler's
   output. Add a "does the entry read ECX/EDX before writing them" column to any such sweep.
 - **Four decompiler/model artifacts that each flipped a return-type verdict.** A **tail `JMP` is
-  recorded as a call reference**, so the instructions after it are unrelated code - this produced
-  every apparent EAX-reader of `ConsolePrint`, `PlayUiSound` and `RenderQueue_Submit`. A
+  recorded as a call reference**, so the instructions after it are unrelated code. **The shape of
+  that artifact is narrower than this bullet used to claim, and two of its three named functions
+  were wrong**: it is an **incoming** tail `JMP`, not an outgoing one, so it afflicts a callee whose
+  *callers* tail-jump to it. `PlayUiSound` had exactly 2 such references out of 88, and
+  `RenderQueue_Submit` has **zero** among its 102 — neither is a tail-call pass-through at all.
+  (`ConsolePrint` is unchecked; leave that clause alone.) The sharp rule: **filter reference sites by
+  the mnemonic at the *from*-address**, not by the callee's own epilogue. And prefer the positive
+  test where one exists — *a function whose EAX at `RET` differs between two paths by construction
+  is `void`*, which is what settled `RenderQueue_Submit` (one path leaves `RenderQueue_Add`'s return,
+  the other a destructor's `this`). That needs no caller census and cannot be faked by an artifact. A
   last-EAX-write walk must **skip `__security_check_cookie` @ 0x005e46aa**, which preserves EAX -
   that alone flipped three functions from "void" to their real return. `FILD` counts as reading ST0
   in Ghidra's model (41 fake floating-point consumers on one function). `OR EAX,0xffffffff`
@@ -1127,6 +1188,22 @@ section.
   a transaction for you. Every explorer in a round shares one snapshot, so they cannot disagree
   because the program moved under one of them — and that snapshot is taken from the program **as
   last saved in Ghidra**.
+- **A read-only snapshot can be STALE EVEN AFTER a successful `save_program`, so never use one to
+  verify your own or an agent's work.** Measured the hard way: a consolidator applied ~45 renames,
+  four new classes and several new types and reported `save_program` returning `saved: true`; a
+  `create_readonly_context` taken *afterwards* still showed every one of them as `FUN_`, with **no**
+  unsaved-changes warning to signal that the view was old. That read produced a confident and
+  completely wrong conclusion that the agent had fabricated its report — followed by a redundant
+  re-application that created a duplicate data type and needed its own recovery. **A read-write
+  context binds the live program and is the authoritative read.** So the rule is narrower than the
+  bullet below suggests: snapshots are for *exploring*, and anything you intend to assert about
+  current DB state — especially a negative, "this was not applied" — must come from
+  `create_context`. Corollary: when two readings disagree, suspect the instrument before concluding
+  against the agent.
+- **A report saying "not yet applied" is a statement about when it was written, not about the
+  database.** The same staleness as the census bullet above, one level up. Read the DB before
+  applying a findings report; it costs a handful of read-only calls and prevents redundant or
+  conflicting writes.
 - **A consolidator's edits are invisible to every explorer spawned afterwards until the program is
   saved**, and this is measured, not inferred: a consolidator wrote a plate comment, and the next
   `create_readonly_context` came back with `The program has unsaved changes in Ghidra. This snapshot
@@ -1164,7 +1241,18 @@ section.
   and renaming a component *wider* than the field mislabels its neighbours (`MobileActor+0x187` was
   a 4-byte `int` spanning 0x188). Use `clearAtOffset` then
   `replaceAtOffset(off, dt, dt.getLength(), name, comment)`, and re-check `getLength()` afterwards —
-  an unchanged struct size is the guard that the edit landed where you meant.
+  an unchanged struct size is the guard that the edit landed where you meant. **That guard earns its
+  keep**: skipping the `clearAtOffset` on a non-packed structure makes `replaceAtOffset` *insert*
+  rather than overwrite, and a 0x2c struct silently became 0x4c. The recovery is **not**
+  `deleteAtOffset` in a loop — that does not shrink a non-packed structure and will hang the 30-second
+  call — it is `deleteAll()` followed by sequential `add()`, which respects alignment.
+- **Creating a data type without checking for an existing one produces a `.conflict` twin, and the
+  cleanup is easy to get wrong.** `dtm.findDataTypes(name, list)` matches on *display* name, so a
+  search for `"Foo.conflict"` can return the canonical `Foo` — removing that result deletes the real
+  type and collapses every parameter using it to `undefined`. Resolve a duplicate with
+  `dtm.replaceDataType(dup, orig, False)` per the note below, or check `dtm.getDataType(path)` for the
+  exact path first; and note the path may not be the one you assume (`/gunlok/ResourceStringEntry`,
+  not `/ResourceStringEntry`), so a path-based "it is absent" check is itself a false-negative risk.
 - For `__thiscall`, the `this` type comes from the function's **parent class namespace**
   (`setParentNamespace`), not `updateFunction`; a parameter literally named `this` binds to ECX.
 - Ghidra's `__thiscall` puts **only** `this` in ECX, everything else on the stack. A function
@@ -1233,7 +1321,14 @@ unrelated, long after the call.
   standard-layout, so embedding it does not cost `-Winvalid-offsetof` warnings on the
   containing struct. Picking the right `T` is a real claim about the payload: `List_Member<T>`
   puts `data` at 0x0c for a pointer but at 0x10 for an 8-aligned value type, which is exactly
-  what makes `MenuListItem` 0x78 rather than 0x10
+  what makes `MenuListItem` 0x78 rather than 0x10.
+  **There is a second, incompatible list header in this binary and it is easy to mistake for the
+  first.** It is *pointer-first* — `{List_Member_Base *sentinel; int count; void *cache; bool valid;}`
+  — where the sentinel is a **separate heap object behind a pointer** rather than embedded by value,
+  so `count` sits at +0x04 instead of +0x0c. Modelling one as the other **shifts every field by 8**.
+  Known instances: the spark emitter list at `DAT_007ba1b4`, and both Unit shadow lists
+  (`Unit+0x28`, `Unit+0x38`). This is *not* the AvP `list_tem.hpp` shape, so `src/List.h` does not
+  describe it — check which one you have before embedding `List<T>`
 - Detour hooks follow: resolve original -> attach in constructor -> detach in destructor
 - **Never put a call inside `assert`.** `NDEBUG` is defined in every optimized configuration and
   `assert` then discards its argument *expression*, call and all. `entry.cpp` had

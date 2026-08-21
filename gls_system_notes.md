@@ -14,6 +14,88 @@ The parser is a classic **flex + yacc** pair compiled into the binary:
 - `ParseGSH` @ `0x00478400` - yacc LALR parser; all grammar actions live in one big
   reduce-rule switch
 
+The parser generator is **Berkeley yacc**, and that is not an inference from shape: byacc's own
+SCCS stamp is linked in among the parser tables at 0x006a3d54, 36 bytes reading
+`@(#)yaccpar	1.4 (Berkeley) 02/25/90`.
+
+### The lexer and parser tables
+
+Both are **table-driven**, and the sixteen tables are now defined and named in the database. Every
+boundary below is measured by exact adjacency; the two that are pinned by a *foreign* object rather
+than by symmetry are called out, because both corrected an earlier proposal.
+
+`GSHTokenize`'s seven, contiguous in `.rdata` — 5958 states, 55 character equivalence classes:
+
+| Address | Type | Name | Role |
+|---|---|---|---|
+| 0x00652938 | `short[5960]` | `GshLex_yy_accept` | per-state accepting rule |
+| 0x006557c8 | `byte[256]` | `GshLex_yy_ec` | char -> equivalence class, values 0..55. Measured directly: `MOV BL,byte ptr [EAX + 0x6557c8]` |
+| 0x006558c8 | `byte[56]` | `GshLex_yy_meta` | meta-equivalence class, `nclasses+1` entries, values 1..5 |
+| 0x00655900 | `short[5968]` | `GshLex_yy_base` | per-state base offset |
+| 0x006587a0 | `short[5968]` | `GshLex_yy_def` | default/next state; jam values 5958 / 5959 |
+| 0x0065b640 | `short[7396]` | `GshLex_yy_nxt` | transition table |
+| 0x0065f008 | `short[7394]` | `GshLex_yy_chk` | owner-state table |
+
+then the string pool at 0x006629cc. `yy_chk`'s **base** is pinned decisively rather than by
+symmetry: for every index *i* in 1..7299, `yy_chk[i]` names a state *s* with
+`yy_base[s] <= i <= yy_base[s]+55` — **7299/7299 with zero violations at 0x0065f008**, against 5
+violations at 0x0065f006 and 11 at 0x0065f00a. Its *length* then follows from the string pool,
+giving 7394 — two short of `yy_nxt`, the one asymmetry in the set.
+
+`ParseGSH`'s nine, contiguous in `.data`, in byacc's canonical emission order — ~288 states, 56
+nonterminals, 246 rules, index bound `CMP EBX,0x351`:
+
+| Address | Type | Name |
+|---|---|---|
+| 0x006a3b68 | `short[246]` | `GshParse_yylhs` (starts `-1, 0, 0, 0x23, 0x23, 0x24 ...`) |
+| 0x006a3d54 | `char[36]` | `GshParse_yaccpar_sccsid` — **the byacc version stamp, linked between two tables** |
+| 0x006a3d78 | `short[248]` | `GshParse_yylen` (rule lengths `2,2,2,2,0,1,1,1,3,3,3...`) |
+| 0x006a3f68 | `short[288]` | `GshParse_yydefred` |
+| 0x006a41a8 | `short[56]` | `GshParse_yydgoto` |
+| 0x006a4218 | `short[288]` | `GshParse_yysindex` |
+| 0x006a4458 | `short[288]` | `GshParse_yyrindex` |
+| 0x006a4698 | `short[56]` | `GshParse_yygindex` |
+| 0x006a4708 | `short[852]` | `GshParse_yytable` |
+| 0x006a4db0 | `short[852]` | `GshParse_yycheck` |
+
+`yylhs` is `short[246]`, **not** the 264 first proposed: the SCCS stamp begins at 0x006a3d54 and
+hard-bounds it. (byacc normally emits `yylhs` and `yylen` at equal length and `yylen` here is 248,
+so the 2-entry difference is real and unexplained — but the string is not movable.) `yycheck`'s
+extent is confirmed rather than proposed: `0x006a4db0 + 852*2 = 0x006a5458` lands exactly on the
+start of the next object. `yytable + 850*2 = 0x006a4dac`, immediately preceding `yycheck`, which
+reconciles the `CMP 0x351` bound against the layout independently.
+
+**These tables are a classifier trap, and they have already caught one sweep.** Every dword in them
+has the byte shape `XX 00 YY 00` — two small 16-bit values that read as a plausible `.text` pointer
+when paired. A pointer-table pass deferred ten runs as "unresolved switch jump tables"
+(0x0065b6f8[8], 0x0065b7ac[19], 0x0065eba4[11], 0x0065f2f8[5], 0x0065f310[6], 0x0065f330[5],
+0x006a4144[5], 0x006a4170[5], 0x006a4850[8], 0x006a4898[7]); **none is a jump table** and no
+override should ever be applied to one. A census of the two regions found **159 dwords that read as
+mid-`.text` pointers** — 114 in the lexer tables (0.9% of 12,980 dwords) and 45 in the parser tables
+(2.8% of 1,595); the ten are just the ones long enough to pass a run-length threshold. Two tests
+settle it, either cheaper than finding the dispatch:
+
+1. **Byte shape** — reject a dword whose bytes are `XX 00 YY 00` with `XX,YY < 0x80`. A genuine
+   `.text` pointer here (0x00401000-0x0064cfff) always has a nonzero `byte[1]` or `byte[2]`; a pair
+   of small `short`s never does.
+2. **Decisive and cheap** — require the candidate base to appear as a `disp32` somewhere in `.text`.
+   A jump table that nothing dispatches through is not a jump table, and this is **immune to the
+   undisassembled-code trap**: it does not depend on the referencing code being disassembled. The
+   base of each of the ten appears nowhere in `.text`/`.rdata`/`.data` as a 4-byte LE constant.
+
+Two cheaper tells were available all along: four of the ten sit in `.data`, and MSVC never puts a
+jump table in a writable section; and 0x0065b7ac's 19 "targets" land in **eight unrelated
+functions**. Note also that `CLAUDE.md`'s documented `0x00630063` false positive at
+0x006a4b70-0x006a4b97 is **inside `GshParse_yytable`** — `0x0063` there is parser state 99,
+repeated — so that trap's worked example is not an isolated curiosity but a slice of this same
+object. The real arrays are read with `MOVSX`/`MOVZX reg, word ptr [idx*0x2 + base]` — **scale 2,
+16-bit** — and never by an indirect `JMP`.
+
+Defining these correctly pulls in **zero** new code: a `short[]` array creates no references into
+`.text`. Measured after the fact — 0 references originate inside all sixteen tables. The
+auto-analysis hazard would only have fired had they been defined as **pointer** arrays, i.e. the
+wrong action.
+
 Parsing is **two-pass** (`LoadGLS` runs `ParseGSH` twice over the same file):
 
 1. **Pass 1** (lexer bootstrap token `0x101`): forward-declares symbols, processes the
@@ -71,8 +153,8 @@ current frame rate; the ` * 60.0` variant handles minutes).
 | Offset | Name | Notes |
 |--------|------|-------|
 | 0x00474540 | `LoadGLS(char* file, int mode)` | Entry point. Returns `ParsedObjectList*`. `mode` is a bitmask checked by each type's *filter* vtable slot; all standard types test bit 0, so pass `1`. |
-| 0x00474920 | `GSHTokenize` | flex lexer |
-| 0x00478400 | `ParseGSH` | yacc parser (all grammar actions) |
+| 0x00474920 | `GSHTokenize` | flex lexer; tables at 0x00652938-0x006629cc, see above |
+| 0x00478400 | `ParseGSH` | Berkeley yacc parser (all grammar actions); tables at 0x006a3b68-0x006a5458, see above |
 | 0x004747b0 | `ConvertParsedObjects(ParsedObjectList*)` | Calls `toGameObject` (vtbl slot 7) on every parsed object, releasing refs and updating the loading bar. |
 | 0x00474870 | `FreeParsedObjectList(ParsedObjectList*)` | Releases remaining refs and frees the list itself. |
 | 0x00477000 | `PrintParseError(fmt, ...)` | Increments `ParseErrorCount`, which **nothing reads** - see below |

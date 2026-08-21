@@ -48,7 +48,8 @@ Two facts from it that change how bindings get written:
   broadcast, while `actor.health`, `frag`, `remove`, `die`, `set_target`, `associate`, the attack
   methods and `set_pickup_enabled` do. The console commands beside them broadcast *around* the same
   setters, which is what makes the difference invisible in single player. `set_team` is the sharpest
-  case: `Actor::ChangeOwnerAndTeam` @ 0x00530470 replicates and `SetTeamId` does not, and the
+  case: `Actor::BeginTeamOverride` @ 0x00530470 (slot 80, formerly `ChangeOwnerAndTeam`)
+  replicates and `SetTeamId` does not, and the
   binding took the latter — now fixed, and it was two bugs, because bare `SetTeamId` also left the
   actor on its **old team's actor list**. **Check the setter, not the command** —
   `console_command_notes.md` §6 is the full table.

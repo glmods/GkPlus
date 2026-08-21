@@ -188,12 +188,25 @@ bool GetChooseLevelEnabled();
 void SetChooseLevelEnabled(bool enabled);
 
 // PlayUiSound @ 0x0058cdd0 - __fastcall with the sound id in ECX and nothing in
-// EDX (the body pushes ECX, a 0 and the sound-engine global, and tail-calls
-// 0x0058a660). OnMenuItemClicked opens with UiSoundMenuSelect for *every*
-// activation, so anything that handles a click instead of the game has to play
-// it too or the item feels dead.
+// EDX. The body pushes ECX, a 0 and the sound-engine global and *calls*
+// 0x0058a660 (`CALL` + `ADD ESP,0xc` + a bare `RET`, not a tail `JMP`), so with
+// one exit and nothing touching EAX afterwards it **returns that call's value**:
+// a sound voice index, or 0 / -1 / -2 on three distinct failures. Hence `int`,
+// not `void` - per the `LoadLevel` rule a wrapper's return type is as
+// load-bearing as its arguments, and a `void` here would hand callers whatever
+// happened to be in EAX. Nothing in GkPlus reads it today; forwarding it costs
+// nothing and keeps the mirror honest.
+//
+// The game itself never reads EAX at any of the 86 call sites, because
+// 0x0058a660 hands the voice index back through an out-pointer instead: its
+// variadic option string takes an 'e' letter whose `int *` is pre-set to -1 and
+// overwritten on success.
+//
+// OnMenuItemClicked opens with UiSoundMenuSelect for *every* activation, so
+// anything that handles a click instead of the game has to play it too or the
+// item feels dead.
 inline constexpr int UiSoundMenuSelect = 0x57;
-void PlayUiSound(int sound_id);
+int PlayUiSound(int sound_id);
 // IsAnyInGameMenuOpen @ 0x00569550.
 bool IsAnyInGameMenuOpen();
 // CloseInGameMenu @ 0x005691f0 (kind 0/1/2/3/0x41/0x42/0x43).

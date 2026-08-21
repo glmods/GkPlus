@@ -35,6 +35,15 @@ Every size is confirmed three ways: slot 35 `GetSize` returns it, slot 0's
 > **`PresidentActor`'s vtable is 96 slots, not 84.** It is the last vtable in `.rdata`, so the
 > "ends at the next vtable" shortcut under-counts it; it actually runs to 0x00669500, where the
 > string pool starts. The DB's `PresidentActorVtbl` (len 384) already had this right.
+>
+> **What is *past* slot 95 is load-bearing, not trivia.** The string pool at 0x00669500 opens with
+> `"nanofrag_projectile"`, so a read of slot 96 / 97 / 98 off this table yields the ASCII dwords
+> `"nano"` / `"frag"` / `"_pro"`. None of the three is a mapped address, so an out-of-range
+> dispatch on a `PresidentActor` is an immediate access violation at a **fixed,
+> non-attacker-chosen** EIP. That matters because five wire-reachable sites do dispatch slots 96,
+> 97 and 98 on an id-resolved object with no class check — see `game_defects_notes.md`, "Slot
+> 96/97/98 dispatch on a wire-supplied actor id". It is a remote crash, **not** control-flow
+> hijack, and the stack drift described there is the worse half of it.
 
 **`ProjectileActor` was called `UnknownActor`** until the evidence below settled what it is. The
 rename has been applied throughout: the class namespace and its 14 member functions, the
@@ -81,7 +90,7 @@ plausible-looking library one.
 ## Actor Factory / Storage
 
 `CreateActor` @ 0x00510760 dispatches on `role->ai` to the right subclass. Actors live in the hash
-map `actors` @ 0x007ba0d8; `GetActorById` @ 0x0044e0b0; `num_actors` @ 0x007b9ffc.
+map `actors` @ 0x007ba0d8; `GetActorById` @ 0x0044e0b0; `NextActorId` @ 0x007b9ffc (renamed from `num_actors`: it is a monotonic next-id counter, never decremented).
 
 ## Base `Actor` VTable (83 slots)
 
@@ -175,8 +184,31 @@ Only the class that *introduces* the override appears here; its descendants inhe
 | 54 | 0x0054f4f0 | `SetField0x188(bool)` | `RET 4`, discards |
 | 55 | 0x0054f270 | `OnPrePhysics` | no-op |
 | 56 | 0x0054efa0 | `PathToTarget` | `RET 0x8` stub, arguments discarded; `MobileActor::PathToTarget` @ 0x00539930 is the real body - it calls `FindNavPathWithinRadius` @ 0x0052c100 and pushes the result through slot 90 (`navigation_notes.md` §5.4) |
-| 57 | 0x0052e0a0 | `bool Raycast(float *out_hit, Vec3 *from, Vec3 *to, float *nearest_inout)` | ray/shape intersection, `RET 0x10`. Returns **`bool` in AL** - true = hit - and all eight slot 57/58 dispatch sites consume it with `TEST AL,AL`. AL only: the body ends `MOV AL,BL`, so EAX[31:8] is residue from the preceding call and widening the return to `int` would be wrong. Branches on `entity->field_0x18` to 0x004619d0, else on `anim_object` to 0x00461cb0; false if both are absent |
-| 58 | 0x0052df50 | `bool SweepTest(float *out_hit, Vec3 *from, Vec3 *to, Vec3 *sweep, float *nearest_inout)` | swept intersection, `RET 0x14` - same `bool`-in-AL contract, one extra `Vec3 *`. Helpers 0x00461b20 / 0x00461ed0 |
+| 57 | 0x0052e0a0 | `bool Raycast(float *out_hit, Vec3 *from, Vec3 *direction, float *nearest_inout)` | ray/shape intersection, `RET 0x10`. Returns **`bool` in AL** - true = hit - and all eight slot 57/58 dispatch sites consume it with `TEST AL,AL`. AL only: the body ends `MOV AL,BL`, so EAX[31:8] is residue from the preceding call and widening the return to `int` would be wrong. Branches on `entity->field_0x18` to `Renderable_RaycastMesh` @ 0x004619d0, else on `anim_object` to `Renderable_RaycastBounds` @ 0x00461cb0; false if both are absent. **Both branches pass the same `EDX = this->anim_object`** (`MOV EDX,[ESI+0xe0]` at 0x0052e10b *and* 0x0052e178) - `Role::shape` only discriminates how that `Renderable` was built, it is not a second object |
+| 58 | 0x0052df50 | `bool SweepTest(float *out_hit, Vec3 *from, Vec3 *velocity, Vec3 *accel, float *nearest_inout)` | **a ballistic cast, not a volume sweep**, `RET 0x14` - same `bool`-in-AL contract. The 4th argument is `(0, GravityAcceleration, 0)` at all four dispatch sites and the leaf solves a quadratic, so `p(t) = from + t*v + t^2*a/2`. Helpers `Renderable_TrajectoryCastMesh` @ 0x00461b20 / `Renderable_TrajectoryCastBounds` @ 0x00461ed0. The name should be `TrajectoryCast`; see below |
+
+**The `Vec3 *` third argument of slots 57 and 58 is a DIRECTION / first-order rate vector, not an
+endpoint**, and `t` parameterises `p(t) = from + t*to`. Three independent confirmations:
+
+1. All four leaf helpers transform `from` with `AffineTransform` and `to` with `Mat3Transform` —
+   the linear part only. A world endpoint would need the affine transform; transforming the
+   *direction* instead is precisely what makes `t` invariant under the object transform, which is
+   why the design works.
+2. The leaves evaluate `origin + t*dir` parametrically and use `to` as a divisor.
+3. Every caller builds `to` as a velocity. `ProjectileActor::InitPositionAndTiming` copies
+   `ProjectileActor+0x138` (`velocity`) verbatim and then integrates gravity into it.
+
+The leaves take a **`HitRecord *` in ECX** — `0x10` bytes, `{0x00 float t; 0x04 Vec3f normal;}`,
+with `t` **in/out**: the caller seeds it as the early-out bound and only a nearer hit overwrites it.
+They are `__fastcall` with ECX = the hit record and EDX = the `Renderable`, so ECX is *not* a `this`
+and they stay in the global namespace. Their last argument is a `Vec3 *`; **they take no `float *`
+at all**, which an earlier recording of this signature had. Full table in `address_map.md`,
+"Collision casting".
+
+> **Slot 58's name is wrong and the rename is an open item.** It should be `TrajectoryCast`. The
+> evidence above is strong, but it was deliberately not applied: it spans this file, `src/Actors.h`
+> and three Ghidra surfaces (the function, the `ActorVtbl` slot-58 field and the `Actor_SweepTest`
+> funcdef), and it was flagged for a decision rather than made.
 | 59 | 0x0054f4e0 | `OnDamageReceived` | no-op - see PickupActor, where the slot is really `SetPickupType` |
 | 60 | 0x0054f1a0 | `IsTargetable` | false |
 | 61 | 0x0054f250 | `IsVisible` | `+0x10d` |
@@ -198,15 +230,21 @@ Only the class that *introduces* the override appears here; its descendants inhe
 | 77 | 0x0054f350 | `OnAnimationEvent` | no-op |
 | 78 | 0x00530270 | `SetTarget` | `RET 0x8`; `void(float now, float deadline)`, stored to `+0x20`/`+0x24`. Broadcast 0x56 |
 | 79 | 0x00530390 | `ClearTarget` | bare `RET`; `void(Actor *)`. Broadcast 0x57 |
-| 80 | 0x00530470 | `ChangeOwnerAndTeam` | `RET 0xc`; `void(float now, float deadline, int team_id)`, stored to `+0x28`/`+0x2c` plus the team via slot 33. Broadcasts 0x58 + 0x50. `TurretActor` @ 0x0054af80 is the **only** class overriding it in any of the sixteen tables - it forwards all three arguments verbatim (`CALL 0x00530470` @ 0x0054afa1) and then advances its own `+0x58/+0x5c` 64-bit think time if behind. The only dispatch site in the whole binary is 0x0053f78d |
-| 81 | 0x00530650 | `ReleaseFromOwner` | bare `RET`; `void(Actor *)`. Zeroes both floats and sets the team to the **literal 2** (`PUSH 2` @ 0x00530801) - an expiring override does not restore the previous team. Broadcasts 0x59 + 0x50. `TurretActor` @ 0x0054afe0 is the only override |
+| 80 | 0x00530470 | `BeginTeamOverride` (was `ChangeOwnerAndTeam`) | `RET 0xc`; `void(float now, float deadline, int team_id)`, stored to `+0x28`/`+0x2c` plus the team via slot 33. Broadcasts 0x58 + 0x50. `TurretActor` @ 0x0054af80 is the **only** class overriding it in any of the sixteen tables - it forwards all three arguments verbatim (`CALL 0x00530470` @ 0x0054afa1) and then advances its own `+0x58/+0x5c` 64-bit think time if behind. The only dispatch site in the whole binary is 0x0053f78d |
+| 81 | 0x00530650 | `EndTeamOverride` (was `ReleaseFromOwner`) | bare `RET`; `void(Actor *)`. Zeroes both floats and sets the team to the **literal 2** (`PUSH 2` @ 0x00530801) - an expiring override does not restore the previous team. Broadcasts 0x59 + 0x50. `TurretActor` @ 0x0054afe0 is the only override |
 
-**"Owner" in both slot names is unconfirmed.** Neither body touches an owner pointer, an
-inventory, an attachment, or any actor id other than `this->+0xc`: slot 80's only durable effects
-are `+0x28`, `+0x2c` and the team, and slot 81 zeroes the floats and sets team 2. That reads as a
-**timed team override and its expiry** (`BeginTeamOverride`/`EndTeamOverride`), but the rename was
-deliberately *not* applied - it would have to sweep the DB, `src/Actors.h`, `src/JsActors.cpp` and
-every notes file in one pass. Open item.
+**"Owner" was wrong in both slot names, and the rename is now applied.** Neither body touches an
+owner pointer, an inventory, an attachment, or any actor id other than `this->+0xc`: slot 80's only
+durable effects are `+0x28` (start), `+0x2c` (deadline) and the team (`+0xbc` via slot 33, plus two
+`TeamActorLists` @ 0x007ba038 edits gated on `+0x3c`), and slot 81 zeroes the two floats and sets
+the team to the literal 2. So the pair is a **timed team override and its expiry**. Applied across
+the Ghidra DB (function, `ActorVtbl` slot 80/81 field, and the `Actor_BeginTeamOverride` /
+`Actor_EndTeamOverride` funcdefs), `src/Actors.h`, `src/JsActors.cpp`, this file,
+`combat_notes.md` and `directplay_protocol_notes.md`. Two independent measurements settle it: the
+`+0x28`/`+0x2c` pair is a start and a deadline (four float witnesses, see the field table below),
+and update 0x58's payload is `{u32 id, u32 actor_id, u32 team, f32 now, f32 deadline}` — the two
+trailing dwords are the timestamps. **Prior names `ChangeOwnerAndTeam` / `ReleaseFromOwner` will
+still appear in outside write-ups.**
 | 82 | 0x005308d0 | `ActivateInWorld` | re-register in spatial/team structures, set flag 0x200 |
 
 > Slot 70 is the per-tick update, and it is `Update` in all ten of its distinct bodies. What each
@@ -230,8 +268,8 @@ Fields whose meaning was settled by reading the code that touches them, not by t
 | 0x04 | `int` | **reference count** | the retain/release pair in `AiBeginInvestigate` @ 0x0045e050: `INC dword ptr [ESI+0x4]` to retain, and on release decrement then call slot 0 with the scalar-delete flag when it reaches zero |
 | 0x20 | `float` | **start time** in seconds of the slot-78 target window, arg1 of `SetTarget`; pairs with `+0x24` | `MOV [ESI+0x20],ECX` @ 0x005302bc (from `[EBP+0x8]`), plus `MOVSS [EDI+0x20],XMM0` @ 0x0052d299 in `Actor::Ctor`. arg1 is a float via a typed sink - `StopAndBroadcast` @ 0x00539bd0 does `MOVSS XMM0,[EBP+0x8]` @ 0x00539bfb / `COMISS XMM0,[ESI+0x1e8]` @ 0x00539c00 |
 | 0x24 | `float` | deadline in seconds firing **slot 79** (`ClearTarget`); 0.0 means disabled | `AiThink_Waiting` @ 0x00456bed - `MOVSS XMM0,[ESI+0x24]`, compared in seconds against the scaled clock, then `CALL [vtbl+0x13c]`. Stronger still, `AiThink_Turret` does **arithmetic** on it: `MULSS XMM0,[EBX+0x24]` @ 0x00455ec4 - a multiply is better evidence of a float than a compare is |
-| 0x28 | `float` | **start time** in seconds of the slot-80 team override, arg1 of `ChangeOwnerAndTeam`; pairs with `+0x2c` | `MOV [ESI+0x28],EDX` @ 0x005304c0 (from `[EBP+0x8]`). Typed by the constructor: `Actor::Ctor` zeroes all four of `+0x20/+0x24/+0x28/+0x2c` with adjacent `MOVSS ...,XMM0` @ 0x0052d299/0x0052d2b0/0x0052d2c7/0x0052d2de, each a literal 0 widened through the FPU - an `int` field zeroed is `MOV dword ptr [EDI+off],0` |
-| 0x2c | `float` | deadline in seconds firing **slot 81** (`ReleaseFromOwner`); 0.0 means disabled. With `+0x28` it is the start and expiry of a **timed team override** | read by **seven think procs plus `Actor::Frag`**, all `MOVSS` + `UCOMISS`/`COMISS` - `AiThink_Bot` @ 0x004513a8, `AiThink_Scavenger` @ 0x00455799, `AiThink_Turret` @ 0x00455f0f, `AiThink_Waiting` @ 0x00456c21 (`CALL [vtbl+0x144]`), `AiThink_Minebot` @ 0x00456d3b, `AiThink_Node` @ 0x0045a94b, `AiThink_Swarm` @ 0x0045b6f9, `Actor::Frag` @ 0x0052e2d9. `AiThink_Turret`'s read is gated on `GameMode`(0x007b9e28) `>= 2` @ 0x00455f01-0d, mirroring the writer's own SP/Coop skip @ 0x0053f743 - which is itself evidence the two sites mean the same field. The **writer** side, long read as an int, is a bit-copy of a stack-passed float (`MOV [ESI+0x2c],EAX` @ 0x005304b4) doing no arithmetic, so it is type-agnostic; `ReleaseFromOwner` @ 0x00530696 clears it with an x87-produced float zero, which an int would not need |
+| 0x28 | `float` | **start time** in seconds of the slot-80 team override, arg1 of `BeginTeamOverride` (slot 80, was `ChangeOwnerAndTeam`); pairs with `+0x2c` | `MOV [ESI+0x28],EDX` @ 0x005304c0 (from `[EBP+0x8]`). Typed by the constructor: `Actor::Ctor` zeroes all four of `+0x20/+0x24/+0x28/+0x2c` with adjacent `MOVSS ...,XMM0` @ 0x0052d299/0x0052d2b0/0x0052d2c7/0x0052d2de, each a literal 0 widened through the FPU - an `int` field zeroed is `MOV dword ptr [EDI+off],0` |
+| 0x2c | `float` | deadline in seconds firing **slot 81** (`EndTeamOverride`, was `ReleaseFromOwner`); 0.0 means disabled. With `+0x28` it is the start and expiry of a **timed team override** | read by **seven think procs plus `Actor::Frag`**, all `MOVSS` + `UCOMISS`/`COMISS` - `AiThink_Bot` @ 0x004513a8, `AiThink_Scavenger` @ 0x00455799, `AiThink_Turret` @ 0x00455f0f, `AiThink_Waiting` @ 0x00456c21 (`CALL [vtbl+0x144]`), `AiThink_Minebot` @ 0x00456d3b, `AiThink_Node` @ 0x0045a94b, `AiThink_Swarm` @ 0x0045b6f9, `Actor::Frag` @ 0x0052e2d9. `AiThink_Turret`'s read is gated on `GameMode`(0x007b9e28) `>= 2` @ 0x00455f01-0d, mirroring the writer's own SP/Coop skip @ 0x0053f743 - which is itself evidence the two sites mean the same field. The **writer** side, long read as an int, is a bit-copy of a stack-passed float (`MOV [ESI+0x2c],EAX` @ 0x005304b4) doing no arithmetic, so it is type-agnostic; `EndTeamOverride` @ 0x00530696 clears it with an x87-produced float zero, which an int would not need |
 | 0x38 | `void (*)(Actor *, uint, int)` | the **on-placed hook**, called once from slot 51 (`InitPositionAndTiming`) @ 0x0052dd18 under a null guard, immediately after the nav-poly lookup. It is *not* a think proc - every `AIType` installs its per-tick proc into `+0x34`, and `ExecutorActorTick` reads neither field | `Actor_SetAiBehaviour` @ **0x00450550** is the only writer (the store itself is `MOV [ESI+0x38],0x45a640` @ 0x00450610, inside its `Mine` case - this row used to cite that instruction address as the function entry), and only for `AIType::Mine` (`Mine_OnDeployed` @ 0x0045a640) |
 | 0xd8 | `float` | game time in seconds of the current tick | written by the slot-70 base body @ 0x0052f91a from its third argument |
 | 0xdc | `float` | the `+0xd8` value as of the last state broadcast | @ 0x0052fa66, and by all four `MobileActor` motion broadcasters, each of which ends `+0xdc = +0xd8` |
@@ -513,6 +551,84 @@ and when the victim's role name is one of `hark`, `gunlok`, `maskelyn`, `frend`,
 6. **Slot names describe the base implementation.** Slots 9, 15, 16, 32, 54, 59, 76, 77 and 82
    all mean something materially different in at least one subclass. The five worst were renamed;
    the rest are flagged above.
+
+## The funcdef surface, and why it goes stale on its own
+
+The vtable **structs** in the Ghidra DB (`ActorVtbl`, `MobileActorVtbl`, ...) type each slot with a
+named `FunctionDefinition`, so every slot has **three** names that can drift apart: the function's,
+the struct field's, and the funcdef's. A pass that reconciles the *functions* against the binary —
+which is what most of this file records — leaves the other two untouched, and the funcdefs are the
+surface nothing else reads, so nothing notices. `/GkPlus/Vtables` holds 108 funcdefs plus 4 in the
+root category.
+
+An audit of all 112 against their targets found **13 mismatches in 111 comparable pairs**, of which
+exactly one was an ABI defect:
+
+- **`MobileActor_QueueOrderPosition`** (slot 86, `MobileActor::QueueOrderPosition` @ 0x0054e5f0)
+  declared `void(Vec3f *)` = **4 argument bytes** against the function's `RET 0x10` = **16**. The
+  real signature is `void(Vec3f coords /*by value*/, bool)`. Fixed on the funcdef.
+- Eight were type-only at identical widths — `int`/`char` where the function says `float`/`bool`,
+  `longlong *` where it says `Vec3f *`, `int` returns that are `void`. The function side was right
+  in all eight; the funcdefs are fixed.
+- Three had it the other way round, and are worth knowing as a *category*: the **funcdef** was right
+  because the **function** had `signatureSource == DEFAULT`, i.e. nobody had ever set it. Those were
+  `TurretActor::IsTurretEnabled` @ 0x0054f190 (`bool(TurretActor *)`, whole body
+  `MOV AL,[ECX+0x310]; RET`), `TurretActor::GetTurretTargetAngles` @ 0x0054eb90 (an 8-byte return in
+  EDX:EAX — now typed with a new `Vec2f`, and `TurretActor+0x318`/`+0x31c` retyped `float`), and
+  `PickupActor::SetPickupEnabled` @ 0x00546240, which had calling convention `unknown` and **no
+  `this` at all** despite `MOV ESI,ECX` / `MOV byte ptr [ESI+0x120],AL` / `RET 0x4`. All three now
+  say `__thiscall`.
+
+Slot 0 needed no exemption — it matched. `Actor_GetCenterCoords` (slot 4) differs from its target
+only in notation (`Vec3f *` parameter vs Ghidra's `__return_storage_ptr__`), identical ABI, and was
+left alone.
+
+Ten funcdefs and/or fields were **stale names** with signatures that already agreed, and are now
+consistent with the functions:
+
+| Surface | Was | Is |
+|---|---|---|
+| `ActorVtbl` slot 8 field type | `Actor_IsMine *` | `Actor_IsConcealed *` |
+| slot 24 field + funcdef | `GetAIController` | `GetNavAgent` |
+| slot 52 field + funcdef | `ReleaseAttachment` | `ReleaseHeldReferences` |
+| slot 56 field | `OnCollisionResponse` | `PathToTarget` |
+| slot 63 **function + funcdef** | `CanBePickedUp` | `IsCrouched` — see the correction note below |
+| slot 70 field + funcdef | `SyncPositionAndBroadcast` | `Update` |
+| slot 80 / 81 field + funcdef | `ChangeOwnerAndTeam` / `ReleaseFromOwner` | `BeginTeamOverride` / `EndTeamOverride` |
+| `MobileActorVtbl` slot 83 | `UpdateMineDetectionAndBounds` | `ToggleCrouchAndCamouflage` |
+| `PickupActorVtbl` slot 85 | `SetField0x138` | `SetRequiredItem` |
+| `PresidentActorVtbl` slot 95 field | `PresidentMethod` | `SetExitPosition` |
+
+> **Slot 63 went the other way, and the direction matters.** The round-4 brief listed it with the
+> other nine as a stale *field* name — `IsCrouched` to be replaced by the funcdef's
+> `CanBePickedUp`. That is backwards, and the override column is what settles it: the base
+> @ 0x0054f150 is `XOR AL,AL; RET`, and **`PickupActor` carries that base** (0x006683dc + 63*4 ==
+> 0x0054f150), so the one class that can be picked up would always answer false. Only `MobileActor`
+> and below override, at 0x0054f160, with `MOV AL,[ECX+0x187]` — and `MobileActor+0x187` is
+> `is_crouched`, written by slot 83 `ToggleCrouchAndCamouflage` and read by the crouch/concealment
+> logic (`stealth_and_fog_notes.md`). `src/Actors.h` and `src/JsActors.cpp` have said `IsCrouched`
+> all along. So the **function name and the funcdef** were the stale surfaces here, not the field,
+> and all three now say `IsCrouched`. The general lesson: "the function side is trusted" is a claim
+> about a *previous pass*, not about the binary — check the override column before letting a funcdef
+> overrule a field.
+
+Two of those were not tidiness. Slot 24 is **CLAUDE.md's own worked example** of the rename-all-
+surfaces convention, and the funcdef was the surface that pass missed. And slot 70's stale name was
+the *root cause* of a documented protocol error: `directplay_protocol_notes.md` credited some two
+dozen update rows to a `SyncPositionAndBroadcast` that no longer existed as a function, and recorded
+that fact as "a name that cannot be checked". The name survived only in the funcdef.
+
+**Still outstanding, deliberately: 108 of the 111 funcdefs declare `this` as `void *`** rather than
+the owning class pointer. It is ABI-neutral — it costs only the decompiler's `this`-typing at an
+indirect call through the struct — and it is 108 near-identical edits, so it was left as a decision
+rather than made in passing.
+
+**One dead struct removed:** `ActorVtblExt`, a superseded duplicate of `MobileActorVtbl` slots
+83-88 with zero data instances and only its own auto-generated pointer type referencing it, along
+with its funcdef `actor_goto` (which carried the same wrong `int` return as `MobileActor_Goto`).
+`ItemActorVtbl`, `NodeActorVtbl` and `Type15ActorVtbl` are in the same condition — zero parents, no
+data instance — and were **left in place**; there is no `ItemActor` or `Type15Actor` in the
+hierarchy above, so they are probably also dead, but "probably" is not a reason to delete.
 
 ## Method-ownership convention
 

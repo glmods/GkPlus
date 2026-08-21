@@ -149,7 +149,7 @@ Every other AI type sets only `+0x34`. The two are not peers: `+0x34` is the per
 `AiThink_Mine` is `__thiscall(Actor*, uint now_lo, int now_hi)` and rate-limits itself to **1 Hz**
 against the calling thread's `ClockTicksPerSecond`, storing the next-think deadline in
 `Actor+0x58/+0x5c`. Arms as in the table in §1.2. The proximity scan (ids 0 and 4) walks
-**`TeamSlots`**, skips the mine's own team, skips Cooperative allies via `TeamSlot+0x6a`, and
+**`TeamSlots`**, skips the mine's own team, skips Cooperative allies via `TeamSlot+0x6a` `player_controlled`, and
 tests squared distance against `Actor+0x168` squared; a victim already targeting the mine, or one
 whose `+0x189` byte is set, is skipped.
 
@@ -165,7 +165,7 @@ see §9.
 fourth executor-side `ApplyDamage` (slot 68, `vtbl+0x110`) call site, at **0x00450c7e**:
 
 ```
-ScaleDamageForResistance(out, TeamSlots[victim.team]+0x6a, damage,
+ScaleDamageForResistance(out, TeamSlots[victim.team].player_controlled, damage,
                          victim_role->resistance_factor (+0x90),
                          victim_role->armor_value (+0x94), 0x21)
 ApplyDamage(victim, *out, 1, mine->team_id)          ; three stack args, RET 0xc
@@ -184,7 +184,7 @@ Whatever culls victims behind cover, it is not this call.
 Two arms worth naming:
 
 - **EMP**: when the detonator's `weapon == 4`, the victim gets `vtbl+0x10c` (slot 67) instead of
-  damage, gated on `TeamSlots[victim.team]+0x6a`. That is why `Rol_Mine_EMP` ships with
+  damage, gated on `TeamSlots[victim.team].player_controlled` (`+0x6a`). That is why `Rol_Mine_EMP` ships with
   `limit 0`.
 - **Chain reaction**: a victim whose `ai_type == Mine` is re-entered through `MineDetonate`
   itself (0x00450bea) - **but only when the detonator is not an EMP mine** (`weapon != 4`

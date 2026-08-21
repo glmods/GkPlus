@@ -18,7 +18,7 @@ Two containers, and confusing them costs an offset on every field:
 ## 1. `Inventory` — the carried-items container
 
 `Inventory` is allocated exactly once per actor, in **`MobileActor::SetTeamId` @ 0x00533430**, and
-only when the actor moves onto a **player-controlled team** (`TeamSlots[team].field_0x6a != 0`) and
+only when the actor moves onto a **player-controlled team** (`TeamSlots[team].player_controlled != 0`, `TeamSlot+0x6a`) and
 `Actor+0x3c` is set. A background creature never gets one, which is why `Actor::GetInventory`
 (slot 16, @ 0x0054eb10) returns `NULL` on the base class.
 
@@ -471,11 +471,21 @@ Recovered from the byte map at **0x0050bae0** (indexed `cmd - 4`) and the pointe
 | cmd | size | handler | meaning |
 |---|---|---|---|
 | `0x0f` | 16 | 0x0050a1d7 | `EquipItemInSlot(actor, slot, item_id, 1)` |
+| `0x10` | 16 | 0x0050a204 | **the queued twin of `0x0f`** — `QueueToggleEquipOrder` @ 0x00538e80, `PendingOrder` **kind 5**. It goes through the **toggle**, so it can push **kind 9 (unequip)** instead: the pusher counts queued kind 5 minus kind 9 for the same item and tail-calls the kind-9 pusher when the balance is 1 |
 | `0x11` | 12 | 0x0050a2fb | `UseInventoryItem(actor, item_id, 1)` |
+| `0x12` | 12 | 0x0050a325 | **the queued twin of `0x11`** — `QueueUseItemOrder` @ 0x00538ca0, `PendingOrder` **kind 7** |
 | `0x13` | 12 | 0x0050a34d | `DropItem(actor, item_id)` |
-| `0x15` | 12 | 0x0050a39d | **unequip** — walk `inventory_list` for `slot->item->id == arg`, `UnequipSlot` |
+| `0x14` | 12 | 0x0050a38a | **the queued twin of `0x13`** — `QueueDropOrder` @ 0x00538d40, `PendingOrder` **kind 8** |
+| `0x15` | 12 | 0x0050a39d | **unequip** — walk `inventory_list` for `slot->item->id == arg`, `UnequipSlot`, then broadcast update `0x80` from 0x0050a478 |
+| `0x16` | 12 | 0x0050a49a | **the queued twin of `0x15`** — `QueueUnequipOrder` @ 0x00538de0, `PendingOrder` **kind 9** |
 | `0x17` | 24 | 0x0050a22f | **give item**, immediate `{giver, recipient, item_id, f32 game_time, amount}` — sets the pending give state and issues the walk |
 | `0x18` | 24 | 0x0050a2b7 | **give item**, queued — same payload; calls `QueueGiveItemOrder` @ 0x00538f80 (at 0x0050a2e8) to build `PendingOrder` kind 6 |
+
+**The odd/even pairing is what named the order kinds.** The odd id calls the callee **directly**
+while the even id only enqueues, so each immediate arm above is a literal statement of what its
+queued twin means — which is how `orders_notes.md` §3 settled that kinds 5, 7 and 9 are *equip into
+a body slot*, *use item* and *unequip*, correcting a one-place rotation (`Interact` / `Equip` /
+`UseItem`). Read that section before relying on any order-kind name written before it.
 
 **This is now settled, and `directplay_protocol_notes.md` has been corrected to match.** It read
 `0x17` as "board / attach (escort) — actor id + carrier + slot"; there is no board or attach command

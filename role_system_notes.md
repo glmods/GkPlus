@@ -208,7 +208,9 @@ snaps the new actor onto the owner actor's hotspot.
 
 `Scavenger`, `Minebot`, `Reserved`, `Waiting`, `Pathfinder`, `Swarm` have no explicit
 case and fall through `default` (so they become CharacterActor / MobileActor / plain
-Actor depending on the character/projectile presence). Every spawn does `num_actors++`.
+Actor depending on the character/projectile presence). Every spawn does `NextActorId++` (0x007b9ffc,
+formerly named `num_actors`; it is a monotonic next-id counter, never decremented, so it is not a
+live-actor count).
 
 Note there is a **second, lighter actor factory** for the client/main thread,
 `ClientSpawnActorForTeam` @ 0x004fce90, with different class sizes and its own id counter

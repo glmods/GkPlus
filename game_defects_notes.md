@@ -12,7 +12,7 @@ Gunlok*, which is an appendix and not a defect — and never renumber an existin
 |---|---|---|
 | 1 | `Font_QueueText` smashes its stack past ~1024 characters | the game itself (training debrief) |
 | 2 | `PrintParseWarning` / `PrintParseError` discard their output | — (a trap, not a bug) |
-| 3 | `GetResourceString` walks its table with no terminator | a missing localized string id |
+| 3 | `GetResourceString` ignores its table's terminator | a missing localized string id |
 | 4 | the process faults on exit via the console `QUIT` | any exit |
 | 5 | the section adjacency test overflows its shared-vertex buffer | degenerate-after-weld level geometry |
 | 6 | `TexMergePolys` writes a UV list before deciding not to merge | an authored `SHPMRGDT` |
@@ -126,22 +126,41 @@ under any debugger (each call is a synchronous round-trip). That is why
 
 ---
 
-## 3. `GetResourceString` @ 0x00579000 walks its table with no terminator
+## 3. `GetResourceString` @ 0x00579000 ignores its table's terminator
 
-The localized string lookup is a five-instruction linear scan with **no end check**:
+The localized string lookup is a five-instruction linear scan with **no end check** — although,
+and this is the correction that changes what a fix would look like, **the table does have a
+terminator; this function simply never tests it**. `ResourceStringEntry` is 0x14 bytes and its
+`+0x10` field is `is_last`: `LoadResourceStringTable` @ 0x00578f30 sets it with
+`SETZ AL` on `(id == last_id)` (0x00578f97 / 0x00578fa3), so exactly the final entry carries it,
+and `FreeResourceStringTable` @ 0x00579020 **honours it** — `XOR EAX,EAX / CMP [ESI],EAX /
+CMOVZ EAX,EDI` at 0x00579046-0x0057904a continues only while it is zero. So the sentinel is
+written by the loader and read by the deallocator, and skipped by the one function that walks the
+array looking for something. The fix is a **one-instruction test inside the loop**, not a new
+sentinel; an earlier revision of this section said "no terminator", which pointed at the wrong
+one.
+
+The scan itself:
 
 ```
 00579000  MOV EAX,dword ptr [ECX]        ; the table head
 00579002  CMP dword ptr [EAX],EDX        ; is this the id?
 00579004  JZ  0x0057900d
 00579006  ADD EAX,0x14                   ; next 0x14-byte entry
-00579009  CMP dword ptr [EAX],EDX        ; <-- faults here
+00579009  CMP dword ptr [EAX],EDX        ; <-- faults here; entry->is_last (+0x10) is never read
 0057900b  JNZ 0x00579006                 ; ... forever
 0057900d  MOV ECX,dword ptr [EAX + 0x4]
 00579010  TEST ECX,ECX
 00579012  MOV EAX,0x7c14b4               ; a default string when the entry is null
 00579017  CMOVNZ EAX,ECX
 ```
+
+The parameter is `ResourceStringEntry **` — **one level of indirection**, ECX being the *address
+of* the pointer global `LocalizedStrings` @ 0x00725664 rather than the array. Census: all 854 call
+references reach this function with `MOV ECX,0x725664` and none dereferences first. The contrast
+that proves it is deliberate is `FreeResourceStringTable`, which is handed the **array base** via
+`MOV ECX,[0x00725664]` @ 0x0046aa72 — the binary distinguishes the two shapes and gives each
+function the one it wants.
 
 Ask for an id the table does not hold and the loop runs off the end of the resource
 image and dereferences unmapped memory: **`0xc0000005` at fault offset `0x00179009`**
@@ -1282,6 +1301,126 @@ feature anyone can trigger.
 
 ---
 
+## 20. Five wire-reachable sites dispatch a vtable slot on an unchecked id (CONFIRMED)
+
+**The primary primitive is not the crash. It is unbounded remote executor-thread ESP drift.**
+
+Five sites take an actor/unit id straight off the wire, resolve it, and call a fixed vtable slot
+index on the result. Three are `Actor` slots in the executor's `ExecutorThreadProc` @ 0x00509050;
+two are `Unit` slots in the client's `ApplyUpdateMessage` @ 0x004fde70, and because `GetUnitById`
+returns a `Unit`, the `Actor` slot numbering does **not** apply to those two.
+
+| Site | Dispatcher | Insn | Tree / slot | Triggered by | Arg bytes pushed |
+|---|---|---|---|---|---|
+| 0x00509eba | `ExecutorThreadProc` | `CALL [EDX+0x184]` | `Actor` 97 | commands 0x0a / 0x0c | 0x10 |
+| 0x00509fe4 | `ExecutorThreadProc` | `CALL [ESI+0x180]` | `Actor` 96 | commands 0x0b / 0x0d | 0x10 |
+| 0x0050a03f | `ExecutorThreadProc` | `CALL [EDX+0x188]` | `Actor` 98 | command 0x0e | 0x04 |
+| 0x004fdf16 | `ApplyUpdateMessage` | `CALL [EDX+0x188]` | `Unit` 98 | update 0x39 | 0x0c |
+| 0x004fe957 | `ApplyUpdateMessage` | `CALL [EDX+0x180]` | `Unit` 96 | update 0x1e | 0x08 |
+
+Slots 96/97/98 exist on `CharacterActor` and its descendants. They do **not** exist on
+`PickupActor` (86 slots), `TrackObjectActor`, `TumbleweedActor`, `BackgroundCreatureActor`,
+`BlockerActor` (83 each), `ProjectileActor` (85), base `MobileActor` (95) or `PresidentActor` (96,
+so 97 and 98 are past the end) — see `actor_vtable_notes.md`.
+
+### The drift, which is the part that matters
+
+An out-of-range slot index most often lands on a **getter with a bare `RET`** — the `.rdata`
+following these tables is full of them. The arm pushed 0x4-0x10 bytes of arguments and does not
+clean them, because every one of these arms assumes a **callee** pop (`RET n`), which is what the
+in-range callee would have done. So each malformed message leaks 4-16 bytes of the executor
+thread's stack, without bound. A peer looping command **0x0e** at any pickup id is the cheapest
+version: 4 bytes per message, one message.
+
+This is exactly the failure mode CLAUDE.md's `RET`-form trap describes, and it presents the same
+way: a delayed, non-deterministic access violation with **EIP on the stack** and a faulting module
+of "unknown", nowhere near the culprit, appearing only once something has run often enough. It will
+be mis-blamed on GkPlus's hooks — hence this entry.
+
+### Nothing constrains it
+
+- **No class check on the lookup.** `GetActorById` @ 0x0044e0b0 and `GetUnitById` @ 0x0044e070 are
+  identical short separate-chaining hash walks matching `[node+0xc] == id`. Neither inspects a
+  vptr, a size, or an RTTI predicate.
+- **No sender-ownership check** in either dispatcher.
+- **Ids are guessable.** `NextActorId` @ 0x007b9ffc (named `num_actors` until this pass — it never
+  decrements) is read-then-`INC`ed at every `CreateActor` / `SpawnProjectileActor` arm, reset to 0
+  by `FUN_0052dcb0`, and saved and restored with the game. The id space is therefore dense and
+  monotonic: a peer needs neither an information leak nor a lucky guess.
+- **Every class is addressable.** All sixteen `Actor` classes self-register in the actors hash from
+  the **base** `Actor` constructor, so no subclass is out of reach of an id.
+- **`Unit+0x127` is not a guard.** It is `user_placed_by_camera_track`, a base-`Unit` flag set only
+  by `CameraTrackObject_SetUserPlacement` @ 0x004dcc79 and cleared by `CameraTrackObject_Stop`
+  @ 0x004dd3d9, and 0 on every ordinary unit. (The `0x120` sometimes cited alongside it is base
+  *`Actor`*, in the other class tree; base `Unit` is 0x130.)
+
+### The crash half, stated no more strongly than it is
+
+Where the index lands past the end of `.rdata`'s vtable run entirely, it reads whatever follows.
+For `PresidentActor` (vtable 0x00669380, 96 slots, ending at 0x00669500 where the string pool
+begins with `"nanofrag_projectile"`) slots 96/97/98 read the ASCII dwords `"nano"`, `"frag"` and
+`"_pro"`. None is a mapped address, so this is an immediate AV at a **fixed,
+non-attacker-chosen EIP**: a remote crash, **not** control-flow hijack. Do not overstate it — the
+drift above is the more serious of the two.
+
+### Why this was previously filed as "no evidence"
+
+The selection path looked like it might constrain which classes an order could name. It does not,
+and the reason is worth recording: update **0xc3** (arm 0x00500ade) inserts an arbitrary
+wire-supplied unit id into the local client's `SelectedUnits` @ 0x007b46d8 via `AddToSelection`
+@ 0x0049ed30 — a bare hash insert, no type filter. The real filter is at *order-issue* time, and it
+is **not** the RTTI ladder: `IssueGroundTargetOrderToSelection` @ 0x0049f010 gates on `Unit`
+**slot 11**, which is `XOR EAX,EAX; RET` in every class except the five `CharacterUnit`-family
+ones, where it is `MOV EAX,[ECX+0x290]; RET` — i.e. a *controllable* flag, not `IsCharacter`. That
+is why the defect has no in-play symptom: ordinary play never produces these messages for a class
+that lacks the slot. It says nothing about what a peer can send.
+
+### Measurement notes
+
+Both dispatchers' jump tables are resolved and no override is needed: `ApplyUpdateMessage` is
+18,501 bytes with **0 undefined bytes** and `ExecutorThreadProc` 10,732 with 0. So the negative
+half of this finding is not the "sweep over `.text` is a statement about the disassembly" trap.
+
+---
+
+## 21. Both render-queue entry points turn an allocation failure into a null dereference (CONFIRMED)
+
+**Status:** latent — unreachable unless the pool allocator is exhausted. Recorded because the code
+*reads like a guard*, so the next person to look at it will believe the failure is handled.
+
+`RenderQueue_Submit` @ 0x0059d760 pool-allocates the 0x30-byte `DrawItem` and then tests it:
+
+```
+0059d77a  TEST ESI,ESI
+0059d77c  JZ  0x0059d78d
+0059d77e  MOV dword ptr [ESI + 0x4],0x1      ; refcount = 1   (the success path)
+0059d785  MOV dword ptr [ESI],0x66da04       ; vptr
+0059d78b  JMP 0x0059d78f
+0059d78d  XOR ESI,ESI                        ; <-- the "failure" path
+0059d78f  MOV EAX,dword ptr [EBP + 0x8]
+0059d792  MOV dword ptr [ESI + 0xc],EAX      ; <-- unconditional write through ESI
+```
+
+The null check exists, branches, and lands **four bytes before an unconditional store through the
+pointer it just proved was null**. All it actually skips is the vptr and refcount initialisation;
+the eight field writes that follow (0x0059d792 through 0x0059d7bc) run either way. So on
+allocation failure this faults at 0x0059d792 writing address 0xc, rather than dropping the draw.
+
+`RenderQueue_Add` @ 0x005a8eb0 has the identical shape at `XOR ESI,ESI` @ 0x005a903f.
+
+Two things make this worth a section rather than a footnote. It is **the shape of a bail without
+the effect of one**, which is the kind of thing a reader credits without checking — the branch
+target is right there. And a fault at 0x0059d792 would present as an access violation writing a
+tiny address from inside the renderer, with the real cause (an exhausted pool) several layers away
+and no diagnostic anywhere; compare §11, where the pool allocator's own critical section is
+disarmed by a flag nothing sets.
+
+Neither is reachable in practice: `pool_alloc` failing at all means the page sub-allocator is out,
+and nothing in a normal session gets close. GkPlus's `gk::SubmitDrawItem` is unaffected — it fails
+closed on its own arguments before it reaches either function.
+
+---
+
 ## Dead code: things that look reachable and are not
 
 Not defects. Recorded so nobody analyses them twice.
@@ -1364,10 +1503,32 @@ first dead-code verdict in this file that ran the sweep *and* recorded that the 
 is what makes it different in kind from the four that collapsed:
 
 - `GameState` @ 0x006b02b4 has a **complete, enumerable writer set**. A byte scan for its
-  little-endian address over 0x00400000-0x0083ba00 returned **90 hits, 22 of them writes, all
+  little-endian address over 0x00400000-0x0083ba00 returned **90 hits, 21 of them writes, all
   accounted for** — including two that sat in undefined bytes and had to be hand-decoded
-  (0x0044c0a0 `A1 B4 02 6B 00` = a *read* in an undisassembled console handler, and 0x004b067e
-  `89 3D B4 02 6B 00` = the write inside `PlayFmvAndSetState`'s undefined arms). A second scan for
+  (0x0044c0a0 `A1 B4 02 6B 00` = a *read*, in what is now `CommandInfoDialogTest` @ 0x0044c0a0, the
+  console command **"INFO DIALOG TEST"**; and 0x004b067e `89 3D B4 02 6B 00` = the write inside
+  `PlayFmvAndSetState`'s arms).
+
+  **Both undefined regions have since been recovered, and the census now reconciles exactly**: 90
+  byte occurrences and 90 *defined* references — 69 reads and 21 writes, with 0x004b067e among the
+  writers. Two corrections to the paragraph as it originally stood:
+
+  - **It said 22 writes. The snapshot supports 21** (20 defined references at the time, plus the one
+    hidden write), and there is no read-modify-write to explain the difference. The verdict is
+    unaffected — a census claiming *more* writers than exist is conservative and cannot have missed
+    a state's writer — but 22 should not be quoted onward unchecked.
+  - **It said elsewhere in this file that `PlayFmvAndSetState`'s arms were "now disassembled". They
+    were not.** The function was named, but its body ended at its unresolved indirect jump
+    (0x004b0570-0x004b064f) and the four switch arms plus jump table (0x004b0650-0x004b073f, 240
+    bytes) were still undefined data — so the *write* at 0x004b067e, the more dangerous of the two
+    occurrences, stayed invisible to any reference-based sweep. Recovering it needed a **jump-table
+    override**, not just `COMPUTED_JUMP` references: the selector is `LEA EAX,[EDI-0xa]` @ 0x004b0644
+    with **no bound check**, which is exactly the case the standing trap says the decompiler
+    re-derives for itself. Measured cascade for that recovery: +2 functions, -310 undefined `.text`
+    bytes. `CommandInfoDialogTest` cost +1 function and -79 bytes, with `GameState` writes unchanged
+    — which is the check that its recovery could not have disturbed the verdict.
+
+  A second scan for
   rebased `[reg+disp]` forms over bases 0x006b02a4-0x006b02b7 found only those same two sites, and
   the global's **address is never taken** (no `LEA`, no `PUSH`). So there is no route to it that a
   reference count would miss.

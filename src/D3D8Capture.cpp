@@ -153,6 +153,11 @@ void ReadTextureUploadMode() {
 // `IDirect3DBaseTexture8 *` the loader stores there once the texture exists - which, with this
 // layer installed, is our own CaptureTexture wrapper. So the join is a pointer compare.
 //
+// "The whole texture-acquire path" is true for *minting* and only for minting. The cache's
+// **lookup** half is separately inlined at six sites out of
+// `TextureManager::TextureManager_TouchByRecord` @ 0x005a1240, none of which allocates - so a
+// hook here does not observe every cache operation, only every one that creates a record.
+//
 // Hooked rather than called, and hooked HERE rather than in src/Render.cpp, which is
 // deliberately pure struct + native API with no `*System` of its own. `D3D8CaptureSystem`
 // already owns a detour and already owns the textures this names.
@@ -171,21 +176,39 @@ void ReadTextureUploadMode() {
 // never again be confused for one another.
 
 // Every record the engine has minted. A cache *hit* returns an existing record, so this is a
-// set rather than a list - the 31 call sites hit far more often than they miss. Records are
-// never freed: the cache is an MRU list over a hash that only grows, and a level teardown
-// leaves them for the next level to hit.
+// set rather than a list - the 31 call sites hit far more often than they miss.
+//
+// **RECORDS ARE FREED, AND THIS SET THEREFORE HOLDS DANGLING POINTERS AFTER ANY LEVEL CHANGE.**
+// An earlier revision of this comment asserted the opposite ("the cache is an MRU list over a
+// hash that only grows, and a level teardown leaves them for the next level to hit"); that was
+// measured false. `TextureManager::TextureManager_EvictOneUnused` @ 0x005a17d0, for the first
+// record whose `lru_refcount` (+0x1c) and `submesh_refcount` (+0x20) are both zero, does
+// hash-remove -> `free(name)` -> `free(directory)` -> `operator delete(record, 0x34)`
+// @ 0x005a1887 -> unlink -> `operator delete(node, 0xc)`. Its callers include **`LoadLevel` and
+// `UnloadLevel`**, so eviction is a routine part of a level transition and not an
+// out-of-memory path.
+//
+// Nothing here is fixed: the fix is a design choice about who owns the invalidation, and it is
+// filed as **git-bug 85bd09e**. What this comment has to carry meanwhile is that a pointer in
+// this set is only known-live within the level that minted it.
 std::set<AwTexture *> RimRecords;
 
 // `__thiscall` with stack arguments is spelled as a member function of a stand-in class, which
 // is the same shape `PickupActor::Associate` uses in ScriptQueue.cpp and for the same reason: a
 // `__fastcall` hook would take `path` in EDX, where the original expects the stack.
-struct RimCacheAbi {
+//
+// The `this` is the `TextureManager` singleton at 0x00803ce0 (0x2c bytes) - named for the five
+// `TextureManager_*` functions the Ghidra database already carried, and *not* RIM-specific: the
+// same cache holds `bitmaps\maptest.bmp` and a synthetic `" NullTexture"`. Hence
+// `TextureManagerAbi` rather than the `RimCacheAbi` this used to be called. It declares a
+// method and no fields, so the rename pins nothing about the layout.
+struct TextureManagerAbi {
   AwTexture *HookedAcquire(const char *path, unsigned flags);
 };
 
-AwTexture *(RimCacheAbi::*AcquireRimTexture)(const char *, unsigned) = nullptr;
+AwTexture *(TextureManagerAbi::*AcquireRimTexture)(const char *, unsigned) = nullptr;
 
-AwTexture *RimCacheAbi::HookedAcquire(const char *path, unsigned flags) {
+AwTexture *TextureManagerAbi::HookedAcquire(const char *path, unsigned flags) {
   AwTexture *const record = (this->*AcquireRimTexture)(path, flags);
   if (record != nullptr) {
     RimRecords.insert(record);
@@ -3466,11 +3489,11 @@ D3D8CaptureSystem::D3D8CaptureSystem() {
   ::DetourAttach(reinterpret_cast<void **>(&OriginalDirect3DCreate8),
                  reinterpret_cast<void *>(HookedDirect3DCreate8));
   GetObjectAtOffset(AcquireRimTexture, 0x005a15b0);
-  DetourAttach(&AcquireRimTexture, &RimCacheAbi::HookedAcquire);
+  DetourAttach(&AcquireRimTexture, &TextureManagerAbi::HookedAcquire);
 }
 
 D3D8CaptureSystem::~D3D8CaptureSystem() {
-  DetourDetach(&AcquireRimTexture, &RimCacheAbi::HookedAcquire);
+  DetourDetach(&AcquireRimTexture, &TextureManagerAbi::HookedAcquire);
   ::DetourDetach(reinterpret_cast<void **>(&OriginalDirect3DCreate8),
                  reinterpret_cast<void *>(HookedDirect3DCreate8));
 }

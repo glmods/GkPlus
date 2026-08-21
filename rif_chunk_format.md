@@ -847,9 +847,15 @@ The table a polygon's texture index resolves against. **527 of the 563 shipped f
 one**, always as a child of the file-level `REBENVDT`, holding 1,601 entries between them.
 Layout is AvP's `Chunk_With_BMPs` (`3dc/win95/BMPNAMES.CPP`) verbatim.
 
-`Chunk_With_BMPs_Ctor` @ 0x005cfed0 is the parser (shared with the never-shipped
-`BMPLSTST`); `RifLoad_BMPNAMES` @ 0x005d1870 is its loader and `BMP_Name_Ctor`
-@ 0x005cf4b0 builds one entry.
+`Chunk_With_BMPs::Chunk_With_BMPs` @ 0x005cfed0 (was `Chunk_With_BMPs_Ctor`) is the
+parser (shared with the never-shipped `BMPLSTST`); `RifLoad_BMPNAMES` @ 0x005d1870 is
+its loader and `BMP_Name_Ctor` @ 0x005cf4b0 builds one entry.
+
+**Neither `BMPNAMES` nor `BMPLSTST` has a constructor function of its own** — the only
+writes of their vftables (0x0066f734, 0x0066f788) in the whole binary are *inside* their
+loaders, at 0x005d18cc in `RifLoad_BMPNAMES` and 0x005d195c in `RifLoad_BMPLSTST`, so
+the derived ctor is inlined into the loader in both cases. `SHBMPNAM` is the exception
+and has three real ones (0x005d0530 / 0x005d0670 / 0x005d0780).
 
 | Offset | Size | Type   | Description                  |
 |--------|------|--------|------------------------------|
@@ -1460,14 +1466,38 @@ Chunk (base, 0x28 bytes)
   |     +-- File_Chunk (REBINFF2) - adds filename, object_array, compression handling
   |     +-- Shape_Chunk (REBSHAPE) - adds shape-specific data @ 0x8C
   |     +-- SubShape_Chunk (SUBSHAPE)
-  |     +-- Object_Chunk (RBOBJECT) - adds object_data (location, orientation)
+  |     +-- Lockable_Chunk_With_Children (0x44; abstract, 15 slots, vtbl 0x0066e378)
+  |     |     adds six 4-byte BOOLs @ 0x2c..0x40; overrides slots 6/7 to gate on the first
+  |     |     |
+  |     |     +-- Object_Chunk (RBOBJECT, 0xac) - object_data @ 0x44 (a 0x60 ChunkObject)
+  |     |     +-- Environment_Data_Chunk (REBENVDT, 0x44) - adds nothing
+  |     |
   |     +-- (other container types)
+  |
+  +-- Chunk_With_BMPs (0x3c; abstract, 21 slots, vtbl 0x0066f884)
+  |     |  adds `int max_index` @ 0x28 and `List<BMP_Name> bmps` @ 0x2c.
+  |     |  NOTE it derives from Chunk DIRECTLY, not from Chunk_With_Children.
+  |     +-- Global_BMP_Name_Chunk (BMPNAMES, 0x3c)
+  |     +-- Bitmap_List_Store_Chunk (BMPLSTST, 0x3c)
+  |     +-- External_Shape_BMPs_Store_Chunk (SHBMPNAM, 0x7c)
   |
   +-- Miscellaneous_Chunk (fallback for unrecognized IDs)
   |     adds: data_size, data_store*, data*
   |
   +-- (all leaf chunk types - each adds specific fields after base)
 ```
+
+**A correction to `Object_Chunk` and `ChunkObject`, because two errors here cancelled exactly.**
+An earlier revision of the Ghidra layout had the six lock flags as *bytes* at 0x2c-0x31, putting
+`object_data` at +0x34, and then had to append a phantom 16-byte "Gunlok-specific tail" to
+`ChunkObject` to make the total come to the measured 0xac. Both halves were wrong and the
+arithmetic hid it. `Object_Chunk`'s constructor settles it in two instructions:
+`MOV dword ptr [EBX+0x28..0x40],0x0` — **seven consecutive dword stores** — followed by
+`PUSH 0x60 / LEA ESI,[EBX+0x44] / PUSH 0 / PUSH ESI / CALL memset`. So the flags are 4-byte
+`BOOL`s, the base ends at **0x44**, and `ChunkObject` is AvP's **0x60** with no tail:
+`0x44 + 0x60 = 0xa4`, then `program_object_index` +0xa4 and `object_data_store` +0xa8 = 0xac.
+`ChunkObject`'s own fields already summed to 0x60 (`ID` at +0x58, 8 bytes), which was the other
+clue.
 
 ## Key Functions
 
@@ -2250,6 +2280,8 @@ These were already modelled from the binary; AvP names them and explains the lay
 | roles/actors hash `{n,buckets,mask,table}`  | `_base_HashTable` `{nEntries,tableSize,tableSizeMask,chainPA}` | `Hash_tem.hpp:587` |
 | `RoleList`/`ActorNode` `{data, next}`       | `HashTable<T>::Node` `{TYPE d; Node* nextP;}` (data first, then link) | `Hash_tem.hpp:557` |
 | `Chunk` (0x28) / `Chunk_With_Children` (0x2c) | `class Chunk` / `class Chunk_With_Children` | `Chunk.hpp:203` |
+| `Lockable_Chunk_With_Children` (0x44)       | `class Lockable_Chunk_With_Children`  | `MISHCHNK.HPP:34` |
+| `Chunk_With_BMPs` (0x3c)                    | `class Chunk_With_BMPs`               | `BMPNAMES.HPP:332` |
 | `Chunk::Register` @ 0x005d4ae0              | `Chunk::Register(idChunk, idParent, pfnCreate)` | `Chunk.hpp:249` |
 
 Two deliberate divergences found so far:
@@ -2318,12 +2350,78 @@ Slot counts are almost uniform — **100 classes x 12 slots**, plus:
 | 15 | `RBOBJECT` @ 0x0066e3b4, `REBENVDT` @ 0x0066f1b0 |
 | 21 | `BMPNAMES` @ 0x0066f734, `BMPLSTST` @ 0x0066f788, `SHBMPNAM` @ 0x0066f8d8 |
 
-**The AvP cross-check disagrees, and that is informative.** AvP Gold's `3dc/win95/Chunk.hpp`
-declares **11** virtuals on `Chunk`, and `Chunk_With_Children` adds none — but Gunlok measures
-**12**, so Gunlok's `3dc` is a later revision of the library with one virtual added. The +3 and +9
-extensions on the 15- and 21-slot subclasses are Gunlok-specific, and the intermediate class they
-belong to is **NOT ESTABLISHED**: decompiling the callee chain under `RifLoad_BMPNAMES`
-@ 0x005d1870 would name it.
+**The AvP cross-check disagrees on the base, and that is informative.** AvP Gold's
+`3dc/win95/Chunk.hpp` declares **11** virtuals on `Chunk`, and `Chunk_With_Children` adds none —
+but Gunlok measures **12**, so Gunlok's `3dc` is a later revision of the library with one virtual
+added. That extra slot is **slot 11**, and it is the only Gunlok-specific one; see below.
+
+**Both intermediate classes ARE in the AvP source, though — the +3 and +9 extensions are not
+Gunlok-specific after all.** An earlier revision of this block said the intermediate was "NOT
+ESTABLISHED" and pointed at the callee chain under `RifLoad_BMPNAMES`; the answer was in
+`aliens-vs-predator/source/AvP_vc/3dc` the whole time.
+
+- **15 slots = `Lockable_Chunk_With_Children`** (`win95/MISHCHNK.HPP:34`), deriving from
+  `Chunk_With_Children`. It adds three pure virtuals — `file_equals`, `get_head_id`,
+  `set_lock_user`, which is exactly the `__purecall` triple at slots 12/13/14 — and **overrides
+  slots 6/7** (`size_chunk_for_process`, `fill_data_block_for_process`) with bodies that gate on a
+  `BOOL output_chunk_for_process`. Its own vftable is in the binary at **0x0066e378**, now labelled
+  `Lockable_Chunk_With_Children_Vtbl`, and its slots 6/7 are 0x005afe70 / 0x005afe90, both opening
+  `CMP dword ptr [ECX+0x2c],0x0` — which is what confirms the field *and* pins its width.
+  `sizeof == 0x44`: `children` at +0x28 then six 4-byte AvP `BOOL`s —
+  `output_chunk_for_process` +0x2c (CONFIRMED, the gate), then `updated`, `updated_outside`,
+  `local_lock`, `external_lock`, `deleted` (names PROPOSED from AvP declaration order; the
+  *offsets* are measured, from the **seven-dword zero run** at 0x005b1d68-0x005b1d92 in
+  `Object_Chunk`'s constructor). Gunlok subclasses: `RBOBJECT` = `Object_Chunk`,
+  `REBENVDT` = `Environment_Data_Chunk` (which adds no data members at all — its allocation is
+  exactly 0x44).
+- **21 slots = `Chunk_With_BMPs`** (`win95/BMPNAMES.HPP:332`), deriving from **`Chunk` directly**,
+  own vftable **0x0066f884**, slots 19/20 `__purecall` (`GetMD5Chunk`, `CreateMD5Chunk`).
+  Slots 12-18 in AvP declaration order: `get_version_num`, `set_version_num`, `inc_version_num`,
+  `GetExtendedData`, `GetMD5Val`, `SetMD5Val`, `RemoveMD5Val`. Layout: `int max_index` +0x28,
+  `List<BMP_Name> bmps` +0x2c, `sizeof == 0x3c`, matching the `PUSH 0x3c` in both loaders
+  (0x005d189c, 0x005d192c). Subclasses: `BMPNAMES` = `Global_BMP_Name_Chunk`,
+  `BMPLSTST` = `Bitmap_List_Store_Chunk`, `SHBMPNAM` = `External_Shape_BMPs_Store_Chunk`.
+- **They are SIBLINGS, not a chain**, and the proof is local: `Chunk_With_BMPs` leaves slots
+  4-11 at the *plain `Chunk`* bodies — including slot 11 at the default `return false` rather than
+  `Chunk_With_Children`'s `return true`. Slots 12-14 therefore mean different things in the two
+  branches, and so do parts of the base 12.
+- `External_Shape_BMPs_Store_Chunk` multiply-inherits but is **single-vtable**, because
+  `BMP_Names_ExtraData` has no virtuals — consistent with the 21-slot span. Its extra subobject
+  sits at +0x3c and `version_num` at +0x78; `sizeof == 0x7c`.
+- **All five subclasses now have their member bodies named in the DB**, under real class
+  namespaces (`address_map.md` has the address rows). Two of them confirm the slot numbering
+  *independently of AvP's declaration order*, which matters because that order is the only thing
+  the names rest on: `SHBMPNAM`'s slots 12/13/14 are literally `MOV EAX,[ECX+0x78]`,
+  `MOV [ECX+0x78],EAX` and `INC [ECX+0x78]` — get/set/increment of one field, in exactly that
+  sequence — and slot 15 is `LEA EAX,[ECX+0x3c]`, returning the `BMP_Names_ExtraData` subobject
+  `GetExtendedData` is supposed to return. Separately, `Chunk_With_BMPs::RemoveMD5Val` calls
+  `[EAX+0x4c]` — slot 19 — which is the second witness that slot 19 is `GetMD5Chunk` rather than
+  `CreateMD5Chunk`.
+- **Two of the slot-0 destructors were filed under the wrong class entirely, by Ghidra's Function
+  ID analyzer, and are now corrected.** 0x005b4c70 and 0x005cae70 both carried a `Library Function
+  - Single Match` naming them `std::basic_stringbuf<...>::'scalar deleting destructor'`. They are
+  not: each calls `Chunk_With_Children::~Chunk_With_Children` @ 0x005d4dc0 and then
+  `operator delete(this, 0x44)`, and each is referenced from exactly one address in the whole
+  binary — slot 0 of `Lockable_Chunk_With_Children_Vtbl` and of `REBENVDT_Chunk_Vtbl`
+  respectively. FID fired on the generic MSVC scalar-deleting-destructor *shape*, not on a folded
+  body. They are renamed; the FID plate is kept underneath, per CLAUDE.md's rule that the plate is
+  the record of what matched.
+- **The delete sizes in those three destructors confirm two struct sizes from a second direction.**
+  `Lockable_Chunk_With_Children` and `Environment_Data_Chunk` both `operator delete(this, 0x44)`,
+  and `Object_Chunk::~Object_Chunk` @ 0x005b4d60 (RBOBJECT slot 0, previously `FUN_005b4d60`) does
+  `operator delete(this, 0xac)`. Those had been measured from allocations; the delete size is an
+  independent witness, and it agrees.
+
+**Slot 10 is AvP's `r_u_miscellaneous`** (pinned by `Miscellaneous_Chunk`'s vftable overriding it
+with `return TRUE`), so **slot 11 is the Gunlok-revision addition**. Its default @ 0x005b1a60 is
+`XOR EAX,EAX / RET`, and it is overridden with `MOV EAX,1 / RET` @ 0x005b1cc0 by **exactly the
+`Chunk_With_Children`-family vtables and nobody else** — all 30 references to 0x005b1cc0 land on
+slot 11 of a vtable, and every one of those 30 vtables carries `Chunk_With_Children`'s slot
+1/2/3 bodies. (An explorer report put that count at 20; the census is 30.) So the *behaviour* is
+CONFIRMED and the *noun* is not: no call site for the slot exists anywhere in the chunk library, so
+it is named `r_u_a_chunk_with_children` **PROPOSED**, from who overrides it rather than from a
+consumer. A name-free `Stub11` was available and deliberately not taken; if a call site turns up
+and disagrees, that is the name to change first.
 
 ### Gunlok-only chunks (17)
 

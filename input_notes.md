@@ -41,6 +41,33 @@ InitInputDevices 0x004e3bf0
 and `WM_KEYUP`/`WM_SYSKEYUP` (state = `Released`) by calling `HandleKeyMessage`
 @ 0x004e3f20 with the state in ECX.
 
+`HandleKeyMessage` is **`__fastcall`, not `__thiscall`** - it reads ECX *and* EDX
+(`MOV ESI,ECX` @ 0x004e3f31 then `MOV CL,DL` @ 0x004e3f33):
+
+```
+void __fastcall HandleKeyMessage(KeyState state /*ECX*/, byte vk /*DL*/,
+                                 int lParam /*Stack+0x4, UNUSED*/)
+```
+
+The third argument is **pushed by both call sites and never read by the body**: all five
+exits are `RET 0x4`, and there is no positive-EBP read anywhere in the function. The
+message's `lParam` therefore reaches this function and stops there.
+
+**The state in ECX is a normalised `KeyState`, not the raw `uMsg`.** The wndproc's jump
+table @ 0x0046aea0 is indexed `uMsg - 0x100` and has six entries:
+
+```
+{0x46ad1b, 0x46ad2d, 0x46acc5, 0x46acc5, 0x46ad1b, 0x46ad2d}
+```
+
+Entries 0 and 4 (`WM_KEYDOWN` 0x100 and `WM_SYSKEYDOWN` 0x104) share a target, and entries
+1 and 5 (`WM_KEYUP` 0x101 and `WM_SYSKEYUP` 0x105) share another - that sharing *is* the
+normalisation. `WM_SYSKEYDOWN`/`WM_SYSKEYUP` are folded onto the same `Pressed 0x100` /
+`Released 0x101` values as the ordinary key messages before `HandleKeyMessage` ever runs, so
+nothing downstream can distinguish a system keypress from a plain one, and a `state == 0x100`
+test anywhere below this point means "pressed", not "`WM_KEYDOWN`". (Entries 2 and 3 - 0x102
+and 0x103 by the same index arithmetic - share a third target @ 0x0046acc5.)
+
 `HandleKeyMessage`:
 1. Reads the current virtual-key code and translates it via `TranslateVkToScanCode`
    @ 0x004e4300, which is just `return VkToScanCodeTable[vk]` - a 256-entry `int` LUT at
@@ -53,6 +80,21 @@ and `WM_KEYUP`/`WM_SYSKEYUP` (state = `Released`) by calling `HandleKeyMessage`
    `MOD_Alt 4`) - set on `Pressed`, cleared on `Released`.
 3. Every other key builds a `KeyPressData{state, scanCode, modifiers = KeyModifierState}`
    and calls `HandleKeyPress4`.
+
+**Open question - two fields of that record, seen but not measured.** Both fell out of the
+same pass as the signature above and neither is confirmed:
+
+- `HandleKeyMessage` appears to leave `KeyPressData+0x08` (`lParam`) **uninitialised** in the
+  record it hands to `HandleKeyPress4` - consistent with the unused third argument, but no
+  consumer was checked, so "uninitialised" here means "no write was seen", not "never read".
+- `KeyPressData+0x04` is named `wParam` in the Ghidra DB, yet on this path it receives the
+  **DIK scan code** - the `TranslateVkToScanCode` result, which is then stored a second time
+  into `+0x10` (`scanCode`). So that field name may simply be wrong.
+
+Settling either needs the *other* producers of `KeyPressData` read for what they put at +0x04
+and +0x08 (`ProcessRawMouseButtons`, `DispatchMouseMove`, the wheel case in the wndproc, and
+the dead `PollDInputKeyboard_Unused`). Until then the table under "Data structures" below
+keeps the DB's names, and neither row should be relied on for the keyboard path.
 
 ## Live mouse path (Raw Input)
 
@@ -68,9 +110,43 @@ for raw input; the keyboard is not.**
   `KeyPressData` per button transition with **<400ms double-click detection** (double-click
   sets modifier bit 0x1000; per-button timestamps live at 0x007b6e30). Button states use
   `KeyState` literals 0x201/0x204/0x207 (down), 0x202/0x205/0x208 (up).
+
+  **The double-click is game-synthesized, and the window manager's own one is thrown away.** The
+  400 ms is the literal `0x190` at 0x004e43db — **hardcoded**, not `GetDoubleClickTime`, so it
+  ignores the user's Windows mouse settings — and the `OR dword ptr [EBP-0x2c],0x1000` at
+  0x004e43e3 is the **only** `OR …,0x1000` on the input path in the whole binary. Meanwhile
+  `WM_LBUTTONDBLCLK` (msg 0x203, index 2 of the `msg - 0x201` table below) lands on a function at
+  **0x00496e70 that is a single `RET 0x4` instruction with no body at all** — one call reference,
+  from 0x00470bd5, and nothing else. So a double-click never reaches game code through the message
+  path; it only ever arrives as modifier bit 0x1000 on an ordinary button-down.
+
+  There are exactly four `TEST [reg+8],0x1000` consumers binary-wide, and all four are recon-view
+  mouse handlers (`orders_notes.md` §8.5) testing the event context's `+0x08`. That is worth knowing
+  before reading one of them: `ctx->+0x08 & 0x1000` is **not** an `MK_*` value, which is what it
+  looks like.
 - `DispatchMouseMove` @ 0x004e39b0: called per-frame from `WinMain` (and 0x004b0a30). If
   the accumulated pixel position `MouseXPixels`/`MouseYPixels` (0x006b02ac / 0x006b02b0)
   changed since last frame, it dispatches a **`state = 0x200` (move)** `KeyPressData`.
+
+  **`GL_MENU_INVERT_MOUSE` reaches the vertical axis only.** The Options toggle `InvertMouse`
+  @ 0x007b9cb0 (menu resource id 1111, bound in `SetupMenus` @ 0x004ea0f7) has exactly one gameplay
+  consumer: `MouseLookVerticalStep` @ 0x006a5b30, an `int` that is only ever ±2. It is derived once,
+  in `BuildInventoryScreenObjects` @ 0x0049c7b0 —
+
+  ```
+  0049e3c6  XOR EAX,EAX
+  0049e3c8  CMP dword ptr [InvertMouse 0x007b9cb0],EAX
+  0049e3dc  SETZ AL                              ; AL = (setting == 0)
+  0049e3e7  LEA EAX,[EAX*0x4 + 0xfffffffe]       ; 1 -> +2, 0 -> -2
+  0049e3ee  MOV [0x006a5b30],EAX
+  ```
+
+  — so it is **+2 with the setting off** and −2 with it on. Both readers (0x004ac087 in
+  `FUN_004abfa0`, 0x004a3678 in `FUN_004a35f0`) `IMUL` it into the **vertical** delta and nothing
+  else, so there is no horizontal invert anywhere. The `.data` image value is 2, i.e. un-inverted.
+  The derivation site being inside `BuildInventoryScreenObjects` rather than in the menu's click
+  handler is measured; when that function runs, and therefore how promptly a toggle takes effect,
+  was **not** established.
 - The mouse wheel arrives as a registered `WM_MOUSEWHEEL` in the WndProc and dispatches
   `state = 0x20a`.
 
@@ -99,7 +175,8 @@ everything downstream is cursor-mode-dependent game behaviour.
 
 `HandleGameKeyAction` @ 0x0046f700 is reached from `HandleKeyPress3` @ 0x00470b43 (gated at
 0x00470b2c on `ConsoleStatus != 0`, i.e. the console is not capturing) and requires
-`event->[0x00] == 0x100` (`WM_KEYDOWN`). It then runs a **linear if-else chain** comparing
+`event->[0x00] == 0x100` (the normalised `Pressed` state — so `WM_SYSKEYDOWN` passes this gate
+too; see the wndproc jump table above). It then runs a **linear if-else chain** comparing
 `event->[0x10]` (the DIK) and the current modifier state against **pairs of dwords in `.data`**
 spanning roughly 0x007b72xx-0x007b74xx — one `{key, modifier_mask}` pair per bindable action. There is
 no jump table, so the number of comparisons is the number of bindings.
@@ -254,3 +331,15 @@ detour and the acquire returns to normal.
 | 0x007b6e10 | IDirectInputDevice2A* | `DInputJoystickDevice` |
 | 0x007b6de8 | void*[10] | `DInputKeyboardEnumArray` |
 | 0x007b6de4 | int | `DInputKeyboardEnumCount` |
+| 0x007b6e30 | int[3] | per-button last-press `GetTickCount`, for the synthesized double-click |
+| 0x007b9cb0 | int | `InvertMouse` — the Options toggle, resource id 1111 |
+| 0x006a5b30 | int | `MouseLookVerticalStep` — ±2, derived from `InvertMouse`; vertical only |
+| 0x007b3eb0 | bool[4] | `MouseEdgeScrollLatch` {left,right,up,down} — previous frame's border state |
+| 0x007b3d18 | CameraAxis[6] | `CameraAxes` — the camera control axes the scroll/rotate/zoom keys and the screen edges both drive; see `orders_notes.md` §1.3 and `address_map.md` |
+
+**Mouse-driven camera scrolling** lives outside this file's boundary but starts at its edge:
+`UpdateMouseEdgeScroll` @ 0x004878f0 (`void __fastcall(int mouse_x, int mouse_y)`) is called from
+`RunInGameFrame` @ 0x0046e704 with `MouseXPixels`/`MouseYPixels`, and turns screen-border proximity
+into `SetCameraAxisInput` @ 0x00484e20 calls on `CameraAxes[0]`/`[1]` — the same entry point the
+`Scroll left/right/up/down` key bindings use. `MouseEdgeScrollLatch` is what makes each border
+crossing issue one press and one release instead of one per frame.

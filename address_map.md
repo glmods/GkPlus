@@ -30,6 +30,10 @@ any function here** - a wrong `RET` form drifts ESP and faults somewhere unrelat
 | Offset | Type | Name |
 |--------|------|------|
 | 0x007ba0d8 | Actors* | actors — `HashTable<Actor*>`, so +0x00 is the vptr and `n_entries` is at +0x04 |
+| 0x007b9ffc | int | `NextActorId` — the executor's monotonic actor-id counter. Read-then-`INC` at every `CreateActor` / `SpawnProjectileActor` arm, reset to 0 by `FUN_0052dcb0`, saved by `SaveGame` @ 0x00507d7d and restored by `LoadGame` @ 0x00505d38. **Named `num_actors` until round 4, which it never was** — nothing decrements it, so it is a next-id and not a live count. Its density is what makes actor ids guessable from the wire (`game_defects_notes.md` §20) |
+| 0x007b46d8 | HashTable<Unit*> | `SelectedUnits` — the local client's selection. vptr @ +0x00, `n_entries` @ 0x007b46dc, `num_buckets` @ 0x007b46e0, `mask` @ 0x007b46e4, `buckets` @ 0x007b46e8. **Untyped**: `AddToSelection` @ 0x0049ed30 does no class test and has a remote caller (update 0xc3) — see `orders_notes.md` §10.0 |
+| 0x006b0004 | HitRecord | `ScratchHitRecord` — the 0x10-byte scratch hit record (`{float t; Vec3f normal;}`) the collision cast helpers are handed in ECX |
+| 0x006520a0 | float | `FloatHalf` = 0.5f (was `FLOAT_006520a0`) |
 | 0x0054f2b0 | ThisCall (member) | HashTable_Remove (the template's `Remove`) |
 | 0x0054db10 | FastCall<unsigned, Actor*> | HashFunction_Actor (returns `actor->id`) |
 
@@ -134,7 +138,7 @@ above and the DB name were both deliberately left as they are.
 | 0x007b74f0 | LevelList[8] | KeyBindingCategories |
 | 0x007b76b0 | LevelList | MultiplayerLevelList |
 | 0x007b6f20 | LevelList | FileFindList (save-file enumeration) |
-| 0x00725664 | ResourceEntry** | LocalizedStrings |
+| 0x00725664 | ResourceStringEntry* | LocalizedStrings — 30,003 x 0x14 entries, `index == id`. `GetResourceString` is handed the **address of this slot**; `FreeResourceStringTable` is handed the array |
 
 **Misc/Game State:**
 
@@ -196,9 +200,9 @@ targets @ 0x0046aa84, 11 arms over states 1-19 — **state 20 is outside its ran
 | 0x007ba198 | — | BlobShadowShapeDefault — sprite quad for `blob shadow 0`, `units\alpha junk.rim` |
 | 0x007ba19c | — | BlobShadowShapeSpider — sprite quad for `blob shadow 1` (`spider`) |
 | 0x007ba1a4 | — | AlphaJunkTexture — the shared `units\alpha junk.rim` both quads sample |
-| 0x007ba1ac | — | Unit_BuildShadowNode_StaticGuard — **not data**: the MSVC magic-static guard for a function-local static in `Unit_BuildShadowNode` @ 0x005525b0 |
+| 0x007ba1ac | — | Unit_BuildShadow_StaticGuard — **not data**: the MSVC magic-static guard for a function-local static in `Unit_BuildShadow` @ 0x005525b0 (renamed from `Unit_BuildShadowNode`) |
 | 0x007ba1c4 | SparkSystem* | TheSparkSystem — 0x68 bytes, `Spark_EnsureSystem` @ 0x00558400 / `Spark_DestroySystem` @ 0x00558490 |
-| 0x007ba1b4 | List | the spark emitter list (count 0x1b8, cache 0x1bc/0x1c0) |
+| 0x007ba1b4 | List<SparkEmitter*> | SparkEmitters — 16-byte header: SparkEmitterCount 0x1b8, SparkEmitterCache 0x1bc, SparkEmitterCacheValid 0x1c0. Nodes are 0x10-byte `List_Member<SparkEmitter*>`, vtable 0x006696bc |
 | 0x007ba1cc | float* | SparkSystemTime — the system's seconds accumulator |
 | 0x00838c58 | void*[256] | ImageCodecTrieRoot — the image-codec magic-byte trie; freed at exit by `_atexit(&LAB_0064c9c0)` via `ImageCodecTrie_FreeSubtree` @ 0x005c8690 |
 
@@ -285,8 +289,43 @@ CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84
 |--------|------|------|
 | 0x00739090 | Map** | TheMap (0x18c; non-NULL disables ToMap's geometry phase) |
 | 0x00739098 | list | MapAuxObjectList (positional sounds etc.) |
-| 0x007b3ec4 | TeamSlot* | TeamSlots (stride 0xc4; `active` @ 0x69 = slot active) |
+| 0x007b3ec4 | TeamSlot* | TeamSlots (stride 0xc4) — see the four flag bytes below |
+| 0x006a58e0 | int | LocalPlayerTeam — the team index of *this* machine's player |
 | 0x007b3ec0 | int* | NumTeamSlots |
+
+**`TeamSlot`'s four flag bytes at +0x68..+0x6b.** All four are written by one per-team init loop,
+`FUN_00496420` (callers `RunInGameFrame`, `BeginMultiplayerGame`, `EnterSinglePlayerMode`,
+`ApplyUpdateMessage` x3). The team-index space is a **three-way partition stored as two bools**,
+`+0x6a` and `+0x6b` — they are *not* a complementary pair:
+
+| Offset | Name | Meaning |
+|--------|------|---------|
+| +0x68 | `player_controlled_not_local` | `player_controlled && team != LocalPlayerTeam` (written @ 0x00496554 after `CMP ESI,[LocalPlayerTeam]` @ 0x00496549). **Its only reader is dead code** — `LoadLevel` @ 0x004e0d3d tests it right after branching away on `+0x6a`, and `+0x68`'s writer predicate *implies* `+0x6a`, so it is always 0 there |
+| +0x69 | `active` | set **unconditionally** by the init loop and never cleared, so both readers (`ToMap` @ 0x00481752, `LoadLevel` @ 0x004e0d44) always see 1. Inert in practice |
+| +0x6a | `player_controlled` | **this team belongs to a human player** — *any* player, not necessarily the local one. Set for every team index except 0 and 2 (`CMP ESI,0x2 / JZ` then `TEST ESI,ESI / JZ` then `MOV byte [EDX+EAX+0x6a],1` @ 0x0049653b-0x00496544). 73 readers |
+| +0x6b | `not_enemy_source` | team 0 only — the writer @ 0x004965b2 is **unindexed**, so it hits slot 0 alone. Every enemy scan skips team 0 |
+
+```
+(+0x6a = 1, +0x6b = 0)   human player team, indices 1, 3, 4, 5, ...
+(+0x6a = 0, +0x6b = 1)   team 0, neutral / scenery
+(+0x6a = 0, +0x6b = 0)   team 2, the AI enemy team
+```
+
+**The team numbering that pins all of this**: `FUN_00503130` @ 0x005031f9 hands player *n* the team
+`(n == 0) ? 1 : n + 2` and sizes the array at `players + 2`, so the player team indices are exactly
+{1, 3, 4, 5, ...} — exactly the set `+0x6a` is set for, and exactly the set
+`ClassifyCursorTarget` @ 0x004a77a0 hardcodes (`t != 1 && t != 3 && t != 4 && t != 5`). The decisive
+consumer is `LoadLevel` @ 0x004e0d30, which creates an AI team-group for exactly the **complement**
+of `+0x6a`. Shipped scripts agree: `in team 0` x2605, `in team 2` x156 (all `Rol_technocrate` /
+`Rol_pulsax` / `Rol_silo_*` / `Rol_baddie_*`), `in team 1` x70 (all GunLok/Hark/Frend/Elint),
+`in team 3` x2; and the MP scripts are `CaptureFlag_team1/3/4/5.gcs` — there is no `_team2`.
+
+`+0x6a` was proposed as `is_player_team` and then refused in an earlier round, on the grounds that it
+is set for teams 3, 4, ... and so cannot mean "the player's team". **That refusal aimed at the wrong
+reading** — it read the name as *local* player, correctly showed `+0x68` is that, and over-generalised.
+The fallback it proposed, "team participates in hostilities", is contradicted outright: team 2 is the
+most hostile team in the game and does not have the flag. The name is `player_controlled` precisely
+because it cannot be misread as *local*.
 | 0x007b6dd0 | char* | ConsoleFileName (level `.gcs`) |
 | 0x007b68e4 | int* | NextClientActorId (client actor id counter) |
 | 0x007b6dc0 | float* | LoadingProgressFraction (`DrawLoadingProgressBar` clamps a percent into it) |
@@ -303,11 +342,34 @@ CRT-constructed to `1024.0` with an atexit destructor and **no readers** (0x9c84
 | 0x007b470c .. 0x007b4730 | void*[10] | Cursor_Unselected, Cursor_Standard, Cursor_Attack, Cursor_AttackGround, Cursor_PickUp, Cursor_Activate, Cursor_Drop, Cursor_Pass, Cursor_CameraLock, Cursor_HealCharacter — consecutive dwords, all built by `LoadCursorHierarchies` @ 0x0049c4d0 |
 | 0x007b4740 | int* | InventoryDragState — **PROPOSED**: written 0/1/2/3 by `FUN_004a5210`, read by `DrawInventoryItemPanel` |
 
-**0x006a5b34 is deliberately left unnamed.** `UpdateCursorForMode`'s guard reads it, but its image
-value is **1** and its only writer also writes 1, so that branch is **never taken**; six further
-references take its **address**, and its neighbours are the constant 2 and pointers to
-`"gunlok"`/`"elint"`/`"frend"`/`"maskelyn"`. So it is probably the head of a record rather than a
-flag, and naming it as one would be a guess — **PROPOSED**.
+**The 3D cursor object and its animation** — five consecutive globals, plus the one that used to be
+called "probably the head of a record":
+
+| Offset | Type | Name |
+|--------|------|------|
+| 0x007f5e8c | Renderable** | Cursor3DObject — the 3D mouse-cursor `Renderable` (0x1f0), built by `Renderable_CtorCopy` inside `FUN_00588620`, whose sole caller is `SetCurrentCursor` @ 0x004ad1a0. Every user null-checks it |
+| 0x007f5e90 | int* | Cursor3DLoopAnim — the looping sequence id, −1 for none |
+| 0x007f5e94 | bool* | Cursor3DOneShotActive |
+| 0x007f5e95 | bool* | Cursor3DOneShotDone — the module's **own** completion byte; `PlayCursorAnimation` passes *this* address, not the caller's |
+| 0x007f5e98 | bool** | Cursor3DIdleFlagOut — the caller's out-parameter, retained across frames so the completion handler can write through it |
+| 0x006a5b34 | bool* | **Cursor3DAnimIdle** — 1 = no one-shot cursor animation playing |
+
+**0x006a5b34 is `Cursor3DAnimIdle`, and `UpdateCursorForMode`'s guard on it IS reachable.** This
+entry previously said the branch was never taken and that the global was probably the head of a
+record; both are **retracted**. The six references that take its *address* are its writers: they
+pass it in EDX to `PlayCursorAnimation` @ 0x00588920 (`void __fastcall(int anim_id, bool *out_idle)`,
+bare `RET`, so the register pair is the whole signature), which zeroes it while a looping sequence
+plays and mirrors the one-shot completion byte into it; `SubmitCursorAndFinishCursorAnim`
+@ 0x00588ad0 sets it back to 1 through `Cursor3DIdleFlagOut`. The guard means *leave the cursor
+alone while its click animation runs*, and the image value of 1 is simply the idle state.
+
+**And 0x006a5b30–0x006a5b4c is not a record** — three unrelated adjacent globals:
+
+| Offset | Type | Name |
+|--------|------|------|
+| 0x006a5b30 | int* | **MouseLookVerticalStep** — only ever ±2. `SETZ AL` on `InvertMouse` @ 0x007b9cb0 then `LEA EAX,[EAX*4-2]` @ 0x0049e3e7, so **+2 when the setting is 0**. Both readers `IMUL` it into the **vertical** delta only; see `input_notes.md` |
+| 0x006a5b38 | char*[5] | **PlayerCharacterNames** — `{"gunlok", "elint", "hark", "frend", "maskelyn"}`. **Five**, not four: `"hark"` @ 0x00652740 was undefined data. Bound proved by `CMP EBX,0x14 / JC` @ 0x004a1d68 in `FUN_004a1c60` |
+| 0x006a5b4c | float* | a lone `2500.0f` with one reader (0x0049b607, the "you are being scanned" HUD radius) — **past** the array's end, left unnamed |
 
 **Window and video mode:** (see `src/WindowPlacement.h`)
 
@@ -336,14 +398,56 @@ pointer, and the source of most of the code that was undiscovered.
 | 0x0064dc50-0x0064dc64 | `.CRT$XI*` C initializers (6 pointers) |
 | 0x0064dc78-0x0064dc80 | `.CRT$XP*` pre-terminators (3) |
 | 0x0066e000-0x00672000 | the **RIF/chunk vtable band** — 245 sub-tables; see `rif_chunk_format.md` |
-| 0x006a0000-0x006a2c00 | x86 `__except_handler4` **`_EH4_SCOPETABLE`** tables — 82 headers + 84 records |
+| 0x00652938-0x006629cc | the **flex lexer tables** for `GSHTokenize` (7 arrays; `gls_system_notes.md`). Read `MOVZX reg, word ptr [idx*2 + base]` — **`short`, not pointers** |
+| 0x006a0000-0x006a2c00 | x86 `__except_handler4` **`_EH4_SCOPETABLE`** tables — 82 headers + 84 records, and 96 funclets now all named (see below) |
+| 0x006a3b68-0x006a5458 | the **Berkeley yacc parser tables** for `ParseGSH` (9 arrays plus the `@(#)yaccpar 1.4 (Berkeley) 02/25/90` SCCS stamp at 0x006a3d54; `gls_system_notes.md`). Also `short`, also in a **writable** section — MSVC never puts a jump table in one |
+| fourteen bases in 0x006a3008-0x006ab640 | the **fourteen per-translation-unit `random()` generators**, `Rng<Module>_{State,End,FPtr,RPtr}`; full table in `threading_model_notes.md`. 78 seed-table *pairs* exist in `.data` but only these 14 are complete generators |
+| 0x007f5f78-0x007fef80 | the **math lookup tables**, all filled by `InitMathLookupTables` @ 0x0058f310: `SinTable` `float[0x1400]` @ 0x007f5f78, `CosTable` **a single `float *`** @ 0x007faf78 (= `&SinTable[1024]`), `ACosToTurnsTable` `float[4097]` @ 0x007faf7c, ending exactly at `RsqrtMantissaTable` @ 0x007fef80. `TurnUnitsPerRevolution` @ 0x007f5f74 is the float 4096.0 — **the angle unit throughout this binary is 4096 units per revolution** |
 | 0x006aabe8-0x006aade7 | a **128-entry** dispatch array (0x00571c10 -> 0x005745f0). **Nothing in the image references it** — the base is computed at runtime |
+
+**The `_EH4_SCOPETABLE` funclets, and the trap in them.** All 96 non-null
+`_EH4_SCOPETABLE_RECORD` filter/handler slots are now named on a
+`<Owner>_{ehfilt,ehexcept,ehfinally}_<n>` scheme (`fn_%08x` of the owner entry where the owner's
+name is not unique program-wide or exceeds 48 characters — six owners are all named exactly
+`operator()<>`). **`createFunction` is the correct action for only 12 of them**, and the reason
+generalises well past the CRT:
+
+| N | shape | action |
+|---|---|---|
+| 16 | `__finally`; the owner `CALL`s the scope-table address itself, so Ghidra had already made it a function | rename only |
+| 56 | `__finally`, **dual-entry**: the scope-table address is a 1-4 instruction enclosing-frame register reload that falls through into an existing inner `FUN_*` the parent also `CALL`s a few bytes later | rename the **inner** function, **label** the outer address |
+| 12 | `__except` **filter**, self-contained, ends in `RET` | `createFunction` |
+| 8 | `__except` **handler stub** — a bare `MOV ESP,[EBP-0x18]` rejoining the parent's `__try` resume point | label only, **never a function** |
+| 4 | the same handler stub, undisassembled (29 bytes total) | disassemble, then label only |
+
+The category boundary is exactly the SEH construct: of the 84 records, 12 are `__except` (filter +
+handler) and 72 are `__finally` (handler only), and 12x2 + 72 = 96 with no residue. **An MSVC
+`__finally` funclet has two entry points**, so "the scope table points at an address with no
+function" is *not* a missing function — creating one there yields a stub that falls through into a
+foreign body. No signatures are declared on any of them: they are compiler-generated with fixed
+shapes. Owner attribution is exact — all 82 tables have exactly one referencing function, all 82
+call `__SEH_prolog4` @ 0x005e52e0, and `__SEH_prolog4` has exactly 82 distinct callers; the 96 slots
+hold 96 distinct addresses, none inside a non-owner's body. Seven funclets sit at a *lower* address
+than their owner's entry, which is not an anomaly: those owners' entries are hot-patch `MOV EDI,EDI`
+stubs placed elsewhere with the real body as a second range. One result worth knowing:
+`__ArrayUnwind`'s filter @ 0x005e3f1e has a **non-contiguous body**, `[0x5e3f1e-0x5e3f41]` plus
+`[0x5e3f5e-0x5e3f62]`, with the `__except` handler stub and `__ArrayUnwind`'s own epilogue sandwiched
+between — and `__ArrayUnwind`'s own body is unchanged by creating it.
 
 0x0064dc50-0x0064dc80 is the CRT initializer/terminator run above and **not** a SafeSEH
 `SEHandlerTable`: no `SEHandlerTable` / `__safe_se_handler_table` symbol exists in the database at
 all.
 
 ### Key Function Addresses (offsets from base)
+
+**Math and misc, added 2026-08:**
+
+| Offset | Signature | Name |
+|--------|-----------|------|
+| 0x0058f310 | ThisCall<void, float*> | `InitMathLookupTables` (was `FUN_0058f310`) — the C++ static initializer, registered from 0x0043abe0, that fills `SinTable`, `CosTable` and `ACosToTurnsTable`. It is where the 4096-units-per-revolution angle unit is established |
+| 0x0044c0a0 | FastCall<void> | `CommandInfoDialogTest` — the console command "INFO DIALOG TEST". Sat as raw undisassembled DATA until 2026-08; its registration @ 0x0043d6cd is the only reference to it in the binary |
+| 0x0056a030 | FastCall<void, char*, int> | `OpenInGameInfoDialog` (was `FUN_0056a030`) — builds the 0xb8-byte `InGameDialogA` (one label, one button); sibling of `OpenInGameConfirmDialog` @ 0x0056a120 |
+| 0x005a6670 | — | `GetCpuBrandString` — reads the CPU-brand string tables at 0x0066de00-0x0066e000. The four-byte "pointer-shaped" runs inside those tables (0x0066de64, 0x0066de7c, 0x0066df38, 0x0066df60, 0x0066df70) are inlined `strcpy` loads of `"-WB\0"` / `"aGX\0"`, not pointers |
 
 **Console:**
 
@@ -363,6 +467,7 @@ all.
 | Offset | Signature | Name |
 |--------|-----------|------|
 | 0x0044e0b0 | FastCall<Actor*, int> | GetActorById |
+| 0x0044e070 | FastCall<Unit*, int> | GetUnitById — the **client**-tree counterpart. Neither does any class check; both are short separate-chaining walks matching `[node+0xc] == id` |
 
 **Roles:**
 
@@ -408,13 +513,15 @@ all.
 | 0x004f7cd0 | FastCall<void, Menu*> | Menu::ClearItems |
 | 0x004fbf10 | ThisCall<void, Menu*, void*> | Menu::AppendItemNode |
 | 0x004ea8e0 | StdCall<void> | UpdateAndDrawMenuScreen |
-| 0x0058cdd0 | FastCall<void, int> | PlayUiSound (id in ECX; 0x57 = menu activation) |
+| 0x0058cdd0 | FastCall<int, int> | PlayUiSound (id in ECX; 0x57 = menu activation). Returns a **sound voice index**, or 0 / -1 / -2 on three distinct failures — a real `CALL` + `ADD ESP,0xc` + bare `RET`, not a tail `JMP`, so EAX passes through from `SoundSystem_PlaySound` |
 | 0x004d5380 | StdCall<void> | InitConsole (WinMain @ 0x0046bb81, right before SetupMenus) |
 | 0x004e7e50 | StdCall<void> | EnterMainMenuScreen |
 | 0x00470c70 | FastCall<void, void*> | MenuScreenInputHandler |
-| 0x00579000 | FastCall<const char*, void*, unsigned> | GetResourceString (ECX=&LocalizedStrings). Opens `MOV EAX,[ECX]`, then scans in 0x14-byte steps **with no end test** — so a table that is not loaded does not fault, it walks `.data` until a dword happens to match the id |
-| 0x00578f30 | FastCall<void, void*, int, unsigned, void**> | LoadResourceStringTable — `WinMain` @ 0x0046b355 passes (res dll, 0, 0x7532, 0x00725664) |
-| 0x00725664 | void* | **LocalizedStrings** — the string table, null until the above. `gk::ResourceString`'s readiness test, for the same reason as ConsoleInitialized: it is filled after the engine's first file open |
+| 0x00579000 | FastCall<const char*, ResourceStringEntry**, unsigned> | GetResourceString (ECX = **&LocalizedStrings**, one level of indirection — all 854 call sites do `MOV ECX,0x725664`). Opens `MOV EAX,[ECX]`, then scans in 0x14-byte steps **without testing `entry->is_last` (+0x10)**, which the array does carry — so a missing id walks `.data` until a dword happens to match. `game_defects_notes.md` §3 |
+| 0x00578f30 | FastCall<int, HINSTANCE, int, int, ResourceStringEntry**> | LoadResourceStringTable — `WinMain` @ 0x0046b355 passes (res dll, 0, 0x7532, &LocalizedStrings) ⇒ 30,003 entries / 600,060 bytes. `RET 0x8`; returns the count of ids that resolved, which the one call site ignores |
+| 0x00579020 | FastCall<int, ResourceStringEntry*> | FreeResourceStringTable — takes the **array base** (`MOV ECX,[0x00725664]` @ 0x0046aa72), and is the one function that **honours** `is_last` |
+| 0x00725664 | ResourceStringEntry* | **LocalizedStrings** — the string table, null until the above. `gk::ResourceString`'s readiness test, for the same reason as ConsoleInitialized: it is filled after the engine's first file open |
+| 0x007c14b4 | char[4] | EmptyResourceString — what `GetResourceString` returns for an entry whose `text` is null. Sits just before the 0x400 `LoadStringA` scratch at 0x007c14b8 |
 
 **The mouse cursor:**
 
@@ -428,7 +535,44 @@ all.
 | 0x004ad1a0 | FastCall<void, void*> | SetCurrentCursor(cursor /*ECX*/) — stores to `CurrentCursor`, tail-jumps to the below |
 | 0x004a2140 | — | ApplyWin32CursorShape — maps `CurrentCursor` to a `LoadCursorA` id, and does nothing else. **Was named `SetCursor`**, which is now the USER32 import thunk at 0x005712e1 |
 | 0x0049c4d0 | — | LoadCursorHierarchies — builds all ten cursors from `user interface/game_cursor.rif` |
+| 0x00588920 | FastCall<void, int, bool*> | PlayCursorAnimation(anim_id /*ECX*/, out_idle /*EDX*/) — was `FUN_00588920`. Bare `RET`, so **zero stack arguments**. Called with anim_id 1, 2 or 3; every one of its six call sites passes `&Cursor3DAnimIdle` |
+| 0x00588ad0 | CDecl<void> | SubmitCursorAndFinishCursorAnim — **was `SubmitSkyBackdrop`, whose plate comment was factually wrong**. It submits `Cursor3DObject` with `Camera_Menu2D` *and* is the one-shot animation's completion handler (restart the loop, clear the flag, write 1 through `Cursor3DIdleFlagOut`) |
+| 0x00588a80 | CDecl<void> | CenterMouseCursor — client dimensions `>> 1`, optional `ClientToScreen`, `SetCursorPos`. Was `FUN_00588a80` |
 | 0x0049f340 | FastCall<char> | IsInventoryScreenOpen — `CMP dword [0x007b6e50],0; SETNZ AL; RET` |
+
+**The recon view** (`CursorMode` 5, `ReconView` — the name is CONFIRMED, see `orders_notes.md`
+§10.1; but note the **polarity of `ReconModeActive` @ 0x007b9ca1 is an open question**,
+`ai_behaviour_notes.md` §11, so everything below is stated in terms of the byte's *value*):
+
+| Offset | Signature | Name |
+|--------|-----------|------|
+| 0x004a45d0 | CDecl<void> | OnReconViewLeftButtonDown — **zoom in**: `ReconZoomRate = 0.92593` (= 1/1.08). Was **undefined bytes** |
+| 0x004a4510 | CDecl<void> | OnReconViewRightButtonDown — **zoom out**: `ReconZoomRate = 1.08`. Was **undefined bytes** |
+| 0x004a4620 | StdCall<bool, int> | OnReconViewLeftDrag(reason) — `RET 0x4`, returns `AL = 1`; acts only on `reason & 2`, rate back to 1.0f |
+| 0x004a4590 | StdCall<bool, int> | OnReconViewRightDrag(reason) — the mirror of the above |
+| 0x004a4560 | CDecl<void> | OnReconViewRightClick — rate back to 1.0f, stop the sound. Was **undefined bytes** |
+| 0x004a4660 | FastCall<void, void*> | OnReconViewLeftClick(event_ctx) — **was `AdvanceGunlokSuperAbility`**. The rate reset, then the whole `ReconTargetState` machine, and on the fire transition it assembles the 16-byte command `0x27` payload at 0x004a47be-0x004a47eb and sends it |
+| 0x004ac540 | ThisCall (RET 0x8) | DrawTargetingReticule — owns six of the `ReconTargetState` writes and is the sole writer of `ReconReticuleTarget` |
+| 0x004a86c0 | — | DrawTargetInfoPanel — fetches **39 `GL_RECON_*` resource ids**, more than any other function in the binary. Called from `DrawOrderMenu` only when `[0x007b9ca1] == 0` |
+
+All six handlers are registered in `RegisterAllInterfaceHandlers` @ 0x0049c44e-0x0049c4c1 with mask
+**0x1fa0** (row `CursorMode` 5, all six target-class columns) and all six open with
+`CMP ReconTargetState, 4 / JZ` — manual zoom is locked out while the auto-scan zoom runs. Together
+they are a held-button zoom; see `orders_notes.md` §8.5.
+
+| Offset | Type | Name |
+|--------|------|------|
+| 0x007b3f7c | ReconTargetState* | ReconTargetState — 8 values, 0..7. Nine writes, all in `DrawTargetingReticule` or the `OnReconView*` handlers. **Value 3 is never written and never equality-tested** — 0x004a993d is a `< 3` range test and 0x004acc32 heads a chain over 2/5/4/7 — so it is an unused value, **not** dead code |
+| 0x007b3f6c | Unit** | ReconReticuleTarget — CONFIRMED. Stored by `DrawTargetingReticule` @ 0x004ac596, read as the command-0x27 target |
+| 0x007b3f68 | Unit** | ReconSubjectUnit — PROPOSED |
+| 0x007b3f50 | bool* | ReconAutoZoomActive — PROPOSED |
+| 0x007b3f44 | float* | ReconAutoZoomStartTime — the `GetGameTimeSeconds` stamp; PROPOSED |
+| 0x006a5ae4 | float* | ReconZoomRate — the per-frame multiplier; 1.0f = no zoom |
+| 0x006a5b00 | float* | ReconZoomFactor — `*= ReconZoomRate` in `UpdateSelectedUnitCamera` at 0x00497dca-0x00497e03, then drives the FOV pair 0x007b4e34/0x007b4e38. **Rate < 1 means zoom in** |
+| 0x006a5af8 | int* | ReconZoomSoundHandle — the looping `"Zooming"` sound; −1 = none |
+| 0x006a5b08 / 0x006a5b0c | float* | EpwEnergyCostFractionSP (0.2f) / EpwEnergyCostFractionMP (0.7f) — PROPOSED names; the split and the compare against `Unit+0xec` are measured, the word "EPW" comes from `GL_RECON_EPW_ARMED` |
+| 0x007b48b8 / 0x007b48c0 / 0x007b48c8 | float* | ReconCameraSavedRoll / Pitch / Yaw — **function-local statics of `ToggleReconMode`**, each with its MSVC thread-safe-init guard in the dword immediately after (0x007b48bc / c4 / cc). They were read as "camera-transition deadlines against the thread tick" until the guard triple was recognised |
+| 0x005e459e / 0x005e4554 | CDecl<void, int*> | `_Init_thread_header` / `_Init_thread_footer` — the MSVC magic-static pair, 37 call sites each, always paired. `[TLS+0x20]` is `_Init_thread_epoch` |
 
 **In-game menus:**
 
@@ -533,7 +677,9 @@ linked-list chases over the game's own pool heap, touching no D3D object)
 |--------|-----------|------|
 | 0x0055fb20 | CDecl<void> | RenderHudItems — walks `HudItemList` @ 0x007ba250, makes `Camera_Hud` current, calls slot 2 on each item. **Exactly one call site** (0x0046e8c1) and zero literal references anywhere in the image |
 | 0x0055fbd0 | ThisCall<void, HudItem*, int, int> | HudItem_DrawByKind — draws **one** HUD element, dispatched on `this->kind` (`+0x60`, 0..0x43; index table 0x00563928, jump table 0x005638f8). 11 `RenderQueue_Submit` sites, **all passing `Camera_Hud`**, then a run of immediate 2D quads. Was `DrawHud`, which described the caller rather than this |
-| 0x0056a7b0 | ThisCall<void, HudItem*, int, int> | HudItem_Draw — slot 2 of the vtable at 0x006697a4, which is **`ParticleTester_vtbl`**, not a HUD-item table: its two writers agree on one class (`ParticleTester::Ctor` @ 0x0056a310 constructs it, `FUN_0056a6e0` is its destructor and chains to `HudWidget_Dtor`, so `HudWidget` is the **base** — calling this table `HudItem_vtbl` would file a derived table under its base). Object size 0x190, confirmed twice: `PUSH 0x190` in `SpawnParticleTester`, `free_sized(this, 400)` in slot 0. Forwards to the above |
+| 0x0056a7b0 | ThisCall<void, HudItem*, int, int> | HudItem_Draw — slot 2 of the vtable at 0x006697a4, which is **`ParticleTester_vtbl`**, not a HUD-item table: its two writers agree on one class (`ParticleTester::Ctor` @ 0x0056a310 constructs it, `ParticleTester_Dtor` @ 0x0056a6e0 is its destructor and chains to `HudWidget_Dtor`, so `HudWidget` is the **base** — calling this table `HudItem_vtbl` would file a derived table under its base). Object size 0x190, confirmed twice: `PUSH 0x190` in `SpawnParticleTester`, `free_sized(this, 400)` in slot 0. Forwards to the above |
+| 0x0056a6e0 | ThisCall<void, ParticleTester*> | `ParticleTester_Dtor` (was `FUN_0056a6e0`) — writes `ParticleTester_vtbl` @ 0x0056a70b, destroys four embedded 3-element arrays (+0xa8, +0xcc, +0xd8, +0x170) via `_eh_vector_destructor_iterator_`, then chains to `HudWidget_Dtor` @ 0x0055f8d0 |
+| 0x0056d110 | ThisCall<void*, ParticleTester*, char> | `ParticleTester_ScalarDeletingDtor` (was `FUN_0056d110`) — vtable slot 0; calls the above, then `free_sized(this, 0x190)` if `flags & 1`. `RET 0x4` |
 | 0x005695a0 | CDecl<void> | Hud2D_BeginBatch — `RenderBatch_Begin` + bind `HudPlatesTexture`. 2 call sites, both in `RunInGameFrame` (0x0046e87a inventory / 0x0046e8b8 in-level) |
 | 0x005695c0 | FastCall<void, float*, float*, uint, float> | Hud2D_DrawQuad — `(rect_px, uv, diffuse, z)`; 4 verts (stride 0x20) + 6 indices into `ImmediateBatch`. Writes the caller's `z` **verbatim** and `rhw = 1/z`. Wrappers: `Hud2D_DrawQuadNormalized` 0x00569e00, `Hud2D_DrawMeterBar` 0x00569ef0, `Hud2D_DrawNumber` 0x0056d390 |
 | 0x00569ed0 | CDecl<void> | Hud2D_FlushBatch — `RenderBatch_End` + `RenderBatch_Draw(D3DPT_TRIANGLELIST, indexed)`. One call site (0x0046e8cf), no literal references |
@@ -563,6 +709,50 @@ as the camera pointer), and a `D3DVIEWPORT8` sits at `+0x254` with `MinZ` at `+0
 | 0x007b5a70 | the sky/backdrop camera | 1.00 .. 1.00 | 1 / 1000 |
 | 0x007b50b0 | (unidentified) | 0.02 .. 0.04 | 0 / 10 |
 | 0x007b5590 | (unidentified) | 0.04 .. 0.06 | 0 / 10 |
+
+**Camera control axes** — `CameraAxes` @ **0x007b3d18**, `CameraAxis[6]`, `0x20` bytes each. Not
+camera *positions*: each element is a key/edge-scroll-driven **velocity integrator with a linear
+acceleration ramp** up to `CameraScrollSpeed`. The noun comes from the data's drivers — the ten
+camera key bindings and the screen-edge scroll — which is why an earlier proposal to name the reset
+function `ResetCameraTrackSlots` was declined.
+
+| `CameraAxis` | Type | Name |
+|---|---|---|
+| +0x00 | byte | `flags` — bit0 direction, bit1 held, bit2 ramping. `Reset` does `AND [this],0xf9`: it clears bits 1-2 and **preserves bit 0** |
+| +0x04 | int | `ramp_start_tick` |
+| +0x08 | int | `ramp_end_tick` |
+| +0x0c | float | `ramp_start_rate` |
+| +0x10 | float | `ramp_accel` |
+| +0x14 | float | `pending_delta` |
+| +0x18 | int | `last_sample_tick` |
+| +0x1c | float | `last_rate` |
+
+`sizeof == 0x20` and the count of 6 are pinned by `CameraAxes_StaticInit` @ 0x00437500 —
+`_eh_vector_constructor_iterator_(0x7b3d18, 0x20, 6, ctor 0x00488000, dtor 0x004880d0)` — which was
+outside any function body until 2026-08.
+
+`CameraAxisId`: 0 `ScrollX`, 1 `ScrollY`, 2 `Unused2`, 3 `Elevation`, 4 `Rotation`, 5 `Zoom`.
+0/1/3/4/5 are confirmed by lining `HandleGameKeyAction`'s ten `SetCameraAxisInput` arms up against
+`GLkeys.cfg`'s category-0 lines, both in registration order — the table is in `orders_notes.md` §1.3.
+**Axis 2 has no setter anywhere in the binary**: one reference in the whole database, a
+`ConsumeDelta` at 0x00486edf inside `UpdateReconCamera`, so its output is always 0.0 and the
+arithmetic it feeds is inert. Whether that is a removed control or a defect is not established.
+
+| Offset | Signature | Name |
+|--------|-----------|------|
+| 0x00484080 | ThisCall<void, CameraAxis*> | CameraAxis::Reset — bare `RET`; restamps `last_sample_tick` from the client `RealTimeClock` @ 0x006aaaa0 |
+| 0x004840c0 | ThisCall<float*, CameraAxis*, float*, int> | CameraAxis::RateAt — samples the ramp at a tick, clamping to `CameraScrollSpeed`. `RET 0x8` |
+| 0x00484150 | ThisCall<float*, CameraAxis*, float*, int> | CameraAxis::ConsumeDelta — trapezoidal integration returning a **delta**, not a value, and consuming the state. `RET 0x8`. One consumer per axis per frame |
+| 0x00484210 | ThisCall<void, CameraAxis*, bool, bool> | CameraAxis::SetInput(positive, pressed) — starts/ends the ramp. `RET 0x8`. **Exactly one caller**, the wrapper below |
+| 0x00484e20 | FastCall<void, CameraAxisId, bool, bool> | SetCameraAxisInput(axis /*ECX*/, positive /*DL*/, pressed /*stack*/) — `SHL ECX,5 / ADD ECX,0x7b3d18`, `RET 0x4`. 24 call sites: `HandleGameKeyAction` (10), `CommandControls` (10), `UpdateMouseEdgeScroll` (4). **Model it `__fastcall`, not `__thiscall`** — Ghidra's `__thiscall` will not model the EDX argument |
+| 0x00487a00 | CDecl<void> | ResetCameraAxes — `Reset` over all six, then clears `MouseEdgeScrollLatch` with one dword store. Called from `ClearCameraTrack` (tail `JMP`), `ToggleReconMode` and `LoadLevel` |
+| 0x004878f0 | FastCall<void, int, int> | UpdateMouseEdgeScroll(mouse_x /*ECX*/, mouse_y /*EDX*/) — bare `RET`. The `XOR AL,AL` at entry is a byte-local init, **not** a third argument |
+| 0x00488000 / 0x004880d0 | ThisCall | CameraAxis::CameraAxis / ::~CameraAxis — 3 bytes (`MOV EAX,ECX; RET`) and 1 byte (`RET`) |
+
+| Offset | Type | Name |
+|--------|------|------|
+| 0x007b3e44 | float* | CameraScrollSpeed — the terminal rate. Sole writer is the 0.5/1.0/2.0 switch in `BuildInventoryScreenObjects` (0x0049e42d/455/45f), i.e. the menu preference |
+| 0x007b3eb0 | bool[4] | MouseEdgeScrollLatch — {left, right, up, down}, the previous frame's border state. **Neither a count nor an index**, both of which were proposed; the dword-width clear in `ResetCameraAxes` is what made it look scalar |
 
 **Text rendering:** (see `rendering_notes.md` §4.2 — text is its own queue, not the render queue)
 
@@ -603,6 +793,69 @@ as the camera pointer), and a `D3DVIEWPORT8` sits at `+0x254` with `MinZ` at `+0
 | 0x0044c340 | StdCall<int> | GetParticleIDFromName (console keyword -> ParticleType) |
 | 0x007c1964 | ParticleTypeInfo* | ParticleTypeInfos (13 x 0xd4; **not** ParticleGenerator) |
 | 0x007c1968 | void* | ParticlesRimTextures (`bitmaps\particles.rim`) |
+
+**The texture cache:** (see `rendering_notes.md` §6.1; `AwTexture` is mirrored in `src/Render.h`)
+
+| Offset | Signature | Name |
+|--------|-----------|------|
+| 0x00803ce0 | TextureManager | **TextureManagerInstance** — the cache singleton, 0x2c bytes, was `TexturesObject`. No vtable of its own; the vptr at +0x08 belongs to an embedded `HashTable<AwTextureNode *>` (derived vtable 0x0066db0c). Built by the CRT static init `TextureManager_StaticInit` @ 0x0043add0 |
+| 0x005a15b0 | ThisCall<AwTexture*, const char*, unsigned> (RET 0x8) | `TextureManager::AcquireRimTexture` — hashes, returns an existing record with `+0x1c` bumped and an MRU relink, or mints a fresh 0x34-byte `AwTexture`. **Not** RIM-only; **not** the lookup path (see `TouchByRecord`) |
+| 0x005a19a0 | ThisCall<void, void(*)()> (RET 0x4) | `TextureManager::TextureManager_LoadPending` — the loading-bar tick; strdups the cwd into a record's `directory` when it is null |
+| 0x005a1b80 | ThisCall<void> | `TextureManager::TextureManager_RecreateAll` |
+| 0x005a1ca0 | ThisCall<void> | `TextureManager::TextureManager_ReleaseAll` |
+| 0x005a1d60 | ThisCall<void> | `TextureManager::TextureManager_SetCreateFlag0x400` |
+| 0x005a1240 | ThisCall<...> | `TextureManager::TextureManager_TouchByRecord` — the **lookup** half, separately inlined at six sites, none of which allocates. A hook on `AcquireRimTexture` does not see these |
+| 0x005a1540 | ThisCall<void> | `TextureManager::TextureManager_Dtor` |
+| 0x005a17d0 | ThisCall<bool> | `TextureManager::TextureManager_EvictOneUnused` — **frees records**, called from `LoadLevel` and `UnloadLevel`. See `game_defects_notes.md`-adjacent git-bug 85bd09e |
+| 0x005a1900 | ThisCall<void> | `TextureManager::TextureManager_PurgeReleasedEntries` |
+| 0x005a1d90 / 0x005a1e00 / 0x005a1ea0 | ThisCall | `HashTable_Ctor` / `HashTable_Dtor` / `HashTable_Remove` — **not** `TextureManager` members; they take the embedded table at `+0x08` in ECX |
+| 0x005a14d0 / 0x005a14f0 / 0x005a1510 | — | `HashTable_NewNode` / `HashTable_DeleteNode` / `HashTable_NewNodeWithNext` — the three overridden node-allocation slots |
+| 0x00803d0c | AwTexture | **TextureLookupKey** — a function-local static used only as the search key, which makes acquire **non-reentrant**: `name` is written into this object's `name` field (0x00803d38) and then hashed |
+| 0x006ac120 | AwTexture* | TextureLookupKeyPtr — holds `&TextureLookupKey` |
+| 0x00803d40 | — | TextureLookupKeyInitGuard — the magic-static guard for the above |
+| 0x006ab978 | int | the VRAM page counter eviction decrements by `(w * h) >> 12` when `AwTexture::vram_counted` is set |
+
+**Sparks:** (see `rendering_notes.md` §4.3.1)
+
+| Offset | Signature | Name |
+|--------|-----------|------|
+| 0x00558780 | CDecl<void> | Spark_Reset — drains the emitter list **and** the live particle chain. Body is non-contiguous: `[0x00558780, 0x0055881a]` + `[0x0055a170, 0x0055a1a2]` |
+| 0x00558820 | FastCall<void, const Vec3f*, int> | Spark_AddEmitter — the **sole constructor** of `SparkEmitter` (`pool_alloc(0x50)`, vptr 0x00669690) |
+| 0x00669690 / 0x006696bc | — | the `SparkEmitter` vtable (2 slots) and its `List_Member` node vtable |
+
+**The RIF chunk class tree:** (see `rif_chunk_format.md`)
+
+| Offset | Name |
+|--------|------|
+| 0x0066e378 | **Lockable_Chunk_With_Children_Vtbl** — 15 slots, 12/13/14 `__purecall`. **Nothing in `.text` installs it**: the constant 0x0066e378 does not occur in `.text` at all, consistent with an abstract base whose ctor is inlined into every concrete subclass |
+| 0x0066f884 | **Chunk_With_BMPs_Vtbl** — 21 slots, 19/20 `__purecall`; slots 4-11 are the plain `Chunk` bodies, which is what proves it derives from `Chunk` and not from `Chunk_With_Children` |
+| 0x005d4a00 / 0x005d4a60 / 0x005d4a90 / 0x005d4ac0 / 0x005d4ad0 | `Chunk::` slots 2/4/5/6/7 — `output_chunk`, `make_data_block_from_chunk`, `make_data_block_for_process`, `size_chunk_for_process`, `fill_data_block_for_process` |
+| 0x005b1a30 / 0x005b1a40 / 0x005b1a50 / 0x005b1a60 | `Chunk::` slots 8/9/10/11 — `prepare_for_output`, `post_input_processing`, `r_u_miscellaneous`, `r_u_a_chunk_with_children` (**slot 11 is the Gunlok-revision addition**; the name is PROPOSED, the behaviour is not) |
+| 0x005d4df0 / 0x005d4e30 / 0x005d4eb0 / 0x005d5160 / 0x005d51a0 / 0x005d4ef0 / 0x005d4f10 / 0x005b1cc0 | `Chunk_With_Children::` slots 1/2/3/6/7/8/9/11 |
+| 0x005afe70 / 0x005afe90 | `Lockable_Chunk_With_Children::size_chunk_for_process` / `fill_data_block_for_process` — both open `CMP dword ptr [ECX+0x2c],0x0`, the `output_chunk_for_process` gate |
+| 0x005cfed0 | `Chunk_With_BMPs::Chunk_With_BMPs` — the shared ctor/parser, was `Chunk_With_BMPs_Ctor`; writes vptr 0x0066f884 @ 0x005cff11 |
+| 0x005d1f70 / 0x005cfda0 / 0x005cfe10 | `Chunk_With_BMPs::` slots 0/1/3 — `~Chunk_With_BMPs`, `size_chunk`, `fill_data_block` |
+| 0x005cf520 / 0x005cf730 / 0x005cf970 / 0x005cfba0 / 0x005cfcf0 / 0x005cfd20 / 0x005cfd70 | `Chunk_With_BMPs::` slots 12-18 — `get_version_num`, `set_version_num`, `inc_version_num`, `GetExtendedData`, `GetMD5Val`, `SetMD5Val`, `RemoveMD5Val`. `RemoveMD5Val` calling `[EAX+0x4c]` (slot 19) is a second confirmation that 19 is `GetMD5Chunk` |
+| 0x005b2100 / 0x005b2300 / 0x005b2490 / 0x005b24a0 / 0x005b24d0 | `Object_Chunk::` — `get_header`, then slots 12/13/14 `file_equals` / `get_head_id` / `set_lock_user`, plus slot 9 `post_input_processing` (only RBOBJECT carries it) |
+| 0x005ca110 / 0x005ca1e0 | `Environment_Data_Chunk::Environment_Data_Chunk` — two ctors, both writing vptr 0x0066f1b0 |
+| 0x005ca2b0 / 0x005ca2c0 / 0x005ca2d0 / 0x005ca2e0 / 0x005ca310 | `Environment_Data_Chunk::` — `get_header`, then slots 12/13/14 and slot 9 `post_input_processing`. `file_equals` is literally `MOV EAX,1 / RET 0x4`, and `get_head_id` tail-calls `get_header`, exactly as `Object_Chunk`'s does |
+| 0x005d1c50 / 0x005d00b0 / 0x005d01b0 | `Global_BMP_Name_Chunk::` slots 0/19/20 — dtor, `GetMD5Chunk`, `CreateMD5Chunk` |
+| 0x005d1c80 / 0x005d0220 / 0x005d03c0 | `Bitmap_List_Store_Chunk::` slots 0/19/20 — same three |
+| 0x005d1fa0 / 0x005d2040 / 0x005d09d0 | `External_Shape_BMPs_Store_Chunk::` slots 0/1/3 — dtor, `size_chunk`, `fill_data_block` |
+| 0x005d2010 / 0x005d2030 / 0x005d2020 / 0x005d2000 | `External_Shape_BMPs_Store_Chunk::` slots 12/13/14/15 — the four one-line accessors, and they **pin `version_num` at +0x78**: `MOV EAX,[ECX+0x78]`, `MOV [ECX+0x78],EAX`, `INC [ECX+0x78]`, and `LEA EAX,[ECX+0x3c]` for `GetExtendedData` returning the `BMP_Names_ExtraData` subobject |
+| 0x005d07c0 / 0x005d0950 | `External_Shape_BMPs_Store_Chunk::GetMD5Chunk` / `CreateMD5Chunk` (slots 19/20) |
+| 0x005d0530 / 0x005d0670 / 0x005d0780 | `External_Shape_BMPs_Store_Chunk::External_Shape_BMPs_Store_Chunk` — three ctors, all writing vptr 0x0066f8d8; 0x005d0530 writes the `Chunk_With_BMPs` vptr first, which is the base-then-derived order that confirms the edge |
+
+**Sound:** (see `menu_system_notes.md` for `PlayUiSound`)
+
+| Offset | Signature | Name |
+|--------|-----------|------|
+| 0x0058a660 | CDecl<int, SoundSystem*, int, const char*, ...> | SoundSystem_PlaySound — **variadic**, bare `RET`. Returns a voice index; the option string is the real interface, and its `'e'` letter takes an `int *` pre-set to -1 that receives that index — which is why 0 of 190 call sites read EAX |
+| 0x00588bd0 | ThisCall<int, SoundSystem*, SoundRequest*> (RET 0x4) | SoundSystem_StartVoice — returns -2, 0, or `(voice - base) / 0x5c` |
+| 0x0058d880 | — | SoundRequest_Dtor |
+| 0x0058cdf0 | FastCall<int, int, const char*, uint32, uint32> (RET 0x8) | PlaySoundOnObject — was `undefined(void)` with no convention declared |
+| 0x004464d0 | FastCall<int> | CommandPlaySound — **takes no arguments**; reads the console word itself via `ConsoleParseInt(0)` @ 0x004d6770, then tail-`JMP`s to `PlayUiSound` |
+| 0x006a3738 | int | AmbientLoopVoiceHandle |
 
 **Memory:** (wrapped as `gk::pool_alloc` / `gk::pool_free` in `src/Memory.cpp`)
 
@@ -679,6 +932,48 @@ as the camera pointer), and a `D3DVIEWPORT8` sits at `+0x254` with `MinZ` at `+0
 | 0x004dad40 | ThisCall<int, void*, HANDLE> | WriteTeamCarryOverState |
 | 0x004da980 | CDecl<int, HANDLE> | ReadTeamCarryOverState |
 | 0x0044c8d0 | FastCall<int, const char*> | strlen_plus1 (length **includes** NUL) |
+
+### Collision casting (`Renderable` / `SceneNode` / AABB leaves)
+
+The ray and trajectory intersection helpers behind `Actor` slots 57 (`Raycast`) and 58. **The
+`Vec3 *` argument of those two slots is a DIRECTION / first-order rate vector, not an endpoint**, and
+`t` parameterises `p(t) = from + t*to` — three independent confirmations: the helpers transform
+`from` with `AffineTransform` but `to` with `Mat3Transform` (the linear part only, which is exactly
+what makes `t` invariant under the object transform, and which a world endpoint could not use); the
+leaves evaluate `origin + t*dir` parametrically and divide by `to`; and every caller builds `to` as a
+velocity (`ProjectileActor::InitPositionAndTiming` copies `ProjectileActor+0x138`, `velocity`,
+verbatim and then integrates gravity into it).
+
+**Slot 58 is a ballistic cast, not a volume sweep.** Its extra `Vec3 *` is
+`(0, GravityAcceleration, 0)` at all four dispatch sites and the leaf solves a quadratic:
+`p(t) = from + t*v + t*t*a/2`. The slot is still named `SweepTest` in the DB and in `src/Actors.h`
+— renaming it is an open item, see `actor_vtable_notes.md`.
+
+`HitRecord` is 0x10 = `{0x00 float t; 0x04 Vec3f normal;}` and `t` is **in/out**: the caller seeds it
+with the early-out bound and only a nearer hit overwrites it.
+
+| Offset | Signature | Name |
+|--------|-----------|------|
+| 0x004619d0 | FastCall<bool, HitRecord*, Renderable*, Vec3f* /*from*/, Vec3f* /*direction*/> | `Renderable_RaycastMesh` — `RET 0x8` |
+| 0x00461cb0 | same | `Renderable_RaycastBounds` — `RET 0x8` |
+| 0x00461b20 | FastCall<bool, HitRecord*, Renderable*, Vec3f* /*from*/, Vec3f* /*velocity*/, Vec3f* /*accel*/> | `Renderable_TrajectoryCastMesh` — `RET 0xc` |
+| 0x00461ed0 | same | `Renderable_TrajectoryCastBounds` — `RET 0xc` |
+| 0x00460ee0 | — | `SceneNode_RaycastTree` |
+| 0x00461110 | — | `SceneNode_TrajectoryCastTree` |
+| 0x004613b0 | — | `SceneNode_RaycastBounds` |
+| 0x004615a0 | — | `SceneNode_TrajectoryCastBounds` — read only **structurally**; the weakest name of the group |
+| 0x00460080 | — | `SubMesh_RaycastPolygons` |
+| 0x0045e9b0 | — | `RayVsAabb` |
+| 0x0045f200 | — | `TrajectoryVsAabb` |
+| 0x004659b0 | — | `TrajectoryVsAabbAxis` — `RET 0x24` |
+| 0x00465ab0 | — | `TrajectoryVsAabbFace` — `RET 0x24` |
+| 0x0045da70 | — | `SolveQuadratic` |
+| 0x00472220 | — | `Map_GetCollisionRootNode` — whole body `MOV EAX,[ECX+0xc8] ; MOV EAX,[EAX+0x17c] ; RET`. **No stack arguments** (its call sites push the *next* callee's arguments around it), but it **does read ECX**, so it is not argument-free — its one register parameter is still undeclared |
+
+The four `Renderable_*` are `__fastcall` with **ECX = the `HitRecord`, EDX = the `Renderable`** — ECX
+is *not* a `this`, which is why they stay in the global namespace. Both branches of `Actor::Raycast`
+pass the same `EDX = this->anim_object` (`MOV EDX,[ESI+0xe0]` at 0x0052e10b **and** 0x0052e178);
+`Role::shape` only discriminates how that `Renderable` was built, it is not a second object.
 
 ### Recovered switch-table function bodies
 

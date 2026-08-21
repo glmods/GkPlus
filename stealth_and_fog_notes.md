@@ -272,7 +272,7 @@ A concealed unit is submitted through `RenderQueue_Submit` with material
 `pool_alloc` `{vptr = 0x00664024, refcount = 1, float alpha}`:
 
 - **Own team** (`Unit+0xb4 == LocalPlayerTeam` @ 0x006a58e0), or a Cooperative ally
-  (`TeamSlots[team]+0x6a != 0`): **alpha = 0.7** (`0x3f333333`). That is the manual's
+  (`TeamSlots[team].player_controlled != 0`, `+0x6a`): **alpha = 0.7** (`0x3f333333`). That is the manual's
   "turns darker" — a constant 70% translucency, not a colour change.
 - **Any other team**: find the minimum squared distance from this unit to any entry of
   `ObjectList` @ 0x007b6928 (the player's own named characters), with the running minimum
@@ -499,7 +499,7 @@ implementation at 0x004cf3b0 is literally `*(int *)(this + 0xb4) = arg; return;`
 `ApplyUpdateMessage` 0x004fecca (spawn path) and case **0xb7**; removed from `MobileUnit::LeaveWorld`
 @ 0x004c0f80, `ProjectileUnit::~ProjectileUnit` @ 0x004c4a50 and case **0xb8**. The `+0x211 = 1` is therefore
 **not a construction-time event**: a unit becomes a defogger whenever its team becomes the local
-player's team - or, in Cooperative, any team whose `TeamSlots[team]+0x6a` is set - so every team
+player's team - or, in Cooperative, any team whose `TeamSlots[team].player_controlled` (`+0x6a`) is set - so every team
 change re-evaluates it.
 
 Console `DEFOGGER` (`CommandDefogger` @ 0x00442a10) broadcasts **0xb7**, 8 bytes
@@ -657,7 +657,8 @@ nothing else.
 
 - `src/Actors.h` carries the field and slot 8/9/63 names already (`is_concealed`, `is_crouched`,
   `IsConcealed`/`SetConcealed`, `IsCrouched`). Still outstanding there: **slot 83**, declared as
-  `virtual void UpdateMineDetectionAndBounds() = 0;` at `src/Actors.h:394`, which is
+  `virtual void ToggleCrouchAndCamouflage() = 0;` in `src/Actors.h` (`MobileActor` slot 83; the
+  declaration was called `UpdateMineDetectionAndBounds` when this was written), which is
   `ToggleCrouchAndCamouflage`. **None of these has a `static_assert` behind it**, so nothing but
   review catches a wrong slot name.
 - `Role::limit` (+0x54, GLS field 0x78) was suggested as a possible defogger consumer. It

@@ -399,8 +399,8 @@ guard, or being simulation-authority code that broadcasts. This is why a joining
 > appending, or the stock script equips the wrong actor.
 | `CommandBatchAndBroadcast` | 0x00448400 | console command that runs a script file | body is inside `if (LevelLoadReason != 3) if (IsExecutorRunning())` — **guarded, proven** |
 | `Frag` | 0x0052e220 | kill/score credit | Actor vtable slot; broadcasts — *inferred* |
-| `SyncPositionAndBroadcast` | 0x0053d8d0 | position sync | Actor vtable slot; broadcasts — *inferred* |
-| `OnFlagCaptured` | 0x00533120 | CTF capture; queues `CaptureFlag_team<N>.gcs` | called from `SyncPositionAndBroadcast` @ 0x00533720; broadcasts — *inferred* |
+| `CharacterActor::Update` | 0x0053d8d0 | position sync | Actor vtable slot 70; broadcasts — *inferred* |
+| `OnFlagCaptured` | 0x00533120 | CTF capture; queues `CaptureFlag_team<N>.gcs` | called from `MobileActor::Update` @ 0x00533720; broadcasts — *inferred* |
 | `OnPickedUp` | 0x00546440 | item pickup; queues the item's `associated_script` | `PickupActor` vtable slot; broadcasts — *inferred* |
 
 #### Where each caller's string comes from
@@ -415,7 +415,7 @@ table and cannot be reached indirectly.
 | `EvaluateTriggers` | `TriggerData+0x54` | `script_name`, `strdup`'d by `RegisterTriggers` — from a `.gls`/`.gcs` `add trigger`, or `gk::RegisterTriggers` |
 | `OnPickedUp` | `PickupActor+0x134` | `associated_script`, set by `Actor` vtable slot 66 (`Associate`) — the console's `ASSOCIATE`, or `actor.associate()` |
 | `Frag` | `Destructibility+0x08`, tag 4 | `ReplaceDestructibility::script` — GLS field 0x00 of the "replace destructibility" section (whose keyword is `name`; it is a `.gcs` path, see `role_subobjects_notes.md`) |
-| `SyncPositionAndBroadcast` @ 0x0053d8d0 | `[[this+0xc]+0x10]` | `Vulnerability::script` — including the one `AddInterfaceBeamVulnerability` @ 0x00510fe0 synthesises from `Role::interface_beam_script`. **Freed immediately after queueing**, so it fires once |
+| `CharacterActor::Update` @ 0x0053d8d0 | `[[this+0xc]+0x10]` | `Vulnerability::script` — including the one `AddInterfaceBeamVulnerability` @ 0x00510fe0 synthesises from `Role::interface_beam_script`. **Freed immediately after queueing**, so it fires once |
 | `MultiplayerRespawnRole` | stack buffer | the literal `RTPRespawn.gcs` / `TPRespawn.gcs` @ 0x006679d4 |
 | `OnFlagCaptured` | stack buffer | the literal `CaptureFlag_team5.gcs` @ 0x00669574 with the team digit patched |
 | `CommandBatchAndBroadcast` | `g_ConsoleWordBuf` @ 0x006af5f8 | the console line, via `CopyRemainingArgs` — the `BATCHANDBROADCAST` command ("a bit like BATCH but it tells clients to batch it as well"). The open-ended one: any console input reaches it, including `console.execute()` from a script |
@@ -430,8 +430,14 @@ there is nothing to convert and the queue hook handles them.
 > The guard covers only the `SpawnRole` call; `QueueScriptExecution` runs unconditionally below
 > it. What proves it executor-only is the call graph — its sole caller is `EvaluateTriggers`.
 >
-> Note also that `SyncPositionAndBroadcast` names **11 distinct functions**; the one that queues
-> scripts is `0x0053d8d0`, *not* the `0x00533720` that calls `OnFlagCaptured`. Resolve by address.
+> Note also that `SyncPositionAndBroadcast` was a **stale name and is now gone**: it was
+> `ActorVtbl` slot 70's field/funcdef name, never a function name, and the function at that slot
+> is `Actor::Update`. The "11 distinct functions" it appeared to name are the eleven slot-70
+> `Update` overrides. The one that queues scripts is `CharacterActor::Update` @ `0x0053d8d0`,
+> *not* the `MobileActor::Update` @ `0x00533720` that calls `OnFlagCaptured`. Resolve by address.
+> (That stale field name is also what made `directplay_protocol_notes.md` §7 attribute update
+> `0x62` to a position-sync sender; only base `Actor::Update` @ `0x0052f8a0` broadcasts a
+> position, and it sends `0x6f`, not `0x62`.)
 
 Caveat on the last four: they are **vtable-dispatched**, so their callers cannot be enumerated
 statically. `OnPickedUp` is `PickupActorVtbl` slot 84 (`0x0066852c`, offset 0x150); see
@@ -510,7 +516,8 @@ exclusive flag (byte), +0x04 CRITICAL_SECTION, +0x1C reader count. Writers spin 
   `FindTokenWithValue`, `ListTokens`, `FreeTokens` all lock it (tokens are read and
   written from both threads);
 - door open/close (`OpenDoor`/`CloseDoor` @ 0x0043fbd0/0x0043fc50);
-- position sync (`SyncPositionAndBroadcast`, `InitPositionAndTiming` variants);
+- position sync (`Actor::Update` @ 0x0052f8a0 and its slot-70 overrides, `InitPositionAndTiming`
+  variants);
 - **the `Map`** — the lock is `Map->lock`, taken by both threads, and the constructor that
   initialises it is `MapBase_Ctor` @ 0x00489990. (Note the DB models `Map` as **one flat 0x18c
   record** with both its constructor and destructor in namespace `Map`; there is no `MapBase` type
@@ -590,28 +597,96 @@ WinMain initializes the main clock (`FUN_005718b0(&0x007c07d0, 0)`)
 and copies the whole struct to the executor clock if the thread is running; `LoadLevel`
 re-syncs both on level load.
 
-### Random number generator (two states)
+### Random number generator — fourteen of them, one per translation unit
 
-Lagged-Fibonacci-style RNG with a 0x7C-byte state table per thread @ 0x006a8140
-(+ `i*0x7c`), and per-thread pointer arrays @ 0x006a8238 / 0x006a8240 / 0x006a8248
-indexed by `i = (GetCurrentThreadId() == ExecutingThread)`. Keeps simulation
-randomness (executor) independent from client-side randomness (main). Those four are named
-`RngStateTables` / `RngStateEnd` / `RngPtrA` / `RngPtrB` in the database (6 / 3 / 11 / 11
-references).
+**`random()` TYPE_3, degree 31, separation 3** — `x[n] = x[n-3] + x[n-31] mod 2^32`, output
+`x >> 1`. That is BSD/glibc's `random()`, identified exactly, not "Lagged-Fibonacci-style".
 
-**There is a second set of four at the same shape, and it is the one the AI uses.**
-0x006a3130 / 0x006a3228 / 0x006a3230 / 0x006a3238 — exactly **0x5010 lower** than the named set,
-member for member, with the identical layout (a 0x7c-byte state per thread plus three pointer
-arrays of two dwords each). Every `AiThink_*` inlines *that* set: 28 / 14 / 56 / 56 references,
-from `AiThink_Bot`, `AiThink_Minebot`, `AiThink_Node`, `AiThink_Swarm` and `FUN_00457f80`. The two
-random 4-way picks inside `AiThink_Bot` (`ai_behaviour_notes.md` §2.1.2) read it.
+**There are FOURTEEN independent instances in `.data`**, all with byte-identical initial contents.
+This section used to record two, at 0x006a8140 and 0x006a3130, and ask whether they were two RNGs
+or one wrongly-recorded set. **Neither: the question dissolves.** The distinguishing axis is the
+**translation unit**. These are four file-scope statics declared in a header —
+`state[2][31]`, `end[2]`, `f[2]`, `r[2]` — so every `.cpp` that draws a random number links its
+**own private copy with its own private stream**. The `0x5010` gap between the two once compared
+here is a coincidence: the object footprint is 0x110 and 0x5010 / 0x110 = 74.6, and **seven other
+complete instances lie between them**.
 
-Whether these are **two independent RNGs, or the addresses above were recorded wrongly, is NOT
-ESTABLISHED.** What would settle it: the writers at 0x00504d3e-0x00504d90 and
-0x0050f999-0x0050fc83 reference the *named* set, so finding the analogous producer for the
-0x006a3130 set decides which of the two readings is right. What **is** settled is which set the AI
-draws from — 0x006a3130. Those four addresses are deliberately left as `DAT_` in the database for
-this reason; do not name them until the producer is found.
+Per-instance layout (verified against all fourteen — every cursor array is already correct in the
+file image):
+
+```
++0x000  int state[2][31]  (0xf8)   slot i at base + i*0x7c
++0x0f8  int *end[2]  = {base+0x7c, base+0xf8}   one past each slot's table
++0x100  int *f[2]    = {base+0x0c, base+0x88}   = &state[i][3], the ACCUMULATOR cursor
++0x108  int *r[2]    = {base+0x00, base+0x7c}   = &state[i][0], the ADDEND cursor
+```
+
+Step: `*f += *r; result = *f >> 1; f++; r++; if (r >= end[i]) r = &state[i][0]; else if (f >= end[i])
+f = &state[i][0];` — `random()` TYPE_3 with the two wrap tests swapped in order, which is harmless
+because the cursors are 3 apart and advance together, so exactly one can reach `end` per call.
+
+**Per-thread selection is identical in all fourteen** and is still what keeps executor randomness
+independent of client randomness: `CALL GetCurrentThreadId` / `CMP EAX,[ExecutingThread =
+0x007b9d7c]` / `SETZ` gives `i` in {0,1}, slot 1 the executor and slot 0 anything else. **Neither
+address set "belongs to" a thread** — each carries a stream for both. That is a property of all
+fourteen, not a distinction between any two.
+
+**THERE IS NO PRODUCER — for any of them.** Every instance is fully statically initialized in the
+file image: the 31-dword seed table (duplicated for both thread slots) *and* all three cursor
+arrays already point into it at load time. There is nothing left to seed, which is why no seeding
+code exists. The four addresses this section used to nominate as the deciding measurement —
+0x00504d3e-0x00504d90 and 0x0050f999-0x0050fc83 — **are not producers**: they are the cursor advance
+inside the inlined `Next()` body, the same 11-reference expansion `AiThink_Bot` contains. A raw byte
+scan of `.text` for all 952 target addresses (every dword of every state table and cursor array,
+so undefined regions were searched too) found 268 base references, all 268 matching the
+`IMUL r,r,0x7c` + `ADD` wrap idiom, and **0 sites outside a defined function**.
+
+**The seed is a compile-time literal, not `initstate` output.** The 31 words begin
+`cd38f625 fd6391ec 8704647a 52dd5fc6` and end `54ef7f47 798f8829`; half exceed 2^31, so they are not
+the `16807*s mod (2^31-1)` sequence BSD's `initstate` would produce, and there is no copy of the
+table in `.rdata` for a re-seeder to copy from.
+
+**USER-VISIBLE CONSEQUENCE — worth knowing wherever determinism comes up: with no runtime
+re-seeding, every launch produces the identical stream per instance per thread slot.** Attract-mode
+demo, particle jitter, the 1-in-10 log sample. This is a question mark over the `0x87` lock-step
+turn model, though a desync there would come from divergent **call counts**, not from seeding.
+
+The fourteen, named `Rng<Module>_{State,End,FPtr,RPtr}` in the database — the module is the
+distinguishing axis, so a bare `RngStateTables` on one instance was actively misleading, reading as
+*the* RNG. (`RngPtrA` was the accumulator `f` and `RngPtrB` the addend `r`; those old names were
+correct as to mechanism, only the "producers" characterisation was wrong.)
+
+| State base | Refs | Name | Consumers |
+|---|---|---|---|
+| 0x006a3008 | 55 | `RngConsoleCmd_State` | `CommandHeap`, `CommandRespawnHeap`, `CommandPresident` |
+| 0x006a3130 | 198 | `RngAi_State` | `AiThink_Bot`/`Node`/`Swarm`/`Minebot`, `FUN_00457f80` — the AI set |
+| 0x006a3748 | 9 | `RngAttractDemo_State` | `StartAttractModeDemo` |
+| 0x006a61f8 | 385 | `RngUnit_State` | `Unit_Draw`, `Unit_DrawWithTeamState`, `Unit_UpdateMovement`, `EnterWorld`, `Update`, `FUN_004bfd70`, `FUN_004c9f30` |
+| 0x006a6588 | 11 | `RngToken_State` | `GetTokenValue` |
+| 0x006a69d0 | 33 | `RngUnk4de320_State` | `FUN_004de320` |
+| 0x006a6ae8 | 22 | `RngMpSpawn_State` | `SpawnMultiplayerPlayerCharacters` (cursors at 0x006a71e0) |
+| 0x006a7c20 | 54 | `RngMenuAnim_State` | `MenuListItem__InitAnimation` / `__RestartValueAnimation` (cursors at 0x006a7d54) |
+| 0x006a7f30 | 46 | `RngUpdateApply_State` | `ApplyUpdateMessage` |
+| 0x006a8140 | 31 | `RngServerTick_State` | `EvaluateTriggers`, `BroadcastToPlayers` — the set this section used to name |
+| 0x006a8360 | 283 | `RngWorldFx_State` | `DrawWorldEffects`, `FUN_00514300`/`00519190`/`0051b510`/`00525410`/`005258d0`/`00525cb0` |
+| 0x006a8578 | 191 | `RngPickup_State` | `SetPickupType`, `UseInventoryItem`, `Frag`, `ApplyDamage`, `ActivateInWorld`, `SetTeamId`, `Ctor`, `Update` |
+| 0x006ab328 | 100 | `RngParticle_State` | `ParticleEmitter_Update`, `ParticleSystem_Render`, `FUN_0057b940` |
+| 0x006ab640 | 20 | `RngSound_State` | `FUN_00589440`, `FUN_0058aa10` — the sound TU (cursors at 0x006ab758) |
+
+Each instance's `_End` / `_FPtr` / `_RPtr` sit at `base+0xf8` / `+0x100` / `+0x108`, except the three
+noted above where the linker placed the cursor arrays 0x6f8 / 0x134 / 0x118 bytes past the state
+table instead. **Those three are the proof that this is four separate statics and not one struct** —
+a struct's members cannot be separated like that — and at 0x006ab640 the bytes at `base+0xf8` are a
+`RIFF`/`WAVE`/`fmt ` header belonging to something else entirely.
+
+The AI set's reference count is **36 / 18 / 72 / 72**, not the 28 / 14 / 56 / 56 this section used to
+record — up by exactly four call sites' worth (each inline expansion emits 2 base + 1 end + 4 f + 4 r
+= 11 refs, and the delta is 4 x {2,1,4,4}), consistent with `AiThink_Bot`'s recovered handler bytes
+having been disassembled since. The named set is unchanged at 6 / 3 / 11 / 11.
+
+**Do not treat a bare seed-table match as an RNG**: 78 seed-table pairs exist in `.data` but only
+these 14 are complete generators. The same 124-byte literal is embedded in other structs, mostly
+next to `411cf5c3` = 9.81f.
 
 ## Process-level
 
@@ -684,8 +759,8 @@ project database.
 | 0x00505310 | StdCall<void> | RunQueuedScript (per frame, host only) |
 | 0x00579700 / 0x005797c0 | ThisCall<void, bool> | RWLock Lock / Unlock |
 | 0x007c07a0 / 0x007c07d0 | 0x30-byte struct | executor / main game clock |
-| 0x006a8140 | 2 x 0x7c | per-thread RNG state (`RngStateTables`; pointer arrays 0x006a8238 / 0x006a8240 / 0x006a8248) |
-| 0x006a3130 | 2 x 0x7c | a second set of the same shape, 0x5010 lower (arrays 0x006a3228 / 0x006a3230 / 0x006a3238) — the one every `AiThink_*` inlines. Left `DAT_`; whether it is a separate RNG is NOT ESTABLISHED, see above |
+| 0x006a8140 | 2 x 0x7c | `RngServerTick_State` — per-thread `random()` state (cursor arrays 0x006a8238 / 0x006a8240 / 0x006a8248). **One of fourteen per-TU instances**, not *the* RNG; see the RNG section above for the full table |
+| 0x006a3130 | 2 x 0x7c | `RngAi_State` — the instance every `AiThink_*` inlines (cursor arrays 0x006a3228 / 0x006a3230 / 0x006a3238). Once recorded here as a possible *second* RNG whose status was NOT ESTABLISHED; it is simply a different translation unit's copy |
 | 0x007c066c / 0x007c0670 | byte / CS | pool-allocator lock enable (never set) / CS |
 | 0x00587b60 / 0x00587a90 / 0x00587bf0 | | PlayMusicTrack / PlayMusicThread / StopMusicTrack |
 | 0x0046a6d0 | FastCall<int, HANDLE*> | CheckSingleInstance ("GunLok") |

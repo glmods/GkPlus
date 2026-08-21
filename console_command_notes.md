@@ -415,6 +415,17 @@ re-classify; do not hand-edit a row without re-running the check.
 | `CLEAR DIALOGS` | "I neither need nor give help" |
 | `CONFIRM DIALOG TEST` | "I neither need nor give help" |
 | `INFO DIALOG TEST` | "I neither need nor give help" |
+
+The three dialog-test rows share one help string (@ 0x0064f0c8) because the three registrations
+share it. Their handlers are `CommandInfoDialogTest` @ 0x0044c0a0, `CommandConfirmDialogTest`
+@ 0x0044c0f0 and `CommandClearDialogs` @ 0x0044c150, registered consecutively at 0x0043d6cd /
+0x0043d6e3 / … inside `SetupConsoleCommands` @ 0x0043c800. **`CommandInfoDialogTest` sat as raw,
+undisassembled DATA until 2026-08** — 79 bytes at a 16-byte-aligned address preceded by 13 bytes of
+`0xCC`, with its registration the only reference to it in the whole binary — which is why it was
+absent from every earlier handler count. It is `void __fastcall(void)`: a bare `RET`, no register
+read before write, and like its siblings it reads the console word buffer `g_ConsoleWordBuf`
+@ 0x006af5f8 rather than taking arguments. It gates on `GameState` being 5, 6, 7 or 0x12 and
+otherwise prints `GL_ERROR_MAIN_GAME_ONLY`, then tail-calls `OpenInGameInfoDialog` @ 0x0056a030.
 | `RESET TIME` | help text is literally "Alex - TEST" |
 | `TIMER INFO` | help text is literally "Alex - TEST" |
 
@@ -594,7 +605,7 @@ Measured by forward reachability to `BroadcastToPlayers` @ 0x00504bf0 or `SendTo
 | `actor.armor` | `Actor::SetArmorValue` @ 0x0054f360 | **no** |
 | `actor.shield` | `Actor::SetShieldValue` @ 0x0054f440 | **no** |
 | `actor.set_position()` | `Actor::SetPositionAndOrientation` @ 0x0052ded0 | **no** |
-| `actor.set_team()` | was `SetTeamId`, now `ChangeOwnerAndTeam` @ 0x00530470 | **yes**, since d11995b |
+| `actor.set_team()` | was `SetTeamId`, now `BeginTeamOverride` @ 0x00530470 (slot 80; was called `ChangeOwnerAndTeam`) | **yes**, since d11995b |
 | `actor.concealed` (was `actor.mine`) | `Actor::SetConcealed` @ 0x0054e890 | **no** |
 | `actor.goto()` | `MobileActor::Goto` @ 0x00539450 | **no** |
 | `turret.turret_enabled` | `TurretActor::SetTurretEnabled` @ 0x0054e8b0 | **no** |
@@ -609,7 +620,8 @@ Three of these deserve more than a row:
   changes a team brackets it with a removal from the old team's actor list and an insert into the
   new one, gated on `+0x3c` — so calling it bare also left the actor **on its old team's list**,
   which is a correctness bug before replication even enters into it.
-  `Actor::ChangeOwnerAndTeam` @ 0x00530470 does the list move and broadcasts update 0x58 (with the
+  `Actor::BeginTeamOverride` @ 0x00530470 (slot 80, formerly `ChangeOwnerAndTeam`) does the list
+  move and broadcasts update 0x58 (with the
   `+0x28`/`+0x2c` fields) followed by 0x50 (the team). The binding now calls it, passing the actor's
   current `+0x28`/`+0x2c` back in so it stays a team change.
 
@@ -702,7 +714,7 @@ plus slot 86 in eight.
 
 **Re-confirmed again after the slot 78 / slot 80 float retype.** Turning
 `SetTarget(int, int)` into `SetTarget(float, float)` and
-`ChangeOwnerAndTeam(int, int, int)` into `ChangeOwnerAndTeam(float, float, int)` changes no argument
+`BeginTeamOverride(int, int, int)` into `BeginTeamOverride(float, float, int)` changes no argument
 *bytes* — 0x8 and 0xc either way — so no `static_assert` moved and the sweep is **still clean at
 1,460/1,460**: 1,444 entries compared after the 16 exempt slot-0 rows, 249 distinct target
 functions, and all sixteen table bounds re-confirmed by the reference test (including

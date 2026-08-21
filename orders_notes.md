@@ -104,6 +104,40 @@ The order-layer half, with the DIK the binding is registered with and the functi
 | **Recon (cat 5)** |
 | `Toggle Recon Mode on/off` | 28 (0x1c) | ENTER | 0 | 0x004976d0 |
 
+**Category 0 (Camera) has no Handler column entry above, and now has an answer.** Its first ten
+bindings do not each get a function: they all route through one, `SetCameraAxisInput` @ 0x00484e20
+(`void __fastcall(CameraAxisId axis /*ECX*/, bool positive /*DL*/, bool pressed /*stack*/)`, which
+does `SHL ECX,5 / ADD ECX,0x7b3d18` and tail-calls `CameraAxis::SetInput` — its only caller). The
+ten arms in `HandleGameKeyAction` test `ESI` against the consecutive category-0 binding records
+0x007b7274 / 7c / 84 / 8c / 94 / 9c / a4 / ac / b4 / bc (stride 8, registration order) and pass
+`axis = {3,3,4,4,5,5,0,1,0,1}` with `positive = {0,1,0,1,0,1,0,0,1,1}`. Lining that up against
+`GLkeys.cfg`'s category-0 lines, which are in the same registration order:
+
+| GLkeys.cfg line (cat 0) | axis | `CameraAxisId` | `positive` | call site |
+|---|---|---|---|---|
+| `Decrease camera elevation` | 3 | `Elevation` | 0 | 0x004708a2 |
+| `Increase camera elevation` | 3 | `Elevation` | 1 | 0x004708b8 |
+| `Rotate camera clockwise` | 4 | `Rotation` | 0 | 0x004708ce |
+| `Rotate camera anti-clockwise` | 4 | `Rotation` | 1 | 0x004708e4 |
+| `Zoom in` | 5 | `Zoom` | 0 | 0x004708fa |
+| `Zoom out` | 5 | `Zoom` | 1 | 0x00470910 |
+| `Scroll left` | 0 | `ScrollX` | 0 | 0x00470923 |
+| `Scroll up` | 1 | `ScrollY` | 0 | 0x00470939 |
+| `Scroll right` | 0 | `ScrollX` | 1 | 0x0047094c |
+| `Scroll down` | 1 | `ScrollY` | 1 | 0x00470962 |
+
+The 11th binding, `Camera Lock`, never reaches this function.
+
+`CameraAxes` @ **0x007b3d18** is `CameraAxis[6]`, `0x20` bytes each — a velocity integrator with a
+linear acceleration ramp per axis, not a set of camera *positions*; see `address_map.md` under
+"Camera control axes" for the layout and the rest of the API. The table above **is** the
+confirmation of five of the six `CameraAxisId` values; the sixth, **axis 2, has no setter anywhere
+in the binary** — its one reference in the whole database is a `ConsumeDelta` at 0x00486edf inside
+`UpdateReconCamera`, so its output is always 0.0 and the arithmetic it feeds is inert. Whether that
+is a removed control or a defect is not established. The console command `CommandControls` has its
+own ten call sites into `SetCameraAxisInput`, and `UpdateMouseEdgeScroll` @ 0x004878f0 has four, on
+axes 0 and 1 only.
+
 The manual's Active Pause = Pause key and cancel-last = CTRL+`\` are **both wrong for the shipped
 binary**: they are SPACE and DELETE. The manual's "Formations"/"Engagement rules" wording is also
 not the engine's — the strings are the eight names above, all in one category.
@@ -171,36 +205,70 @@ Values 0..10, no gaps.
 | 2 | `GotoObject` | `MobileActor::QueueGotoObjectOrder` 0x00538b20, `RET 0x8` | MobileActor slot 70 → `GotoObject` 0x005394d0 |
 | 3 | `HoldMarker` | `MobileActor::PushHoldMarkerOrder` 0x00538a30, bare `RET` — **prepended** | none: the jump table maps kind 3 to the *exit* label, so it blocks the queue |
 | 4 | `CrouchToggle` | `MobileActor::QueueCrouchOrder` 0x00538be0, bare `RET` | MobileActor slot 70 → slot 83 `ToggleCrouchAndCamouflage` |
-| 5 | `Interact` | `MobileActor::QueueInteractOrder` 0x00538e80, `RET 0x8` | MobileActor slot 70 → `EquipItemInSlot(arg_c, arg_b, 1)` @ 0x00536ba0 |
+| 5 | `EquipItemInSlot` | `MobileActor::QueueToggleEquipOrder` 0x00538e80, `RET 0x8` | MobileActor slot 70 → `EquipItemInSlot(arg_c, arg_b, 1)` @ 0x00536ba0 |
 | 6 | `GiveItem` | `MobileActor::QueueGiveItemOrder` 0x00538f80, `RET 0xc` | MobileActor slot 70 → `GetActorById(arg_a)`, `this+0x40 = target` (refcounted), `+0x44 = arg_b`, `+0x124 = arg_d` |
-| 7 | `Equip` | `MobileActor::QueueEquipOrder` 0x00538ca0, `RET 0x4` | MobileActor slot 70 → `UseInventoryItem(arg_b, 1)` @ 0x005370d0 |
+| 7 | `UseItem` | `MobileActor::QueueUseItemOrder` 0x00538ca0, `RET 0x4` | MobileActor slot 70 → `UseInventoryItem(arg_b, 1)` @ 0x005370d0 |
 | 8 | `Drop` | `MobileActor::QueueDropOrder` 0x00538d40, `RET 0x4` | MobileActor slot 70 → `MobileActor::DropItem(arg_b)` @ 0x00538240 |
-| 9 | `UseItem` | `MobileActor::QueueUseItemOrder` 0x00538de0, `RET 0x4` | MobileActor slot 70 → walk `inventory_list` for `entry+0x24 == arg_b`, `MobileActor::UnequipSlot(entry)` @ 0x00536ec0, broadcast **0x80** |
+| 9 | `Unequip` | `MobileActor::QueueUnequipOrder` 0x00538de0, `RET 0x4` | MobileActor slot 70 → walk `inventory_list` for `entry+0x24 == arg_b`, `MobileActor::UnequipSlot(entry)` @ 0x00536ec0, broadcast **0x80** |
 | 10 | `SetAmmoType` | `CharacterActor::QueueOrderKind10` 0x00541980, `RET 0x4` | CharacterActor slot 70 → slot 99 `SetAmmoType(arg_b)` |
 
-Names for 5/6/7 are taken from the *immediate* console/wire twin that reaches the same callee
-(§8) — **and that provenance has now cost one name, so treat the other three as open.** Kind 6 was
-called `Board` on `directplay_protocol_notes.md`'s reading of command 0x17 ("board / attach
-(escort)"); the consumer is `GiveItemTo`, so it is **`GiveItem`**, and both it and its client twin
-`Unit_SendGiveItem` @ 0x004c0d50 have been renamed. (Breadcrumb: outside write-ups still say
-`Board` / `Unit_SendBoard` / `QueueBoardOrder`.)
+Names for 5/6/7 were originally taken from the *immediate* console/wire twin that reaches the same
+callee (§8), and that provenance cost **four** names in the end. Kind 6 was called `Board` on
+`directplay_protocol_notes.md`'s reading of command 0x17 ("board / attach (escort)"); the consumer
+is `GiveItemTo`, so it is **`GiveItem`**, and both it and its client twin `Unit_SendGiveItem`
+@ 0x004c0d50 have been renamed. (Breadcrumb: outside write-ups still say `Board` /
+`Unit_SendBoard` / `QueueBoardOrder`.)
 
-**Kinds 5, 7 and 9 may be misnamed on exactly the same provenance — recorded as an open doubt, not
-acted on.** Each name comes from the wire twin, and each arm's *callee* says something else:
+### Kinds 5, 7 and 9 were rotated, and are now corrected — MEASURED
 
-| kind | current name | what its arm actually calls |
-|---|---|---|
-| 5 | `Interact` | `EquipItemInSlot(arg_c, arg_b, 1)` @ 0x00536ba0 |
-| 7 | `Equip` | `UseInventoryItem(arg_b, 1)` @ 0x005370d0 |
-| 9 | `UseItem` | walk `inventory_list`, `UnequipSlot(entry)` @ 0x00536ec0, broadcast 0x80 |
+This section previously carried the rotation as an open doubt marked *UNMEASURED — do not rename on
+the strength of this table*. It has been measured, and the three names were indeed rotated by one
+relative to their callees. **The neighbours are not shifted**: kinds 2, 3, 4, 6 and 8 all check out,
+so the rotation was confined to 5/7/9.
 
-The three look **rotated by one** relative to their callees, which is suggestive and is *not*
-evidence. **UNMEASURED — do not rename on the strength of this table.** Settling it needs the
-0x13/0x14/0x19-family wire arms read against these three callees, which is what would say whether the
-wire names or the callees are the mislabelled side. Kind 8 is **`Drop`**: its consumer is
-`MobileActor::DropItem` @ 0x00538240 and its client producer is `Unit::Unit_SendDropItem`
-@ 0x004c0cf0, whose 12-byte payload is `{id, actor_id, item_id}` with the id chosen by
-`CMP byte [EBP+0xc],0` — 0x14 queued, 0x13 immediate.
+**The mechanism that settles it, and it generalises — two arms per action.** For kinds 5/7/8/9 the
+wire uses two command ids for one action: the **odd** id calls the callee **directly**, the **even**
+id enqueues a `PendingOrder`. So each immediate arm is a literal statement of what its queued twin
+means, with no naming chain in between — which is exactly what the old note said was needed, and it
+was available from the arms already in §8 rather than from the 0x13/0x14/0x19 family.
+
+| cmd | arm | what the immediate arm does | queued twin | => kind |
+|---|---|---|---|---|
+| `0x0f` | 0x0050a1d7 | `EquipItemInSlot(slot, item, 1)` @ 0x00536ba0 | `0x10` @ 0x0050a204 | **5 = equip into a body slot** |
+| `0x11` | 0x0050a2fb | `UseInventoryItem(item, 1)` @ 0x005370d0 | `0x12` @ 0x0050a325 | **7 = use item** |
+| `0x15` | 0x0050a39d | inventory walk + `UnequipSlot` @ 0x00536ec0 + broadcast 0x80 | `0x16` @ 0x0050a49a | **9 = unequip** |
+
+**Two independent client-side corroborations, neither using any existing name.**
+
+- `MobileActor::QueueToggleEquipOrder` @ 0x00538e80 (the kind-5 pusher, was `QueueInteractOrder`)
+  walks the pending queue at `this+0x1f0` counting **+1 per kind 5 and −1 per kind 9 for the same
+  item id** (0x00538ec6-0x00538ee5), and when the balance is exactly 1 it tail-calls the kind-9
+  pusher @ 0x00538de0 instead of pushing kind 5. So 5 and 9 are an **equip/unequip toggle pair on
+  one item** — which is only coherent if 5 is equip and 9 is unequip.
+- `Unit_ToggleEquipItem` @ 0x004ad1c0 is the same toggle against *current state* rather than against
+  the queue: it searches the local player's equipped list for the item, and sends **unequip** (slot
+  104) if found or **equip into the first free body slot** if not.
+
+The corrected enum, in full — and this is now applied to the Ghidra database, which had also never
+received this file's earlier kind-6 and kind-8 corrections:
+
+```
+0 Order_AttackTarget   4 Order_CrouchToggle     8 Order_Drop
+1 Order_AttackPosition 5 Order_EquipItemInSlot  9 Order_Unequip
+2 Order_GotoObject     6 Order_GiveItem        10 Order_SetAmmoType
+3 Order_HoldMarker     7 Order_UseItem
+```
+
+Breadcrumb, since outside write-ups will still use the old names: kind 5 was `Interact`
+(`QueueInteractOrder` / `Unit_SendInteract`), kind 7 was `Equip` (`QueueEquipOrder` /
+`Unit_SendEquip`), kind 9 was `UseItem` (`QueueUseItemOrder` / `Unit_SendUseItem`) — and note that
+`QueueUseItemOrder` and `Unit_SendUseItem` **still exist as names, at different addresses**, so an
+old reference to either is not merely stale but points at the wrong function.
+
+Kind 8 is **`Drop`** and survives unchanged: its consumer is `MobileActor::DropItem` @ 0x00538240
+and its client producer is `Unit::Unit_SendDropItem` @ 0x004c0cf0, whose 12-byte payload is
+`{id, actor_id, item_id}` with the id chosen by `CMP byte [EBP+0xc],0` — 0x14 queued, 0x13
+immediate.
 
 ### 3.1 Correction to `src/Actors.h`
 
@@ -256,14 +324,14 @@ queue":
 
 | kind | arm | payoff | dequeued? |
 |---|---|---|---|
-| 2 | 0x00535125 | slot 63 test; false → `GotoObject`, `+0x44 = arg_a`; true → slot 83 | conditional |
-| 3 | 0x0053533c | **none** — the default / bound-fail target, sitting *after* `PopFrontOrder` | **no** |
-| 4 | 0x00535172 | slot 83 on `this` | yes |
-| 5 | 0x00535181 | `EquipItemInSlot(arg_c, arg_b, 1)` | yes |
-| 6 | 0x00535195 | `GetActorById(arg_a)`, `GotoObject`, then `held_actor` / `pending_action_id` / `pending_action_amount` | yes |
-| 7 | 0x00535329 | `UseInventoryItem(arg_b, 1)` | yes |
-| 8 | 0x00535204 | `DropItem(arg_b)` | yes |
-| 9 | 0x00535213 | slot 34 walk, `UnequipSlot(entry)`, broadcast **0x80** | yes |
+| 2 `GotoObject` | 0x00535125 | slot 63 test; false → `GotoObject`, `+0x44 = arg_a`; true → slot 83 | conditional |
+| 3 `HoldMarker` | 0x0053533c | **none** — the default / bound-fail target, sitting *after* `PopFrontOrder` | **no** |
+| 4 `CrouchToggle` | 0x00535172 | slot 83 on `this` | yes |
+| 5 `EquipItemInSlot` | 0x00535181 | `EquipItemInSlot(arg_c, arg_b, 1)` — `arg_c` is the body slot, `arg_b` the item | yes |
+| 6 `GiveItem` | 0x00535195 | `GetActorById(arg_a)`, `GotoObject`, then `goto_actor` / `pending_action_id` / `pending_action_amount` | yes |
+| 7 `UseItem` | 0x00535329 | `UseInventoryItem(arg_b, 1)` | yes |
+| 8 `Drop` | 0x00535204 | `DropItem(arg_b)` | yes |
+| 9 `Unequip` | 0x00535213 | slot 34 walk, `UnequipSlot(entry)`, broadcast **0x80** from 0x00535313 | yes |
 
 One thing this settles about kind 6: **`QueueGiveItemOrder` @ 0x00538f80 writes no field of `this`
 at all** — it only allocates the record and appends it. So the `+0x40`/`+0x44`/`+0x124` writes in
@@ -440,8 +508,9 @@ different classes** — the earlier reading, "table base 0x00664ac8", filed both
 descendant, which is the shallowest-owner error CLAUDE.md warns about. Measured ownership
 (`rendering_notes.md` §5.1):
 
-* slots **100-104** (`Unit_SendInteract`, `Unit_SendEquip`, `Unit_SendDropItem`, `Unit_SendGiveItem`,
-  `Unit_SendUseItem`) are **added by `MobileUnit`, table base 0x0066491c** — not by
+* slots **100-104** (`Unit_SendEquipItemInSlot`, `Unit_SendUseItem`, `Unit_SendDropItem`,
+  `Unit_SendGiveItem`, `Unit_SendUnequipItem` — the first, second and fifth renamed by the kind
+  5/7/9 rotation in §3) are **added by `MobileUnit`, table base 0x0066491c** — not by
   `CharacterUnit`. `MobileUnit` also adds 92 `Unit_IsCrouched` and 93
   `Unit_SetCrouchedAndConcealed`, and overrides 33 `Unit_SetTeamWithInventory`,
   55 `Unit_Dissociate`, 57 `Unit_UpdateMovement`, 73 `Unit_SendStop`,
@@ -476,11 +545,11 @@ descendant, which is the shallowest-owner error CLAUDE.md warns about. Measured 
 | — | `0x08`, `0x21` | 2 `GotoObject` | (map-section move; `0x21` is the multi-actor batch) | `QueueGotoObjectOrder` @0x00509463/0x00509492/0x00509906 |
 | — | `0x26` push / `0x25` pop | 3 `HoldMarker` | `ActivateUnitAndResume` 0x0046ef50 | `PushHoldMarkerOrder` @0x0050a10c / `ReleaseHoldMarkerOrder` @0x0050a0b0 |
 | `0x1c` | `0x22` | 4 `CrouchToggle` | `Unit_SendCrouchToggle` 0x004c09d0 (slot 0x134) | `QueueCrouchOrder` @0x00509dc9 |
-| `0x0f` | `0x10` | 5 `Interact` | `Unit_SendInteract` 0x004c0bc0 (slot 0x190) | `QueueInteractOrder` @0x0050a21c |
+| `0x0f` | `0x10` | 5 `EquipItemInSlot` | `Unit_SendEquipItemInSlot` 0x004c0bc0 (slot 0x190) | `QueueToggleEquipOrder` @0x0050a21c |
 | `0x17` | `0x18` | 6 `GiveItem` | `Unit_SendGiveItem` 0x004c0d50 (slot 0x19c) | `QueueGiveItemOrder` @0x0050a2e8 |
-| `0x11` | `0x12` | 7 `Equip` | `Unit_SendEquip` 0x004c0c90 (slot 0x194) | `QueueEquipOrder` @0x0050a33a |
+| `0x11` | `0x12` | 7 `UseItem` | `Unit_SendUseItem` 0x004c0c90 (slot 0x194) | `QueueUseItemOrder` @0x0050a33a |
 | `0x13` | `0x14` | 8 `Drop` | `Unit::Unit_SendDropItem` 0x004c0cf0 (slot 0x198) | `QueueDropOrder` @0x0050a38a |
-| `0x15` | `0x16` | 9 `UseItem` | `Unit_SendUseItem` 0x004c0dc0 (slot 0x1a0) | `QueueUseItemOrder` @0x0050a4af |
+| `0x15` | `0x16` | 9 `Unequip` | `Unit_SendUnequipItem` 0x004c0dc0 (slot 0x1a0) | `QueueUnequipOrder` @0x0050a4af |
 | `0x19` | `0x1a` | 10 `SetAmmoType` | `Unit_SendSetAmmoType` 0x004c0c30 (slot 0x14c) | vslot 85 `QueueOrderKind10` @0x0050a52c |
 | — | `0x1b` | — | `Unit_SendStandingOrder` 0x004bdd60 | `SetStandingOrder` @0x0050a4c2 |
 | — | `0x23` | — | `Unit_SendCancelLastOrder` 0x004be6f0 | `CancelLastOrder` @0x0050a015 |
@@ -488,7 +557,16 @@ descendant, which is the shallowest-owner error CLAUDE.md warns about. Measured 
 
 Server→client updates the order layer emits: **0x86** (a record was popped, from `PopFrontOrder`),
 **0x66** (a `HoldMarker` was released), **0x65** (team-wide activate, tail of case 0x26),
-**0x80** (a `UseItem` order consumed an inventory entry).
+**0x80** (the equipped slot holding an item has been **unequipped**).
+
+`0x80` is `{u32 0x80, u32 actor_id, u32 item_id}`, 12 bytes, reliable, and it had been described
+here as "a `UseItem` order consumed an inventory entry" — a casualty of the kind 5/7/9 rotation in
+§3, since the pusher that emits it was called `QueueUseItemOrder` at the time and is now
+`QueueUnequipOrder`. There are **exactly two senders binary-wide**, both on the unequip path:
+0x0050a478 in the cmd-`0x15` immediate arm, and 0x00535313 in `MobileActor::Update`'s kind-9 arm.
+The client applies it by walking the equipped list and calling `Unit_UnequipSlot` @ 0x004bd370 —
+the exact structural mirror of the cmd-`0x15` arm. `directplay_protocol_notes.md` §7 is corrected
+to match.
 
 ### 8.1 Corrections to `directplay_protocol_notes.md` §6
 
@@ -614,6 +692,52 @@ keeping: **`CursorMode` 6 (`Suspended`) is never filled in any matrix of any reg
 configuration-dependent cells in the whole table are one drag pair keyed on `RightMouseScrollMode`
 @ 0x007b9cbc (a GLkeys.cfg / Options setting) at 0x0049c348-0x0049c359.
 
+The first of those two is not an omission — it **is** how "suspended" works. With no cell filled on
+any button in any matrix, every click, drag and press is inert while `CursorMode == 6`, which is
+exactly the behaviour the name claims. It needs no further investigation.
+
+**Six of the 22 registrations are one mode's complete handler set, and they are the recon view's
+zoom control.** Registered at 0x0049c44e-0x0049c4c1, all six with mask `0x1fa0` (`& 0x7f` = 0x20 →
+row `CursorMode` 5; `>> 7` = 0x3f → all six columns):
+
+| matrix | LMB (`LeftButtonInterface` 0x007b41f8) | RMB (0x007b4498) |
+|---|---|---|
+| button-down `+0x190` | `OnReconViewLeftButtonDown` 0x004a45d0 | `OnReconViewRightButtonDown` 0x004a4510 |
+| drag `+0xe8` | `OnReconViewLeftDrag` 0x004a4620 | `OnReconViewRightDrag` 0x004a4590 |
+| click `+0x40` | `OnReconViewLeftClick` 0x004a4660 | `OnReconViewRightClick` 0x004a4560 |
+
+Three of those six (0x004a4510, 0x004a4560, 0x004a45d0) were **undefined bytes** in the database
+until 2026-08, and 0x004a4660 was `AdvanceGunlokSuperAbility`. What the set does: a button-down sets
+`ReconZoomRate` @ 0x006a5ae4 — **0.92593 = 1/1.08 for LMB (zoom in), 1.08 for RMB (zoom out)** — and
+starts the looping `"Zooming"` sound; the drag handlers and both click handlers put the rate back to
+`1.0f` and stop it. `UpdateSelectedUnitCamera` then does `ReconZoomFactor *= ReconZoomRate` once a
+frame at 0x00497dca-0x00497e03 and drives the camera FOV pair 0x007b4e34/0x007b4e38 from the result,
+which is why a rate below 1.0 means zoom *in*. All six open with `CMP ReconTargetState, 4 / JZ`, so
+manual zoom is locked out while the auto-scan zoom is running.
+
+**The zoom direction is confirmed by the game's own words, not inferred from the constants.**
+`glreseng.dll`'s training-level text: *"You are now in Recon mode. In Recon mode, you are not able to
+move, but you can observe enemies and get data on their type and firepower. You can look around using
+the mouse. **You can zoom in using the left mouse button. The right mouse button will zoom back
+out.**"* Likewise the state machine's three double-click transitions: *"You need to destroy this enemy
+by double-clicking three times — once to scan, once to lock, and once to fire"*, matching string ids
+**1116 / 1117 / 1118**, which are verbatim `"Double click to scan with EPW"` / `"…to lock EPW"` /
+`"…to fire EPW"`. (Those three ids are **HUD prompt strings, not menu preferences** — there are no
+`GL_MENU_RECON_DOUBLE_CLICK_*` identifiers — and 0x45c/0x45d/0x45e are referenced **nowhere** in
+`.text`, so the binary never fetches them.)
+
+That a **complete** press/drag/release set per button is exactly what a held-button zoom needs is
+what turned the §10.1 anomaly into evidence rather than a puzzle. `OnReconViewLeftClick` is the odd
+one out only in doing more: after the same rate reset it runs the whole target / scan / lock / fire
+state machine on `ReconTargetState` @ 0x007b3f7c and, on the fire transition, assembles the 16-byte
+command `0x27` payload `{u32 0x27, u32 *(shooter+0x0c), f32 GameTimeClock seconds,
+u32 *(target+0x0c)}` at 0x004a47be-0x004a47eb and sends it. (An earlier note claimed that payload was
+*not* assembled in that body; it is, and `directplay_protocol_notes.md`'s attribution of command
+0x27 to that function is correct.)
+
+**The `ctx->+0x08 & 0x1000` modifier those handlers test is a game-synthesized double-click**, not
+an `MK_*` value — see `input_notes.md`.
+
 **Flare mode is the worked example, end to end.** Entry is *not* a matrix cell — it is the
 `GL_CONTROLS_FIREFLARE` key binding (default DIK_F) calling `EnterFlareMode` @ 0x004a17e0, which
 arms each selected unit (`Unit+0x284 = 1`, prior loadout saved to `+0x27c`/`+0x280` with `0x21` as the
@@ -719,6 +843,26 @@ exactly like `actors`:
 `List<Object*>` of every game object, and the scan is a plain forward/backward walk with the
 sentinel skipped, filtered by vslot 71. There is no separate "player character" array.
 
+### 10.0 The selection is **untyped**, and the filter is elsewhere
+
+Read the local entry points above and it looks as though the selected set is character-only:
+`SelectAllCharacters` and the next/previous walk both filter on vslot 71, and
+`ApplyStandingOrderToSelection` skips anything whose `IsMobile` is false. **That is a property of
+those callers, not of the set.** `AddToSelection` @ 0x0049ed30 is a bare hash insert with no type
+test of any kind, and it has a **remote** caller: `ApplyUpdateMessage`'s update **0xc3** arm
+@ 0x00500ade resolves an arbitrary wire-supplied unit id through `GetUnitById` @ 0x0044e070 — which
+does no class check either — and inserts the result. So any `Unit` subclass can be in
+`SelectedUnits`, and code that reads the set must not assume otherwise.
+
+**The real filter is at order-issue time, and it is not the RTTI ladder.**
+`IssueGroundTargetOrderToSelection` @ 0x0049f010 gates each entry on **`Unit` slot 11**, which is
+`XOR EAX,EAX; RET` in every class except the five `CharacterUnit`-family ones, where it is
+`MOV EAX,[ECX+0x290]; RET`. That is a *controllable* flag — "can this unit be given orders right
+now" — not an `IsCharacter` predicate, so it is neither a type test nor a constant. Statements
+elsewhere in this file that read as though the selection were character-only should be understood
+as describing the *local* paths that populate it. See `game_defects_notes.md` for what the missing
+type test is worth to a peer.
+
 Every selection mutator opens with `CMP byte ptr [0x007b3f51],0` → `ExitFlareMode(CL=0)` @ 0x004a17b0, which is
 presumably "close the open command wheel"; that was not confirmed. One step of that guess can now
 be sharpened without being closed: the command-wheel mode **is** `CursorMode == 1`, set by
@@ -749,11 +893,12 @@ order kinds.
 | 2 | `GroundTarget` | `BeginAttackGroundTargeting`, `EnterFlareMode`, `OnCommandWheelClick` | "attack ground" | CONFIRMED by its body |
 | 3 | `InventoryScreen` | `FUN_0049f350` @ 0x0049f48c | "drop" / "pass" | PROPOSED-strong |
 | 4 | `PauseMenu` | `ToggleInGamePauseMenu` @ 0x004a0e50 | "standard" (inert) | PROPOSED — empty body |
-| 5 | `UnitFollow` | `ToggleReconMode` @ 0x004977bd | "standard" (inert) | PROPOSED — empty body |
+| 5 | `ReconView` | `ToggleReconMode` @ 0x004977bd | "standard" (inert) | **CONFIRMED** — two-step, see below |
 | 6 | `Suspended` | `SuspendCursorMode` @ 0x004a0d70 (console `CommandCursor`, `CutsceneCamera_Enter`) | none — dispatches to the epilogue | CONFIRMED by its body |
 
-The confidence column is load-bearing: modes 1, 4 and 5 have **empty** case bodies, so their names
-come from their setters' names, one inference step beyond the rest.
+The confidence column is load-bearing: modes 1 and 4 have **empty** case bodies, so their names
+come from their setters' names, one inference step beyond the rest. Mode 5's body is empty too, but
+its name no longer rests on the setter (below).
 
 `CommitPendingOrderTarget` in the row above is now **`OnCommandWheelClick`** @ 0x004a4250: it is the
 LMB click handler registered for row `CursorMode::CommandWheel`, all six columns, and cases 0, 1 and
@@ -761,10 +906,30 @@ LMB click handler registered for row `CursorMode::CommandWheel`, all six columns
 former open question — whether cases 0-3 were dead — is settled: `PendingCommandWheelAction`
 @ 0x007b4448 has six writers, five of them the command-wheel entry classes' vtable slots.)
 
-**Mode 5's name `UnitFollow` is now itself suspect.** It is the only mode owning a *complete*
-LMB+RMB x {button-down, click, drag} handler set in the matrices of §8.5, which reads much more like
-a dedicated ability-aiming mode than a follow toggle. Not renamed — the evidence is structural, not a
-measured engine word.
+**Mode 5 is `ReconView`, and it was `UnitFollow` until 2026-08.** The name is now CONFIRMED despite
+the empty case body, by a two-step argument that never touches the dispatch:
+
+1. `SetCursorMode(5)` is reached from **exactly one call site**, 0x004977c2 — the only one of the
+   setter's 26 sites that loads a literal `ECX = 5` — and it sits on the `ToggleReconMode` branch
+   that has just stored `[ReconModeActive 0x007b9ca1] = 0` at 0x00497798.
+2. `DrawOrderMenu` calls `DrawTargetInfoPanel` @ 0x004a86c0 — which fetches **39 `GL_RECON_*`
+   resource ids**, more than any other function in the binary — only when that same byte is 0
+   (`CMP byte ptr [0x007b9ca1],0` @ 0x004987a2 / `JNZ`, call @ 0x004987b0).
+
+So the cursor mode set alongside that byte state is the mode whose HUD is the recon panel. Note both
+steps are phrased in terms of the byte's *value*, not of what its name claims — the polarity of
+`ReconModeActive` is an open question (`ai_behaviour_notes.md` §11) and nothing here depends on it.
+
+Corroborating, and this is what raised the question in the first place: mode 5 is the only mode
+owning a *complete* LMB+RMB x {button-down, click, drag} handler set in the matrices of §8.5. That
+anomaly is now **explained rather than open** — the six handlers are the recon view's held-button
+zoom control, and a held-button zoom needs exactly a press/drag/release triple per button. See §8.5.
+
+**Mode 6's mechanism, while we are here.** No registration anywhere sets mask bit 6, so with no
+handler in any of the three matrices of any of the three per-button registries, every click, drag
+and press is inert while suspended. `SuspendCursorMode` @ 0x004a0d70 saves `CursorMode` into
+`SavedCursorMode` and sets 6; `RestoreCursorMode` @ 0x004a0da0 puts it back. **The absence is the
+mechanism, not a gap** — it needs no further investigation.
 
 The addresses in the "set by" column are as recovered and are **not uniformly function entries** —
 0x004a11bd and 0x004977bd sit inside `OpenCommandWheel` and `ToggleReconMode`, whose entries §11
@@ -781,16 +946,29 @@ measured part.
   `IDC_NO` vs `IDC_CROSS` for the attack cursor).
 - **Case 0 is the interesting one.** With an empty selection it uses `ActorUnderCursor`
   (0x007b68e8) -> "unselected"; otherwise a hostility test via `TeamSlots` (0x007b3ec4, stride
-  0xc4, bytes +0x6a/+0x6b selected on `GameMode == 1`) plus `IsFriendlyFireEnabled`, and a
+  0xc4, bytes +0x6a `player_controlled` / +0x6b `not_enemy_source` selected on `GameMode == 1`) plus `IsFriendlyFireEnabled`, and a
   `FogOfWar_SampleTotal` visibility test, yielding "activate", "pick up", or "attack" with variant
   1 (in range) or 0 (out of range) after comparing `|target − unit|²` against a per-unit threshold.
 - What it is **not**: mode 6's body is the bare epilogue, which is what makes "suspended" mean *the
-  cursor is left exactly as it was*. And the guard at the top of the function
-  (`CMP byte [0x006a5b34],0` / `JZ`) **is never taken** — 0x006a5b34's image value is 1 and its only
-  writer also writes 1. That global is deliberately left unnamed: six other references take its
-  **address**, and its neighbours are the constant 2 and pointers to
-  `"gunlok"`/`"elint"`/`"frend"`/`"maskelyn"`, so it is probably the head of a record rather than a
-  flag. **PROPOSED.**
+  cursor is left exactly as it was*.
+- **The guard at the top of the function IS reachable** — this entry previously said it was never
+  taken, and that was wrong. `CMP byte [0x006a5b34],0 / JZ` reads
+  **`Cursor3DAnimIdle`**, a `bool`: 1 = no one-shot cursor animation playing, 0 = one is. The guard
+  means *leave the cursor alone while its click animation runs*. Its writers are the six references
+  that take its **address** and pass it in EDX to `PlayCursorAnimation` @ 0x00588920 (was
+  `FUN_00588920`, `void __fastcall(int anim_id, bool *out_idle)`, bare `RET`, so the register pair is
+  the whole signature): that function zeroes the byte while a looping sequence plays and mirrors the
+  one-shot completion byte into it, and `SubmitCursorAndFinishCursorAnim` @ 0x00588ad0 sets it back
+  to 1 through the retained pointer `Cursor3DIdleFlagOut` @ 0x007f5e98. A value-only sweep could not
+  see any of that, which is how the image value of 1 came to be read as "born set, never cleared".
+- **`0x006a5b30`–`0x006a5b4c` is not a record.** Three unrelated adjacent globals, so the "head of a
+  record" reading above is retracted too. `0x006a5b30` is `MouseLookVerticalStep`, an `int` that is
+  only ever ±2 (`SETZ AL` on the Invert Mouse setting then `LEA EAX,[EAX*4-2]` @ 0x0049e3e7, so **+2
+  when the setting is 0** and −2 otherwise), and both readers `IMUL` it into the **vertical** delta
+  only. `0x006a5b38` is `PlayerCharacterNames`, `char *[5]` — **five** entries,
+  `{"gunlok", "elint", "hark", "frend", "maskelyn"}`; `"hark"` @ 0x00652740 was undefined data, which
+  is why earlier readings listed four. The bound is `CMP EBX,0x14 / JC` @ 0x004a1d68 in
+  `FUN_004a1c60`. `0x006a5b4c` is a lone `2500.0f` with one reader, past the array's end.
 
 **No box/marquee select was found.** `ToggleReconMode` @ 0x004976d0 (the Recon Mode toggle
 of line 103, and the master gate on the cone renderer; see `ai_behaviour_notes.md` §7) and
@@ -807,9 +985,11 @@ proven absent.
 - **The formation geometry.** `TeamSlot+0xb0` has four writers and no reader was located. Neither
   the per-member offsets for Cluster / Side-by-side / Single file nor the anchor rule was found.
 - ~~**Kind 6's exact meaning.**~~ **SETTLED: kind 6 is `GiveItem`**, and the three fields are named.
-  `Actor+0x40` is `held_actor` (a general retained reference to another actor — "the actor I am moving
-  toward or holding", *not* the pending-give recipient, and its savegame encoding `target->id + 1`
-  is what settles the kind); `Actor+0x44` is `pending_action_id`, an id whose **namespace depends on
+  `Actor+0x40` is `goto_actor` (**the actor this one is walking to** — every value-writer stores the
+  argument of a `MobileActor::GotoObject` call made 8-20 bytes earlier, and the start-a-walk gate
+  `CMP [EDI+0x40],0 / JNZ skip` @ 0x00534f8a is what settles it; it was `held_actor` here and
+  `attachment` before that, and it is *not* the pending-give recipient — its savegame encoding
+  `target->id + 1` is what settles that it is durable); `Actor+0x44` is `pending_action_id`, an id whose **namespace depends on
   the pending action** — an actor id for the kind-2 goto arm and the goto-object command, an item id
   for the kind-6 give arm; and `+0x124` is `pending_action_amount`, whose every measured use is the
   give amount. The latter two names are PROPOSED (the *overloading* on `+0x44` is confirmed); see

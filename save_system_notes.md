@@ -154,7 +154,7 @@ Two independent actor lists are stored, matching the game's two-thread design (s
 (`UnitsTable`, whose objects are `Unit`s built by `0x004b4620`, not `Actor`s).
 
 ```
-u32  num_actors            // the global next-actor-id counter
+u32  NextActorId           // the global next-actor-id counter (0x007b9ffc; was named num_actors)
 u32  serverActorCount
 serverActorCount x {
     u32  size              // actor->vtbl->GetSize()
@@ -226,8 +226,8 @@ The save format copes in three ways:
    length-prefixed text with `-1` for NULL. The loader turns them back into pointers via
    `GetRoleById` / `GetActorById` against the freshly loaded level.
 
-   **`Actor+0x40` (`held_actor`) is the worked example, and its encoding is what settled what that
-   field is.** The writer is nine instructions:
+   **`Actor+0x40` (`goto_actor`, formerly `held_actor`) is the worked example, and its encoding is
+   what settled what that field is.** The writer is nine instructions:
 
    ```
    00531d3c  MOV  EAX,[EBX+0x40]
@@ -239,12 +239,16 @@ The save format copes in three ways:
    00531d5b  CALL EDI               ; WriteFile, 4 bytes
    ```
 
-   `ReadActorFixups` reads it straight back into `&actor->held_actor` @ 0x00530ad7, and
+   `ReadActorFixups` reads it straight back into `&actor->goto_actor` @ 0x00530ad7, and
    `Actor_FixupAfterLoad` decodes it: `LEA EDI,[EAX-1]` @ 0x00531803, hash through the actors table
    (buckets 0x007ba0e8, mask 0x007ba0e4), compare `entry->+0xc == id`, then store the found pointer
    **with a retain** @ 0x0053183a-41. A field with a savegame encoding and a rehydration pass of its
    own is not transient per-order state, which is why `Actor+0x40` is a general retained actor
-   reference (`held_actor`) rather than the pending-give recipient it used to be named for.
+   reference rather than the pending-give recipient it used to be named for. It is now
+   **`goto_actor`**: every value-writer stores the argument of a `MobileActor::GotoObject` call made
+   a few instructions earlier, and the start-a-walk gate `CMP [EDI+0x40],0 / JNZ` @ 0x00534f8a reads
+   as "only start if I am not already walking to something". (Prior names: `held_actor`, and before
+   that a pending-give recipient.)
 
    `Actor+0x44` (`pending_action_id`) is by contrast a **plain persisted int** - copied as part of
    the blob @ 0x00530a67 and never touched by `Actor_FixupAfterLoad`, which is exactly consistent

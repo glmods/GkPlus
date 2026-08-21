@@ -12,6 +12,7 @@ container types but nothing else:
 | Activation | `OnMenuItemClicked` @ `0x004ecf10` | `InGameMenu__OnItemActivated` @ `0x00563c30` — **nothing in the retail binary dispatches it**, `game_defects_notes.md` §17 |
 | Lifetime | built once at startup, persists | built on open, freed by `CloseInGameMenu` |
 | Rendering | front-end renderer | HUD renderer inside `HudItem_DrawByKind` |
+| Input | keyboard **and** mouse — `MenuScreenInputHandler` @ `0x00470c70` | **mouse only** — ESC toggles, hover selects, see "Input model" below |
 
 `InGameMenus` ends at `0x007b76ac`, i.e. immediately before `Menus`; the two arrays are
 adjacent but unrelated. GkPlus historically only knew about `Menus`.
@@ -183,15 +184,26 @@ with `1`.
 Menu labels never hold literal text; they hold `GL_RESOURCE_ID` values resolved through
 `GetResourceString` @ `0x00579000` (`__fastcall`, ECX = `&LocalizedStrings`, EDX = id).
 
-- `LocalizedStrings` @ `0x00725664` is a single `ResourceEntry*`.
-- `ResourceEntry` is 0x14 bytes: `{ GL_RESOURCE_ID id; char *text; int unused1; int unused2; int isLast; }`.
+- `LocalizedStrings` @ `0x00725664` is a single `ResourceStringEntry*`, and **`GetResourceString`
+  is handed the address of that slot, not the array** — one level of indirection. All 854 call
+  references reach it with `MOV ECX,0x725664` and none dereferences first. The contrast that shows
+  it is deliberate: `FreeResourceStringTable` takes the **array base**, via
+  `MOV ECX,[0x00725664]` @ `0x0046aa72`. (The DB type was called `ResourceEntry` here until the
+  parameter was typed; it is `ResourceStringEntry` on all surfaces now.)
+- `ResourceStringEntry` is 0x14 bytes:
+  `{ GL_RESOURCE_ID id; char *text; int unused1; int unused2; int is_last; }`.
 - `LoadResourceStringTable` @ `0x00578f30` is called once from `WinMain` @ `0x0046b355` with
   `firstId = GL_START (0)`, `lastId = GL_END (0x7532)` — 30003 records, 600060 bytes. Every
   string is `LoadStringA`'d out of a satellite DLL into a heap copy, then the DLL is
-  `FreeLibrary`'d immediately.
-- Lookup is a **linear scan** comparing `+0x00` to the id, with **no bounds check**. Because
-  the table covers the whole contiguous id space, record index == id in practice.
-- Missing strings have `text == NULL` and resolve to `EmptyResourceString` @ `0x007c14b4` (`""`).
+  `FreeLibrary`'d immediately. It sets `is_last` with `SETZ` on `(id == lastId)`, so the array
+  *does* carry a terminator, and returns the count of ids that resolved (which its one caller
+  ignores).
+- Lookup is a **linear scan** comparing `+0x00` to the id, with **no bounds check and no test of
+  `is_last`** — the sentinel is written by the loader, honoured by the deallocator, and skipped by
+  the one function that searches. Because the table covers the whole contiguous id space, record
+  index == id in practice, which is why this is survivable. `game_defects_notes.md` §3.
+- Missing strings have `text == NULL` and resolve to `EmptyResourceString` @ `0x007c14b4` (`""`),
+  which sits immediately before the 0x400-byte `LoadStringA` scratch buffer at `0x007c14b8`.
 - Freed by `FreeResourceStringTable` @ `0x00579020` from `MainWindowWndProc`'s `WM_DESTROY`.
 
 `LoadResLibrary` @ `0x00578f10` picks the DLL from `GetUserDefaultLangID()`:
@@ -352,7 +364,7 @@ with all those `*DAT_007b74c8 = 0x2ee1;` stores):
 
 | Menu | Label | Value global | Labels array |
 |------|-------|--------------|--------------|
-| 6 Mouse | Invert Mouse | `InvertMouse` `0x007b9cb0` | — |
+| 6 Mouse | Invert Mouse (id **1111**, bound at 0x004ea0f7) | `InvertMouse` `0x007b9cb0` | — |
 | 6 Mouse | Right Mouse Scroll | `RightMouseScrollMode` `0x007b9cbc` | `0x007b76ac` (2) |
 | 6 Mouse | Dragbox Edge Scroll | `DragboxEdgeScroll` `0x007b9cb8` | — |
 | 6 Mouse | Scroll Speed | `ScrollSpeed` `0x007b9cc0` | `0x007b7d04` (3) |
@@ -382,6 +394,29 @@ menu displays `9 - value`, so "bandwidth use" counts down where volume counts up
 
 Menu 19's particle-rate item passes the **hardcoded English literal `"Particle Rate"`**
 instead of a `GL_RESOURCE_ID` — the only unlocalized menu label in the game.
+
+**`Invert Mouse` reaches the vertical axis and nothing else**, which is worth knowing before
+believing the label. `InvertMouse` @ 0x007b9cb0 has exactly one gameplay consumer:
+`MouseLookVerticalStep` @ 0x006a5b30, an `int` derived from it once as `+2` when the setting is 0 and
+`−2` otherwise (`SETZ AL` then `LEA EAX,[EAX*4-2]` @ 0x0049e3e7), and both readers `IMUL` it into the
+**vertical** delta only. There is no horizontal invert. See `input_notes.md`.
+
+**Three shipped strings adjacent to it are not menu items at all**, and are worth recording because
+their ids look like preference ids and are not:
+
+| id | string | status |
+|---|---|---|
+| 1116 | `"Double click to scan with EPW"` | **no reference anywhere in `.text`** |
+| 1117 | `"Double click to lock EPW"` | **no reference anywhere in `.text`** |
+| 1118 | `"Double click to fire EPW"` | **no reference anywhere in `.text`** |
+
+They sit in the same string-table block as `Invert Mouse` (1111) and `Server Type: ` (1115), and a
+scan of all 676,244 `.text` instructions finds a load of 0x45b but none of 0x45c/0x45d/0x45e. So they
+are HUD prompts the shipped binary never fetches — one-for-one with the three double-click
+transitions of `ReconTargetState` (scan / lock / fire) that `orders_notes.md` §8.5 describes, and the
+training-level script teaches those three by prose instead (*"double-clicking three times — once to
+scan, once to lock, and once to fire"*). Do not invent `GL_MENU_RECON_DOUBLE_CLICK_*` names for them;
+there are no such identifiers.
 
 ## Front-end navigation, input and rendering
 
@@ -502,6 +537,19 @@ PlayUiSound(0x57);
 0x102 -> scroll up      0x103 -> scroll down     0x101 -> back handler @0x004ed00f
 switch (ChosenMenu)  ->  jump table @0x004ef318 (36 entries)
 ```
+
+`PlayUiSound` @ `0x0058cdd0` **returns an `int`**, not `void` — a sound voice index, or 0 / -1 /
+-2 on three distinct failures. The body is `CALL 0x0058a660` / `ADD ESP,0xc` / bare `RET`: a real
+call with one exit and nothing touching EAX afterwards, so EAX passes straight through from
+`SoundSystem_PlaySound`, which positively returns a value (its tail stashes the result in ESI
+*across* a destructor call and restores it — `MOV EAX,ESI` @ `0x0058a983`). It reads as `void`
+because **no call site anywhere reads EAX**: the callee's variadic option string has an `'e'`
+letter taking an `int *` that is pre-set to -1 and overwritten with the voice index, and that is
+the channel the game actually uses. A census of EAX readers therefore cannot tell a `void`
+function from one whose callers ignore the result — cf. `RenderQueue_Submit`, which *is* `void`
+and is proved so by a different test (`rendering_notes.md` §5).
+`CommandPlaySound` @ `0x004464d0` tail-`JMP`s here and forwards that `int`; it takes **no
+arguments**, reading the console word itself through `ConsoleParseInt(0)`.
 
 **A decompiler trap:** `LAB_004ef2f1` is `CALL GoToMenu` whose `ECX` (target menu) and `DL`
 (push flag) are set at roughly 30 different `JMP` predecessors. Ghidra renders **every** menu
@@ -770,12 +818,14 @@ Each open menu also owns a panel widget in `InGameMenuPanels[7]` @ `0x007ba1dc`.
 | 2 | 0x02 | `OpenInGameSaveMenu` @ `0x00568e40` | save-file list |
 | 3 | 0x03 | `OpenInGameMultiplayerFailedMenu` @ `0x00567830` | Load Game, Restart Level, Exit to Menu |
 | 4 | 0x41 | `OpenInGameOptionsMenu` @ `0x00567f00` | volumes, bandwidth, friendly fire/mines, hints, autocrouch, resume |
-| 5 | 0x42 | `InGameDialogA_Ctor` @ `0x0056c920`, from `FUN_0056a030` | `InGameDialogA` @ `0x007ba1f0` — one label + one button |
+| 5 | 0x42 | `InGameDialogA_Ctor` @ `0x0056c920`, from `OpenInGameInfoDialog` @ `0x0056a030` | `InGameDialogA` @ `0x007ba1f0` — one label + one button |
 | 6 | 0x43 | `OpenInGameConfirmDialog` @ `0x0056a120` | yes/no confirmation dialog (`InGameConfirmDialog` @ `0x007ba1f4`) |
 
 - **Index 5** is the object at `0x007ba1f0`, now labelled `InGameDialogA`: a 0xb8-byte dialog of
   vtable `0x00669878` (`InGameDialogA_vtbl`), built by `InGameDialogA_Ctor` @ `0x0056c920` from
-  `FUN_0056a030`, holding one kind-`0x42` label and one kind-`0x44` button, and activated by
+  **`OpenInGameInfoDialog`** @ `0x0056a030` (was `FUN_0056a030`; `__fastcall(char *text /*ECX*/,
+  ... /*EDX*/)`, the `malloc(0xb8)` at 0x0056a0aa is this object), holding one kind-`0x42` label and
+  one kind-`0x44` button, and activated by
   Enter/Space through `ActivateInGameDialogA_Default` @ `0x0056a2b0`. Index 6 is `0x007ba1f4`,
   `InGameConfirmDialog`.
 - `IsAnyInGameMenuOpen` @ `0x00569550` scans the panel array.
@@ -791,6 +841,45 @@ Each open menu also owns a panel widget in `InGameMenuPanels[7]` @ `0x007ba1dc`.
   (`CDMusicVolumeLabel`, `BattleMusicVolumeLabel`, `SoundEffectsVolumeLabel`,
   `CinematicsVolumeLabel`, then bandwidth / friendly fire / friendly mines / hints /
   autocrouch) before building the items, so the menu shows a snapshot, not live values.
+
+### Input model — ESC toggles, the mouse does everything else
+
+**The two menu systems have genuinely different input models**, and the front-end one above does
+not describe the in-game wheel. Everything here was **measured in the running game** (run
+2026-08-19, `game_defects_notes.md` §17.3) rather than read out of the disassembly, and all three
+facts are **CONFIRMED**:
+
+- **ESC is a toggle.** It reaches the wheel through `DeselectOrActivateMenu` @ `0x00496f70`, which
+  opens the menu only when `GetSelectionCount() == 0` and otherwise **clears the selection** — so
+  with units selected the first press deselects and the wheel opens on the next one. A second press
+  with nothing selected closes it again (`ToggleInGamePauseMenu`, the same entry point row 0 uses).
+- **The wheel takes no keyboard input at all.** With it verifiably open, DOWN does not move the
+  highlight, and neither ENTER nor SPACE activates the highlighted row. There is no in-game
+  counterpart to `MenuSelectPreviousItem` / `MenuSelectNextItem`.
+- **Selection is purely the mouse hit-test.** Hovering moves the highlight, which is what updates
+  `InGameMenuSelectedItem` @ `0x006a89b4` — the same global the inner switch of
+  `InGameMenu__OnItemActivated` reads.
+
+Against the front end, where `MenuScreenInputHandler` @ `0x00470c70` maps cursor up/down to
+`MenuSelectPreviousItem` / `MenuSelectNextItem` and "Enter, or mouse click" to `OnMenuItemClicked`
+(see the input map above):
+
+| | Front-end menu | In-game wheel |
+|---|---|---|
+| Open / close | `GoToMenu` @ `0x004fbfa0`; ESC -> `MenuEscapePressed` @ `0x004f0ef0` | ESC toggles, via `DeselectOrActivateMenu` @ `0x00496f70` |
+| Move the highlight | cursor up/down, wheel up/down, **or** mouse hover | mouse hover **only** |
+| Activate | Enter **or** mouse click | mouse click only — no keyboard route |
+
+The Enter/Space activation recorded above for **index 5** (`InGameDialogA`, kind `0x42`, via
+`ActivateInGameDialogA_Default` @ `0x0056a2b0`) is **not** a counter-example: that is the dialog
+button widget's own route and it lands on a different vtable's slot 4, so it does not generalize to
+the wheel. `game_defects_notes.md` §17.1 has the three dispatch sites.
+
+**This section says nothing about whether the wheel's Options / Load Game / Save Game rows work.**
+That is the separate, still-open question of §17.1/§17.2 — a dispatch analysis, not an in-game
+measurement — and §17.3's run was **INCONCLUSIVE** on it, because no synthetic mouse click reaches
+this game at all (the mouse is on Raw Input, `input_notes.md`). The three facts above are what that
+run *did* establish; the verdict on those three rows stays PROPOSED.
 
 ### In-game item dispatch — `InGameMenu__OnItemActivated` @ `0x00563c30`
 

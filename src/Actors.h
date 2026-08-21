@@ -66,8 +66,8 @@ struct Actor {
   // meaning "disabled". +0x20/+0x24 are written by slot 78 (`SetTarget`, arg1 ->
   // +0x20 @ 0x005302bc, arg2 -> +0x24 @ 0x005302b0) and +0x24's expiry fires
   // slot 79 (`ClearTarget`); +0x28/+0x2c are written by slot 80
-  // (`ChangeOwnerAndTeam`, arg1 -> +0x28 @ 0x005304c0, arg2 -> +0x2c
-  // @ 0x005304b4) and +0x2c's expiry fires slot 81 (`ReleaseFromOwner`). The AI
+  // (`BeginTeamOverride`, arg1 -> +0x28 @ 0x005304c0, arg2 -> +0x2c
+  // @ 0x005304b4) and +0x2c's expiry fires slot 81 (`EndTeamOverride`). The AI
   // timer `AiThink_Waiting` @ 0x00456bed/0x00456c21 does `MOVSS` + `UCOMISS`
   // against `FloatZero` and the scaled clock for both deadlines.
   //
@@ -82,7 +82,7 @@ struct Actor {
   //   * At slot 80's only dispatch site in the binary (0x0053f78d, the
   //     `Confusion` MP branch) arg2 is produced by `ADDSS` - `now` plus the
   //     vulnerability's duration converted with `FILD`.
-  //   * `ReleaseFromOwner` clears both with an x87-produced float zero
+  //   * `EndTeamOverride` clears both with an x87-produced float zero
   //     (0x00530696/0x00530699), which an int field would not need.
   //
   // What misled the earlier reading: slot 80's stores are *bit-copies* of
@@ -110,26 +110,40 @@ struct Actor {
   // instruction inside its Mine case, which is what this used to cite).
   void(__thiscall *on_placed)(Actor *, unsigned now_lo, int now_hi);
   int field0x3c;              // 0x3c gates the team-list move - see JsActors.cpp
-  // 0x40 a **general** retained reference to another actor - "the actor I am
-  // moving toward or holding" - released by slot 52 `ReleaseHeldReferences`.
-  // This was `attachment`, on a reading that had it as the pending-give
-  // recipient; that reading is refuted. The give path is one of five writers,
-  // and the two AI writers have nothing to do with items: `AiBeginInvestigate`
-  // @ 0x0045e186 (ai_state 7) and `AiThink_Swarm` @ 0x0045b8b4 (ai_state 8) both
-  // store here immediately after a `GotoObject` call. The finding that settles
-  // the kind is that it has a **savegame encoding of its own**:
-  // `WriteActorFixups` @ 0x00531d3c writes `target->id + 1` with 0 meaning none,
-  // and `Actor_FixupAfterLoad` @ 0x005317f6 decodes it back through the actors
-  // hash into a retained pointer. Transient give state would not need that.
-  // Sentinel is 0.
-  Actor *held_actor;          // 0x40 ref-counted; released by slot 52
+  // 0x40 **the actor this one is walking to** - a retained reference, released
+  // by slot 52 `ReleaseHeldReferences`. Sentinel is 0.
+  //
+  // Named `held_actor` here until every writer was read (and `attachment`
+  // before that, on a pending-give reading that is refuted; outside write-ups
+  // still use both names). Every *value*-writer stores the argument of a
+  // `MobileActor::GotoObject` call made 8-20 bytes earlier, each followed by an
+  // `INC [reg+4]` retain: `AiThink_Swarm` @ 0x0045b8b4 (ai_state 8),
+  // `AiBeginInvestigate` @ 0x0045e186 (ai_state 7), `ExecutorThreadProc` cmd
+  // 0x17 @ 0x0050a294, `MobileActor::Update` kind 6 @ 0x005351d8. Both AI
+  // readers use it only as a `+0xa0` position source to re-issue a move. The
+  // clincher is the start-a-walk gate `CMP [EDI+0x40],0 / JNZ skip`
+  // @ 0x00534f8a - meaningless as "held actor", obvious as "already walking to
+  // something". `AiThink_Minebot` @ 0x00456d65 is a *clear*, not a writer
+  // (`MOV [ESI+0x40],EBX` with EBX the zero register, no retain follows); two
+  // further clears are @ 0x0045c6b7 and @ 0x00457ec9.
+  //
+  // It is **not** `goto_object`: three distinct fields are involved and
+  // `MobileActor+0x1c0` (`dest_node`) is already the goto *target object*
+  // pointer, unretained, while `MobileActor+0x1dc` (`goto_target`) is the
+  // derived `Vec3`. This one is the pursued **actor**, and the finding that
+  // settles that it is a durable reference rather than transient state is its
+  // **savegame encoding of its own**: `WriteActorFixups` @ 0x00531d3c writes
+  // `target->id + 1` with 0 meaning none, and `Actor_FixupAfterLoad`
+  // @ 0x005317f6 decodes it back through the actors hash into a retained
+  // pointer.
+  Actor *goto_actor;          // 0x40 ref-counted; released by slot 52
   // 0x44 an id whose **namespace depends on the pending action**, which is why
   // it is not `item_id` and not actor-specific either. Sentinel -1 (note
-  // `held_actor`'s is 0 - the differing sentinels are themselves evidence the
+  // `goto_actor`'s is 0 - the differing sentinels are themselves evidence the
   // two are different kinds). It is an **actor** id for the kind-2 goto arm
   // (order+0x4 @ 0x0053515d), the wire goto-object command (cmd+0xc
   // @ 0x005094a5), the walk-to-actor tick (@ 0x00534f6f, gated on
-  // `+0x44 != -1 && held_actor == 0`) and the receive arm (@ 0x00535373); it is
+  // `+0x44 != -1 && goto_actor == 0`) and the receive arm (@ 0x00535373); it is
   // an **item** id for the kind-6 give arm (order+0x8 @ 0x005351ed), wire
   // command 0x17 (@ 0x0050a29d) and the give completion (@ 0x00533f6a, which
   // feeds it to `GiveItemTo` and then resets to -1). Persisted verbatim.
@@ -298,7 +312,7 @@ struct Actor {
   //     breaker**, not a release of one particular thing. Was
   //     `ReleaseAttachment`, which read it as being about `Actor+0x40` alone;
   //     the five overriders release three unrelated fields and chain by
-  //     tail-JMP: `Actor` @ 0x0052de60 -> `held_actor` (+0x40),
+  //     tail-JMP: `Actor` @ 0x0052de60 -> `goto_actor` (+0x40),
   //     `MobileActor` @ 0x00532d10 -> the route object at +0x1cc (not an actor),
   //     `CharacterActor` @ 0x005409e0 -> `attack_target` (+0x2d8), and
   //     `ProjectileActor`/`TrackObjectActor` are pure forwarding thunks. The
@@ -332,12 +346,36 @@ struct Actor {
   //     callee, `nearest_inout` only read by it; both are floats by measurement -
   //     ProjectileActor+0x158 is the caller-side nearest-so-far that receives
   //     *out_hit and is compared with COMISS @ 0x005430ce. `from` is a Vec3 at
-  //     every site (&Actor::coords, or &CharacterActor::aim_direction); `to` is a
-  //     12-byte local, endpoint vs direction unmeasured.
-  virtual bool Raycast(float *out_hit, Vec3 *from, Vec3 *to, float *nearest_inout) = 0; // RET 0x10
-  // 58  swept intersection; same bool-in-AL contract and the same opt-out, plus one
-  //     extra Vec3 * before the nearest-so-far pointer.
-  virtual bool SweepTest(float *out_hit, Vec3 *from, Vec3 *to, Vec3 *sweep,
+  //     every site (&Actor::coords, or &CharacterActor::aim_direction).
+  //
+  //     **`to` is a DIRECTION / first-order rate vector, not an endpoint** - that
+  //     was "unmeasured" here and is now settled three ways. (1) The leaf helpers
+  //     transform `from` with AffineTransform but `to` with Mat3Transform, the
+  //     linear part only; a world endpoint would need the affine transform, and
+  //     transforming the direction instead is exactly what makes `t` invariant
+  //     under the object transform. (2) The leaves evaluate `origin + t*dir`
+  //     parametrically and use `to` as a divisor. (3) Every caller builds `to` as
+  //     a velocity - ProjectileActor::InitPositionAndTiming copies
+  //     ProjectileActor+0x138 (`velocity`) verbatim and then integrates gravity
+  //     into it. So `t` parameterises p(t) = from + t*to.
+  //
+  //     Both branches of Actor::Raycast @ 0x0052e0a0 pass the same
+  //     `this->anim_object` to the leaf (MOV EDX,[ESI+0xe0] at 0x0052e10b *and*
+  //     0x0052e178): Role::shape only discriminates how that Renderable was
+  //     built, it is not a second object.
+  virtual bool Raycast(float *out_hit, Vec3 *from, Vec3 *direction, float *nearest_inout) = 0; // RET 0x10
+  // 58  **a ballistic cast, not a volume sweep**: the extra Vec3 * is
+  //     (0, GravityAcceleration, 0) at all four dispatch sites and the leaf
+  //     solves a quadratic, so p(t) = from + t*v + t*t*a/2. Same bool-in-AL
+  //     contract and the same Pickup/Projectile opt-out as slot 57.
+  //
+  //     The name is therefore wrong - it should be `TrajectoryCast`, matching the
+  //     leaf helpers Renderable_TrajectoryCastMesh @ 0x00461b20 /
+  //     Renderable_TrajectoryCastBounds @ 0x00461ed0. **Rename deliberately not
+  //     applied**: it spans this file, the Ghidra DB (function, ActorVtbl slot 58
+  //     field, Actor_SweepTest funcdef) and actor_vtable_notes.md, and it was
+  //     flagged for a decision rather than done. Open item.
+  virtual bool SweepTest(float *out_hit, Vec3 *from, Vec3 *velocity, Vec3 *accel,
                          float *nearest_inout) = 0; // RET 0x14
   // 59  base no-op; in PickupActor this slot is really SetPickupType.
   virtual void OnDamageReceived(int, int) = 0; // RET 0x8: two arguments
@@ -412,13 +450,24 @@ struct Actor {
   virtual void SetTarget(float now, float deadline) = 0;
   // 79  clear target, broadcast 0x57.
   virtual void ClearTarget() = 0;
-  // 80  reassign owner+team, broadcast 0x58 then 0x50. Stores now -> +0x28 and
-  //     deadline -> +0x2c; both are floats (see the field comments above). RET
-  //     0xc. `TurretActor` is the only class overriding it (@ 0x0054af80), and
-  //     it forwards all three arguments verbatim.
-  virtual void ChangeOwnerAndTeam(float now, float deadline, int team_id) = 0;
-  // 81  release from owner, broadcast 0x59 then 0x50.
-  virtual void ReleaseFromOwner() = 0;
+  // 80  **begin a timed team override**, broadcast 0x58 then 0x50. Stores
+  //     now -> +0x28 and deadline -> +0x2c; both are floats (see the field
+  //     comments above). RET 0xc. `TurretActor` is the only class overriding it
+  //     (@ 0x0054af80), and it forwards all three arguments verbatim.
+  //
+  //     Named `ChangeOwnerAndTeam` here until the body was read, and outside
+  //     write-ups still use that name. It touches **no owner pointer, no
+  //     inventory, no attachment and no actor id other than `this->id`**: the
+  //     only durable state it writes is +0x28 (start), +0x2c (deadline) and the
+  //     team (+0xbc via slot 33, plus two `TeamActorLists` @ 0x007ba038 edits
+  //     gated on +0x3c). Its pair, slot 81, is the *expiry* - it zeroes the two
+  //     floats and sets the team to the literal 2.
+  virtual void BeginTeamOverride(float now, float deadline, int team_id) = 0;
+  // 81  end the timed team override begun by slot 80: zero +0x28/+0x2c and set
+  //     the team to the **literal 2** (`PUSH 2` @ 0x00530801) - an expiring
+  //     override does not restore the previous team. Broadcast 0x59 then 0x50.
+  //     Was `ReleaseFromOwner`; it releases nothing from any owner.
+  virtual void EndTeamOverride() = 0;
   // 82  (re)register in the spatial/team structures, set flag 0x200; MobileActor
   //     also disposes the inventory on death, BlockerActor un-blocks its nav polys.
   virtual void ActivateInWorld() = 0;
@@ -538,7 +587,7 @@ struct MobileActor : Actor {
   // 0x1e8 / 0x1ec are **game-time seconds, not priorities**. Every writer stores
   // the tick's `now`: GotoObject @ 0x005394d0 sets both to it, 0x00539540 sets
   // +0x1ec = Actor::state_time, and CancelLastOrder / Dissociate /
-  // ReleaseFromOwner all call GetGameTimeSeconds @ 0x00571b10 immediately before
+  // EndTeamOverride all call GetGameTimeSeconds @ 0x00571b10 immediately before
   // the call that writes +0x1e8. The gate `+0x1e8 <= now` guarding GotoObject
   // and StopAndBroadcast is therefore a stale-command / re-entry guard, not an
   // arbitration between competing orders - which is what `goto_priority` and
@@ -709,6 +758,13 @@ struct ProjectileActor : Actor {
   bool hit_predicted;     // 0x154
   bool hit_is_world;      // 0x155
   char pad0x156[2];
+  // 0x158 seconds until the predicted impact. It is a **TIME, not a distance**,
+  // and this name is measured rather than proposed: it is seeded from the world
+  // raycast's HitRecord::t, doubles as the in/out nearest-hit bound while
+  // candidates are tested, and is *decremented by the frame dt every tick*
+  // (COMISS @ 0x005430ce, SUBSS + MOVSS @ 0x005430fe / 0x00543108). A distance
+  // would not be. So do not rename it `nearest_hit_distance` - that has been
+  // proposed and is wrong in unit.
   float time_to_impact;   // 0x158
   int hit_actor_id;       // 0x15c
   void *weapon_context;   // 0x160

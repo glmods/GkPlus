@@ -29,32 +29,39 @@ const char *MenuItemTypeName(MenuItemType t) {
   }
 }
 
-// GetResourceString @ 0x00579000 takes ECX = &LocalizedStrings (the address of
-// the resource-table pointer global @ 0x00725664), so the pointer must live at a
-// stable address - a function-local static, resolved once.
+// GetResourceString @ 0x00579000 opens `MOV EAX,dword ptr [ECX]`, so ECX is the
+// address *of* the resource-table pointer global @ 0x00725664 - one level of
+// indirection, not two. Measured: all 854 call sites in gl.exe load ECX with
+// `MOV ECX,0x725664` and none dereferences it first. (The contrast that settles
+// it is `FreeResourceStringTable` @ 0x00579020, which is handed the array base
+// instead, via `MOV ECX,[0x00725664]` @ 0x0046aa72 - the binary distinguishes the
+// two shapes and uses each with the function that wants it.)
+//
+// So `LocalizedStrings` is itself the slot address and is passed by value.
+// Passing `&LocalizedStrings` would hand the game a pointer to *our* static,
+// whose contents are 0x00725664, and the scan would run from the wrong base.
 const char *ResourceString(unsigned id) {
-  static void *LocalizedStrings;
-  static FastCall<const char *, void *, unsigned> GetResourceString;
+  static void **LocalizedStrings;
+  static FastCall<const char *, void **, unsigned> GetResourceString;
   if (!GetResourceString) {
     GetObjectAtOffset(LocalizedStrings, 0x00725664);
     GetObjectAtOffset(GetResourceString, 0x00579000);
   }
-  if (!LocalizedStrings) {
+  // The table itself is null until `LoadResourceStringTable` @ 0x00578f30 fills it
+  // - `WinMain` at 0x0046b355, and like the console that is *after* the engine's
+  // first file open, so a script running from the first-open anchor is ahead of
+  // it. GetResourceString scans 0x14-byte entries **with no bound**, so an
+  // unloaded table does not fault, it walks .data until some dword matches the id.
+  // Read fresh through the slot every call, because the whole point is that it
+  // changes after the first call this might get.
+  //
+  // (The entries do carry an `is_last` flag at +0x10, which
+  // `FreeResourceStringTable` honours and `GetResourceString` never tests - so
+  // the walk is unbounded despite the terminator existing.)
+  if (!*LocalizedStrings) {
     return "";
   }
-  // The table itself, which is null until `LoadResourceStringTable` @ 0x00578f30
-  // fills it - `WinMain` at 0x0046b355, and like the console that is *after* the
-  // engine's first file open, so a script running from the first-open anchor is
-  // ahead of it. GetResourceString opens `MOV EAX,[ECX]` and then scans in
-  // 0x14-byte steps **with no end test**, so an unloaded table does not fault, it
-  // walks .data until something matches the id. Read fresh, because the whole
-  // point is that it changes after the first call this might get.
-  void **table;
-  GetObjectAtOffset(table, 0x00725664);
-  if (!*table) {
-    return "";
-  }
-  const char *s = GetResourceString(&LocalizedStrings, id);
+  const char *s = GetResourceString(LocalizedStrings, id);
   return s ? s : "";
 }
 
@@ -140,10 +147,10 @@ void SetChooseLevelEnabled(bool enabled) {
   *p = enabled ? 1 : 0;
 }
 
-void PlayUiSound(int sound_id) {
-  FastCall<void, int> fn;
+int PlayUiSound(int sound_id) {
+  FastCall<int, int> fn;
   GetObjectAtOffset(fn, 0x0058cdd0);
-  fn(sound_id);
+  return fn(sound_id);
 }
 
 bool IsAnyInGameMenuOpen() {
