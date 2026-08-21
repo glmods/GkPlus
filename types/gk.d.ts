@@ -822,6 +822,17 @@ declare module "gk" {
     /** `VISION`. */
     vision_cones: boolean;
 
+    /** The recon-mode byte. More than a camera: the pass that submits every vision cone
+     *  and hearing-range ring is gated on it being true. The game reaches it only from a
+     *  key binding (Enter) or the command wheel, which is why this exists. Writing
+     *  `false` does nothing unless something is selected. */
+    recon_mode: boolean;
+
+    /** Whether range rings and cones are shown, the key bound to numpad `.`. Starts on.
+     *  This, {@link recon_mode} and {@link vision_cones} are all necessary for a ring and
+     *  are known not to be sufficient - at least one further gate is unidentified. */
+    range_rings: boolean;
+
     /** `BATTLE NUMBER`: enemies needed before the battle music escalates. */
     battle_number: number;
     /** `SET TRAINING AREA`, 1..6. The offset `TRNTXT` and `REPTXT` add. */

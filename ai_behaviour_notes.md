@@ -690,6 +690,36 @@ mentions:
   inert in the follow-unit view. The cursor dispatcher itself is
   `orders_notes.md` §10's `UpdateCursorForMode`.
 
+  **Measured in the running game 2026-08-21, and it settles the "inference" above while opening a
+  new hole.** With `levels.start` into level02 and nothing selected, `ReconModeActive` reads **1**
+  from the first frame in the level - so the byte is indeed *not* left clear when the selection is
+  empty, exactly as the paragraph above predicts and against the older inference. The view in that
+  state is the **normal follow view** with the unit-portrait HUD, not the overhead green one, which
+  puts one more datum on §11's "inverted" side: byte 1 is the normal view.
+
+  **And yet nothing is drawn.** With `ReconModeActive` 1, `ShowRangeRingsToggle` 1 and
+  `VisionConesEnabled` 1 all read back through the new `game.recon_mode` / `game.range_rings` /
+  `game.vision_cones` bindings, and with `Rol_lob_large_alert` - the one shipped role that sets
+  **both** `draw vision cone yes` and `draw hearing range yes` (`lob.gsh`:207) - spawned two metres
+  from the player and plainly visible in a brightly lit level03 frame, the renderer submits **no
+  cone and no ring**: 364 draws, and `game.vision_cones = false` removes not one of them from
+  `render.frame_draws`. Repeated on level02 with a spawned `adversor` and with the level's own
+  `smartbot`s (which *are* `Chr_Walking_Mine`, `walking_mine.gsh`:61, so they carry the ring), and
+  with a draw count held rock-steady at 143 across 25 polls - so it is not an intermittent pulse
+  being missed either.
+
+  So **there is at least one further gate, and it is not in this section**. It lies between
+  0x0049a0dc (the `Unit+0x7e` test that opens the loop body) and 0x0049b327 (`VisionConesEnabled`),
+  roughly 4 KB of code that nobody has read; the per-unit timed-pulse test at 0x0049b3d7 - the
+  64-bit clock against `Unit+0x140`/`+0x144`, phase `(now - that) * Unit+0x14c`, branch on
+  `phase >= 1.0` at 0x0049b430 - is a candidate for the *ring* but cannot explain the *cone*. Until
+  that is read, **"no ring on screen" is not evidence about the renderer**, which is what one whole
+  session concluded the hard way.
+
+  One practical note on the binding: `game.recon_mode = false` **silently does nothing** when the
+  selection is empty, because it calls `ToggleReconMode` and the `:= 0` branch is exactly what the
+  selection gate at 0x00497786 aborts. Set `game.selected_actor` first.
+
 `orders_notes.md` line 103 already listed that binding; nothing had connected it to the cone
 renderer. Then two more gates:
 

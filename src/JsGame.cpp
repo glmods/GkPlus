@@ -106,6 +106,10 @@ GK_BOOL_ACCESSORS(GetLowDetail, SetLowDetail, GetDetailLevelToggle,
                   SetDetailLevelToggle)
 GK_BOOL_ACCESSORS(GetVisionCones, SetVisionCones, GetVisionConesEnabled,
                   SetVisionConesEnabled)
+GK_BOOL_ACCESSORS(GetReconMode, SetReconMode, GetReconModeActive,
+                  SetReconModeActive)
+GK_BOOL_ACCESSORS(GetRangeRings, SetRangeRings, GetRangeRingsShown,
+                  SetRangeRingsShown)
 
 #undef GK_BOOL_ACCESSORS
 
@@ -229,6 +233,10 @@ const JSCFunctionListEntry GameProps[] = {
     JS_CGETSET_DEF2("low_detail", GetLowDetail, SetLowDetail,
                     JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE),
     JS_CGETSET_DEF2("vision_cones", GetVisionCones, SetVisionCones,
+                    JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE),
+    JS_CGETSET_DEF2("recon_mode", GetReconMode, SetReconMode,
+                    JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE),
+    JS_CGETSET_DEF2("range_rings", GetRangeRings, SetRangeRings,
                     JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE),
     JS_CGETSET_DEF2("battle_number", GetBattleNumberJs, SetBattleNumberJs,
                     JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE),

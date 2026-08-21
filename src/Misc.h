@@ -92,6 +92,35 @@ bool GetDetailLevelToggle();  void SetDetailLevelToggle(bool v); // 0x007b9c9c
 // [0x007b4708], CL; RET` - so the flag it writes is also the getter.
 bool GetVisionConesEnabled(); void SetVisionConesEnabled(bool v);
 
+// `ReconModeActive` @ 0x007b9ca1, the byte the "Toggle Recon Mode on/off" binding flips
+// (DIK 28, Enter by default; the command wheel is the only other route). `ToggleReconMode`
+// @ 0x004976d0 has **no console command** behind it, which is the whole reason this pair
+// exists - nothing else in this repo could reach it.
+//
+// It is more than a camera: `DrawOrderMenu`'s pass over the visible units, entered at
+// 0x0049a063, is gated on this byte being non-zero, and that pass is where every vision
+// cone and hearing-range ring is submitted. **Which side of the byte the player calls
+// "recon" is an open question** - the name may be inverted, see ai_behaviour_notes.md
+// section 11 - so this is deliberately a value and not a mode.
+//
+// Two things the setter cannot do anything about. It calls the game's **toggle**, which
+// does far more than write the flag (camera save/restore, cursor mode, mouse picking), so
+// the byte must never be written directly; and the `:= 0` direction is gated on a non-empty
+// selection at 0x00497786, so `SetReconModeActive(false)` **silently does nothing** unless
+// something is selected. Set the selection first.
+bool GetReconModeActive();    void SetReconModeActive(bool v);
+
+// `ShowRangeRingsToggle` @ 0x006a373e - another gate on the range-ring submit (0x0049bc72,
+// and the cone's at 0x0049baca), and the key bound to "Toggle vision cones on/off"
+// (DIK 83, numpad `.`). It lives in .data with an initial value of 1, so it is on until the
+// player turns it off.
+//
+// These two plus `VISION on` are **necessary and measurably not sufficient**: with all three
+// set and a role carrying both draw flags in frame, level03 submitted no cone and no ring at
+// all. At least one further gate is unaccounted for; ai_behaviour_notes.md section 7 has the
+// measurement and the address range still to read.
+bool GetRangeRingsShown();    void SetRangeRingsShown(bool v);
+
 bool GetControlsDisabled();   void SetControlsDisabled(bool v);// 0x007b9ca0, byte
 
 // 0x006abe18, which is `GetSettings()->IsFriendlyFireOn`: the menu preference

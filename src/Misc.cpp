@@ -127,6 +127,22 @@ void SetVisionConesEnabled(bool v) {
   fn(v);
 }
 
+bool GetReconModeActive() { return GetByteFlag(0x007b9ca1); }
+void SetReconModeActive(bool v) {
+  if (GetReconModeActive() == v) {
+    return;
+  }
+  // 0x004976d0, __cdecl, no arguments, bare RET. It is a *toggle*, not a setter, and it
+  // does much more than write the flag - saves and restores the camera, drops the unit
+  // selection - so the byte must never be written directly.
+  CDecl<void> fn;
+  GetObjectAtOffset(fn, 0x004976d0);
+  fn();
+}
+
+bool GetRangeRingsShown() { return GetByteFlag(0x006a373e); }
+void SetRangeRingsShown(bool v) { SetByteFlag(0x006a373e, v); }
+
 bool GetControlsDisabled() { return GetByteFlag(0x007b9ca0); }
 void SetControlsDisabled(bool v) { SetByteFlag(0x007b9ca0, v); }
 
