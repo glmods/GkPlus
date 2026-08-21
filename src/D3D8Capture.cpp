@@ -15,6 +15,7 @@
 #include <set>
 #include <vector>
 
+#include "Camera.h"
 #include "Core.h"
 #include "ImageCodec.h"
 #include "LoadScreen.h"
@@ -2351,6 +2352,23 @@ void ResolvePipeline(vulkan::DrawItem &item, D3DPRIMITIVETYPE type) {
   // the HUD.
   const bool pre_transformed = (State.fvf & 0x004u) == 0x004u;
   item.pipeline.depth_clamp = (pre_transformed && vulkan::RhwDepthRaw()) ? 1u : 0u;
+
+  // ...and which LAYER the draw belongs to, which is a different question and has a different
+  // answer. `pre_transformed` above is `D3DFVF_XYZRHW` and is true of only 2 of level02's 268
+  // draws; what says "this is 2D" is the CAMERA. Gunlok has no per-draw layer at all - what
+  // decides whether one 2D element lands in front of another is which camera drew it, and
+  // `InitRenderCameras` gives each of the nine a slice of the depth range
+  // (`rendering_notes.md` §4.4). Every one of them is orthographic except `Camera_World` and the
+  // sky camera, so the engine's own `CurrentCameraIsPerspective` is exactly the test, with no
+  // threshold to tune. It is read here rather than derived from the depth slice because a slice
+  // test would be wrong: one orthographic camera runs 0.06..0.30 and overlaps the world's
+  // 0.10..1.00.
+  //
+  // Read straight out of the game, on the game thread, at the moment of the draw - the same
+  // global `src/HudFix.cpp` writes when it re-asserts a camera, which is what keeps the two
+  // consistent: with the HUD fix in place the meters flush under `Camera_Hud`, and this reads
+  // orthographic for them too.
+  item.ui = !gk::CurrentCameraIsPerspective();
 }
 
 // What fixed-function lighting turns this draw's vertex colour into, for the ONE case the

@@ -7,6 +7,16 @@ this is the mechanics.
 These lived in a session scratchpad and were rebuilt from the notes twice before being checked in.
 Each one exists because something about driving this game wastes a run otherwise.
 
+**What the harness is for, and what it is not.** It aligns two frames so a *difference* between
+them means something, and that is all it does. For the **fidelity** work — is the Vulkan path
+drawing what D3D8 drew — the residual it produces is the whole answer and smaller is better. For a
+**new feature**, whose entire purpose is to make the game look different, it is not an answer at
+all: a residual there measures how far the change reaches, and a change that made the game uglier
+would score the same or higher. Use it on a feature to check that `off -> on -> off` comes back
+bit-identical, to get a noise floor, and to see *where* on the frame the change landed — then look
+at the screenshots and play it. `vulkan_renderer_plan.md`'s "What a residual can and cannot say" is
+the rule; this harness is happy to hand you a large number for something that looks terrible.
+
 ```powershell
 . .\utils\rendertest\shoot-settled.ps1        # dot-source; it pulls in the other two
 Shoot-Settled -Renderer d3d8   -Level level02 -Out ref.png

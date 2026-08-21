@@ -83,10 +83,27 @@ BoolRow Rows[] = {
      vulkan::SetPerPixelLighting, AvailableUnderVulkan},
     {"Lighting Maps", "core.render.lighting_maps", nullptr, vulkan::LightingMaps,
      vulkan::SetLightingMaps, AvailableUnderVulkan},
+    // The float target and the tonemap pass. `Hdr()` reads back as REQUESTED rather
+    // than as effective, which is what makes it safe to bind a toggle to directly -
+    // see GetHdr in src/JsRender.cpp for why that differs from the antialiasing row
+    // below, which has to read `MsaaWanted` to get the same property.
+    {"HDR", "core.render.hdr", "GKPLUS_VK_HDR", vulkan::Hdr, vulkan::SetHdr,
+     AvailableUnderVulkan},
 };
 
 constexpr const char *MsaaKey = "core.render.msaa";
 constexpr const char *MsaaEnv = "GKPLUS_VK_MSAA";
+
+// --- Tone mapping -----------------------------------------------------------
+//
+// A cycle row for the same reason antialiasing is one: the operators are named,
+// and the string table has no "Rolloff". Only meaningful with HDR on, but the row
+// is left visible either way - a setting that vanishes when its companion is off
+// is harder to find than one that reads as inert.
+constexpr const char *TonemapKey = "core.render.tonemap";
+
+const char *TonemapLabels[] = {"Clamp", "Rolloff", "Reinhard", "ACES"};
+constexpr uint32_t TonemapCount = 4;
 
 void BoolClicked(CustomMenuItem *item, void *user) {
   const BoolRow *row = static_cast<const BoolRow *>(user);
@@ -148,6 +165,19 @@ void MsaaClicked(CustomMenuItem *item, void *user) {
   MsaaRefresh(item, user);
 }
 
+void TonemapRefresh(CustomMenuItem *item, void *) {
+  const uint32_t op = vulkan::Tonemap();
+  SetCustomMenuValueText(item, TonemapLabels[op < TonemapCount ? op : 0]);
+}
+
+void TonemapClicked(CustomMenuItem *item, void *user) {
+  const uint32_t next = (vulkan::Tonemap() + 1) % TonemapCount;
+  vulkan::SetTonemap(next);
+  settings::SetNumber(TonemapKey, next);
+  settings::Save();
+  TonemapRefresh(item, user);
+}
+
 void OpenPage(CustomMenuItem *, void *) { GoToMenu(PageMenu, true); }
 
 } // namespace
@@ -164,6 +194,15 @@ void ApplyStoredRenderSettings() {
       continue;
     }
     row.set(settings::GetBool(row.key, false));
+  }
+
+  if (settings::Has(TonemapKey)) {
+    const double op = settings::GetNumber(TonemapKey, 1.0);
+    // No env companion: `GKPLUS_VK_HDR` already covers the case this rule exists for
+    // (a setting that keeps the game from starting), and the operator cannot.
+    if (op >= 0.0 && op < static_cast<double>(TonemapCount)) {
+      vulkan::SetTonemap(static_cast<uint32_t>(op));
+    }
   }
 
   if (!EnvOverridden(MsaaEnv) && settings::Has(MsaaKey)) {
@@ -189,6 +228,12 @@ void RegisterRenderMenu() {
                                             CustomMenuOwner::Native);
   SetCustomMenuRefresh(msaa, MsaaRefresh);
   SetCustomMenuAvailable(msaa, AvailableUnderVulkan);
+
+  CustomMenuItem *tonemap = AddCustomMenuValue(PageMenu, "Tone Mapping",
+                                               TonemapClicked, nullptr,
+                                               CustomMenuOwner::Native);
+  SetCustomMenuRefresh(tonemap, TonemapRefresh);
+  SetCustomMenuAvailable(tonemap, AvailableUnderVulkan);
 
   for (BoolRow &row : Rows) {
     // The initial state is a placeholder, not a reading: registration runs from

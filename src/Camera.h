@@ -104,4 +104,21 @@ bool IsCameraFocusSet();
 // by touching the list locally, so it has no local-only equivalent.
 bool IsCameraTracking();
 void StopCameraTracking(); // ClearCameraTrack @ 0x00487e30, + ControlsDisabled
+
+// CurrentCameraIsPerspective @ 0x007c1470 - the engine's own record of whether the
+// camera currently applied to the device is a perspective one, written by the
+// canonical four-step camera switch (`rendering_notes.md` §4.4) and by
+// `src/HudFix.cpp` when it re-asserts one.
+//
+// **It is this game's "is this draw part of the world" test**, and it is exact
+// rather than a heuristic: `InitRenderCameras` @ 0x004af4d0 runs every one of the
+// nine cameras through `Camera_SetOrthographic` @ 0x004b04e0 EXCEPT
+// `Camera_World` and the sky camera, so orthographic means a 2D layer - the
+// menus, the text, the HUD - and perspective means the scene. The depth slice
+// each camera owns is *not* a substitute: one orthographic camera runs
+// 0.06..0.30 and overlaps the world's 0.10..1.00.
+//
+// The Vulkan renderer reads it per draw, which is what lets it keep the 2D
+// layers out of the HDR pipeline (`vulkan_renderer_notes.md` §4.92).
+bool CurrentCameraIsPerspective();
 } // namespace gk

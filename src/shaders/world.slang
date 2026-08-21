@@ -212,6 +212,18 @@ struct GpuFrameData {
     ConstBufferPointer<uint> split_corners;
     uint split_base;   // the canonical-vertex index bit 0 stands for
     uint split_count;  // how many bits are valid
+    // --- HDR (the plan's "In progress: HDR") -------------------------------------------------
+    //
+    // kLinearInput / kUnclamped, appended for the reason the two blocks above were: every field
+    // with a pinned `offsetof` in src/VkDraw.h is above here, and the end is the only place a
+    // field can go without moving one of them.
+    uint colour_flags;
+    // **Three words of padding and not one**, and it is the same constraint the tessellation block
+    // above records: `cascades` is a `float4[]`, so std430 aligns the whole struct to 16 while the
+    // scalar rule aligns it to 8, and the two only agree on a size that is a multiple of 16.
+    // `src/gen-shader-abi.py` refuses a struct whose two layouts disagree, which is what caught
+    // this rather than a wrong picture later.
+    uint pad_colour[3];
 };
 
 // **56 bytes of a guaranteed 128.** It reached exactly 128 with the light grid (§4.56), and
@@ -277,6 +289,47 @@ static const uint kNormaliseNormals = 0x04u;
 static const uint kSpecularEnable = 0x08u;
 static const uint kVertexColour = 0x10u;
 static const uint kColourVertex = 0x20u;
+
+// GpuFrameData::colour_flags - must match src/VkDraw.h.
+//
+// `kLinearInput` is `render.linear_input`: every ALBEDO the shader reads is sRGB-decoded on the
+// way in, so the texture cascade, the light sum and the framebuffer blend all run on light rather
+// than on its encoding, and the tonemap pass encodes once on the way out.
+//
+// **Albedo only, and that is a decision rather than an omission.** A texture fetch and an unpacked
+// D3DCOLOR are gamma-encoded pictures of a surface, so they are decoded. A light's colour and a
+// material's are neither: they are intensities the game authored as numbers, several of them
+// greater than 1 - notes 4.48 measured level02's key light at `diffuse 4.0`, which is not a colour
+// in any encoding - so decoding them would bend an authored quantity through a curve it never went
+// through. The materials that *do* carry a picture reach the equation as a vertex colour anyway
+// (`D3DMCS_COLOR1` on every lit draw, see fragment_main), and are decoded there.
+static const uint kLinearInput = 0x1u;
+// `render.hdr` itself. The clamps that reproduce the fixed function's D3DCOLOR output stage come
+// off, so an over-range light survives to the tonemap instead of dying at the last multiply. It is
+// a separate bit rather than the same one because it is inert without a float target, where
+// kLinearInput is not.
+static const uint kUnclamped = 0x2u;
+
+// The exact piecewise sRGB curve, and the inverse of `srgb_encode` in tonemap.slang - the two have
+// to agree exactly or the 2D half of the game does not survive the round trip. See the note there
+// for why the round trip is exact at 8 bits through an fp16 buffer.
+float3 srgb_decode(float3 encoded) {
+    const float3 c = max(encoded, float3(0, 0, 0));
+    return select(c <= 0.04045, c / 12.92, pow((c + 0.055) / 1.055, 2.4));
+}
+
+// Applied to an albedo, and only when the knob is on. Alpha is never touched anywhere: it is
+// coverage rather than light, it is not gamma-encoded, and the alpha test compares it in 0..255
+// units where a curve would move every threshold in the game.
+float4 decode_albedo(float4 c) {
+    return (pc.frame[0].colour_flags & kLinearInput) != 0u ? float4(srgb_decode(c.rgb), c.a) : c;
+}
+
+// The fixed function's output stage, which clamps to a D3DCOLOR. Under `render.hdr` there is a
+// float target to clamp into instead of an 8-bit one, so it does not.
+float3 clamp_output(float3 c) {
+    return (pc.frame[0].colour_flags & kUnclamped) != 0u ? max(c, float3(0, 0, 0)) : saturate(c);
+}
 
 // A D3DCOLOR - 0xAARRGGBB in a uint - as a float4.
 float4 unpack_colour(uint packed) {
@@ -727,10 +780,16 @@ LitColour resolve_lit_colour(GpuDrawRecord draw, LightSums sums, float4 vertex_c
     LitColour out;
     // Saturated because the fixed function's output is a D3DCOLOR: the clamp is where the
     // pipeline is, not an approximation of it.
-    out.color = float4(saturate(emissive.rgb + ambient.rgb * sums.ambient +
-                                diffuse.rgb * sums.diffuse),
+    //
+    // ... which is exactly why `render.hdr` lifts it. This is the line that discards three
+    // quarters of level02's key light - notes 4.48 measured it at `diffuse 4.0` - and with a float
+    // target underneath there is somewhere for the rest to go. `clamp_output` is the identity
+    // under kUnclamped and `saturate` otherwise, so the stock path is unchanged by construction
+    // rather than by inspection.
+    out.color = float4(clamp_output(emissive.rgb + ambient.rgb * sums.ambient +
+                                    diffuse.rgb * sums.diffuse),
                        diffuse.a);
-    out.specular = want_specular ? saturate(specular.rgb * sums.specular) : float3(0, 0, 0);
+    out.specular = want_specular ? clamp_output(specular.rgb * sums.specular) : float3(0, 0, 0);
     return out;
 }
 
@@ -990,8 +1049,9 @@ VertexOut shade_surface(float3 local_pos, float3 local_normal, float4 uv, float4
         // two can be compared on one paused frame rather than across two launches - which is
         // the only comparison with a noise floor small enough to see this (§4.21). Neither set
         // means lighting is off, and D3D's lighting-off result is the vertex colour itself.
-        output.color = (draw.lighting & kLitCollapse) != 0u ? unpack_colour(draw.lit_colour)
-                                                            : vertex_colour;
+        output.color = (draw.lighting & kLitCollapse) != 0u
+                           ? decode_albedo(unpack_colour(draw.lit_colour))
+                           : vertex_colour;
         return output;
     }
 
@@ -1037,7 +1097,7 @@ VertexOut shade_surface(float3 local_pos, float3 local_normal, float4 uv, float4
 VertexOut vertex_main(uint vertex_id: SV_VertexID) {
     Vertex v = pc.vertices[pc.base_vertex + vertex_id];
     VertexOut output = shade_surface(v.pos.xyz, v.normal_and_color.xyz, v.uv,
-                                     unpack_colour(asuint(v.normal_and_color.w)));
+                                     decode_albedo(unpack_colour(asuint(v.normal_and_color.w))));
     // The same values, differing only in how they are interpolated. Mirrored here, at the one
     // exit there is, rather than at each exit of the body above - which is the whole reason the
     // body is a separate function.
@@ -1123,7 +1183,7 @@ ControlPoint tess_vertex_main(uint vertex_id: SV_VertexID) {
     // Unpacked here rather than in the domain shader because the tessellator interpolates it: a
     // packed D3DCOLOR cannot be blended as an integer, and unpacking after interpolation would
     // mean interpolating the *bits*.
-    cp.colour = unpack_colour(asuint(v.normal_and_color.w));
+    cp.colour = decode_albedo(unpack_colour(asuint(v.normal_and_color.w)));
     cp.split = is_split_corner(pc.base_vertex + vertex_id) ? 1u : 0u;
     return cp;
 }
@@ -1723,6 +1783,17 @@ float4 fragment_main(VertexOut input) : SV_Target {
                              ? textures[s.texture].SampleBias(samplers[s.sampler_index], uv,
                                                               chrome_lod)
                              : textures[s.texture].Sample(samplers[s.sampler_index], uv));
+            // The one place an albedo enters this shader from a file. It is decoded AFTER the
+            // filter rather than by an `_SRGB` view, which would decode before it and is the more
+            // correct order - but a view is per descriptor and this array is one bindless table
+            // shared by every draw, so an `_SRGB` twin would mean a second descriptor per texture
+            // and a rebuild of the table every time the knob moves. The error the cheap order
+            // costs is bounded by how much two texels of one DXT block differ, and the knob has to
+            // stay writable from the REPL mid-frame.
+            //
+            // The fog-of-war grid passes through here too and is unharmed: it is `D3DFMT_A8` and
+            // is read as `tex.a`, which nothing decodes.
+            tex = decode_albedo(tex);
         }
 
         // The fog of war, read as it goes past: `BLENDTEXTUREALPHA(TEXTURE, CURRENT)` on an

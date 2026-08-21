@@ -651,6 +651,20 @@ The one fact that shapes everything: **the seam is `Direct3DCreate8`, not the AW
 queue**, and the ground truth to compare against is `GKPLUS_RENDERER=d3d8` - the original runtime,
 still shipped in SysWOW64.
 
+**The 0.13/255 is a reproduction claim, and it is not how a new feature is judged.** Everything
+below this paragraph - the shadow systems, per-pixel lighting, lighting maps, AO, tessellation,
+MSAA, HDR - exists to make the game look *different from* the original, so a residual against the
+baseline says how far it reaches and never whether it is any good. A change that made the game
+uglier would produce the same number, or a bigger one. Keep quoting residuals for the *fidelity*
+work, where matching D3D8 is the goal and smaller really is better; for a departure, quote it as
+coverage and settle the feature by looking at the frame and playing it. On a departure a residual
+still answers three things and they are all worth keeping: **off -> on -> off is bit-identical**
+(the feature is properly gated), an off-vs-off shot gives the **noise floor** without which no
+reading means anything, and an unexpectedly *large* reach is a **defect signal** - it says the
+feature touched something outside its own description. `vulkan_renderer_plan.md`'s "What a residual
+can and cannot say" is the full rule; every departure in this repo was written up the wrong way
+round at first.
+
 It also does **MSAA** (`render.msaa`, off by default, settable at any time): the world pass at N
 samples resolved on the way out, which dynamic rendering makes three fields on the attachment the
 pass already had - the image it used to draw into becomes the one it resolves into, so the scale
@@ -660,6 +674,26 @@ whole world pipeline cache and the work therefore hangs off `ReconcileRenderTarg
 holds a `vkDeviceWaitIdle`) rather than off the setter; and `sampleShadingEnable` stays **off**, so
 the fragment shader runs once per pixel and `world.slang`'s AO fetch keeps landing on the texel it
 did at one sample. `vulkan_renderer_notes.md` §4.88.
+
+It also does **HDR** (`render.hdr`, off by default, settable at any time): the world pass into
+`R16G16B16A16_SFLOAT`, every albedo sRGB-decoded on the way in, the D3DCOLOR clamps lifted, and a
+full-screen tonemap pass in place of the scale blit. **Internal HDR, SDR presentation** - the
+surface format is untouched. It is the first feature here whose goal is *not* reproduction, so it
+is in `render.stock`'s set; `GKPLUS_VK_HDR=1` is the launch-time form. Two things in it are
+measurements. **The 2D layers are not in the pipeline at all** (§4.92): the menus, briefing
+screens, HUD and inventory are drawn *after* the tonemap and with the decode off, so no operator
+reaches them - ACES, `rolloff` and `exposure = 2.5` produce byte-identical main-menu frames, where
+before the split ACES recoloured 99.61% of it. The classifier is the engine's own
+`CurrentCameraIsPerspective`, because `InitRenderCameras` makes every camera orthographic except
+`Camera_World` and the sky camera; **`depth_clamp` is not it** (that is `FVF & XYZRHW`, true of 2
+of level02's 268 draws) and neither is a depth-slice threshold (one orthographic camera runs
+0.06..0.30 and overlaps the world's 0.10..1.00). And the decode is **albedo only** - textures and
+unpacked D3DCOLOR vertex colours, never light or material colours, which are intensities rather
+than pictures and several of which exceed 1. It reaches 83% of level02
+at 9.56/255 - coverage, not a score - and what that reach *is* on screen is shadow detail rather
+than range: the dark half of the frame becomes legible, the characters get darker because they were
+blowing out, and that frame has almost no over-range in it at all. The fire cameras are where the
+range half still has to be looked at.
 
 It also draws **ambient occlusion with no blur pass** (`render.ao`, off by default): the sample
 offsets are generated in 2D from one fixed lattice disc shared by every pixel and the 3D position of

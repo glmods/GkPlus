@@ -1,6 +1,7 @@
 #include "VkRenderer.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <vector>
 
@@ -76,6 +77,44 @@ bool ImGuiReady = false;
 VkImage OffscreenImage = VK_NULL_HANDLE;
 VkDeviceMemory OffscreenMemory = VK_NULL_HANDLE;
 VkImageView OffscreenView = VK_NULL_HANDLE;
+// What the offscreen and multisampled targets were actually BUILT at, which is the swapchain's
+// format until `render.hdr` moves it to `R16G16B16A16_SFLOAT`. It is what the reconcile compares
+// against and what it hands `ApplyColourFormat`, the same relationship `MsaaSamples` has to
+// `MsaaTargetSamples()` - so a target that failed to allocate leaves this at the format the
+// pipelines were built for rather than at the one that was asked for.
+VkFormat TargetFormat = VK_FORMAT_UNDEFINED;
+
+// --- the LDR intermediate, where the tonemap lands and the 2D layers are drawn ----------------
+//
+// Only exists while the frame is being tonemapped. The tonemap cannot write the swapchain
+// directly, because the 2D pass has to come after it and 2D has to rasterise at the GAME's
+// backbuffer size - which is §4.37's whole finding, and the reason the offscreen target exists in
+// the first place. So the tonemap writes here at the render extent, the UI pass draws on top of it
+// here, and the existing NEAREST blit takes the finished image to the swapchain exactly as it
+// always did.
+//
+// Its format is the swapchain's, not the float one: everything drawn into it is authored final,
+// and the blit at the end needs no conversion.
+VkImage LdrImage = VK_NULL_HANDLE;
+VkDeviceMemory LdrMemory = VK_NULL_HANDLE;
+VkImageView LdrView = VK_NULL_HANDLE;
+VkExtent2D LdrExtent = {};
+
+// ...and a depth buffer of its own, single-sample, rather than a share of the world pass's.
+//
+// **Not a convenience - the world's is the wrong sample count.** With `render.msaa` on, that image
+// is multisampled and the pipelines that use it are too, while the LDR colour target is and must
+// be single-sample; a pass mixing the two is invalid, and validation says so on the
+// `vkCmdBeginRendering` and again on every draw. Antialiasing the 2D layer would be the wrong fix
+// as well as the expensive one: there is no geometric edge in a screen-space quad to smooth.
+//
+// It could be skipped altogether if the 2D layers only ever painted in submission order, and they
+// nearly do - but `Camera_Text` (0.02..0.04) and `Camera_Hud` (0.03..0.04) overlap, so depth is
+// what orders those two against each other and dropping it would be a behaviour change rather
+// than a saving.
+VkImage UiDepthImage = VK_NULL_HANDLE;
+VkDeviceMemory UiDepthMemory = VK_NULL_HANDLE;
+VkImageView UiDepthView = VK_NULL_HANDLE;
 // What the world pass rasterises into: the backbuffer size when the offscreen target is up, the
 // swapchain extent when it is not. The depth buffer and every viewport follow it.
 VkExtent2D RenderExtent = {};
@@ -401,13 +440,19 @@ bool CreateOffscreen(VkExtent2D extent) {
 
   VkImageCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   info.imageType = VK_IMAGE_TYPE_2D;
-  info.format = Format.format;
+  info.format = TargetFormat;
   info.extent = {extent.width, extent.height, 1};
   info.mipLevels = 1;
   info.arrayLayers = 1;
   info.samples = VK_SAMPLE_COUNT_1_BIT;
   info.tiling = VK_IMAGE_TILING_OPTIMAL;
-  info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  // SAMPLED as well as TRANSFER_SRC, and **both unconditionally**. The two are the two ways this
+  // image reaches the swapchain - the blit reads it as a transfer source, the tonemap pass reads
+  // it as a texture - and asking for only the one the current knob needs would mean recreating
+  // the image on a toggle that otherwise costs nothing but a pipeline rebuild. A usage bit on an
+  // image this size is free; a rebuild path that only runs when someone flips a knob is not.
+  info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+               VK_IMAGE_USAGE_SAMPLED_BIT;
   info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   if (vkCreateImage(device, &info, nullptr, &OffscreenImage) != VK_SUCCESS) {
@@ -441,12 +486,144 @@ bool CreateOffscreen(VkExtent2D extent) {
   VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
   view.image = OffscreenImage;
   view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-  view.format = Format.format;
+  view.format = TargetFormat;
   view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
   if (vkCreateImageView(device, &view, nullptr, &OffscreenView) != VK_SUCCESS) {
     return Fail("could not create the offscreen colour target's view");
   }
+  // The tonemap pass reads this image out of the bindless array rather than through a descriptor
+  // set of its own, the same way the AO resolve reads the prepass's targets. Written once here
+  // because a bindless slot is a pointer to a view and this view only changes when the target is
+  // rebuilt - at which point this runs again. It is the only one of the reserved slots written
+  // from this file, because this is the only one of those images VkRenderer owns.
+  WriteBindlessView(kTonemapSourceSlot, reinterpret_cast<uint64_t>(OffscreenView));
   OffscreenActive = true;
+  return true;
+}
+
+void DestroyLdrTarget() {
+  VkDevice device = GetDevice();
+  if (UiDepthView != VK_NULL_HANDLE) {
+    vkDestroyImageView(device, UiDepthView, nullptr);
+    UiDepthView = VK_NULL_HANDLE;
+  }
+  if (UiDepthImage != VK_NULL_HANDLE) {
+    vkDestroyImage(device, UiDepthImage, nullptr);
+    UiDepthImage = VK_NULL_HANDLE;
+  }
+  if (UiDepthMemory != VK_NULL_HANDLE) {
+    vkFreeMemory(device, UiDepthMemory, nullptr);
+    UiDepthMemory = VK_NULL_HANDLE;
+  }
+  if (LdrView != VK_NULL_HANDLE) {
+    vkDestroyImageView(device, LdrView, nullptr);
+    LdrView = VK_NULL_HANDLE;
+  }
+  if (LdrImage != VK_NULL_HANDLE) {
+    vkDestroyImage(device, LdrImage, nullptr);
+    LdrImage = VK_NULL_HANDLE;
+  }
+  if (LdrMemory != VK_NULL_HANDLE) {
+    vkFreeMemory(device, LdrMemory, nullptr);
+    LdrMemory = VK_NULL_HANDLE;
+  }
+  LdrExtent = {};
+}
+
+// Same allocation shape as the offscreen target above, and directly rather than through VMA for
+// the same reason: one image that lives as long as the swapchain does.
+bool CreateLdrTarget(VkExtent2D extent) {
+  DestroyLdrTarget();
+  VkDevice device = GetDevice();
+
+  VkImageCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  info.imageType = VK_IMAGE_TYPE_2D;
+  info.format = Format.format;
+  info.extent = {extent.width, extent.height, 1};
+  info.mipLevels = 1;
+  info.arrayLayers = 1;
+  // **One sample, whatever `render.msaa` says.** The world pass has already resolved by the time
+  // the tonemap runs, and the 2D layers are screen-space quads and text with nothing to
+  // antialias - the game drew them unmultisampled on every renderer it ever had.
+  info.samples = VK_SAMPLE_COUNT_1_BIT;
+  info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (vkCreateImage(device, &info, nullptr, &LdrImage) != VK_SUCCESS) {
+    return Fail("could not create the LDR target");
+  }
+
+  VkMemoryRequirements requirements = {};
+  vkGetImageMemoryRequirements(device, LdrImage, &requirements);
+  VkPhysicalDeviceMemoryProperties memory = {};
+  vkGetPhysicalDeviceMemoryProperties(GetPhysicalDevice(), &memory);
+  uint32_t type = UINT32_MAX;
+  for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+    if ((requirements.memoryTypeBits & (1u << i)) != 0 &&
+        (memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+      type = i;
+      break;
+    }
+  }
+  if (type == UINT32_MAX) {
+    return Fail("no device-local memory type for the LDR target");
+  }
+
+  VkMemoryAllocateInfo allocate = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  allocate.allocationSize = requirements.size;
+  allocate.memoryTypeIndex = type;
+  if (vkAllocateMemory(device, &allocate, nullptr, &LdrMemory) != VK_SUCCESS ||
+      vkBindImageMemory(device, LdrImage, LdrMemory, 0) != VK_SUCCESS) {
+    return Fail("could not back the LDR target");
+  }
+
+  VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  view.image = LdrImage;
+  view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view.format = Format.format;
+  view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  if (vkCreateImageView(device, &view, nullptr, &LdrView) != VK_SUCCESS) {
+    return Fail("could not create the LDR target's view");
+  }
+  // The 2D pass's own single-sample depth, in the world's format so the pipelines it shares
+  // declare the same one.
+  VkImageCreateInfo depth_info = info;
+  depth_info.format = static_cast<VkFormat>(DepthFormatValue());
+  depth_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+  if (vkCreateImage(device, &depth_info, nullptr, &UiDepthImage) != VK_SUCCESS) {
+    return Fail("could not create the 2D pass's depth buffer");
+  }
+  vkGetImageMemoryRequirements(device, UiDepthImage, &requirements);
+  type = UINT32_MAX;
+  for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+    if ((requirements.memoryTypeBits & (1u << i)) != 0 &&
+        (memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+      type = i;
+      break;
+    }
+  }
+  if (type == UINT32_MAX) {
+    return Fail("no device-local memory type for the 2D pass's depth buffer");
+  }
+  allocate.allocationSize = requirements.size;
+  allocate.memoryTypeIndex = type;
+  if (vkAllocateMemory(device, &allocate, nullptr, &UiDepthMemory) != VK_SUCCESS ||
+      vkBindImageMemory(device, UiDepthImage, UiDepthMemory, 0) != VK_SUCCESS) {
+    return Fail("could not back the 2D pass's depth buffer");
+  }
+  VkImageViewCreateInfo depth_view_info = view;
+  depth_view_info.image = UiDepthImage;
+  depth_view_info.format = depth_info.format;
+  depth_view_info.subresourceRange = {
+      VK_IMAGE_ASPECT_DEPTH_BIT |
+          (DepthHasStencil() ? VK_IMAGE_ASPECT_STENCIL_BIT : VkImageAspectFlags(0)),
+      0, 1, 0, 1};
+  if (vkCreateImageView(device, &depth_view_info, nullptr, &UiDepthView) != VK_SUCCESS) {
+    return Fail("could not create the 2D pass's depth view");
+  }
+
+  LdrExtent = extent;
   return true;
 }
 
@@ -475,7 +652,9 @@ bool CreateMsaaTarget(VkExtent2D extent, VkSampleCountFlagBits samples) {
 
   VkImageCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   info.imageType = VK_IMAGE_TYPE_2D;
-  info.format = Format.format;
+  // `TargetFormat` and not the swapchain's: this image resolves INTO whichever image `world_view`
+  // names, and a resolve requires both to have the same format.
+  info.format = TargetFormat;
   info.extent = {extent.width, extent.height, 1};
   info.mipLevels = 1;
   info.arrayLayers = 1;
@@ -520,7 +699,7 @@ bool CreateMsaaTarget(VkExtent2D extent, VkSampleCountFlagBits samples) {
   VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
   view.image = MsaaImage;
   view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-  view.format = Format.format;
+  view.format = TargetFormat;
   view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
   if (vkCreateImageView(device, &view, nullptr, &MsaaView) != VK_SUCCESS) {
     return Fail("could not create the multisampled colour target's view");
@@ -570,8 +749,18 @@ bool ReconcileRenderTarget() {
   bool want_offscreen = false;
   const VkExtent2D want = DesiredRenderExtent(want_offscreen);
   const auto want_samples = static_cast<VkSampleCountFlagBits>(MsaaTargetSamples());
+  // **HDR needs the offscreen target and cannot be done without it.** With no target of its own
+  // the world pass draws straight into the swapchain image, whose format is not ours to choose -
+  // so `render.hdr` is simply inert in that configuration rather than being an error, exactly as
+  // it is on a device with no tonemap pass. That is also the honest answer: the fallback exists
+  // because the surface would not take TRANSFER_DST (see CreateSwapchain), and a renderer that
+  // refused to draw there would trade a working frame for a feature.
+  const auto want_format = want_offscreen
+                               ? static_cast<VkFormat>(HdrTargetFormat(Format.format))
+                               : Format.format;
   if (want_offscreen == OffscreenActive && want.width == RenderExtent.width &&
-      want.height == RenderExtent.height && want_samples == MsaaSamples) {
+      want.height == RenderExtent.height && want_samples == MsaaSamples &&
+      want_format == TargetFormat) {
     return true;
   }
   {
@@ -579,15 +768,24 @@ bool ReconcileRenderTarget() {
     vkDeviceWaitIdle(GetDevice());
   }
   RenderExtent = want;
+  // Before either target is created: both read it.
+  TargetFormat = want_format;
   if (want_offscreen) {
     if (!CreateOffscreen(want)) {
       // Fall back rather than stop: rasterising at the window's size is what every build before
       // §4.37 did, and a renderer that draws slightly wrong beats one that draws nothing.
       DestroyOffscreen();
       RenderExtent = Extent;
+      // ... and the format falls back with it, for the reason the `else` branch below gives.
+      TargetFormat = Format.format;
     }
   } else {
     DestroyOffscreen();
+    // Whatever was wanted, the world pass is about to draw into the swapchain image, so the
+    // pipelines have to be built for the swapchain's format. This is the fallback path above as
+    // well as the deliberate one - `CreateOffscreen` failing must not leave the pipelines built
+    // for a target that does not exist.
+    TargetFormat = Format.format;
   }
   // After the offscreen target, because it is sized to `RenderExtent` and the fallback above can
   // still move it. Same fallback shape for the same reason - a target that will not allocate
@@ -599,10 +797,27 @@ bool ReconcileRenderTarget() {
   } else {
     DestroyMsaaTarget();
   }
+  // The LDR intermediate exists only while the frame is tonemapped, and is sized to the render
+  // extent like everything else here. A failure to allocate is not fatal and not even a fallback:
+  // `Tonemapping()` reads this image's existence, so a frame that cannot have it goes back to the
+  // plain blit and loses HDR rather than losing the frame - the rule every optional pass in this
+  // renderer follows.
+  if (OffscreenActive && TargetFormat != Format.format) {
+    if (!CreateLdrTarget(RenderExtent)) {
+      DestroyLdrTarget();
+    }
+  } else {
+    DestroyLdrTarget();
+  }
   // `MsaaSamples` and not `want_samples`: it is what the target was actually built at, so a
   // failure above leaves the pipelines and the depth image at one sample and agreeing with the
   // attachment they will be used with. Before ResizeDraw, whose CreateDepth reads it.
   ApplySampleCount(static_cast<uint32_t>(MsaaSamples));
+  // `TargetFormat` and not `want_format`, for exactly that reason: it is what the targets were
+  // built at, and every fallback above has already written the truth into it. This is where the
+  // world pipeline cache goes when HDR is switched, and it is safe here and nowhere else - the
+  // wait-idle above still holds.
+  ApplyColourFormat(static_cast<uint32_t>(TargetFormat));
   // DrawReady() is false during bring-up, where StartDraw creates the depth buffer at this same
   // extent immediately afterwards.
   if (DrawReady() && !ResizeDraw(RenderExtent.width, RenderExtent.height)) {
@@ -973,17 +1188,39 @@ void DrawFrame() {
   // part that actually matters - is what every alpha-blended and additive draw over an uncovered
   // background blends *against*. A translucent beam against a black sky comes out lighter and
   // hazier over a blue-grey one, which reads as "this renderer gets translucency wrong".
+  // Whether the frame is being tonemapped, which is the one question the rest of this function
+  // asks about HDR. `TargetFormat != Format.format` says the offscreen target is the float one, so
+  // only the tonemap pass can present it; `LdrView` says the intermediate that pass writes into
+  // actually got allocated. Both, because a float target with nowhere to tonemap it to is a black
+  // window.
+  const bool tonemapping =
+      OffscreenActive && TargetFormat != Format.format && LdrView != VK_NULL_HANDLE;
+
   const d3d8::ClearValues &clears = d3d8::Clears();
-  const auto channel = [](uint32_t argb, int shift) {
-    return static_cast<float>((argb >> shift) & 0xff) / 255.0f;
+  // sRGB-decoded on the same terms as every other albedo the frame carries (see kLinearInput in
+  // world.slang). It has to be: this colour is what every alpha-blended and additive draw over an
+  // uncovered background blends against, so leaving it encoded while everything drawn on top of it
+  // is linear would make the sky the one surface in the frame in the wrong space. The exact
+  // piecewise curve, and the inverse of tonemap.slang's `srgb_encode`.
+  const bool decode_clear = tonemapping && LinearInput();
+  const auto channel = [decode_clear](uint32_t argb, int shift) {
+    const float value = static_cast<float>((argb >> shift) & 0xff) / 255.0f;
+    if (!decode_clear) {
+      return value;
+    }
+    return value <= 0.04045f ? value / 12.92f
+                             : std::pow((value + 0.055f) / 1.055f, 2.4f);
   };
   VkRenderingAttachmentInfo colour = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
   colour.imageView = world_view;
   colour.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
   colour.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
   colour.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  // The alpha deliberately does NOT go through `channel`: alpha is coverage rather than light and
+  // is not gamma-encoded, which is the same rule `decode_albedo` follows in the shader.
   colour.clearValue.color = {{channel(clears.colour, 16), channel(clears.colour, 8),
-                              channel(clears.colour, 0), channel(clears.colour, 24)}};
+                              channel(clears.colour, 0),
+                              static_cast<float>((clears.colour >> 24) & 0xff) / 255.0f}};
 
   // Multisampling is entirely this: the pass draws into `MsaaView` and averages into the image it
   // would otherwise have drawn into. Everything downstream - the scale blit, the overlay pass, the
@@ -1059,13 +1296,124 @@ void DrawFrame() {
   VkRect2D scissor = {{0, 0}, RenderExtent};
   vkCmdSetViewport(frame.cmd, 0, 1, &viewport);
   vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
-  RecordDraws(frame.cmd);
+  // The world layer alone when the frame is being tonemapped: the 2D layers are drawn AFTER the
+  // tonemap, into the LDR target, because a tonemap curve applied to Gunlok's menus, briefing
+  // screens and HUD recolours content that was authored final (§4.92). `Layer::All` is the
+  // single-pass frame every build before that drew, and is what runs whenever HDR is off.
+  //
+  // **`Layer::World` must be followed by `Layer::Ui`**, unconditionally and even when the layer is
+  // empty: `RecordDraws` hands the draw list to `LastItems` on any pass that is not `World`, so a
+  // `World` pass with no `Ui` after it would leak the list into the next frame.
+  RecordDraws(frame.cmd, tonemapping ? Layer::World : Layer::All);
   vkCmdEndRendering(frame.cmd);
 
-  // The scale, which is what makes the two sizes agree. NEAREST rather than LINEAR by default:
-  // the original's own stretch preserves a 4-bit texture's sixteen distinct values (§4.37), which
-  // only a point sample can, so D3D drops columns rather than mixing them.
-  if (OffscreenActive) {
+  // Under HDR the frame finishes in three steps instead of one, and the ORDER is the whole point
+  // of §4.92: tonemap the world into an LDR target, draw the 2D layers on top of it there, and
+  // only then scale to the swapchain. Drawing the 2D layers before the tonemap is what put
+  // Gunlok's menus, briefing screens and HUD through a curve that was never meant for them.
+  //
+  // Why the LDR target and not the swapchain: the 2D pass has to rasterise at the GAME's
+  // backbuffer size, which is §4.37's finding and the reason the offscreen target exists at all.
+  // The scale therefore has to stay last.
+  if (tonemapping) {
+    Barrier(frame.cmd, OffscreenImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    Barrier(frame.cmd, LdrImage, VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    // Into the LDR target at the RENDER extent, so this one is 1:1 and does no scaling at all -
+    // the scale happens in the blit below, as it always did. RecordTonemap's nearest mapping is
+    // the identity when the two extents match.
+    RecordTonemap(frame.cmd, reinterpret_cast<uint64_t>(LdrView), RenderExtent.width,
+                  RenderExtent.height, RenderExtent.width, RenderExtent.height);
+
+    // The 2D layers, on top of the tonemapped world. Skipped when there are none, which is most
+    // in-level frames' neighbours - though not level02's, which has seven.
+    if (HasUiDraws()) {
+      VkRenderingAttachmentInfo ui_colour = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+      ui_colour.imageView = LdrView;
+      ui_colour.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      // LOAD, not CLEAR: the tonemapped world is what these draws blend over, and that is the
+      // whole correctness argument for doing it here rather than masking pixels in the tonemap -
+      // a translucent HUD element blends against final LDR colour exactly as it does on the
+      // original.
+      ui_colour.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      ui_colour.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+      // **The depth buffer is CLEARED for this pass, not carried over, and that is safe rather
+      // than convenient.** These draws only ever have to occlude each other: every 2D camera owns
+      // a depth slice at or below 0.06 while `Camera_World` owns 0.10..1.00
+      // (`rendering_notes.md` §4.4), so with `D3DCMP_LESSEQUAL` a 2D draw passes against any world
+      // depth by construction and the world can never occlude it. Their mutual ordering is
+      // preserved because they are recorded in submission order into one pass. Clearing also means
+      // the world pass keeps its `DONT_CARE` store and costs no extra bandwidth for this.
+      // **Its own depth image, not the world's** - see UiDepthImage. The world's is multisampled
+      // whenever `render.msaa` is on and this target is not, and a pass may not mix the two.
+      VkRenderingAttachmentInfo ui_depth = depth;
+      ui_depth.imageView = UiDepthView;
+      ui_depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+      ui_depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+      VkRenderingAttachmentInfo ui_stencil = ui_depth;
+
+      if (UiDepthView != VK_NULL_HANDLE) {
+        Barrier(frame.cmd, UiDepthImage, VK_IMAGE_LAYOUT_UNDEFINED, depth_layout,
+                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                VK_IMAGE_ASPECT_DEPTH_BIT |
+                    (has_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VkImageAspectFlags(0)));
+      }
+
+      VkRenderingInfo ui_pass = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+      ui_pass.renderArea.extent = RenderExtent;
+      ui_pass.layerCount = 1;
+      ui_pass.colorAttachmentCount = 1;
+      ui_pass.pColorAttachments = &ui_colour;
+      ui_pass.pDepthAttachment = UiDepthView != VK_NULL_HANDLE ? &ui_depth : nullptr;
+      ui_pass.pStencilAttachment =
+          (UiDepthView != VK_NULL_HANDLE && has_stencil) ? &ui_stencil : nullptr;
+      vkCmdBeginRendering(frame.cmd, &ui_pass);
+      // The same viewport and scissor the world pass used, half-pixel origin included: these are
+      // the same draws with the same pixels-to-clip matrix, just later.
+      vkCmdSetViewport(frame.cmd, 0, 1, &viewport);
+      vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
+      RecordDraws(frame.cmd, Layer::Ui);
+      vkCmdEndRendering(frame.cmd);
+    } else {
+      // Nothing in the layer, but the list still has to be handed over - see the note on
+      // `Layer::World` above. Records no commands.
+      RecordDraws(frame.cmd, Layer::Ui);
+    }
+
+    // ...and now the scale, from the finished LDR image, with exactly the blit the non-HDR path
+    // below uses.
+    Barrier(frame.cmd, LdrImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT,
+            VK_ACCESS_2_TRANSFER_READ_BIT);
+    Barrier(frame.cmd, Images[image_index], VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+            VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+
+    VkImageBlit blit = {};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[1] = {static_cast<int32_t>(RenderExtent.width),
+                          static_cast<int32_t>(RenderExtent.height), 1};
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.dstOffsets[1] = {static_cast<int32_t>(Extent.width),
+                          static_cast<int32_t>(Extent.height), 1};
+    vkCmdBlitImage(frame.cmd, LdrImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   Images[image_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                   PresentLinearFilter ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+  } else if (OffscreenActive) {
+    // The blit, unchanged: NEAREST rather than LINEAR by default because the original's own
+    // stretch preserves a 4-bit texture's sixteen distinct values (§4.37), which only a point
+    // sample can, so D3D drops columns rather than mixing them.
     Barrier(frame.cmd, OffscreenImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -1091,14 +1439,19 @@ void DrawFrame() {
   // going through the scale above. It loads rather than clears - the world is already there,
   // whether by blit or because it was drawn straight into this image.
   if (draw_data != nullptr) {
+    // The swapchain image is written by a transfer whenever there is an offscreen target at all -
+    // the HDR path scales from the LDR intermediate with the same blit the plain path uses, so
+    // both end in TRANSFER_DST. The only case that does not is the world pass drawing straight
+    // into it.
+    const bool came_from_blit = OffscreenActive;
     Barrier(frame.cmd, Images[image_index],
-            OffscreenActive ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
-                            : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            came_from_blit ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                           : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            OffscreenActive ? VK_PIPELINE_STAGE_2_BLIT_BIT
-                            : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            OffscreenActive ? VK_ACCESS_2_TRANSFER_WRITE_BIT
-                            : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            came_from_blit ? VK_PIPELINE_STAGE_2_BLIT_BIT
+                           : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            came_from_blit ? VK_ACCESS_2_TRANSFER_WRITE_BIT
+                           : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT);
 
@@ -1120,7 +1473,10 @@ void DrawFrame() {
     vkCmdEndRendering(frame.cmd);
   }
 
-  // Whichever of the three wrote the swapchain image last is what this barrier comes from.
+  // Whichever wrote the swapchain image last is what this barrier comes from, and after §4.92
+  // there are only two: the overlay and the direct world pass write it as an attachment, and
+  // everything else arrives through the blit. The tonemap does NOT touch this image - it writes
+  // the LDR intermediate, which the blit then scales from.
   const bool ended_as_attachment = draw_data != nullptr || !OffscreenActive;
   Barrier(frame.cmd, Images[image_index],
           ended_as_attachment ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL

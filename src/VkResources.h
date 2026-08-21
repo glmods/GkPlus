@@ -295,6 +295,11 @@ constexpr uint32_t kDynShadowMapSlot = 4093;
 constexpr uint32_t kAoResultSlot = 4091;   // what the world shader multiplies by
 constexpr uint32_t kAoPositionSlot = 4090; // world position per pixel, the resolve's input
 constexpr uint32_t kAoNormalSlot = 4089;   // ... and its normal
+// The offscreen colour target, which the tonemap pass reads back as a texture under `render.hdr`.
+// Same reasoning again - it is not a `TextureImage`, so the top of the array keeps it clear of
+// every path that walks the image list - and it is the only one of these written by VkRenderer
+// rather than by VkDraw, because VkRenderer owns that image.
+constexpr uint32_t kTonemapSourceSlot = 4088;
 void WriteBindlessView(uint32_t index, uint64_t view);
 
 // The set and its layout, as opaque handles so this header keeps mentioning no Vulkan type

@@ -8,6 +8,8 @@
 // what the game itself draws - `render.material_override` repaints the Vulkan frame and leaves
 // `GKPLUS_RENDERER=d3d8` and `d3d9` exactly as they were. That is what keeps the A/B honest.
 
+#include <string>
+
 #include "D3D8Capture.h"
 #include "JsBindings.h"
 #include "VkCapture.h"
@@ -714,11 +716,134 @@ JSValue SetMsaaValue(JSContext *ctx, JSValueConst, JSValueConst value) {
   return JS_UNDEFINED;
 }
 
-// `render.stock` - all ten deliberate departures from D3D8 at once, and back again (VkDraw.h,
+// --- HDR (VkDraw.h's "HDR: a linear-light pipeline with an SDR tonemap") ----------------------
+//
+// `render.hdr` - the world pass into `R16G16B16A16_SFLOAT` and a tonemap pass in place of the
+// scale blit. Off by default, and in `render.stock`'s set.
+//
+// **Writable at any time and it costs one frame**, for exactly the reason `render.msaa` does and
+// through the same machinery: the setter records the request and `ReconcileRenderTarget` rebuilds
+// the targets and the world pipeline cache at the top of the next frame, under the wait-idle a
+// resize takes anyway.
+//
+// Unlike `render.msaa` this one reads back **as requested, not as effective**, and that is
+// deliberate rather than an inconsistency: the effective value is a `VkFormat` this side does not
+// name, and the two things that can make it differ - a device with no tonemap pass, and the frame
+// between the write and the reconcile - are both reported by `render.status` in words. A panel
+// binding a checkbox here therefore does not have to keep a pending value of its own.
+JSValue GetHdr(JSContext *ctx, JSValueConst) { return JS_NewBool(ctx, vulkan::Hdr()); }
+
+JSValue SetHdrValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetHdr(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+// `render.linear_input` - sRGB-decode every albedo the shader reads. On by default *within* HDR,
+// and inert without it. Off is the bisect: `hdr` with `linear_input` off is the same numbers in a
+// wider container, so anything that changes between the two is the colour work rather than the
+// pass.
+JSValue GetLinearInput(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::LinearInput());
+}
+
+JSValue SetLinearInputValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetLinearInput(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+// `render.tonemap` - the operator, as a name rather than a number, because a number here would be
+// unreadable in a REPL session and every one of the four is a different look.
+//
+// **No operator reaches the 2D half of the game**: the menus, briefing screens, HUD and inventory
+// are drawn after the tonemap, so what is chosen here applies to the world alone (notes §4.92).
+// `rolloff` is the default because it is the conservative one - exactly the identity below
+// `render.tonemap_knee`, so it only touches what genuinely exceeds it - and not because anything
+// depends on it any more.
+const char *TonemapName(uint32_t op) {
+  switch (op) {
+  case 1: return "rolloff";
+  case 2: return "reinhard";
+  case 3: return "aces";
+  default: return "clamp";
+  }
+}
+
+JSValue GetTonemap(JSContext *ctx, JSValueConst) {
+  return JS_NewString(ctx, TonemapName(vulkan::Tonemap()));
+}
+
+JSValue SetTonemapValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  const char *name = JS_ToCString(ctx, value);
+  if (name == nullptr) {
+    return JS_EXCEPTION;
+  }
+  const std::string text = name;
+  JS_FreeCString(ctx, name);
+  // **Refused rather than approximated**, the same rule `GKPLUS_VK_PRESENT_MODE` follows: the
+  // whole point of naming an operator is knowing which one ran, and a typo silently behaving as
+  // `clamp` would read as "HDR does nothing on this machine".
+  if (text == "clamp") {
+    vulkan::SetTonemap(0);
+  } else if (text == "rolloff") {
+    vulkan::SetTonemap(1);
+  } else if (text == "reinhard") {
+    vulkan::SetTonemap(2);
+  } else if (text == "aces") {
+    vulkan::SetTonemap(3);
+  } else {
+    return JS_ThrowTypeError(ctx, "render.tonemap must be clamp, rolloff, reinhard or aces");
+  }
+  return JS_UNDEFINED;
+}
+
+// `render.exposure` - a linear multiplier applied before the operator, which is the only place it
+// can go: after it, it would brighten an already-compressed image and undo the compression.
+JSValue GetExposure(JSContext *ctx, JSValueConst) {
+  return JS_NewFloat64(ctx, vulkan::Exposure());
+}
+
+JSValue SetExposureValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  double v = 0.0;
+  if (JS_ToFloat64(ctx, &v, value) != 0) {
+    return JS_EXCEPTION;
+  }
+  vulkan::SetExposure(static_cast<float>(v));
+  return JS_UNDEFINED;
+}
+
+// `render.tonemap_knee` - where `rolloff` stops being the identity. Read by that operator alone.
+JSValue GetTonemapKnee(JSContext *ctx, JSValueConst) {
+  return JS_NewFloat64(ctx, vulkan::TonemapKnee());
+}
+
+JSValue SetTonemapKneeValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  double v = 0.0;
+  if (JS_ToFloat64(ctx, &v, value) != 0) {
+    return JS_EXCEPTION;
+  }
+  vulkan::SetTonemapKnee(static_cast<float>(v));
+  return JS_UNDEFINED;
+}
+
+// `render.tonemap_white` - what `reinhard` maps to exactly 1.0. Read by that operator alone.
+JSValue GetTonemapWhite(JSContext *ctx, JSValueConst) {
+  return JS_NewFloat64(ctx, vulkan::TonemapWhite());
+}
+
+JSValue SetTonemapWhiteValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  double v = 0.0;
+  if (JS_ToFloat64(ctx, &v, value) != 0) {
+    return JS_EXCEPTION;
+  }
+  vulkan::SetTonemapWhite(static_cast<float>(v));
+  return JS_UNDEFINED;
+}
+
+// `render.stock` - all eleven deliberate departures from D3D8 at once, and back again (VkDraw.h,
 // notes §4.87). `true` is the setup a comparison against `GKPLUS_RENDERER=d3d8` needs; `false`
 // restores what the session had, not the build's defaults.
 //
-// **The point of it is that the A/B is one write on a paused frame.** Ten of them by hand is ten
+// **The point of it is that the A/B is one write on a paused frame.** Eleven by hand is eleven
 // frames of drift on anything that moves, and the comparison this exists to serve is the one with
 // the zero noise floor.
 //
@@ -1733,6 +1858,12 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("pn_max_offset", Getpn_max_offset, Setpn_max_offsetValue),
     JS_CGETSET_DEF("tess_shadow_factor", Getshadow_factor, Setshadow_factorValue),
     JS_CGETSET_DEF("msaa", GetMsaa, SetMsaaValue),
+    JS_CGETSET_DEF("hdr", GetHdr, SetHdrValue),
+    JS_CGETSET_DEF("linear_input", GetLinearInput, SetLinearInputValue),
+    JS_CGETSET_DEF("tonemap", GetTonemap, SetTonemapValue),
+    JS_CGETSET_DEF("exposure", GetExposure, SetExposureValue),
+    JS_CGETSET_DEF("tonemap_knee", GetTonemapKnee, SetTonemapKneeValue),
+    JS_CGETSET_DEF("tonemap_white", GetTonemapWhite, SetTonemapWhiteValue),
     JS_CGETSET_DEF("stock", GetStock, SetStockValue),
     JS_CGETSET_DEF("per_pixel_lighting", GetPerPixelLighting, SetPerPixelLightingValue),
     JS_CGETSET_DEF("map_light_report", GetMapLightReport, nullptr),

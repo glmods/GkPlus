@@ -2761,19 +2761,104 @@ declare module "gk" {
      *  writable afterwards either way. */
     msaa: number;
 
+    /** Render the world into a float target and tonemap it to the swapchain.
+     *
+     *  The first feature in this renderer whose goal is **not** reproduction.
+     *  It changes the arithmetic of every blend in the frame on purpose: the
+     *  world pass draws into `R16G16B16A16_SFLOAT`, every albedo is
+     *  sRGB-decoded on the way in (see {@link linear_input}), the clamps that
+     *  reproduce the fixed function's D3DCOLOR output come off, and a
+     *  full-screen pass tonemaps and re-encodes on the way out. Internal HDR,
+     *  SDR presentation - no HDR display is involved and the swapchain is
+     *  unchanged.
+     *
+     *  What the range is *for*: the map light rig authors values well over 1
+     *  (level02's key light is `diffuse 4.0`), every `ONE/ONE` additive draw -
+     *  fires, flares, muzzle flashes - saturates at 1 in the framebuffer, and
+     *  the lighting maps' highlights are clipped by the same output. All three
+     *  are crushed without this and survive to the tonemap with it.
+     *
+     *  **Takes effect on the next frame**, through exactly the machinery
+     *  {@link msaa} uses: the colour format is baked into every world pipeline,
+     *  so the write records a request and the rebuild happens between frames.
+     *  Unlike `msaa` this reads back **as requested**, so a control can bind to
+     *  it directly; `render.status` is where "requested but not engaged" shows
+     *  up, which is what a device with no tonemap pass reads as.
+     *
+     *  Needs the offscreen target, so it is inert with {@link offscreen} off or
+     *  on a surface that will not take `TRANSFER_DST`.
+     *  In {@link stock}'s set. `GKPLUS_VK_HDR=1` is the launch-time form. */
+    hdr: boolean;
+
+    /** sRGB-decode every albedo the shader reads. On by default, inert without
+     *  {@link hdr}.
+     *
+     *  **Albedo only**: texture fetches and unpacked D3DCOLOR vertex colours,
+     *  which are gamma-encoded pictures of a surface. Deliberately *not* light
+     *  or material colours - those are intensities the game authored as
+     *  numbers, several of them greater than 1, and a curve would bend an
+     *  authored quantity it never went through. Alpha is never decoded
+     *  anywhere, which leaves the alpha test's 0..255 comparison alone.
+     *
+     *  Off is the **bisect**: `hdr` with this off is the same numbers in a
+     *  wider container, nothing but over-range changed - so anything that
+     *  differs between the two settings is the colour work rather than the
+     *  pass. */
+    linear_input: boolean;
+
+    /** The tonemap operator: `"clamp"`, `"rolloff"`, `"reinhard"` or `"aces"`.
+     *  Anything else throws rather than falling back, because a typo behaving
+     *  as `clamp` would read as "HDR does nothing on this machine".
+     *
+     *  **Every operator is safe for the 2D half of the game.** The menus, the
+     *  briefing and debrief screens, the HUD, the inventory and the upgrade
+     *  screen are drawn *after* the tonemap, so no operator reaches them and
+     *  what is chosen here applies to the world alone. That is a property of
+     *  the pass structure rather than of the curve, and it was not always true:
+     *  before the split, ACES recoloured 99.61% of the main menu.
+     *
+     *  `rolloff` is the default because it is the conservative one, not because
+     *  anything depends on it - it is exactly the identity below
+     *  {@link tonemap_knee}, so it only ever touches what genuinely exceeds it.
+     *
+     *  `clamp` is what the 8-bit target did by itself; with `linear_input` off
+     *  it makes the pass a reproduction of the blit it replaced. */
+    tonemap: "clamp" | "rolloff" | "reinhard" | "aces";
+
+    /** A linear multiplier applied **before** the operator, which is the only
+     *  place it can go - after it, it would brighten an already-compressed
+     *  image and undo the compression. 1 by default. */
+    exposure: number;
+
+    /** Where `rolloff` stops being the identity, 0.75 by default. Read by that
+     *  operator alone. Below it the curve is exactly `y = x`; above it the
+     *  remaining headroom is compressed with a C1 join, asymptotic to 1, so no
+     *  finite input ever clips and there is no crease at the knee. */
+    tonemap_knee: number;
+
+    /** What `reinhard` maps to exactly 1.0, 4.0 by default - the magnitude of
+     *  the over-range that actually reaches the pass in this game. Read by that
+     *  operator alone. */
+    tonemap_white: number;
+
     /** Every deliberate departure from D3D8, switched together.
      *
      *  `true` is the setup a fidelity comparison against
-     *  `GKPLUS_RENDERER=d3d8` needs, in one write rather than ten - which is
+     *  `GKPLUS_RENDERER=d3d8` needs, in one write rather than eleven - which is
      *  the whole point, because the comparison worth making is on a *paused*
-     *  frame and ten writes is ten frames of drift on anything that moves.
+     *  frame and eleven writes is eleven frames of drift on anything that
+     *  moves.
      *
      *  The set is exactly what each knob already documents as "off is the build
      *  before it existed": `per_pixel_lighting`, `map_lighting`,
      *  `lighting_maps`, the four shadow systems the game never had
      *  (`sun_shadows`, `map_shadows`, `dynamic_shadows`, `local_shadows`), and
-     *  `ao`, `tessellation` and `msaa` - the last three off by default already,
-     *  and here so a session that turned them on is not one this lies about.
+     *  `ao`, `tessellation`, `msaa` and `hdr` - the last four off by default
+     *  already, and here so a session that turned them on is not one this lies
+     *  about. `hdr`'s own sub-knobs (`linear_input`, `tonemap`, `exposure`,
+     *  `tonemap_knee`, `tonemap_white`) are deliberately **not** in the set:
+     *  with `hdr` off none of them does anything, and an operator the user
+     *  chose has no business being part of what "the stock look" means.
      *
      *  The fidelity knobs are **not** in it - `half_pixel`, `rhw_depth_raw`,
      *  `viewport_rect`, `shade_mode`, `local_lights`, `map_light_cull`. For
@@ -2782,12 +2867,12 @@ declare module "gk" {
      *  real one.
      *
      *  **`false` restores the session, not the defaults.** Switching to stock
-     *  snapshots the ten first, so a `local_shadows` that was off before
-     *  returns to off. Only those ten switches move - `shadow_bias`,
+     *  snapshots the eleven first, so a `local_shadows` that was off before
+     *  returns to off. Only those eleven switches move - `shadow_bias`,
      *  `map_light_gain`, `bump_scale` and every other parameter under them
      *  survive the round trip untouched.
      *
-     *  Reads back derived: `true` only while all ten are configured off, so
+     *  Reads back derived: `true` only while all eleven are configured off, so
      *  turning one back on by hand makes this read `false` rather than leaving
      *  a mode flag that disagrees with the frame.
      *  `GKPLUS_VK_STOCK=1` is the launch-time form. */

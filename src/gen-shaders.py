@@ -88,6 +88,11 @@ ENTRY_POINTS = [
     ("ao.slang", "ao_prepass_fragment", "fragment"),
     ("ao.slang", "ao_fullscreen_vertex", "vertex"),
     ("ao.slang", "ao_resolve_fragment", "fragment"),
+    # The tonemap pass, which is what replaces the scale blit under `render.hdr`. Its own copy of
+    # the full-screen triangle rather than a reuse of ao.slang's: the AO pass is allowed to fail to
+    # build and this one still has to run, so borrowing its module would couple the two.
+    ("tonemap.slang", "tonemap_fullscreen_vertex", "vertex"),
+    ("tonemap.slang", "tonemap_fragment", "fragment"),
 ]
 
 SLANGC_ARGS = [

@@ -130,6 +130,14 @@ bool IsCameraTracking() {
   return fn();
 }
 
+bool CurrentCameraIsPerspective() {
+  // A plain byte, read rather than called: there is no accessor in the binary and
+  // the four writers all store to it directly.
+  unsigned char *flag = nullptr;
+  GetObjectAtOffset(flag, 0x007c1470);
+  return *flag != 0;
+}
+
 void StopCameraTracking() {
   // Exactly what CommandStopTracking does: drop the track list, then hand the
   // controls back - ClearCameraTrack alone leaves the player unable to steer.

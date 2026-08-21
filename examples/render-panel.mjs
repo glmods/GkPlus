@@ -35,6 +35,12 @@ let readout = null;
 const MSAA_COUNTS = [1, 2, 4, 8];
 const MSAA_LABELS = ["off", "2x", "4x", "8x"];
 
+/** The operator names, in the order the combo lists them.
+ *  Annotated rather than inferred: without it the element type is `string`, and
+ *  `render.tonemap` is a union of the four literals - so the assignment below is
+ *  exactly what the type check catches. @type {Array<"clamp" | "rolloff" | "reinhard" | "aces">} */
+const TONEMAP_OPS = ["clamp", "rolloff", "reinhard", "aces"];
+
 /** The count asked for while the frame that adopts it has not run yet, or null.
  *  `render.msaa` reads back what is IN FORCE, so a control bound straight to it
  *  would show the old value for one frame and write it back over the request.
@@ -419,6 +425,41 @@ export function draw_render_panel(ImGui) {
     if (msaaPending !== null) {
       ImGui.TextWrapped(`waiting for the next frame (in force: ${live}x)`);
     }
+    ImGui.TreePop();
+  }
+
+  // --- HDR -------------------------------------------------------------------
+  //
+  // No pending value here, unlike the antialiasing above: `render.hdr` reads back
+  // as REQUESTED rather than as in force, precisely so a control can bind to it
+  // directly. What is not in force yet shows up in `render.draws` in words.
+  if (ImGui.TreeNode("HDR")) {
+    const hdr = toggle(ImGui, "hdr", "hdr",
+      "Render into R16G16B16A16_SFLOAT and tonemap to the swapchain. Linear-light " +
+        "lighting and no D3DCOLOR clamp - worth 9.56/255 over 83% of level02, most " +
+        "of it shadow detail. Off is the shipped renderer.");
+    ImGui.BeginDisabled(!hdr);
+    toggle(ImGui, "linear_input", "linear_input",
+      "sRGB-decode every albedo on the way in. On is the point of the feature; off " +
+        "is the bisect - same numbers, wider container, only over-range changed.");
+    const op = render.tonemap;
+    const picked = ImGui.Combo("tonemap", Math.max(0, TONEMAP_OPS.indexOf(op)), TONEMAP_OPS);
+    if (picked.changed) {
+      render.tonemap = TONEMAP_OPS[picked.current_item];
+    }
+    ImGui.SetItemTooltip(
+      "Applies to the world alone - the menus, HUD and briefing screens are drawn after " +
+        "the tonemap, so no operator reaches them. rolloff is the default because it is " +
+        "the identity below the knee and touches only what exceeds it."
+    );
+    slider(ImGui, "exposure", "exposure", 0.1, 4.0,
+      "A linear multiplier applied BEFORE the operator, which is the only place it " +
+        "can go.");
+    slider(ImGui, "knee", "tonemap_knee", 0.0, 1.0,
+      "Where rolloff stops being the identity. Read by that operator alone.");
+    slider(ImGui, "white", "tonemap_white", 1.0, 16.0,
+      "What reinhard maps to exactly 1.0. Read by that operator alone.", "%.1f");
+    ImGui.EndDisabled();
     ImGui.TreePop();
   }
 

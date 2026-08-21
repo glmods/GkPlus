@@ -17,6 +17,18 @@ frame is **2.59/255** whole-frame — and that residual has a known cause (§4.3
 rasterises into a 640x480 backbuffer while the swapchain is 628x468, so every pre-transformed draw
 is scaled by 628/640 during rasterisation instead of being stretched once at present.
 
+**Two kinds of section live here, and they are judged by opposite standards.** A *reproduction*
+section is settled by its residual against `GKPLUS_RENDERER=d3d8` and smaller is better - that is
+what §4.28, §4.31, §4.37, §4.38 and §4.47 are, and the 0.13/255 above is their score. A *departure*
+section - per-pixel lighting, the shadow systems, lighting maps, ambient occlusion, tessellation,
+MSAA, HDR - exists to change the look on purpose, so **its residual is not a score at all**. There
+a difference is not an improvement and a bigger one is not a better one; the number says how far
+the feature reaches and whether it is gated and inert when off, and what settles it is looking at
+the frame and playing the game. Several sections below still print a departure's residual as though
+it were a merit figure - read those as coverage. `vulkan_renderer_plan.md`'s "What a residual can
+and cannot say" is the full rule, and §4.64, §4.45, §4.46, §4.47 and §4.86 are the five cases where
+what actually decided the design was a play report or a look at the picture.
+
 Sections are in the order they were measured, and several correct earlier ones. Where they
 disagree the later number wins — §4.36 is superseded by §4.37, and §4.33 corrects the reading of
 the junk pile in §4.30-§4.32. `vulkan_renderer_plan.md` carries the current state; this file
@@ -4469,7 +4481,12 @@ Incidentally, the vertex dump on that draw shows diffuse `ff080808`, `ff0c0c0a`,
 
 The first change here that is meant to make the game look *different* rather than to make it match.
 D3D8's light sum now runs per fragment; `render.per_pixel_lighting = false` restores the
-fixed-function path. **Worth 0.48 MAD over 26.9% of a paused level02 frame.**
+fixed-function path. **It reaches 26.9% of a paused level02 frame at 0.48 MAD** - and since this is
+the first section in this file whose residual is *not* a score, it is worth saying once here what
+the preamble now says generally: that number is coverage. It says the feature ran and how far it
+spread, not that the frame improved, and a worse-looking change would read the same. What makes the
+case is the difference image below - the effect is on the units and the curved geometry and is zero
+on flat ground, which is precisely what Gouraud shading cannot represent.
 
 The equation is untouched — the same lights, the same attenuation and spot factors, the same
 `N·L > 0` gate on the specular sum (§4.46). What changes is what the rasteriser interpolates:
@@ -8989,3 +9006,326 @@ to the game's own function on any other format. That guard is the load-bearing p
 One side effect to know about before calling it at all: `SetColour` also overwrites the global
 `ClearColour` @ 0x007c1204, whose only reader is `ClearBackBufferAndZ`. `FOGCOLOUR` therefore
 changes what the whole backbuffer is cleared to, not just the fog.
+
+## 4.91 HDR as a linear-light pipeline, and a tonemap that reached the whole frame (§4.92 fixes the second half)
+
+The first feature here whose goal is explicitly not reproduction (the plan's "In progress: HDR").
+The world pass renders into `R16G16B16A16_SFLOAT`, every albedo is sRGB-decoded on the way in, the
+clamps reproducing the fixed function's D3DCOLOR output come off, and a full-screen pass tonemaps
+and re-encodes on the way to the swapchain. Internal HDR, SDR presentation: the surface format is
+untouched and no HDR display is involved.
+
+### What was crushed before it
+
+Three sources of over-range, all authored and all discarded at the last multiply:
+
+- **The map light rig.** §4.48 measured level02's key light at `diffuse 4.0`. `resolve_lit_colour`
+  in `world.slang` then did `saturate(...)`, throwing away three quarters of it.
+- **Every `ONE/ONE` additive draw** — the fire cameras, flares, muzzle flashes, particles —
+  saturating in the framebuffer, so five bright sprites stacked are the same white as one.
+- **The lighting maps' highlights** (§4.48), a specular term added after the stages and clipped by
+  the same output.
+
+### Four decisions, and the one that would have been got wrong
+
+**1. Linear input, not extended-range gamma.** The cheap design widens the container and changes
+nothing else, so the off path stays bit-identical by construction. It is not what was built:
+Gunlok's textures and vertex colours are gamma-encoded and every multiply and every framebuffer
+blend currently runs on the encoding rather than on the light. `render.linear_input` is a separate
+knob precisely so the two can be told apart on one paused frame — `hdr` with it off *is* the
+extended-range design.
+
+**2. Albedo only.** A texture fetch and an unpacked D3DCOLOR are gamma-encoded pictures of a
+surface, so they are decoded. A light's colour and a material's are not: they are intensities the
+game authored as numbers, several greater than 1 — `diffuse 4.0` is not a colour in any encoding —
+so decoding them would bend an authored quantity through a curve it never went through. The
+materials that *do* carry a picture reach the equation as a vertex colour anyway (`D3DMCS_COLOR1`
+on every lit draw) and are decoded there. `src/VkLighting`'s companion maps are exempt for the same
+reason at a different scale: R is a height field, G a highlight intensity, B a sharpness. Alpha is
+never decoded anywhere, which also leaves the alpha test's 0..255 comparison alone.
+
+**3. The tonemap has to be identity below a knee.** This is the decision a film curve would have
+lost, and it is measured rather than argued — see below. Gunlok's whole 2D half goes through the
+same world pass as the world does, is authored LDR, and is something the player expects to look
+exactly as it did.
+
+**4. The scale is the tonemap.** §4.37 measured that the `vkCmdBlitImage` `VK_FILTER_NEAREST` this
+pass replaces is not a lazy default: the original's windowed stretch preserves a 4-bit texture's
+sixteen distinct values, so D3D drops columns rather than mixing them. The fragment shader
+therefore computes `floor((dst + 0.5) * src / dst)` and `Load`s it, which is what nearest blitting
+is specified to resolve to — no sampler, and reproducible rather than approximately right. The
+ImGui overlay needed no thought at all: it is already its own pass on the swapchain image,
+downstream of the blit, so it is downstream of the tonemap for free.
+
+### The measurements, and what they are not
+
+**None of the numbers below says HDR looks good, and they cannot.** The point of the feature is to
+change the look, so a residual against `hdr = false` measures how far it reaches and nothing else -
+a change that made the game uglier would score the same or higher. What they do settle is the three
+things a residual *can* settle on a departure: that phase 1 is properly gated, that the way back is
+clean, and that the tonemap does not spread past the part of the frame it was meant to reach.
+Whether the picture is better is decided in the two paragraphs after the tables, by looking at it.
+
+All seven configurations inside **one paused level02 frame** at the settled camera, 3060x1716,
+`msaa 4x`, `linear_input` and `tonemap` switched between shots. One frame and one session is the
+point: level02 will not hold still, and a comparison across two launches has a noise floor larger
+than most of what is below.
+
+| against `hdr = false` | MAD /255 | max | pixels changed | mean level |
+|---|---|---|---|---|
+| `hdr` off (the reference) | 0 | 0 | 0% | 20.325 |
+| `hdr`, `linear_input` off, `clamp` | **0.0196** | 82 | 0.67% | 20.339 |
+| `hdr`, linear, `clamp` | 9.5599 | 135 | 83.39% | 28.276 |
+| `hdr`, linear, `rolloff` (the default) | 9.5608 | 135 | 83.39% | 28.275 |
+| `hdr`, linear, `reinhard` | 9.1236 | 135 | 83.45% | 27.752 |
+| `hdr`, linear, `aces` | 7.1914 | 255 | 84.19% | 22.771 |
+| `hdr` off again | 0.0084 | 73 | 0.06% | 20.325 |
+
+**Row 2 is phase 1's acceptance test and it passes.** The float target plus the tonemap pass, with
+neither colour change engaged, moves 0.67% of the frame by a mean of 0.0196/255 — which is exactly
+what was predicted and nothing else: framebuffer blending now happens at fp16 where it used to
+happen at 8-bit UNORM, so an unblended draw is bit-identical and a blended one differs by the
+quantisation of its intermediates. A *visible* change at that setting would have been a defect in
+the pass. Row 7 says the way back is clean.
+
+**The linear pipeline reaches 83% of the frame at 9.56 MAD** - which is a statement about how many
+pixels one changed multiply touches, not about whether they look better, and 83% is unsurprising
+because every lit pixel in the game is such a pixel. What is worth having out of it is the
+*direction*: mean level goes 20.3 to 28.3. That is not a brightness offset, it is the midtone
+behaviour of a gamma-space multiply being removed — `encode(decode(a) * L)` is brighter than
+`a * L` for every `L < 1`, and Gunlok's interiors are lit almost entirely by `L < 1`. On screen it
+reads as shadow detail: the ground texture and the debris in the dark half of the frame become
+legible where they were black. The characters go the other way and get *darker*, which is the same
+arithmetic at `L > 1` — they were blowing out before and are now in range.
+
+### The measurement that settles the default operator - because blast radius IS checkable
+
+At the main menu, five shots in one session. The menu animates, so the floor is not zero: shooting
+`hdr = false` twice gives **1.137 MAD over 5.02% of the frame**, and that is the number everything
+here is read against.
+
+| main menu, against `hdr = false` | MAD /255 | pixels changed | mean level |
+|---|---|---|---|
+| `hdr`, `linear_input` off, `clamp` | 0.555 | 1.22% | 29.061 |
+| `hdr`, linear, `rolloff` | **0.714** | 4.64% | 29.221 |
+| `hdr`, linear, `aces` | **8.103** | **99.61%** | 25.278 |
+| `hdr` off again (**the floor**) | 1.137 | 5.02% | 29.256 |
+
+**`rolloff` is under the animation floor on every count** — the 2D half survives `decode -> curve
+-> encode` as an identity, which is what the exact piecewise sRGB curve on both sides plus fp16
+storage buys (fp16's ~5e-4 relative error against that curve's steepest slope is under a hundredth
+of an 8-bit level, so the round trip is exact where it matters).
+
+**ACES recolours 99.61% of the menu and drops its mean level by 3.7.** Note *what kind* of number
+that is, because it is the exception that proves the rule at the top of this section. It is not
+"ACES scores badly": a tonemap is supposed to change the look, and 99.61% would be meaningless as a
+quality reading. It is that the feature **reached somewhere it had no business reaching**. A
+departure that spreads past its own description is wrong however it looks, and that is a question a
+residual answers exactly.
+
+**This was read here as the argument for making `rolloff` the default. It was a defect report, and
+§4.92 fixes it properly**: the 2D layers are now drawn *after* the tonemap and no operator can
+reach them, so ACES moves 0.00% of the main menu rather than 99.61%. Everything below about
+`rolloff` being load-bearing is superseded - it stays the default because it is conservative, not
+because anything depends on it. A film curve has a toe and a shoulder and applies them to the main
+menu, the briefing and debrief screens, the HUD panel and the inventory and upgrade screens as
+readily as to the world, because all of them are pre-transformed draws through the same pass and
+nothing downstream can tell them apart. `reinhard` is milder and still wrong for the same reason —
+it is nowhere the identity, and it moves 53% of the *level* frame relative to `clamp`.
+
+So the default is a **highlight rolloff**: exactly `y = x` below `render.tonemap_knee`, and above it
+`k + (1-k)(1 - exp(-(x-k)/(1-k)))`, whose derivative at the knee is exactly 1 (no crease) and which
+asymptotes to 1 (no finite input clips). ACES and Reinhard stay available as looks.
+
+### What the frame does not show, and where to look instead
+
+`clamp` versus `rolloff` on the settled level02 frame differ by **0.0038 MAD over 0.04% of pixels**.
+Here a *small* number is the informative one, for the same reason a large one was above: it is a
+coverage reading. It is not the rolloff failing — it is that only **0.004%** of that frame has any channel above
+250 to begin with. The settled camera is a dark interior and there is almost no over-range in it at
+all, so the feature's headline benefit is invisible there and the 9.56 MAD above is entirely the
+linear pipeline rather than the range.
+
+The over-range lives where the additive draws are, and the two cameras §4.45 and §4.46 were argued
+over — level02's fires — are the obvious place to **look at** it next, along with a flare. Nobody
+has looked; the 0.04% is a statement about the settled frame and not about the game. Note the verb:
+what is wanted there is a screenshot of a fire under `clamp` and under `rolloff` side by side, not
+a MAD between them. The MAD will be large — five additive sprites stacking past 1.0 instead of
+clipping to white is a big pixel difference by construction — and it will not say which one looks
+like fire.
+
+### Cost
+
+Nothing measurable. 3072x1728 at `R16G16B16A16_SFLOAT` is 42 MB against the shadow atlas's 66, and
+the pass is one full-screen triangle with one `Load` per pixel. `render.vulkan_report` shows 0
+validation errors, 5 pipelines and 0 dropped draws in every configuration above.
+
+`R16G16B16A16` rather than `R11G11B10` because the alpha channel is not spare: the world pass's
+attachment carries the fixed function's alpha into the framebuffer blend, and a format without one
+makes every `SRCALPHA` draw in the game read 1.
+
+### The two things it reuses rather than invents
+
+The colour format is baked into every world pipeline exactly the way `rasterizationSamples` is
+(§4.88), so switching it invalidates the cache whole — and `ReconcileRenderTarget` already holds
+the `vkDeviceWaitIdle` that needs, which is why `render.hdr` is writable mid-frame at a cost of one
+frame. And the offscreen target reaches the tonemap through a **fixed high bindless slot**
+(`kTonemapSourceSlot`, 4088) in the same range the shadow atlases and the AO pass use, for the same
+reason: it is not a `TextureImage`, so the top of the array keeps it clear of every path that walks
+the image list. It is the only one of those slots written by `VkRenderer` rather than by `VkDraw`,
+because it is the only one of those images `VkRenderer` owns.
+
+One consequence worth stating because it looks like a bug: **`render.hdr` reads back as requested
+rather than as effective**, unlike `render.msaa`. The effective value is a `VkFormat` the script
+side does not name, and the two things that make them differ — a device with no tonemap pass, and
+the one frame between the write and the reconcile — are both reported in words by `render.draws`
+(`hdr: requested, NO TONEMAP PASS ON THIS DEVICE` / `requested, not engaged yet`). That is what
+lets a menu row bind a toggle straight to it, where the antialiasing row has to read `MsaaWanted`
+to get the same property.
+
+## 4.92 The 2D layers leave the HDR pipeline, and the classifier is the engine's own camera flag
+
+§4.91 shipped with a workaround where it should have had a fix. The tonemap ran over the whole
+frame, so it ran over Gunlok's menus, briefing screens, HUD, inventory and upgrade screens - all of
+which are drawn by the same world pass and all of which are authored *final*. The mitigation was to
+make the default operator identity below a knee, which keeps those screens intact but only by
+never doing anything to them; ACES, which does, recoloured **99.61% of the main menu**. That was
+recorded there as the argument for the default. It was really a defect report.
+
+This section removes the tonemap from the 2D layers entirely. **They are now drawn after it**, into
+the LDR target it writes, so no operator can reach them and the linear pipeline never touches them
+either.
+
+### The classifier already existed, and two obvious candidates are wrong
+
+**Gunlok has no per-draw layer at all.** What decides whether one 2D element lands in front of
+another is *which camera drew it*: `InitRenderCameras` @ 0x004af4d0 gives each of nine cameras a
+slice of the depth range (`rendering_notes.md` §4.4). And every one of those cameras is put through
+`Camera_SetOrthographic` @ 0x004b04e0 **except `Camera_World` and the sky camera**. So
+
+    CurrentCameraIsPerspective @ 0x007c1470 == 0   <=>   this draw is a 2D layer
+
+exactly, with nothing to tune. It is the engine's own byte, written by the canonical four-step
+camera switch, and `src/HudFix.cpp` was already reading it for a different reason - which is also
+what keeps the two consistent, since with the HUD fix in place the meters flush under `Camera_Hud`
+and this reads orthographic for them too. `gk::CurrentCameraIsPerspective()` in `src/Camera.h` is
+the wrapper; `src/D3D8Capture.cpp` reads it per draw, on the game thread, at the moment of the draw.
+
+Two candidates that look right and are not:
+
+- **`PipelineState::depth_clamp`**, which the header describes as "set for a pre-transformed draw
+  and only for one". True, and useless here: it is `FVF & D3DFVF_XYZRHW`, and **only 2 of level02's
+  268 draws set it**. Gunlok draws most of its 2D through an orthographic camera with ordinary
+  transformed vertices, not through RHW. `render.draw_info` now prints this flag, which is how the
+  discrepancy was found.
+- **A depth-slice threshold.** The world owns 0.10..1.00 and every 2D camera sits at or below 0.06,
+  so `max_depth < 0.1` looks like the same test - but §4.4's table has an orthographic camera at
+  **0.06..0.30**, which overlaps the world. Unused in the two frames measured here, and a trap
+  waiting for a third.
+
+### What the partition actually looks like
+
+| | 2D draws | world draws |
+|---|---|---|
+| level02, settled and paused | **7** | 261 |
+| main menu | **24** | 0 |
+| briefing screen | all of them | 0 |
+
+Two things follow, and the second is the one that shaped the implementation.
+
+**The front end is entirely 2D.** Not "mostly": the main menu's rotating character is a 3D model,
+and it is drawn by an orthographic camera like everything else on that screen, so it classifies as
+2D and leaves the HDR pipeline with the rest of the menu. That is the desired answer - those
+screens are UI, whatever they contain.
+
+**In level the 2D draws interleave with the world**, in three runs
+(`world -> hud -> world -> hud -> world -> text`), because the HUD plate is a retained queue item
+and `RenderQueue_Flush` state-sorts it wherever it likes. So the split cannot be "everything after
+draw N"; it has to be a filter.
+
+### The frame is now three steps, and the order is forced
+
+    world layer  ->  float offscreen (+ MSAA resolve)
+    tonemap      ->  LDR target, at the render extent, 1:1
+    2D layer     ->  the same LDR target, on top
+    blit         ->  swapchain, NEAREST, scaling
+
+**Why an LDR intermediate rather than tonemapping straight to the swapchain.** The 2D pass has to
+rasterise at the *game's* backbuffer size - that is §4.37's finding and the entire reason the
+offscreen target exists - so the scale has to stay last. The tonemap therefore lands in a
+same-size, swapchain-format image and the blit that follows is the one that was always there. The
+tonemap's nearest mapping degenerates to the identity when its two extents match, so it does no
+resampling on the way through.
+
+**Why after rather than a mask in the tonemap.** A per-pixel mask was the cheaper design and it is
+wrong where it matters: a translucent 2D element over the world would mark those pixels as 2D and
+stop the world beneath them being tonemapped. Drawing the layer afterwards makes a blended HUD
+element blend against final LDR colour, which is exactly what it does on the original. Level02 has
+one blended 2D draw of seven; the main menu has 22 of 24.
+
+### Four things the split needed, three of which are traps
+
+**The 2D layers get their own `GpuFrameData`.** They must not be sRGB-decoded and must not have
+their D3DCOLOR clamps lifted - nothing downstream would re-encode them, and their blends were
+authored against that clamp. `push.frame` is already a per-draw push, so a second block with
+`colour_flags` cleared says it per pass with no shader ABI change and no per-draw flag. It is a
+whole 352-byte copy rather than one field on purpose: every other field has to stay identical, or
+the split shows up as a shading change rather than a colour-space one.
+
+**`PipelineState::ldr_target` is set at RECORD time, never at capture time.** The two passes target
+two formats, so the format has to be in the pipeline key. It cannot be stamped on the game thread
+where the rest of the state is: whether the passes exist at all is `render.hdr`'s answer, which
+moves between the scene being captured and the frame being recorded, and a pipeline whose format
+disagrees with its attachment is an invalid draw rather than a wrong picture. With HDR off nothing
+sets it, so the pipeline set is exactly what it was before this existed.
+
+**`RecordDraws` now runs twice a frame, and three things in it were once-a-frame by accident.** It
+ends by swapping the draw list into `LastItems` and clearing it - which on the world pass would
+leave the 2D pass with nothing to draw. It calls `UploadFrameData` and `UploadMapLights`, which
+allocate out of the frame scratch and publish the addresses the draws push. And it zeroes the
+tessellation and batch-census counters, which the second pass would otherwise wipe, reporting a
+268-draw frame as a 7-draw one. All three are now gated on the layer. The invariant that makes it
+safe is that `Layer::World` is *never* the last pass: `VkRenderer` follows it with `Layer::Ui`
+unconditionally, even when that layer is empty, precisely so the hand-over happens.
+
+**The 2D pass needs its own single-sample depth buffer, and validation is what said so.** The first
+build shared the world's, which is multisampled whenever `render.msaa` is on while the LDR target
+is not - and a pass may not mix sample counts. Two errors, one on `vkCmdBeginRendering` and one on
+every draw. The fix is a depth image of its own plus `rasterizationSamples = 1` on any pipeline
+with `ldr_target` set, which is the right answer anyway: there is no geometric edge in a
+screen-space quad to antialias, and the game drew its HUD unmultisampled on every renderer it ever
+had.
+
+Its depth is **cleared** rather than carried over from the world pass, which is safe rather than
+convenient: every 2D camera's slice is at or below 0.06 and `Camera_World`'s is 0.10..1.00, and
+every camera's ZFUNC is `D3DCMP_LESSEQUAL` (§4.4), so a 2D draw passes against any world depth by
+construction and the world can never occlude it. Their mutual ordering survives because they are
+recorded into one pass in submission order. That also means the world pass keeps its `DONT_CARE`
+depth store and this costs no extra bandwidth.
+
+### The measurements
+
+**The main menu is now operator-invariant, exactly.** ACES, `rolloff` and `exposure = 2.5` produce
+**byte-identical frames** - max channel difference **0** between all three - and all of them sit at
+0.567 MAD against `hdr = false`, under that screen's own animation floor of 1.137 over 5.02%.
+Restricted to the non-black part of the frame, **100.00%** of it is invariant to the operator.
+Before this section ACES moved 99.61% of it.
+
+**In level, the 2D layer is exempt and the world is not.** On level02's settled paused frame the
+HUD panel crop is **max 0 between `rolloff` and `aces`** and 0.027 MAD against `hdr = false`, while
+a floor crop moves by 120 between the two operators. Of the non-black frame, **3.71%** is
+operator-invariant, which is the HUD, the objectives text and the pause text - about what seven
+draws of 268 should come to. Whole-frame coverage of the linear pipeline drops from 83.39% to
+79.08%, the difference being the layer that left.
+
+`off -> on -> off` still returns to 0.009 MAD, and Vulkan validation is clean (`[]`) across a sweep
+of all four operators, an exposure change, MSAA on, and HDR toggled twice - at both the menu and in
+level.
+
+### What this changes about §4.91
+
+**`rolloff` is no longer load-bearing, and §4.91's argument for it is superseded.** It stays the
+default because it is the conservative choice for a game whose content is almost entirely LDR - it
+is the identity below the knee, so it only ever touches what actually exceeds it - but it is now a
+taste, not a guard. **ACES and Reinhard are usable looks** rather than things that wreck the front
+end, which is what they were when that section was written.

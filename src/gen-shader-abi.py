@@ -83,6 +83,7 @@ PAIRS = [
      {"pos": "pos", "normal_and_color": "normal", "uv": "uv0"}),
     ("ao.slang", "GpuDrawRecord", "GpuDrawRecord", {}),
     ("ao.slang", "AoPush", "AoPushConstants", {}),
+    ("tonemap.slang", "TonemapPush", "TonemapPushConstants", {}),
 ]
 
 # size and the two alignments: (bytes, scalar align, std430 align).

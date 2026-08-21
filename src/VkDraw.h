@@ -311,12 +311,23 @@ struct GpuFrameData {
   uint64_t split_corners; // device address of the bitset in the frame scratch
   uint32_t split_base;    // the canonical-vertex index bit 0 stands for
   uint32_t split_count;   // how many bits are valid; 0 is the single "no table" test
+  // --- HDR (see SetHdr below) ---------------------------------------------------------------
+  //
+  // kLinearInput | kUnclamped. Appended for the reason both blocks above were: every offsetof
+  // below pins a field at or before `split_corners`, and the end is the only place a field can be
+  // added without moving one of them.
+  uint32_t colour_flags;
+  // Three and not one: `cascades` is a `float4[]`, so std430 aligns this struct to 16 where the
+  // scalar rule aligns it to 8, and only a multiple of 16 satisfies both. See the same note in
+  // world.slang - `src/gen-shader-abi.py` is what enforces it.
+  uint32_t pad_colour[3];
 };
-static_assert(sizeof(GpuFrameData) == 336, "the scratch stride is part of the shader ABI");
+static_assert(sizeof(GpuFrameData) == 352, "the scratch stride is part of the shader ABI");
 static_assert(offsetof(GpuFrameData, cascades) == 176, "std430 puts a float4 array on 16");
 static_assert(offsetof(GpuFrameData, sun_matrix) == 240, "... and so does the matrix after it");
 static_assert(offsetof(GpuFrameData, ao_texture) == 304, "the AO block appends, it does not insert");
 static_assert(offsetof(GpuFrameData, split_corners) == 320, "... and so does this one");
+static_assert(offsetof(GpuFrameData, colour_flags) == 336, "... and so does the HDR pair");
 
 // GpuDrawRecord::lighting flags.
 //
@@ -509,6 +520,15 @@ struct PipelineState {
   uint32_t stencil_fail = 1;   // D3DSTENCILOP_KEEP
   uint32_t stencil_zfail = 1;
   uint32_t stencil_pass = 1;
+  // Which pass this pipeline belongs to, and therefore which colour format it declares: 0 is the
+  // world pass's target, 1 the LDR one the 2D layers are drawn into after the tonemap (see
+  // `Layer` below). **Set at record time, never by the capture layer** - whether the two passes
+  // exist at all is `render.hdr`'s answer, and it can move between the scene being captured on the
+  // game thread and the frame being recorded, so a bit stamped at capture would be a frame stale.
+  // A pipeline whose format disagrees with its attachment is an invalid draw rather than a wrong
+  // picture, so that frame matters. With HDR off nothing sets it and the pipeline set is exactly
+  // what it was before this existed.
+  uint32_t ldr_target = 0;
   // `depthClampEnable`, set for a pre-transformed draw and only for one. D3D **clamps** a
   // pre-transformed vertex's z into the viewport's MinZ..MaxZ rather than clipping the
   // primitive away - measured both ways round with `render.depth_probe` (notes §4.45) - and
@@ -583,6 +603,19 @@ struct DrawItem {
   uint32_t viewport_height = 0;
   DrawSource vertex_source = DrawSource::Arena;
   DrawSource index_source = DrawSource::Arena;
+  // **Which layer this draw belongs to, taken from the engine's own answer.** Gunlok has no
+  // per-draw layer; what decides whether a 2D element lands in front of another is which camera
+  // drew it, and `InitRenderCameras` gives each camera a slice of the depth range
+  // (`rendering_notes.md` §4.4). Every one of those cameras is ORTHOGRAPHIC except `Camera_World`
+  // and the sky camera, so `CurrentCameraIsPerspective` @ 0x007c1470 - which the engine itself
+  // maintains, and which `src/HudFix.cpp` already reads - is exactly "is this draw part of the
+  // world". No threshold is involved, and a depth-slice test would not do: there is an
+  // orthographic camera at 0.06..0.30 that overlaps the world's 0.10..1.00.
+  //
+  // Measured on level02's settled frame: 7 draws of 268, in three runs interleaved with the world.
+  // At the main menu and on the briefing screen it is every draw there is, which is the point -
+  // those screens then leave the HDR pipeline entirely and come out as the shipped pixels.
+  bool ui = false;
   bool indexed = true;     // DrawPrimitiveUP has no indices at all
   uint8_t index_stride = 2; // 2 or 4, for the index type to bind
   // The world-space box this draw's vertices occupy, for the shadow bakes to cull against.
@@ -757,7 +790,19 @@ uint32_t PendingDrawIndex();
 
 // Records the whole list into `cmd`, inside a rendering pass the caller has begun, then clears
 // it. The depth image view is the caller's to attach - see DepthImageView.
-void RecordDraws(void *command_buffer);
+// Which layer to record. Under `render.hdr` the frame is two passes with the tonemap between them
+// - `World` into the float target, `Ui` into the LDR one afterwards - because a tonemap curve
+// applied to Gunlok's menus, briefing screens and HUD recolours content that was authored final
+// (notes §4.92: before the split, ACES moved 99.61% of the main menu). `All` is the single-pass
+// frame every build before that drew, and is what runs whenever HDR is off.
+enum class Layer { All, World, Ui };
+
+void RecordDraws(void *command_buffer, Layer layer = Layer::All);
+
+// Whether this frame has any 2D draw at all. VkRenderer asks before running the UI pass, so a
+// frame with nothing in that layer - which is most of an in-level frame's neighbours - costs no
+// pass, no barrier and no depth clear.
+bool HasUiDraws();
 
 // Build the world-space light grid, if the level's light set has changed since it was last built.
 //
@@ -1397,10 +1442,85 @@ uint32_t MsaaTargetSamples();
 // only caller, and it takes one for the resize it is doing anyway.
 void ApplySampleCount(uint32_t samples);
 
+// --- HDR: a linear-light pipeline with an SDR tonemap ------------------------------------------
+//
+// See "In progress: HDR" in vulkan_renderer_plan.md for the design and the four decisions behind
+// it. In this header, what a caller has to know:
+//
+// `render.hdr` makes the world pass draw into `R16G16B16A16_SFLOAT` instead of the swapchain's
+// 8-bit BGRA and replaces the scale blit with a full-screen tonemap pass. It is the biggest
+// departure in this file - the first one whose goal is not reproduction - so it is off by default
+// and it is in the stock preset's set.
+//
+// **Settable at any time**, and the machinery for that already exists: the colour format is baked
+// into every world pipeline exactly the way `rasterizationSamples` is, so it invalidates the cache
+// whole, and `ReconcileRenderTarget` is where both are noticed under the `vkDeviceWaitIdle` it
+// already takes. The knob is a store; the work happens between frames.
+//
+// Three sub-knobs, and they exist so the feature can be bisected on one paused frame rather than
+// argued about:
+//
+//   - `render.linear_input` sRGB-decodes every albedo the shader reads - textures and unpacked
+//     D3DCOLOR vertex colours, and deliberately NOT light or material colours, which are
+//     intensities rather than pictures (see kLinearInput in world.slang). With it off, `hdr` is
+//     the extended-range design: the same numbers in a wider container, nothing but over-range
+//     changed. On by default, since running the arithmetic on gamma-encoded values is the thing
+//     being fixed.
+//   - `render.tonemap` picks the operator, and **it applies to the world alone**: the 2D layers are
+//     drawn after the tonemap (see `Layer` above, notes §4.92), so no operator reaches Gunlok's
+//     menus, briefing screens, HUD or inventory. That was not always so - before the split ACES
+//     recoloured 99.61% of the main menu, and `rolloff` being the identity below its knee was the
+//     only thing holding those screens together. It is still the default, but now because it is
+//     the conservative choice rather than because anything depends on it. `clamp` is the bisect
+//     setting: with `linear_input` off it makes the pass a reproduction of the blit it replaced.
+//   - `render.exposure`, `render.tonemap_knee` and `render.tonemap_white` are the operator's
+//     parameters. Exposure multiplies before the operator, which is the only place it can go.
+//
+// `GKPLUS_VK_HDR=1` is the launch-time form.
+void SetHdr(bool on);
+bool Hdr();
+void SetLinearInput(bool on);
+bool LinearInput();
+// 0 clamp, 1 rolloff, 2 reinhard, 3 aces. Out of range is stored as asked and behaves as clamp,
+// the same way `SetMsaa` stores a count the device cannot serve.
+void SetTonemap(uint32_t op);
+uint32_t Tonemap();
+void SetExposure(float value);
+float Exposure();
+void SetTonemapKnee(float value);
+float TonemapKnee();
+void SetTonemapWhite(float value);
+float TonemapWhite();
+
+// The format `ReconcileRenderTarget` should build the offscreen and multisampled targets at, given
+// the swapchain's own. Separate from `Hdr()` for the reason `MsaaTargetSamples` is separate from
+// `MsaaWanted`: the choice is made once, on the way to the renderer, rather than at each of the
+// three places that compare two formats.
+uint32_t HdrTargetFormat(uint32_t swapchain_format);
+
+// Adopt a colour format: stamp it on every world pipeline built from here on, and destroy the ones
+// already cached, since the attachment format is baked into each. **The caller must already hold a
+// `vkDeviceWaitIdle`**, exactly as for `ApplySampleCount`, and `ReconcileRenderTarget` is again the
+// only caller.
+void ApplyColourFormat(uint32_t format);
+
+// Whether the tonemap pass is up. False on a device that could not build it, where the renderer
+// falls back to the blit and therefore to SDR - the same "lose the feature, not the frame" rule
+// every other optional pass in this file follows.
+bool TonemapReady();
+
+// Record the tonemap pass: a full-screen triangle reading `kTonemapSourceSlot` at
+// `source_width x source_height` and writing `dest_view` at `dest_width x dest_height`. It begins
+// and ends its own rendering; the caller owns the layout transitions on both images, because the
+// caller is the only thing that knows what touched them last.
+void RecordTonemap(void *command_buffer, uint64_t dest_view, uint32_t source_width,
+                   uint32_t source_height, uint32_t dest_width, uint32_t dest_height);
+
 // --- the stock-look preset (§4.87) ------------------------------------------------------------
 //
 // Every deliberate departure from D3D8, switched together. `render.stock = true` is the setup a
-// fidelity comparison against `GKPLUS_RENDERER=d3d8` needs, in one write instead of ten; `false`
+// fidelity comparison against `GKPLUS_RENDERER=d3d8` needs, in one write instead of eleven;
+// `false`
 // puts back what was there before.
 //
 // **A preset over the knobs, not a mode of its own.** Nothing in the draw path reads it - it
@@ -1412,8 +1532,8 @@ void ApplySampleCount(uint32_t samples);
 // The set is exactly what this header already documents as "off is the build before it existed":
 // `per_pixel_lighting`, `map_lighting` and `lighting_maps` - §4.60's "three departures to switch
 // off" - plus the four shadow systems the game never had (`sun_shadows`, `map_shadows`,
-// `dynamic_shadows`, `local_shadows`), plus `ao`, `tessellation` and `msaa`. The last three are
-// off by default already and are here anyway, so that a session which turned them on is not a
+// `dynamic_shadows`, `local_shadows`), plus `ao`, `tessellation`, `msaa` and `hdr`. The last four
+// are off by default already and are here anyway, so that a session which turned them on is not a
 // session this lies about.
 //
 // `msaa` is the one member that is not a bool, and it is in the set for the plainest reason of
@@ -1425,23 +1545,28 @@ void ApplySampleCount(uint32_t samples);
 //   - **`stencil_shadow` needs no entry.** The game's own blob is dropped only while the sun's map
 //     is actually drawing a real one (see SetStencilShadow), so `sun_shadows = false` restores it
 //     by itself. Listing it would be a second place to keep that interaction true.
+//   - **`hdr`'s sub-knobs need no entry either**, and for a different reason from
+//     `stencil_shadow`'s: `linear_input`, `tonemap`, `exposure`, `tonemap_knee` and
+//     `tonemap_white` describe how a float target is presented, and with `hdr` off there is no
+//     float target for them to describe. Putting them in the set would restore five values that
+//     were already inert, and would make an operator the user chose part of what "stock" means.
 //   - **The fidelity knobs are untouched** - `half_pixel`, `rhw_depth_raw`, `viewport_rect`,
 //     `shade_mode`, `local_lights`, `map_light_cull`. For every one of those ON *is* the
 //     reproduction, so switching them would move the frame away from D3D8 rather than towards it.
 //     `stock` is not "turn the renderer off"; it is "draw what the original drew".
 //
-// **It restores the session, not the build's defaults.** Switching to stock snapshots the ten
+// **It restores the session, not the build's defaults.** Switching to stock snapshots the eleven
 // first, so switching back returns a `local_shadows` that was off before to off. The snapshot is
 // taken only on a transition *into* stock, so writing `true` twice cannot overwrite it with the
 // values it just wrote; with no snapshot to restore - a fresh session's first `false` - it applies
 // the defaults, which is the shipped pipeline with `ao` and `tessellation` still off.
 //
-// Only the ten switches move. Every parameter under them - `shadow_bias`, `map_light_gain`,
+// Only the eleven switches move. Every parameter under them - `shadow_bias`, `map_light_gain`,
 // `bump_scale`, the AO radius - is left exactly as it was, so a tuned value survives the round
 // trip without being part of the snapshot at all.
 //
-// Reads back **derived**: true iff all ten are currently configured off, so turning one back on
-// by hand makes it read false rather than leaving a mode flag that disagrees with the frame. It is
+// Reads back **derived**: true iff all eleven are currently configured off, so turning one back
+// on by hand makes it read false rather than leaving a mode flag that disagrees with the frame. It is
 // the *wanted* value of each that is compared, not the effective one - `ao` reads false until its
 // pass exists and `tessellation` false on a device without the feature, and a preset that could
 // not tell "off" from "unavailable" would restore the wrong frame on that device.

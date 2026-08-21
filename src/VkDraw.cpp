@@ -88,7 +88,12 @@ std::string Error;
 DrawStats TheStats;
 
 VkPipelineLayout Layout = VK_NULL_HANDLE;
+// What the WORLD pass draws into. Follows `render.hdr`, so it is not necessarily the swapchain's.
 VkFormat ColourFormat = VK_FORMAT_UNDEFINED;
+// ... and what the swapchain is, which never changes for the life of a device. The tonemap pass
+// writes into that, so it needs its own record rather than reading `ColourFormat` - which is the
+// one thing HDR moves.
+VkFormat SwapchainFormat = VK_FORMAT_UNDEFINED;
 
 // One VkPipeline per distinct fixed-function state, built on first use. Five of them on
 // level01 (§4.19), and the map is walked once per draw - a linear scan over five entries would
@@ -463,7 +468,13 @@ VkPipeline CreatePipelineFor(const PipelineState &state) {
   // `input.position.xy` - keeps landing on the same texel it does at one sample.
   VkPipelineMultisampleStateCreateInfo multisample = {
       VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-  multisample.rasterizationSamples = SampleCount;
+  // **The 2D pass is never multisampled**, whatever `render.msaa` says. Its target is the
+  // single-sample LDR image and its content is screen-space quads and text - there is no geometric
+  // edge in it to antialias, and the game drew it unmultisampled on every renderer it ever had. It
+  // is also not optional: a pipeline's sample count must equal its attachment's, and validation
+  // says so on every draw.
+  multisample.rasterizationSamples =
+      state.ldr_target != 0 ? VK_SAMPLE_COUNT_1_BIT : SampleCount;
 
   VkPipelineDepthStencilStateCreateInfo depth = {
       VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -524,7 +535,11 @@ VkPipeline CreatePipelineFor(const PipelineState &state) {
   // swapchain - the same reason VkRenderer uses it for the overlay.
   VkPipelineRenderingCreateInfo rendering = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
   rendering.colorAttachmentCount = 1;
-  rendering.pColorAttachmentFormats = &ColourFormat;
+  // The world pass's target, or the LDR one the 2D layers land in after the tonemap. The two are
+  // the same format whenever HDR is off, and `ldr_target` is never set then, so this reduces to
+  // what it always was.
+  const VkFormat attachment_format = state.ldr_target != 0 ? SwapchainFormat : ColourFormat;
+  rendering.pColorAttachmentFormats = &attachment_format;
   rendering.depthAttachmentFormat = DepthFormat;
   rendering.stencilAttachmentFormat = DepthStencil ? DepthFormat : VK_FORMAT_UNDEFINED;
 
@@ -2293,6 +2308,24 @@ struct AoPushConstants {
 };
 static_assert(sizeof(AoPushConstants) == 56);
 
+// The tonemap pass's block, here for exactly the reason the one above it is. Every field is a
+// 4-byte scalar on purpose, so the scalar and std430 layouts agree and `src/gen-shader-abi.py`
+// can check the pair - a `uint2` for the two extents would align to 8 under one rule and 4 under
+// the other, and the generator refuses a struct whose two layouts disagree.
+struct TonemapPushConstants {
+  uint32_t source_texture;
+  uint32_t op;
+  uint32_t flags;
+  uint32_t source_width;
+  uint32_t source_height;
+  uint32_t dest_width;
+  uint32_t dest_height;
+  float exposure;
+  float knee;
+  float white;
+};
+static_assert(sizeof(TonemapPushConstants) == 40);
+
 // **Every struct this file shares with a shader, checked against the shader's own declaration.**
 // Here rather than beside each struct because this is the one point where all three sources are in
 // scope - `src/VkDraw.h`, `src/VertexFormat.h`, and the four push blocks above, which are
@@ -2363,6 +2396,10 @@ uint64_t GridBuiltForAddress = 0;
 uint64_t FrameMapLightByteOffset = 0;
 // Where this frame's GpuFrameData sits. Written once at the top of RecordDraws.
 uint64_t FrameDataAddress = 0;
+// The same block with `colour_flags` cleared, for the 2D pass - see the end of UploadFrameData.
+// Equal to `FrameDataAddress` when the second allocation failed, which costs the UI layer its
+// colour-space exemption and nothing else.
+uint64_t UiFrameDataAddress = 0;
 uint32_t GridBuiltForCount = 0;
 bool GridBuiltForCullOn = false;
 float GridMin[3] = {};
@@ -3029,13 +3066,199 @@ bool CreateAoPass(uint32_t width, uint32_t height) {
   return true;
 }
 
+// --- HDR: the float target's knobs and the tonemap pass ---------------------------------------
+//
+// See SetHdr in VkDraw.h for what this is and the plan's "In progress: HDR" for why. Everything
+// here is either a knob or the one pass that replaces the scale blit; the targets themselves
+// belong to VkRenderer, which is what owns the offscreen image.
+
+// R16G16B16A16 rather than R11G11B10: the alpha channel is not spare. The world pass's attachment
+// carries the fixed function's alpha through to the framebuffer blend, and a format without one
+// would make every SRCALPHA draw in the game read 1. 2.4 MB at 640x480 against the shadow atlas's
+// 66 MB, so the two bytes a channel are not worth an argument.
+constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+
+// GpuFrameData::colour_flags - must match world.slang.
+constexpr uint32_t kLinearInput = 0x1u;
+constexpr uint32_t kUnclamped = 0x2u;
+
+// TonemapPushConstants::flags - must match tonemap.slang. A separate word from the two above
+// because it describes the pass rather than the frame, and the two are set from one place each.
+constexpr uint32_t kEncodeSrgb = 0x1u;
+
+// **Off by default**, for the reason every departure in this file is: a default run has to keep
+// the renderer's residual claim against `GKPLUS_RENDERER=d3d8` true, and this one breaks it
+// deliberately and completely.
+bool HdrEnabled = false;
+bool HdrEnvRead = false;
+// On by default *within* HDR - running the arithmetic on gamma-encoded values is the thing being
+// fixed, so the interesting configuration is the one that fixes it. Off makes `hdr` the
+// extended-range design instead, which is the bisect.
+bool LinearInputEnabled = true;
+// 1 = rolloff. See `apply_operator` in tonemap.slang for why the default is not a film curve.
+uint32_t TonemapOp = 1;
+float ExposureValue = 1.0f;
+// Where the rolloff stops being the identity. 0.75 leaves three quarters of the range untouched,
+// which covers everything the game itself authors - a D3DCOLOR cannot exceed 1 - while still
+// leaving the compressed half enough room not to read as a hard knee.
+float TonemapKneeValue = 0.75f;
+// What `reinhard` maps to exactly 1.0. 4.0 because that is the magnitude of the over-range
+// actually reaching this pass: notes 4.48 measured level02's key light at `diffuse 4.0`.
+float TonemapWhiteValue = 4.0f;
+
+void ReadHdrEnvOnce() {
+  if (HdrEnvRead) {
+    return;
+  }
+  HdrEnvRead = true;
+  char value[16] = {};
+  const DWORD len = ::GetEnvironmentVariableA("GKPLUS_VK_HDR", value, sizeof(value));
+  if (len == 0 || len >= sizeof(value)) {
+    return;
+  }
+  const std::string text(value, len);
+  HdrEnabled = !(text == "0" || text == "off" || text == "no");
+}
+
+bool TonemapPassReady = false;
+VkPipelineLayout TonemapLayout = VK_NULL_HANDLE;
+VkPipeline TonemapPipeline = VK_NULL_HANDLE;
+VkShaderModule TonemapVertexModule = VK_NULL_HANDLE;
+VkShaderModule TonemapFragmentModule = VK_NULL_HANDLE;
+
+void DestroyTonemapPass() {
+  TonemapPassReady = false;
+  if (TonemapPipeline != VK_NULL_HANDLE) {
+    vkDestroyPipeline(GetDevice(), TonemapPipeline, nullptr);
+    TonemapPipeline = VK_NULL_HANDLE;
+  }
+  if (TonemapLayout != VK_NULL_HANDLE) {
+    vkDestroyPipelineLayout(GetDevice(), TonemapLayout, nullptr);
+    TonemapLayout = VK_NULL_HANDLE;
+  }
+  VkShaderModule *modules[] = {&TonemapVertexModule, &TonemapFragmentModule};
+  for (VkShaderModule *module : modules) {
+    if (*module != VK_NULL_HANDLE) {
+      vkDestroyShaderModule(GetDevice(), *module, nullptr);
+      *module = VK_NULL_HANDLE;
+    }
+  }
+}
+
+// Built once, at StartDraw, and never rebuilt: it writes the SWAPCHAIN, whose format is fixed for
+// the life of the device - so unlike the world pipelines this one is untouched by the knob that
+// changes what the world pass draws into.
+bool CreateTonemapPass() {
+  TonemapVertexModule =
+      CreateModule(kTonemapFullscreenVertexSpv, sizeof(kTonemapFullscreenVertexSpv));
+  TonemapFragmentModule = CreateModule(kTonemapFragmentSpv, sizeof(kTonemapFragmentSpv));
+  if (TonemapVertexModule == VK_NULL_HANDLE || TonemapFragmentModule == VK_NULL_HANDLE) {
+    return false;
+  }
+  // It reads the offscreen target out of the bindless array, the same way the AO resolve reads its
+  // two inputs, so there is no descriptor set of its own to build.
+  auto set_layout = reinterpret_cast<VkDescriptorSetLayout>(BindlessDescriptorSetLayout());
+  if (set_layout == VK_NULL_HANDLE || SwapchainFormat == VK_FORMAT_UNDEFINED) {
+    return false;
+  }
+
+  VkPushConstantRange range = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               sizeof(TonemapPushConstants)};
+  VkPipelineLayoutCreateInfo layout = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  layout.setLayoutCount = 1;
+  layout.pSetLayouts = &set_layout;
+  layout.pushConstantRangeCount = 1;
+  layout.pPushConstantRanges = &range;
+  if (vkCreatePipelineLayout(GetDevice(), &layout, nullptr, &TonemapLayout) != VK_SUCCESS) {
+    return false;
+  }
+
+  VkPipelineShaderStageCreateInfo stages[2] = {};
+  stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  stages[0].module = TonemapVertexModule;
+  stages[0].pName = "tonemap_fullscreen_vertex";
+  stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  stages[1].module = TonemapFragmentModule;
+  stages[1].pName = "tonemap_fragment";
+
+  // One triangle pulled from SV_VertexID, so no vertex input and no buffer.
+  VkPipelineVertexInputStateCreateInfo vertex_input = {
+      VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineInputAssemblyStateCreateInfo assembly = {
+      VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineViewportStateCreateInfo viewport = {
+      VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  viewport.viewportCount = 1;
+  viewport.scissorCount = 1;
+  VkPipelineRasterizationStateCreateInfo raster = {
+      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  raster.polygonMode = VK_POLYGON_MODE_FILL;
+  raster.cullMode = VK_CULL_MODE_NONE;
+  raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  raster.lineWidth = 1.0f;
+  // **One sample, whatever `render.msaa` says.** The multisampled target is resolved at the end of
+  // the world pass, so what this reads is already single-sampled - the same reason the scale blit
+  // it replaces never knew MSAA existed.
+  VkPipelineMultisampleStateCreateInfo multisample = {
+      VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineDepthStencilStateCreateInfo depth = {
+      VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+  VkPipelineColorBlendAttachmentState attachment = {};
+  attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+  VkPipelineColorBlendStateCreateInfo blend = {
+      VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  blend.attachmentCount = 1;
+  blend.pAttachments = &attachment;
+  const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+  VkPipelineDynamicStateCreateInfo dynamic = {
+      VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+  dynamic.dynamicStateCount = 2;
+  dynamic.pDynamicStates = dynamic_states;
+
+  VkPipelineRenderingCreateInfo rendering = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+  rendering.colorAttachmentCount = 1;
+  rendering.pColorAttachmentFormats = &SwapchainFormat;
+
+  VkGraphicsPipelineCreateInfo info = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  info.pNext = &rendering;
+  info.stageCount = 2;
+  info.pStages = stages;
+  info.pVertexInputState = &vertex_input;
+  info.pInputAssemblyState = &assembly;
+  info.pViewportState = &viewport;
+  info.pRasterizationState = &raster;
+  info.pMultisampleState = &multisample;
+  info.pDepthStencilState = &depth;
+  info.pColorBlendState = &blend;
+  info.pDynamicState = &dynamic;
+  info.layout = TonemapLayout;
+  if (vkCreateGraphicsPipelines(GetDevice(), VK_NULL_HANDLE, 1, &info, nullptr,
+                                &TonemapPipeline) != VK_SUCCESS) {
+    return false;
+  }
+  TonemapPassReady = true;
+  return true;
+}
+
 } // namespace
 
 bool StartDraw(uint32_t width, uint32_t height, uint32_t colour_format) {
   if (Ready) {
     return true;
   }
-  ColourFormat = static_cast<VkFormat>(colour_format);
+  SwapchainFormat = static_cast<VkFormat>(colour_format);
+  // **Only if nothing has set it.** `ReconcileRenderTarget` runs before this at bring-up and
+  // has already called `ApplyColourFormat` with whatever `HdrTargetFormat` chose, so assigning
+  // the swapchain's format unconditionally here would silently undo the HDR target on the very
+  // frame it was created.
+  if (ColourFormat == VK_FORMAT_UNDEFINED) {
+    ColourFormat = SwapchainFormat;
+  }
   if (!ChooseDepthFormat() || !CreateDepth(width, height) || !CreatePipelineLayout()) {
     return false;
   }
@@ -3071,6 +3294,14 @@ bool StartDraw(uint32_t width, uint32_t height, uint32_t colour_format) {
   if (!CreateAoPass(width, height)) {
     DebugWrite("gkplus: ambient occlusion unavailable\n");
     DestroyAoPass();
+  }
+  // Not fatal either, and this is the one whose failure has to be *reported* rather than merely
+  // survived: without it `HdrTargetFormat` keeps the 8-bit target, so `render.hdr` reads back on
+  // and does nothing. It needs the bindless set, which `CreatePipelineLayout` has already proved
+  // exists, and the swapchain format, which is this function's own argument.
+  if (!CreateTonemapPass()) {
+    DebugWrite("gkplus: tonemap pass unavailable, render.hdr will not engage\n");
+    DestroyTonemapPass();
   }
   Items.reserve(kMaxDrawsPerFrame);
   Ready = true;
@@ -3540,6 +3771,7 @@ void SplitCornerCounts(uint32_t &corners, uint32_t &analysed_draws, uint32_t &pe
 // this frame's) and before any draw is recorded (so every draw's push points at the same block).
 void UploadFrameData() {
   FrameDataAddress = 0;
+  UiFrameDataAddress = 0;
   const ScratchAlloc alloc = AllocateScratchFrames(1);
   if (!alloc.valid || alloc.mapped == nullptr) {
     return; // every draw then pushes address 0, and the shader's null check draws unlit
@@ -3666,7 +3898,40 @@ void UploadFrameData() {
   frame->ao_flags = (AoMapOnlyEnabled ? kAoMapOnly : 0u) | (AoDebugEnabled ? kAoDebug : 0u);
   frame->ao_direct = AoDirectValue;
   frame->pad_ao = 0.0f;
+  // **Both derived from the target this frame is actually drawing into**, not from the knob.
+  // `render.hdr` is a request; `ColourFormat` is the answer, and it lags the request by a frame at
+  // bring-up and stays at the swapchain's format forever on a device with no tonemap pass. Lifting
+  // the clamps against an 8-bit target would achieve nothing (UNORM clamps anyway) but decoding
+  // the albedo against one would be visibly wrong - a dark frame nothing ever re-encodes - so the
+  // gate has to be the format rather than the intent.
+  const bool hdr_active = ColourFormat == kHdrFormat;
+  frame->colour_flags = (hdr_active && LinearInputEnabled ? kLinearInput : 0u) |
+                        (hdr_active ? kUnclamped : 0u);
+  frame->pad_colour[0] = frame->pad_colour[1] = frame->pad_colour[2] = 0;
   FrameDataAddress = ScratchFrameAddress() + alloc.offset * sizeof(GpuFrameData);
+
+  // --- and a second copy for the UI pass, differing in one word -------------------------------
+  //
+  // The 2D layers are drawn AFTER the tonemap, into an 8-bit target, so they must not be
+  // sRGB-decoded and must not have their clamps lifted: nothing downstream would re-encode them,
+  // and the fixed function's D3DCOLOR clamp is what their blends were authored against. A second
+  // block is how that is said per pass without a per-draw flag - `push.frame` is already a
+  // per-draw push, so a UI draw simply points at this one.
+  //
+  // A whole 352-byte copy rather than one field, because every *other* field has to stay
+  // identical: the UI layer still samples the shadow atlases, still reads the AO result, still
+  // carries the same tessellation and lighting-map parameters. Diverging on anything but
+  // `colour_flags` would make the split visible as a shading change rather than as a colour-space
+  // one. Allocated unconditionally so the address is valid whatever the knobs say - it costs 352
+  // bytes of a 2688 KB per-frame arena.
+  UiFrameDataAddress = FrameDataAddress;
+  const ScratchAlloc ui_alloc = AllocateScratchFrames(1);
+  if (ui_alloc.valid && ui_alloc.mapped != nullptr) {
+    auto *ui = static_cast<GpuFrameData *>(ui_alloc.mapped);
+    *ui = *frame;
+    ui->colour_flags = 0;
+    UiFrameDataAddress = ScratchFrameAddress() + ui_alloc.offset * sizeof(GpuFrameData);
+  }
 }
 
 namespace {
@@ -5825,6 +6090,126 @@ void ApplySampleCount(uint32_t samples) {
   DestroyPipelineCache();
 }
 
+// --- HDR ---------------------------------------------------------------------------------------
+//
+// See SetHdr in VkDraw.h. The knobs are stores; the rebuild they imply happens in
+// `ReconcileRenderTarget`, exactly as it does for `render.msaa`.
+
+void SetHdr(bool on) {
+  // The env var is consumed here as well as at bring-up, for the reason `SetMsaa` gives: reading
+  // it after assigning would put the environment's value back over the caller's.
+  ReadHdrEnvOnce();
+  HdrEnabled = on;
+}
+
+bool Hdr() {
+  ReadHdrEnvOnce();
+  return HdrEnabled;
+}
+
+void SetLinearInput(bool on) { LinearInputEnabled = on; }
+bool LinearInput() { return LinearInputEnabled; }
+
+void SetTonemap(uint32_t op) { TonemapOp = op; }
+uint32_t Tonemap() { return TonemapOp; }
+
+void SetExposure(float value) { ExposureValue = value; }
+float Exposure() { return ExposureValue; }
+
+void SetTonemapKnee(float value) { TonemapKneeValue = value; }
+float TonemapKnee() { return TonemapKneeValue; }
+
+void SetTonemapWhite(float value) { TonemapWhiteValue = value; }
+float TonemapWhite() { return TonemapWhiteValue; }
+
+uint32_t HdrTargetFormat(uint32_t swapchain_format) {
+  ReadHdrEnvOnce();
+  // **Gated on the pass, not just on the knob.** A float target nothing can present is a black
+  // window, so a device that could not build the tonemap pipeline keeps the 8-bit target and the
+  // blit - the same "lose the feature, not the frame" rule the shadow atlases and the AO pass
+  // follow. It also means the first frame comes up 8-bit even under `GKPLUS_VK_HDR=1`, because
+  // `ReconcileRenderTarget` runs before `StartDraw` builds the pass; the next frame's reconcile
+  // notices the mismatch and rebuilds, which costs one frame at startup and nothing after it.
+  return (HdrEnabled && TonemapPassReady) ? static_cast<uint32_t>(kHdrFormat) : swapchain_format;
+}
+
+void ApplyColourFormat(uint32_t format) {
+  const auto wanted = static_cast<VkFormat>(format);
+  if (wanted == ColourFormat) {
+    return;
+  }
+  ColourFormat = wanted;
+  // **Not optional and not deferrable**, and word for word the reason `ApplySampleCount` gives:
+  // the colour attachment's format is baked into every cached pipeline, and a pipeline whose
+  // format disagrees with the attachment is an invalid draw rather than a wrong picture. They go
+  // now, while the caller's wait-idle still holds.
+  DestroyPipelineCache();
+}
+
+bool TonemapReady() { return TonemapPassReady; }
+
+void RecordTonemap(void *command_buffer, uint64_t dest_view, uint32_t source_width,
+                   uint32_t source_height, uint32_t dest_width, uint32_t dest_height) {
+  if (!TonemapPassReady || dest_view == 0 || source_width == 0 || source_height == 0 ||
+      dest_width == 0 || dest_height == 0) {
+    return;
+  }
+  auto cmd = static_cast<VkCommandBuffer>(command_buffer);
+
+  VkRenderingAttachmentInfo colour = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  colour.imageView = reinterpret_cast<VkImageView>(dest_view);
+  colour.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  // DONT_CARE: the triangle covers every pixel of the target and the fragment shader writes
+  // unconditionally, so a clear would be a second whole-image write. Same reasoning as the AO
+  // resolve's.
+  colour.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  colour.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+  VkRenderingInfo rendering = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+  rendering.renderArea.extent = {dest_width, dest_height};
+  rendering.layerCount = 1;
+  rendering.colorAttachmentCount = 1;
+  rendering.pColorAttachments = &colour;
+  vkCmdBeginRendering(cmd, &rendering);
+
+  // **A zero origin, not `ViewportOrigin()`.** The half-pixel shift is a fixed-function
+  // convention difference that belongs to the world pass; this triangle is in clip space and its
+  // fragment reads its own integer `SV_Position` to pick a source texel, so shifting the viewport
+  // would move every pixel's idea of which column it is reading by half a column - which is
+  // exactly the registration the nearest scale exists to get right. The AO resolve says the same
+  // thing about the same trap.
+  VkViewport viewport = {0.0f, 0.0f, static_cast<float>(dest_width),
+                         static_cast<float>(dest_height), 0.0f, 1.0f};
+  VkRect2D scissor = {{0, 0}, {dest_width, dest_height}};
+  vkCmdSetViewport(cmd, 0, 1, &viewport);
+  vkCmdSetScissor(cmd, 0, 1, &scissor);
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, TonemapPipeline);
+  auto set = reinterpret_cast<VkDescriptorSet>(BindlessDescriptorSet());
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, TonemapLayout, 0, 1, &set, 0,
+                          nullptr);
+
+  TonemapPushConstants push = {};
+  push.source_texture = kTonemapSourceSlot;
+  push.op = TonemapOp;
+  // The encode is `linear_input`'s other half and must never be set without it: the buffer only
+  // holds linear light when something decoded it on the way in, and encoding gamma-encoded values
+  // a second time washes the whole frame out. One flag word derived in one place is what keeps the
+  // two from being set independently by accident.
+  push.flags = (ColourFormat == kHdrFormat && LinearInputEnabled) ? kEncodeSrgb : 0u;
+  push.source_width = source_width;
+  push.source_height = source_height;
+  push.dest_width = dest_width;
+  push.dest_height = dest_height;
+  push.exposure = ExposureValue;
+  push.knee = TonemapKneeValue;
+  push.white = TonemapWhiteValue;
+  vkCmdPushConstants(cmd, TonemapLayout,
+                     VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push),
+                     &push);
+  vkCmdDraw(cmd, 3, 1, 0, 0);
+  vkCmdEndRendering(cmd);
+}
+
 // --- the stock-look preset (§4.87) ------------------------------------------------------------
 //
 // See SetStock in VkDraw.h for what is in the set and what is deliberately not.
@@ -5845,6 +6230,12 @@ struct DepartureSet {
   // The only member that is not a bool, and the reason kStock spells its value out rather than
   // relying on a zero: the reproduction here is ONE sample per pixel, not none.
   uint32_t msaa = 1;
+  // **`hdr` alone, and deliberately not its four sub-knobs.** `linear_input`, `tonemap`,
+  // `exposure`, `knee` and `white` describe how the float target is presented; with `hdr` off
+  // there is no float target and none of them does anything, so putting them in the set would mean
+  // `stock = false` restoring five values that were already inert - and, worse, would make an
+  // operator the user had chosen part of what "the stock look" means.
+  bool hdr = false;
 
   friend bool operator==(const DepartureSet &, const DepartureSet &) = default;
 };
@@ -5864,6 +6255,7 @@ constexpr DepartureSet kStock = {
     .ambient_occlusion = false,
     .tessellation = false,
     .msaa = 1,
+    .hdr = false,
 };
 
 DepartureSet SavedDepartures;
@@ -5892,6 +6284,10 @@ DepartureSet CurrentDepartures() {
   // had just turned on, and `Stock()` would answer true for a frame that is about to be
   // multisampled.
   set.msaa = MsaaWanted();
+  // `Hdr()` and not `ColourFormat == kHdrFormat`, for the reason the whole comment above gives:
+  // the format is the effective value and lags the request, so snapshotting through it would
+  // record "off" for a knob switched on a frame ago.
+  set.hdr = Hdr();
   return set;
 }
 
@@ -5912,6 +6308,7 @@ void ApplyDepartures(const DepartureSet &set) {
   SetAmbientOcclusion(set.ambient_occlusion);
   SetTessellationEnabled(set.tessellation);
   SetMsaa(set.msaa);
+  SetHdr(set.hdr);
 }
 } // namespace
 
@@ -6118,12 +6515,26 @@ void ClearDraws() {
   InternedMaterials.clear();
 }
 
-void RecordDraws(void *command_buffer) {
+bool HasUiDraws() {
+  for (const DrawItem &item : Items) {
+    if (item.ui) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void RecordDraws(void *command_buffer, Layer layer) {
   // Per frame, not cumulative: the question these answer is "what is the set predicate selecting
   // right now", which a running total cannot say. Zeroed here rather than at the draw loop so an
   // early return below reports 0 rather than the previous frame's figures.
-  TessDrawsThisFrame = 0;
-  TessPatchesThisFrame = 0;
+  // **Only on the pass that comes first.** Under `render.hdr` this function runs twice a frame -
+  // once per layer - and zeroing here unconditionally would make the UI pass wipe the world pass's
+  // figures and report a frame with 261 draws as a frame with 7.
+  if (layer != Layer::Ui) {
+    TessDrawsThisFrame = 0;
+    TessPatchesThisFrame = 0;
+  }
   TheStats.items = Items.size();
   if (Items.size() > TheStats.max_items) {
     TheStats.max_items = Items.size();
@@ -6133,7 +6544,9 @@ void RecordDraws(void *command_buffer) {
     TheStats.max_materials = InternedMaterials.size();
   }
   if (!Ready || Items.empty()) {
-    ClearDraws();
+    if (layer != Layer::World) {
+      ClearDraws();
+    }
     return;
   }
   auto cmd = static_cast<VkCommandBuffer>(command_buffer);
@@ -6149,12 +6562,20 @@ void RecordDraws(void *command_buffer) {
   const uint64_t materials = ScratchMaterialAddress();
   if (arena_vertices == 0 || arena_indices == VK_NULL_HANDLE || draw_records == 0 ||
       materials == 0) {
-    ClearDraws();
+    if (layer != Layer::World) {
+      ClearDraws();
+    }
     return;
   }
 
-  UploadMapLights();
-  UploadFrameData();
+  // **Once a frame, on the first pass only.** Both allocate out of the frame scratch and both
+  // publish addresses the draws below push; running them again for the UI pass would allocate a
+  // second set and, worse, `UploadFrameData` would hand `Layer::Ui` a block whose `colour_flags`
+  // it had just recomputed. The UI pass reads what the world pass published.
+  if (layer != Layer::Ui) {
+    UploadMapLights();
+    UploadFrameData();
+  }
 
   if (set != VK_NULL_HANDLE) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, Layout, 0, 1, &set, 0,
@@ -6187,9 +6608,16 @@ void RecordDraws(void *command_buffer) {
   // The batching census (DrawStats::batch_runs). Nothing here changes what is submitted - it
   // counts what an indirect world pass could merge, which is the question that decides whether
   // one is worth writing at all.
-  TheStats.batch_runs = 0;
-  TheStats.batch_longest = 0;
-  TheStats.batch_draws = 0;
+  // Zeroed on the first pass only, for the reason the tessellation counters above are: under
+  // `render.hdr` this function runs once per layer, and the 2D pass would otherwise report its
+  // seven draws as the whole frame's batching. The runs it then accumulates are the two layers'
+  // added together, which is what the census is asking anyway - it counts what an indirect world
+  // pass could merge.
+  if (layer != Layer::Ui) {
+    TheStats.batch_runs = 0;
+    TheStats.batch_longest = 0;
+    TheStats.batch_draws = 0;
+  }
   uint64_t run_length = 0;
   VkPipeline run_pipeline = VK_NULL_HANDLE;
   uint32_t run_ref = UINT32_MAX, run_mask = 0, run_write_mask = 0;
@@ -6216,12 +6644,23 @@ void RecordDraws(void *command_buffer) {
     if (index >= DrawHideFirst && index <= DrawHideLast) {
       continue;
     }
+    // The layer split. `All` records everything, which is the single-pass frame and what runs
+    // whenever HDR is off.
+    if ((layer == Layer::World && item.ui) || (layer == Layer::Ui && !item.ui)) {
+      continue;
+    }
     // The tessellation bit is set here, on a copy, rather than by the capture layer: which draws
     // are the level mesh is this renderer's policy and not something D3D was asked for, and the
     // predicates and the material table are both in this file. A draw that does not want it
     // forms exactly the key it formed before the feature existed, which is what makes
     // `render.tessellation = false` bit-identical rather than merely equivalent.
     PipelineState key = item.pipeline;
+    // Which target this pass writes, so the pipeline declares the right attachment format. Only
+    // ever set on the UI pass, which only ever runs under HDR - so with the feature off every key
+    // formed here is the one that was formed before it existed.
+    if (layer == Layer::Ui) {
+      key.ldr_target = 1;
+    }
     if (WantsTessellation(item)) {
       key.tessellate = 1;
       ++TessDrawsThisFrame;
@@ -6314,7 +6753,10 @@ void RecordDraws(void *command_buffer) {
     push.record = item.record;
     push.material = item.material;
     push.base_vertex = item.base_vertex;
-    push.frame = FrameDataAddress;
+    // The 2D layers get the copy with `colour_flags` cleared: they are drawn after the tonemap
+    // into an 8-bit target, so nothing downstream would re-encode a decoded albedo and the
+    // D3DCOLOR clamp their blends were authored against has to stay. See UploadFrameData.
+    push.frame = layer == Layer::Ui ? UiFrameDataAddress : FrameDataAddress;
     if (push.vertices == 0) {
       continue;
     }
@@ -6386,10 +6828,16 @@ void RecordDraws(void *command_buffer) {
     }
   }
   close_run();
-  // Kept rather than dropped, so `render.draw_info(i)` can describe the frame that was just
-  // recorded. A swap rather than a copy: the buffers trade places and neither allocates.
-  LastItems.swap(Items);
-  ClearDraws();
+  // **Only on the pass that comes last**, which is the whole hazard of running this twice: the
+  // world pass handing the list to `LastItems` would leave the UI pass with nothing to record and
+  // the frame with no HUD. `Layer::World` is by construction never the last pass - VkRenderer
+  // follows it with `Layer::Ui` unconditionally when it splits at all.
+  if (layer != Layer::World) {
+    // Kept rather than dropped, so `render.draw_info(i)` can describe the frame that was just
+    // recorded. A swap rather than a copy: the buffers trade places and neither allocates.
+    LastItems.swap(Items);
+    ClearDraws();
+  }
 }
 
 void SetDrawRange(uint32_t first, uint32_t last) {
@@ -6430,7 +6878,11 @@ std::string DescribeDraw(uint32_t index) {
       // draw is visible: it is per draw, the game uses six of them and never the default (§4.32),
       // and a draw in the wrong slice is drawn in front of things it should be behind - which
       // looks like a depth-test defect and is not one.
-      "  alpha test func %u ref %u   shade %u   material %u   depth slice %.4f..%.4f\n"
+      // `depth_clamp` is set for a pre-transformed draw and ONLY for one (see PipelineState),
+      // so it is this frame's answer to "is this draw 2D" - which is what decides whether the
+      // tonemap should touch it. Printed rather than derived from the depth slice, which is only
+      // a proxy: the slice says where a draw sits, not how its vertices got there.
+      "  alpha test func %u ref %u   shade %u   material %u   depth slice %.4f..%.4f  %s\n"
       // ...and the rectangle, which is the other half of the same viewport and decides WHERE the
       // draw lands rather than how deep it is (§4.47).
       "  viewport rect %d,%d %ux%u\n"
@@ -6444,7 +6896,8 @@ std::string DescribeDraw(uint32_t index) {
       p.cull_mode, p.colour_write, p.stencil_enable, p.stencil_func, p.stencil_fail,
       p.stencil_zfail, p.stencil_pass, d.stencil_ref, d.stencil_mask, d.stencil_write_mask,
       d.flags & 0x0fu, (d.flags >> 8) & 0xffu, d.shade_mode, d.material, d.min_depth,
-      d.max_depth, d.viewport_x, d.viewport_y, d.viewport_width, d.viewport_height,
+      d.max_depth, p.depth_clamp ? "PRE-TRANSFORMED (2D)" : "3D",
+      d.viewport_x, d.viewport_y, d.viewport_width, d.viewport_height,
       d.stage_count,
       d.stages[0].texture_index == kNoTexture ? -1 : (int)d.stages[0].texture_index,
       d.stages[0].sampler_index, d.stages[0].color, d.stages[0].alpha,
@@ -7238,6 +7691,24 @@ std::string FormatDrawStats() {
   // original: a reader comparing a shot against real D3D8 has to know which equation ran, and
   // "no line" would read as "the fixed-function one" to anyone who had not been told otherwise.
   add("light sum: per %s\n", PerPixelLightingEnabled() ? "PIXEL" : "vertex (the original)");
+  // Printed unconditionally for the same reason, and it has to say all three parts:
+  // `render.hdr` reads back as REQUESTED, so a device with no tonemap pass and the one frame
+  // between a write and the reconcile both read `hdr = true` while the frame is still 8-bit.
+  // This is where that difference is visible, and "requested but not engaged" is the only
+  // wording that tells "I asked for it" from "it is happening".
+  if (Hdr() || ColourFormat == kHdrFormat) {
+    const bool engaged = ColourFormat == kHdrFormat;
+    add("hdr: %s, %s input, tonemap %s, exposure %.2f (knee %.2f, white %.2f)\n",
+        engaged ? "R16G16B16A16_SFLOAT"
+                : (TonemapPassReady ? "requested, not engaged yet"
+                                    : "requested, NO TONEMAP PASS ON THIS DEVICE"),
+        (engaged && LinearInputEnabled) ? "linear" : "gamma (linear_input off)",
+        TonemapOp == 1   ? "rolloff"
+        : TonemapOp == 2 ? "reinhard"
+        : TonemapOp == 3 ? "aces"
+                         : "clamp",
+        ExposureValue, TonemapKneeValue, TonemapWhiteValue);
+  }
   // Only when it is on, for the reason the material overrides are: a `0 draws, 0 patches` on every
   // report would read as an invariant of the renderer rather than as "nobody asked for it"
   // (§4.44). A device with no `tessellationShader` therefore prints nothing whatever the knob
@@ -7381,6 +7852,12 @@ void ShutdownDraw() {
   // Reverse creation order: the per-frame atlas borrows the map's module, and the map's borrows
   // the sun's module and layout. Destroying a pipeline after its layout is legal, but this is the
   // order that reads correctly.
+  DestroyTonemapPass();
+  // Forgotten with the pass, not kept: `StartDraw` only adopts the swapchain's format when this is
+  // UNDEFINED, so leaving a stale one here would make a recreated device draw into whatever the
+  // last one happened to be using.
+  ColourFormat = VK_FORMAT_UNDEFINED;
+  SwapchainFormat = VK_FORMAT_UNDEFINED;
   DestroyAoPass();
   DestroyDynShadowAtlas();
   DestroyMapShadowAtlas();
