@@ -23,7 +23,7 @@
 // format a page of text every time they are touched, so nothing here reads one
 // per frame - they sit behind a button that caches what it read.
 
-import { console, render } from "gk";
+import { console, render, settings } from "gk";
 
 /** Text the readout buttons have fetched, so a page of formatted state is built
  *  when it is asked for rather than sixty times a second.
@@ -54,6 +54,82 @@ const BLOOM_BLENDS = ["off", "add", "screen", "max"];
  *  @type {number | null} */
 let msaaPending = null;
 
+/** Persist one `render` knob to `<profile>\settings.json`, under the same
+ *  `core.render.*` namespace `src/RenderMenu.cpp`'s front-end page already
+ *  uses - so a knob this panel and that page both expose (`hdr`, `ao`,
+ *  `tessellation`, ...) is the same stored value either way, and
+ *  `ApplyStoredRenderSettings` restores it before this panel ever runs.
+ *  `settings.set` creates `core` and `core.render` on first use, and nothing
+ *  here calls `.save()` - the per-frame autosave (`SaveSettled`) is what
+ *  writes it, which is the point: a slider dragged for a dozen frames would
+ *  otherwise hit the disk a dozen times.
+ *  @param {string} key
+ *  @param {unknown} value
+ */
+function persist(key, value) {
+  settings.set(`core.render.${key}`, value);
+}
+
+/** The same, for one field of one bloom layer. `render.bloom_layer` takes a
+ *  partial spec, but a settings array is a value - the whole thing has to be
+ *  read, patched and written back, since there is nothing an element write
+ *  could go through (see src/JsSettings.cpp - an array handed out is frozen).
+ *  @param {number} index
+ *  @param {import("gk").BloomLayerSpec} patch
+ */
+function persistBloomLayer(index, patch) {
+  const stored = settings.core?.render?.bloom_layers;
+  const layers = Array.isArray(stored) ? stored.slice() : [];
+  while (layers.length <= index) {
+    layers.push({});
+  }
+  layers[index] = { ...layers[index], ...patch };
+  settings.set("core.render.bloom_layers", layers);
+}
+
+/** Put every stored `core.render.*` knob back onto `render`, once, when this
+ *  module loads - which is what makes a setting changed through this panel
+ *  survive to the next launch rather than only the next frame.
+ *
+ *  Generic rather than a per-key list: `persist` above stores a knob under
+ *  its own `render` property name, so replaying every stored key back onto
+ *  that same property covers whatever this panel exposes without a second
+ *  list to keep in sync. `bloom_layers` is the one exception - it is an
+ *  array, not a `render` property - so it is applied through `bloom_layer`
+ *  instead. A knob a past build stored that this one no longer has just sets
+ *  an unused property and is otherwise harmless.
+ *
+ *  Runs after `ApplyStoredRenderSettings` (`src/RenderMenu.cpp`), which
+ *  already restored the eight knobs the front-end page also exposes - same
+ *  keys, so this repeats rather than overrides those, and is the only
+ *  restorer for everything else this panel adds. */
+function restoreRenderSettings() {
+  const stored = settings.core?.render;
+  if (!stored) {
+    return;
+  }
+  for (const key of Object.keys(stored)) {
+    if (key === "bloom_layers") {
+      continue;
+    }
+    try {
+      render[key] = stored[key];
+    } catch (error) {
+      console.warn(`render-panel: could not restore render.${key}: ${error}`);
+    }
+  }
+  const layers = stored.bloom_layers;
+  if (Array.isArray(layers)) {
+    layers.forEach((spec, index) => {
+      if (spec && typeof spec === "object") {
+        render.bloom_layer(index, spec);
+      }
+    });
+  }
+}
+
+restoreRenderSettings();
+
 /** A checkbox bound to a `render` property, written only when it changes.
  *  @param {ImGui} ImGui
  *  @param {string} label
@@ -65,6 +141,7 @@ function toggle(ImGui, label, key, tip) {
   const result = ImGui.Checkbox(label, render[key] === true);
   if (result.changed) {
     render[key] = result.value;
+    persist(key, result.value);
   }
   if (tip) {
     ImGui.SetItemTooltip(tip);
@@ -88,6 +165,7 @@ function slider(ImGui, label, key, min, max, tip, format) {
   });
   if (result.changed) {
     render[key] = result.value;
+    persist(key, result.value);
   }
   if (tip) {
     ImGui.SetItemTooltip(tip);
@@ -107,6 +185,7 @@ function intSlider(ImGui, label, key, min, max, tip) {
   const result = ImGui.SliderInt(label, Number.isFinite(current) ? current : min, min, max);
   if (result.changed) {
     render[key] = result.value;
+    persist(key, result.value);
   }
   if (tip) {
     ImGui.SetItemTooltip(tip);
@@ -363,6 +442,7 @@ export function draw_render_panel(ImGui) {
       }
       if (ImGui.RadioButton(set, render.tess_set === set) && render.tess_set !== set) {
         render.tess_set = set;
+        persist("tess_set", set);
       }
     }
     ImGui.SetItemTooltip(
@@ -427,6 +507,7 @@ export function draw_render_panel(ImGui) {
     if (picked.changed) {
       msaaPending = MSAA_COUNTS[picked.current_item];
       render.msaa = msaaPending;
+      persist("msaa", msaaPending);
     }
     ImGui.SetItemTooltip(
       "Sample count for the world pass. Takes effect next frame - it rebuilds the " +
@@ -458,6 +539,7 @@ export function draw_render_panel(ImGui) {
     const picked = ImGui.Combo("tonemap", Math.max(0, TONEMAP_OPS.indexOf(op)), TONEMAP_OPS);
     if (picked.changed) {
       render.tonemap = TONEMAP_OPS[picked.current_item];
+      persist("tonemap", TONEMAP_OPS[picked.current_item]);
     }
     ImGui.SetItemTooltip(
       "Applies to the world alone - the menus, HUD and briefing screens are drawn after " +
@@ -512,7 +594,9 @@ export function draw_render_panel(ImGui) {
         const blend = ImGui.Combo("blend", Math.max(0, BLOOM_BLENDS.indexOf(layer.blend)),
           BLOOM_BLENDS);
         if (blend.changed) {
-          render.bloom_layer(index, { blend: BLOOM_BLENDS[blend.current_item] });
+          const value = BLOOM_BLENDS[blend.current_item];
+          render.bloom_layer(index, { blend: value });
+          persistBloomLayer(index, { blend: value });
         }
         ImGui.SetItemTooltip(
           "off skips the layer's two GPU passes entirely. add is what a lens does; " +
@@ -523,6 +607,7 @@ export function draw_render_panel(ImGui) {
           { format: "%.2f" });
         if (threshold.changed) {
           render.bloom_layer(index, { threshold: threshold.value });
+          persistBloomLayer(index, { threshold: threshold.value });
         }
         ImGui.SetItemTooltip(
           "Linear luminance at which a pixel starts to contribute. 1.0 is exactly a " +
@@ -531,6 +616,7 @@ export function draw_render_panel(ImGui) {
         const knee = ImGui.SliderFloat("knee", layer.knee, 0.0, 2.0, { format: "%.2f" });
         if (knee.changed) {
           render.bloom_layer(index, { knee: knee.value });
+          persistBloomLayer(index, { knee: knee.value });
         }
         ImGui.SetItemTooltip(
           "Half-width of the soft ramp around the threshold. Zero pops a surface's whole " +
@@ -540,6 +626,7 @@ export function draw_render_panel(ImGui) {
           { format: "%.4f" });
         if (radius.changed) {
           render.bloom_layer(index, { radius: radius.value });
+          persistBloomLayer(index, { radius: radius.value });
         }
         ImGui.SetItemTooltip(
           "The blur's sigma as a fraction of the FRAME HEIGHT, so it means the same at " +
@@ -549,6 +636,7 @@ export function draw_render_panel(ImGui) {
           { format: "%.2f" });
         if (intensity.changed) {
           render.bloom_layer(index, { intensity: intensity.value });
+          persistBloomLayer(index, { intensity: intensity.value });
         }
         ImGui.SetItemTooltip(
           "The multiplier at composite time. Zero still records both passes - use " +
