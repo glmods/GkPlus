@@ -230,6 +230,31 @@ struct GpuFrameData {
     // `src/gen-shader-abi.py` refuses a struct whose two layouts disagree, which is what caught
     // this rather than a wrong picture later.
     uint pad_colour[2];
+    // --- soft sun shadows, PCSS (notes 4.100) --------------------------------------------------
+    //
+    // Appended for the reason every block since `sun_matrix` has been: every field with a pinned
+    // offset in src/VkDraw.h is above this, and the end is the only place a field can be added
+    // without moving one of them. Four words, so the struct stays a multiple of 16.
+    //
+    // `shadow_softness` is the **tangent of the sun's angular radius** - the penumbra's world
+    // radius per world unit between a fragment and whatever shadows it. **0 is the single test
+    // for "hard"**, and it takes the 3x3 path this file had before PCSS existed, unchanged, so
+    // the default is bit-identical to that build rather than approximately it.
+    float shadow_softness;
+    // The filter's floor and ceiling, in texels of whichever cascade the fragment landed in. The
+    // floor keeps a contact shadow at least as filtered as the old 3x3 was; the ceiling bounds
+    // both how sparse the kernel may get and how far a tap may stray from its own tile.
+    float shadow_soft_min;
+    float shadow_soft_max;
+    // How many of `kShadowDisc` each of the two loops walks. Clamped to the table on the CPU.
+    uint shadow_soft_taps;
+    // The screen-space mask (shadowmask.slang). `kNoTexture` is the single test: "the knob is
+    // off", "the pass could not be built" and "it did not run this frame" are one state here.
+    uint shadow_mask_texture;
+    // The prepass's world position, which is what makes reading the mask *safe*: a fragment only
+    // takes it when the pixel it would read is the surface being shaded.
+    uint shadow_mask_position;
+    uint pad_mask[2];
 };
 
 // **56 bytes of a guaranteed 128.** It reached exactly 128 with the light grid (§4.56), and
@@ -803,16 +828,81 @@ LitColour resolve_lit_colour(GpuDrawRecord draw, LightSums sums, float4 vertex_c
     return out;
 }
 
+// The sampling pattern both of PCSS's loops walk, unit radius.
+//
+// **The same construction ao.slang uses, and for the same two reasons** (notes 4.86): one fixed
+// pattern shared by every pixel is the friendliest case there is for the texture cache, and - far
+// more important here - it produces no noise, so nothing has to blur the result. A per-pixel
+// rotation is what textbook PCSS does, and it trades this pattern's banding for grain that only a
+// blur removes; there is no blur pass on the shadow term, and adding one over a 640x480 frame
+// would halo every silhouette exactly as 4.86 says it would.
+//
+// Duplicated rather than shared because a `.slang` here is standalone - the build compiles each
+// file on its own, with no include and no module (gen-shaders.py). This is ao.slang's 32-entry
+// maximin prefix verbatim, so a shorter `shadow_soft_taps` is still a well-spread subset of it
+// rather than a corner of the plot.
+static const uint kShadowDiscSize = 32u;
+static const float2 kShadowDisc[kShadowDiscSize] = {
+    float2(+0.000000, +0.000000), float2(-0.700000, -0.675000),
+    float2(+0.000000, +0.950000), float2(+0.950000, +0.000000),
+    float2(-0.800000, +0.425000), float2(+0.500000, -0.750000),
+    float2(+0.425000, +0.425000), float2(+0.000000, -0.925000),
+    float2(-0.475000, -0.025000), float2(+0.500000, -0.012500),
+    float2(-0.925000, +0.000000), float2(+0.000000, +0.500000),
+    float2(-0.012500, -0.500000), float2(-0.400000, +0.425000),
+    float2(-0.425000, -0.450000), float2(+0.750000, -0.500000),
+    float2(+0.425000, -0.350000), float2(+0.500000, +0.762500),
+    float2(-0.250000, +0.750000), float2(+0.750000, +0.250000),
+    float2(-0.600000, +0.675000), float2(-0.750000, -0.250000),
+    float2(-0.250000, -0.750000), float2(-0.250000, -0.250000),
+    float2(+0.725000, +0.500000), float2(+0.250000, +0.750000),
+    float2(+0.750000, -0.250000), float2(+0.250000, -0.750000),
+    float2(+0.250000, +0.250000), float2(+0.250000, -0.200000),
+    float2(-0.250000, +0.250000), float2(-0.750000, +0.050000),
+};
+
 // How lit this fragment is by the sun, 0 fully shadowed to 1 fully lit.
 //
-// A 3x3 PCF over the depth map. Manual comparison rather than a comparison sampler, because the
-// bindless set's sampler array is `SamplerState` and adding a second array of
-// `SamplerComparisonState` would mean a third binding on a set whose last binding is pinned by
-// VARIABLE_DESCRIPTOR_COUNT - for nine taps that cost the same either way.
-float sun_visibility(float3 world_position) {
+// Three paths now, and the first is a lookup rather than a filter. `shadowmask.slang` resolves the
+// whole term into a screen-space mask with a rotated kernel and blurs it; where that mask covers
+// the surface being shaded, this reads it and is done. Where it does not - the mask is off, the
+// pass could not be built, or this pixel is a different surface from the one the prepass saw -
+// the filter runs here as it always did: a 3x3 PCF when `shadow_softness` is 0, PCSS over one
+// fixed lattice when it is not.
+//
+// Manual comparison rather than a comparison sampler in both, because the bindless set's sampler
+// array is `SamplerState` and adding a second array of `SamplerComparisonState` would mean a
+// third binding on a set whose last binding is pinned by VARIABLE_DESCRIPTOR_COUNT - for taps
+// that cost the same either way. PCSS could not use one for its first loop regardless: a blocker
+// search needs the depth that is stored, not the verdict of a comparison against it.
+// How far off this fragment's own position the prepass's may be and still be the same surface, as
+// a fraction of the distance to the eye. **Relative and not absolute**, because the two positions
+// are the same arithmetic in a different pass and differ only by rasterisation precision, which
+// scales with magnitude - an absolute epsilon would be slack up close and would reject the far
+// half of every level.
+//
+// What it is really rejecting is not precision but *a different surface*: a transparent draw over
+// the ground, a fragment MSAA-resolved from a triangle the prepass's single sample did not see, a
+// draw the prepass never rasterised at all. Each of those falls back on the inline filter below,
+// which is what makes the mask a substitution rather than a replacement - nothing loses its shadow
+// because a screen-space pass could not see it.
+static const float kMaskMatch = 0.01;
+
+float sun_visibility(float3 world_position, int2 pixel, float3 eye) {
     const GpuFrameData frame = pc.frame[0];
     if (frame.shadow_texture == kNoTexture || frame.shadow_cascades == 0u) {
         return 1.0;
+    }
+    if (frame.shadow_mask_texture != kNoTexture) {
+        const float4 seen = textures[frame.shadow_mask_position].Load(int3(pixel, 0));
+        const float3 delta = seen.xyz - world_position;
+        const float tolerance = kMaskMatch * max(length(world_position - eye), 1.0);
+        if (seen.w != 0.0 && dot(delta, delta) <= tolerance * tolerance) {
+            // **Raw visibility**: `shadow_strength` is applied here and not in the mask, so the
+            // knob costs no re-resolve and there is one definition of what it means.
+            return lerp(1.0, textures[frame.shadow_mask_texture].Load(int3(pixel, 0)).r,
+                        saturate(frame.shadow_strength));
+        }
     }
     // ONE transform, however many cascades: `sun_matrix` is the sun's basis with no scale, so this
     // is the fragment in light space in world units, and a cascade is a centre and a half-extent
@@ -830,7 +920,7 @@ float sun_visibility(float3 world_position) {
 
     // The FIRST cascade that contains this fragment, which is the smallest one because they are
     // ordered inward-out - so the sharpest map that covers a fragment is the one it uses, and the
-    // selection needs no view-space depth. §4.56's warning applies here too: the view matrix on
+    // selection needs no view-space depth. 4.56's warning applies here too: the view matrix on
     // this side is per DRAW, so anything derived from it is a quiet source of error.
     uint cascade = frame.shadow_cascades;
     float2 local = float2(0.0, 0.0);
@@ -856,19 +946,88 @@ float sun_visibility(float3 world_position) {
     const float2 hi = float2(1.0, 1.0) - lo;
 
     float lit = 0.0;
-    for (int y = -1; y <= 1; ++y) {
-        for (int x = -1; x <= 1; ++x) {
+    if (frame.shadow_softness <= 0.0) {
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                const float2 tap =
+                    clamp(local + float2(float(x), float(y)) * frame.shadow_texel, lo, hi);
+                // SampleLevel, not Sample: this runs under a branch on the material, where an
+                // implicit-derivative fetch is undefined - the same rule shade_lighting_map
+                // follows.
+                const float d =
+                    textures[frame.shadow_texture].SampleLevel(samplers[frame.shadow_sampler],
+                                                               (tap + tile) * 0.5, 0.0).r;
+                lit += reference <= d ? 1.0 : 0.0;
+            }
+        }
+        lit /= 9.0;
+    } else {
+        // --- PCSS -----------------------------------------------------------------------------
+        //
+        // The penumbra is worked out in WORLD units and converted to texels last, which is what
+        // carries it across a cascade boundary: the same blocker at the same distance produces the
+        // same penumbra on the ground whichever map answered for it, even though that is eight
+        // texels in cascade 0 and one in cascade 3. A radius quoted in texels would paint a
+        // visible ring where two cascades meet, in every frame, for nothing.
+        //
+        // A cascade's texel is `2 * extent / tile` world units, `cascades[i].z` is `1 / extent`
+        // and `shadow_texel` is `1 / tile`, so that is this product and no new field is needed.
+        const float world_texel = 2.0 * frame.shadow_texel / frame.cascades[cascade].z;
+        const uint taps = min(frame.shadow_soft_taps, kShadowDiscSize);
+        const float ceiling = max(frame.shadow_soft_max, frame.shadow_soft_min);
+
+        // **The search radius is the ceiling**, which is an argument rather than a knob nobody
+        // wrote: a blocker found beyond it could only ask for a penumbra the ceiling clamps back
+        // to the ceiling, so searching further cannot change the answer - it can only cost taps
+        // and drag in occluders the filter will never reach.
+        float blocker_sum = 0.0;
+        float blocker_count = 0.0;
+        for (uint i = 0u; i < taps; ++i) {
             const float2 tap =
-                clamp(local + float2(float(x), float(y)) * frame.shadow_texel, lo, hi);
-            // SampleLevel, not Sample: this runs under a branch on the material, where an
-            // implicit-derivative fetch is undefined - the same rule shade_lighting_map follows.
+                clamp(local + kShadowDisc[i] * ceiling * frame.shadow_texel, lo, hi);
+            const float d =
+                textures[frame.shadow_texture].SampleLevel(samplers[frame.shadow_sampler],
+                                                           (tap + tile) * 0.5, 0.0).r;
+            // Against the SAME biased reference the filter compares with, so a surface that is not
+            // its own blocker there is not one here either - otherwise every lit slope would find
+            // a blocker about a bias away and soften itself for no reason.
+            if (d < reference) {
+                blocker_sum += d;
+                blocker_count += 1.0;
+            }
+        }
+        // Nothing between this fragment and the sun anywhere in the search: fully lit, and the
+        // second loop never runs. That is the common case over an open frame, and it is what keeps
+        // the average cost well below two full kernels.
+        if (blocker_count < 0.5) {
+            return 1.0;
+        }
+
+        // Similar triangles, in the sun's own space: the light is a disc of angular radius
+        // `atan(softness)`, so a blocker `distance` away casts a penumbra of `softness * distance`
+        // in this fragment's plane. `shadow_z_span` is what turns the map's 0..1 depth back into
+        // the world units both the softness and the texel are quoted in.
+        const float distance = max(depth - blocker_sum / blocker_count, 0.0) * frame.shadow_z_span;
+        const float radius =
+            clamp(frame.shadow_softness * distance / world_texel, frame.shadow_soft_min, ceiling);
+
+        // **The bias does not scale with the radius, and that is not an oversight.** The usual
+        // reason a wide PCF wants more bias is that it compares distant texels of a sloped surface
+        // against one plane - but under PCSS a surface that is its own blocker reports a distance
+        // near zero and therefore a radius near `shadow_soft_min`, so a wide kernel only happens
+        // where the blocker really is somewhere else. Acne stays in the regime `shadow_bias` was
+        // swept in (4.59); scaling here would buy nothing and peter-pan every soft edge.
+        for (uint i = 0u; i < taps; ++i) {
+            const float2 tap =
+                clamp(local + kShadowDisc[i] * radius * frame.shadow_texel, lo, hi);
             const float d =
                 textures[frame.shadow_texture].SampleLevel(samplers[frame.shadow_sampler],
                                                            (tap + tile) * 0.5, 0.0).r;
             lit += reference <= d ? 1.0 : 0.0;
         }
+        lit /= float(taps);
     }
-    return lerp(1.0, lit / 9.0, saturate(frame.shadow_strength));
+    return lerp(1.0, lit, saturate(frame.shadow_strength));
 }
 
 // The level's own baked lighting, re-created at this fragment.
@@ -1708,7 +1867,8 @@ float4 fragment_main(VertexOut input) : SV_Target {
         // the fixed-function reproduction and this is a departure from it.
         LightSums sums = light_sum(draw, input.world_position, normal, want_specular,
                                    to_eye, draw.material_specular.w,
-                                   sun_visibility(input.world_position));
+                                   sun_visibility(input.world_position,
+                                                  int2(input.position.xy), draw.eye.xyz));
         // D3D's own sum, and it is occluded on **different** terms from the map rig above. These
         // are the level's dynamic lights - the sun, level02's two fires - and each of them already
         // has a shadow map answering "is this light blocked" exactly, per light, inside the loop.

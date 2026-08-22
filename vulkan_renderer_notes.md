@@ -10098,3 +10098,282 @@ over-range in it gets no bloom at all - and they behave as intended on the one f
 looked at. Whether they are *right* is a judgement to be made by playing the game, and the levels
 with the most to gain (the fire cameras, the flares, the muzzle flashes) are exactly the ones a
 paused A/B cannot hold still.
+
+
+## 4.100 Soft sun shadows (PCSS), and the stray write that made the whole feature inert
+
+`render.shadow_softness`, off by default. The sun's cascades keep the same map, the same bias and
+the same cascade selection; what changes is the filter. The 3x3 PCF filters one texel everywhere,
+so an edge's width is a property of the shadow map — the same at a foot on the ground and under a
+roof three metres up. PCSS makes it a property of the scene: search the map for what is blocking
+the sun, and let the distance between that blocker and the receiver set the filter's radius.
+
+`src/shaders/world.slang`'s `sun_visibility`, `SetShadowSoftness` and its three companions in
+`src/VkDraw.h`.
+
+### The knob is an angular radius, not a filter width
+
+`shadow_softness` is **the tangent of the sun's angular radius**: the penumbra's world radius per
+world unit of blocker distance. That is the same choice `shadow_bias` made in §4.59 for the same
+reason — a number in texels of the near cascade would have to be re-tuned for every
+`shadow_extent`, every cascade count and every atlas size, and this one does not.
+
+It also settles what happens at a cascade boundary, which a radius in texels could not. The
+penumbra is worked out in **world units** and converted to texels last:
+
+    world_texel = 2 * shadow_texel / cascades[i].z      // 2 * extent / tile, no new field
+    radius      = softness * (depth - blocker) * shadow_z_span / world_texel
+
+so the same blocker at the same distance produces the same penumbra on the ground whichever
+cascade answered for it — eight texels in cascade 0 and one in cascade 3. Computing it in texels
+would paint a ring where two cascades meet, in every frame, for nothing.
+
+The real sun's angular radius is about 0.00465, which at this game's scale is invisible: at
+level04's near cascade one world unit of blocker distance buys half a texel. So a usable value is
+a stylistic choice, and 0.02–0.10 is the range the sweep below covers.
+
+### Three decisions that are arguments rather than taste
+
+- **The tap pattern is ao.slang's fixed lattice disc, not a per-pixel rotated one.** §4.86's
+  argument transfers whole: a rotated kernel turns banding into grain, grain needs a blur, and
+  there is no blur pass on the shadow term — adding one at 640x480 would halo every silhouette.
+  The 32-entry maximin prefix is duplicated into `world.slang` because a `.slang` here is compiled
+  standalone, with no include and no module.
+- **The blocker search radius *is* the ceiling** (`shadow_soft_max`), which is why there is no
+  fourth knob. A blocker found beyond it could only ask for a penumbra the ceiling clamps back to
+  the ceiling, so searching further cannot change a pixel — it can only cost taps and drag in
+  occluders the filter will never reach.
+- **The bias does not scale with the radius.** The usual reason a wide PCF wants more bias is that
+  it compares distant texels of a sloped surface against one plane — but under PCSS a surface that
+  is its own blocker reports a distance near zero and therefore a radius near `shadow_soft_min`, so
+  a wide kernel only ever happens where the blocker really is somewhere else. Acne stays in the
+  regime §4.59 swept `shadow_bias` in, and scaling here would buy nothing and peter-pan every soft
+  edge. The measurement below is consistent with that: at `softness = 0.10` the difference against
+  the hard filter is confined to shadow *edges*, with nothing appearing on lit ground.
+
+### The defect: a field appended to `GpuFrameData` was zeroed after being written
+
+The first build of this was **completely inert** — every knob read back correctly, the report
+printed the value it had been given, and the frame did not change by one pixel at any setting,
+including deliberately absurd ones. What it was:
+
+    frame->pad_colour[0] = frame->pad_colour[1] = frame->pad_colour[2] = 0;
+
+`pad_colour` has been `uint32_t[2]` since §4.98 took one of its three words for
+`bump_diffuse_limit`, and that line kept writing a third. It was the last member of the struct, so
+the write went four bytes past the struct into unused scratch and cost nothing — until PCSS
+appended a field there, at which point `UploadFrameData` set `shadow_softness` and then zeroed it
+again forty lines later, every frame. From `c88cfc2` (§4.91) to here.
+
+**Every check this repo has for that struct passed.** `sizeof` is asserted, every `offsetof` is
+asserted, and `src/gen-shader-abi.py` — which exists precisely because §4.67's field drift was
+invisible — cross-checks all 57 members against the Slang declaration. None of them can see a
+*write*. So the rule §4.67 left ("anything added to this struct goes in the same place in both
+files") needs a second half: **a field appended to `GpuFrameData` is only as good as the last line
+that writes the struct**, and a pad array indexed by a literal is where that goes wrong. Two cheap
+guards: never write a pad array element by index (`std::fill`, or drop the line — the struct is
+value-initialised at the top of `UploadFrameData` anyway), and when a new field appears inert,
+suspect a later writer before suspecting the shader.
+
+Finding it took three shader probes, and the sequence is worth keeping because the first two
+answers were both misleading:
+
+1. `return 0.0` inside the soft branch — **no change**, so the branch never runs.
+2. The same probe with the condition replaced by one on a field known to arrive
+   (`shadow_texel <= 0`) — **86.7% of the frame changed**, so the branch, the loops and the disc
+   all work and the field is the problem.
+3. `return 0.0` when `shadow_soft_taps == 16u`, then 0.25 for `shadow_soft_max == 24.0` — both
+   fired, and *changing them from the REPL moved the picture between the shades*. So the tail of
+   the struct arrives, at runtime, at offsets 360 and 364 — which leaves 352 being written and
+   then unwritten, and there is only one line that can do that.
+
+Probe 3 is the one to reach for first next time: it asks "does this offset arrive" without
+depending on the feature under test working at all.
+
+### Measured, on level04's paused start, `shadow_extent 70`, 4 cascades
+
+Level04 rather than level02, for the same reason §4.59 swept the bias there: level02's start is
+under cover, and the sun's map has almost no edge on screen to soften.
+
+| `shadow_softness` | 0 → 0 | 0.02 | 0.05 | 0.10 |
+|---|---|---|---|---|
+| frame changed vs hard | **0.00%** | 10.02% | 13.04% | 20.91% |
+| MAD | **0.000** | 0.322 | 0.493 | 0.660 |
+| max channel-sum | **0** | 270 | 270 | 274 |
+
+**Off → on → off is bit-identical**, and that is a real 0 rather than a small number: the shader
+tests one field and takes the untouched 3x3 path, so the default is the build before PCSS by
+construction. The noise floor on that frame is 0 as well, which is what makes the rest of the row
+readable — but only once the level has *settled*. Taken immediately after `Shoot-Settled`'s pause,
+two identical captures differ by 3.4% of the frame at MAD 0.25, all of it the units' idle
+animation, which is enough to hide the 0.02 column entirely. Take the floor pair in the same
+session, right before the A/B.
+
+**Where the difference lands is the result, not how much of it there is.** The difference image at
+0.10 is a band around every shadow edge — a halo around each unit's ground shadow, the terrain
+shadow's boundary along the ridge, the rock shards at the top — and nothing in any shadow's
+interior, on any lit ground, or on any surface the sun does not reach. That is a penumbra, and it
+is the check to re-run after touching this: a difference that is *not* confined to edges means the
+blocker search is finding the receiver itself.
+
+### Cost
+
+RelWithDebInfo, `GKPLUS_VK_PRESENT_MODE=immediate` (under FIFO this measures the monitor — §4.79),
+same paused level04 frame:
+
+| | off | on, 8 taps | on, 16 taps | on, 32 taps |
+|---|---|---|---|---|
+| ms/frame | 5.32 | 5.29 | 5.30 | 6.51 |
+
+16 taps — the default — is free at this camera, and 32 costs 1.2 ms. "Up to twice the tap count"
+is the worst case rather than the bill: a fragment whose blocker search finds nothing returns lit
+without running the filter at all, and that is most of an open frame.
+
+### What has not been measured
+
+The look, as always. The defaults were chosen from the arithmetic and from one frame; whether
+0.05 is the right number for this game is a judgement to make by playing it, and the case with the
+most to gain — a unit walking under a tall structure, where the penumbra should visibly widen as
+the shadow leaves the caster's foot — is exactly the one a paused A/B cannot show.
+
+
+## 4.101 Rotation and a blur: the sun's shadow as a screen-space mask - and the prepass was drawing the wrong surface
+
+§4.100 filtered the shadow map inline, over one fixed lattice shared by every pixel, on §4.86's
+argument that a rotated kernel needs a blur and a blur halos. That argument is right about *ambient
+occlusion* and wrong about a penumbra, for one reason: a fixed pattern cannot trade its artefact for
+noise, so an under-sampled kernel produces **structure** - and a wide PCSS penumbra is exactly the
+under-sampled case. This implements the other half: rotate the kernel per pixel, resolve the whole
+term into a screen-space target, and blur it.
+
+`src/shaders/shadowmask.slang`, `render.shadow_soft_blur` (on by default, inert while
+`shadow_softness` is 0).
+
+### The rotation and the blur are one design
+
+The rotation is chosen from a **4x4 tile of the pixel's own coordinates** - 16 angles, in Bayer
+order - and the blur is a **4x4 box**. Four consecutive integers cover each residue mod 4 exactly
+once, so every pixel's blur window contains all sixteen rotations exactly once, wherever it sits.
+The output is therefore a `16 x taps` estimate with **no residual dither**, rather than a noisy
+estimate smoothed until the noise is bearable. Three consequences:
+
+- The window is `-1..+2` and not `-2..+2`. A symmetric 5x5 would cover one residue twice and bias
+  the estimate toward that rotation. The asymmetry shifts the term by half a pixel, in a quantity
+  that is already an average over a penumbra.
+- The rotation is a function of the **pixel**, not of the frame, so nothing crawls or shimmers as
+  the camera moves. There is no temporal filter here to lean on and there must not need to be one.
+- Where the bilateral guard rejects a tap the identity breaks, so a silhouette is the one place
+  residual noise can appear - the same place a plain Gaussian would instead have bled one surface's
+  shadow onto another.
+
+The disc is a **Vogel spiral generated per tap** (`r = sqrt((i + 0.5) / n)`, `theta = i * golden`)
+rather than a baked table, because a table is only equal-area at its own length: a 32-point table's
+first 16 points cover the inner half of the disc. Generating it costs one sqrt and one sincos a tap
+and keeps `shadow_soft_taps` meaning the same thing on both paths. A spiral rather than ao.slang's
+lattice for the obvious reason - a lattice is stratified in one fixed frame, which is precisely the
+property a per-pixel rotation destroys.
+
+The blur's two guards are both **dimensionless**, which is what lets them work with no eye position,
+no depth range and no world-space scale: a tap is rejected if it is more than 0.2 of its own length
+off the centre pixel's tangent plane, or if the two normals disagree by more than `dot < 0.7`. The
+first kills a depth step; the second kills a wall meeting a floor, where the delta lies *in* the
+floor's plane and the plane test alone would accept it.
+
+### It is a substitution, not a replacement
+
+The mask is only read where the prepass saw **the same surface the world shader is shading**:
+`sun_visibility` loads the prepass position at its own pixel and compares it against the fragment's,
+with a tolerance of 1% of the distance to the eye. Everything else - a transparent draw over the
+ground, a fragment MSAA-resolved from a triangle the prepass's single sample missed, a draw the
+prepass never rasterised - falls back on the inline filter. So nothing loses its shadow because a
+screen-space pass could not see it, and the feature cannot introduce a *class* of wrong pixels, only
+a class of pixels that pay the old cost.
+
+Two more things follow from the pass reading the AO prepass's targets rather than rasterising its
+own geometry: the prepass is now gated on **either** feature wanting it, and the mask's two targets
+must be the same grid as the AO pass's, which is why they are created and resized together.
+
+### The defect this found: the prepass has been drawing the base mesh since §4.71
+
+The first measurement of mask-against-inline was **27.77% of the frame at MAD 2.60** - against a
+same-setting floor of 4%, and against the sun shadow's own whole-frame effect of MAD 2.1. The two
+paths compute the same quantity and were disagreeing by as much as the feature is worth.
+
+They disagreed because the AO prepass has no tessellated pipeline. The world pass draws the
+PN-displaced surface (§4.71); the prepass drew the **base mesh** underneath it, so every pixel's
+recorded world position was up to `pn_max_offset` off the surface being shaded - which at level04's
+near cascade is `0.05 / 0.0085`, six shadow texels. Turning `render.tessellation` off collapsed the
+disagreement to 7.69% at MAD 0.62, against a 4.40% floor, which is what identified it.
+
+Ambient occlusion had been absorbing the same error since §4.71 without anyone noticing, because a
+hemisphere test over a 3-world-unit radius does not care about 0.05 of displacement and its output
+is smooth. **A screen-space feature is only as registered as its prepass**, and the way to find out
+is to compute something twice - once from the prepass and once inline - and difference them. That
+test did not exist before this section.
+
+The fix is a tessellated twin of the prepass (`ao_prepass_tess_vertex` / `_hull` / `_domain`),
+bound whenever the world pass is tessellating. It is **shadow.slang's construction, verbatim**, and
+takes the same four fields in its push for the same reason that block spells out: the patch is a
+function of `pn_strength`, `pn_flat_threshold`, `pn_max_offset` and the split-corner table, and the
+tessellation *factor* is not among them - it decides only how finely the same surface is sampled.
+So the prepass takes the shadow bake's uniform factor rather than the world pass's screen-space
+rule. With it, mask against inline is **8.65% at MAD 0.42** against a 4.22% floor: the two paths now
+agree to about the noise of an animating frame.
+
+### Measured, level04's paused start, `softness 0.023`, `min 0.97`, `max 16`
+
+`off -> on -> off` differs in **867 pixels of 5.25 million**, all of them inside one 96x70 box
+containing a unit that moved between the captures - and nowhere else. 99.94% of the frame is
+bit-identical between two *identical* captures on this frame, which is the floor that reading rests
+on.
+
+The quality claim needs the shadow term isolated from the picture, because the frame's own texture
+swamps it: capture with `sun_shadows` off, capture with each filter, and divide. That gives
+visibility per pixel, and the error against the most converged estimate available (the mask at 32
+taps, 512 effective samples) over the 29% of the frame that is partially shadowed:
+
+| | lattice, 8 taps | mask, 8 taps | lattice, 32 taps | mask, 32 taps |
+|---|---|---|---|---|
+| RMS error vs reference | 0.1182 | **0.0533** | 0.0758 | 0 (reference) |
+| roughness in the penumbra | 0.0493 | 0.0451 | 0.0455 | 0.0425 |
+
+**The mask at 8 taps beats the lattice at 32** - a quarter of the samples for a third less error -
+which is the interleaved-sampling identity doing exactly what it promises. The caveat is that the
+reference is one of the candidates, so any *systematic* difference between the two families is
+charged to the lattice; the two agree in the mean over the penumbra to 0.022 of visibility, which
+bounds how much of the table that could be. Looking at the extracted visibility maps says the same
+thing without the arithmetic: the lattice's penumbra is stepped and blotchy at 8 taps and still
+visibly banded at 32, the mask's is smooth at both.
+
+### Cost
+
+RelWithDebInfo, `GKPLUS_VK_PRESENT_MODE=immediate`, and **at 3060x1716** - 17x the pixels of the
+640x480 most numbers in this file were taken at, so these are a worst case for anything screen-space:
+
+| | hard | lattice, 32 | mask, 8 | mask, 32 |
+|---|---|---|---|---|
+| ms/frame | 5.12 | 6.42 | 6.58 | 8.71 |
+
+Repeatable to 0.05 ms. **The mask at 8 taps costs what the lattice at 32 costs and is more
+accurate**, which is the configuration to prefer. With AO also on, the prepass is shared: AO alone
+is 7.97 and both together 12.22, which does not decompose cleanly against the 8.71 above - the
+deltas are not additive at this resolution and no conclusion should be drawn from subtracting them
+beyond "the second feature does not pay for the prepass twice".
+
+### Two things to know before touching this
+
+- **A new `.slang` file needs a CMake re-configure.** The shader list comes from
+  `gen-shaders.py --deps` at *configure* time, so a file added to `ENTRY_POINTS` and not
+  re-configured is invisible to the build: the generated header keeps its old contents, the ABI
+  asserts fire against a struct that has moved on, and re-running the build changes nothing. It
+  presents as a stale-header error that no amount of rebuilding clears.
+- **`GpuFrameData` is now declared three times** - world.slang, shadowmask.slang and src/VkDraw.h -
+  and `src/gen-shader-abi.py` checks all three. Lift the struct rather than hand-copying it; the
+  copy in shadowmask.slang was taken with a script for exactly that reason, and the one time it was
+  taken before world.slang's own edit landed, the size assert caught it immediately.
+
+### What has not been measured
+
+Play. Every number here is one paused camera on one level, and the case the design is really for -
+a unit walking under a tall structure while the camera moves, where the fixed lattice's structure
+would swim and the mask's should not - is the one a paused A/B cannot show at all.

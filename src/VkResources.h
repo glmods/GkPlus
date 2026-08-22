@@ -308,6 +308,11 @@ constexpr uint32_t kTonemapSourceSlot = 4088;
 // horizontal blur writes 1, and the vertical blur writes 0 again. So `kBloomSlotBase - 2 * layer` is
 // the finished layer and nothing has to track which side of the ping-pong the last pass landed on.
 constexpr uint32_t kBloomSlotBase = 4087;
+// The screen-space sun-shadow mask (4.101), below the bloom layers' six. Two, because the blur
+// reads one and writes the other: `kShadowMaskSlot` is what the world shader samples and
+// `kShadowMaskRawSlot` is the resolve's unblurred output, which nothing outside that pass reads.
+constexpr uint32_t kShadowMaskSlot = 4081;
+constexpr uint32_t kShadowMaskRawSlot = 4080;
 constexpr uint32_t BloomSlot(uint32_t layer, uint32_t buffer) {
   return kBloomSlotBase - (layer * 2 + buffer);
 }

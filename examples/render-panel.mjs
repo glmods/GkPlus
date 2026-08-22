@@ -258,6 +258,33 @@ export function draw_render_panel(ImGui) {
       "Half-width of the OUTERMOST cascade, in world units. The camera's own max " +
         "distance is 75, so 70 covers everything it can see.",
       "%.0f");
+
+    ImGui.SeparatorText("Soft edges (PCSS)");
+    // `shadow_softness` is a departure, so 0 is off and off is the 3x3 the
+    // renderer had before - the sub-knobs are inert there and say so.
+    slider(ImGui, "softness", "shadow_softness", 0, 0.15,
+      "The tangent of the sun's angular radius - penumbra per unit of blocker " +
+        "distance, NOT a filter width. 0 is the old fixed 3x3. The real sun is " +
+        "0.005 and invisible here; 0.02-0.08 is the useful range.",
+      "%.3f");
+    ImGui.BeginDisabled(render.shadow_softness <= 0);
+    toggle(ImGui, "rotate + blur", "shadow_soft_blur",
+      "A screen-space mask: the kernel is rotated per pixel over a 4x4 tile and " +
+        "a 4x4 blur resolves all sixteen rotations exactly. Off filters inline " +
+        "over one fixed pattern - cheaper, and it bands where this dithers. " +
+        "On shares the geometry prepass with AO.");
+    slider(ImGui, "min radius (texels)", "shadow_soft_min", 0, 4,
+      "1 is the 3x3's own radius, so a contact shadow is never less filtered " +
+        "than it was before.",
+      "%.2f");
+    slider(ImGui, "max radius (texels)", "shadow_soft_max", 1, 64,
+      "The ceiling, and also the blocker search radius - a blocker beyond it " +
+        "could only ask for a penumbra this clamps back anyway.",
+      "%.0f");
+    intSlider(ImGui, "taps", "shadow_soft_taps", 1, 32,
+      "Per loop, and there are two - but the filter only runs where the search " +
+        "found a blocker, which is a minority of an open frame.");
+    ImGui.EndDisabled();
     ImGui.EndDisabled();
     toggle(ImGui, "stencil_shadow", "stencil_shadow",
       "Also draw the game's own blob shadow. Off, or a unit carries both.");

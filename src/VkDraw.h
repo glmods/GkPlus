@@ -326,13 +326,34 @@ struct GpuFrameData {
   // scalar rule aligns it to 8, and only a multiple of 16 satisfies both. See the same note in
   // world.slang - `src/gen-shader-abi.py` is what enforces it.
   uint32_t pad_colour[2];
+  // --- soft sun shadows, PCSS (see SetShadowSoftness below) -----------------------------------
+  //
+  // Appended for the reason the AO, split-corner and HDR blocks above were: every `offsetof`
+  // below pins a field at or before `colour_flags`, and the end is the only place four more words
+  // can go without moving one of them. Four and not three, so the struct stays a multiple of 16.
+  float shadow_softness;        // tan of the sun's angular radius; 0 is the hard 3x3 PCF
+  float shadow_soft_min;        // the filter's floor, in texels of the fragment's own cascade
+  float shadow_soft_max;        // ... and its ceiling, which is also the blocker search radius
+  uint32_t shadow_soft_taps;    // how many disc taps each of PCSS's two loops walks
+  // The screen-space mask (see SetShadowSoftBlur). `kNoTexture` is the single test again - "the
+  // knob is off", "the pass could not be created", "the prepass did not run this frame" and "the
+  // sun casts nothing" are one state in the shader.
+  uint32_t shadow_mask_texture;
+  // The prepass's world position, so the world shader can ask whether the pixel it is about to
+  // read is the surface it is shading. A fragment that fails that test - a transparent draw over
+  // the ground, a silhouette pixel MSAA resolved from another triangle - takes the inline filter
+  // instead, which is what keeps the mask an improvement rather than a new way to be wrong.
+  uint32_t shadow_mask_position;
+  uint32_t pad_mask[2];
 };
-static_assert(sizeof(GpuFrameData) == 352, "the scratch stride is part of the shader ABI");
+static_assert(sizeof(GpuFrameData) == 384, "the scratch stride is part of the shader ABI");
 static_assert(offsetof(GpuFrameData, cascades) == 176, "std430 puts a float4 array on 16");
 static_assert(offsetof(GpuFrameData, sun_matrix) == 240, "... and so does the matrix after it");
 static_assert(offsetof(GpuFrameData, ao_texture) == 304, "the AO block appends, it does not insert");
 static_assert(offsetof(GpuFrameData, split_corners) == 320, "... and so does this one");
 static_assert(offsetof(GpuFrameData, colour_flags) == 336, "... and so does the HDR pair");
+static_assert(offsetof(GpuFrameData, shadow_softness) == 352, "... and so does the PCSS block");
+static_assert(offsetof(GpuFrameData, shadow_mask_texture) == 368, "... and so does the mask pair");
 
 // GpuDrawRecord::lighting flags.
 //
@@ -933,6 +954,74 @@ float ShadowExtent();
 // texel density, which is what makes cascading A/B-able on one paused frame.
 void SetShadowCascades(int count);
 int ShadowCascades();
+
+// --- soft sun shadows (PCSS) -------------------------------------------------------------------
+//
+// **How wide a shadow's edge is, decided per fragment by what casts it.** The 3x3 PCF above
+// filters a fixed one-texel radius, so every edge in the level is the same width and its width is
+// a property of the shadow map rather than of the scene. PCSS makes it a property of the scene:
+// find what is blocking the sun, and let the distance between the blocker and the receiver set
+// the filter's radius - so a foot on the ground stays sharp while the shadow of a roof three
+// metres up is soft, which is what a real penumbra does.
+//
+// `shadow_softness` is **the tangent of the sun's angular radius**: the penumbra's world radius
+// per world unit of blocker distance. It is not a filter width and does not depend on the map's
+// resolution, the cascade count or `shadow_extent` - which is what lets one number hold across
+// all of them, exactly as `shadow_bias` being in texels does for the bias.
+//
+// **0 is off and it is bit-identical to the build before PCSS**, not approximately so: the shader
+// tests this one field and takes the untouched 3x3 path. That is the default, because a real
+// penumbra is a departure from D3D8 like AO, HDR and bloom are, and the reproduction claim has to
+// keep meaning what it says (vulkan_renderer_plan.md, "What a residual can and cannot say").
+//
+// The sun's true angular radius is about 0.00465, which at this game's scale is invisible; the
+// useful range is a stylistic choice and the panel's slider says so.
+void SetShadowSoftness(float tangent);
+float ShadowSoftness();
+
+// The floor and ceiling on the filter's radius, in texels of whichever cascade the fragment
+// landed in. The floor is what keeps a contact shadow at least as filtered as the 3x3 it replaces
+// (1.0 is that kernel's own radius); the ceiling bounds two separate things at once - how sparse a
+// fixed tap count may get before the penumbra bands, and how far a tap may stray from its own
+// cascade tile, whose edge the shader clamps at.
+//
+// **The ceiling is also the blocker search radius**, which is why there is no third knob: a
+// blocker further away than this could only ask for a penumbra the ceiling clamps back to the
+// ceiling, so searching past it cannot change a pixel.
+void SetShadowSoftMin(float texels);
+float ShadowSoftMin();
+void SetShadowSoftMax(float texels);
+float ShadowSoftMax();
+
+// How many taps each of PCSS's two loops walks, 1..32. The cost is up to twice this many a
+// fragment against the 3x3's nine - "up to", because a fragment whose blocker search finds nothing
+// returns lit without running the filter at all, which is most of an open frame.
+//
+// Under `shadow_soft_blur` it is 1..32 of a Vogel spiral generated per tap rather than of a baked
+// table, so a prefix is still equal-area - and each tap then stands for sixteen, one per rotation.
+void SetShadowSoftTaps(int taps);
+int ShadowSoftTaps();
+
+// **Which of the two soft filters runs**, and it is the one real choice in this feature.
+//
+// Off: the filter runs inline in the world shader, over one fixed lattice shared by every pixel.
+// No pass, no target, nothing to register against the frame - and a hard ceiling on quality,
+// because a fixed pattern cannot trade its artefact for noise. Under-sample it and every occluder
+// leaves a fan of shifted copies of its own silhouette (the artefact 4.86 measured on the AO disc).
+//
+// On, the default: a **screen-space mask**. The kernel is rotated per pixel from a 4x4 tile of the
+// pixel's own coordinates, which turns that structure into dither, and a 4x4 bilateral box blur
+// resolves it - the two sizes being equal is what makes the blur exact rather than approximate,
+// since a four-wide window covers each of the sixteen rotations exactly once. So the same tap
+// count buys sixteen times the samples, and what it costs is a full-screen resolve plus a blur
+// **plus the geometry prepass**, which this shares with `render.ao` and which therefore only costs
+// something when AO is off.
+//
+// The mask is only consulted where the prepass saw the same surface the world shader is shading
+// (see `shadow_mask_position`); everywhere else the inline filter runs, so this is a substitution
+// rather than a replacement and nothing loses its shadow because a pass could not see it.
+void SetShadowSoftBlur(bool enabled);
+bool ShadowSoftBlur();
 
 // **A diagnostic, and the one that prices shadows from D3D's own point and spot lights** (§4.65).
 // On by default. Off drops every point and spot light from the light sum and keeps the

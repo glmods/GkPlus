@@ -3355,6 +3355,74 @@ declare module "gk" {
      *  0.2% of the frame. */
     shadow_extent: number;
 
+    /** How wide a sun shadow's edge is, decided per fragment by what casts it
+     *  (PCSS). **0 is off and is the default**, and off is the fixed 3x3 filter
+     *  this renderer had before - bit-identically, because the shader tests this
+     *  one number rather than approximating that kernel with a wider one.
+     *
+     *  The value is **the tangent of the sun's angular radius**: the penumbra's
+     *  world radius per world unit between a fragment and whatever shadows it. So
+     *  it is not a filter width and does not depend on the map's resolution, the
+     *  cascade count or `shadow_extent` - one number holds across all of them, in
+     *  the way `shadow_bias` being in texels does for the bias. A foot on the
+     *  ground stays sharp; the shadow of a roof three metres up goes soft.
+     *
+     *  The real sun's is about 0.00465, which at this game's scale is invisible,
+     *  so a usable value is a stylistic choice rather than a physical one -
+     *  0.02 to 0.08 is the range worth looking at. Like `ao`, `hdr` and `bloom`
+     *  this is a departure from what D3D8 drew, so a residual against the
+     *  original says how far it reaches and never whether it is any good. */
+    shadow_softness: number;
+
+    /** The floor and ceiling on PCSS's filter radius, in texels of whichever
+     *  cascade the fragment landed in. Inert while `shadow_softness` is 0.
+     *
+     *  1 is the floor by default because that is exactly the 3x3's own radius, so
+     *  a contact shadow is never *less* filtered than it was before PCSS. The
+     *  ceiling, 24, bounds two things at once: how sparse a fixed tap count may
+     *  get before a penumbra bands, and how far a tap may stray from its own
+     *  cascade tile, whose edge the shader clamps at.
+     *
+     *  **The ceiling is also the blocker search radius**, which is why there is
+     *  no third knob - a blocker further away than this could only ask for a
+     *  penumbra the ceiling clamps back to the ceiling. */
+    shadow_soft_min: number;
+    shadow_soft_max: number;
+
+    /** How many taps of the shader's 32-entry disc each of PCSS's two loops
+     *  walks, 1 to 32. 16 by default.
+     *
+     *  The cost is *up to* twice this against the hard path's nine: a fragment
+     *  whose blocker search finds nothing returns lit without running the filter
+     *  at all, which is most of an open frame. */
+    shadow_soft_taps: number;
+
+    /** Which of the two soft filters runs, and it is the one real choice in
+     *  this feature. **On by default**, and inert while `shadow_softness` is 0.
+     *
+     *  Off: the filter runs inline in the world shader over one fixed pattern
+     *  shared by every pixel. No extra pass and no target - and a ceiling on
+     *  quality, because a fixed pattern cannot trade its artefact for noise, so
+     *  an under-sampled kernel leaves a fan of shifted copies of every
+     *  occluder's silhouette rather than grain.
+     *
+     *  On: a **screen-space mask**. The kernel is rotated per pixel from a 4x4
+     *  tile of the pixel's coordinates and a 4x4 bilateral blur resolves it -
+     *  the two being the same size is what makes the blur exact, since a
+     *  four-wide window covers each of the sixteen rotations exactly once. The
+     *  same tap count therefore buys sixteen times the samples.
+     *
+     *  What it costs is a full-screen resolve, a blur, and **the geometry
+     *  prepass it shares with `ao`** - so with AO already on it is two
+     *  full-screen passes, and with AO off it is those plus a depth-only walk
+     *  over the frame's solid geometry.
+     *
+     *  The mask is consulted only where the prepass saw the same surface the
+     *  world shader is shading; everything else falls back on the inline
+     *  filter, so nothing loses its shadow because a screen-space pass could
+     *  not see it. */
+    shadow_soft_blur: boolean;
+
     /** Draw the game's **own** blob shadow as well as the sun's map. Off by
      *  default, since otherwise a unit carries both.
      *

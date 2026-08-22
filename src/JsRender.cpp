@@ -1082,6 +1082,13 @@ JSValue SetSunShadowsValue(JSContext *ctx, JSValueConst, JSValueConst value) {
 GK_SHADOW_KNOB(shadow_bias, ShadowBias)
 GK_SHADOW_KNOB(shadow_strength, ShadowStrength)
 GK_SHADOW_KNOB(shadow_extent, ShadowExtent)
+// PCSS (VkDraw.h, notes 4.100). `render.shadow_softness` is the sun's angular radius as a
+// tangent, **not** a filter width: the penumbra's world radius per world unit between a fragment
+// and its blocker, so one value holds at any map resolution, cascade count or `shadow_extent`.
+// 0 is off, and off takes the 3x3 path bit-identically.
+GK_SHADOW_KNOB(shadow_softness, ShadowSoftness)
+GK_SHADOW_KNOB(shadow_soft_min, ShadowSoftMin)
+GK_SHADOW_KNOB(shadow_soft_max, ShadowSoftMax)
 GK_SHADOW_KNOB(map_shadow_bias, MapShadowBias)
 GK_SHADOW_KNOB(dynamic_shadow_bias, DynamicShadowBias)
 // Ambient occlusion's five float knobs (§4.86). Same macro, because they are the same shape - a
@@ -1178,6 +1185,31 @@ JSValue SetMapShadowRateValue(JSContext *ctx, JSValueConst, JSValueConst value) 
     return JS_EXCEPTION;
   }
   vulkan::SetMapShadowRate(rate);
+  return JS_UNDEFINED;
+}
+
+// `render.shadow_soft_blur` (VkDraw.h, notes 4.101) - the rotated screen-space mask against the
+// inline lattice. It reads back **what was asked for** rather than what the device could build,
+// because unlike `sun_shadow_indirect` the two paths do not produce the same image.
+JSValue GetShadowSoftBlur(JSContext *ctx, JSValueConst) {
+  return JS_NewBool(ctx, vulkan::ShadowSoftBlur());
+}
+
+JSValue SetShadowSoftBlurValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  vulkan::SetShadowSoftBlur(JS_ToBool(ctx, value) != 0);
+  return JS_UNDEFINED;
+}
+
+JSValue GetShadowSoftTaps(JSContext *ctx, JSValueConst) {
+  return JS_NewInt32(ctx, vulkan::ShadowSoftTaps());
+}
+
+JSValue SetShadowSoftTapsValue(JSContext *ctx, JSValueConst, JSValueConst value) {
+  int32_t taps = 0;
+  if (JS_ToInt32(ctx, &taps, value) < 0) {
+    return JS_EXCEPTION;
+  }
+  vulkan::SetShadowSoftTaps(taps);
   return JS_UNDEFINED;
 }
 
@@ -2025,6 +2057,11 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("shadow_strength", GetShadowStrength, SetShadowStrengthValue),
     JS_CGETSET_DEF("shadow_extent", GetShadowExtent, SetShadowExtentValue),
     JS_CGETSET_DEF("shadow_cascades", GetShadowCascades, SetShadowCascadesValue),
+    JS_CGETSET_DEF("shadow_softness", GetShadowSoftness, SetShadowSoftnessValue),
+    JS_CGETSET_DEF("shadow_soft_min", GetShadowSoftMin, SetShadowSoftMinValue),
+    JS_CGETSET_DEF("shadow_soft_max", GetShadowSoftMax, SetShadowSoftMaxValue),
+    JS_CGETSET_DEF("shadow_soft_taps", GetShadowSoftTaps, SetShadowSoftTapsValue),
+    JS_CGETSET_DEF("shadow_soft_blur", GetShadowSoftBlur, SetShadowSoftBlurValue),
     JS_CGETSET_DEF("map_shadows", GetMapShadows, SetMapShadowsValue),
     JS_CGETSET_DEF("map_shadow_bias", GetMapShadowBias, SetMapShadowBiasValue),
     JS_CGETSET_DEF("map_shadow_rate", GetMapShadowRate, SetMapShadowRateValue),

@@ -86,6 +86,11 @@ ENTRY_POINTS = [
     # walks one fixed disc over the first's output.
     ("ao.slang", "ao_prepass_vertex", "vertex"),
     ("ao.slang", "ao_prepass_fragment", "fragment"),
+    # The tessellated prepass (4.101). The prepass has to rasterise the surface the world pass
+    # shades, and until this existed it drew the base mesh under a displaced one.
+    ("ao.slang", "ao_prepass_tess_vertex", "vertex"),
+    ("ao.slang", "ao_prepass_hull", "hull"),
+    ("ao.slang", "ao_prepass_domain", "domain"),
     ("ao.slang", "ao_fullscreen_vertex", "vertex"),
     ("ao.slang", "ao_resolve_fragment", "fragment"),
     # The tonemap pass, which is what replaces the scale blit under `render.hdr`. Its own copy of
@@ -93,6 +98,12 @@ ENTRY_POINTS = [
     # build and this one still has to run, so borrowing its module would couple the two.
     ("tonemap.slang", "tonemap_fullscreen_vertex", "vertex"),
     ("tonemap.slang", "tonemap_fragment", "fragment"),
+    # The sun's shadow as a screen-space mask (4.101): a rotated kernel per pixel and a blur that
+    # resolves it. Three entry points for two passes, and no prepass of its own - it reads the AO
+    # pass's position and normal targets.
+    ("shadowmask.slang", "mask_fullscreen_vertex", "vertex"),
+    ("shadowmask.slang", "mask_resolve_fragment", "fragment"),
+    ("shadowmask.slang", "mask_blur_fragment", "fragment"),
     # Bloom (4.99). Three entry points for two passes: the extract downsamples and thresholds the
     # float target, and the blur runs over one axis at a time - the same fragment for both, since the
     # axis is a push constant. The composite is not here at all; it is in tonemap.slang, which is

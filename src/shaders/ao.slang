@@ -81,7 +81,32 @@ struct AoPush {
     // artistic weight and the world shader is a plain multiply.
     float strength;
     uint taps;         // how many of kDisc to walk, clamped to its length on the CPU
+    // --- what the tessellated prepass needs (4.101) ------------------------------------------
+    //
+    // **The same four the shadow pass carries, for the same reason its block spells out**: this
+    // prepass has to rasterise the surface the COLOUR pass draws, the patch is a function of these
+    // and the control points alone, and the tessellation *factor* is not among them - it only
+    // decides how finely the same surface is sampled. So one uniform factor here, exactly as the
+    // shadow bake uses, and no screen-space rule.
+    //
+    // Until this existed the prepass drew the **base mesh** while the world pass shaded the
+    // displaced one, which put every pixel's recorded world position up to `pn_max_offset` off the
+    // surface being shaded. Ambient occlusion could absorb that; the shadow mask cannot, and
+    // measuring it is what found it - see 4.101.
+    float pn_strength;
+    float pn_flat_threshold;
+    float pn_max_offset;
+    float tess_factor;
+    // **Before the pointer and not at the end**: `split_corners` is 8-aligned under both layout
+    // rules and the thirteen scalars above it end at 68, so the padding is there either way and
+    // naming it is what keeps this declaration the same shape as the C++ one.
     float pad0;
+    // The split-corner table (4.71), which shapes the patch and therefore belongs here for the
+    // same reason the three knobs do: without it this pass would close a seam the colour pass
+    // leaves open, or the reverse.
+    ConstBufferPointer<uint> split_corners;
+    uint split_base;
+    uint split_count; // 0 is "off", "no level" and "not built yet" alike
 };
 
 [[vk::push_constant]]
@@ -149,6 +174,135 @@ PrepassTargets ao_prepass_fragment(PrepassOut input) {
     // input is a direction. This is the same correction the per-pixel light sum makes.
     out.normal = float4(normalize(input.world_normal) * 0.5 + 0.5, 1.0);
     return out;
+}
+
+// --- the tessellated prepass (4.101) ------------------------------------------------------------
+//
+// A second path through the same pass, taken when the world pass is tessellating. It is
+// shadow.slang's construction verbatim - and it has to be, because "the same surface" is a claim
+// about arithmetic: `pn_weight` here, in shadow.slang and in world.slang must agree term for term
+// or this pass records positions on a surface nothing draws.
+
+struct PrepassControlPoint {
+    float3 pos;
+    float3 normal;
+    uint record;
+    uint split; // 1 where the mesh splits this corner, which zeroes its tangent term
+};
+
+struct PrepassPatchConstants {
+    float edges[3] : SV_TessFactor;
+    float inner    : SV_InsideTessFactor;
+};
+
+bool ao_is_split_corner(uint index) {
+    if (pc.split_count == 0u || index < pc.split_base) {
+        return false;
+    }
+    const uint offset = index - pc.split_base;
+    if (offset >= pc.split_count) {
+        return false;
+    }
+    return (pc.split_corners[offset >> 5u] & (1u << (offset & 31u))) != 0u;
+}
+
+[shader("vertex")]
+PrepassControlPoint ao_prepass_tess_vertex(uint vertex_id: SV_VertexID) {
+    const Vertex v = pc.vertices[pc.base_vertex + vertex_id];
+    PrepassControlPoint cp;
+    cp.pos = v.pos.xyz;
+    cp.normal = v.normal_and_color.xyz;
+    cp.record = pc.record;
+    cp.split = ao_is_split_corner(pc.base_vertex + vertex_id) ? 1u : 0u;
+    return cp;
+}
+
+PrepassPatchConstants ao_prepass_hull_constants(InputPatch<PrepassControlPoint, 3> patch) {
+    PrepassPatchConstants out;
+    const float factor = max(pc.tess_factor, 1.0);
+    out.edges[0] = factor;
+    out.edges[1] = factor;
+    out.edges[2] = factor;
+    out.inner = factor;
+    return out;
+}
+
+[shader("hull")]
+[domain("tri")]
+[partitioning("fractional_odd")]
+[outputtopology("triangle_cw")]
+[outputcontrolpoints(3)]
+[patchconstantfunc("ao_prepass_hull_constants")]
+PrepassControlPoint ao_prepass_hull(InputPatch<PrepassControlPoint, 3> patch,
+                                    uint id: SV_OutputControlPointID) {
+    return patch[id];
+}
+
+// See world.slang's `pn_weight` and shadow.slang's `shadow_pn_weight`. Three copies of one
+// function, and the comment in shadow.slang explains why they must not diverge.
+float ao_pn_weight(float3 pi, float3 pj, float3 ni, uint split) {
+    if (split != 0u) {
+        return 0.0;
+    }
+    const float3 edge = pj - pi;
+    const float length_sq = dot(edge, edge);
+    if (length_sq < 1e-18) {
+        return 0.0;
+    }
+    const float w = dot(edge, ni);
+    if (w * w <= pc.pn_flat_threshold * pc.pn_flat_threshold * length_sq) {
+        return 0.0;
+    }
+    const float limit = 3.0 * pc.pn_max_offset;
+    return clamp(w, -limit, limit) * pc.pn_strength;
+}
+
+[shader("domain")]
+[domain("tri")]
+[partitioning("fractional_odd")]
+[outputtopology("triangle_cw")]
+PrepassOut ao_prepass_domain(PrepassPatchConstants constants, float3 bary: SV_DomainLocation,
+                             const OutputPatch<PrepassControlPoint, 3> patch) {
+    const float3 p1 = patch[0].pos, p2 = patch[1].pos, p3 = patch[2].pos;
+    const float3 n1 = normalize(patch[0].normal);
+    const float3 n2 = normalize(patch[1].normal);
+    const float3 n3 = normalize(patch[2].normal);
+
+    const uint s1 = patch[0].split, s2 = patch[1].split, s3 = patch[2].split;
+    const float3 b210 = (2.0 * p1 + p2 - ao_pn_weight(p1, p2, n1, s1) * n1) / 3.0;
+    const float3 b120 = (2.0 * p2 + p1 - ao_pn_weight(p2, p1, n2, s2) * n2) / 3.0;
+    const float3 b021 = (2.0 * p2 + p3 - ao_pn_weight(p2, p3, n2, s2) * n2) / 3.0;
+    const float3 b012 = (2.0 * p3 + p2 - ao_pn_weight(p3, p2, n3, s3) * n3) / 3.0;
+    const float3 b102 = (2.0 * p3 + p1 - ao_pn_weight(p3, p1, n3, s3) * n3) / 3.0;
+    const float3 b201 = (2.0 * p1 + p3 - ao_pn_weight(p1, p3, n1, s1) * n1) / 3.0;
+    const float3 e = (b210 + b120 + b021 + b012 + b102 + b201) / 6.0;
+    const float3 v = (p1 + p2 + p3) / 3.0;
+    const float3 b111 = e + (e - v) * 0.5;
+
+    const float u = bary.x, vv = bary.y, w = bary.z;
+    const float u2 = u * u, v2 = vv * vv, w2 = w * w;
+    const float3 local = p1 * (u2 * u) + p2 * (v2 * vv) + p3 * (w2 * w) +
+                         b210 * (3.0 * u2 * vv) + b120 * (3.0 * u * v2) +
+                         b201 * (3.0 * u2 * w) + b021 * (3.0 * v2 * w) +
+                         b102 * (3.0 * u * w2) + b012 * (3.0 * vv * w2) +
+                         b111 * (6.0 * u * vv * w);
+    // Linearly interpolated and not Vlachos' quadratic field, because world.slang's domain
+    // interpolates it linearly and this pass has to agree with that one.
+    const float3 normal = patch[0].normal * u + patch[1].normal * vv + patch[2].normal * w;
+
+    const GpuDrawRecord draw = pc.draws[patch[0].record];
+    PrepassOut output;
+    const float4 point = float4(local, 1.0);
+    output.position = mul(point, float4x4(draw.mvp[0], draw.mvp[1], draw.mvp[2], draw.mvp[3]));
+    if ((draw.lighting & kLightSum) == 0u) {
+        output.position = float4(0, 0, 2, 1);
+    }
+    output.world_position =
+        mul(point, float4x4(draw.world[0], draw.world[1], draw.world[2], draw.world[3])).xyz;
+    output.world_normal = mul(normal, float3x3(draw.normal_transform[0].xyz,
+                                               draw.normal_transform[1].xyz,
+                                               draw.normal_transform[2].xyz));
+    return output;
 }
 
 // --- the resolve ------------------------------------------------------------------------------

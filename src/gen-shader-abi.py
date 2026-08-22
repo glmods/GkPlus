@@ -83,6 +83,11 @@ PAIRS = [
      {"pos": "pos", "normal_and_color": "normal", "uv": "uv0"}),
     ("ao.slang", "GpuDrawRecord", "GpuDrawRecord", {}),
     ("ao.slang", "AoPush", "AoPushConstants", {}),
+    # GpuFrameData's THIRD declaration (4.101). The mask pass reads the frame block through a
+    # pointer, so a field that drifts here reads another field's word exactly as 4.67's did.
+    ("shadowmask.slang", "GpuMapLight", "GpuMapLight", {}),
+    ("shadowmask.slang", "GpuFrameData", "GpuFrameData", {}),
+    ("shadowmask.slang", "MaskPush", "MaskPushConstants", {}),
     ("tonemap.slang", "TonemapPush", "TonemapPushConstants", {}),
     ("bloom.slang", "BloomPush", "BloomPushConstants", {}),
 ]

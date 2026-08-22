@@ -819,6 +819,24 @@ float ShadowStrengthValue = 0.7f;
 float ShadowExtentValue = 70.0f;
 int ShadowCascadeCount = static_cast<int>(kMaxShadowCascades);
 
+// PCSS. **0 is off**, and off is the 3x3 path this renderer had before it - bit-identical, because
+// the shader tests this one field rather than approximating the old kernel with a new one. See
+// SetShadowSoftness in VkDraw.h for what the number is and why it is not a filter width.
+float ShadowSoftnessValue = 0.0f;
+// 1 texel is exactly the 3x3's own radius, so the floor is "no softer than before" rather than a
+// number chosen to look right. The ceiling bounds a fixed tap count's density and keeps a tap in
+// its own cascade tile; 24 of a 2048 tile is 2.3% of a cascade's width.
+float ShadowSoftMinValue = 1.0f;
+float ShadowSoftMaxValue = 24.0f;
+// Must not exceed kShadowDisc in world.slang, which the shader clamps to anyway - this is the
+// clamp that keeps `render.shadow_soft_taps` reading back what it will actually do.
+constexpr int kShadowDiscSize = 32;
+int ShadowSoftTapCount = 16;
+// Rotation and a blur, through the screen-space mask, rather than the inline lattice. On, and see
+// SetShadowSoftBlur for what the two are. It costs nothing while `shadow_softness` is 0: the mask
+// pass is gated on the softness as well, because with a hard filter there is nothing to resolve.
+bool ShadowSoftBlurEnabled = true;
+
 // Built once a frame by BuildSunCascades and read by both the shadow pass and UploadFrameData.
 float FrameSunMatrix[16] = {};                          // world -> light space, rotation only
 float FrameCascade[kMaxShadowCascades][4] = {};         // centre.xy, 1/extent, bias in ndc depth
@@ -2304,9 +2322,35 @@ struct AoPushConstants {
   float bias;
   float strength;
   uint32_t taps;
+  // What the tessellated prepass needs (4.101), and it is the shadow push's set for the reason
+  // that block spells out: the patch is a function of these and the control points, and the
+  // FACTOR is not one of them - it decides only how finely the same surface is sampled.
+  float pn_strength;
+  float pn_flat_threshold;
+  float pn_max_offset;
+  float tess_factor;
+  // **Before the pointer and not at the end**, because `split_corners` is 8-aligned under both
+  // layout rules and the thirteen scalars above it end at 68: the padding exists either way, and
+  // naming it is what keeps the two declarations the same shape.
   float pad0;
+  uint64_t split_corners;
+  uint32_t split_base;
+  uint32_t split_count;
 };
-static_assert(sizeof(AoPushConstants) == 56);
+static_assert(sizeof(AoPushConstants) == 88);
+
+// Must match `MaskPush` in src/shaders/shadowmask.slang, and here for the reason the one above it
+// is. One block for both of that file's passes; `source_texture` is the field only the blur reads.
+struct MaskPushConstants {
+  // The frame block. **Reserved before this pass records and filled after**, which is what
+  // ReserveFrameData exists for - see the comment there.
+  uint64_t frame;
+  uint32_t position_texture;
+  uint32_t normal_texture;
+  uint32_t source_texture;
+  uint32_t pad0;
+};
+static_assert(sizeof(MaskPushConstants) == 24);
 
 // The tonemap pass's block, here for exactly the reason the one above it is. Every field is a
 // 4-byte scalar on purpose, so the scalar and std430 layouts agree and `src/gen-shader-abi.py`
@@ -2822,11 +2866,43 @@ VkImageView AoResultView = VK_NULL_HANDLE;
 VkImageView AoDepthView = VK_NULL_HANDLE;
 VkPipelineLayout AoLayout = VK_NULL_HANDLE;
 VkPipeline AoPrepassPipeline = VK_NULL_HANDLE;
+// The tessellated twin (4.101), built up front beside it exactly as the shadow passes' twins are,
+// so `render.tessellation` is a knob that can be moved rather than a build-time decision. Null on
+// a device with no tessellation, where the prepass falls back on the flat one - which is correct
+// there, because the world pass is not tessellating either.
+VkPipeline AoPrepassTessPipeline = VK_NULL_HANDLE;
 VkPipeline AoResolvePipeline = VK_NULL_HANDLE;
 VkShaderModule AoPrepassVertexModule = VK_NULL_HANDLE;
+VkShaderModule AoPrepassTessVertexModule = VK_NULL_HANDLE;
+VkShaderModule AoPrepassHullModule = VK_NULL_HANDLE;
+VkShaderModule AoPrepassDomainModule = VK_NULL_HANDLE;
 VkShaderModule AoPrepassFragmentModule = VK_NULL_HANDLE;
 VkShaderModule AoFullscreenVertexModule = VK_NULL_HANDLE;
 VkShaderModule AoResolveFragmentModule = VK_NULL_HANDLE;
+
+// --- the screen-space sun-shadow mask (4.101) -----------------------------------------------------
+//
+// Two R8 targets at the render extent, sharing the AO prepass's position and normal. `MaskRaw` is
+// the resolve's output and is read by nothing but the blur; `MaskImage` is what the world shader
+// samples. Two rather than a ping-pong over one, because a blur cannot read the image it writes.
+constexpr VkFormat kMaskFormat = VK_FORMAT_R8_UNORM;
+bool MaskReady = false;
+// Set by the pass itself, read by UploadFrameData - the same "did it actually run" contract
+// `AoRanThisFrame` has, and for the same reason: a frame that resolved nothing leaves the target
+// holding the previous frame's mask, and a stale mask is a shadow one frame behind the camera.
+bool MaskRanThisFrame = false;
+VkImage MaskImage = VK_NULL_HANDLE;
+VkImage MaskRawImage = VK_NULL_HANDLE;
+VkDeviceMemory MaskMemory = VK_NULL_HANDLE;
+VkDeviceMemory MaskRawMemory = VK_NULL_HANDLE;
+VkImageView MaskView = VK_NULL_HANDLE;
+VkImageView MaskRawView = VK_NULL_HANDLE;
+VkPipelineLayout MaskLayout = VK_NULL_HANDLE;
+VkPipeline MaskResolvePipeline = VK_NULL_HANDLE;
+VkPipeline MaskBlurPipeline = VK_NULL_HANDLE;
+VkShaderModule MaskFullscreenVertexModule = VK_NULL_HANDLE;
+VkShaderModule MaskResolveFragmentModule = VK_NULL_HANDLE;
+VkShaderModule MaskBlurFragmentModule = VK_NULL_HANDLE;
 uint32_t AoWidth = 0;
 uint32_t AoHeight = 0;
 // Zeroed on every path that does not render, so an `ao: off` report is never printed beside a
@@ -2937,7 +3013,7 @@ bool CreateAoTargets(uint32_t width, uint32_t height) {
 void DestroyAoPass() {
   AoReady = false;
   DestroyAoTargets();
-  VkPipeline *pipelines[] = {&AoPrepassPipeline, &AoResolvePipeline};
+  VkPipeline *pipelines[] = {&AoPrepassPipeline, &AoPrepassTessPipeline, &AoResolvePipeline};
   for (VkPipeline *pipeline : pipelines) {
     if (*pipeline != VK_NULL_HANDLE) {
       vkDestroyPipeline(GetDevice(), *pipeline, nullptr);
@@ -2949,7 +3025,9 @@ void DestroyAoPass() {
     AoLayout = VK_NULL_HANDLE;
   }
   VkShaderModule *modules[] = {&AoPrepassVertexModule, &AoPrepassFragmentModule,
-                               &AoFullscreenVertexModule, &AoResolveFragmentModule};
+                               &AoPrepassTessVertexModule, &AoPrepassHullModule,
+                               &AoPrepassDomainModule, &AoFullscreenVertexModule,
+                               &AoResolveFragmentModule};
   for (VkShaderModule *module : modules) {
     if (*module != VK_NULL_HANDLE) {
       vkDestroyShaderModule(GetDevice(), *module, nullptr);
@@ -2961,6 +3039,10 @@ void DestroyAoPass() {
 bool CreateAoPass(uint32_t width, uint32_t height) {
   AoPrepassVertexModule = CreateModule(kAoPrepassVertexSpv, sizeof(kAoPrepassVertexSpv));
   AoPrepassFragmentModule = CreateModule(kAoPrepassFragmentSpv, sizeof(kAoPrepassFragmentSpv));
+  AoPrepassTessVertexModule =
+      CreateModule(kAoPrepassTessVertexSpv, sizeof(kAoPrepassTessVertexSpv));
+  AoPrepassHullModule = CreateModule(kAoPrepassHullSpv, sizeof(kAoPrepassHullSpv));
+  AoPrepassDomainModule = CreateModule(kAoPrepassDomainSpv, sizeof(kAoPrepassDomainSpv));
   AoFullscreenVertexModule = CreateModule(kAoFullscreenVertexSpv, sizeof(kAoFullscreenVertexSpv));
   AoResolveFragmentModule = CreateModule(kAoResolveFragmentSpv, sizeof(kAoResolveFragmentSpv));
   if (AoPrepassVertexModule == VK_NULL_HANDLE || AoPrepassFragmentModule == VK_NULL_HANDLE ||
@@ -3070,6 +3152,40 @@ bool CreateAoPass(uint32_t width, uint32_t height) {
     return false;
   }
 
+  // The tessellated twin. Not fatal if it cannot be built: the prepass then rasterises the base
+  // mesh, which is what it did before 4.101 and is exactly right whenever the world pass is not
+  // tessellating either.
+  if (Caps().tessellation_shader && AoPrepassTessVertexModule != VK_NULL_HANDLE &&
+      AoPrepassHullModule != VK_NULL_HANDLE && AoPrepassDomainModule != VK_NULL_HANDLE) {
+    VkPipelineShaderStageCreateInfo tess_stages[4] = {};
+    tess_stages[0] = stages[0];
+    tess_stages[0].module = AoPrepassTessVertexModule;
+    tess_stages[0].pName = "ao_prepass_tess_vertex";
+    tess_stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    tess_stages[1].stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
+    tess_stages[1].module = AoPrepassHullModule;
+    tess_stages[1].pName = "ao_prepass_hull";
+    tess_stages[2].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    tess_stages[2].stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+    tess_stages[2].module = AoPrepassDomainModule;
+    tess_stages[2].pName = "ao_prepass_domain";
+    tess_stages[3] = stages[1];
+    VkPipelineTessellationStateCreateInfo tessellation = {
+        VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
+    tessellation.patchControlPoints = 3;
+    VkPipelineInputAssemblyStateCreateInfo patches = assembly;
+    patches.topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+    VkGraphicsPipelineCreateInfo tess_info = info;
+    tess_info.stageCount = 4;
+    tess_info.pStages = tess_stages;
+    tess_info.pTessellationState = &tessellation;
+    tess_info.pInputAssemblyState = &patches;
+    if (vkCreateGraphicsPipelines(GetDevice(), VK_NULL_HANDLE, 1, &tess_info, nullptr,
+                                  &AoPrepassTessPipeline) != VK_SUCCESS) {
+      AoPrepassTessPipeline = VK_NULL_HANDLE;
+    }
+  }
+
   // The resolve: one triangle, no depth, one R8 target.
   VkPipelineDepthStencilStateCreateInfo no_depth = {
       VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -3091,6 +3207,185 @@ bool CreateAoPass(uint32_t width, uint32_t height) {
   AoReady = true;
   return true;
 }
+void DestroyMaskTargets() {
+  VkImageView *views[] = {&MaskView, &MaskRawView};
+  for (VkImageView *view : views) {
+    if (*view != VK_NULL_HANDLE) {
+      vkDestroyImageView(GetDevice(), *view, nullptr);
+      *view = VK_NULL_HANDLE;
+    }
+  }
+  VkImage *images[] = {&MaskImage, &MaskRawImage};
+  for (VkImage *image : images) {
+    if (*image != VK_NULL_HANDLE) {
+      vkDestroyImage(GetDevice(), *image, nullptr);
+      *image = VK_NULL_HANDLE;
+    }
+  }
+  VkDeviceMemory *memories[] = {&MaskMemory, &MaskRawMemory};
+  for (VkDeviceMemory *memory : memories) {
+    if (*memory != VK_NULL_HANDLE) {
+      vkFreeMemory(GetDevice(), *memory, nullptr);
+      *memory = VK_NULL_HANDLE;
+    }
+  }
+}
+
+// The mask's two targets, at the same extent as the AO pass's - which is not a coincidence to be
+// maintained but a requirement: this pass reads that pass's position and normal by integer pixel,
+// so the three images are the same grid or the mask is registered against the wrong surface.
+bool CreateMaskTargets(uint32_t width, uint32_t height) {
+  DestroyMaskTargets();
+  if (width == 0 || height == 0) {
+    return false;
+  }
+  constexpr VkImageUsageFlags kColour =
+      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  if (!CreatePassImage(width, height, kMaskFormat, kColour, VK_IMAGE_ASPECT_COLOR_BIT, &MaskImage,
+                       &MaskMemory, &MaskView) ||
+      !CreatePassImage(width, height, kMaskFormat, kColour, VK_IMAGE_ASPECT_COLOR_BIT,
+                       &MaskRawImage, &MaskRawMemory, &MaskRawView)) {
+    DestroyMaskTargets();
+    return false;
+  }
+  WriteBindlessView(kShadowMaskSlot, reinterpret_cast<uint64_t>(MaskView));
+  WriteBindlessView(kShadowMaskRawSlot, reinterpret_cast<uint64_t>(MaskRawView));
+  return true;
+}
+
+void DestroyMaskPass() {
+  MaskReady = false;
+  DestroyMaskTargets();
+  VkPipeline *pipelines[] = {&MaskResolvePipeline, &MaskBlurPipeline};
+  for (VkPipeline *pipeline : pipelines) {
+    if (*pipeline != VK_NULL_HANDLE) {
+      vkDestroyPipeline(GetDevice(), *pipeline, nullptr);
+      *pipeline = VK_NULL_HANDLE;
+    }
+  }
+  if (MaskLayout != VK_NULL_HANDLE) {
+    vkDestroyPipelineLayout(GetDevice(), MaskLayout, nullptr);
+    MaskLayout = VK_NULL_HANDLE;
+  }
+  VkShaderModule *modules[] = {&MaskFullscreenVertexModule, &MaskResolveFragmentModule,
+                               &MaskBlurFragmentModule};
+  for (VkShaderModule *module : modules) {
+    if (*module != VK_NULL_HANDLE) {
+      vkDestroyShaderModule(GetDevice(), *module, nullptr);
+      *module = VK_NULL_HANDLE;
+    }
+  }
+}
+
+// Two full-screen passes and no geometry at all, so this is the AO resolve's pipeline state with a
+// different fragment shader - **and a layout of its own**, because the push block is a different
+// size and a pipeline layout is part of a pipeline.
+//
+// It is built independently of the AO pass and fails independently: a device that cannot build
+// this one keeps `render.ao` and loses only the blur, falling back on the inline filter.
+bool CreateMaskPass(uint32_t width, uint32_t height) {
+  MaskFullscreenVertexModule =
+      CreateModule(kMaskFullscreenVertexSpv, sizeof(kMaskFullscreenVertexSpv));
+  MaskResolveFragmentModule =
+      CreateModule(kMaskResolveFragmentSpv, sizeof(kMaskResolveFragmentSpv));
+  MaskBlurFragmentModule = CreateModule(kMaskBlurFragmentSpv, sizeof(kMaskBlurFragmentSpv));
+  if (MaskFullscreenVertexModule == VK_NULL_HANDLE ||
+      MaskResolveFragmentModule == VK_NULL_HANDLE || MaskBlurFragmentModule == VK_NULL_HANDLE) {
+    return false;
+  }
+  auto set_layout = reinterpret_cast<VkDescriptorSetLayout>(BindlessDescriptorSetLayout());
+  if (set_layout == VK_NULL_HANDLE) {
+    return false;
+  }
+  if (!CreateMaskTargets(width, height)) {
+    return false;
+  }
+
+  VkPushConstantRange range = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               sizeof(MaskPushConstants)};
+  VkPipelineLayoutCreateInfo layout = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  layout.setLayoutCount = 1;
+  layout.pSetLayouts = &set_layout;
+  layout.pushConstantRangeCount = 1;
+  layout.pPushConstantRanges = &range;
+  if (vkCreatePipelineLayout(GetDevice(), &layout, nullptr, &MaskLayout) != VK_SUCCESS) {
+    return false;
+  }
+
+  VkPipelineShaderStageCreateInfo stages[2] = {};
+  stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  stages[0].module = MaskFullscreenVertexModule;
+  stages[0].pName = "mask_fullscreen_vertex";
+  stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+  VkPipelineVertexInputStateCreateInfo vertex_input = {
+      VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineInputAssemblyStateCreateInfo assembly = {
+      VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineViewportStateCreateInfo viewport = {
+      VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  viewport.viewportCount = 1;
+  viewport.scissorCount = 1;
+  VkPipelineRasterizationStateCreateInfo raster = {
+      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  raster.polygonMode = VK_POLYGON_MODE_FILL;
+  raster.cullMode = VK_CULL_MODE_NONE;
+  raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  raster.lineWidth = 1.0f;
+  VkPipelineMultisampleStateCreateInfo multisample = {
+      VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineDepthStencilStateCreateInfo no_depth = {
+      VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+  VkPipelineColorBlendAttachmentState attachment = {};
+  attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+  VkPipelineColorBlendStateCreateInfo blend = {
+      VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  blend.attachmentCount = 1;
+  blend.pAttachments = &attachment;
+  const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+  VkPipelineDynamicStateCreateInfo dynamic = {
+      VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+  dynamic.dynamicStateCount = 2;
+  dynamic.pDynamicStates = dynamic_states;
+  VkPipelineRenderingCreateInfo rendering = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+  rendering.colorAttachmentCount = 1;
+  rendering.pColorAttachmentFormats = &kMaskFormat;
+
+  VkGraphicsPipelineCreateInfo info = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  info.pNext = &rendering;
+  info.stageCount = 2;
+  info.pStages = stages;
+  info.pVertexInputState = &vertex_input;
+  info.pInputAssemblyState = &assembly;
+  info.pViewportState = &viewport;
+  info.pRasterizationState = &raster;
+  info.pMultisampleState = &multisample;
+  info.pDepthStencilState = &no_depth;
+  info.pColorBlendState = &blend;
+  info.pDynamicState = &dynamic;
+  info.layout = MaskLayout;
+
+  stages[1].module = MaskResolveFragmentModule;
+  stages[1].pName = "mask_resolve_fragment";
+  if (vkCreateGraphicsPipelines(GetDevice(), VK_NULL_HANDLE, 1, &info, nullptr,
+                                &MaskResolvePipeline) != VK_SUCCESS) {
+    return false;
+  }
+  stages[1].module = MaskBlurFragmentModule;
+  stages[1].pName = "mask_blur_fragment";
+  if (vkCreateGraphicsPipelines(GetDevice(), VK_NULL_HANDLE, 1, &info, nullptr,
+                                &MaskBlurPipeline) != VK_SUCCESS) {
+    return false;
+  }
+  MaskReady = true;
+  return true;
+}
+
 
 // --- HDR: the float target's knobs and the tonemap pass ---------------------------------------
 //
@@ -3702,6 +3997,13 @@ bool StartDraw(uint32_t width, uint32_t height, uint32_t colour_format) {
     DebugWrite("gkplus: ambient occlusion unavailable\n");
     DestroyAoPass();
   }
+  // The screen-space shadow mask (4.101), and it fails independently of the pass above even
+  // though it reads that pass's targets: losing it costs the rotation and the blur, and
+  // `render.shadow_softness` falls back on the inline filter, which needs none of this.
+  if (!CreateMaskPass(width, height)) {
+    DebugWrite("gkplus: shadow mask unavailable, soft shadows will filter inline\n");
+    DestroyMaskPass();
+  }
   // Not fatal either, and this is the one whose failure has to be *reported* rather than merely
   // survived: without it `HdrTargetFormat` keeps the 8-bit target, so `render.hdr` reads back on
   // and does nothing. It needs the bindless set, which `CreatePipelineLayout` has already proved
@@ -4188,16 +4490,51 @@ void SplitCornerCounts(uint32_t &corners, uint32_t &analysed_draws, uint32_t &pe
   too_large = SplitTooLarge;
 }
 
+// Where this frame's block lives, between the two halves below. Null outside that window, which
+// `UploadFrameData` treats as "nobody reserved one" and allocates for itself.
+GpuFrameData *ReservedFrameData = nullptr;
+
+// **Claim this frame's block without filling it.** The shadow mask pass (4.101) records a push
+// constant pointing at the frame block, and it is recorded *before* `RecordDraws` - so the address
+// has to exist earlier than the contents do. That is legal and it is not a trick: a push constant
+// is baked into the command buffer at record time, but the buffer it points at is read when the
+// queue executes, which is after the whole frame has been recorded and `UploadFrameData` has run.
+//
+// Idempotent within a frame, and safe to skip: a frame where the mask pass does not run never
+// calls this and `UploadFrameData` allocates as it always did.
+void ReserveFrameData() {
+  if (ReservedFrameData != nullptr) {
+    return;
+  }
+  const ScratchAlloc alloc = AllocateScratchFrames(1);
+  if (!alloc.valid || alloc.mapped == nullptr) {
+    return;
+  }
+  ReservedFrameData = static_cast<GpuFrameData *>(alloc.mapped);
+  // Zeroed here rather than left as the previous scene's bytes, because between this call and
+  // `UploadFrameData` the block is reachable by the GPU only in the sense that its address has been
+  // pushed - but a *dropped* frame that never fills it would otherwise hand the mask pass a stale
+  // sun matrix. Zero is `shadow_texture == 0`... which is a real slot, so the pass must be gated on
+  // the CPU rather than on the contents - which it is (`ShadowMaskWanted`).
+  *ReservedFrameData = GpuFrameData{};
+  FrameDataAddress = ScratchFrameAddress() + alloc.offset * sizeof(GpuFrameData);
+}
+
 // One GpuFrameData for this frame, written after the lights are uploaded (so the addresses are
 // this frame's) and before any draw is recorded (so every draw's push points at the same block).
 void UploadFrameData() {
-  FrameDataAddress = 0;
   UiFrameDataAddress = 0;
-  const ScratchAlloc alloc = AllocateScratchFrames(1);
-  if (!alloc.valid || alloc.mapped == nullptr) {
-    return; // every draw then pushes address 0, and the shader's null check draws unlit
+  GpuFrameData *frame = ReservedFrameData;
+  if (frame == nullptr) {
+    FrameDataAddress = 0;
+    const ScratchAlloc alloc = AllocateScratchFrames(1);
+    if (!alloc.valid || alloc.mapped == nullptr) {
+      return; // every draw then pushes address 0, and the shader's null check draws unlit
+    }
+    frame = static_cast<GpuFrameData *>(alloc.mapped);
+    FrameDataAddress = ScratchFrameAddress() + alloc.offset * sizeof(GpuFrameData);
   }
-  auto *frame = static_cast<GpuFrameData *>(alloc.mapped);
+  ReservedFrameData = nullptr;
   *frame = GpuFrameData{};
   frame->map_lights = FrameMapLightAddress;
   frame->light_grid = LightGridAddress();
@@ -4267,6 +4604,12 @@ void UploadFrameData() {
   frame->shadow_z_near = FrameSunZNear;
   frame->shadow_z_span = FrameSunZSpan;
   frame->shadow_cascades = frame->shadow_texture == kNoTexture ? 0u : FrameCascadeCount;
+  // PCSS (SetShadowSoftness). Uploaded unconditionally: 0 is the hard path in the shader, so there
+  // is nothing here that has to know whether the feature is on.
+  frame->shadow_softness = ShadowSoftnessValue;
+  frame->shadow_soft_min = ShadowSoftMinValue;
+  frame->shadow_soft_max = ShadowSoftMaxValue;
+  frame->shadow_soft_taps = static_cast<uint32_t>(ShadowSoftTapCount);
   // The static shadow atlas. **`map_shadow_texture` now means "the atlas exists and somebody wants
   // it"**, and which of its two producers may sample it is `light_flags` below - because the map
   // lights (§4.61) and D3D's own point lights (§4.65) are separate features sharing one image and
@@ -4329,8 +4672,18 @@ void UploadFrameData() {
   const bool hdr_active = ColourFormat == kHdrFormat;
   frame->colour_flags = (hdr_active && LinearInputEnabled ? kLinearInput : 0u) |
                         (hdr_active ? kUnclamped : 0u);
-  frame->pad_colour[0] = frame->pad_colour[1] = frame->pad_colour[2] = 0;
-  FrameDataAddress = ScratchFrameAddress() + alloc.offset * sizeof(GpuFrameData);
+  // Two, not three. `pad_colour` has been `uint32_t[2]` since 4.98 took one of its words for
+  // `bump_diffuse_limit`, and this line kept writing a third - four bytes past the array, which
+  // was the last member and therefore past the struct. It cost nothing until PCSS appended a
+  // field there, whereupon `shadow_softness` was zeroed after being written and the whole feature
+  // read as inert with every knob reporting the value it had been given (4.100).
+  frame->pad_colour[0] = frame->pad_colour[1] = 0;
+  // The mask (4.101). `MaskRanThisFrame` and not the knob, for the reason `ao_texture` above uses
+  // the same test: a frame whose pass did not run leaves the target holding the previous frame's
+  // mask, and a shadow one frame behind the camera is worse than no mask at all.
+  frame->shadow_mask_texture = MaskRanThisFrame ? kShadowMaskSlot : kNoTexture;
+  frame->shadow_mask_position = kAoPositionSlot;
+  frame->pad_mask[0] = frame->pad_mask[1] = 0;
 
   // --- and a second copy for the UI pass, differing in one word -------------------------------
   //
@@ -4763,12 +5116,35 @@ void RecordShadowPass(void *command_buffer) {
 //
 // Outside any render pass on entry and outside one on exit, like the three passes beside it in
 // DrawFrame - it begins and ends its own.
+// Whether the mask pass has anything to do this frame. **Every term is CPU-side**, which is what
+// lets `ReserveFrameData` be called on exactly the frames the pass records a pointer for - the
+// contents of the frame block do not exist yet at that point, so the gate cannot consult them.
+//
+// `FrameSunValid` is the one that is not a knob: `RecordShadowPass` sets it, it runs before this
+// pass, and it is false on every frame with no sun and no rendered map.
+bool ShadowMaskWanted() {
+  return Ready && MaskReady && SunShadowsEnabled && ShadowReady && FrameSunValid &&
+         ShadowSoftBlurEnabled && ShadowSoftnessValue > 0.0f;
+}
+
+// The geometry prepass and everything that reads it: ambient occlusion (4.86) and the sun-shadow
+// mask (4.101).
+//
+// **It is one function because the prepass is one pass.** Both features want world position and
+// normal per pixel at the render extent, rasterised with the same half-pixel origin the world pass
+// uses, and running it twice would be a second walk over the frame's solid geometry for a byte-
+// identical result. So the prepass is gated on *either* wanting it, and each resolve on its own
+// knob - which also means turning AO off while the mask is on keeps the prepass, and its cost
+// moves from one feature to the other rather than disappearing.
 void RecordAoPass(void *command_buffer) {
   auto cmd = static_cast<VkCommandBuffer>(command_buffer);
   AoDrawCalls = 0;
   AoCastersDropped = 0;
   AoRanThisFrame = false;
-  if (!Ready || !AoReady || !AoEnabled || cmd == VK_NULL_HANDLE || Items.empty()) {
+  MaskRanThisFrame = false;
+  const bool want_ao = AoReady && AoEnabled;
+  const bool want_mask = ShadowMaskWanted();
+  if (!Ready || (!want_ao && !want_mask) || cmd == VK_NULL_HANDLE || Items.empty()) {
     return;
   }
   const uint64_t arena_vertices = VertexArenaAddress();
@@ -4864,10 +5240,30 @@ void RecordAoPass(void *command_buffer) {
   VkRect2D scissor = {{0, 0}, {AoWidth, AoHeight}};
   vkCmdSetViewport(cmd, 0, 1, &viewport);
   vkCmdSetScissor(cmd, 0, 1, &scissor);
-  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, AoPrepassPipeline);
+  // **Tessellated exactly when the world pass is**, which is the whole point of the twin: this
+  // pass records where each pixel's surface *is*, and the surface the world pass shades is the
+  // displaced one. `AoPrepassTessPipeline` null is a device that could not build it, where the
+  // flat pipeline is also what the world pass is using.
+  const bool prepass_tessellating =
+      TessellationEnabled() && AoPrepassTessPipeline != VK_NULL_HANDLE;
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    prepass_tessellating ? AoPrepassTessPipeline : AoPrepassPipeline);
 
   AoPushConstants push = {};
   push.draws = draw_records;
+  // Filled whether or not this pass is tessellating, for the reason FillShadowTessPush is: they
+  // are the colour pass's values and the patch is a function of them.
+  {
+    const TessellationParams &tess = TessParams();
+    push.pn_strength = tess.pn_strength;
+    push.pn_flat_threshold = tess.pn_flat_threshold;
+    push.pn_max_offset = tess.pn_max_offset < 0.0f ? 0.0f : tess.pn_max_offset;
+    // **The shadow bake's uniform factor, not the world pass's screen-space rule.** Same argument:
+    // the factor decides how finely the patch is sampled and not what the patch is, and a constant
+    // cannot disagree with itself across a shared edge.
+    push.tess_factor = tess.shadow_factor < 1.0f ? 1.0f : tess.shadow_factor;
+    SplitCornerTableFor(push.split_corners, push.split_base, push.split_count);
+  }
   VkBuffer bound_index = VK_NULL_HANDLE;
   for (const CasterBucket &bucket : buckets) {
     const VkBuffer index_buffer = bucket.index_source == DrawSource::Arena
@@ -4910,6 +5306,8 @@ void RecordAoPass(void *command_buffer) {
   dependency.pImageMemoryBarriers = to_read;
   vkCmdPipelineBarrier2(cmd, &dependency);
 
+  // **The AO resolve, on its own knob.** The prepass above may have run purely for the mask.
+  if (want_ao) {
   VkRenderingAttachmentInfo result = colour[0];
   result.imageView = AoResultView;
   // LOAD_OP_DONT_CARE: the resolve writes every pixel of the target unconditionally - the
@@ -4952,6 +5350,98 @@ void RecordAoPass(void *command_buffer) {
   dependency.pImageMemoryBarriers = &result_read;
   vkCmdPipelineBarrier2(cmd, &dependency);
   AoRanThisFrame = true;
+  }
+
+  // --- the sun-shadow mask (4.101): resolve, then blur ---------------------------------------
+  //
+  // Two full-screen passes over the same prepass output. The resolve reads the shadow map, which
+  // `RecordShadowPass` has already rendered and left readable this frame; the blur reads the
+  // resolve.
+  if (want_mask) {
+    // The frame block this pass points at is filled later in the frame, by `UploadFrameData`
+    // inside `RecordDraws`. See ReserveFrameData for why that is sound.
+    ReserveFrameData();
+    if (FrameDataAddress == 0) {
+      return; // no scratch for the block, so nothing to point the pass at
+    }
+    MaskPushConstants mask_push = {};
+    mask_push.frame = FrameDataAddress;
+    mask_push.position_texture = kAoPositionSlot;
+    mask_push.normal_texture = kAoNormalSlot;
+
+    VkImageMemoryBarrier2 mask_barrier = to_read[0];
+    mask_barrier.image = MaskRawImage;
+    mask_barrier.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    mask_barrier.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    mask_barrier.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    mask_barrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    mask_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    mask_barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    dependency.imageMemoryBarrierCount = 1;
+    dependency.pImageMemoryBarriers = &mask_barrier;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+
+    VkRenderingAttachmentInfo mask_target = colour[0];
+    mask_target.imageView = MaskRawView;
+    // DONT_CARE for the reason the AO resolve's target is: every pixel is written
+    // unconditionally, so a clear would be a second write of the whole image.
+    mask_target.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &mask_target;
+    rendering.pDepthAttachment = nullptr;
+    vkCmdBeginRendering(cmd, &rendering);
+    // A zero origin, not the prepass's half-pixel one, and for the same reason the AO resolve
+    // uses one: this is a full-screen triangle whose fragment reads its own integer position.
+    VkViewport mask_view = {0.0f, 0.0f, static_cast<float>(AoWidth),
+                            static_cast<float>(AoHeight), 0.0f, 1.0f};
+    vkCmdSetViewport(cmd, 0, 1, &mask_view);
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, MaskResolvePipeline);
+    auto mask_set = reinterpret_cast<VkDescriptorSet>(BindlessDescriptorSet());
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, MaskLayout, 0, 1, &mask_set, 0,
+                            nullptr);
+    vkCmdPushConstants(cmd, MaskLayout,
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       sizeof(mask_push), &mask_push);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRendering(cmd);
+
+    // The resolve's output becomes the blur's input, and the blurred target becomes an
+    // attachment - one barrier for both, as the prepass's pair was.
+    VkImageMemoryBarrier2 blur_barriers[2] = {};
+    blur_barriers[0] = mask_barrier;
+    blur_barriers[0].srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    blur_barriers[0].srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    blur_barriers[0].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    blur_barriers[0].dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    blur_barriers[0].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    blur_barriers[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    blur_barriers[1] = mask_barrier;
+    blur_barriers[1].image = MaskImage;
+    dependency.imageMemoryBarrierCount = 2;
+    dependency.pImageMemoryBarriers = blur_barriers;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+
+    mask_target.imageView = MaskView;
+    rendering.pColorAttachments = &mask_target;
+    vkCmdBeginRendering(cmd, &rendering);
+    vkCmdSetViewport(cmd, 0, 1, &mask_view);
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, MaskBlurPipeline);
+    mask_push.source_texture = kShadowMaskRawSlot;
+    vkCmdPushConstants(cmd, MaskLayout,
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       sizeof(mask_push), &mask_push);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRendering(cmd);
+
+    VkImageMemoryBarrier2 mask_read = blur_barriers[0];
+    mask_read.image = MaskImage;
+    dependency.imageMemoryBarrierCount = 1;
+    dependency.pImageMemoryBarriers = &mask_read;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+    MaskRanThisFrame = true;
+  }
 }
 
 namespace {
@@ -6204,6 +6694,32 @@ void SetShadowCascades(int count) {
 }
 int ShadowCascades() { return ShadowCascadeCount; }
 
+// Clamped at 0 rather than passed through, because a negative tangent is not a smaller penumbra -
+// it is the hard path, and it would reach it by accident rather than by the knob's own test.
+void SetShadowSoftness(float tangent) {
+  ShadowSoftnessValue = tangent > 0.0f ? tangent : 0.0f;
+}
+float ShadowSoftness() { return ShadowSoftnessValue; }
+
+void SetShadowSoftMin(float texels) { ShadowSoftMinValue = texels > 0.0f ? texels : 0.0f; }
+float ShadowSoftMin() { return ShadowSoftMinValue; }
+
+void SetShadowSoftMax(float texels) { ShadowSoftMaxValue = texels > 0.0f ? texels : 0.0f; }
+float ShadowSoftMax() { return ShadowSoftMaxValue; }
+
+void SetShadowSoftTaps(int taps) {
+  ShadowSoftTapCount = taps < 1 ? 1 : (taps > kShadowDiscSize ? kShadowDiscSize : taps);
+}
+int ShadowSoftTaps() { return ShadowSoftTapCount; }
+
+void SetShadowSoftBlur(bool enabled) { ShadowSoftBlurEnabled = enabled; }
+// **What the knob asked for, not what the device could build.** The opposite convention to
+// `sun_shadow_indirect`, which reads back what it can actually do - and the difference is that
+// there the two paths produce the same image, so a silent downgrade is honest. Here they do not:
+// a mask that failed to build gives a visibly different filter, and a getter that reported the
+// fallback as "the knob is off" would hide it. `render.draws` is where the difference is stated.
+bool ShadowSoftBlur() { return ShadowSoftBlurEnabled; }
+
 void SetLocalLights(bool enabled) { LocalLightsEnabled = enabled; }
 bool LocalLights() { return LocalLightsEnabled; }
 
@@ -7056,6 +7572,12 @@ bool ResizeDraw(uint32_t width, uint32_t height) {
   if (AoReady && !CreateAoTargets(width, height)) {
     DebugWrite("gkplus: ambient occlusion targets could not be resized\n");
     DestroyAoPass();
+  }
+  // The mask's two targets are read by integer pixel against the AO pass's, so they resize with
+  // it or the mask is registered against the wrong surface at the new extent.
+  if (MaskReady && !CreateMaskTargets(width, height)) {
+    DebugWrite("gkplus: shadow mask targets could not be resized\n");
+    DestroyMaskPass();
   }
   // The bloom layers are a fixed line count but the frame's ASPECT RATIO, so they move with the
   // extent too - and `BloomSourceHeight`, which the extract's tap count is derived from, is only
@@ -8386,6 +8908,28 @@ std::string FormatDrawStats() {
         "%.4f per texel\n",
         kShadowAtlas, kShadowAtlas, (unsigned)(ShadowBytes / 1024), (unsigned)ShadowFormat,
         kShadowTile, near_extent, near_extent * 2.0f / static_cast<float>(kShadowTile));
+    // PCSS, and the second number is the reading: `shadow_softness` is quoted per world unit of
+    // blocker distance, so what a value MEANS on screen is the penumbra it produces at a plausible
+    // distance. One world unit is the one that needs no assumption about the level.
+    if (ShadowSoftnessValue > 0.0f) {
+      add("  soft (PCSS): softness %.4f - %.3f world units of penumbra a unit of blocker "
+          "distance, %.1f near-cascade texels; radius %.1f..%.1f texels, %d taps a loop\n",
+          ShadowSoftnessValue, ShadowSoftnessValue,
+          ShadowSoftnessValue / (near_extent * 2.0f / static_cast<float>(kShadowTile)),
+          ShadowSoftMinValue, ShadowSoftMaxValue, ShadowSoftTapCount);
+      // Four states and not two, for the reason the sun's own line has four: "the knob is off",
+      // "this device could not build the pass" and "it is on but did not run this frame" all
+      // produce the inline filter on screen and only the report tells them apart.
+      add("    filter: %s\n",
+          !ShadowSoftBlurEnabled
+              ? "inline, one fixed lattice for every pixel (render.shadow_soft_blur)"
+              : (!MaskReady ? "inline - NO MASK PASS on this device, which is the fallback"
+                            : (MaskRanThisFrame
+                                   ? "screen-space mask, 16 rotations resolved by a 4x4 blur"
+                                   : "inline - the mask pass did not run this frame")));
+    } else {
+      add("  hard: a 3x3 PCF at one texel, everywhere (render.shadow_softness)\n");
+    }
   }
   if (TheStats.stencil_shadow_draws_hidden > 0) {
     add("  the game's own stencil shadow: %llu draws dropped (render.stencil_shadow puts it "
@@ -8484,6 +9028,7 @@ void ShutdownDraw() {
   // last one happened to be using.
   ColourFormat = VK_FORMAT_UNDEFINED;
   SwapchainFormat = VK_FORMAT_UNDEFINED;
+  DestroyMaskPass();
   DestroyAoPass();
   DestroyDynShadowAtlas();
   DestroyMapShadowAtlas();

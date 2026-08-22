@@ -746,6 +746,32 @@ the pattern is a lattice rather than blue noise, an under-sampled fixed kernel p
 copies of every silhouette rather than grain, and scaling the *ambient* term is inert in this game
 because Gunlok has none to occlude (`vulkan_renderer_notes.md` §4.86).
 
+It also makes the **sun's shadow soft** (`render.shadow_softness`, off by default): PCSS over the
+same cascades, where a blocker search decides the filter's radius per fragment, so a foot on the
+ground stays sharp and the shadow of something three metres up spreads. The knob is **the tangent
+of the sun's angular radius**, not a filter width, and the penumbra is computed in world units and
+converted to texels last — which is what keeps it the same width across a cascade boundary where a
+radius in texels would paint a ring. It shares ao.slang's fixed lattice disc for the same reason
+that pass has one: a rotated kernel needs a blur and there is no blur on the shadow term. Off is
+bit-identical to the 3x3 that preceded it, free at the default 16 taps, and the difference it makes
+is **confined to shadow edges** — a difference that is not is the blocker search finding the
+receiver. `vulkan_renderer_notes.md` §4.100, which also records the four-byte write past
+`pad_colour` that had been zeroing the tail of `GpuFrameData` since §4.91 and made the first build
+of this completely inert with every knob still reading back correctly.
+
+That filter is a **screen-space mask** by default (`render.shadow_soft_blur`, §4.101): the kernel is
+rotated per pixel from a 4x4 tile of the pixel's own coordinates and a 4x4 bilateral blur resolves
+it, and the two sizes matching is what makes the blur exact — a four-wide window covers each of the
+sixteen rotations exactly once, so the estimate carries no residual dither and nothing crawls when
+the camera moves. It reads the **AO prepass's** position and normal, so the prepass is now gated on
+either feature wanting it, and it is consulted only where that prepass saw the same surface the
+world shader is shading — everything else falls back on the inline filter. Off, the filter runs
+inline over one fixed lattice, which is cheaper and bands. **The mask at 8 taps beats the lattice at
+32 for the same cost.** Writing it is also what found that the AO prepass had been rasterising the
+**base mesh** under the PN-displaced surface since §4.71 — a screen-space feature is only as
+registered as its prepass, and the way that surfaced was computing the same quantity twice, once
+from the prepass and once inline, and differencing them.
+
 It also draws two things the game never could, both keyed on a texture's `.rim` name:
 `render.material_override` retextures, tints or hides every draw sampling one asset, and
 **`src/VkLighting`** gives one a bump/metallic/roughness response from a companion
