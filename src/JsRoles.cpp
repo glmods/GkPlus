@@ -214,8 +214,6 @@ JSValue SetRoleStat(JSContext *ctx, JSValueConst self, JSValueConst v,
 enum RoleCount {
   CountResistance,
   CountLimit,
-  CountHierNodes26To30,
-  CountHierNodes21To25,
 };
 
 JSValue GetRoleCount(JSContext *ctx, JSValueConst self, int magic) {
@@ -230,12 +228,6 @@ JSValue GetRoleCount(JSContext *ctx, JSValueConst self, int magic) {
     break;
   case CountLimit:
     value = r->limit;
-    break;
-  case CountHierNodes26To30:
-    value = r->num_hier_nodes_26_30;
-    break;
-  case CountHierNodes21To25:
-    value = r->num_hier_nodes_21_25;
     break;
   }
   return JS_NewInt32(ctx, value);
@@ -487,9 +479,17 @@ JSValue RoleSpawn(JSContext *ctx, JSValueConst self, int argc,
       !ToVec4(ctx, argv[2], &orientation)) {
     return JS_EXCEPTION;
   }
+  // An actor, not an id. SpawnRole wants the id, but nothing in this surface
+  // makes a script carry one around any more - and `JS_ToInt32` on the actor a
+  // script would naturally pass yielded 0, silently making actor 0 the owner.
+  // 0 is also the "no owner" value, which is exactly why that went unnoticed.
   int32_t owner = 0;
-  if (argc > 3 && JS_ToInt32(ctx, &owner, argv[3])) {
-    return JS_EXCEPTION;
+  if (argc > 3 && !JS_IsUndefined(argv[3]) && !JS_IsNull(argv[3])) {
+    Actor *owner_actor = ActorFromValue(ctx, argv[3]);
+    if (!owner_actor) {
+      return JS_EXCEPTION;
+    }
+    owner = owner_actor->id;
   }
 
   // Spawning inserts into the actors hash the executor is walking; the lookup that
@@ -542,10 +542,6 @@ const JSCFunctionListEntry RoleProto[] = {
     JS_CGETSET_MAGIC_DEF("alpha", GetRoleStat, SetRoleStat, StatAlpha),
     JS_CGETSET_MAGIC_DEF("resistance", GetRoleCount, nullptr, CountResistance),
     JS_CGETSET_MAGIC_DEF("limit", GetRoleCount, nullptr, CountLimit),
-    JS_CGETSET_MAGIC_DEF("num_hier_nodes_26_30", GetRoleCount, nullptr,
-                         CountHierNodes26To30),
-    JS_CGETSET_MAGIC_DEF("num_hier_nodes_21_25", GetRoleCount, nullptr,
-                         CountHierNodes21To25),
     JS_CGETSET_MAGIC_DEF("alpha_fogging", GetRoleFlag, SetRoleFlag,
                          FlagAlphaFogging),
     JS_CGETSET_MAGIC_DEF("per_vertex_fogging", GetRoleFlag, SetRoleFlag,

@@ -59,6 +59,8 @@ add_library(GkPlus MODULE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/GUI.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/HudFix.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ImageCodec.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ActorArg.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/RenderSettings.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/InputFix.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsActors.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/JsCamera.cpp"

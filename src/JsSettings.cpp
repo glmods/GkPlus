@@ -427,11 +427,22 @@ JSValue RemoveJs(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
 }
 
 JSValue SaveJs(JSContext *ctx, JSValueConst, int, JSValueConst *) {
-  return JS_NewBool(ctx, settings::Save());
+  // Throws rather than returning false: this writes a temporary and moves it over
+  // the target, so a failure means the file on disk is somebody else's problem
+  // now - not something to discover from an ignored return.
+  if (!settings::Save()) {
+    return JS_ThrowInternalError(ctx, "could not write %s",
+                                 settings::Path().c_str());
+  }
+  return JS_UNDEFINED;
 }
 
 JSValue ReloadJs(JSContext *ctx, JSValueConst, int, JSValueConst *) {
-  return JS_NewBool(ctx, settings::Reload());
+  if (!settings::Reload()) {
+    return JS_ThrowInternalError(ctx, "could not re-read %s",
+                                 settings::Path().c_str());
+  }
+  return JS_UNDEFINED;
 }
 
 // The whole document as a plain object, detached from the store - the tree itself

@@ -51,7 +51,15 @@ import type {
   LevelModule,
   Menus,
   MenuItem,
+  BloomBlend,
+  BloomState,
+  BloomStatus,
+  MaterialOverridesState,
   Mod,
+  Render,
+  RenderBoolKey,
+  RenderNumberKey,
+  RenderStringKey,
   Role,
   SetupMenus,
   TurretActor,
@@ -105,7 +113,7 @@ gameConsole.text_color = 0xff00ff00;
 gameConsole.log("host logging", 1, true);
 gameConsole.warn("also here");
 gameConsole.execute("SPAWN gunlok");
-const queuedFile: boolean = gameConsole.execute_file("level01.gcs");
+gameConsole.execute_file("level01.gcs"); // throws if the file will not open
 
 // @ts-expect-error - there is no global console: the host installs none, and
 // log/info/warn/error/debug live on the one exported by "gk".
@@ -204,13 +212,13 @@ triggers.create({
   kind: triggers.kind.location,
   coords: [{ x: 0, y: 0, z: 0 }],
   value: 500,
-  targets: ["hark", "gunlok"],
+  targets: [actors["hark"]!, actors["gunlok"]!],
   script: "ambush",
 });
 // The same field takes a message instead of a file name.
 triggers.create({
   kind: triggers.kind.death,
-  targets: ["hark"],
+  targets: [actors["hark"]!],
   script: { kind: "boss_down", bonus: 500 },
 });
 // @ts-expect-error - `kind` is required
@@ -255,7 +263,7 @@ game.battle_number = 4;
 game.training_area = 3;
 
 const selected: Actor | null = game.selected_actor;
-game.selected_actor = 12; // by id, like actor.set_target
+game.selected_actor = actors[12]!; // the object, matching the getter
 game.selected_actor = null;
 // @ts-expect-error - a wrapper is a fresh object each lookup; ids are the currency
 game.selected_actor = actors[12];
@@ -355,12 +363,12 @@ const Rol_Bug: Role = make.role({
 const bugId: number = Rol_Bug.id;
 // A reusable handle is fine too - the rif cache owns it.
 make.role({ identifier: "bug2", hierarchy: hcy, ai: "bot" });
-const ammoOk: boolean = make.ammo({
+make.ammo({
   ammo_type: "plasma bolts",
   weapon_type: "plasma pistol",
   role: Rol_Bug,
 });
-const infoOk: boolean = make.ammo_info({ ammo_type: "flares", shape: hcy, max_per_slot: 50 });
+make.ammo_info({ ammo_type: "flares", shape: hcy, max_per_slot: 50 });
 make.camera_track({ name: "first contact", file: "levels\\level01.rif" });
 // @ts-expect-error - `file` is required: it reaches a strlen with no null check
 make.camera_track({ name: "first contact" });
@@ -406,7 +414,7 @@ const arena: Level = levels.add("Test Arena", {
     // A trigger can carry data rather than a file name now.
     triggers.create({
       kind: triggers.kind.death,
-      targets: ["gunlok"],
+      targets: [actors["gunlok"]!],
       script: { kind: "hero_down" },
     });
   },
@@ -442,13 +450,13 @@ const asModule: LevelModule = {
 const fromModule: Level = levels.add("From A Module", asModule);
 
 // --- starting a level, with no menus in the way ----------------------------------
-const started: boolean = levels.start(arena);
+levels.start(arena);
 levels.start(arena, { difficulty: "hard" });
 levels.start("level01", { difficulty: 2 });
 levels.start({ script: "level01.gls", console: "level01.gcs" });
 arena.start({ difficulty: "easy" });
 const pending: boolean = levels.start_pending;
-const quitToMenu: boolean = levels.quit();
+levels.quit();
 for (const entry of levels.startable) {
   const where: number = entry.index;
   const what: string = entry.title + entry.script + entry.console;
@@ -551,7 +559,7 @@ camera.jerky_zoom_to(250);
 camera.rotate(45, 2);
 camera.elevate(-10, 1);
 camera.nudge(0.25, 0);
-camera.center_on(12);
+camera.center_on(actors[12]!);
 
 // console administration - six of these have localized names.
 gameConsole.hide();
@@ -585,7 +593,7 @@ fx.rain(3);
 light.dark();
 light.fade_to_black(3, 1);
 light.ray_color(1, 0, 0);
-light.light_on("door_a", "dummy", 1, 1, 1, 0.5);
+light.light_on(actors["door_a"]!, "dummy", 1, 1, 1, 0.5);
 light.remove_cylinders();
 
 // objectives
@@ -609,37 +617,38 @@ screen.borders(60, 2);
 screen.borders_off();
 screen.status_window("WATCH");
 screen.end_game_fmv("win");
-screen.game_speed(0);
-screen.game_speed();
-screen.main_menu();
-screen.quit();
+game.set_speed(0);
+// @ts-expect-error - the speed is required: there is no getter to pair with
+game.set_speed();
+levels.quit(); // ends the session; screen.main_menu() was the duplicate
+game.quit();
 // @ts-expect-error - only GENERAL, WATCH or OFF
 screen.status_window("BIG");
 // @ts-expect-error - only win or lose
 screen.end_game_fmv("draw");
 
 // units - actors are named by token
-units.set_ai("hark", "turret");
-units.set_activity("hark", "PATROL");
-units.turn_vision_cone(true, "hark");
-units.turret_los(false, "turret_a");
-units.set_scale(2, "hark");
-units.set_vulnerability("hark", "gunlok", 5, "boom.gcs");
-units.watch("elint");
+units.set_ai(actors["hark"]!, "turret");
+units.set_activity("PATROL");
+units.turn_vision_cone(true, actors["hark"]!);
+units.turret_los(false, actors["turret_a"]!);
+units.set_scale(2);
+units.set_vulnerability(actors["hark"]!, "gunlok", 5, "boom.gcs");
+units.watch(actors["elint"]!);
 // @ts-expect-error - not one of the three activities
 units.set_activity("hark", "DANCE");
 
 // inventory
-inventory.give("gunlok", "plasmagnum");
+inventory.give(actors["gunlok"]!, "plasmagnum");
 inventory.give_and_equip_role_team("Rol_GunLok", 2, "plasmatrix");
-inventory.heap("garbage_pile_a", "plasmagnum", "plasmatrix");
+inventory.heap(actors["garbage_pile_a"]!, "plasmagnum", "plasmatrix");
 inventory.if_carrying("keycard", "OPEN DOOR 1");
 
 // tracks
 tracks.run("lift_a");
 tracks.pause("lift_a");
 tracks.declare_door({ x: 1, y: 2, z: 3 }, 1);
-tracks.attach("lift_a");
+tracks.attach(actors["lift_a"]!);
 
 // demo
 demo.record();
@@ -654,9 +663,9 @@ script.cancel_wait_for();
 // there is no quoting. It still type-checks, so this is a runtime contract.
 fx.water(10);
 
-light.associate("lift_a", "door_a", "dummy", 1, 1, 1, 0.5);
+light.associate(actors["lift_a"]!, actors["door_a"]!, "dummy", 1, 1, 1, 0.5);
 music.play_environmental_sound(3);
-screen.say("regrouping at the bridge"); // free text: spaces are fine here
+game.say("regrouping at the bridge"); // free text: spaces are fine here
 gameConsole.write_log("a note with spaces");
 
 // damage() takes the attacker's team for frag credit; -1 (the default) is nobody.
@@ -668,19 +677,19 @@ if (someone) {
 
 // --- the broadcasting members (authority-gated, safe to call unguarded) --------
 
-camera.track(12);
+camera.track(actors[12]!);
 camera.bezier_track({ x: 0 }, { x: 10 }, { x: 20 }, { x: 30 });
 fx.airstrike({ x: 0, z: 0 }, { x: 50, z: 50 });
-fx.smoke("hark");
-fx.stop_particles("hark");
-fx.texture_animate("hark", 2, [0, 0, 0.5, 0.5]);
+fx.smoke(actors["hark"]!);
+fx.stop_particles(actors["hark"]!);
+fx.texture_animate(actors["hark"]!, 2, [0, 0, 0.5, 0.5]);
 light.add({ x: 1, y: 2, z: 3 }, 1, 0.5, 0);
 light.add_blinking({ x: 1 }, 1, 1, 1);
-light.shadow("hark");
-units.play_animation("hark", 3);
-units.give_control("hark", 2);
-units.player_select("hark");
-units.speak(12, "watch the bridge");
+light.shadow(actors["hark"]!);
+units.play_animation(actors["hark"]!, 3);
+units.give_control(actors["hark"]!, 2);
+units.player_select(actors["hark"]!);
+units.speak(actors[12]!, "watch the bridge");
 inventory.remove_item("plasmagnum");
 tracks.set("lift_a", { x: 0 }, { x: 1 }, { x: 2 }, { x: 3 }, true);
 tracks.open_door(1);
@@ -782,8 +791,8 @@ const settingWindowY: number = settingWindow.y;
 const settingUnknown: unknown = settings.get("mymod.nothing");
 settings.set("mymod.a.b.c", 7);
 const settingRemoved: boolean = settings.remove("mymod.a");
-const settingsSaved: boolean = settings.save();
-const settingsReloaded: boolean = settings.reload();
+settings.save();
+settings.reload();
 const settingsPath: string = settings.path;
 const settingsAll: Record<string, unknown> = settings.all;
 
@@ -796,23 +805,238 @@ settings.get(["mymod", "window"]);
 
 // --- the Vulkan renderer's material override ---------------------------------
 
-const overrideReadback: string = render.material_override("gunlok_mk2", {
+const overrideReadback: MaterialOverridesState = render.material.override("gunlok_mk2", {
   texture: "hark_512",
   tint: [1, 0.25, 0.25],
   hide: false,
 });
-render.material_override("bitmaps\water.rim", { tint: [0.2, 0.4, 1, 0.5] });
-render.material_override("gunlok_mk2", null);
-render.material_override("gunlok_mk2");
-const overrides: string = render.material_overrides;
-render.clear_material_overrides();
+render.material.override("bitmaps\water.rim", { tint: [0.2, 0.4, 1, 0.5] });
+render.material.override("gunlok_mk2", null);
+render.material.override("gunlok_mk2");
+const overrides: MaterialOverridesState = render.material.overrides;
+// The two readbacks are structures now, not preformatted text. The text is still
+// there, on the measurement surface where a report belongs.
+const firstKey: string | undefined = overrides.entries[0]?.key;
+const firstMatch: string | undefined = overrides.entries[0]?.images[0]?.name;
+const bloomState: BloomState = render.bloom.layers;
+const bloomWhy: BloomStatus = bloomState.status;
+const layerSigma: number = bloomState.layers[0]!.sigma_px;
+const layerBlend: BloomBlend = bloomState.layers[0]!.blend;
+// @ts-expect-error - the report is text; the readback is not
+const notText: string = render.bloom.layers;
+render.material.clear();
 // @ts-expect-error - a tint is [r, g, b] or [r, g, b, a], not a packed number
-render.material_override("gunlok_mk2", { tint: 0xff00ff });
+render.material.override("gunlok_mk2", { tint: 0xff00ff });
 // @ts-expect-error - the readback is the host's
-render.material_overrides = "";
+render.material.overrides = "";
 
-render.chrome_scale = 1.0;
-render.chrome_blur = 4.0;
-render.chrome_texgen = false;
+render.lighting_map.chrome_scale = 1.0;
+render.lighting_map.chrome_blur = 4.0;
+render.lighting_map.chrome_texgen = false;
 // @ts-expect-error - texgen is a choice between two coordinates, not a blend
-render.chrome_texgen = 0.5;
+render.lighting_map.chrome_texgen = 0.5;
+
+// --- actor identity is the object, everywhere -------------------------------
+//
+// One rule, and these are what pin it: an actor is passed as the wrapper and
+// never as an id or a token name. The id form is the dangerous one to leave
+// working, because `JS_ToInt32` on an object yields 0 rather than throwing - so
+// a member that accepted an id silently retargeted actor 0 when handed the
+// object it looked like it wanted.
+
+const target = actors["hark"]!;
+someone.set_target(target);
+someone.set_target(target, 0);
+// @ts-expect-error - an id is not an actor
+someone.set_target(12);
+// @ts-expect-error - nor is a token name
+someone.set_target("hark");
+
+game.selected_actor = target;
+game.selected_actor = null;
+// @ts-expect-error - the setter takes what the getter returns
+game.selected_actor = 12;
+
+camera.track(target);
+camera.center_on(target);
+// @ts-expect-error - command-backed members take the object too
+camera.track(12);
+
+// The command-backed namespaces are the ones that used to speak names.
+units.set_ai(target, "turret");
+// @ts-expect-error - a name is not an actor
+units.set_ai("hark", "turret");
+// @ts-expect-error - and neither is an id
+units.give_control(12, 2);
+// @ts-expect-error - set_activity acts on game.selected_actor and takes no actor
+units.set_activity(target, "PATROL");
+// @ts-expect-error - set_scale acts on game.actor_under_cursor and takes no actor
+units.set_scale(2, target);
+
+// A trigger watches actors, not names.
+const armed = triggers.create({
+  kind: triggers.kind.death,
+  targets: [target],
+  script: { kind: "down" },
+});
+const stillThere: boolean = armed.valid;
+const armedKind: number = armed.kind;
+const wasRemoved: boolean = armed.remove();
+// @ts-expect-error - a target is an actor, not a token name
+triggers.create({ kind: triggers.kind.death, targets: ["hark"] });
+// @ts-expect-error - the handle is the host's; there is nothing to assign
+armed.valid = true;
+
+triggers.remove_shot({ x: 1, y: 2, z: 3 });
+// @ts-expect-error - remove_shot matches by position, not by name
+triggers.remove_shot("shot_a");
+
+// A role reaches a command as the object as well, since these resolve a role by
+// name and a role reliably has one.
+inventory.give(target, roles["plasmagnum"]!);
+inventory.give(target, "plasmagnum");
+// @ts-expect-error - the recipient is an actor, so a role is not interchangeable
+inventory.give(roles["gunlok"]!, "plasmagnum");
+
+// An owner is an actor too.
+roles["gunlok"]!.spawn(0, { x: 0, y: 0, z: 0 }, null, target);
+// @ts-expect-error - not an id
+roles["gunlok"]!.spawn(0, { x: 0, y: 0, z: 0 }, null, 12);
+
+// --- render is exactly typed; render.debug is the loose half -----------------
+//
+// The whole point of the split. `Render` used to carry `[key: string]: any`,
+// which meant a misspelled knob type-checked and silently did nothing - for all
+// 135 members, not just the undeclared ones. The index signature now lives on
+// `RenderDebug` alone, where a member genuinely comes and goes with whatever is
+// being measured.
+
+render.hdr.enabled = true;
+render.sun_shadow.softness = 0.02;
+render.hdr.tonemap = "agx";
+// @ts-expect-error - THE case this split exists for: a typo used to be silent
+render.shadow_softnes = 0.02;
+// @ts-expect-error - and so did a knob that never existed
+render.definitely_not_a_knob = 1;
+// @ts-expect-error - a tonemap operator is one of six names, not any string
+render.hdr.tonemap = "filmick";
+
+// The bisects and the probes moved, and reaching for the old spelling is an error
+// rather than an `any`.
+// @ts-expect-error - a measurement knob, so it is on render.debug
+render.draw_hide = "12";
+// @ts-expect-error - likewise the A/B composite, which reads back derived
+render.stock = true;
+// @ts-expect-error - and the read-only reports
+const movedReport: string = render.vulkan_report;
+
+render.debug.draw_hide = "12";
+render.debug.stock = true;
+const debugReport: string = render.debug.vulkan_report;
+// Undeclared by design: the investigation surface is loose on purpose.
+render.debug.whatever_the_next_measurement_needs = 1;
+
+// The three knobs that were reachable only through the old index signature are
+// declared now, so they are checked like everything else.
+render.dynamic_shadow.enabled = true;
+render.dynamic_shadow.bias = 1.5;
+render.local_light.shadow_taps = 4;
+// @ts-expect-error - a count, not a switch
+render.local_light.shadow_taps = true;
+
+// --- the families are sub-objects --------------------------------------------
+//
+// Ten of the group names were themselves knobs - `render.ao` was the switch - so
+// each group's switch is `enabled` now, which is what lets a family and its
+// switch share a name.
+render.ao.enabled = true;
+render.ao.radius = 2.5;
+render.tess.enabled = false;
+render.tess.pn_strength = 0.5;
+render.lighting_map.chrome_blur = 4;
+render.material.clear();
+// The four with no family stayed put.
+render.msaa = 4;
+render.specular = true;
+// @ts-expect-error - the flat spellings are gone
+render.ao_radius = 2.5;
+// @ts-expect-error - including the switch that used to be the family's root
+render.ao = true;
+// @ts-expect-error - a group is the host's; there is nothing to assign
+render.ao = {};
+
+// The key types are generic over the group now, because the namespace is nested.
+const boolKey: RenderBoolKey<Render["ao"]> = "enabled";
+const numberKey: RenderNumberKey<Render["sun_shadow"]> = "softness";
+const stringKey: RenderStringKey<Render["hdr"]> = "tonemap";
+// @ts-expect-error - `enabled` is a boolean, so it is not a number key
+const wrongKind: RenderNumberKey<Render["ao"]> = "enabled";
+// @ts-expect-error - and a knob from another group is not a key of this one
+const wrongGroup: RenderBoolKey<Render["ao"]> = "soft_blur";
+
+// --- one failure convention --------------------------------------------------
+//
+// Failure throws; a boolean return means a *question was answered*. The two used
+// to be indistinguishable - `levels.start()` returning false meant "did not
+// start", `actor.damage()` returning false means "did not land", and nothing in
+// the surface said which kind you were holding.
+levels.start(arena);
+settings.save();
+make.ammo({ ammo_type: "flares" });
+// @ts-expect-error - failure throws, so there is nothing to test
+if (levels.start(arena)) {
+}
+// @ts-expect-error - likewise
+const saved: boolean = settings.save();
+
+// These stay boolean, because each answers a question rather than reporting a
+// failure.
+const landed: boolean = someone.damage(10);
+const wasPresent: boolean = settings.remove("mymod.stale");
+const wasThere: boolean = mods.exists("Graphics\Bitmaps\Main Menu 01.RIM");
+
+// --- namespace boundaries ----------------------------------------------------
+//
+// `screen` is presentation. Session control is `game`; the level list is
+// `levels`. Every one of these used to be on `screen` because it happens to be a
+// console command.
+game.toggle_pause();
+game.set_speed(1);
+game.say("on my way");
+game.quit();
+levels.next();
+levels.add_file("level02.gls", "level02.gcs");
+// @ts-expect-error - moved to game
+screen.toggle_pause();
+// @ts-expect-error - moved to levels
+screen.next_level();
+// @ts-expect-error - it was a second name for levels.quit()
+screen.main_menu();
+
+// --- a vector is {x, y, z}, and an array is not one --------------------------
+camera.position = { x: 1, y: 2, z: 3 };
+camera.position = { y: 2 }; // a partial update is deliberate
+// @ts-expect-error - and this used to be a silent no-op at runtime
+camera.position = [1, 2, 3];
+
+// --- console severity --------------------------------------------------------
+gameConsole.level = "warn";
+gameConsole.warn("this still shows");
+gameConsole.debug("this does not");
+// @ts-expect-error - not one of the five
+gameConsole.level = "verbose";
+
+// --- objectives.add is typed from the handler --------------------------------
+objectives.add(0, "primary", 1, 2, 3);
+// @ts-expect-error - the priority is one of three words
+objectives.add(0, "urgent", 1, 2, 3);
+// @ts-expect-error - and the -1 sentinel is the binding's business, not a parameter
+objectives.add(0, "primary", 1, -1, 2, 3);
+
+// --- the unexplained internals are gone --------------------------------------
+// @ts-expect-error - a count of hierarchy nodes in an unexplained slot range,
+// which no script could act on
+const nodes: number = roles[0]!.num_hier_nodes_26_30;
+// Actor and Role agree on the spelling now.
+const actorShields: number = someone.shields;
+const roleShields: number = roles[0]!.shields;

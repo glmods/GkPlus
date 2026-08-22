@@ -300,7 +300,7 @@ with `ALPHABLENDENABLE`, `SRCBLEND`, `DESTBLEND`, `ZENABLE`, `ZWRITEENABLE`,
 built from the shadow state, so it exists under `GKPLUS_RENDERER=d3d8` as well —
 **no Vulkan renderer is needed for any of this.**
 
-`render.frame_draws()` holds one frame, so a single dump is one camera's worth of
+`render.debug.frame_draws()` holds one frame, so a single dump is one camera's worth of
 draws. `utils/rendertest/harvest-draws.ps1` merges every frame into a running
 per-texture map **inside the game** and brings back only the totals;
 `gkpbr.cli observed --from <dump>` folds that into the checked-in
@@ -758,7 +758,7 @@ asset in every later session and the game looks *fine* — which is the failure 
 6655629 spent a session chasing, and why this install still has a leftover
 `rimutil-body-test` mod for someone to trip over.
 
-### Why a mod and not `render.material_override`
+### Why a mod and not `render.material.override`
 
 The override was the obvious candidate and it cannot do this. It re-points every draw
 sampling one **loaded** image at another **loaded** image, keyed on a case-insensitive
@@ -789,7 +789,7 @@ first attempt used `ground/city ruins ground 1_a.rim`, which the profile says is
 drawn 134,396 times over the whole run and which the settled frame's own draw list
 confirms is on screen — 7 draws, 148 primitives. It moved **234 pixels**. Draw
 counts are not screen area, primitive counts are not either, and picking the target
-off the profile alone wasted a run. `render.frame_draws()` at the rest position is
+off the profile alone wasted a run. `render.debug.frame_draws()` at the rest position is
 what to read, and even that only ranks candidates.)
 
 | what was served | what was on screen |

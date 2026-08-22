@@ -332,8 +332,8 @@ variance visible at all: `sneeker 512` drew 0.641 / 0.232 / 0.087.
 painted into them already, so a specular response is *added* to a painted one and no
 metallic map can subtract that — de-lighting would, and this tool has none. And the
 engine over-drives its lights, which is why `LightingMapParams::specular_scale`
-defaults to 0.25. If the result is still too hot in game, `render.specular_scale` and
-`render.specular_from_diffuse` are live knobs over the REPL and cost nothing to sweep.
+defaults to 0.25. If the result is still too hot in game, `render.lighting_map.specular_scale` and
+`render.lighting_map.specular_from_diffuse` are live knobs over the REPL and cost nothing to sweep.
 
 ## gpt-image-2 returns a relief *render*, not a height field
 

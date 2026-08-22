@@ -13,6 +13,7 @@
 #include "Core.h"
 #include "D3D8Capture.h"
 #include "GUI.h"
+#include "RenderSettings.h"
 #include "VkRenderer.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd,
@@ -280,6 +281,12 @@ void RunOverlayDrawCallback() {
 }
 
 void RunFrameCallback() {
+  // Ahead of the script callback and outside the null check, because it is not
+  // the script host's business: the Advanced Graphics page can change a renderer
+  // knob with no script running at all, and `SetFrameCallback` is only installed
+  // once a JS context exists. Comparing ~70 knobs against the store costs
+  // nothing next to a frame, and writes only when one differs.
+  render_settings::SyncToSettings();
   if (Frame) {
     Frame();
   }

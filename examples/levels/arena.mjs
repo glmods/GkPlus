@@ -16,8 +16,12 @@
 // What is *not* replaced is the .rif. Geometry still comes out of the game's own
 // asset files; this module supplies everything the two script files used to.
 
-import { console, game, triggers } from "gk";
+import { actors, console, game, triggers } from "gk";
 import { roles as bugRoles } from "../headers/bug.mjs";
+
+/** The death trigger armed in setup, kept so it can be disarmed.
+ *  @type {import("gk").Trigger | null} */
+let unitLostTrigger = null;
 
 /** @type {import("gk").LevelMap} */
 export const map = {
@@ -151,11 +155,20 @@ export function setup(level) {
   // The object is JSON-encoded, travels the engine's own script queue - so every
   // machine in a multiplayer game gets it - and arrives at message_received
   // below. A string in that field would still mean "run this .gcs".
-  triggers.create({
-    kind: triggers.kind.death,
-    targets: ["elint"],
-    script: { kind: "unit_lost", who: "elint" },
-  });
+  //
+  // `targets` takes the actors themselves. The engine's target list holds names,
+  // so an actor no token names cannot go in one - which is why this reads the
+  // placed actor out of the collection rather than using something spawned.
+  const elint = actors["elint"];
+  if (elint) {
+    // The handle is worth keeping: a trigger is the only scheduling that
+    // survives a save, and this is the only way to disarm one early.
+    unitLostTrigger = triggers.create({
+      kind: triggers.kind.death,
+      targets: [elint],
+      script: { kind: "unit_lost", who: "elint" },
+    });
+  }
 
   console.log(`${level.title}: setup done`);
 }
@@ -187,6 +200,13 @@ export function message_received(msg, level) {
     case "mission_failed":
       // Not guarded: this only shows a screen locally, and every machine should.
       console.execute("stats screen");
+      // Nothing more to watch for. A death trigger fires once and the engine
+      // destroys it, so this is usually already false - which is exactly why
+      // `remove` reports rather than throwing.
+      if (unitLostTrigger) {
+        unitLostTrigger.remove();
+        unitLostTrigger = null;
+      }
       break;
 
     default:

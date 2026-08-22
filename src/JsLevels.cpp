@@ -860,7 +860,15 @@ JSValue QueueStart(JSContext *ctx, const LevelStartRequest &request) {
   if (const char *refusal = LevelStartRefusal(request)) {
     return JS_ThrowTypeError(ctx, "%s", refusal);
   }
-  return JS_NewBool(ctx, QueueLevelStart(request));
+  // Throws rather than returning false. The two ways this fails are worth telling
+  // apart and neither is something a script should carry on past: a start is
+  // already pending, or the target could not be resolved.
+  if (!QueueLevelStart(request)) {
+    return JS_ThrowInternalError(
+        ctx, "could not start the level - a start is already pending, or the "
+             "target does not name a level (levels.start_pending says which)");
+  }
+  return JS_UNDEFINED;
 }
 
 JSValue LevelsStart(JSContext *ctx, JSValueConst, int argc,
@@ -895,7 +903,12 @@ JSValue LevelStart(JSContext *ctx, JSValueConst self, int argc,
 }
 
 JSValue LevelsQuit(JSContext *ctx, JSValueConst, int, JSValueConst *) {
-  return JS_NewBool(ctx, QueueReturnToMainMenu());
+  if (!QueueReturnToMainMenu()) {
+    return JS_ThrowInternalError(
+        ctx, "could not return to the main menu - a level start or quit is "
+             "already pending");
+  }
+  return JS_UNDEFINED;
 }
 
 JSValue GetPending(JSContext *ctx, JSValueConst) {
@@ -933,6 +946,30 @@ JSValue GetStartable(JSContext *ctx, JSValueConst) {
   return out;
 }
 
+// --- the shipped level list --------------------------------------------------
+//
+// Moved here from `screen`, where they sat because they are console commands.
+// Adding a level to Choose Level and advancing to the next one belong beside
+// `levels.add` and `levels.start`, not beside the briefing text and the FMVs.
+//
+// `add_file` is the `.gls` counterpart of `add`: the same list, but naming a pair
+// of files on disk instead of a module. Both end up in `startable`.
+
+JSValue LevelsAddFile(JSContext *ctx, JSValueConst, int argc,
+                      JSValueConst *argv) {
+  return RunConsoleCommand(ctx, "ADD MISSION", argc, argv);
+}
+
+JSValue LevelsAddMultiplayerFile(JSContext *ctx, JSValueConst, int argc,
+                                 JSValueConst *argv) {
+  return RunConsoleCommand(ctx, "ADD MULTI MISSION", argc, argv);
+}
+
+// Advances to the next level in the campaign order, as finishing one does.
+JSValue LevelsNext(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+  return RunConsoleCommand(ctx, "NEXT LEVEL", argc, argv);
+}
+
 const JSCFunctionListEntry LevelsProps[] = {
     JS_CFUNC_DEF("add", 2, LevelsAdd),
     JS_CGETSET_DEF("current", GetCurrent, nullptr),
@@ -940,6 +977,9 @@ const JSCFunctionListEntry LevelsProps[] = {
     JS_CFUNC_DEF("quit", 0, LevelsQuit),
     JS_CGETSET_DEF("startable", GetStartable, nullptr),
     JS_CGETSET_DEF("start_pending", GetPending, nullptr),
+    JS_CFUNC_DEF("add_file", 2, LevelsAddFile),
+    JS_CFUNC_DEF("add_multiplayer_file", 2, LevelsAddMultiplayerFile),
+    JS_CFUNC_DEF("next", 0, LevelsNext),
 };
 
 const CollectionOps LevelsOps = {

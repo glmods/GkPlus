@@ -26,14 +26,19 @@ JSValue ConsolePrint(JSContext *ctx, JSValueConst, int argc,
   return JS_UNDEFINED;
 }
 
-// log/info/warn/error/debug, all the same thing. This is the host's own
-// logging - it was a global `console` until there was no reason to have two
-// console objects in scope. Unlike print() it takes any number of values of any
-// type, joins them with spaces, and goes through js::Log, which also writes to
+// log/info/warn/error/debug. This is the host's own logging - it was a global
+// `console` until there was no reason to have two console objects in scope.
+// Unlike print() it takes any number of values of any type, joins them with
+// spaces, and goes through js::LogAt, which also writes to
 // the debugger and feeds the game console one line at a time (it keeps one list
 // entry per line and does not wrap on '\n').
-JSValue ConsoleWrite(JSContext *ctx, JSValueConst, int argc,
-                     JSValueConst *argv) {
+//
+// The five used to be **the same function with no severity**, so nothing could
+// tell an error from a trace: not a log filter, not a panel, not the person
+// reading the console. They now carry a level as the entry's magic, `warn` and
+// `error` are marked on screen, and `console.level` silences anything below it.
+JSValue ConsoleWrite(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv,
+                     int magic) {
   std::string line;
   for (int i = 0; i < argc; ++i) {
     const char *text = JS_ToCString(ctx, argv[i]);
@@ -46,7 +51,30 @@ JSValue ConsoleWrite(JSContext *ctx, JSValueConst, int argc,
     line += text;
     JS_FreeCString(ctx, text);
   }
-  Log(line.c_str());
+  LogAt(static_cast<Severity>(magic), line.c_str());
+  return JS_UNDEFINED;
+}
+
+// The quietest level that still reaches the console, by name. Assigning an
+// unknown one throws rather than picking a neighbour: the failure mode of
+// guessing here is a script that has silently stopped reporting.
+JSValue GetLogLevel(JSContext *ctx, JSValueConst) {
+  return JS_NewString(ctx, SeverityName(LogLevel()));
+}
+
+JSValue SetLogLevelValue(JSContext *ctx, JSValueConst, JSValueConst v) {
+  const char *name = JS_ToCString(ctx, v);
+  if (!name) {
+    return JS_EXCEPTION;
+  }
+  Severity level = Severity::Debug;
+  const bool known = SeverityFromName(name, &level);
+  JS_FreeCString(ctx, name);
+  if (!known) {
+    return JS_ThrowRangeError(
+        ctx, "console.level must be debug, log, info, warn or error");
+  }
+  SetLogLevel(level);
   return JS_UNDEFINED;
 }
 
@@ -105,8 +133,9 @@ GK_CONSOLE_LOCALIZED(QueueSize, 10007)
 // them: each line is appended to the console's command queue, which pops one
 // per frame, so the effects land over the following frames rather than here.
 // The path is resolved by the game against its *current* directory, which moves
-// during a level load. Returns whether the file opened; a missing one is false
-// rather than an exception, which is how the game treats it.
+// during a level load. A file that will not open throws: the engine treats that
+// as a silent nothing, and so did this until the return value nobody read was
+// replaced.
 JSValue ExecuteFile(JSContext *ctx, JSValueConst, int argc,
                     JSValueConst *argv) {
   if (argc < 1) {
@@ -116,9 +145,20 @@ JSValue ExecuteFile(JSContext *ctx, JSValueConst, int argc,
   if (!path) {
     return JS_EXCEPTION;
   }
-  bool opened = ExecuteCommandFile(path);
+  const bool opened = ExecuteCommandFile(path);
+  // Throws rather than returning false. A file that could not be opened is the
+  // one failure this can have, and a script that ignored the old boolean carried
+  // on as though its commands had been queued.
+  if (!opened) {
+    JSValue error = JS_ThrowReferenceError(
+        ctx, "could not open the console script '%s' - the path is relative to "
+             "the game's Scripts directory",
+        path);
+    JS_FreeCString(ctx, path);
+    return error;
+  }
   JS_FreeCString(ctx, path);
-  return JS_NewBool(ctx, opened);
+  return JS_UNDEFINED;
 }
 
 // Both colours are ARGB (0xAARRGGBB) and there are no setters in the native API:
@@ -234,18 +274,20 @@ JSValue GetCommands(JSContext *ctx, JSValueConst) {
 // The whole console surface, host logging included - there is no global
 // `console`, so this object is the only one a script sees.
 const JSCFunctionListEntry ConsoleProps[] = {
+    JS_CGETSET_DEF2("level", GetLogLevel, SetLogLevelValue,
+                    JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE),
     JS_CFUNC_DEF2("print", 1, ConsolePrint,
                   JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE),
-    JS_CFUNC_DEF2("log", 1, ConsoleWrite,
-                  JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE),
-    JS_CFUNC_DEF2("info", 1, ConsoleWrite,
-                  JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE),
-    JS_CFUNC_DEF2("warn", 1, ConsoleWrite,
-                  JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE),
-    JS_CFUNC_DEF2("error", 1, ConsoleWrite,
-                  JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE),
-    JS_CFUNC_DEF2("debug", 1, ConsoleWrite,
-                  JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE),
+    JS_CFUNC_MAGIC_DEF("log", 1, ConsoleWrite,
+                       static_cast<int>(Severity::Log)),
+    JS_CFUNC_MAGIC_DEF("info", 1, ConsoleWrite,
+                       static_cast<int>(Severity::Info)),
+    JS_CFUNC_MAGIC_DEF("warn", 1, ConsoleWrite,
+                       static_cast<int>(Severity::Warn)),
+    JS_CFUNC_MAGIC_DEF("error", 1, ConsoleWrite,
+                       static_cast<int>(Severity::Error)),
+    JS_CFUNC_MAGIC_DEF("debug", 1, ConsoleWrite,
+                       static_cast<int>(Severity::Debug)),
     JS_CFUNC_DEF2("execute", 1, Execute,
                   JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE),
     JS_CFUNC_DEF2("execute_file", 1, ExecuteFile,

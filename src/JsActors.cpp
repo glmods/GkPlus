@@ -581,17 +581,22 @@ JSValue ActorSetTarget(JSContext *ctx, JSValueConst self, int argc,
     return JS_EXCEPTION;
   }
   if (argc < 1) {
-    return JS_ThrowTypeError(ctx, "set_target(id, mode) expects an actor id");
+    return JS_ThrowTypeError(ctx, "set_target(actor, mode) expects an actor");
   }
-  int32_t target = 0;
-  int32_t mode = 0;
-  if (JS_ToInt32(ctx, &target, argv[0])) {
+  // An actor, not an id - matching attack_target, which always took one. Slot 78
+  // wants the id, so it is read off the actor here rather than being the thing a
+  // script has to hold: `JS_ToInt32` on an actor wrapper yields 0 without
+  // throwing, so the id-taking version silently retargeted actor 0 whenever it
+  // was handed the object it looked like it wanted.
+  Actor *target = ActorFromValue(ctx, argv[0]);
+  if (!target) {
     return JS_EXCEPTION;
   }
+  int32_t mode = 0;
   if (argc > 1 && JS_ToInt32(ctx, &mode, argv[1])) {
     return JS_EXCEPTION;
   }
-  a->SetTarget(target, mode); // slot 78
+  a->SetTarget(target->id, mode); // slot 78
   return JS_UNDEFINED;
 }
 
@@ -937,7 +942,7 @@ const JSCFunctionListEntry ActorProto[] = {
                          FlagPendingOrders),
     JS_CGETSET_MAGIC_DEF("health", GetActorStat, SetActorStat, StatHealth),
     JS_CGETSET_MAGIC_DEF("armor", GetActorStat, SetActorStat, StatArmor),
-    JS_CGETSET_MAGIC_DEF("shield", GetActorStat, SetActorStat, StatShield),
+    JS_CGETSET_MAGIC_DEF("shields", GetActorStat, SetActorStat, StatShield),
     JS_CGETSET_MAGIC_DEF("strength_ratio", GetActorStat, nullptr,
                          StatStrengthRatio),
     JS_CFUNC_DEF("damage", 2, ActorDamage),
@@ -1123,6 +1128,61 @@ const CollectionOps ActorsOps = {
 };
 
 } // namespace
+
+// The one way an actor crosses into a binding. Every member that names an actor
+// takes the object and comes through here, so nothing in the JS surface spells
+// an actor as a bare id or a token name.
+//
+// It re-derives through `Resolve`, so it inherits the whole safety property: a
+// destroyed actor throws instead of dereferencing a recycled pool page, and an
+// id that was reused for a different object is refused. Its predecessor was
+// `JS_ToInt32` on whatever the caller passed, which for an object goes
+// ToNumber -> NaN -> **0** without throwing - so passing an actor where an id was
+// wanted silently retargeted actor 0.
+Actor *ActorFromValue(JSContext *ctx, JSValueConst v) {
+  if (!IsActorValue(v)) {
+    JS_ThrowTypeError(ctx, "expected an actor");
+    return nullptr;
+  }
+  return Resolve(ctx, v);
+}
+
+// The type test on its own, without the resolve and without throwing. The
+// console-argument formatter needs it as a *test*, because an Actor wrapper is
+// also an ordinary object and would otherwise fall into the {x, y, z} case and
+// silently append "0 0 0".
+bool IsActorValue(JSValueConst v) {
+  JSClassID id = 0;
+  JS_GetAnyOpaque(v, &id);
+  return IsActorClassId(id);
+}
+
+// The actor's token name, for the handful of places where the *engine's own data
+// model* stores a name rather than an id - a trigger's target list is the only
+// one left in this surface, and it keeps `char *` copies that EvaluateTriggers
+// matches by string.
+//
+// Throws when no token names the actor, which is the honest answer: a
+// script-spawned actor has no token, so the engine cannot express it as a
+// trigger target at all. Nothing here mints one - a token is saved into the
+// savegame and replicated to nobody, so inventing one would leave a permanent
+// artefact behind to work around a limit the engine really has.
+bool ActorTokenName(JSContext *ctx, Actor *actor, std::string *out) {
+  Tokens *tokens = GetTokensTable();
+  char *name = nullptr;
+  if (!tokens || !FindTokenWithValue(tokens, static_cast<float>(actor->id),
+                                     &name) ||
+      !name) {
+    JS_ThrowTypeError(ctx,
+                      "actor %d has no name: no token holds its id, and the "
+                      "engine stores this by name rather than by id. Only an "
+                      "actor placed by the level can be used here.",
+                      actor->id);
+    return false;
+  }
+  *out = name;
+  return true;
+}
 
 JSValue NewActorWrapper(JSContext *ctx, Actor *actor) {
   // The RTTI ladder runs once, here, and fixes the prototype for the wrapper's

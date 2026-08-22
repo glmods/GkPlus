@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <type_traits>
 
 namespace gk {
@@ -1719,8 +1720,49 @@ bool Bloom();
 void SetBloomLayer(uint32_t index, const BloomLayer &layer);
 BloomLayer BloomLayerAt(uint32_t index);
 
-// The three layers with the size each is actually running at, for `render.bloom_layers` and the
-// report. Includes the sizes because a radius is only interpretable next to them.
+// Why the pass is or is not contributing. Four states rather than two, because
+// they are four different things a caller has to be able to tell apart, and
+// `Bloom()` reads back as REQUESTED (exactly as `Hdr()` does) so the switch alone
+// cannot distinguish them.
+enum class BloomStatus : std::uint32_t {
+  Off,         // the switch is off
+  Unavailable, // the pass did not build on this device
+  Inert,       // needs the float target - an 8-bit one has no over-range to threshold
+  Idle,        // on and able, but every layer's blend is `off`
+  Active,
+};
+
+// One layer's knobs alongside what they came out as. The derived half is the
+// point: a radius is a fraction of frame *height*, so 0.006 is a different number
+// of texels in each of the three layers, and whether the kernel hit its cap is
+// not computable from the knob at all.
+struct BloomLayerState {
+  BloomLayer layer;
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+  float sigma_px = 0.0f;   // the Gaussian's sigma in THIS layer's texels
+  std::uint32_t taps = 0;  // per side
+  bool capped = false;     // taps hit kBloomMaxTaps, so the radius is being refused
+};
+
+struct BloomState {
+  bool requested = false;
+  BloomStatus status = BloomStatus::Off;
+  // 0 until the pass has run once. The extract's tap count follows the
+  // downsample ratio, so it moves with the resolution rather than being fixed.
+  std::uint32_t source_height = 0;
+  std::uint32_t extract_taps = 0;
+  BloomLayerState layers[kBloomLayers];
+};
+
+// The lowercase name of a status, for the readback and the report.
+const char *BloomStatusName(BloomStatus status);
+
+// The structured form, which `render.bloom_layers` hands to script. DescribeBloom
+// below formats exactly this, so the two cannot drift.
+BloomState BloomStateNow();
+
+// The three layers with the size each is actually running at, as text.
 std::string DescribeBloom();
 
 // Whether the pass is up. False on a device that could not build it, where the knob reads back as
@@ -2050,9 +2092,41 @@ void SetMaterialOverride(const std::string &name, const MaterialOverride &over);
 // key is a string the caller chose, so removing it should not depend on what it matched.
 bool RemoveMaterialOverride(const std::string &name);
 void ClearMaterialOverrides();
+// One live image a key matched.
+struct MaterialOverrideImage {
+  std::uint32_t index = 0;
+  std::string name;
+  // False when an earlier key already claimed this image. First key wins, so a
+  // later broader one cannot silently take over - but it can look like it did
+  // from the call site, which is why this is reported rather than filtered.
+  bool owned = false;
+};
+
+struct MaterialOverrideState {
+  std::string key;
+  std::string texture; // empty: no replacement asked for
+  // Whether `texture` names a live image. A key that resolves to nothing draws
+  // the original, which is indistinguishable from the override not being
+  // registered unless it is reported.
+  bool texture_resolved = false;
+  std::uint32_t texture_image = 0;
+  float tint[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+  bool hide = false;
+  std::vector<MaterialOverrideImage> images;
+};
+
+struct MaterialOverridesState {
+  std::vector<MaterialOverrideState> entries;
+  std::uint64_t overridden_draws = 0;
+  std::uint64_t hidden_draws = 0;
+};
+
 // Every registered override, with the live images its key currently resolves to and what each
 // resolves *to*. The readback matters more here than for a diagnostic: a substring key can match
 // nothing, or match more than the author meant, and neither shows up as an error.
+MaterialOverridesState MaterialOverridesNow();
+
+// The same, as text. Formats exactly what the call above returns.
 std::string DescribeMaterialOverrides();
 
 uint64_t DepthImageView();

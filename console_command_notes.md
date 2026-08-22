@@ -332,7 +332,7 @@ re-classify; do not hand-edit a row without re-running the check.
 | `REMOVE ITEM` | `inventory.remove_item(role)` |
 | `REMOVE LIGHT CYLINDER` | `light.remove_cylinders()` |
 | `REMOVE PULSE RINGS` | `fx.remove_pulse_rings(endpoint)` |
-| `REMOVE TRIGGER` | `units.remove_trigger(...)` |
+| `REMOVE TRIGGER` | `triggers.remove_shot(position)` |
 | `REMOVEBB` | `units.remove_bounding_box(actor)` |
 | `REPTXT` | `objectives.repeat_text(n)` |
 | `RESPAWN HEAP` | `inventory.respawn_heap(...)` |
@@ -345,7 +345,7 @@ re-classify; do not hand-edit a row without re-running the check.
 | `SAY` | `screen.say(message)` (localized name; sends via a native) |
 | `SEA` | `fx.sea(...)` |
 | `SELECT` | `game.selected_actor = id` |
-| `SET ACTIVITY` | `units.set_activity(actor, activity)` |
+| `SET ACTIVITY` | `units.set_activity(activity)` — acts on `game.selected_actor`; see §5 |
 | `SET CAMERA` | `camera.position` |
 | `SET CAMERA FOCUS` | `camera.focus = pos` |
 | `SET CAMERA ORI` | `camera.orientation` |
@@ -359,7 +359,7 @@ re-classify; do not hand-edit a row without re-running the check.
 | `SET REQUIRED ORI` | `camera.turn_to(y, r, p, secs)` |
 | `SET REQUIRED POS` | `camera.move_to(where, secs)` |
 | `SET REQUIRED POSDIST` | `camera.move_and_zoom_to(...)` |
-| `SET SCALE` | `units.set_scale(scale, actor?)` |
+| `SET SCALE` | `units.set_scale(scale)` — acts on `game.actor_under_cursor`; see §5 |
 | `SET SPEED` | `tracks.set_speed(scale, ...names)` |
 | `SET TRACK` | `tracks.set(...)` |
 | `SET TRAINING AREA` | `game.training_area` |
@@ -570,8 +570,15 @@ Three clusters are gaps for their own reasons rather than that one:
   exists, and `Actor::team_id` sits at +0xbc, but the wrapper's surface is deliberately the vtable
   rather than the fields, so reading it needs either a vtable getter or a documented exception the
   way `id` and `name` already are.
-- **`REMOVE TRIGGER`** has a native (`RemoveTrigger` @ 0x0050c400) and no binding, so `triggers`
-  can create but not destroy.
+- **`REMOVE TRIGGER` is bound now, and it reaches much less than the name suggests.**
+  `CommandRemoveTrigger` @ 0x00444500 parses one word, requires it to be exactly `SHOT`
+  (`__mbsicmp`, so anything else does nothing at all), then matches a `TRIGGER_SHOT` trigger by
+  comparing the parsed position against its `coords[1]` and `coords[2]`. So it removes shot
+  triggers by position and nothing else, which is what `triggers.remove_shot(position)` says. The
+  old `units.remove_trigger(...args)` was typed as arbitrary varargs and could never have been
+  anything but that one call. Anything GkPlus created has a handle instead —
+  `trigger.remove()`, over the native `RemoveTriggerFromGlobalList` @ 0x0050c400, which is exact
+  and cannot remove somebody else's trigger by coincidence.
 
 `console.execute` remains the escape hatch for all 178 — with the caveat from §1 that fifteen
 names are localized, so anything reaching for `EXIT`, `QUIT`, `MENU`, `SAY`, `HELP`, `TIME`,
@@ -845,6 +852,42 @@ from before the trigger fired and the trigger is restored and fires again, but r
 already-settled promise is a no-op — the awaiting code never runs a second time. Keeping the
 progress in a token instead does not have that failure mode.
 
+
+### 5.1 Two bindings whose arguments did not match their handler
+
+Both found by reading the handlers while converting the surface to take `Actor` objects, and both
+were silent.
+
+- **`units.set_activity(actor, activity)` never worked.** `CommandSetActivity` @ 0x00445940 parses
+  a **single** word — the activity keyword — and operates on the global `selected_actor_id`,
+  printing `GL_ERROR_NO_ACTOR_SELECTED` when nothing is selected. The binding sent
+  `SET ACTIVITY <actor> <activity>`, so the handler read `<actor>` as the keyword, every
+  `__mbsicmp` against `GOTO`/`PATROL`/`STOP` failed, and the call did nothing. It is
+  `set_activity(activity)` now, with `game.selected_actor` as the way to choose the target.
+- **`units.set_scale`'s `actor` parameter was fictional.** `CommandSetScale` @ 0x00447370 parses
+  one float and applies it to `ActorUnderCursor`; the trailing word was read by nothing. It is
+  `set_scale(scale)` now, documented against `game.actor_under_cursor`.
+
+### 5.2 `ConsoleParseInt` is not an integer parser, and the decompiler hides both halves
+
+`ConsoleParseInt` @ 0x004d6770 has to be read as **disassembly**; its decompilation returns
+`extraout_EAX` on every path and states neither of the two things that matter.
+
+- A word that does not start with a digit falls through to `ConsoleParseWord` +
+  `GetTokenValue` @ 0x004d3910, so it accepts **a token name as readily as digits** — and since a
+  token naming an actor holds that actor's id, every `ConsoleParseInt`-based handler already took
+  an actor either way. That is what makes `src/ActorArg`'s one code path cover both handler groups.
+- A leading `-` does **not** disqualify a negative: the scan loop toggles a flag on each one and
+  `NEG EAX` / `CMOVZ` at 0x004d684b applies it on the way out.
+
+Reading only the decompiler suggested the opposite of the second point, which in turn made
+`CommandAddObjective`'s `iVar3 == -1` gate look unsatisfiable and the whole command dead. It is
+not: `ADD OBJECTIVE` takes
+`<team slot> <PRIMARY|SECONDARY|TERTIARY> <id> -1 <title> <body>`, where the fourth number is a
+hard-coded sentinel with no other accepted value. `objectives.add` writes it, so it is not a
+parameter — which is the whole reason that member is worth typing rather than leaving as the
+varargs passthrough it was. Both `add objective` lines in the shipped `.gcs` files are `rem`'d out
+and would not have worked: each puts a `2` where the -1 belongs.
 
 ## 5. Defects this inventory turned up
 

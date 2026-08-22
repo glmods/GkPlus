@@ -3,7 +3,7 @@
 #include "CustomMenu.h"
 #include "D3D8Capture.h"
 #include "Menu.h"
-#include "Settings.h"
+#include "RenderSettings.h"
 #include "VkContext.h"
 #include "VkDraw.h"
 #include "VkLighting.h"
@@ -42,23 +42,13 @@ bool AvailableWithTessellation(void *) {
   return VulkanIsDrawing() && vulkan::Caps().tessellation_shader;
 }
 
-// Whether a `GKPLUS_*` companion is set, which is what makes the stored value
-// stand aside. See Settings.h: an environment override is the instrument you
-// reach for when the setting you need to change is the one keeping the game from
-// starting, so it cannot lose to a file.
-bool EnvOverridden(const char *name) {
-  if (!name) {
-    return false;
-  }
-  return ::GetEnvironmentVariableA(name, nullptr, 0) != 0;
-}
-
 // --- The boolean rows -------------------------------------------------------
 
+// No `key` or `env`: which setting a row persists to, and which environment
+// variable outranks it, is src/RenderSettings.cpp's table now. A row is a label,
+// a knob and a visibility rule.
 struct BoolRow {
   const char *label;
-  const char *key; // under `core.render.`, named as the `render.*` knob is
-  const char *env; // the launch-time override that outranks the file, if any
   bool (*get)();
   void (*set)(bool);
   CustomMenuAvailable available;
@@ -67,39 +57,34 @@ struct BoolRow {
 // Non-const and at namespace scope: `&Rows[i]` is handed to the game side as the
 // item's `user` and is read on every click and every frame the page is up.
 BoolRow Rows[] = {
-    {"Tessellation", "core.render.tessellation", nullptr,
-     vulkan::TessellationEnabled, vulkan::SetTessellationEnabled,
+    {"Tessellation", vulkan::TessellationEnabled, vulkan::SetTessellationEnabled,
      AvailableWithTessellation},
-    {"Dynamic Shadows", "core.render.dynamic_shadows", nullptr,
-     vulkan::DynamicShadows, vulkan::SetDynamicShadows, AvailableUnderVulkan},
-    {"Sun Shadows", "core.render.sun_shadows", nullptr, vulkan::SunShadows,
+    {"Dynamic Shadows", vulkan::DynamicShadows, vulkan::SetDynamicShadows, AvailableUnderVulkan},
+    {"Sun Shadows", vulkan::SunShadows,
      vulkan::SetSunShadows, AvailableUnderVulkan},
-    {"Map Shadows", "core.render.map_shadows", nullptr, vulkan::MapShadows,
+    {"Map Shadows", vulkan::MapShadows,
      vulkan::SetMapShadows, AvailableUnderVulkan},
-    {"Ambient Occlusion", "core.render.ao", nullptr, vulkan::AmbientOcclusion,
+    {"Ambient Occlusion", vulkan::AmbientOcclusion,
      vulkan::SetAmbientOcclusion, AvailableUnderVulkan},
-    {"Per-Pixel Lighting", "core.render.per_pixel_lighting",
-     "GKPLUS_VK_PER_PIXEL_LIGHTING", vulkan::PerPixelLighting,
+    {"Per-Pixel Lighting", vulkan::PerPixelLighting,
      vulkan::SetPerPixelLighting, AvailableUnderVulkan},
-    {"Lighting Maps", "core.render.lighting_maps", nullptr, vulkan::LightingMaps,
+    {"Lighting Maps", vulkan::LightingMaps,
      vulkan::SetLightingMaps, AvailableUnderVulkan},
     // The float target and the tonemap pass. `Hdr()` reads back as REQUESTED rather
     // than as effective, which is what makes it safe to bind a toggle to directly -
     // see GetHdr in src/JsRender.cpp for why that differs from the antialiasing row
     // below, which has to read `MsaaWanted` to get the same property.
-    {"HDR", "core.render.hdr", "GKPLUS_VK_HDR", vulkan::Hdr, vulkan::SetHdr,
+    {"HDR", vulkan::Hdr, vulkan::SetHdr,
      AvailableUnderVulkan},
     // Bloom needs HDR and is inert without it, but the row stays visible either way - for the
     // reason the Tone Mapping row above does: a setting that vanishes when its companion is off is
     // harder to find than one that reads as inert. Only the master switch is here; the fifteen
     // per-layer numbers behind `render.bloom_layer` are a script and a panel's business, exactly as
     // `shadow_bias` and the AO radius are.
-    {"Bloom", "core.render.bloom", "GKPLUS_VK_BLOOM", vulkan::Bloom, vulkan::SetBloom,
+    {"Bloom", vulkan::Bloom, vulkan::SetBloom,
      AvailableUnderVulkan},
 };
 
-constexpr const char *MsaaKey = "core.render.msaa";
-constexpr const char *MsaaEnv = "GKPLUS_VK_MSAA";
 
 // --- Tone mapping -----------------------------------------------------------
 //
@@ -107,7 +92,6 @@ constexpr const char *MsaaEnv = "GKPLUS_VK_MSAA";
 // and the string table has no "Rolloff". Only meaningful with HDR on, but the row
 // is left visible either way - a setting that vanishes when its companion is off
 // is harder to find than one that reads as inert.
-constexpr const char *TonemapKey = "core.render.tonemap";
 
 const char *TonemapLabels[] = {"Clamp",  "Rolloff", "Reinhard",
                                "ACES",   "Filmic",  "AgX"};
@@ -119,10 +103,10 @@ void BoolClicked(CustomMenuItem *item, void *user) {
   // it took is not asserted here - the next refresh reads the knob back, so a
   // setting that declined to change shows what it actually is.
   row->set(item->value != 0);
-  // Stored as requested rather than as read back, for the same reason: a value
-  // the device refused this run may be the one wanted on a machine that can.
-  settings::SetBool(row->key, item->value != 0);
-  settings::Save();
+  // No settings write here. src/RenderSettings.cpp owns persistence for every
+  // renderer knob and picks the change up on the next frame, which is what stops
+  // this page and a script from having two different rules for the same knob -
+  // clicking HDR here used to persist while `render.hdr = true` did not.
 }
 
 void BoolRefresh(CustomMenuItem *item, void *user) {
@@ -168,8 +152,6 @@ void MsaaClicked(CustomMenuItem *item, void *user) {
     }
   }
   vulkan::SetMsaa(next);
-  settings::SetNumber(MsaaKey, next);
-  settings::Save();
   MsaaRefresh(item, user);
 }
 
@@ -181,8 +163,6 @@ void TonemapRefresh(CustomMenuItem *item, void *) {
 void TonemapClicked(CustomMenuItem *item, void *user) {
   const uint32_t next = (vulkan::Tonemap() + 1) % TonemapCount;
   vulkan::SetTonemap(next);
-  settings::SetNumber(TonemapKey, next);
-  settings::Save();
   TonemapRefresh(item, user);
 }
 
@@ -191,36 +171,11 @@ void OpenPage(CustomMenuItem *, void *) { GoToMenu(PageMenu, true); }
 } // namespace
 
 void ApplyStoredRenderSettings() {
-  static bool applied = false;
-  if (applied) {
-    return;
-  }
-  applied = true;
-
-  for (const BoolRow &row : Rows) {
-    if (EnvOverridden(row.env) || !settings::Has(row.key)) {
-      continue;
-    }
-    row.set(settings::GetBool(row.key, false));
-  }
-
-  if (settings::Has(TonemapKey)) {
-    const double op = settings::GetNumber(TonemapKey, 1.0);
-    // No env companion: `GKPLUS_VK_HDR` already covers the case this rule exists for
-    // (a setting that keeps the game from starting), and the operator cannot.
-    if (op >= 0.0 && op < static_cast<double>(TonemapCount)) {
-      vulkan::SetTonemap(static_cast<uint32_t>(op));
-    }
-  }
-
-  if (!EnvOverridden(MsaaEnv) && settings::Has(MsaaKey)) {
-    const double samples = settings::GetNumber(MsaaKey, 1.0);
-    // SetMsaa clamps to what the device offers, so a file naming a count this
-    // machine cannot do asks for the nearest one rather than being an error.
-    if (samples >= 1.0 && samples <= 64.0) {
-      vulkan::SetMsaa(static_cast<uint32_t>(samples));
-    }
-  }
+  // Kept as the entry point FileHookSystem calls, but the work is
+  // src/RenderSettings.cpp's: one table covers all 74 renderer settings rather
+  // than the eleven this page happens to expose, and the same table is what
+  // writes them back.
+  render_settings::ApplyStored();
 }
 
 void RegisterRenderMenu() {

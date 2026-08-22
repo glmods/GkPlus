@@ -36,6 +36,29 @@ JSValue NewMenusNamespace(JSContext *ctx);
 // on newlines, because the console draws one list entry per line.
 void Log(const char *text);
 
+// How loud a `console.*` line is. The five spellings used to be one function
+// with no severity at all, so nothing downstream - a panel, a log filter, the
+// REPL backchannel - could tell an error from a trace.
+//
+// It is an ordering, and `js::SetLogLevel` drops anything below the current one.
+// `Error` is deliberately last so "quieter" is "larger": a script can silence
+// its own tracing without silencing what went wrong.
+enum class Severity { Debug, Log, Info, Warn, Error };
+
+// Writes one line at `level`. Below the current threshold it does nothing.
+void LogAt(Severity level, const char *text);
+
+// The threshold, default `Severity::Debug` (everything). `console.level` is the
+// script-facing name.
+void SetLogLevel(Severity level);
+Severity LogLevel();
+
+// The lowercase name of a level, and the reverse. The reverse returns false for
+// an unknown name rather than guessing, so a typo in `console.level` raises
+// instead of silently going quiet.
+const char *SeverityName(Severity level);
+bool SeverityFromName(const char *name, Severity *out);
+
 // Reports (and clears) ctx's pending exception through Log, prefixed with
 // `where` - "main.mjs", "draw_gui", a menu callback, and so on. Every seam that
 // calls into script has to end here rather than let an exception escape into

@@ -43,9 +43,52 @@ void AddTriggerToGlobalList(TriggerKind kind, Vec3 *coords,
   fn(kind, coords, time_or_radius, targets, script, team);
 }
 
-TriggerData *RemoveTrigger(TriggerData *trigger, char c) {
+TriggerData *RemoveTriggerFromGlobalList(TriggerData *trigger, char free_flag) {
   ThisCall<TriggerData *, TriggerData *, char> fn;
   GetObjectAtOffset(fn, 0x0050c400);
-  return fn(trigger, c);
+  return fn(trigger, free_flag);
+}
+
+TriggerListHead *GetTriggerList() {
+  TriggerListHead *head = nullptr;
+  GetObjectAtOffset(head, 0x006af858);
+  return head;
+}
+
+TriggerData *LastRegisteredTrigger() {
+  TriggerListHead *head = GetTriggerList();
+  if (!head || !head->sentinel) {
+    return nullptr;
+  }
+  // The insert is at the tail, so `prev` of the sentinel is the newest node.
+  // Empty list: prev points back at the sentinel, which is a bare
+  // List_Member_Base carrying no `data` - reading one off it is the heap
+  // over-read src/List.h exists to prevent, hence the explicit compare.
+  TriggerNodeBase *tail = head->sentinel->prev;
+  if (!tail || tail == head->sentinel) {
+    return nullptr;
+  }
+  return entry_of(tail)->data;
+}
+
+bool TriggerIsRegistered(const TriggerData *trigger) {
+  TriggerListHead *head = GetTriggerList();
+  if (!trigger || !head || !head->sentinel) {
+    return false;
+  }
+  // Bounded by `count` as well as by the sentinel: this walks a list the
+  // executor can relink, and an unbounded loop over a torn `next` chain would
+  // hang the calling thread rather than report a miss. Callers take an
+  // ExecutorPause, which is what makes the walk itself sound; the bound is the
+  // backstop for the case where they did not.
+  const TriggerNodeBase *sentinel = head->sentinel;
+  int budget = head->count + 1;
+  for (TriggerNodeBase *node = sentinel->next;
+       node && node != sentinel && budget-- > 0; node = node->next) {
+    if (entry_of(node)->data == trigger) {
+      return true;
+    }
+  }
+  return false;
 }
 } // namespace gk

@@ -7213,45 +7213,79 @@ BloomLayer BloomLayerAt(uint32_t index) {
 
 bool BloomReady() { return BloomPassReady; }
 
+BloomState BloomStateNow() {
+  BloomState out;
+  out.requested = Bloom();
+  // The order of these tests is load-bearing. With the switch off, neither of
+  // the two below is the reason nothing is happening - this reported
+  // "idle - every layer is off" until that was fixed, which blames the layers
+  // when they are not at fault.
+  out.status = !BloomPassReady          ? BloomStatus::Unavailable
+               : !out.requested         ? BloomStatus::Off
+               : ColourFormat != kHdrFormat ? BloomStatus::Inert
+               : BloomRanThisFrame      ? BloomStatus::Active
+                                        : BloomStatus::Idle;
+  out.source_height = BloomSourceHeight;
+  if (BloomSourceHeight != 0) {
+    out.extract_taps = BloomExtractTaps(BloomSourceHeight, BloomExtent[0].height);
+  }
+  for (uint32_t layer = 0; layer < kBloomLayers; ++layer) {
+    BloomLayerState &state = out.layers[layer];
+    state.layer = BloomLayers[layer];
+    state.width = BloomExtent[layer].width;
+    state.height = BloomExtent[layer].height;
+    state.sigma_px = BloomSigma(layer);
+    state.taps = BloomBlurTaps(state.sigma_px);
+    state.capped = state.taps == kBloomMaxTaps;
+  }
+  return out;
+}
+
+const char *BloomStatusName(BloomStatus status) {
+  switch (status) {
+  case BloomStatus::Unavailable: return "unavailable";
+  case BloomStatus::Inert:       return "inert";
+  case BloomStatus::Idle:        return "idle";
+  case BloomStatus::Active:      return "active";
+  case BloomStatus::Off:         break;
+  }
+  return "off";
+}
+
 std::string DescribeBloom() {
+  const BloomState state = BloomStateNow();
   std::string out;
   char line[256];
   auto add = [&](const char *fmt, auto... args) {
     std::snprintf(line, sizeof(line), fmt, args...);
     out += line;
   };
-  // Four states rather than two, because they are four different things a caller has to be able to
-  // tell apart - and `render.bloom` reads back as REQUESTED, exactly as `render.hdr` does, so this
-  // is the one place the difference is visible.
-  add("bloom: %s%s\n", Bloom() ? "on" : "off",
-      !BloomPassReady ? " (UNAVAILABLE - the pass did not build)"
-      // Before the two below, because with the switch off neither of them is the reason nothing is
-      // happening - it printed "off (idle - every layer is off)" until this line was added, which
-      // says the layers are the problem when they are not.
-      : !Bloom() ? ""
-      : ColourFormat != kHdrFormat
+  const char *why =
+      state.status == BloomStatus::Unavailable
+          ? " (UNAVAILABLE - the pass did not build)"
+      : state.status == BloomStatus::Inert
           ? " (INERT - needs render.hdr; an 8-bit target has no over-range light to threshold)"
-      : BloomRanThisFrame ? ""
-                          : " (idle - every layer is off)");
+      : state.status == BloomStatus::Idle ? " (idle - every layer is off)"
+                                          : "";
+  add("bloom: %s%s\n", state.requested ? "on" : "off", why);
   for (uint32_t layer = 0; layer < kBloomLayers; ++layer) {
-    const BloomLayer &l = BloomLayers[layer];
-    const char *blend = l.blend == BloomBlend::Add      ? "add"
-                        : l.blend == BloomBlend::Screen ? "screen"
-                        : l.blend == BloomBlend::Max    ? "max"
-                                                        : "off";
-    const float sigma = BloomSigma(layer);
-    const uint32_t taps = BloomBlurTaps(sigma);
+    const BloomLayerState &l = state.layers[layer];
+    const char *blend = l.layer.blend == BloomBlend::Add      ? "add"
+                        : l.layer.blend == BloomBlend::Screen ? "screen"
+                        : l.layer.blend == BloomBlend::Max    ? "max"
+                                                              : "off";
     // The layer's size and its sigma in texels alongside the knob's own value, because a radius is
     // only interpretable next to them: 0.06 is 3.6 texels of a 60-line layer, and would be 43 of a
     // 720-line one - which is what the cap would then be refusing.
     add("  layer %u: %-6s threshold %.2f knee %.2f radius %.4f intensity %.2f"
         "   %ux%u, sigma %.2f px, %u taps%s\n",
-        layer, blend, l.threshold, l.knee, l.radius, l.intensity, BloomExtent[layer].width,
-        BloomExtent[layer].height, sigma, taps, taps == kBloomMaxTaps ? " (CAPPED)" : "");
+        layer, blend, l.layer.threshold, l.layer.knee, l.layer.radius,
+        l.layer.intensity, l.width, l.height, l.sigma_px, l.taps,
+        l.capped ? " (CAPPED)" : "");
   }
-  if (BloomSourceHeight != 0) {
-    add("  extracted from %u lines, %u box taps per axis into the first layer\n", BloomSourceHeight,
-        BloomExtractTaps(BloomSourceHeight, BloomExtent[0].height));
+  if (state.source_height != 0) {
+    add("  extracted from %u lines, %u box taps per axis into the first layer\n",
+        state.source_height, state.extract_taps);
   }
   return out;
 }
@@ -7495,9 +7529,47 @@ void ClearMaterialOverrides() {
   ResolveMaterialOverrides();
 }
 
-std::string DescribeMaterialOverrides() {
+MaterialOverridesState MaterialOverridesNow() {
   EnsureOverridesResolved();
-  if (Overrides.empty()) {
+  MaterialOverridesState out;
+  out.overridden_draws = TheStats.overridden_draws;
+  out.hidden_draws = TheStats.hidden_draws;
+  const std::vector<TextureImageInfo> images = TextureImages();
+  for (size_t index = 0; index < Overrides.size(); ++index) {
+    const OverrideEntry &entry = Overrides[index];
+    MaterialOverrideState state;
+    state.key = entry.key;
+    state.texture = entry.over.texture;
+    state.hide = entry.over.hide;
+    for (int i = 0; i < 4; ++i) {
+      state.tint[i] = entry.over.tint[i];
+    }
+    if (!entry.over.texture.empty()) {
+      const uint32_t replacement = FindImageByName(images, entry.lowered_texture);
+      state.texture_resolved = replacement != kNoTexture;
+      state.texture_image = state.texture_resolved ? replacement : 0;
+    }
+    // Every image the key matches, because a substring key matching nothing and one matching
+    // half the level look identical from the call site.
+    for (const TextureImageInfo &image : images) {
+      if (image.name.empty() || Lowered(image.name).find(entry.lowered) == std::string::npos) {
+        continue;
+      }
+      MaterialOverrideImage matched;
+      matched.index = static_cast<uint32_t>(image.index);
+      matched.name = image.name;
+      matched.owned = image.index < Resolved.size() && Resolved[image.index].any &&
+                      Resolved[image.index].owner == index;
+      state.images.push_back(std::move(matched));
+    }
+    out.entries.push_back(std::move(state));
+  }
+  return out;
+}
+
+std::string DescribeMaterialOverrides() {
+  const MaterialOverridesState state = MaterialOverridesNow();
+  if (state.entries.empty()) {
     return "no material overrides registered\n"
            "  render.material_override(\"<.rim substring>\", {texture, tint, hide})\n";
   }
@@ -7507,44 +7579,31 @@ std::string DescribeMaterialOverrides() {
     std::snprintf(line, sizeof(line), fmt, args...);
     out += line;
   };
-  const std::vector<TextureImageInfo> images = TextureImages();
-  for (size_t index = 0; index < Overrides.size(); ++index) {
-    const OverrideEntry &entry = Overrides[index];
-    const uint32_t tint = PackTint(entry.over.tint);
+  for (const MaterialOverrideState &entry : state.entries) {
+    const uint32_t tint = PackTint(entry.tint);
     add("\"%s\"%s  tint %.3f %.3f %.3f %.3f%s\n", entry.key.c_str(),
-        entry.over.hide ? "  HIDDEN" : "", entry.over.tint[0], entry.over.tint[1],
-        entry.over.tint[2], entry.over.tint[3],
-        tint == 0xffffffffu ? " (identity)" : "");
-    if (!entry.over.texture.empty()) {
-      const uint32_t replacement = FindImageByName(images, entry.lowered_texture);
-      if (replacement == kNoTexture) {
+        entry.hide ? "  HIDDEN" : "", entry.tint[0], entry.tint[1], entry.tint[2],
+        entry.tint[3], tint == 0xffffffffu ? " (identity)" : "");
+    if (!entry.texture.empty()) {
+      if (!entry.texture_resolved) {
         add("  -> texture \"%s\": NO LIVE IMAGE MATCHES - the original is drawn\n",
-            entry.over.texture.c_str());
+            entry.texture.c_str());
       } else {
-        add("  -> texture \"%s\" = image %u\n", entry.over.texture.c_str(),
-            (unsigned)replacement);
+        add("  -> texture \"%s\" = image %u\n", entry.texture.c_str(),
+            (unsigned)entry.texture_image);
       }
     }
-    // Every image the key matches, because a substring key matching nothing and one matching
-    // half the level look identical from the call site.
-    size_t matched = 0;
-    for (const TextureImageInfo &image : images) {
-      if (image.name.empty() || Lowered(image.name).find(entry.lowered) == std::string::npos) {
-        continue;
-      }
-      const bool mine = image.index < Resolved.size() && Resolved[image.index].any &&
-                        Resolved[image.index].owner == index;
+    for (const MaterialOverrideImage &image : entry.images) {
       add("     image %-4u %s%s\n", (unsigned)image.index, image.name.c_str(),
-          mine ? "" : "   (taken by an earlier key)");
-      ++matched;
+          image.owned ? "" : "   (taken by an earlier key)");
     }
-    if (matched == 0) {
+    if (entry.images.empty()) {
       out += "     MATCHES NOTHING - no live image's .rim path contains this\n";
     }
   }
   add("%llu draws overridden, %llu hidden since the last render.reset()\n",
-      (unsigned long long)TheStats.overridden_draws,
-      (unsigned long long)TheStats.hidden_draws);
+      (unsigned long long)state.overridden_draws,
+      (unsigned long long)state.hidden_draws);
   return out;
 }
 

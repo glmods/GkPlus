@@ -90,10 +90,10 @@ declare module "gk" {
     /** `TRACK <id>`: follows an actor. Broadcasts (update 0xb4), so it is
      *  authority-gated - a no-op on a joining client, which then receives the
      *  host's. */
-    track(actor_id: number): void;
+    track(actor: Actor): void;
     /** `CAMERA TRACK`: a Bezier camera move through four control points, the
      *  first the start and the last the end. Broadcasts (update 0xaa). */
-    bezier_track(p1: Point, p2: Point, p3: Point, p4: Point): void;
+    bezier_track(p1: Vec3Like, p2: Vec3Like, p3: Vec3Like, p4: Vec3Like): void;
 
     // --- the interpolated moves ---------------------------------------------
     //
@@ -102,12 +102,12 @@ declare module "gk" {
     // duration, a mode flag) whose pairing is only written down in the handler.
 
     /** `SET REQUIRED POS`: eases the focus to `where` over `seconds`. */
-    move_to(where: Point, seconds?: number): void;
+    move_to(where: Vec3Like, seconds?: number): void;
     /** `SET REQUIRED ORI`, in degrees, over `seconds`. */
     turn_to(yaw: number, roll: number, pitch: number, seconds?: number): void;
     /** `SET REQUIRED DISTANCE`: eases the zoom. */
     zoom_to(distance: number, seconds?: number): void;
-    move_and_zoom_to(where: Point, distance: number, seconds?: number): void;
+    move_and_zoom_to(where: Vec3Like, distance: number, seconds?: number): void;
     /** `SET JERKY DISTANCE`: zooms with two deliberate jerks on the way. */
     jerky_zoom_to(distance: number): void;
     /** `ROTATE CAMERA`: n units right (negative for left) over m seconds. */
@@ -117,7 +117,7 @@ declare module "gk" {
     /** `ALTER CAMERA`: offsets by screen fractions - 1 is a whole width. */
     nudge(dx: number, dy: number): void;
     /** `CENTRE`: centres on a unit, by id. */
-    center_on(actor_id: number): void;
+    center_on(actor: Actor): void;
   }
 
   // --- console ---------------------------------------------------------------
@@ -130,13 +130,28 @@ declare module "gk" {
     print(text: string): void;
 
     /** Joins its arguments with spaces and writes them to the game console and
-     *  to the debugger, a line at a time. All five are the same function - the
-     *  host has no severity levels. */
+     *  to the debugger, a line at a time.
+     *
+     *  The five differ only in severity, which `console.level` filters on and
+     *  which tags the debugger line; `warn` and `error` are also marked on
+     *  screen. There is no global `console`, so this object is the only one a
+     *  script sees. */
     log(...args: unknown[]): void;
     info(...args: unknown[]): void;
     warn(...args: unknown[]): void;
     error(...args: unknown[]): void;
     debug(...args: unknown[]): void;
+
+    /** The quietest level that still reaches the console. Anything below it is
+     *  dropped.
+     *
+     *  The five writers above used to be **one function with no severity**, so
+     *  nothing downstream could tell an error from a trace. They now carry one:
+     *  `warn` and `error` are marked on screen, every line is tagged for the
+     *  debugger, and setting this silences the rest. Assigning a name that is
+     *  not one of the five throws - guessing would leave a script silently not
+     *  reporting. */
+    level: "debug" | "log" | "info" | "warn" | "error";
 
     /** Runs one console command, exactly as typing it would. */
     execute(command: string): void;
@@ -148,7 +163,7 @@ declare module "gk" {
      *  (`ONLY IF SAFE`, `ONLY IF HINTS ON`, `CLEAR BATCH`,
      *  `EXECUTE IMMEDIATELY`, `NORMAL EXECUTION`); lines are capped at 249
      *  characters. Returns whether the file opened. */
-    execute_file(path: string): boolean;
+    execute_file(path: string): void;
 
     /** ARGB, as 0xAARRGGBB. */
     text_color: number;
@@ -296,8 +311,9 @@ declare module "gk" {
      *  `SET ACTOR ARMOUR` command sends update 0x93 around a call to it. Same
      *  trap as `set_position`: correct in single player, a desync otherwise. */
     armor: number;
-    /** **Local only**, for the same reason as `armor`. */
-    shield: number;
+    /** **Local only**, for the same reason as `armor`. Spelled as `role.shields`
+     *  is; it was `shield` here and `shields` there for no reason. */
+    shields: number;
     /** health / the role's strength, so 1 is untouched and 0 is dead. */
     readonly strength_ratio: number;
     /** Camouflaged - hidden in water or a scrap pile, which the AI treats as a
@@ -330,7 +346,7 @@ declare module "gk" {
     associate(script: string | ScriptMessage, one_shot?: boolean): void;
     dissociate(): void;
     /** Takes the target's **id**, not the wrapper - see `actor.id`. */
-    set_target(id: number, mode?: number): void;
+    set_target(target: Actor, mode?: number): void;
     clear_target(): void;
     /** Moves the actor to another team. Read the current one with `actor.team`.
      *
@@ -697,8 +713,6 @@ declare module "gk" {
     alpha: number;
     readonly resistance: number;
     readonly limit: number;
-    readonly num_hier_nodes_26_30: number;
-    readonly num_hier_nodes_21_25: number;
 
     alpha_fogging: boolean;
     per_vertex_fogging: boolean;
@@ -717,7 +731,7 @@ declare module "gk" {
       team?: number,
       position?: Vec3Like | null,
       orientation?: Vec4Like | null,
-      owner?: number
+      owner?: Actor | null
     ): Actor | null;
     toString(): string;
   }
@@ -842,7 +856,7 @@ declare module "gk" {
      *  clear) - a wrapper is a fresh object on every lookup, so ids are the
      *  currency between the bindings and the game. */
     get selected_actor(): Actor | null;
-    set selected_actor(value: number | null);
+    set selected_actor(value: Actor | null);
     /** What the mouse is over, or null - what `GET ACTOR ID` reports. */
     readonly actor_under_cursor: Actor | null;
 
@@ -854,6 +868,33 @@ declare module "gk" {
      *  that gate itself, and raising would break a `message_received` that
      *  every machine runs. */
     spawn(amount?: number, team?: number): void;
+
+    /** Toggles the single-player "active pause". Single player only; in
+     *  multiplayer it is a vote sent to the server, which is why `paused` is
+     *  read-only and this is a call rather than a setter.
+     *
+     *  Moved here from `screen`, along with the three below. */
+    toggle_pause(): void;
+
+    /** 1 is normal, 0 is the "active pause".
+     *
+     *  The argument is **required**, unlike the console command, where omitting
+     *  it prints the current value instead. There is no getter for it to pair
+     *  with, so a script asking for a value it cannot read back is a mistake
+     *  rather than a console line. */
+    set_speed(speed: number): void;
+
+    /** Broadcasts a chat message to the other players. May contain spaces -
+     *  this handler takes the rest of the line, unlike most.
+     *
+     *  It does reach the network, but through a native that owns the send (like
+     *  `SpawnRole`) rather than by building an update, so running the real
+     *  command is correct. */
+    say(message: string): void;
+
+    /** Exits to the desktop. `levels.quit()` is the one that ends the session
+     *  and returns to the front end. */
+    quit(): void;
   }
 
   export type DifficultyName = "easy" | "medium" | "hard" | "extreme";
@@ -861,33 +902,7 @@ declare module "gk" {
 
   // --- the broadcast-free command namespaces -----------------------------------
 
-  /** A world position. These namespaces accept any `{x, y, z}`; components left
-   *  out are sent as 0, which is how the console's own parser treats a short
-   *  argument list. */
-  export type Point = Vec3Like;
 
-  /** Arguments accepted by the command-backed namespaces below.
-   *
-   *  Those namespaces format a console command line and run the game's own
-   *  handler, rather than reimplementing it. That is deliberate: every one of
-   *  those handlers *is* an argument parser, with defaults that come from the
-   *  map bounds or the cursor, so running it is faithful by construction. What
-   *  the binding adds is typed arguments, locale-independent numbers, a name
-   *  that does not depend on the language DLL, and a length check the engine
-   *  does not do.
-   *
-   *  A `boolean` becomes `ON`/`OFF`, a number a decimal, a `{x, y, z}` three
-   *  numbers, an array its elements, and `undefined`/`null` ends the argument
-   *  list. **A string may not contain whitespace** - the console splits on it
-   *  and has no quoting - and that throws rather than silently splitting. */
-  export type CommandArg =
-    | number
-    | boolean
-    | string
-    | Point
-    | readonly CommandArg[]
-    | undefined
-    | null;
 
   /** World effects and particles. Everything here is fire-and-forget; nothing
    *  reads back. Positions default to the cursor or the map bounds when
@@ -895,42 +910,42 @@ declare module "gk" {
   export interface Fx {
     /** `WATER height corner1 corner2 detail flag` - a body of water over an
      *  area. Omitting the corners uses the map bounds. */
-    water(height?: number, corner1?: Point, corner2?: Point, detail?: number, animate?: boolean): void;
-    lava(height?: number, corner1?: Point, corner2?: Point, detail?: number, animate?: boolean): void;
-    oil(height?: number, corner1?: Point, corner2?: Point, detail?: number, animate?: boolean): void;
-    sea(height?: number, corner1?: Point, corner2?: Point, animate?: boolean): void;
-    swamp(height?: number, corner1?: Point, corner2?: Point, detail?: number, animate?: boolean): void;
+    water(height?: number, corner1?: Vec3Like, corner2?: Vec3Like, detail?: number, animate?: boolean): void;
+    lava(height?: number, corner1?: Vec3Like, corner2?: Vec3Like, detail?: number, animate?: boolean): void;
+    oil(height?: number, corner1?: Vec3Like, corner2?: Vec3Like, detail?: number, animate?: boolean): void;
+    sea(height?: number, corner1?: Vec3Like, corner2?: Vec3Like, animate?: boolean): void;
+    swamp(height?: number, corner1?: Vec3Like, corner2?: Vec3Like, detail?: number, animate?: boolean): void;
 
     /** `where` must be any point near the body of liquid. */
-    raise_water(where: Point, amount: number): void;
-    lower_water(where: Point, amount: number): void;
-    raise_lava(where: Point, amount: number): void;
-    lower_lava(where: Point, amount: number): void;
-    set_water_speed(where: Point, speed: number): void;
-    set_water_direction(where: Point, direction: Point): void;
+    raise_water(where: Vec3Like, amount: number): void;
+    lower_water(where: Vec3Like, amount: number): void;
+    raise_lava(where: Vec3Like, amount: number): void;
+    lower_lava(where: Vec3Like, amount: number): void;
+    set_water_speed(where: Vec3Like, speed: number): void;
+    set_water_direction(where: Vec3Like, direction: Vec3Like): void;
 
     /** An electrical crackle between two points; amplitude is in decimetres. */
-    electricity(start: Point, end: Point, amplitude?: number): void;
+    electricity(start: Vec3Like, end: Vec3Like, amplitude?: number): void;
     /** Takes either endpoint of a crackle created with `electricity`. */
-    deactivate_electricity(endpoint: Point): void;
-    laser_fence(start: Point, end: Point): void;
+    deactivate_electricity(endpoint: Vec3Like): void;
+    laser_fence(start: Vec3Like, end: Vec3Like): void;
 
-    pulse_rings(start: Point, end: Point, radius: number, travel_time: number, spacing: number): void;
+    pulse_rings(start: Vec3Like, end: Vec3Like, radius: number, travel_time: number, spacing: number): void;
     /** Takes either end of a `pulse_rings` run. */
-    remove_pulse_rings(endpoint: Point): void;
-    ring(where: Point, sides: number, min_radius: number, max_radius: number): void;
-    basin(where: Point, sides: number, lower_radius: number, upper_radius: number): void;
+    remove_pulse_rings(endpoint: Vec3Like): void;
+    ring(where: Vec3Like, sides: number, min_radius: number, max_radius: number): void;
+    basin(where: Vec3Like, sides: number, lower_radius: number, upper_radius: number): void;
 
     /** Defaults to the cursor position. */
-    explode(where?: Point): void;
+    explode(where?: Vec3Like): void;
     /** `EWS` - explode with smoke. */
-    explode_with_smoke(where?: Point): void;
-    sparks(where?: Point): void;
+    explode_with_smoke(where?: Vec3Like): void;
+    sparks(where?: Vec3Like): void;
 
     rain(on: boolean): void;
     snow(on: boolean): void;
     lightning(on: boolean): void;
-    particle_tester(type: number, where?: Point): void;
+    particle_tester(type: number, where?: Vec3Like): void;
     particle_rate(rate: number): void;
 
     // Broadcasting members. Safe to call unguarded: the handler checks
@@ -938,13 +953,13 @@ declare module "gk" {
     // authority machine's update instead.
 
     /** Searchlights and explosions over an area. Broadcasts (0xc2). */
-    airstrike(corner1: Point, corner2: Point): void;
+    airstrike(corner1: Vec3Like, corner2: Vec3Like): void;
     /** Smoke billowing from a character. Broadcasts (0xbe). */
-    smoke(actor: string): void;
+    smoke(actor: Actor): void;
     /** Stops every particle effect on a character. Broadcasts (0xbf). */
-    stop_particles(actor: string): void;
+    stop_particles(actor: Actor): void;
     /** `TEXTURE ANIMATE frames u0 v0 u1 v1 ...`. Broadcasts. */
-    texture_animate(actor: string, frames: number, uvs: readonly number[]): void;
+    texture_animate(actor: Actor, frames: number, uvs: readonly number[]): void;
   }
 
   /** The lighting commands that do not broadcast. `world` carries the sun,
@@ -957,32 +972,57 @@ declare module "gk" {
     fade_out(): void;
     fade_to_black(seconds?: number, hold_seconds?: number): void;
     fade_from_black(seconds?: number): void;
-    corona(where?: Point, color?: readonly number[]): void;
-    spotlight(where?: Point): void;
-    ray(where?: Point): void;
+    corona(where?: Vec3Like, color?: readonly number[]): void;
+    spotlight(where?: Vec3Like): void;
+    ray(where?: Vec3Like): void;
     /** Recolours every light ray on the level. */
     ray_color(r: number, g: number, b: number): void;
-    cylinder(where: Point): void;
+    cylinder(where: Vec3Like): void;
     remove_cylinders(): void;
     /** `LIGHTON actor dummy r g b a` - a corona light on an actor's dummy. */
-    light_on(actor: string, dummy: string, r: number, g: number, b: number, a: number): void;
+    light_on(actor: Actor, dummy: string, r: number, g: number, b: number, a: number): void;
     /** Sphere-maps the actor under the cursor. */
     reflect(): void;
     /** A light at a position, RGB each 0..1. Broadcasts (0xc0). */
-    add(where: Point, r: number, g: number, b: number): void;
+    add(where: Vec3Like, r: number, g: number, b: number): void;
     /** As `add`, but blinking. Broadcasts (0xc1). */
-    add_blinking(where: Point, r: number, g: number, b: number): void;
+    add_blinking(where: Vec3Like, r: number, g: number, b: number): void;
     /** Shadowing on an actor. Broadcasts (0xc4). */
-    shadow(actor: string): void;
+    shadow(actor: Actor): void;
     /** `ASSOCIATELIGHT lift actor dummy r g b a` - binds a corona light to a
      *  lift so it travels with it. */
-    associate(lift: string, actor: string, dummy: string,
+    /** Ties a light to a lift, so it travels with it.
+     *
+     *  Both actors, not just the second: `CommandAssociateLight` @ 0x0044a5c0
+     *  resolves the lift through `ConsoleParseActorName` and passes its **id** to
+     *  the body it shares with `LIGHTON` (`CommandLightOnOrAssociate`
+     *  @ 0x0044c470, which `light_on` reaches with -1 for "no lift"). So the
+     *  command line carries two actor names here and one there. */
+    associate(lift: Actor, actor: Actor, dummy: string,
               r: number, g: number, b: number, a: number): void;
   }
 
   /** Mission objectives and the training-level text. */
   export interface Objectives {
-    add(...args: CommandArg[]): void;
+    /** Adds a mission objective. Recovered from `CommandAddObjective`
+     *  @ 0x00446300 rather than guessed, which is why it is typed rather than a
+     *  varargs passthrough - every argument is gated and the handler returns
+     *  **silently** when one fails.
+     *
+     *  `title` and `body` are offsets into the localized string table from
+     *  `GL_OBJECTIVE_0`, not text. The handler also demands a literal `-1` in a
+     *  fourth slot with no other accepted value; the binding writes it, so it is
+     *  not a parameter here.
+     *
+     *  Both `add objective` lines in the shipped `.gcs` files are commented out
+     *  and would not have worked - each puts a `2` where that -1 belongs. */
+    add(
+      team_slot: number,
+      priority: "primary" | "secondary" | "tertiary",
+      id: number,
+      title: number,
+      body: number
+    ): void;
     /** Moves one step closer to completing the objective. */
     complete(objective: number): void;
     fail(objective: number): void;
@@ -1021,7 +1061,13 @@ declare module "gk" {
     victory_kills(count: number): void;
   }
 
-  /** Presentation, briefing screens and session control. */
+  /** Presentation: borders, the cursor, briefing and debrief text, bitmaps,
+   *  FMVs, cutscenes and the end-of-mission statistics.
+   *
+   *  Session control used to live here too, because it is all console commands -
+   *  pausing, chat, exiting, and adding a level to Choose Level. Those are on
+   *  `game` and `levels` now: where a member lives should say what it affects,
+   *  not which of the two binding styles it happens to use. */
   export interface Screen {
     /** Widescreen bars. Width 0 with a speed scrolls them off. */
     borders(width: number, speed?: number): void;
@@ -1039,43 +1085,38 @@ declare module "gk" {
     play_fmv(name: string): void;
     play_cutscene(name: string): void;
     status_window(mode: "GENERAL" | "WATCH" | "OFF"): void;
-    /** Single player only; in multiplayer it is a vote sent to the server. */
-    toggle_pause(): void;
-    /** 1 is normal, 0 is the "active pause". Prints the current value when
-     *  called with no argument. */
-    game_speed(speed?: number): void;
-    next_level(): void;
-    /** Adds a .gls level to Choose Level. `levels.add` is the script-defined
-     *  equivalent and does not need a file. */
-    add_mission(script: string, console_script?: string): void;
-    add_multiplayer_mission(script: string, console_script?: string): void;
-    /** Quits the current game to the front end. The command name is localized,
-     *  so this resolves it from the language DLL rather than spelling it. */
-    main_menu(): void;
-    /** Exits to the desktop. Localized name, as above. */
-    quit(): void;
-    /** Broadcasts a chat message to the other players. The message may contain
-     *  spaces - this handler takes the rest of the line, unlike most.
-     *
-     *  It does reach the network, but through a native that owns the send
-     *  (like `SpawnRole`), not by building an update itself - so running the
-     *  real command, which is what this does, is correct. */
-    say(message: string): void;
     /** The end-of-mission statistics screen. Unlike the rest of the
      *  broadcasting members this one sends *to* the server, which is the right
      *  direction from a client, so it needs no authority gate. */
     stats(): void;
   }
 
-  /** Per-actor AI and behaviour. Actors are named by **token**, the way the
-   *  console names them - see `actor.name`.
+  /** Per-actor AI and behaviour. Every member takes the **`Actor` object**;
+   *  nothing here is addressed by name or by id.
    *
-   *  The members that broadcast (`ANIM`, `BOARD`, `DEFOGGER`, `FOGGER`,
-   *  `GIVE CONTROL`, `PLAYER SELECT`, `REMOVEBB`) are absent. */
+   *  These dispatch the game's own console handlers, which is what keeps their
+   *  defaults, clamps, executor handshake and broadcasts exactly right - so an
+   *  actor has to reach a handler that was written to parse a word. It does:
+   *  the actor is spelled as its id on the command line, and the shared
+   *  `ConsoleParseActorName` helper is substituted through for the handlers that
+   *  resolve a name rather than an id. The consequence worth knowing is that
+   *  **a script-spawned actor works here**, where a name-based surface could not
+   *  express one at all.
+   *
+   *  The broadcasting members are all present (`ANIM`, `BOARD`, `DEFOGGER`,
+   *  `FOGGER`, `GIVE CONTROL`, `PLAYER SELECT`, `REMOVEBB`) and cost nothing
+   *  extra, since the handler does its own broadcasting. */
   export interface Units {
-    set_ai(actor: string, ai: string): void;
-    alert_node(node: string): void;
-    set_activity(actor: string, activity: "PATROL" | "STOP" | "GOTO"): void;
+    set_ai(actor: Actor, ai: string): void;
+    alert_node(node: Actor): void;
+    /** Acts on **`game.selected_actor`**, not on an actor you name - set that
+     *  first. `CommandSetActivity` parses a single word, the activity keyword,
+     *  and reads the selection; it prints an error when nothing is selected.
+     *
+     *  This used to declare a leading `actor` parameter, which made the call
+     *  silently do nothing: the handler read that argument as the keyword, and
+     *  every comparison against `GOTO`/`PATROL`/`STOP` failed. */
+    set_activity(activity: "PATROL" | "STOP" | "GOTO"): void;
     /** `ADD WAYPOINT` and `ADD PATROLPOINT` are **one implementation**
      *  (`CommandAddWaypointOrPatrolPoint` @ 0x0044c760, reached by a `JMP` from
      *  either registration with only a `CL` flag to tell them apart), and both
@@ -1083,29 +1124,30 @@ declare module "gk" {
      *  default of 0.0. It becomes the waypoint record's `wait_time`, the dwell
      *  in seconds - but only the patrol list is ever walked for it, so on
      *  `add_waypoint` the argument is accepted and inert. */
-    add_waypoint(where?: Point, wait_time?: number): void;
-    add_patrol_point(where?: Point, wait_time?: number): void;
+    add_waypoint(where?: Vec3Like, wait_time?: number): void;
+    add_patrol_point(where?: Vec3Like, wait_time?: number): void;
     new_node_waypoint_list(node: string): void;
-    make_hunter(actor: string): void;
-    make_flare_firer(actor: string): void;
-    turn_vision_cone(on: boolean, actor: string): void;
-    turn_hearing_range(on: boolean, actor: string): void;
-    turret_los(on: boolean, turret: string): void;
-    set_scale(scale: number, actor?: string): void;
+    make_hunter(actor: Actor): void;
+    make_flare_firer(actor: Actor): void;
+    turn_vision_cone(on: boolean, actor: Actor): void;
+    turn_hearing_range(on: boolean, actor: Actor): void;
+    turret_los(on: boolean, turret: Actor): void;
+    /** Scales **`game.actor_under_cursor`**. `CommandSetScale` parses one float
+     *  and applies it to whatever the cursor is over; the trailing `actor`
+     *  parameter this used to declare was read by nothing at all. */
+    set_scale(scale: number): void;
     delete_team(team: number): void;
     /** Like selecting, but also opens the status window. */
-    watch(actor: string): void;
+    watch(actor: Actor): void;
     create_president(): void;
     list_team(team: number): void;
-    /** `triggers.create` has no removal counterpart; this is it. */
-    remove_trigger(...args: CommandArg[]): void;
     /** Bounds for wandering background creatures. */
-    set_upper_left_bound(where: Point): void;
-    set_lower_right_bound(where: Point): void;
+    set_upper_left_bound(where: Vec3Like): void;
+    set_lower_right_bound(where: Vec3Like): void;
     /** `VULNERABILITY target vulnerable_to delay type_or_script`. */
     set_vulnerability(
-      target: string,
-      vulnerable_to: string,
+      target: Actor,
+      vulnerable_to: Role | string,
       delay: number,
       type_or_script: string | number
     ): void;
@@ -1113,50 +1155,50 @@ declare module "gk" {
     // Broadcasting members - see the note on `fx`.
 
     /** Plays an animation on an actor. Broadcasts (0xba). */
-    play_animation(actor: string, animation: number): void;
+    play_animation(actor: Actor, animation: number): void;
     /** Sends every actor to an object, boarding it if it can be boarded.
      *  Broadcasts (0xb5). */
-    board(target: string): void;
+    board(target: Actor): void;
     /** Makes the actor defog the map as it moves. Broadcasts (0xb7). */
-    make_defogger(actor: string): void;
+    make_defogger(actor: Actor): void;
     /** Reverses `make_defogger`. Broadcasts (0xb8). */
-    clear_defogger(actor: string): void;
+    clear_defogger(actor: Actor): void;
     /** Moves an actor to a team **and** replicates - this is the command
      *  behind update 0x50, and the same thing `actor.set_team` now does. */
-    give_control(actor: string, team: number): void;
+    give_control(actor: Actor, team: number): void;
     /** As if the player clicked the actor. Broadcasts (0xc3). */
-    player_select(actor: string): void;
+    player_select(actor: Actor): void;
     /** Drops an actor's bounding box so it stops being clipped out.
      *  Broadcasts (0xbb). */
-    remove_bounding_box(actor: string): void;
+    remove_bounding_box(actor: Actor): void;
     /** Anyone within earshot of the unit receives the message, which may
      *  contain spaces. Broadcasts. */
-    speak(unit: number, message: string): void;
+    speak(actor: Actor, message: string): void;
   }
 
   /** Giving and equipping items. `REMOVE ITEM` broadcasts and is absent. */
   export interface Inventory {
-    give(character: string, item: string): void;
-    give_and_say(character: string, item: string): void;
-    give_and_equip(character: string, item: string): void;
-    give_and_equip_and_say(character: string, item: string): void;
-    give_role(role: string, item: string): void;
+    give(character: Actor, item: Role | string): void;
+    give_and_say(character: Actor, item: Role | string): void;
+    give_and_equip(character: Actor, item: Role | string): void;
+    give_and_equip_and_say(character: Actor, item: Role | string): void;
+    give_role(role: Role | string, item: Role | string): void;
     /** Gives to the last respawned actor, if it matches the role. */
     give_role_id(item: string): void;
-    give_role_team(role: string, team: number, item: string): void;
-    give_and_equip_role(role: string, item: string): void;
+    give_role_team(role: Role | string, team: number, item: Role | string): void;
+    give_and_equip_role(role: Role | string, item: Role | string): void;
     give_and_equip_role_id(item: string): void;
-    give_and_equip_role_team(role: string, team: number, item: string): void;
+    give_and_equip_role_team(role: Role | string, team: number, item: Role | string): void;
     /** Fills a named actor with one of a list of items. */
-    heap(actor: string, ...items: string[]): void;
-    respawn_heap(index: number, actor: string, ...items: string[]): void;
+    heap(actor: Actor, ...items: (Role | string)[]): void;
+    respawn_heap(index: number, actor: Actor, ...items: (Role | string)[]): void;
     next_respawn_id(): void;
     /** Runs `command` only if the item is carried. The condition needs the
      *  engine's inventory walk, which has no binding, so this stays a command. */
     if_carrying(item: string, command: string): void;
     /** Removes every instance of a role from friendly inventories.
      *  Broadcasts (0x7d). */
-    remove_item(role: string): void;
+    remove_item(role: Role | string): void;
   }
 
   /** Track objects - lifts and moving platforms - plus doors and attachment.
@@ -1168,19 +1210,19 @@ declare module "gk" {
     pause(name: string): void;
     unpause(name: string): void;
     /** Declares a door: a location and an identifying number. */
-    declare_door(where: Point, id: number): void;
+    declare_door(where: Vec3Like, id: number): void;
     /** Attaches a lift to the level so characters can walk on and off it. */
-    attach(actor: string): void;
-    detach(actor: string): void;
+    attach(actor: Actor): void;
+    detach(actor: Actor): void;
 
     // Broadcasting members - see the note on `fx`.
 
     /** `SET TRACK name p1 p2 p3 p4 carries_passengers` - the Bezier the actor
      *  follows. The actor must be AI type `track object`. Broadcasts (0xa9). */
-    set(name: string, p1: Point, p2: Point, p3: Point, p4: Point,
+    set(name: string, p1: Vec3Like, p2: Vec3Like, p3: Vec3Like, p4: Vec3Like,
         carries_passengers?: boolean): void;
     /** A speed scale for the named track objects. Broadcasts (0xab). */
-    set_speed(scale: number, ...names: string[]): void;
+    set_speed(scale: number, ...actors: Actor[]): void;
     /** Seconds between automatic `run` commands. Broadcasts (0xac). */
     set_loop_time(seconds: number): void;
     /** Doors are addressed by the number given to `declare_door`.
@@ -1504,15 +1546,46 @@ declare module "gk" {
      *  as a file.
      *
      *  Either way it reaches every machine - the engine broadcasts the payload
-     *  and each player consumes its own copy. */
+     *  and each player consumes its own copy.
+     *
+     *  **A message is only delivered while a script-defined level is loaded.**
+     *  It goes to that level's `message_received` and nowhere else, so in one of
+     *  the fifteen shipped levels the payload is dropped - with a note to the
+     *  debugger, not to the console. Use a `.gcs` name there, or register the
+     *  level with `levels.add`. */
     script?: string | ScriptMessage;
-    /** The actors the trigger watches, **by token name**. */
-    targets?: string[];
+    /** The actors the trigger watches. */
+    targets?: Actor[];
+  }
+
+  /** A registered trigger, as returned by `triggers.create`. */
+  export interface Trigger {
+    /** Whether this handle still names a live trigger. A trigger that has fired
+     *  is destroyed by the engine with no notification, so this is the only safe
+     *  thing to read on a handle held across frames - and it is what `remove`
+     *  checks for you.
+     *
+     *  It is a re-derivation, not a cached flag: the check walks the engine's
+     *  global list for the record, then confirms the kind and script pointer
+     *  still match. That last part is a recycle heuristic rather than a proof -
+     *  the pool reuses pages, so two scriptless triggers of one kind at the same
+     *  address are indistinguishable. */
+    readonly valid: boolean;
+    /** The `triggers.kind` value this was created with. Readable even after the
+     *  trigger is gone, because it is snapshotted rather than read back. */
+    readonly kind: number;
+    /** Unregisters and destroys the trigger. Returns false if it had already
+     *  fired or the level ended - not an error, since nothing reports either. */
+    remove(): boolean;
+    toString(): string;
   }
 
   export interface Triggers {
-    /** Registers a trigger. Silently registers nothing when no level is
-     *  running - the engine drops it rather than reporting.
+    /** Registers a trigger and returns a handle to it.
+     *
+     *  **Throws when no level is running.** `AddTriggerToGlobalList` early-outs
+     *  when the executor is not running, so there is nothing to hand back; this
+     *  used to be a silent no-op.
      *
      *  **Local, and that is correct.** `RegisterTriggers` does not broadcast:
      *  in a stock level every machine runs the same `.gcs` and registers its
@@ -1528,7 +1601,17 @@ declare module "gk" {
      *  in the JavaScript heap survives, and nothing can: a closure cannot be
      *  serialized. Anything that must outlive a save belongs here, with its
      *  progress in `tokens` (which are saved too). */
-    create(options: TriggerOptions): void;
+    create(options: TriggerOptions): Trigger;
+
+    /** The engine's own `REMOVE TRIGGER`, for a trigger GkPlus did not create -
+     *  a level's own. Its reach is much narrower than the name suggests:
+     *  `CommandRemoveTrigger` only handles **shot** triggers, and matches one by
+     *  comparing `position` against the trigger's second and third coordinates.
+     *
+     *  For anything from `create`, use `trigger.remove()` - it is exact, and it
+     *  cannot remove somebody else's trigger by coincidence. */
+    remove_shot(position: Vec3Like): void;
+
     readonly kind: Readonly<Record<TriggerKindName, number>>;
   }
 
@@ -1931,9 +2014,9 @@ declare module "gk" {
     role(desc: RoleDesc): Role;
     /** Fills the Ammo slot at [ammo_type + weapon_type * 19]. False when that
      *  slot is already taken - the first definition of a pair wins. */
-    ammo(desc: AmmoDesc): boolean;
+    ammo(desc: AmmoDesc): void;
     /** Fills AmmoInfos[ammo_type]. */
-    ammo_info(desc: AmmoInfoDesc): boolean;
+    ammo_info(desc: AmmoInfoDesc): void;
     /** Needs a loaded level: it offsets the path by the map origin. `name` is
      *  matched against the cutscene tracks in the .rif named by `file`; both
      *  are required. */
@@ -1942,7 +2025,7 @@ declare module "gk" {
       file: string;
       pgen?: ParticleGeneratorDesc;
       pgen2?: ParticleGeneratorDesc;
-    }): boolean;
+    }): void;
   }
 
   /** What only the GLS *parser* can answer. Building objects is `make`. */
@@ -2039,7 +2122,7 @@ declare module "gk" {
     /** `levels.start(this, options)` - starts this level, no menus, no
      *  briefing. Deferred to the next turn of the message loop; see
      *  `levels.start` for what that means and what it throws. */
-    start(options?: { difficulty?: DifficultyName | number }): boolean;
+    start(options?: { difficulty?: DifficultyName | number }): void;
 
     /** Every object of that name in the level .rif, in the coordinates the game
      *  would have spawned a placed object at. Throws outside a load callback,
@@ -2176,14 +2259,22 @@ declare module "gk" {
     start(
       target: Level | string | { script: string; console?: string },
       options?: { difficulty?: DifficultyName | number },
-    ): boolean;
+    ): void;
 
     /** Ends the session and returns to the main menu. Deferred like `start`. */
-    quit(): boolean;
+    quit(): void;
 
     /** True between `start`/`quit` and the load actually running. A second
      *  request while one is pending throws rather than replacing it. */
     readonly start_pending: boolean;
+
+    /** Adds a `.gls` level to Choose Level - the file-backed counterpart of
+     *  `add`, which needs no file. Both end up in `startable`. */
+    add_file(script: string, console_script?: string): void;
+    add_multiplayer_file(script: string, console_script?: string): void;
+
+    /** Advances to the next level in the campaign order, as finishing one does. */
+    next(): void;
 
     [Symbol.iterator](): IterableIterator<Level>;
   }
@@ -2485,9 +2576,9 @@ declare module "gk" {
     remove(path: string): boolean;
     /** Writes the file now. Only needed for a change that must survive a crash -
      *  otherwise it happens by itself. False if the file could not be replaced. */
-    save(): boolean;
+    save(): void;
     /** Re-reads from disk, discarding anything written since the last save. */
-    reload(): boolean;
+    reload(): void;
     /** The whole document as a plain **detached** object - the tree itself is the
      *  live view, so this is for a copy that will not change under you. */
     readonly all: Record<string, unknown>;
@@ -2542,6 +2633,84 @@ declare module "gk" {
   export type BloomBlend = "off" | "add" | "screen" | "max";
 
   /** One bloom layer, as `render.bloom_layer` returns it. */
+  /** Why the bloom pass is or is not contributing. Four states rather than two,
+   *  because they are four different things and `render.bloom` reads back as
+   *  *requested* - so the switch alone cannot tell them apart.
+   *
+   *  `inert` in particular is not a failure: bloom needs `render.hdr`, because an
+   *  8-bit target has no over-range light for a threshold to select. */
+  export type BloomStatus = "off" | "unavailable" | "inert" | "idle" | "active";
+
+  /** One layer's knobs, plus what they came out as. The derived half is the
+   *  reason this is worth reading: `radius` is a fraction of frame *height*, so
+   *  the same number is a different count of texels in each of the three layers,
+   *  and whether the kernel hit its cap is not computable from the knob at all. */
+  export interface BloomLayerState extends BloomLayer {
+    /** The layer's own resolution. A fixed line count (240/120/60), not a
+     *  fraction of the frame - which is what makes `radius` mean the same thing
+     *  at 640x480 and at 3072x1728. */
+    readonly width: number;
+    readonly height: number;
+    /** The Gaussian's sigma in **this layer's** texels. */
+    readonly sigma_px: number;
+    /** Taps per side. */
+    readonly taps: number;
+    /** The kernel hit its cap, so the radius asked for is being refused. */
+    readonly capped: boolean;
+  }
+
+  /** What `render.bloom_layers` reads back.
+   *
+   *  It was a preformatted string until the surface was tidied. The argument for
+   *  the string - that the interesting part is what a caller cannot compute from
+   *  the knobs - was an argument about *content*, never about format: a panel
+   *  binding a row per layer had to parse it back, and a `%.2f` in the report
+   *  silently became the precision of the readback. The text form is still there
+   *  as `render.debug.bloom_report`, formatted from exactly this. */
+  export interface BloomState {
+    /** As requested, not as effective - `status` is the effective half. */
+    readonly enabled: boolean;
+    readonly status: BloomStatus;
+    /** 0 until the pass has run once. */
+    readonly source_height: number;
+    /** Box taps per axis in the extract, which follows the downsample ratio
+     *  rather than being fixed. */
+    readonly extract_taps: number;
+    readonly layers: readonly BloomLayerState[];
+  }
+
+  /** One live image a material-override key matched. */
+  export interface MaterialOverrideImage {
+    readonly index: number;
+    readonly name: string;
+    /** False when an earlier key already claimed this image - the first key
+     *  wins. Reported rather than filtered out, because from the call site a key
+     *  taken over by an earlier one looks exactly like a key that matched
+     *  nothing. */
+    readonly owned: boolean;
+  }
+
+  export interface MaterialOverrideState {
+    readonly key: string;
+    /** The replacement asked for, or null for none. */
+    readonly texture: string | null;
+    /** The image `texture` resolved to, or **null when nothing matched** - in
+     *  which case the original is drawn, which is otherwise indistinguishable
+     *  from the override never having been registered. */
+    readonly texture_image: number | null;
+    readonly tint: readonly [number, number, number, number];
+    readonly hide: boolean;
+    /** Every live image the key matches. A substring key matching nothing and
+     *  one matching half the level look identical from the call site. */
+    readonly images: readonly MaterialOverrideImage[];
+  }
+
+  export interface MaterialOverridesState {
+    readonly entries: readonly MaterialOverrideState[];
+    readonly overridden_draws: number;
+    readonly hidden_draws: number;
+  }
+
   export interface BloomLayer {
     threshold: number;
     knee: number;
@@ -2581,78 +2750,29 @@ declare module "gk" {
     blend?: BloomBlend;
   }
 
-  /** The Vulkan renderer, under `GKPLUS_RENDERER=vulkan`.
+  /** The renderer's settings - every knob a player or a mod would choose, and
+   *  **every one of them persists**. A write here is saved to
+   *  `core.render.<name>` in `settings.json` once it has settled, exactly as
+   *  clicking the same knob on the Advanced Graphics page is; the two used to
+   *  disagree, so `render.hdr = true` was forgotten on the next launch while the
+   *  menu's own HDR toggle was not.
    *
-   *  Only the material override is declared here. The rest of the namespace is
-   *  the measurement surface `vulkan_renderer_plan.md` documents - counters,
-   *  histograms, verifiers and bisect knobs - which moves with the
-   *  investigation in progress and would be stale in a `.d.ts` more often than
-   *  it was right; the index signature is what keeps it reachable and says
-   *  plainly that it is not typed.
+   *  Two knobs are restored but never written back, because their getters report
+   *  what is *happening* rather than what was asked for: `tessellation` reads
+   *  false on a device with no `tessellationShader`, and `msaa` reads the count
+   *  the device agreed to. Persisting either would let one launch on a weaker
+   *  machine erase the preference for every other.
    *
-   *  Nothing here alters what the *game* draws: the capture layer forwards
-   *  every call to the original runtime unchanged, so an override repaints the
-   *  Vulkan frame and leaves `GKPLUS_RENDERER=d3d8` and `d3d9` untouched. */
-  export interface Render {
-    /** Register, replace or (with a null spec) remove the override for `name`,
-     *  a case-insensitive substring of a texture's `.rim` path.
-     *
-     *  Returns the readback rather than nothing, because the one thing that can
-     *  go wrong is silent: a substring matching no live image, or matching more
-     *  than was meant, is not an error and cannot be seen from the call.
-     *
-     *      render.material_override("gunlok_mk2", {tint: [1, 0, 1]});
-     *      render.material_override("gunlok_mk2", {texture: "hark_512"});
-     *      render.material_override("gunlok_mk2", null);
-     */
-    material_override(name: string, spec?: MaterialOverrideSpec | null): string;
-    /** Every registration, the live images each key matches, and how many draws
-     *  they have touched. A key that matches an asset the camera cannot see
-     *  resolves and reports exactly like one that is on screen - the draw
-     *  counts are what tell them apart. */
-    readonly material_overrides: string;
-    clear_material_overrides(): void;
-
-    /** How much of the last frame's geometry carries **smooth** normals, as text.
-     *
-     *  The measurement a tessellation stage has to be built against. PN triangles
-     *  curve a patch by exactly the term `dot(Pj - Pi, Ni)`, so a corner whose
-     *  normal is perpendicular to both of its edges contributes nothing at all:
-     *  every control point collapses to the linear one and the patch **is** the
-     *  flat triangle it started as. That makes a hard edge free rather than a
-     *  heuristic -- and it also means a mesh whose vertex normals are all face
-     *  normals is one tessellation cannot change.
-     *
-     *  The reported number is `|dot(normalize(edge), normal)|`, the tangent term
-     *  normalised by edge length, taken as the worse of a corner's two edges. It
-     *  is the quantity the construction actually uses rather than a proxy: a
-     *  corner reading `d` bulges its edge by about `d * length / 3`.
-     *
-     *  Bucketed into the level mesh and everything else, because the two are
-     *  authored by different tools. A REPL diagnostic only -- it reads the arena
-     *  back, which submits and waits twice per draw. */
-    normal_census(): string;
-
-    /** **Where two triangles meet, do their two PN patches agree?** As text.
-     *
-     *  The question that comes after `normal_census`, and the one that decides
-     *  whether tessellation tears the level mesh open. The watertight property
-     *  PN triangles rest on is conditional, and the condition is about the
-     *  *data*: the boundary curve for edge (P1,P2) is a function of P1, P2, N1
-     *  and N2 alone, so the two triangles sharing it agree **provided each
-     *  presents the same position and normal at each end**. Where the mesh has
-     *  split a corner into two vertices with different normals -- what an
-     *  exporter does at a material boundary -- the two curves run between the
-     *  same two points by different routes and the patches pull apart.
-     *
-     *  Edges are keyed on the **bit patterns of their endpoint positions**, so a
-     *  split corner reads as one edge rather than two. The reported gap is in
-     *  world units, at the live `pn_strength` / `pn_flat_threshold` /
-     *  `pn_max_offset`, so sweeping a knob and re-reading this prices it.
-     *
-     *  A REPL diagnostic only, and heavier than `normal_census`: it holds a map
-     *  keyed on every distinct edge in the frame. */
-    seam_census(): string;
+   *  An environment variable still outranks the file, per knob rather than
+   *  wholesale - `GKPLUS_VK_MSAA` pins the sample count and says nothing about
+   *  HDR.
+   *
+   *  The Vulkan investigation's measurement surface is `render.debug`, which
+   *  persists nothing. */
+  /** `render.tess` - the PN-triangle amplification pass.
+   *
+   *  Every knob here persists; see {@link Render}. */
+  export interface RenderTess {
 
     /** **PN-triangle amplification over the level mesh.** Off by default.
      *
@@ -2673,7 +2793,15 @@ declare module "gk" {
      *  reproducing D3D. Reads back `false` on a device with no
      *  `tessellationShader` even after being set -- the getter answers "is this
      *  happening", not "was it asked for". */
-    tessellation: boolean;
+    enabled: boolean;
+
+    /** Whether the shadow passes amplify with the colour pass. On.
+     *
+     *  Separable because the bake is where the cost is, so a frame-time
+     *  regression can be pinned to one half. Note the shadow passes take one
+     *  pipeline for their whole caster set, so with `tess_set = "map"` a prop's
+     *  shadow follows a smoothed silhouette its geometry does not have. */
+    shadows: boolean;
 
     /** Which draws are amplified: `"map"` (the level mesh, the default),
      *  `"all"` (props and units too) or `"off"`.
@@ -2688,15 +2816,21 @@ declare module "gk" {
      *
      *  Level02 alone says the opposite -- 53% of its props' corners are curved --
      *  and it is the outlier, not the rule. */
-    tess_set: "map" | "all" | "off";
+    set: "map" | "all" | "off";
 
-    /** Whether the shadow passes amplify with the colour pass. On.
-     *
-     *  Separable because the bake is where the cost is, so a frame-time
-     *  regression can be pinned to one half. Note the shadow passes take one
-     *  pipeline for their whole caster set, so with `tess_set = "map"` a prop's
-     *  shadow follows a smoothed silhouette its geometry does not have. */
-    tess_shadows: boolean;
+    /** The screen-space edge length, in the render target's pixels, that a
+     *  tessellation factor aims for. An edge covering twice this gets 2. */
+    edge_pixels: number;
+    /** The ceiling on a factor, clamped to the device's
+     *  `maxTessellationGenerationLevel`. */
+    max: number;
+    /** The floor. Above 1 it forces uniform amplification, which is how the
+     *  shape can be judged without the factors varying underneath it. */
+    min: number;
+    /** The shadow passes' factor, uniform over every edge -- which makes those
+     *  passes watertight for free, since a constant cannot disagree with itself
+     *  across a shared edge. */
+    shadow_factor: number;
 
     /** **Keep a material boundary from tearing open.** On by default.
      *
@@ -2718,21 +2852,7 @@ declare module "gk" {
      *  has to read 0. Turning this off reproduces the tear. The table is built
      *  from an arena readback spread over a few frames after a level loads, so
      *  the census's `still queued` is non-zero while it converges. */
-    pn_seam_fix: boolean;
-
-    /** The screen-space edge length, in the render target's pixels, that a
-     *  tessellation factor aims for. An edge covering twice this gets 2. */
-    tess_edge_pixels: number;
-    /** The ceiling on a factor, clamped to the device's
-     *  `maxTessellationGenerationLevel`. */
-    tess_max: number;
-    /** The floor. Above 1 it forces uniform amplification, which is how the
-     *  shape can be judged without the factors varying underneath it. */
-    tess_min: number;
-    /** The shadow passes' factor, uniform over every edge -- which makes those
-     *  passes watertight for free, since a constant cannot disagree with itself
-     *  across a shared edge. */
-    tess_shadow_factor: number;
+    seam_fix: boolean;
 
     /** How much of the PN tangent term survives: 1 the full construction, 0
      *  exactly linear.
@@ -2786,45 +2906,12 @@ declare module "gk" {
      *  exactly the cap instead of snapping flat, and watertight for the same
      *  reason the floor is: a function of `(Pi, Pj, Ni)` alone. */
     pn_max_offset: number;
+  }
 
-    /** D3D8's light sum, evaluated **per pixel** instead of per vertex.
-     *
-     *  On by default, and the first thing in this namespace that deliberately
-     *  departs from the original rather than reproducing it. The equation is
-     *  unchanged - the same lights, the same attenuation and spot terms, the same
-     *  `N·L > 0` gate on the specular sum. What changes is what gets interpolated
-     *  across a triangle: a finished colour, or the position and normal that
-     *  colour is computed from.
-     *
-     *  Gouraud shading cannot represent a highlight smaller than a triangle or a
-     *  point light's falloff across one, so the difference concentrates on
-     *  curved and finely-tessellated geometry - a unit, a projectile - and is
-     *  near zero on flat ground. Judge it there, not on a whole-frame average.
-     *
-     *  `false` restores the fixed-function path bit-identically, which is what
-     *  makes it A/B-able on one paused frame.
-     *  `GKPLUS_VK_PER_PIXEL_LIGHTING=0` is the launch-time form. */
-    per_pixel_lighting: boolean;
-
-    /** The world pass's MSAA sample count. `1` is off and is the default.
-     *
-     *  Write `2`, `4` or `8`; anything else **rounds down** to a power of two
-     *  the device supports, so no value throws and `render.status` is where an
-     *  unsupported request shows up. Antialiases geometric edges, the stencil
-     *  shadow volumes included - it does nothing for the alpha-*tested*
-     *  cutouts (sprites, foliage), which need alpha-to-coverage.
-     *
-     *  **Takes effect on the next frame, not on the write.** The setter records
-     *  a number; rebuilding the multisampled target, the depth buffer and every
-     *  cached pipeline happens between frames, under the same wait a resize
-     *  takes. So this reads back the count in force rather than the one
-     *  requested, and a read straight after a write still answers the old
-     *  value - bind a control to your own pending value, not to this, or it
-     *  fights itself for one frame.
-     *
-     *  `GKPLUS_VK_MSAA=4` sets what the first frame comes up at; the knob stays
-     *  writable afterwards either way. */
-    msaa: number;
+  /** `render.hdr` - the float target and the tonemap pass.
+   *
+   *  Every knob here persists; see {@link Render}. */
+  export interface RenderHdr {
 
     /** Render the world into a float target and tonemap it to the swapchain.
      *
@@ -2853,7 +2940,7 @@ declare module "gk" {
      *  Needs the offscreen target, so it is inert with {@link offscreen} off or
      *  on a surface that will not take `TRANSFER_DST`.
      *  In {@link stock}'s set. `GKPLUS_VK_HDR=1` is the launch-time form. */
-    hdr: boolean;
+    enabled: boolean;
 
     /** sRGB-decode the fragment's **final** colour, so the framebuffer blend
      *  and the tonemap run on light. On by default, inert without {@link hdr}.
@@ -2922,14 +3009,20 @@ declare module "gk" {
      *  operator alone (`agx` reads no parameter but {@link exposure}). Below it the curve is exactly `y = x`; above it the
      *  remaining headroom is compressed with a C1 join, asymptotic to 1, so no
      *  finite input ever clips and there is no crease at the knee. */
-    tonemap_knee: number;
+    knee: number;
 
     /** The linear value that maps to exactly 1.0, 4.0 by default - the
      *  magnitude of the over-range that actually reaches the pass in this game.
      *  Read by `reinhard` and by `filmic`, which mean the same thing by it.
      *  Hable's own default for the latter is 11.2, which belongs to a different
      *  exposure convention. */
-    tonemap_white: number;
+    white: number;
+  }
+
+  /** `render.bloom` - bloom, in three independent layers.
+   *
+   *  Every knob here persists; see {@link Render}. */
+  export interface RenderBloom {
 
     /** Bloom: the over-range part of the world image, blurred at three
      *  separate scales and added back inside the tonemap pass. Off by default
@@ -2949,7 +3042,7 @@ declare module "gk" {
      *
      *  Reads back as *requested*, like {@link hdr} - so a checkbox can bind here
      *  directly. `GKPLUS_VK_BLOOM=1` is the launch-time form. */
-    bloom: boolean;
+    enabled: boolean;
 
     /** One bloom layer's five parameters. Three layers, indices 0, 1 and 2, in
      *  increasing scale - 240, 120 and 60 lines tall respectively, which is a
@@ -2974,7 +3067,7 @@ declare module "gk" {
      *  @throws if `index` is not 0, 1 or 2, or if `blend` is not one of the four
      *  names - a typo behaving as `off` would read as "bloom does nothing on
      *  this machine". */
-    bloom_layer(index: number, spec?: BloomLayerSpec | null): BloomLayer;
+    layer(index: number, spec?: BloomLayerSpec | null): BloomLayer;
 
     /** The three layers, the size each is running at, the sigma each radius
      *  works out to in that layer's own texels, and whether the pass is doing
@@ -2984,47 +3077,297 @@ declare module "gk" {
      *  from the knobs: the layer extents, whether a kernel hit its tap cap, and
      *  which of "off", "the pass did not build on this device" and "inert - it
      *  needs {@link hdr}" is the case. */
-    readonly bloom_layers: string;
+    readonly layers: BloomState;
+  }
 
-    /** Every deliberate departure from D3D8, switched together.
+  /** `render.ao` - screen-space ambient occlusion.
+   *
+   *  Every knob here persists; see {@link Render}. */
+  export interface RenderAo {
+
+    /** Screen-space ambient occlusion, **with no blur pass**.
      *
-     *  `true` is the setup a fidelity comparison against
-     *  `GKPLUS_RENDERER=d3d8` needs, in one write rather than twelve - which is
-     *  the whole point, because the comparison worth making is on a *paused*
-     *  frame and twelve writes is twelve frames of drift on anything that
-     *  moves.
+     *  The kernel is one fixed Poisson disc shared by every pixel rather than a
+     *  randomised one, so the output is not noise and needs no blur to become
+     *  usable - which is what removes the halo around every silhouette that a
+     *  blurred AO carries. It matters more here than it would generally: Gunlok
+     *  renders 640x480, where a blur radius is a large fraction of a character.
      *
-     *  The set is exactly what each knob already documents as "off is the build
-     *  before it existed": `per_pixel_lighting`, `map_lighting`,
-     *  `lighting_maps`, the four shadow systems the game never had
-     *  (`sun_shadows`, `map_shadows`, `dynamic_shadows`, `local_shadows`), and
-     *  `ao`, `tessellation`, `msaa`, `hdr` and `bloom` - the last five off by
-     *  default already, and here so a session that turned them on is not one
-     *  this lies about. `hdr`'s own sub-knobs (`linear_input`, `tonemap`,
-     *  `exposure`, `tonemap_knee`, `tonemap_white`) are deliberately **not** in
-     *  the set: with `hdr` off none of them does anything, and an operator the
-     *  user chose has no business being part of what "the stock look" means.
-     *  The bloom layers are out for the same reason one level down - `bloom` is
-     *  in the set because the original could not do it at all, and the fifteen
-     *  numbers under it only describe how it looks.
+     *  Two passes. A prepass rasterises the frame's opaque geometry - the same
+     *  caster set the sun's shadow uses - and writes a **world position** and
+     *  normal per pixel; the resolve walks the disc in screen space, reconstructs
+     *  nothing, and counts how many taps land inside the half-ball at the centre
+     *  pixel. There is no matrix anywhere in it.
      *
-     *  The fidelity knobs are **not** in it - `half_pixel`, `rhw_depth_raw`,
-     *  `viewport_rect`, `shade_mode`, `local_lights`, `map_light_cull`. For
-     *  those, on *is* the reproduction. Nor is `stencil_shadow`: the game's own
-     *  blob shadow comes back on its own once the sun's map stops drawing a
-     *  real one.
+     *  **Off.** The game never had ambient occlusion, so nothing here can be
+     *  measured as closer to D3D8 and off is bit-identical to the build before it
+     *  existed. Judge it on `ao_debug` and on a region, not on a whole-frame
+     *  number. */
+    enabled: boolean;
+
+    /** The hemisphere's radius, in **world units** - what "near enough to
+     *  occlude" means. Level02's mean map edge is 1.952 units and the sun's sharp
+     *  cascade is 8.75 across, which is the scale to think in.
      *
-     *  **`false` restores the session, not the defaults.** Switching to stock
-     *  snapshots the twelve first, so a `local_shadows` that was off before
-     *  returns to off. Only those twelve switches move - `shadow_bias`,
-     *  `map_light_gain`, `bump_scale` and every other parameter under them
-     *  survive the round trip untouched.
+     *  3, and that is a sweep: at level02's settled camera the occluded
+     *  fraction of the debug view goes 0.341 / 0.384 / 0.412 / 0.417 for 0.75 /
+     *  1.5 / 3 / 6, so 3 is the knee past which the disc binds instead and only
+     *  the over-darkening keeps growing. */
+    radius: number;
+
+    /** The disc's radius, as a **fraction of the frame's height**, and
+     *  deliberately independent of `ao_radius`. Constant across the frame, which
+     *  is the technique's whole performance argument - every pixel walks the same
+     *  texel pattern, the friendliest case there is for the texture cache. A
+     *  value derived once per frame from the target size is still one constant,
+     *  so this costs that nothing.
      *
-     *  Reads back derived: `true` only while all twelve are configured off, so
-     *  turning one back on by hand makes this read `false` rather than leaving
-     *  a mode flag that disagrees with the frame.
-     *  `GKPLUS_VK_STOCK=1` is the launch-time form. */
-    stock: boolean;
+     *  Not a pixel count, because the render extent is not a constant: 640x480 on
+     *  the machine the notes' numbers come from, 3072x1728 on another. 0.07,
+     *  which is 34 pixels at 480 lines and 121 at 1728.
+     *
+     *  A constant screen radius is affordable here in a way it would not be
+     *  generally: Gunlok's camera is a fixed-height orbit, so one frame's depth
+     *  spread is narrow and a constant screen radius is very nearly a constant
+     *  world one. */
+    screen_radius: number;
+
+    /** How far along the normal a tap has to be before it counts, in world units.
+     *  The self-occlusion knob: too low and a flat wall shades itself out of its
+     *  own quantisation, too high and a shallow crease stops registering. 0.05. */
+    bias: number;
+
+    /** A scale on the occlusion before it leaves the resolve pass, so the target
+     *  already carries the artistic weight and the world shader stays a plain
+     *  multiply. 1. */
+    strength: number;
+
+    /** How much the occlusion also scales **D3D's own** diffuse sum - the sun and
+     *  the level's dynamic lights. Not the map rig, which is occluded in full
+     *  whatever this says.
+     *
+     *  The split is what each set of lights *is*. The `STDLIGHT` rig is 51 static
+     *  lights on level02 whose whole job was to bake that level's vertex colours -
+     *  an environment, and exactly what occlusion is about. D3D's are few and
+     *  dynamic, and every one of them already has a shadow map answering "is this
+     *  light blocked" exactly, per light - so 0 here is the no-double-counting
+     *  setting rather than a taste one. 1 darkens them too, for a stylised look.
+     *
+     *  The specular is never occluded at any setting: a highlight is a mirror of
+     *  one light in one direction, and nearby geometry says nothing about whether
+     *  that particular path is clear. */
+    direct: number;
+
+    /** How many of the 64-point disc to walk, 1..64. **All of them**, and this is
+     *  not a quality dial with a cheap end.
+     *
+     *  A fixed kernel cannot trade its artefact for noise the way a randomised one
+     *  does, so an under-sampled disc does not go grainy - it goes *structured*.
+     *  Each tap contributes a shifted copy of every occluder's silhouette, and at
+     *  32 points over a wide disc those copies are individually visible: measured
+     *  on level02, where each character left a fan of its own outlines. A blur
+     *  would hide that, and there is no blur here to hide it.
+     *
+     *  **32 is exactly the pattern the technique's author published** - a lattice
+     *  with each point nudged off its cell, not blue noise and not random. The
+     *  other 32 are the same lattice half a cell over. The whole set is
+     *  maximin-ordered, so any smaller count is still a well-spread subset.
+     *
+     *  The cost is linear in this and in nothing else. */
+    taps: number;
+
+    /** Restrict the term to the map's own geometry. **On**, and it is the same
+     *  restriction runtime map lighting carries, for the same reason: a prop or a
+     *  unit is a separate `RBOBJECT` whose vertex colours were baked from its own
+     *  file's lights, and that bake already contains occlusion. Applying this on
+     *  top of it darkens the same crease twice. */
+    map_only: boolean;
+  }
+
+  /** `render.sun_shadow` - the sun's cascaded shadow map.
+   *
+   *  Every knob here persists; see {@link Render}. */
+  export interface RenderSunShadow {
+
+    /** A real shadow map from the sun - the first shadow in Gunlok that is not a
+     *  blob under a unit. Four concentric cascades in one 2x2 atlas of 2048
+     *  tiles, centred on the camera's orbit pivot, 3x3 PCF.
+     *
+     *  On by default. A level with no sun set produces no matrix and therefore
+     *  no shadow, which from the screen is the same as this being off -
+     *  `render.draws` is what tells the two apart. */
+    enabled: boolean;
+
+    /** The sun shadow's depth offset, **in shadow-map texels of whichever cascade
+     *  the fragment landed in**.
+     *
+     *  Texels rather than depth units because that is the unit acne is measured
+     *  in: the depth error a flat surface accumulates across one texel is the
+     *  texel's world size times the surface's slope in light space. So one value
+     *  holds on every cascade, on every level and at every `shadow_extent`, which
+     *  a value in depth units does not.
+     *
+     *  2.5 by default, which is the knee of a sweep rather than a guess. Below it
+     *  level04 shadows itself everywhere; above it the shadow shrinks away from
+     *  its caster at 0.04-0.3% of the frame per texel. */
+    bias: number;
+
+    /** How dark a sun-shadowed fragment goes, 0 to 1. **The one knob here that is
+     *  not a fidelity question**, because the game never had a real shadow and so
+     *  has no ground truth for it.
+     *
+     *  1 is the physically correct value rather than the maximum one: the shadow
+     *  attenuates only the diffuse and specular terms, so 1 means "no sunlight
+     *  reaches here" while the ambient and the level's own baked colour still
+     *  light the surface. 0.7 is the default, and both bounds are measured -
+     *  0.55 leaves level04's unit shadows reading as a smudge, and 1.0 takes
+     *  level02's covered start to 36% of its authored brightness. */
+    strength: number;
+
+    /** Half the width of the box the **outermost** cascade covers, in world
+     *  units, centred on the camera's orbit pivot. So this is the range at which
+     *  shadows stop, and `extent / 2^(cascades-1)` is the sharp near field.
+     *
+     *  70 by default, which is Gunlok's own `camera.max_distance` of 75 rounded
+     *  down: it covers everything the camera can ever see. Raising it to 200 buys
+     *  0.2% of the frame. */
+    extent: number;
+
+    /** How many of the four cascades are live, 1..4.
+     *
+     *  **1 is the single map this started as**, at the same texel density, which
+     *  is what makes cascading A/B-able on one paused frame. Each cascade is half
+     *  the extent of the one outside it, so four of them put the near field at
+     *  0.0085 world units per texel against a single map's 0.068 - and cost about
+     *  1.7 ms, since the caster list is walked once per cascade. */
+    cascades: number;
+
+    /** How wide a sun shadow's edge is, decided per fragment by what casts it
+     *  (PCSS). **0 is off and is the default**, and off is the fixed 3x3 filter
+     *  this renderer had before - bit-identically, because the shader tests this
+     *  one number rather than approximating that kernel with a wider one.
+     *
+     *  The value is **the tangent of the sun's angular radius**: the penumbra's
+     *  world radius per world unit between a fragment and whatever shadows it. So
+     *  it is not a filter width and does not depend on the map's resolution, the
+     *  cascade count or `shadow_extent` - one number holds across all of them, in
+     *  the way `shadow_bias` being in texels does for the bias. A foot on the
+     *  ground stays sharp; the shadow of a roof three metres up goes soft.
+     *
+     *  The real sun's is about 0.00465, which at this game's scale is invisible,
+     *  so a usable value is a stylistic choice rather than a physical one -
+     *  0.02 to 0.08 is the range worth looking at. Like `ao`, `hdr` and `bloom`
+     *  this is a departure from what D3D8 drew, so a residual against the
+     *  original says how far it reaches and never whether it is any good. */
+    softness: number;
+
+    /** The floor and ceiling on PCSS's filter radius, in texels of whichever
+     *  cascade the fragment landed in. Inert while `shadow_softness` is 0.
+     *
+     *  1 is the floor by default because that is exactly the 3x3's own radius, so
+     *  a contact shadow is never *less* filtered than it was before PCSS. The
+     *  ceiling, 24, bounds two things at once: how sparse a fixed tap count may
+     *  get before a penumbra bands, and how far a tap may stray from its own
+     *  cascade tile, whose edge the shader clamps at.
+     *
+     *  **The ceiling is also the blocker search radius**, which is why there is
+     *  no third knob - a blocker further away than this could only ask for a
+     *  penumbra the ceiling clamps back to the ceiling. */
+    soft_min: number;
+    soft_max: number;
+
+    /** How many taps of the shader's 32-entry disc each of PCSS's two loops
+     *  walks, 1 to 32. 16 by default.
+     *
+     *  The cost is *up to* twice this against the hard path's nine: a fragment
+     *  whose blocker search finds nothing returns lit without running the filter
+     *  at all, which is most of an open frame. */
+    soft_taps: number;
+
+    /** Which of the two soft filters runs, and it is the one real choice in
+     *  this feature. **On by default**, and inert while `shadow_softness` is 0.
+     *
+     *  Off: the filter runs inline in the world shader over one fixed pattern
+     *  shared by every pixel. No extra pass and no target - and a ceiling on
+     *  quality, because a fixed pattern cannot trade its artefact for noise, so
+     *  an under-sampled kernel leaves a fan of shifted copies of every
+     *  occluder's silhouette rather than grain.
+     *
+     *  On: a **screen-space mask**. The kernel is rotated per pixel from a 4x4
+     *  tile of the pixel's coordinates and a 4x4 bilateral blur resolves it -
+     *  the two being the same size is what makes the blur exact, since a
+     *  four-wide window covers each of the sixteen rotations exactly once. The
+     *  same tap count therefore buys sixteen times the samples.
+     *
+     *  What it costs is a full-screen resolve, a blur, and **the geometry
+     *  prepass it shares with `ao`** - so with AO already on it is two
+     *  full-screen passes, and with AO off it is those plus a depth-only walk
+     *  over the frame's solid geometry.
+     *
+     *  The mask is consulted only where the prepass saw the same surface the
+     *  world shader is shading; everything else falls back on the inline
+     *  filter, so nothing loses its shadow because a screen-space pass could
+     *  not see it. */
+    soft_blur: boolean;
+  }
+
+  /** `render.map_shadow` - the static map-geometry shadow atlas.
+   *
+   *  Every knob here persists; see {@link Render}. */
+  export interface RenderMapShadow {
+
+    /** Real shadows for the level's own `STDLIGHT` rig - one six-face cube per
+     *  light in a 32 MB atlas, baked once per level from the map's own geometry.
+     *
+     *  **On, and play is what settled it.** It shipped off because no measurement
+     *  could say whether the picture with these shadows was the right one - the
+     *  game never had them - and then the first report from actually playing was
+     *  that the map lights do not cast any. Cost was never the objection: 0.50 ms
+     *  on level01, the level with the most map lights in the game, and nothing
+     *  measurable on level02.
+     *
+     *  Needs `map_lighting`, which is what evaluates that rig at all. The bake is
+     *  gated on this too, so off costs nothing; turning it back on restarts it,
+     *  and `map_shadow_report` says when it has finished. */
+    enabled: boolean;
+
+    /** How far a map-light shadow lookup is moved along the surface normal
+     *  before it is projected, in atlas texels at that fragment's own distance
+     *  from the light.
+     *
+     *  A **normal** offset rather than a depth one because a 64-texel cube face
+     *  is coarse - a texel is `distance / 32` world units - so the error is
+     *  dominated by the surface's slope, and a depth offset large enough to
+     *  cancel it would detach every shadow by metres. 1.0 by default, the larger
+     *  of two knees: level02's acne is gone by 0.25 and level04's needs about 1.
+     *
+     *  **`= 0` is the sharpest picture of what the atlas holds** - per-light acne
+     *  with cube-face stair-stepping and coloured fringes, one colour per light. */
+    bias: number;
+
+    /** How many map lights the bake does per frame, picking up where it left off.
+     *
+     *  256 with indirect drawing and 4 without, taken from the path at startup.
+     *  With one indirect command a face the whole bake is a few milliseconds, so
+     *  level01's 682 lights land in three frames; the fallback issues a draw call
+     *  per caster per face and wants spreading. Writing this **re-bakes from the
+     *  start**, so only write it when it has actually changed. */
+    rate: number;
+
+    /** Whether the bake submits one `vkCmdDrawIndexedIndirect` per cube face or a
+     *  draw call per caster per face - 4,092 commands against 804,924 on level01.
+     *
+     *  On wherever the device has `multiDrawIndirect`. **The two must produce the
+     *  same atlas and this is the only thing that can say so**, so writing it
+     *  rebuilds the pipeline and re-bakes; on a device without the feature it
+     *  does nothing and reads back false. */
+    indirect: boolean;
+  }
+
+  /** `render.map_light` - the level's own `.rif` light rig.
+   *
+   *  Every knob here persists; see {@link Render}. */
+  export interface RenderMapLight {
 
     /** Replace the level's **baked** per-vertex lighting with a per-pixel evaluation
      *  of the light rig that produced it.
@@ -3042,7 +3385,17 @@ declare module "gk" {
      *  Applies to the map's own geometry only. A prop or a unit carries its own
      *  file's bake from its own rig, and substituting the level's there measures
      *  worse; `map_lighting_all` lifts the restriction so that stays checkable. */
-    map_lighting: boolean;
+    enabled: boolean;
+    /** The model's one free parameter. Default 1.35, the mean of the values fitted per
+     *  level (1.1 on level01, 1.5 on level04 and level05) -- so it is a lever rather
+     *  than a calibration.
+     *
+     *  It moved from 1.2 when the falloff's tail was windowed to kill the visible rim
+     *  around every light, and had to: a dimmer tail refits to a brighter gain. */
+    gain: number;
+    /** Substitute on every lit draw rather than only the map geometry. Off, and the
+     *  default is a measurement -- see `map_lighting`. */
+    all: boolean;
     /** Bin the map's lights into a world-space grid so a fragment reads only its
      *  own cell, instead of looping every light in the level. On.
      *
@@ -3051,21 +3404,78 @@ declare module "gk" {
      *  every fragment in it -- the grid drops nothing. That makes this a
      *  correctness A/B rather than a quality trade, and the only test that can
      *  catch a cell quietly missing a light. */
-    map_light_cull: boolean;
-    /** Substitute on every lit draw rather than only the map geometry. Off, and the
-     *  default is a measurement -- see `map_lighting`. */
-    map_lighting_all: boolean;
-    /** The model's one free parameter. Default 1.35, the mean of the values fitted per
-     *  level (1.1 on level01, 1.5 on level04 and level05) -- so it is a lever rather
-     *  than a calibration.
+    cull: boolean;
+  }
+
+  /** `render.local_light` - D3D's point and spot lights.
+   *
+   *  Every knob here persists; see {@link Render}. */
+  export interface RenderLocalLight {
+
+    /** Whether D3D's point and spot lights are in the light sum at all. On.
      *
-     *  It moved from 1.2 when the falloff's tail was windowed to kill the visible rim
-     *  around every light, and had to: a dimmer tail refits to a brighter gain. */
-    map_light_gain: number;
-    /** Which `.rif` the lights came from, how many, the ambient floor, and their world
-     *  bounds beside the map's own -- which is the reading that says the unit scale
-     *  and origin were applied correctly. */
-    readonly map_light_report: string;
+     *  **A diagnostic, and the one that prices `local_shadows`**: off drops them
+     *  and keeps the directionals, so a paused A/B paints exactly the pixels they
+     *  reach - and since a shadow only ever removes light, that set strictly
+     *  contains anything shadowing them could change. It measures 0.75% of
+     *  level02's settled start, 2.34% at its fire camera and 0.63% on level04,
+     *  against the sun's 17%. */
+    enabled: boolean;
+
+    /** Shadows from **the game's own D3D point and spot lights** - level02's fires,
+     *  and anything a `.gcs` adds with `ADD LIGHT`. A different light system from
+     *  `map_shadows` above, sharing the same static atlas: sixteen of its 682
+     *  slots are reserved for these.
+     *
+     *  On. It is affordable because a LEVEL's own local lights are few and do not
+     *  move - five on level02's start, twelve at its fire camera, four on level04,
+     *  none on prison - so a cube per light is baked once and sampled behind the
+     *  same range, `N·L` and cone rejections the map lights' lookup sits behind.
+     *  Nothing measurable on level02.
+     *
+     *  **An effect's light is a different animal and gets nothing.** An explosion's
+     *  light rides a particle, so it moves every frame, never survives the gate
+     *  below and never casts - one `fx.explode` in view leaves ~30 distinct
+     *  contents behind. Effects are also where the game's only spot lights come
+     *  from.
+     *
+     *  **A light that moves gets no shadow rather than a wrong one.** A D3D light
+     *  has no identity across frames, so a slot is held under a key made of the
+     *  light's position, range and cone - deliberately not its colour, since
+     *  `ADD BLINKING LIGHT` rewrites exactly that - and a key must survive four
+     *  frames before it claims one. A light on a track, or a mod's light on a
+     *  projectile, therefore never claims a slot and costs nothing. */
+    shadows: boolean;
+
+    /** The PCF radius for D3D's point and spot lights. The one knob in this
+     *  family that trades frame time directly against the artefact, which is why
+     *  it is settable in a session rather than fixed in a build. */
+    shadow_taps: number;
+  }
+
+  /** `render.dynamic_shadow` - the per-frame shadow atlas.
+   *
+   *  Every knob here persists; see {@link Render}. */
+  export interface RenderDynamicShadow {
+
+    /** The per-frame shadow atlas: every D3D point and spot light in the frame
+     *  gets a cube, cast by every opaque thing in the frame - so a light that
+     *  *moves* casts, and a unit or a barrel is a caster. On by default.
+     *
+     *  It supersedes `local_shadows` for any light it has room for; that one is
+     *  the fallback for the rest, so both being on is the normal setup rather
+     *  than a duplication. The bisects that narrow the bake are on
+     *  `render.debug`. */
+    enabled: boolean;
+
+    /** Depth bias for that atlas, in the same units as `shadow_bias`. */
+    bias: number;
+  }
+
+  /** `render.lighting_map` - the bump/highlight response from a companion `<texture> lighting.dds`.
+   *
+   *  Every knob here persists; see {@link Render}. */
+  export interface RenderLightingMap {
 
     /** Lighting maps: a companion `<texture> lighting.dds` beside a `.RIM`, in a
      *  mod under `gkplus/mods` or in the install itself, giving that one texture
@@ -3082,12 +3492,7 @@ declare module "gk" {
      *  existed, so it A/Bs on one paused frame at a 0.000 noise floor - and
      *  setting it back to `true` **re-reads every file**, which is how a map
      *  edited while the game is running is picked up. */
-    lighting_maps: boolean;
-    /** Which names were probed, what was found for them and where it came from,
-     *  plus the current knobs. Worth reading before concluding a map does not
-     *  work: a texture with no companion file is the normal case, so a misnamed
-     *  file and a stock install look identical from the screen. */
-    readonly lighting_map_report: string;
+    enabled: boolean;
     /** How far the height gradient may tilt the normal. 1.0 (the default) makes a
      *  full-contrast step across one texel a 45-degree slope. Per texel, so a
      *  higher-resolution map is gentler for the same artwork. */
@@ -3148,6 +3553,75 @@ declare module "gk" {
      *  chrome variant asks D3D for `D3DTSS_TCI_CAMERASPACENORMAL`, which is the
      *  camera-space normal's xy. False reproduces the engine's per-unit path. */
     chrome_texgen: boolean;
+  }
+
+  /** `render.material` - retexturing, tinting and hiding by `.rim` name.
+   *
+   *  Every knob here persists; see {@link Render}. */
+  export interface RenderMaterial {
+    /** Register, replace or (with a null spec) remove the override for `name`,
+     *  a case-insensitive substring of a texture's `.rim` path.
+     *
+     *  Returns the readback rather than nothing, because the one thing that can
+     *  go wrong is silent: a substring matching no live image, or matching more
+     *  than was meant, is not an error and cannot be seen from the call.
+     *
+     *      render.material_override("gunlok_mk2", {tint: [1, 0, 1]});
+     *      render.material_override("gunlok_mk2", {texture: "hark_512"});
+     *      render.material_override("gunlok_mk2", null);
+     */
+    override(
+      name: string,
+      spec?: MaterialOverrideSpec | null
+    ): MaterialOverridesState;
+    /** Every registration, the live images each key matches, and how many draws
+     *  they have touched. A key that matches an asset the camera cannot see
+     *  resolves and reports exactly like one that is on screen - the draw
+     *  counts are what tell them apart. */
+    readonly overrides: MaterialOverridesState;
+    clear(): void;
+  }
+
+  export interface Render {
+
+    /** The world pass's MSAA sample count. `1` is off and is the default.
+     *
+     *  Write `2`, `4` or `8`; anything else **rounds down** to a power of two
+     *  the device supports, so no value throws and `render.status` is where an
+     *  unsupported request shows up. Antialiases geometric edges, the stencil
+     *  shadow volumes included - it does nothing for the alpha-*tested*
+     *  cutouts (sprites, foliage), which need alpha-to-coverage.
+     *
+     *  **Takes effect on the next frame, not on the write.** The setter records
+     *  a number; rebuilding the multisampled target, the depth buffer and every
+     *  cached pipeline happens between frames, under the same wait a resize
+     *  takes. So this reads back the count in force rather than the one
+     *  requested, and a read straight after a write still answers the old
+     *  value - bind a control to your own pending value, not to this, or it
+     *  fights itself for one frame.
+     *
+     *  `GKPLUS_VK_MSAA=4` sets what the first frame comes up at; the knob stays
+     *  writable afterwards either way. */
+    msaa: number;
+
+    /** D3D8's light sum, evaluated **per pixel** instead of per vertex.
+     *
+     *  On by default, and the first thing in this namespace that deliberately
+     *  departs from the original rather than reproducing it. The equation is
+     *  unchanged - the same lights, the same attenuation and spot terms, the same
+     *  `N·L > 0` gate on the specular sum. What changes is what gets interpolated
+     *  across a triangle: a finished colour, or the position and normal that
+     *  colour is computed from.
+     *
+     *  Gouraud shading cannot represent a highlight smaller than a triangle or a
+     *  point light's falloff across one, so the difference concentrates on
+     *  curved and finely-tessellated geometry - a unit, a projectile - and is
+     *  near zero on flat ground. Judge it there, not on a whole-frame average.
+     *
+     *  `false` restores the fixed-function path bit-identically, which is what
+     *  makes it A/B-able on one paused frame.
+     *  `GKPLUS_VK_PER_PIXEL_LIGHTING=0` is the launch-time form. */
+    per_pixel_lighting: boolean;
 
     /** Run the specular term of the per-vertex light sum. The mirror image of
      *  `GKPLUS_NO_SPECULAR`, which forces `D3DRS_SPECULARENABLE` off in the
@@ -3158,6 +3632,181 @@ declare module "gk" {
      *
      *  On by default. */
     specular: boolean;
+
+    /** Draw the game's **own** blob shadow as well as the sun's map. Off by
+     *  default, since otherwise a unit carries both.
+     *
+     *  Its three passes are identified by stencil being enabled, which is exact
+     *  rather than a heuristic: over sixteen shipped levels the game draws with
+     *  22 distinct pipeline configurations, exactly 3 of them use stencil, and
+     *  all 3 are that shadow. A level someone else writes is not covered by that,
+     *  which is what this exists to check. */
+    stencil_shadow: boolean;
+
+    /** The pn-triangle amplification pass - see {@link RenderTess}. */
+    readonly tess: RenderTess;
+
+    /** The float target and the tonemap pass - see {@link RenderHdr}. */
+    readonly hdr: RenderHdr;
+
+    /** Bloom, in three independent layers - see {@link RenderBloom}. */
+    readonly bloom: RenderBloom;
+
+    /** Screen-space ambient occlusion - see {@link RenderAo}. */
+    readonly ao: RenderAo;
+
+    /** The sun's cascaded shadow map - see {@link RenderSunShadow}. */
+    readonly sun_shadow: RenderSunShadow;
+
+    /** The static map-geometry shadow atlas - see {@link RenderMapShadow}. */
+    readonly map_shadow: RenderMapShadow;
+
+    /** The level's own `.rif` light rig - see {@link RenderMapLight}. */
+    readonly map_light: RenderMapLight;
+
+    /** D3d's point and spot lights - see {@link RenderLocalLight}. */
+    readonly local_light: RenderLocalLight;
+
+    /** The per-frame shadow atlas - see {@link RenderDynamicShadow}. */
+    readonly dynamic_shadow: RenderDynamicShadow;
+
+    /** The bump/highlight response from a companion `<texture> lighting.dds` - see {@link RenderLightingMap}. */
+    readonly lighting_map: RenderLightingMap;
+
+    /** Retexturing, tinting and hiding by `.rim` name - see {@link RenderMaterial}. */
+    readonly material: RenderMaterial;
+
+
+    /** The measurement surface - see {@link RenderDebug}. */
+    readonly debug: RenderDebug;
+  }
+
+  /** The boolean, numeric and string members of any one `render` group - what a
+   *  generic widget binds to. `RenderBoolKey<RenderAo>` is `"enabled" | "map_only"`,
+   *  so naming a knob that is not a boolean, or does not exist in that group, is a
+   *  compile error.
+   *
+   *  Generic over the group because the namespace is nested now. `-?` strips the
+   *  optionality so a knob is not silently `undefined`-able. */
+  export type RenderBoolKey<T> = {
+    [K in keyof T]-?: T[K] extends boolean ? K : never;
+  }[keyof T];
+
+  export type RenderNumberKey<T> = {
+    [K in keyof T]-?: T[K] extends number ? K : never;
+  }[keyof T];
+
+  export type RenderStringKey<T> = {
+    [K in keyof T]-?: T[K] extends string ? K : never;
+  }[keyof T];
+
+  /** The renderer's measurement surface: probes, censuses, capture controls, the
+   *  read-only reports, and the A/B knobs whose default is already the correct
+   *  value.
+   *
+   *  **Nothing here persists**, and that is the point of it being separate. A
+   *  stored `draw_hide` would hide a draw on the next launch with nothing on
+   *  screen to say why, and `stock` reads back derived rather than as a mode
+   *  flag, so storing it would be meaningless.
+   *
+   *  It is also the only part of `render` that is loosely typed. The index
+   *  signature below is what keeps the undeclared half of the investigation
+   *  reachable; it used to sit on `render` itself, where it disabled typo
+   *  detection for all 135 members - `render.shadow_softnes = 0.02` type-checked
+   *  and silently did nothing. Members come and go here with whatever is being
+   *  measured, so do not read this as licence to leave a new *setting*
+   *  untyped. */
+  export interface RenderDebug {
+
+    /** How much of the last frame's geometry carries **smooth** normals, as text.
+     *
+     *  The measurement a tessellation stage has to be built against. PN triangles
+     *  curve a patch by exactly the term `dot(Pj - Pi, Ni)`, so a corner whose
+     *  normal is perpendicular to both of its edges contributes nothing at all:
+     *  every control point collapses to the linear one and the patch **is** the
+     *  flat triangle it started as. That makes a hard edge free rather than a
+     *  heuristic -- and it also means a mesh whose vertex normals are all face
+     *  normals is one tessellation cannot change.
+     *
+     *  The reported number is `|dot(normalize(edge), normal)|`, the tangent term
+     *  normalised by edge length, taken as the worse of a corner's two edges. It
+     *  is the quantity the construction actually uses rather than a proxy: a
+     *  corner reading `d` bulges its edge by about `d * length / 3`.
+     *
+     *  Bucketed into the level mesh and everything else, because the two are
+     *  authored by different tools. A REPL diagnostic only -- it reads the arena
+     *  back, which submits and waits twice per draw. */
+    normal_census(): string;
+
+    /** **Where two triangles meet, do their two PN patches agree?** As text.
+     *
+     *  The question that comes after `normal_census`, and the one that decides
+     *  whether tessellation tears the level mesh open. The watertight property
+     *  PN triangles rest on is conditional, and the condition is about the
+     *  *data*: the boundary curve for edge (P1,P2) is a function of P1, P2, N1
+     *  and N2 alone, so the two triangles sharing it agree **provided each
+     *  presents the same position and normal at each end**. Where the mesh has
+     *  split a corner into two vertices with different normals -- what an
+     *  exporter does at a material boundary -- the two curves run between the
+     *  same two points by different routes and the patches pull apart.
+     *
+     *  Edges are keyed on the **bit patterns of their endpoint positions**, so a
+     *  split corner reads as one edge rather than two. The reported gap is in
+     *  world units, at the live `pn_strength` / `pn_flat_threshold` /
+     *  `pn_max_offset`, so sweeping a knob and re-reading this prices it.
+     *
+     *  A REPL diagnostic only, and heavier than `normal_census`: it holds a map
+     *  keyed on every distinct edge in the frame. */
+    seam_census(): string;
+
+    /** Every deliberate departure from D3D8, switched together.
+     *
+     *  `true` is the setup a fidelity comparison against
+     *  `GKPLUS_RENDERER=d3d8` needs, in one write rather than twelve - which is
+     *  the whole point, because the comparison worth making is on a *paused*
+     *  frame and twelve writes is twelve frames of drift on anything that
+     *  moves.
+     *
+     *  The set is exactly what each knob already documents as "off is the build
+     *  before it existed": `per_pixel_lighting`, `map_lighting`,
+     *  `lighting_maps`, the four shadow systems the game never had
+     *  (`sun_shadows`, `map_shadows`, `dynamic_shadows`, `local_shadows`), and
+     *  `ao`, `tessellation`, `msaa`, `hdr` and `bloom` - the last five off by
+     *  default already, and here so a session that turned them on is not one
+     *  this lies about. `hdr`'s own sub-knobs (`linear_input`, `tonemap`,
+     *  `exposure`, `tonemap_knee`, `tonemap_white`) are deliberately **not** in
+     *  the set: with `hdr` off none of them does anything, and an operator the
+     *  user chose has no business being part of what "the stock look" means.
+     *  The bloom layers are out for the same reason one level down - `bloom` is
+     *  in the set because the original could not do it at all, and the fifteen
+     *  numbers under it only describe how it looks.
+     *
+     *  The fidelity knobs are **not** in it - `half_pixel`, `rhw_depth_raw`,
+     *  `viewport_rect`, `shade_mode`, `local_lights`, `map_light_cull`. For
+     *  those, on *is* the reproduction. Nor is `stencil_shadow`: the game's own
+     *  blob shadow comes back on its own once the sun's map stops drawing a
+     *  real one.
+     *
+     *  **`false` restores the session, not the defaults.** Switching to stock
+     *  snapshots the twelve first, so a `local_shadows` that was off before
+     *  returns to off. Only those twelve switches move - `shadow_bias`,
+     *  `map_light_gain`, `bump_scale` and every other parameter under them
+     *  survive the round trip untouched.
+     *
+     *  Reads back derived: `true` only while all twelve are configured off, so
+     *  turning one back on by hand makes this read `false` rather than leaving
+     *  a mode flag that disagrees with the frame.
+     *  `GKPLUS_VK_STOCK=1` is the launch-time form. */
+    stock: boolean;
+    /** Which `.rif` the lights came from, how many, the ambient floor, and their world
+     *  bounds beside the map's own -- which is the reading that says the unit scale
+     *  and origin were applied correctly. */
+    readonly map_light_report: string;
+    /** Which names were probed, what was found for them and where it came from,
+     *  plus the current knobs. Worth reading before concluding a map does not
+     *  work: a texture with no companion file is the normal case, so a misnamed
+     *  file and a stock install look identical from the screen. */
+    readonly lighting_map_report: string;
 
     /** Skip the upload path entirely when a vertex or index buffer is unlocked
      *  from a `D3DLOCK_READONLY` lock, which by contract changed nothing (§4.84).
@@ -3302,184 +3951,6 @@ declare module "gk" {
       height?: number
     ): string;
 
-    /** A real shadow map from the sun - the first shadow in Gunlok that is not a
-     *  blob under a unit. Four concentric cascades in one 2x2 atlas of 2048
-     *  tiles, centred on the camera's orbit pivot, 3x3 PCF.
-     *
-     *  On by default. A level with no sun set produces no matrix and therefore
-     *  no shadow, which from the screen is the same as this being off -
-     *  `render.draws` is what tells the two apart. */
-    sun_shadows: boolean;
-
-    /** How many of the four cascades are live, 1..4.
-     *
-     *  **1 is the single map this started as**, at the same texel density, which
-     *  is what makes cascading A/B-able on one paused frame. Each cascade is half
-     *  the extent of the one outside it, so four of them put the near field at
-     *  0.0085 world units per texel against a single map's 0.068 - and cost about
-     *  1.7 ms, since the caster list is walked once per cascade. */
-    shadow_cascades: number;
-
-    /** The sun shadow's depth offset, **in shadow-map texels of whichever cascade
-     *  the fragment landed in**.
-     *
-     *  Texels rather than depth units because that is the unit acne is measured
-     *  in: the depth error a flat surface accumulates across one texel is the
-     *  texel's world size times the surface's slope in light space. So one value
-     *  holds on every cascade, on every level and at every `shadow_extent`, which
-     *  a value in depth units does not.
-     *
-     *  2.5 by default, which is the knee of a sweep rather than a guess. Below it
-     *  level04 shadows itself everywhere; above it the shadow shrinks away from
-     *  its caster at 0.04-0.3% of the frame per texel. */
-    shadow_bias: number;
-
-    /** How dark a sun-shadowed fragment goes, 0 to 1. **The one knob here that is
-     *  not a fidelity question**, because the game never had a real shadow and so
-     *  has no ground truth for it.
-     *
-     *  1 is the physically correct value rather than the maximum one: the shadow
-     *  attenuates only the diffuse and specular terms, so 1 means "no sunlight
-     *  reaches here" while the ambient and the level's own baked colour still
-     *  light the surface. 0.7 is the default, and both bounds are measured -
-     *  0.55 leaves level04's unit shadows reading as a smudge, and 1.0 takes
-     *  level02's covered start to 36% of its authored brightness. */
-    shadow_strength: number;
-
-    /** Half the width of the box the **outermost** cascade covers, in world
-     *  units, centred on the camera's orbit pivot. So this is the range at which
-     *  shadows stop, and `extent / 2^(cascades-1)` is the sharp near field.
-     *
-     *  70 by default, which is Gunlok's own `camera.max_distance` of 75 rounded
-     *  down: it covers everything the camera can ever see. Raising it to 200 buys
-     *  0.2% of the frame. */
-    shadow_extent: number;
-
-    /** How wide a sun shadow's edge is, decided per fragment by what casts it
-     *  (PCSS). **0 is off and is the default**, and off is the fixed 3x3 filter
-     *  this renderer had before - bit-identically, because the shader tests this
-     *  one number rather than approximating that kernel with a wider one.
-     *
-     *  The value is **the tangent of the sun's angular radius**: the penumbra's
-     *  world radius per world unit between a fragment and whatever shadows it. So
-     *  it is not a filter width and does not depend on the map's resolution, the
-     *  cascade count or `shadow_extent` - one number holds across all of them, in
-     *  the way `shadow_bias` being in texels does for the bias. A foot on the
-     *  ground stays sharp; the shadow of a roof three metres up goes soft.
-     *
-     *  The real sun's is about 0.00465, which at this game's scale is invisible,
-     *  so a usable value is a stylistic choice rather than a physical one -
-     *  0.02 to 0.08 is the range worth looking at. Like `ao`, `hdr` and `bloom`
-     *  this is a departure from what D3D8 drew, so a residual against the
-     *  original says how far it reaches and never whether it is any good. */
-    shadow_softness: number;
-
-    /** The floor and ceiling on PCSS's filter radius, in texels of whichever
-     *  cascade the fragment landed in. Inert while `shadow_softness` is 0.
-     *
-     *  1 is the floor by default because that is exactly the 3x3's own radius, so
-     *  a contact shadow is never *less* filtered than it was before PCSS. The
-     *  ceiling, 24, bounds two things at once: how sparse a fixed tap count may
-     *  get before a penumbra bands, and how far a tap may stray from its own
-     *  cascade tile, whose edge the shader clamps at.
-     *
-     *  **The ceiling is also the blocker search radius**, which is why there is
-     *  no third knob - a blocker further away than this could only ask for a
-     *  penumbra the ceiling clamps back to the ceiling. */
-    shadow_soft_min: number;
-    shadow_soft_max: number;
-
-    /** How many taps of the shader's 32-entry disc each of PCSS's two loops
-     *  walks, 1 to 32. 16 by default.
-     *
-     *  The cost is *up to* twice this against the hard path's nine: a fragment
-     *  whose blocker search finds nothing returns lit without running the filter
-     *  at all, which is most of an open frame. */
-    shadow_soft_taps: number;
-
-    /** Which of the two soft filters runs, and it is the one real choice in
-     *  this feature. **On by default**, and inert while `shadow_softness` is 0.
-     *
-     *  Off: the filter runs inline in the world shader over one fixed pattern
-     *  shared by every pixel. No extra pass and no target - and a ceiling on
-     *  quality, because a fixed pattern cannot trade its artefact for noise, so
-     *  an under-sampled kernel leaves a fan of shifted copies of every
-     *  occluder's silhouette rather than grain.
-     *
-     *  On: a **screen-space mask**. The kernel is rotated per pixel from a 4x4
-     *  tile of the pixel's coordinates and a 4x4 bilateral blur resolves it -
-     *  the two being the same size is what makes the blur exact, since a
-     *  four-wide window covers each of the sixteen rotations exactly once. The
-     *  same tap count therefore buys sixteen times the samples.
-     *
-     *  What it costs is a full-screen resolve, a blur, and **the geometry
-     *  prepass it shares with `ao`** - so with AO already on it is two
-     *  full-screen passes, and with AO off it is those plus a depth-only walk
-     *  over the frame's solid geometry.
-     *
-     *  The mask is consulted only where the prepass saw the same surface the
-     *  world shader is shading; everything else falls back on the inline
-     *  filter, so nothing loses its shadow because a screen-space pass could
-     *  not see it. */
-    shadow_soft_blur: boolean;
-
-    /** Draw the game's **own** blob shadow as well as the sun's map. Off by
-     *  default, since otherwise a unit carries both.
-     *
-     *  Its three passes are identified by stencil being enabled, which is exact
-     *  rather than a heuristic: over sixteen shipped levels the game draws with
-     *  22 distinct pipeline configurations, exactly 3 of them use stencil, and
-     *  all 3 are that shadow. A level someone else writes is not covered by that,
-     *  which is what this exists to check. */
-    stencil_shadow: boolean;
-
-    /** Real shadows for the level's own `STDLIGHT` rig - one six-face cube per
-     *  light in a 32 MB atlas, baked once per level from the map's own geometry.
-     *
-     *  **On, and play is what settled it.** It shipped off because no measurement
-     *  could say whether the picture with these shadows was the right one - the
-     *  game never had them - and then the first report from actually playing was
-     *  that the map lights do not cast any. Cost was never the objection: 0.50 ms
-     *  on level01, the level with the most map lights in the game, and nothing
-     *  measurable on level02.
-     *
-     *  Needs `map_lighting`, which is what evaluates that rig at all. The bake is
-     *  gated on this too, so off costs nothing; turning it back on restarts it,
-     *  and `map_shadow_report` says when it has finished. */
-    map_shadows: boolean;
-
-    /** How far a map-light shadow lookup is moved along the surface normal
-     *  before it is projected, in atlas texels at that fragment's own distance
-     *  from the light.
-     *
-     *  A **normal** offset rather than a depth one because a 64-texel cube face
-     *  is coarse - a texel is `distance / 32` world units - so the error is
-     *  dominated by the surface's slope, and a depth offset large enough to
-     *  cancel it would detach every shadow by metres. 1.0 by default, the larger
-     *  of two knees: level02's acne is gone by 0.25 and level04's needs about 1.
-     *
-     *  **`= 0` is the sharpest picture of what the atlas holds** - per-light acne
-     *  with cube-face stair-stepping and coloured fringes, one colour per light. */
-    map_shadow_bias: number;
-
-    /** How many map lights the bake does per frame, picking up where it left off.
-     *
-     *  256 with indirect drawing and 4 without, taken from the path at startup.
-     *  With one indirect command a face the whole bake is a few milliseconds, so
-     *  level01's 682 lights land in three frames; the fallback issues a draw call
-     *  per caster per face and wants spreading. Writing this **re-bakes from the
-     *  start**, so only write it when it has actually changed. */
-    map_shadow_rate: number;
-
-    /** Whether the bake submits one `vkCmdDrawIndexedIndirect` per cube face or a
-     *  draw call per caster per face - 4,092 commands against 804,924 on level01.
-     *
-     *  On wherever the device has `multiDrawIndirect`. **The two must produce the
-     *  same atlas and this is the only thing that can say so**, so writing it
-     *  rebuilds the pipeline and re-bakes; on a device without the feature it
-     *  does nothing and reads back false. */
-    map_shadow_indirect: boolean;
-
     /** What the map-light shadow atlas holds, what it refused for want of a slot,
      *  and how far the bake has got.
      *
@@ -3488,104 +3959,6 @@ declare module "gk" {
      *  screen. */
     readonly map_shadow_report: string;
 
-    /** Screen-space ambient occlusion, **with no blur pass**.
-     *
-     *  The kernel is one fixed Poisson disc shared by every pixel rather than a
-     *  randomised one, so the output is not noise and needs no blur to become
-     *  usable - which is what removes the halo around every silhouette that a
-     *  blurred AO carries. It matters more here than it would generally: Gunlok
-     *  renders 640x480, where a blur radius is a large fraction of a character.
-     *
-     *  Two passes. A prepass rasterises the frame's opaque geometry - the same
-     *  caster set the sun's shadow uses - and writes a **world position** and
-     *  normal per pixel; the resolve walks the disc in screen space, reconstructs
-     *  nothing, and counts how many taps land inside the half-ball at the centre
-     *  pixel. There is no matrix anywhere in it.
-     *
-     *  **Off.** The game never had ambient occlusion, so nothing here can be
-     *  measured as closer to D3D8 and off is bit-identical to the build before it
-     *  existed. Judge it on `ao_debug` and on a region, not on a whole-frame
-     *  number. */
-    ao: boolean;
-
-    /** The hemisphere's radius, in **world units** - what "near enough to
-     *  occlude" means. Level02's mean map edge is 1.952 units and the sun's sharp
-     *  cascade is 8.75 across, which is the scale to think in.
-     *
-     *  3, and that is a sweep: at level02's settled camera the occluded
-     *  fraction of the debug view goes 0.341 / 0.384 / 0.412 / 0.417 for 0.75 /
-     *  1.5 / 3 / 6, so 3 is the knee past which the disc binds instead and only
-     *  the over-darkening keeps growing. */
-    ao_radius: number;
-
-    /** The disc's radius, as a **fraction of the frame's height**, and
-     *  deliberately independent of `ao_radius`. Constant across the frame, which
-     *  is the technique's whole performance argument - every pixel walks the same
-     *  texel pattern, the friendliest case there is for the texture cache. A
-     *  value derived once per frame from the target size is still one constant,
-     *  so this costs that nothing.
-     *
-     *  Not a pixel count, because the render extent is not a constant: 640x480 on
-     *  the machine the notes' numbers come from, 3072x1728 on another. 0.07,
-     *  which is 34 pixels at 480 lines and 121 at 1728.
-     *
-     *  A constant screen radius is affordable here in a way it would not be
-     *  generally: Gunlok's camera is a fixed-height orbit, so one frame's depth
-     *  spread is narrow and a constant screen radius is very nearly a constant
-     *  world one. */
-    ao_screen_radius: number;
-
-    /** How far along the normal a tap has to be before it counts, in world units.
-     *  The self-occlusion knob: too low and a flat wall shades itself out of its
-     *  own quantisation, too high and a shallow crease stops registering. 0.05. */
-    ao_bias: number;
-
-    /** A scale on the occlusion before it leaves the resolve pass, so the target
-     *  already carries the artistic weight and the world shader stays a plain
-     *  multiply. 1. */
-    ao_strength: number;
-
-    /** How much the occlusion also scales **D3D's own** diffuse sum - the sun and
-     *  the level's dynamic lights. Not the map rig, which is occluded in full
-     *  whatever this says.
-     *
-     *  The split is what each set of lights *is*. The `STDLIGHT` rig is 51 static
-     *  lights on level02 whose whole job was to bake that level's vertex colours -
-     *  an environment, and exactly what occlusion is about. D3D's are few and
-     *  dynamic, and every one of them already has a shadow map answering "is this
-     *  light blocked" exactly, per light - so 0 here is the no-double-counting
-     *  setting rather than a taste one. 1 darkens them too, for a stylised look.
-     *
-     *  The specular is never occluded at any setting: a highlight is a mirror of
-     *  one light in one direction, and nearby geometry says nothing about whether
-     *  that particular path is clear. */
-    ao_direct: number;
-
-    /** How many of the 64-point disc to walk, 1..64. **All of them**, and this is
-     *  not a quality dial with a cheap end.
-     *
-     *  A fixed kernel cannot trade its artefact for noise the way a randomised one
-     *  does, so an under-sampled disc does not go grainy - it goes *structured*.
-     *  Each tap contributes a shifted copy of every occluder's silhouette, and at
-     *  32 points over a wide disc those copies are individually visible: measured
-     *  on level02, where each character left a fan of its own outlines. A blur
-     *  would hide that, and there is no blur here to hide it.
-     *
-     *  **32 is exactly the pattern the technique's author published** - a lattice
-     *  with each point nudged off its cell, not blue noise and not random. The
-     *  other 32 are the same lattice half a cell over. The whole set is
-     *  maximin-ordered, so any smaller count is still a well-spread subset.
-     *
-     *  The cost is linear in this and in nothing else. */
-    ao_taps: number;
-
-    /** Restrict the term to the map's own geometry. **On**, and it is the same
-     *  restriction runtime map lighting carries, for the same reason: a prop or a
-     *  unit is a separate `RBOBJECT` whose vertex colours were baked from its own
-     *  file's lights, and that bake already contains occlusion. Applying this on
-     *  top of it darkens the same crease twice. */
-    ao_map_only: boolean;
-
     /** Replace the shaded frame with the occlusion term itself, as grey.
      *
      *  Not optional when tuning: `ao_radius` and `ao_taps` are close to invisible
@@ -3593,31 +3966,6 @@ declare module "gk" {
      *  purpose - the buffer covers every opaque draw the prepass rasterised, and
      *  seeing the half the restriction throws away is the point of looking. */
     ao_debug: boolean;
-
-    /** Shadows from **the game's own D3D point and spot lights** - level02's fires,
-     *  and anything a `.gcs` adds with `ADD LIGHT`. A different light system from
-     *  `map_shadows` above, sharing the same static atlas: sixteen of its 682
-     *  slots are reserved for these.
-     *
-     *  On. It is affordable because a LEVEL's own local lights are few and do not
-     *  move - five on level02's start, twelve at its fire camera, four on level04,
-     *  none on prison - so a cube per light is baked once and sampled behind the
-     *  same range, `N·L` and cone rejections the map lights' lookup sits behind.
-     *  Nothing measurable on level02.
-     *
-     *  **An effect's light is a different animal and gets nothing.** An explosion's
-     *  light rides a particle, so it moves every frame, never survives the gate
-     *  below and never casts - one `fx.explode` in view leaves ~30 distinct
-     *  contents behind. Effects are also where the game's only spot lights come
-     *  from.
-     *
-     *  **A light that moves gets no shadow rather than a wrong one.** A D3D light
-     *  has no identity across frames, so a slot is held under a key made of the
-     *  light's position, range and cone - deliberately not its colour, since
-     *  `ADD BLINKING LIGHT` rewrites exactly that - and a key must survive four
-     *  frames before it claims one. A light on a track, or a mod's light on a
-     *  projectile, therefore never claims a slot and costs nothing. */
-    local_shadows: boolean;
 
     /** What the local half of that atlas holds: keys live, how many hold a baked
      *  cube, how many are still moving, and how many held still but found no free
@@ -3628,16 +3976,6 @@ declare module "gk" {
      *  working - a light that moves lives there permanently - and only the second
      *  is a limit. */
     readonly local_shadow_report: string;
-
-    /** Whether D3D's point and spot lights are in the light sum at all. On.
-     *
-     *  **A diagnostic, and the one that prices `local_shadows`**: off drops them
-     *  and keeps the directionals, so a paused A/B paints exactly the pixels they
-     *  reach - and since a shadow only ever removes light, that set strictly
-     *  contains anything shadowing them could change. It measures 0.75% of
-     *  level02's settled start, 2.34% at its fire camera and 0.63% on level04,
-     *  against the sun's 17%. */
-    local_lights: boolean;
 
     /** Window the range cutoff on D3D's point and spot lights. On by default.
      *

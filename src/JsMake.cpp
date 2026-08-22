@@ -759,7 +759,12 @@ JSValue MakeAmmoJs(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
   }
   d.name = name.empty() ? nullptr : name.c_str();
   d.file = file.empty() ? nullptr : file.c_str();
-  return JS_NewBool(ctx, MakeAmmo(d));
+  // Throws rather than returning false: a definition that did not register is a
+  // script bug, and the old boolean was routinely ignored.
+  if (!MakeAmmo(d)) {
+    return JS_ThrowInternalError(ctx, "make.ammo failed to register the definition");
+  }
+  return JS_UNDEFINED;
 }
 
 JSValue MakeAmmoInfoJs(JSContext *ctx, JSValueConst, int argc,
@@ -793,7 +798,11 @@ JSValue MakeAmmoInfoJs(JSContext *ctx, JSValueConst, int argc,
       !GetInt(ctx, v, "max_per_slot", &d.max_per_slot)) {
     return JS_EXCEPTION;
   }
-  return JS_NewBool(ctx, MakeAmmoInfo(d));
+  if (!MakeAmmoInfo(d)) {
+    return JS_ThrowInternalError(ctx,
+                                 "make.ammo_info failed to register the definition");
+  }
+  return JS_UNDEFINED;
 }
 
 JSValue MakeCameraTrackJs(JSContext *ctx, JSValueConst, int argc,
@@ -826,7 +835,11 @@ JSValue MakeCameraTrackJs(JSContext *ctx, JSValueConst, int argc,
   }
   d.name = name.empty() ? nullptr : name.c_str();
   d.file = file.empty() ? nullptr : file.c_str();
-  return JS_NewBool(ctx, MakeCameraTrack(d));
+  if (!MakeCameraTrack(d)) {
+    return JS_ThrowInternalError(ctx,
+                                 "make.camera_track failed to register the track");
+  }
+  return JS_UNDEFINED;
 }
 
 const JSCFunctionListEntry MakeProps[] = {

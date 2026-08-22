@@ -171,13 +171,15 @@ JSValue SetSelectedActor(JSContext *ctx, JSValueConst, JSValueConst v) {
     SetSelectedActorId(-1);
     return JS_UNDEFINED;
   }
-  // Takes an id, matching actor.set_target - a wrapper is a fresh object every
-  // lookup, so ids are the currency between the bindings and the game.
-  int32_t id = 0;
-  if (JS_ToInt32(ctx, &id, v)) {
+  // An actor, so the getter and the setter agree on their type. It used to take
+  // an id, which made this the one accessor in the surface whose two halves
+  // disagreed - and because JS_ToInt32 on an object yields 0 rather than
+  // throwing, assigning the actor the getter had just returned selected actor 0.
+  Actor *actor = ActorFromValue(ctx, v);
+  if (!actor) {
     return JS_EXCEPTION;
   }
-  SetSelectedActorId(id);
+  SetSelectedActorId(actor->id);
   return JS_UNDEFINED;
 }
 
@@ -207,6 +209,52 @@ JSValue Spawn(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
   }
   DoSpawn(team, amount);
   return JS_UNDEFINED;
+}
+
+// --- session control ---------------------------------------------------------
+//
+// Moved here from `screen`, which had collected it because these are all console
+// commands. `screen` is the presentation layer - borders, briefing text, FMVs,
+// the cursor - and pausing, chatting and exiting are not that. Where a member
+// lives should say what it affects, not which of the two binding styles it
+// happens to use.
+//
+// Still command-backed, for the reason src/JsCommands.cpp gives: the handler is
+// the argument parser and dispatching it keeps the defaults and the executor
+// handshake. Three of the four names come out of glres<lang>.dll, so they cannot
+// be spelled as literals.
+
+// Single player only; in multiplayer it is a vote sent to the server. `paused`
+// reads the result - the write stays a command because toggling it is a clock
+// handshake.
+JSValue TogglePause(JSContext *ctx, JSValueConst, int argc,
+                    JSValueConst *argv) {
+  return RunConsoleCommand(ctx, "PAUSE GAME", argc, argv);
+}
+
+// The argument is required, unlike the console's, where omitting it *prints* the
+// current value. A script asking for a value it cannot read back is a mistake
+// worth catching rather than a line in the console.
+JSValue SetSpeed(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+  if (argc < 1) {
+    return JS_ThrowTypeError(
+        ctx, "set_speed(speed) expects a speed - 1 is normal, 0 is the active "
+             "pause. The console prints the current value when it is omitted; "
+             "there is nothing here for that to return.");
+  }
+  return RunConsoleCommand(ctx, "GAMESPEED", argc, argv);
+}
+
+// Broadcasts a chat message. Takes the rest of the line, so whitespace is
+// allowed here where every other console argument refuses it.
+JSValue Say(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+  return RunLocalizedConsoleCommand(ctx, 10014, argc, argv);
+}
+
+// Exits to the desktop. `levels.quit()` is the one that ends the *session* and
+// returns to the front end.
+JSValue Quit(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
+  return RunLocalizedConsoleCommand(ctx, 10001, argc, argv);
 }
 
 const JSCFunctionListEntry GameProps[] = {
@@ -246,6 +294,10 @@ const JSCFunctionListEntry GameProps[] = {
                     JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE),
     JS_CGETSET_DEF("actor_under_cursor", GetActorUnderCursorJs, nullptr),
     JS_CFUNC_DEF("spawn", 2, Spawn),
+    JS_CFUNC_DEF("toggle_pause", 0, TogglePause),
+    JS_CFUNC_DEF("set_speed", 1, SetSpeed),
+    JS_CFUNC_DEF("say", 1, Say),
+    JS_CFUNC_DEF("quit", 0, Quit),
 };
 
 } // namespace

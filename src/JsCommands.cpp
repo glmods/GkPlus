@@ -36,9 +36,12 @@
 
 #include "Console.h"
 
+#include "ActorArg.h"
+#include "Actors.h"
 #include "Encoding.h"
 #include "JsBindings.h"
 #include "Menu.h"
+#include "Roles.h"
 
 #include <cstdio>
 #include <cstring>
@@ -70,7 +73,7 @@ void AppendNumber(std::string *out, double value) {
 // is meaningful there and an error everywhere else. `free_text` is that
 // distinction, and it is per command rather than global.
 bool AppendValue(JSContext *ctx, std::string *out, JSValueConst v,
-                 bool free_text);
+                 bool free_text, ActorArgScope *actors);
 
 // A {x, y, z} object becomes the three numbers the console expects, in order.
 // Missing components are 0 rather than an error: `ConsoleParsePosition` treats a
@@ -97,7 +100,7 @@ bool AppendVec3Like(JSContext *ctx, std::string *out, JSValueConst v) {
 }
 
 bool AppendArray(JSContext *ctx, std::string *out, JSValueConst v,
-                 bool free_text) {
+                 bool free_text, ActorArgScope *actors) {
   JSValue lengthValue = JS_GetPropertyStr(ctx, v, "length");
   if (JS_IsException(lengthValue)) {
     return false;
@@ -113,7 +116,7 @@ bool AppendArray(JSContext *ctx, std::string *out, JSValueConst v,
     if (JS_IsException(item)) {
       return false;
     }
-    bool ok = AppendValue(ctx, out, item, free_text);
+    bool ok = AppendValue(ctx, out, item, free_text, actors);
     JS_FreeValue(ctx, item);
     if (!ok) {
       return false;
@@ -123,7 +126,7 @@ bool AppendArray(JSContext *ctx, std::string *out, JSValueConst v,
 }
 
 bool AppendValue(JSContext *ctx, std::string *out, JSValueConst v,
-                 bool free_text) {
+                 bool free_text, ActorArgScope *actors) {
   // undefined and null are "argument omitted", which is how every optional
   // console argument is spelled: stop rather than emit a placeholder.
   if (JS_IsUndefined(v) || JS_IsNull(v)) {
@@ -172,14 +175,57 @@ bool AppendValue(JSContext *ctx, std::string *out, JSValueConst v,
     *out += encoded;
     return true;
   }
+  // BEFORE the object cases, and that ordering is load-bearing: an actor
+  // wrapper is an ordinary object, so without this it falls into AppendVec3Like
+  // and silently appends "0 0 0".
+  //
+  // An actor is spelled as its decimal id and also queued on `actors`. The two
+  // together cover both kinds of handler with no per-command declaration: one
+  // group resolves its actor through ConsoleParseActorName, which the queue
+  // substitutes into, and the other reads the digits directly with
+  // ConsoleParseInt and never consults the queue. See src/ActorArg.h.
+  if (IsActorValue(v)) {
+    Actor *actor = ActorFromValue(ctx, v);
+    if (!actor) {
+      return false;
+    }
+    if (!actors) {
+      JS_ThrowTypeError(ctx, "this command does not take an actor");
+      return false;
+    }
+    if (!out->empty()) {
+      *out += ' ';
+    }
+    AppendNumber(out, static_cast<double>(actor->id));
+    actors->Push(actor);
+    return true;
+  }
+  // Also before the object cases, and for the same reason. A role is spelled as
+  // its name because that is what the handlers resolve (`GetRoleByName`), and
+  // unlike an actor a role reliably has one - roles are the registry the `.gls`
+  // named, so a nameless one would be a defect rather than an ordinary case.
+  if (Role *role = RoleFromWrapper(v)) {
+    const char *name = role->name.get();
+    if (!name || !*name) {
+      JS_ThrowTypeError(ctx, "role %d has no name, so it cannot be named on a "
+                             "console command line",
+                        role->id);
+      return false;
+    }
+    if (!out->empty()) {
+      *out += ' ';
+    }
+    *out += name;
+    return true;
+  }
   if (JS_IsArray(v)) {
-    return AppendArray(ctx, out, v, free_text);
+    return AppendArray(ctx, out, v, free_text, actors);
   }
   if (JS_IsObject(v)) {
     return AppendVec3Like(ctx, out, v);
   }
-  JS_ThrowTypeError(ctx, "unsupported console argument: expected a number, "
-                         "boolean, string, {x, y, z} or an array");
+  JS_ThrowTypeError(ctx, "unsupported console argument: expected an actor, a "
+                         "number, boolean, string, {x, y, z} or an array");
   return false;
 }
 
@@ -188,9 +234,15 @@ bool AppendValue(JSContext *ctx, std::string *out, JSValueConst v,
 // only the arguments are transcoded.
 JSValue RunCommandImpl(JSContext *ctx, const char *name, int argc,
                        JSValueConst *argv, bool free_text = false) {
+  // Armed for every command rather than only for the ones that take an actor.
+  // It costs two thread-local reads, it has to outlive the ExecuteCommand below
+  // (that is what the handler reads it through), and it discards anything the
+  // handler did not consume - so a command that takes no actor cannot inherit a
+  // substitution from one that did.
+  ActorArgScope actors;
   std::string line = name;
   for (int i = 0; i < argc; ++i) {
-    if (!AppendValue(ctx, &line, argv[i], free_text)) {
+    if (!AppendValue(ctx, &line, argv[i], free_text, &actors)) {
       return JS_EXCEPTION;
     }
   }
@@ -347,7 +399,57 @@ const JSCFunctionListEntry LightProps[] = {
 
 // --- objectives (7) -----------------------------------------------------------
 
-GK_COMMAND(ObjectiveAdd, "ADD OBJECTIVE")
+// The last of the untyped `CommandArg` spreads, recovered from
+// `CommandAddObjective` @ 0x00446300 rather than guessed:
+//
+//   ADD OBJECTIVE <team slot> <PRIMARY|SECONDARY|TERTIARY> <id> -1 <title> <body>
+//
+// Every argument is gated and the handler **returns silently** when one fails,
+// which is why this was worth typing rather than leaving as varargs:
+//
+//   * the team slot must be `0 <= n < NumTeamSlots`;
+//   * the priority word is compared with `__mbsicmp` against exactly those three
+//     spellings, and anything else returns;
+//   * the id must be non-negative;
+//   * the **fourth number must be literally -1**. It is a hard-coded sentinel
+//     with no other accepted value, so the binding writes it and the caller
+//     never sees it - which is the whole reason a typed wrapper beats the raw
+//     command here. (`ConsoleParseInt` does read a negative: a leading '-'
+//     toggles a sign flag applied on the way out. The decompiler's `extraout_EAX`
+//     hides that, and reading it there suggested the gate was unsatisfiable and
+//     the command dead. It is not.)
+//   * `title` and `body` are offsets from `GL_OBJECTIVE_0` into the localized
+//     string table, not text.
+//
+// The two `add objective` lines in the shipped `.gcs` files are both `rem`'d out
+// and would not have worked: each puts a `2` where the -1 belongs.
+JSValue ObjectiveAdd(JSContext *ctx, JSValueConst, int argc,
+                     JSValueConst *argv) {
+  if (argc < 5) {
+    return JS_ThrowTypeError(
+        ctx, "add(team_slot, priority, id, title, body) expects five arguments");
+  }
+  const char *priority = JS_ToCString(ctx, argv[1]);
+  if (!priority) {
+    return JS_EXCEPTION;
+  }
+  const bool known = std::strcmp(priority, "primary") == 0 ||
+                     std::strcmp(priority, "secondary") == 0 ||
+                     std::strcmp(priority, "tertiary") == 0;
+  JS_FreeCString(ctx, priority);
+  if (!known) {
+    return JS_ThrowTypeError(
+        ctx, "priority must be \"primary\", \"secondary\" or \"tertiary\"");
+  }
+  JSValue sentinel = JS_NewInt32(ctx, -1);
+  JSValueConst forwarded[] = {argv[0], argv[1], argv[2], sentinel, argv[3],
+                              argv[4]};
+  JSValue result = RunConsoleCommand(ctx, "ADD OBJECTIVE",
+                                     static_cast<int>(std::size(forwarded)),
+                                     forwarded);
+  JS_FreeValue(ctx, sentinel);
+  return result;
+}
 GK_COMMAND(ObjectiveComplete, "COMPLETE OBJECTIVE")
 GK_COMMAND(ObjectiveFail, "FAIL OBJECTIVE")
 GK_COMMAND(ObjectiveText, "OBJECTIVE TEXT")
@@ -356,7 +458,7 @@ GK_COMMAND(ObjectiveTrainingText, "TRNTXT")
 GK_COMMAND(ObjectiveRepeatText, "REPTXT")
 
 const JSCFunctionListEntry ObjectiveProps[] = {
-    JS_CFUNC_DEF("add", 2, ObjectiveAdd),
+    JS_CFUNC_DEF("add", 5, ObjectiveAdd),
     JS_CFUNC_DEF("complete", 1, ObjectiveComplete),
     JS_CFUNC_DEF("fail", 1, ObjectiveFail),
     JS_CFUNC_DEF("print", 1, ObjectiveText),
@@ -412,14 +514,6 @@ GK_COMMAND(ScreenFMV, "FMV")
 GK_TEXT_COMMAND(ScreenPlayFMV, "PLAY FMV")
 GK_TEXT_COMMAND(ScreenPlayCutscene, "PLAY CUTSCENE")
 GK_COMMAND(ScreenStatusWindow, "STATUS WINDOW")
-GK_COMMAND(ScreenPauseGame, "PAUSE GAME")
-GK_COMMAND(ScreenGameSpeed, "GAMESPEED")
-GK_COMMAND(ScreenNextLevel, "NEXT LEVEL")
-GK_COMMAND(ScreenAddMission, "ADD MISSION")
-GK_COMMAND(ScreenAddMultiMission, "ADD MULTI MISSION")
-GK_LOCALIZED_COMMAND(ScreenMainMenu, 10002)
-GK_LOCALIZED_COMMAND(ScreenQuit, 10001)
-GK_LOCALIZED_TEXT_COMMAND(ScreenSay, 10014)
 GK_COMMAND(ScreenStats, "STATS SCREEN")
 
 const JSCFunctionListEntry ScreenProps[] = {
@@ -437,14 +531,6 @@ const JSCFunctionListEntry ScreenProps[] = {
     JS_CFUNC_DEF("play_fmv", 1, ScreenPlayFMV),
     JS_CFUNC_DEF("play_cutscene", 1, ScreenPlayCutscene),
     JS_CFUNC_DEF("status_window", 1, ScreenStatusWindow),
-    JS_CFUNC_DEF("toggle_pause", 0, ScreenPauseGame),
-    JS_CFUNC_DEF("game_speed", 1, ScreenGameSpeed),
-    JS_CFUNC_DEF("next_level", 0, ScreenNextLevel),
-    JS_CFUNC_DEF("add_mission", 2, ScreenAddMission),
-    JS_CFUNC_DEF("add_multiplayer_mission", 2, ScreenAddMultiMission),
-    JS_CFUNC_DEF("main_menu", 0, ScreenMainMenu),
-    JS_CFUNC_DEF("quit", 0, ScreenQuit),
-    JS_CFUNC_DEF("say", 1, ScreenSay),
     JS_CFUNC_DEF("stats", 0, ScreenStats),
 };
 
@@ -455,6 +541,13 @@ const JSCFunctionListEntry ScreenProps[] = {
 
 GK_COMMAND(UnitsSetAI, "AI")
 GK_COMMAND(UnitsAlertNode, "ALERT NODE")
+// Takes NO actor, and the binding used to claim one. CommandSetActivity
+// @ 0x00445940 parses a single word - the activity keyword - and operates on the
+// global `selected_actor_id`, printing GL_ERROR_NO_ACTOR_SELECTED when nothing
+// is selected. So `set_activity(actor, activity)` sent `SET ACTIVITY <actor>
+// <activity>`, the handler read `<actor>` as the keyword, all three
+// `__mbsicmp`s against GOTO/PATROL/STOP failed and the call did nothing at all.
+// Set `game.selected_actor` first.
 GK_COMMAND(UnitsSetActivity, "SET ACTIVITY")
 GK_COMMAND(UnitsAddWaypoint, "ADD WAYPOINT")
 GK_COMMAND(UnitsAddPatrolPoint, "ADD PATROLPOINT")
@@ -464,12 +557,14 @@ GK_COMMAND(UnitsFlareFirer, "FLARE FIRER")
 GK_COMMAND(UnitsTurnVisionCone, "TURN VISION CONE")
 GK_COMMAND(UnitsTurnHearingRange, "TURN HEARING RANGE")
 GK_COMMAND(UnitsTurretLOS, "TURRET LOS")
+// Also takes no actor. CommandSetScale @ 0x00447370 parses one float and
+// applies it to `ActorUnderCursor`; the second parameter the binding used to
+// declare was read by nothing. `game.actor_under_cursor` is what it acts on.
 GK_COMMAND(UnitsSetScale, "SET SCALE")
 GK_COMMAND(UnitsDeleteTeam, "DELETE TEAM")
 GK_COMMAND(UnitsWatch, "WATCH")
 GK_COMMAND(UnitsPresident, "PRESIDENT")
 GK_COMMAND(UnitsListTeam, "LIST TEAM")
-GK_COMMAND(UnitsRemoveTrigger, "REMOVE TRIGGER")
 GK_COMMAND(UnitsUpperLeftBound, "SET UPPER LEFT BOUND")
 GK_COMMAND(UnitsLowerRightBound, "SET LOWER RIGHT BOUND")
 GK_COMMAND(UnitsVulnerability, "VULNERABILITY")
@@ -485,7 +580,7 @@ GK_TEXT_COMMAND(UnitsSpeak, "SPEAK")
 const JSCFunctionListEntry UnitsProps[] = {
     JS_CFUNC_DEF("set_ai", 2, UnitsSetAI),
     JS_CFUNC_DEF("alert_node", 1, UnitsAlertNode),
-    JS_CFUNC_DEF("set_activity", 2, UnitsSetActivity),
+    JS_CFUNC_DEF("set_activity", 1, UnitsSetActivity),
     JS_CFUNC_DEF("add_waypoint", 1, UnitsAddWaypoint),
     JS_CFUNC_DEF("add_patrol_point", 1, UnitsAddPatrolPoint),
     JS_CFUNC_DEF("new_node_waypoint_list", 1, UnitsNewNodeWaypointList),
@@ -494,12 +589,11 @@ const JSCFunctionListEntry UnitsProps[] = {
     JS_CFUNC_DEF("turn_vision_cone", 2, UnitsTurnVisionCone),
     JS_CFUNC_DEF("turn_hearing_range", 2, UnitsTurnHearingRange),
     JS_CFUNC_DEF("turret_los", 2, UnitsTurretLOS),
-    JS_CFUNC_DEF("set_scale", 2, UnitsSetScale),
+    JS_CFUNC_DEF("set_scale", 1, UnitsSetScale),
     JS_CFUNC_DEF("delete_team", 1, UnitsDeleteTeam),
     JS_CFUNC_DEF("watch", 1, UnitsWatch),
     JS_CFUNC_DEF("create_president", 0, UnitsPresident),
     JS_CFUNC_DEF("list_team", 1, UnitsListTeam),
-    JS_CFUNC_DEF("remove_trigger", 2, UnitsRemoveTrigger),
     JS_CFUNC_DEF("set_upper_left_bound", 1, UnitsUpperLeftBound),
     JS_CFUNC_DEF("set_lower_right_bound", 1, UnitsLowerRightBound),
     JS_CFUNC_DEF("set_vulnerability", 4, UnitsVulnerability),

@@ -133,6 +133,18 @@ Lint is `uv run --group dev ruff check .` from `blender/`, from `pbr/` and from 
 `npx -y -p typescript tsc -p types/tsconfig.json` (see `js_bindings_notes.md`; TypeScript is not a
 dependency of this repo, which is why a bare `npx tsc` refuses to run).
 
+**`tsc` is not the whole check on the JS surface.** It proves the declarations are self-consistent
+and that the shipped `.mjs` compile against them; it cannot prove they match the **bindings**,
+because the bindings are C++. `python3 types/check-surface.py` is that half — it compares every
+`JSCFunctionListEntry` table against its interface, both directions, over 25 namespaces, and takes
+no arguments. Run both after touching `src/Js*.cpp`:
+
+```bash
+npx -y -p typescript tsc -p types/tsconfig.json    # the declarations, and examples/
+npx -y -p typescript tsc -p examples/jsconfig.json
+python3 types/check-surface.py                     # ... and that they match src/Js*.cpp
+```
+
 ### Runtime-testing outside the game
 
 Nothing in `src/` can be exercised outside Gunlok - `GetBaseAddress()` derives from the host exe's
@@ -415,11 +427,11 @@ one of the two, see Conventions), and hides itself entirely unless `d3d8::Render
 than `Msaa()`, since a write is only adopted at the top of the next frame and the effective value
 would lag one frame behind every click; and the tessellation row is absent without
 `DeviceCaps::tessellation_shader`, because the setting would otherwise read back off forever.
-Every click is written through to `core.render.*` in `src/Settings` and saved immediately, so the
-page has no apply step. `ApplyStoredRenderSettings()` puts them back on the knobs from
-`FileHookSystem`'s **first intercepted open** — the same anchor the DDS codec uses, chosen here
-because it is inside `WinMain` and therefore ahead of the device, so the stored settings are in
-place before the renderer initialises rather than a frame or a menu later.
+The page has no apply step and **no persistence of its own**: a click sets the knob, and
+`src/RenderSettings.cpp` picks the change up on the next frame. It used to write
+`core.render.*` itself for the eleven knobs it happens to expose, which is why clicking HDR here
+survived a restart while `render.hdr.enabled = true` from a script did not — two writers to one knob with
+two different rules. See "Renderer settings" below.
 
 ### The profile (`src/Profile.h/cpp`)
 
@@ -443,11 +455,52 @@ every key it did not know.
 
 **An environment variable outranks the file.** The `GKPLUS_*` overrides are launch-time
 instruments — the switch you reach for when the setting you need to change is the one keeping the
-game from starting — so `ApplyStoredRenderSettings` skips any knob whose companion variable is
-set. Two of the eight have one (`GKPLUS_VK_MSAA`, `GKPLUS_VK_PER_PIXEL_LIGHTING`); doing it in one
-place is what keeps the rule from depending on which setter happens to latch its own env-read flag.
+game from starting — so `src/RenderSettings.cpp` skips any knob whose companion variable is set,
+in **both** directions: it is neither restored from the file nor written back to it. Four of the
+seventy-nine have one (`GKPLUS_VK_MSAA`, `GKPLUS_VK_PER_PIXEL_LIGHTING`, `GKPLUS_VK_HDR`,
+`GKPLUS_VK_BLOOM`); doing it in one place is what keeps the rule from depending on which setter
+happens to latch its own env-read flag.
 `GKPLUS_PROFILE` is the exception in shape rather than in rule — it decides *which* file is read,
 so there is nothing inside the file for it to lose to.
+
+### Renderer settings (`src/RenderSettings.h/cpp`)
+
+**One table, run in both directions**, and it is the authority on what a renderer *setting* is.
+`ApplyStored()` walks it document → knobs from `FileHookSystem`'s first intercepted open — inside
+`WinMain` and therefore ahead of the device, so a stored value is in place before the renderer
+initialises rather than a frame or a menu later. `SyncToSettings()` walks it knobs → document once
+a frame from `RunFrameCallback`, writing only what differs, and `settings::SaveSettled` debounces
+the disk write. Comparing before writing is load-bearing: without it the store would be dirty every
+frame and the fifteen-second cap would become a file write every fifteen seconds forever.
+
+Per-frame sync rather than a write in each of ~70 setters is what makes it catch a write from
+**any** source — a script, the Advanced Graphics page, the REPL. It sits in `RunFrameCallback`
+outside the script host's null check, because a renderer knob can change with no script running at
+all and `SetFrameCallback` is only installed once a JS context exists.
+
+**The keys follow the JS spelling, dots and all** — `render.ao.radius` is
+`core.render.ao.radius`. `render`'s eleven families are sub-objects
+(`src/JsRender.cpp`), and ten of the group names were previously the family's *switch*
+(`render.ao`, `render.hdr`), so each switch is now `<group>.enabled`. That is what lets a family
+and its switch share a name; it is also why every `core.render.*` key changed.
+
+**79 knobs persist; the measurement surface persists nothing.** That split is the same one
+`src/JsRender.cpp` draws between `render` and `render.debug`, and this file is where a knob's side
+is decided. A stored `draw_hide` would hide a draw on the next launch with nothing on screen to say
+why, and `render.debug.stock` reads back *derived* rather than as a mode flag, so storing it would be
+meaningless.
+
+**Two knobs are restored but never written back**, flagged `sync = false`: `tessellation` reads
+back false on a device with no `tessellationShader` however it was set, and `msaa` is read through
+`MsaaWanted()` because the effective count is clamped to what the device offers. Persisting either
+as read would let one launch on a weaker machine erase the preference for every machine that can.
+
+It also owns the **name ↔ value tables** for the enumerated knobs (`tonemap`, `tess_set`, a bloom
+layer's `blend`), shared with `src/JsRender.cpp` rather than spelled twice: a name is what goes into
+`settings.json`, so two spellings of one operator would mean a stored value silently failing to
+restore. The bloom layers are flattened to `core.render.bloom_layer.<i>.<field>` rather than stored
+as an array, because an array is a leaf in `json::Document` and a single field's write would have
+nothing to go through.
 
 **It also decides what runs.** `core.boot` and `core.script` name the two script modules
 (`src/Script.h`), each resolved against the profile directory, each defaulting to `boot.mjs` /
@@ -675,11 +728,11 @@ holds a `vkDeviceWaitIdle`) rather than off the setter; and `sampleShadingEnable
 the fragment shader runs once per pixel and `world.slang`'s AO fetch keeps landing on the texel it
 did at one sample. `vulkan_renderer_notes.md` §4.88.
 
-It also does **HDR** (`render.hdr`, off by default, settable at any time): the world pass into
+It also does **HDR** (`render.hdr.enabled`, off by default, settable at any time): the world pass into
 `R16G16B16A16_SFLOAT`, every albedo sRGB-decoded on the way in, the D3DCOLOR clamps lifted, and a
 full-screen tonemap pass in place of the scale blit. **Internal HDR, SDR presentation** - the
 surface format is untouched. It is the first feature here whose goal is *not* reproduction, so it
-is in `render.stock`'s set; `GKPLUS_VK_HDR=1` is the launch-time form. Two things in it are
+is in `render.debug.stock`'s set; `GKPLUS_VK_HDR=1` is the launch-time form. Two things in it are
 measurements. **The 2D layers are not in the pipeline at all** (§4.92): the menus, briefing
 screens, HUD and inventory are drawn *after* the tonemap and with the decode off, so no operator
 reaches them - ACES, `rolloff` and `exposure = 2.5` produce byte-identical main-menu frames, where
@@ -688,7 +741,7 @@ before the split ACES recoloured 99.61% of it. The classifier is the engine's ow
 `Camera_World` and the sky camera; **`depth_clamp` is not it** (that is `FVF & XYZRHW`, true of 2
 of level02's 268 draws) and neither is a depth-slice threshold (one orthographic camera runs
 0.06..0.30 and overlaps the world's 0.10..1.00). That is also what makes the film curves usable at
-all: `render.tonemap` takes six operators (`clamp`, `rolloff`, `reinhard`, `aces`, `filmic`, `agx`
+all: `render.hdr.tonemap` takes six operators (`clamp`, `rolloff`, `reinhard`, `aces`, `filmic`, `agx`
 - §4.93), and **`agx` is the one suited to this game's content**, because it keeps hue at the top
 end where ACES turns a `diffuse 4.0` light on a red surface orange. Its matrices are written as
 **rows**, the transpose of every GLSL copy of those numbers, and the check that catches a wrong
@@ -708,12 +761,12 @@ other one. What the decode buys is downstream: additive fires and flares accumul
 of clipping, the tonemap gets a real over-range, and an opaque draw is bit-exact against stock.
 **If a decode is ever added back to `src/D3D8Capture.cpp` it needs the LAYER with it** (§4.95) — the
 2D layers are drawn after the tonemap and nothing re-encodes them; that cost a 44%-dark HUD once,
-and the standing check is the in-level HUD panel with `render.hdr` off vs on, which passes at
+and the standing check is the in-level HUD panel with `render.hdr.enabled` off vs on, which passes at
 0.027 MAD.
 
-It also does **bloom, in three independent layers** (`render.bloom`, off by default, plus
-`render.bloom_layer(index, spec)` for each layer's `threshold`, `knee`, `radius`, `intensity` and
-`blend` — `off`/`add`/`screen`/`max`). §4.99. **It requires `render.hdr` structurally rather than by
+It also does **bloom, in three independent layers** (`render.bloom.enabled`, off by default, plus
+`render.bloom.layer(index, spec)` for each layer's `threshold`, `knee`, `radius`, `intensity` and
+`blend` — `off`/`add`/`screen`/`max`). §4.99. **It requires `render.hdr.enabled` structurally rather than by
 policy**: a threshold is a statement about light and every value in an 8-bit target was already
 clamped to 1, so the only thing left to select on there is albedo — which is exactly the 2003 bloom
 everybody remembers. With the float target a threshold at 1.0 selects precisely what the 8-bit
@@ -738,7 +791,7 @@ unpaused, the animating fires put the noise floor at MAD 5.44 over 26% of the fr
 — including two that should be identical. Masked and paused, the numbers are in §4.99, and the one
 worth re-running after any change here is that the **HUD panel's interior is max 0**.
 
-It also draws **ambient occlusion with no blur pass** (`render.ao`, off by default): the sample
+It also draws **ambient occlusion with no blur pass** (`render.ao.enabled`, off by default): the sample
 offsets are generated in 2D from one fixed lattice disc shared by every pixel and the 3D position of
 the *tapped* pixel is what gets reconstructed, so the kernel needs no per-pixel randomisation and
 nothing has to blur the result. `src/shaders/ao.slang`. Three of its decisions are measurements -
@@ -746,7 +799,7 @@ the pattern is a lattice rather than blue noise, an under-sampled fixed kernel p
 copies of every silhouette rather than grain, and scaling the *ambient* term is inert in this game
 because Gunlok has none to occlude (`vulkan_renderer_notes.md` §4.86).
 
-It also makes the **sun's shadow soft** (`render.shadow_softness`, off by default): PCSS over the
+It also makes the **sun's shadow soft** (`render.sun_shadow.softness`, off by default): PCSS over the
 same cascades, where a blocker search decides the filter's radius per fragment, so a foot on the
 ground stays sharp and the shadow of something three metres up spreads. The knob is **the tangent
 of the sun's angular radius**, not a filter width, and the penumbra is computed in world units and
@@ -759,7 +812,7 @@ receiver. `vulkan_renderer_notes.md` §4.100, which also records the four-byte w
 `pad_colour` that had been zeroing the tail of `GpuFrameData` since §4.91 and made the first build
 of this completely inert with every knob still reading back correctly.
 
-That filter is a **screen-space mask** by default (`render.shadow_soft_blur`, §4.101): the kernel is
+That filter is a **screen-space mask** by default (`render.sun_shadow.soft_blur`, §4.101): the kernel is
 rotated per pixel from a 4x4 tile of the pixel's own coordinates and a 4x4 bilateral blur resolves
 it, and the two sizes matching is what makes the blur exact — a four-wide window covers each of the
 sixteen rotations exactly once, so the estimate carries no residual dither and nothing crawls when
@@ -773,7 +826,7 @@ registered as its prepass, and the way that surfaced was computing the same quan
 from the prepass and once inline, and differencing them.
 
 It also draws two things the game never could, both keyed on a texture's `.rim` name:
-`render.material_override` retextures, tints or hides every draw sampling one asset, and
+`render.material.override` retextures, tints or hides every draw sampling one asset, and
 **`src/VkLighting`** gives one a bump/metallic/roughness response from a companion
 `<texture> lighting.dds` served by `src/Vfs` or the install - **R height, G highlight intensity,
 B highlight sharpness**, the normal derived at draw time so the 48-byte canonical vertex is
@@ -800,6 +853,8 @@ reference. Test invocations are under "Running the test suites" above.
 | `src/MapLights.h/cpp` | `MapLightSystem` — the game-facing half of the above: where the level's `.rif` is, what scale it is in, and when to reload. **It has to be a hook**, because neither the path nor the rif object survives the load: `LoadLevel` frees the rif right after `ConvertParsedObjects` and `Map` retains only the *shadow* object's rif name. So it detours `LoadOrGetRifFile` @ 0x004ae960 — the one seam all three of `ToMap`'s routes pass through — records the path and the unit scale, and parses lazily on the first read after a level change. Deriving the path from the `.gls` name instead was measured and **fails on 4 of 32 shipped levels** |
 | `src/Vfs.h/cpp` | The mod filesystem: mount, case-folded index, lookup, read, `Materialize`. Pure lookup — touches no game memory, so it is the half a harness can exercise. See "Mod loading" above |
 | `src/FileHooks.h/cpp` | `FileHookSystem` — the nine IAT patches and the two static-CRT detours that make the engine consult `src/Vfs`, plus the virtual-handle table and the `mods.served`/`mods.recent` diagnostics. Also **`EnsureFirstOpen`**, the shared first-open anchor: three things that must precede the engine's first byte and cannot each have a detour of their own (the DDS codec registration, `ApplyStoredRenderSettings`, and `BootScriptProfile`, which is what lets a script decide the mount set). All four hooks that reach `vfs::Resolve` call it, so whichever the engine gets to first is the anchor. Also the **read-ahead layer**, which is where half of a level load went: `LoadOrBuildSectionAdjacency` @ 0x0044fef0 reads the whole `<level>.map` cache **four bytes per `ReadFile`** — 39,364 calls for level02, 187,313 for level12 — so a warm load is bound by syscall count and not by its 9-23 MB. A handle this layer opened for reading gets a 64 KB buffer and **this layer owns the file position**; keeping the OS pointer in step would cost a `SetFilePointer` per read and buy nothing. Safe only because gl.exe imports no `SetFilePointerEx`/`ReadFileEx` and uses no overlapped I/O, and a handle opened elsewhere (the static CRT uses `CreateFileW`) is never buffered. Reads drop ~99.7% and blocked load time 27-57%; `GKPLUS_FILE_BUFFER=raw` is the A/B and `mods.read_stats()` (`GKPLUS_FILE_STATS=1`) is the instrument. `file_io_notes.md` §1.1-1.2 |
+| `src/ActorArg.h/cpp` | `ActorArgSystem` — hook-only, one detour on `ConsoleParseActorName` @ 0x004d6d90. **What lets a command-backed binding take an `Actor` object rather than a token name.** ~27 handlers resolve their actor through that one helper, and two of its properties make it substitutable rather than merely hookable: it calls `ConsoleParseWord` unconditionally *first*, so the parse position is right whether or not the name resolved, and it prints nothing on failure. A substituted argument is spelled on the command line as the actor's **decimal id**, deliberately not a reserved placeholder — that same spelling is what the *other* group of handlers reads, since `ConsoleParseInt` @ 0x004d6770 takes either digits or a token name. One code path covers both, no caller has to know which group its command is in, and a **script-spawned actor works**, where a name-based surface could not express one at all. The queue is `thread_local` and consumed in order, so a handler taking several actors works; anything left unconsumed is dropped at scope exit rather than leaking into the next command |
+| `src/RenderSettings.h/cpp` | The renderer's knobs as persistent settings — one table walked document → knobs at first open and knobs → document once a frame. **Touches no game memory**, so it is harness-testable. See "Renderer settings" above |
 | `src/Profiler.h/cpp` | The CPU profiler: the per-thread event rings, the frame ring, the sampling thread and the Chrome-trace writer. **Touches no game memory** — it is clock, rings and Win32 thread APIs — so it is one of the few `src/` files a harness could exercise. See "The profiler" above |
 | `src/Repl.h/cpp` | The loopback JavaScript REPL: `StartRepl` / `PumpRepl` / `StopRepl`, owned by `BootScriptHost` rather than by `Subsystems` (it installs no detour). Off unless `GKPLUS_REPL_PORT` is set; `=0` binds an ephemeral port and publishes it to `GKPLUS_LAUNCHER_HWND`, which is how a launcher gets one without racing for it. Also `NotifyRepl` — the **backchannel**, an unsolicited `{event, data}` line a script pushes to every connected client (`repl.notify` in JS, `src/JsRepl.cpp`), which is what makes something that *happens between two polls* observable from outside. A reply always carries `ok` and a notification never does: that is the whole rule a client needs. See "The REPL channel" above |
 | `src/Profile.h/cpp` | Where a launch is configured from: `GKPLUS_PROFILE` or `gkplus` beside `d3d8.dll`, plus the join that resolves a settings key naming a file against it. **Touches no game memory and reads no file**, so it is safe from `DllMain` and harness-testable. It is also the one place that knows the DLL's own directory — `src/Settings` and `src/Script` both used to work it out for themselves. See "The profile" above |
@@ -824,7 +879,7 @@ reference. Test invocations are under "Running the test suites" above.
 | `pbr/` | `gkpbr` — a uv project that generates PBR map sets (color/roughness/metallic/normal/emissive/height) from the 365 `.RIM` a `BMPNAMES` table names, **per UV region rather than per sheet**, because most of them are atlases: a vision model decides what each material is, arithmetic decides every pixel. Pure Python, unrelated to `d3d8.dll`, and it imports `blender/io_scene_rif`'s decoders rather than reimplementing them — so an addon change breaks it silently, which is what `pbr/tests/test_addon_boundary.py` exists to catch. Design record in `pbr/README.md` |
 | `lightmap/` | `gklightmap` — a second uv project, and **`pbr/` with the intelligence removed on purpose**: one `.RIM` in, three prompts to an image-editing model over **OpenRouter** (`OPENROUTER_API_KEY`, env or a file of that name at the repo root), one `<stem> lighting.dds` out. No segmentation, no classification, no gates, no cache. The three channels are `src/VkLighting.h`'s and two do not mean what their names mean elsewhere — R is a *height field*, G is highlight *intensity* (not a metal switch), B is highlight sharpness — so `gklightmap/prompts.py` spells all three out. Writes **uncompressed 24-bit + a full mip chain**, not DXT1: two channels are masks and a block's endpoints would smear them, and there is no S3TC compressor here. $0.20 a texture, measured. Design record in `lightmap/README.md` |
 | `huffman/`, `utils/rifutil` | The C++ REBCRIF1 codec and its CLI. The Python port in `blender/io_scene_rif/rif.py` is decode-only; this is the only compressor |
-| `utils/rendertest` | The PowerShell harness for driving Gunlok through the REPL and capturing frames — launch, dismiss the briefing, wait for the camera to come to rest, screenshot, and bisect `render.draw_hide` for the draw behind a pixel. What every renderer comparison should use; its README is the list of things that waste a run otherwise |
+| `utils/rendertest` | The PowerShell harness for driving Gunlok through the REPL and capturing frames — launch, dismiss the briefing, wait for the camera to come to rest, screenshot, and bisect `render.debug.draw_hide` for the draw behind a pixel. What every renderer comparison should use; its README is the list of things that waste a run otherwise |
 | `utils/symdump` | `gl_symbols.py`, a Ghidra Jython script exporting the database's function names as a symbol map for the profiler (`<hex rva> <hex size> <name>`, RVAs so ASLR does not matter). 12,487 functions, 62% named. Installed at `<Gunlok>\gkplus\symbols\gl.exe.sym`, where `prof.Describe` finds it with no call — which is what makes a sampled stack read `Aw_DrawIndexedPrimitiveUP <- SubMesh_DrawIndexed <- SceneNode_Render` instead of hex. The map's `# file_size` is checked against the loaded module: a map from another build shifts every RVA and would be confidently wrong rather than absent |
 | `utils/rimutil` | `.RIM` <-> PNG CLI over spng + libsquish, both directions, both image forms. `compress` takes `--format dxt1\|dxt3\|body` (default **dxt3**) and `--raw`; **dxt5 is refused by name**, because `TextureFormatCandidates` @ 0x006ac348 lists only DXT1/DXT3 and `SurfaceDesc_SetCompressedFormat` @ 0x005c6820 drops any other fourcc *silently* — a DXT5 file renders with garbage alpha rather than failing. `body` is exactly lossless **on disk** and needs no DXT compressor, and `check_lossless` re-derives every pixel before writing — but **it is not lossless in the engine, and it refuses graded alpha for that reason**: Gunlok ignores the `ALPH` chunk a palettized image carries alpha in, so such a texture loads fully opaque (measured — see `rif_chunk_format.md`, "The engine does not honour an `ALPH` you write"). It picks `masking 2`, the one palettized alpha that works, when every transparent texel shares one RGB; a cut-out that cannot (several RGBs under transparency, so an `ALPH`) is warned about rather than refused, because that case is presumed broken and not measured. Format details in `rif_chunk_format.md`; tests in `utils/rimutil/tests` |
 
@@ -838,7 +893,7 @@ code still live here under Conventions:
 
 - `address_map.md` - the binary's segment layout, every named global and function address, the Actor class hierarchy and subclass sizes, `TriggerKind`, and the `Role`/`Map` struct offsets
 - `script_host_notes.md` - the QuickJS host (`src/Script`) and the loopback REPL (`src/Repl`): boot point, the four facts that pin the design, the REPL protocol and its limits
-- `js_bindings_notes.md` - the `"gk"` module's 27 namespaces (`src/Js*`) and `types/`: the collection scaffolding, the Actor prototype chain, the native-vs-command-backed split, and the nine members that do not replicate
+- `js_bindings_notes.md` - the `"gk"` module's 27 namespaces (`src/Js*`) and `types/`: the collection scaffolding, the Actor prototype chain, the native-vs-command-backed split, the nine members that do not replicate, and the rules the surface is held to — actor identity is the object everywhere, failure throws, and `types/check-surface.py` proves the declarations match the bindings
 - `make_role_notes.md` - `src/MakeRole` and the `make` / `gls` namespaces: one `Make*` per GLS section, the five conversions that carry real risk, and what only the parser can answer
 - `script_queue_notes.md` - the `{kind, body}` envelope on both of Gunlok's queues, its ten hooks, and why the console queue is read through it but never written to it
 - `custom_levels_notes.md` - levels with no `.gls` and no `.gcs` (`src/CustomLevel`), and starting one with no menus (`src/Session`)

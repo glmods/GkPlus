@@ -43,7 +43,7 @@ Two facts from it that change how bindings get written:
   caps a batch line at 249 so the game cannot reach it, but a script can — `gk::ExecuteCommand`
   therefore refuses anything over `kConsoleCommandLineMax` and returns false.
 - **Nine binding members do not replicate, and the ones next to them do.** `actor.armor`,
-  `actor.shield`, `actor.set_position`, `actor.set_team`, `actor.concealed`, `actor.goto`,
+  `actor.shields`, `actor.set_position`, `actor.set_team`, `actor.concealed`, `actor.goto`,
   `turret.turret_enabled`, `pickup.set_required_item` and `tokens[name] = value` all reach no
   broadcast, while `actor.health`, `frag`, `remove`, `die`, `set_target`, `associate`, the attack
   methods and `set_pickup_enabled` do. The console commands beside them broadcast *around* the same
@@ -75,6 +75,20 @@ Two facts from it that change how bindings get written:
   the calling-convention warning above describes. The third is the attacker's team id (-1 for none),
   used for Deathmatch frag credit and as the 0x9b payload. The base and mobile versions are also
   genuinely different functions, not a base and an override that forgot to broadcast: see §6.2.
+- **`triggers.create` returns a handle, and `trigger.remove()` is the only way to disarm one
+  early.** `AddTriggerToGlobalList` returns void, so the handle comes from the list tail read
+  *inside the same `ExecutorPause` as the insert* - reading it after resuming would race an
+  executor that had already fired and removed it. The handle re-derives rather than trusting its
+  pointer, for the reason the Actor wrapper does: `EvaluateTriggers` destroys a fired trigger
+  itself (five call sites) and `DeleteAllTriggers` takes the lot at level teardown, both with no
+  notification. `RemoveTriggerFromGlobalList` decrements `NumTriggers` **even when it does not find
+  the node**, so `remove()` re-checks liveness inside its own pause rather than trusting the
+  earlier check - a lost race would corrupt the count and double-free. Creating one with no level
+  running now throws, where it used to register nothing silently: there is no honest handle for a
+  trigger that was never made.
+- **The global trigger list is the pointer-first list header**, not `List<T>` - CLAUDE.md's second,
+  incompatible shape. `count` is at +0x04 where `List<T>` puts it at +0x0c, so modelling one as the
+  other shifts every field by 8. The four consecutive globals at 0x006af858 are the evidence.
 - **`triggers.create` is local, and that is correct.** Every machine runs the same `.gcs` and
   registers its own copy; the payload is what replicates when it fires. So register triggers in
   `setup` (which runs everywhere) and do *not* guard that with `game.simulation_running` — the
@@ -113,7 +127,7 @@ import gk, { camera, console, actors, roles, tokens, triggers, levels, make, gls
 camera.distance = 900;                              // live accessors
 for (const a of actors) if (a.alive) a.health = 50; // iterable
 actors[12].frag();                                  // by id
-actors["tbaa"].set_target(actors["hark"].id, 0);    // by token name
+actors["tbaa"].set_target(actors["hark"]);          // by token name; an actor, never an id
 roles["gunlok"].spawn(0, {x: 0, y: 0, z: 0});
 for (const [name, value] of Object.entries(tokens)) console.print(`${name}=${value}`);
 console.log("actors:", actors.count);               // the host's own logging - no global console
@@ -293,6 +307,73 @@ through `actors[…]`.
 `EnsureClass` has a six-argument overload for this: unlike the five-argument one, it *always*
 creates a prototype (a class adding no members still needs one in the chain) and chains it to the
 parent's, re-read per context because `JS_SetClassProto` is per-context.
+
+### The rules the surface is held to
+
+Four of these were fixed in one pass after a review of the whole surface, and each was a real
+defect rather than a matter of taste. They are written down because the next binding has to follow
+them, and because three of the four failed *silently*.
+
+**An actor is the object, everywhere.** There is one coercion, `js::ActorFromValue`, and no member
+takes an id or a token name. The id form was the dangerous one to leave working: `JS_ToInt32` on an
+object yields **0** rather than throwing, so `actor.set_target(other)` — passing the object the
+member looked like it wanted — silently retargeted actor 0. `game.selected_actor` was worse, since
+its getter returned an `Actor` and its setter took an id, so assigning back what you had just read
+selected actor 0.
+
+The command-backed half took **names**, which was a second problem: an actor no token names — a
+spawned one — could not be addressed at all. `src/ActorArg.h` is the fix and the argument for it is
+in that header; the short version is that `ConsoleParseActorName` @ 0x004d6d90 is a single shared
+seam for ~27 handlers, and it is substitutable rather than merely hookable because it consumes its
+word unconditionally and prints nothing on failure. The one place a name is still required is a
+**trigger's target list**, because the engine itself stores `char *` there and matches by string;
+`js::ActorTokenName` throws for an actor no token names rather than minting one, since a token is
+saved into the savegame and inventing one would leave an artefact behind to work around a limit the
+engine really has.
+
+**Failure throws; a boolean return answers a question.** `console.execute_file`, `make.ammo`,
+`make.ammo_info`, `make.camera_track`, `levels.start`, `levels.quit`, `settings.save` and
+`settings.reload` all returned a boolean nobody read. The ones that are still boolean are
+predicates and say so: `actor.damage` ("did it land"), `settings.remove` ("was there a key"),
+`mods.exists`, `trigger.remove` ("was it still live"). The two kinds used to be indistinguishable
+from the signature.
+
+**A namespace says what a member affects, not how it is implemented.** `screen` had collected the
+session control — pausing, chat, exiting, adding a level to Choose Level — because all of it is
+console commands, which is a fact about the binding style and not about the game. Those are on
+`game` and `levels` now. It also removed a genuine duplicate: `screen.main_menu()` and
+`levels.quit()` were one act under two names, with different mechanisms and different return types.
+
+**A collection coerces what it understands and refuses the rest.** `ToVec3` accepted any object and
+treated a missing component as "leave it alone", so `camera.position = [1, 2, 3]` passed the type
+guard, missed all three lookups and was a **silent no-op**. It now requires at least one of
+`x`/`y`/`z`; a partial update (`{y: 2}`) is still deliberate and useful.
+
+**`render` is two objects and eleven families.** The measurement surface is `render.debug` and
+persists nothing; the settings are `render` and all persist. Within the settings, the prefix
+families are sub-objects — `render.ao.radius`, `render.sun_shadow.softness`,
+`render.tess.pn_strength` — with four members (`msaa`, `per_pixel_lighting`, `specular`,
+`stencil_shadow`) left flat because they belong to no family.
+
+The one thing that made the grouping more than a move: **ten of the family roots were themselves
+knobs**, so a group named for the family collided with the switch that enables it. Each switch is
+`<group>.enabled` now. `RenderBoolKey<T>` and its two siblings are generic over the group for the
+same reason, and they are what keep a table-driven panel type-safe — `examples/render-panel.mjs`
+passes the group and a key, and naming a knob that is not a boolean, or belongs to another family,
+is a compile error.
+
+### `types/check-surface.py`
+
+`tsc` proves the declarations are self-consistent and that the shipped `.mjs` type-check against
+them. Nothing proved they matched the **bindings**, because the bindings are C++ — which is how
+`render` accumulated 50 undeclared members behind an index signature, and how a deleted
+`units.remove_trigger` stayed declared after its C++ entry was gone.
+
+This compares every `JSCFunctionListEntry` table against its interface, both directions, over 25
+namespaces. Two structural cases are handled explicitly rather than skipped, so "not checked" is
+never the silent default: the Actor surface is one prototype chain in C++ and five mixin interfaces
+in TypeScript (a `+`-joined table name and a `UNIONS` entry put both halves back together), and
+`RenderDebug` is deliberately open. It has been confirmed to fail in both directions.
 
 ### Type definitions (`types/`)
 

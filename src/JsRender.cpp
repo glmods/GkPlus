@@ -12,6 +12,7 @@
 
 #include "D3D8Capture.h"
 #include "JsBindings.h"
+#include "RenderSettings.h"
 #include "VkCapture.h"
 #include "VkContext.h"
 #include "VkDraw.h"
@@ -406,6 +407,10 @@ JSValue ProbeQuad(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
 // because the one thing that can go wrong here is silent: a substring key that matches no live
 // image, or matches more than the author meant, is not an error and cannot be detected from the
 // call site. The answer says what it matched, now.
+// Forward-declared: `material_override` below returns the same structure this
+// builds, and the setter is defined first.
+JSValue GetMaterialOverrides(JSContext *ctx, JSValueConst self);
+
 JSValue MaterialOverrideFn(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
   if (argc < 1) {
     return JS_ThrowTypeError(ctx, "material_override(name, spec) needs a texture name");
@@ -485,14 +490,81 @@ JSValue MaterialOverrideFn(JSContext *ctx, JSValueConst, int argc, JSValueConst 
   JS_FreeValue(ctx, hide);
 
   vulkan::SetMaterialOverride(name, over);
-  const std::string result = vulkan::DescribeMaterialOverrides();
-  return JS_NewStringLen(ctx, result.data(), result.size());
+  // The same structure the getter returns: a setter that reported in a different
+  // shape from the reader was the smaller half of the same incoherence.
+  return GetMaterialOverrides(ctx, JS_UNDEFINED);
 }
 
-// `render.material_overrides` - every registration, with the live images each key matches.
+// `render.material_overrides` - every registered override and what its key currently resolves to.
+//
+// A structure for the same reason `bloom_layers` is one: the content a caller needs is which live
+// images each key matched and which of them it actually owns, and that was only expressible as
+// text a panel had to parse. `vulkan::DescribeMaterialOverrides()` formats exactly this.
 JSValue GetMaterialOverrides(JSContext *ctx, JSValueConst) {
-  const std::string text = vulkan::DescribeMaterialOverrides();
-  return JS_NewStringLen(ctx, text.data(), text.size());
+  const vulkan::MaterialOverridesState state = vulkan::MaterialOverridesNow();
+  JSValue out = JS_NewObject(ctx);
+  if (JS_IsException(out)) {
+    return out;
+  }
+  JSValue entries = JS_NewArray(ctx);
+  if (JS_IsException(entries)) {
+    JS_FreeValue(ctx, out);
+    return JS_EXCEPTION;
+  }
+  uint32_t n = 0;
+  for (const vulkan::MaterialOverrideState &e : state.entries) {
+    JSValue entry = JS_NewObject(ctx);
+    JSValue tint = JS_NewArray(ctx);
+    JSValue images = JS_NewArray(ctx);
+    if (JS_IsException(entry) || JS_IsException(tint) || JS_IsException(images)) {
+      JS_FreeValue(ctx, entry);
+      JS_FreeValue(ctx, tint);
+      JS_FreeValue(ctx, images);
+      JS_FreeValue(ctx, entries);
+      JS_FreeValue(ctx, out);
+      return JS_EXCEPTION;
+    }
+    for (uint32_t i = 0; i < 4; ++i) {
+      JS_SetPropertyUint32(ctx, tint, i, JS_NewFloat64(ctx, e.tint[i]));
+    }
+    uint32_t m = 0;
+    for (const vulkan::MaterialOverrideImage &image : e.images) {
+      JSValue matched = JS_NewObject(ctx);
+      JS_SetPropertyStr(ctx, matched, "index", JS_NewUint32(ctx, image.index));
+      JS_SetPropertyStr(ctx, matched, "name",
+                        JS_NewStringLen(ctx, image.name.data(), image.name.size()));
+      // False means an earlier key already claimed it. Reported rather than filtered:
+      // from the call site, a key taken over by an earlier one looks exactly like a
+      // key that matched nothing.
+      JS_SetPropertyStr(ctx, matched, "owned", JS_NewBool(ctx, image.owned));
+      JS_SetPropertyUint32(ctx, images, m++, matched);
+    }
+    JS_SetPropertyStr(ctx, entry, "key",
+                      JS_NewStringLen(ctx, e.key.data(), e.key.size()));
+    JS_SetPropertyStr(ctx, entry, "texture",
+                      e.texture.empty()
+                          ? JS_NULL
+                          : JS_NewStringLen(ctx, e.texture.data(), e.texture.size()));
+    // Null rather than absent when the key names an image nothing matches: the
+    // original is drawn, which is otherwise indistinguishable from the override
+    // never having been registered.
+    JS_SetPropertyStr(ctx, entry, "texture_image",
+                      e.texture_resolved ? JS_NewUint32(ctx, e.texture_image) : JS_NULL);
+    JS_SetPropertyStr(ctx, entry, "tint", tint);
+    JS_SetPropertyStr(ctx, entry, "hide", JS_NewBool(ctx, e.hide));
+    JS_SetPropertyStr(ctx, entry, "images", images);
+    if (JS_SetPropertyUint32(ctx, entries, n++, entry) < 0) {
+      JS_FreeValue(ctx, entries);
+      JS_FreeValue(ctx, out);
+      return JS_EXCEPTION;
+    }
+  }
+  JS_SetPropertyStr(ctx, out, "entries", entries);
+  JS_SetPropertyStr(ctx, out, "overridden_draws",
+                    JS_NewInt64(ctx, static_cast<int64_t>(state.overridden_draws)));
+  JS_SetPropertyStr(ctx, out, "hidden_draws",
+                    JS_NewInt64(ctx, static_cast<int64_t>(state.hidden_draws)));
+  return out;
 }
 
 JSValue ClearMaterialOverridesFn(JSContext *ctx, JSValueConst, int, JSValueConst *) {
@@ -629,14 +701,7 @@ JSValue SetSeamFixValue(JSContext *ctx, JSValueConst, JSValueConst value) {
 // rather than a pair of booleans because the three are exclusive, and `render.normal_census` says
 // the choice is a real one: more than half the curvature in a frame is in the props.
 JSValue GetTessSet(JSContext *ctx, JSValueConst) {
-  switch (vulkan::TessellationSet()) {
-  case vulkan::TessSet::Map:
-    return JS_NewString(ctx, "map");
-  case vulkan::TessSet::All:
-    return JS_NewString(ctx, "all");
-  default:
-    return JS_NewString(ctx, "off");
-  }
+  return JS_NewString(ctx, render_settings::TessSetName(vulkan::TessellationSet()));
 }
 
 JSValue SetTessSetValue(JSContext *ctx, JSValueConst, JSValueConst value) {
@@ -644,17 +709,13 @@ JSValue SetTessSetValue(JSContext *ctx, JSValueConst, JSValueConst value) {
   if (text == nullptr) {
     return JS_EXCEPTION;
   }
-  const std::string name = text;
+  vulkan::TessSet set = vulkan::TessSet::Off;
+  const bool known = render_settings::TessSetFromName(text, &set);
   JS_FreeCString(ctx, text);
-  if (name == "map") {
-    vulkan::SetTessellationSet(vulkan::TessSet::Map);
-  } else if (name == "all") {
-    vulkan::SetTessellationSet(vulkan::TessSet::All);
-  } else if (name == "off") {
-    vulkan::SetTessellationSet(vulkan::TessSet::Off);
-  } else {
+  if (!known) {
     return JS_ThrowTypeError(ctx, "render.tess_set takes \"map\", \"all\" or \"off\"");
   }
+  vulkan::SetTessellationSet(set);
   return JS_UNDEFINED;
 }
 
@@ -764,19 +825,11 @@ JSValue SetLinearInputValue(JSContext *ctx, JSValueConst, JSValueConst value) {
 // `rolloff` is the default because it is the conservative one - exactly the identity below
 // `render.tonemap_knee`, so it only touches what genuinely exceeds it - and not because anything
 // depends on it any more.
-const char *TonemapName(uint32_t op) {
-  switch (op) {
-  case 1: return "rolloff";
-  case 2: return "reinhard";
-  case 3: return "aces";
-  case 4: return "filmic";
-  case 5: return "agx";
-  default: return "clamp";
-  }
-}
-
+// The name<->index tables live in src/RenderSettings.h, not here. A name is what
+// gets written to settings.json, so two spellings of one operator would mean a
+// stored value silently failing to restore.
 JSValue GetTonemap(JSContext *ctx, JSValueConst) {
-  return JS_NewString(ctx, TonemapName(vulkan::Tonemap()));
+  return JS_NewString(ctx, render_settings::TonemapName(vulkan::Tonemap()));
 }
 
 JSValue SetTonemapValue(JSContext *ctx, JSValueConst, JSValueConst value) {
@@ -784,27 +837,17 @@ JSValue SetTonemapValue(JSContext *ctx, JSValueConst, JSValueConst value) {
   if (name == nullptr) {
     return JS_EXCEPTION;
   }
-  const std::string text = name;
+  uint32_t op = 0;
+  const bool known = render_settings::TonemapFromName(name, &op);
   JS_FreeCString(ctx, name);
   // **Refused rather than approximated**, the same rule `GKPLUS_VK_PRESENT_MODE` follows: the
   // whole point of naming an operator is knowing which one ran, and a typo silently behaving as
   // `clamp` would read as "HDR does nothing on this machine".
-  if (text == "clamp") {
-    vulkan::SetTonemap(0);
-  } else if (text == "rolloff") {
-    vulkan::SetTonemap(1);
-  } else if (text == "reinhard") {
-    vulkan::SetTonemap(2);
-  } else if (text == "aces") {
-    vulkan::SetTonemap(3);
-  } else if (text == "filmic") {
-    vulkan::SetTonemap(4);
-  } else if (text == "agx") {
-    vulkan::SetTonemap(5);
-  } else {
+  if (!known) {
     return JS_ThrowTypeError(
         ctx, "render.tonemap must be clamp, rolloff, reinhard, aces, filmic or agx");
   }
+  vulkan::SetTonemap(op);
   return JS_UNDEFINED;
 }
 
@@ -975,13 +1018,73 @@ JSValue BloomLayerFn(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv)
 }
 
 // `render.bloom_layers` - all three layers, the size each is running at, and whether the pass is
-// actually doing anything. A string and not a structure, for the reason `material_overrides` is one:
+// actually doing anything.
+//
+// A **structure**, not the formatted string this used to be. The argument for the string was that
 // the interesting part is what a caller cannot compute from the knobs - the layer extents, the
 // sigma in texels, whether a kernel hit its cap, and which of "off", "unavailable" and "inert
-// without hdr" is the case.
-JSValue GetBloomLayers(JSContext *ctx, JSValueConst) {
+// without hdr" is the case. That argument was for the *content* and never for the format: a panel
+// binding a row per layer had to parse it back out, and a `%.2f` in the report silently became the
+// precision of the readback. `vulkan::DescribeBloom()` formats exactly this object, so the text
+// form is still there for a REPL and the two cannot drift.
+// The text forms of the two readbacks above, on the measurement surface where a
+// report belongs. Same data, formatted by the same native call, for a REPL
+// session or a readout pane where a structure would just have to be re-rendered.
+JSValue GetBloomReport(JSContext *ctx, JSValueConst) {
   const std::string text = vulkan::DescribeBloom();
   return JS_NewStringLen(ctx, text.data(), text.size());
+}
+
+JSValue GetMaterialOverrideReport(JSContext *ctx, JSValueConst) {
+  const std::string text = vulkan::DescribeMaterialOverrides();
+  return JS_NewStringLen(ctx, text.data(), text.size());
+}
+
+JSValue GetBloomLayers(JSContext *ctx, JSValueConst) {
+  const vulkan::BloomState state = vulkan::BloomStateNow();
+  JSValue out = JS_NewObject(ctx);
+  if (JS_IsException(out)) {
+    return out;
+  }
+  JSValue layers = JS_NewArray(ctx);
+  if (JS_IsException(layers)) {
+    JS_FreeValue(ctx, out);
+    return JS_EXCEPTION;
+  }
+  for (uint32_t i = 0; i < vulkan::kBloomLayers; ++i) {
+    const vulkan::BloomLayerState &l = state.layers[i];
+    JSValue entry = JS_NewObject(ctx);
+    if (JS_IsException(entry)) {
+      JS_FreeValue(ctx, layers);
+      JS_FreeValue(ctx, out);
+      return JS_EXCEPTION;
+    }
+    // The knobs, so a caller reading the report never has to also read the setters.
+    JS_SetPropertyStr(ctx, entry, "threshold", JS_NewFloat64(ctx, l.layer.threshold));
+    JS_SetPropertyStr(ctx, entry, "knee", JS_NewFloat64(ctx, l.layer.knee));
+    JS_SetPropertyStr(ctx, entry, "radius", JS_NewFloat64(ctx, l.layer.radius));
+    JS_SetPropertyStr(ctx, entry, "intensity", JS_NewFloat64(ctx, l.layer.intensity));
+    JS_SetPropertyStr(ctx, entry, "blend",
+                      JS_NewString(ctx, render_settings::BloomBlendName(l.layer.blend)));
+    // ... and what they came out as, which is the half that cannot be computed.
+    JS_SetPropertyStr(ctx, entry, "width", JS_NewUint32(ctx, l.width));
+    JS_SetPropertyStr(ctx, entry, "height", JS_NewUint32(ctx, l.height));
+    JS_SetPropertyStr(ctx, entry, "sigma_px", JS_NewFloat64(ctx, l.sigma_px));
+    JS_SetPropertyStr(ctx, entry, "taps", JS_NewUint32(ctx, l.taps));
+    JS_SetPropertyStr(ctx, entry, "capped", JS_NewBool(ctx, l.capped));
+    if (JS_SetPropertyUint32(ctx, layers, i, entry) < 0) {
+      JS_FreeValue(ctx, layers);
+      JS_FreeValue(ctx, out);
+      return JS_EXCEPTION;
+    }
+  }
+  JS_SetPropertyStr(ctx, out, "enabled", JS_NewBool(ctx, state.requested));
+  JS_SetPropertyStr(ctx, out, "status",
+                    JS_NewString(ctx, vulkan::BloomStatusName(state.status)));
+  JS_SetPropertyStr(ctx, out, "source_height", JS_NewUint32(ctx, state.source_height));
+  JS_SetPropertyStr(ctx, out, "extract_taps", JS_NewUint32(ctx, state.extract_taps));
+  JS_SetPropertyStr(ctx, out, "layers", layers);
+  return out;
 }
 
 // `render.stock` - all twelve deliberate departures from D3D8 at once, and back again (VkDraw.h,
@@ -2001,7 +2104,143 @@ JSValue GetVulkan(JSContext *ctx, JSValueConst) {
   return obj;
 }
 
+// The renderer's **settings**: the knobs a player or a mod chooses, every one of which
+// persists. src/RenderSettings.cpp is the table that saves and restores them, and it is the
+// authority on which side of this split a knob is on - adding one here means adding it there.
+//
+// The measurement surface is RenderDebugProps below, reached as `render.debug`.
+// `render.tess`
+const JSCFunctionListEntry RenderTessProps[] = {
+    // The PN-triangle amplification pass (§4.71).
+    JS_CGETSET_DEF("enabled", GetTessellation, SetTessellationValue),
+    JS_CGETSET_DEF("shadows", GetTessShadows, SetTessShadowsValue),
+    JS_CGETSET_DEF("set", GetTessSet, SetTessSetValue),
+    JS_CGETSET_DEF("edge_pixels", Getedge_pixels, Setedge_pixelsValue),
+    JS_CGETSET_DEF("max", Getmax_factor, Setmax_factorValue),
+    JS_CGETSET_DEF("min", Getmin_factor, Setmin_factorValue),
+    JS_CGETSET_DEF("shadow_factor", Getshadow_factor, Setshadow_factorValue),
+    JS_CGETSET_DEF("seam_fix", GetSeamFix, SetSeamFixValue),
+    JS_CGETSET_DEF("pn_strength", Getpn_strength, Setpn_strengthValue),
+    JS_CGETSET_DEF("pn_flat_threshold", Getpn_flat_threshold, Setpn_flat_thresholdValue),
+    JS_CGETSET_DEF("pn_max_offset", Getpn_max_offset, Setpn_max_offsetValue),
+};
+
+// `render.hdr`
+const JSCFunctionListEntry RenderHdrProps[] = {
+    JS_CGETSET_DEF("enabled", GetHdr, SetHdrValue),
+    JS_CGETSET_DEF("linear_input", GetLinearInput, SetLinearInputValue),
+    JS_CGETSET_DEF("tonemap", GetTonemap, SetTonemapValue),
+    JS_CGETSET_DEF("exposure", GetExposure, SetExposureValue),
+    JS_CGETSET_DEF("knee", GetTonemapKnee, SetTonemapKneeValue),
+    JS_CGETSET_DEF("white", GetTonemapWhite, SetTonemapWhiteValue),
+};
+
+// `render.bloom`
+const JSCFunctionListEntry RenderBloomProps[] = {
+    JS_CGETSET_DEF("enabled", GetBloom, SetBloomValue),
+    JS_CFUNC_DEF("layer", 2, BloomLayerFn),
+    JS_CGETSET_DEF("layers", GetBloomLayers, nullptr),
+};
+
+// `render.ao`
+const JSCFunctionListEntry RenderAoProps[] = {
+    JS_CGETSET_DEF("enabled", GetAo, SetAoValue),
+    JS_CGETSET_DEF("radius", GetAoRadius, SetAoRadiusValue),
+    JS_CGETSET_DEF("screen_radius", GetAoScreenRadius, SetAoScreenRadiusValue),
+    JS_CGETSET_DEF("bias", GetAoBias, SetAoBiasValue),
+    JS_CGETSET_DEF("strength", GetAoStrength, SetAoStrengthValue),
+    JS_CGETSET_DEF("direct", GetAoDirect, SetAoDirectValue),
+    JS_CGETSET_DEF("taps", GetAoTaps, SetAoTapsValue),
+    JS_CGETSET_DEF("map_only", GetAoMapOnly, SetAoMapOnlyValue),
+};
+
+// `render.sun_shadow`
+const JSCFunctionListEntry RenderSunShadowProps[] = {
+    JS_CGETSET_DEF("enabled", GetSunShadows, SetSunShadowsValue),
+    JS_CGETSET_DEF("bias", GetShadowBias, SetShadowBiasValue),
+    JS_CGETSET_DEF("strength", GetShadowStrength, SetShadowStrengthValue),
+    JS_CGETSET_DEF("extent", GetShadowExtent, SetShadowExtentValue),
+    JS_CGETSET_DEF("cascades", GetShadowCascades, SetShadowCascadesValue),
+    JS_CGETSET_DEF("softness", GetShadowSoftness, SetShadowSoftnessValue),
+    JS_CGETSET_DEF("soft_min", GetShadowSoftMin, SetShadowSoftMinValue),
+    JS_CGETSET_DEF("soft_max", GetShadowSoftMax, SetShadowSoftMaxValue),
+    JS_CGETSET_DEF("soft_taps", GetShadowSoftTaps, SetShadowSoftTapsValue),
+    JS_CGETSET_DEF("soft_blur", GetShadowSoftBlur, SetShadowSoftBlurValue),
+};
+
+// `render.map_shadow`
+const JSCFunctionListEntry RenderMapShadowProps[] = {
+    JS_CGETSET_DEF("enabled", GetMapShadows, SetMapShadowsValue),
+    JS_CGETSET_DEF("bias", GetMapShadowBias, SetMapShadowBiasValue),
+    JS_CGETSET_DEF("rate", GetMapShadowRate, SetMapShadowRateValue),
+    JS_CGETSET_DEF("indirect", GetMapShadowIndirect, SetMapShadowIndirectValue),
+};
+
+// `render.map_light`
+const JSCFunctionListEntry RenderMapLightProps[] = {
+    JS_CGETSET_DEF("enabled", GetMapLighting, SetMapLightingValue),
+    JS_CGETSET_DEF("gain", GetMapLightGain, SetMapLightGainValue),
+    JS_CGETSET_DEF("all", GetMapLightingAll, SetMapLightingAllValue),
+    JS_CGETSET_DEF("cull", GetMapLightCull, SetMapLightCullValue),
+};
+
+// `render.local_light`
+const JSCFunctionListEntry RenderLocalLightProps[] = {
+    JS_CGETSET_DEF("enabled", GetLocalLights, SetLocalLightsValue),
+    JS_CGETSET_DEF("shadows", GetLocalShadows, SetLocalShadowsValue),
+    JS_CGETSET_DEF("shadow_taps", GetLocalShadowTaps, SetLocalShadowTapsValue),
+};
+
+// `render.dynamic_shadow`
+const JSCFunctionListEntry RenderDynamicShadowProps[] = {
+    JS_CGETSET_DEF("enabled", GetDynamicShadows, SetDynamicShadowsValue),
+    JS_CGETSET_DEF("bias", GetDynamicShadowBias, SetDynamicShadowBiasValue),
+};
+
+// `render.lighting_map`
+const JSCFunctionListEntry RenderLightingMapProps[] = {
+    JS_CGETSET_DEF("enabled", GetLightingMaps, SetLightingMapsValue),
+    JS_CGETSET_DEF("bump_scale", Getbump_scale, Setbump_scaleValue),
+    JS_CGETSET_DEF("bump_diffuse", Getbump_diffuse, Setbump_diffuseValue),
+    JS_CGETSET_DEF("bump_diffuse_limit", Getbump_diffuse_limit,
+                   Setbump_diffuse_limitValue),
+    JS_CGETSET_DEF("specular_scale", Getspecular_scale, Setspecular_scaleValue),
+    JS_CGETSET_DEF("specular_from_diffuse", Getspecular_from_diffuse,
+                   Setspecular_from_diffuseValue),
+    JS_CGETSET_DEF("gloss_min", Getgloss_min, Setgloss_minValue),
+    JS_CGETSET_DEF("gloss_max", Getgloss_max, Setgloss_maxValue),
+    JS_CGETSET_DEF("chrome_scale", Getchrome_scale, Setchrome_scaleValue),
+    JS_CGETSET_DEF("chrome_blur", Getchrome_blur, Setchrome_blurValue),
+    JS_CGETSET_DEF("chrome_texgen", GetChromeTexgen, SetChromeTexgen),
+};
+
+// `render.material`
+const JSCFunctionListEntry RenderMaterialProps[] = {
+    JS_CFUNC_DEF("override", 2, MaterialOverrideFn),
+    JS_CGETSET_DEF("overrides", GetMaterialOverrides, nullptr),
+    JS_CFUNC_DEF("clear", 0, ClearMaterialOverridesFn),
+};
+
+// What is left on `render` itself: the four settings with no family to belong to.
 const JSCFunctionListEntry RenderProps[] = {
+    JS_CGETSET_DEF("msaa", GetMsaa, SetMsaaValue),
+    JS_CGETSET_DEF("per_pixel_lighting", GetPerPixelLighting, SetPerPixelLightingValue),
+    JS_CGETSET_DEF("specular", GetSpecularValue, SetSpecularValue),
+    JS_CGETSET_DEF("stencil_shadow", GetStencilShadow, SetStencilShadowValue),
+};
+
+
+// `render.debug` - the Vulkan investigation's measurement surface: the probes, the censuses,
+// the capture controls, the read-only reports, and the A/B knobs whose default is already the
+// correct value.
+//
+// Separate from the settings above for two reasons, and neither is tidiness. **Nothing here
+// persists**: a stored `draw_hide` would hide a draw on the next launch with nothing on screen
+// to say why, and `stock` reads back derived so storing it is meaningless. And it is what lets
+// `render` itself be exactly typed in types/gk.d.ts - the `[key: string]: any` that used to
+// disable typo detection for all 135 members now sits on this object alone, where a member
+// genuinely may come and go with an investigation.
+const JSCFunctionListEntry RenderDebugProps[] = {
     JS_CGETSET_DEF("captured", GetCaptured, nullptr),
     JS_CGETSET_DEF("report", GetReport, nullptr),
     JS_CGETSET_DEF("stats", GetStats, nullptr),
@@ -2015,88 +2254,21 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CGETSET_DEF("verify_process_vertices", GetVerifyProcessVertices,
                    SetVerifyProcessVerticesValue),
     JS_CGETSET_DEF("process_vertices_report", GetProcessVerticesReport, nullptr),
-    JS_CGETSET_DEF("specular", GetSpecularValue, SetSpecularValue),
     JS_CGETSET_DEF("half_pixel", GetHalfPixel, SetHalfPixelValue),
     JS_CGETSET_DEF("rhw_depth_raw", GetRhwDepthRaw, SetRhwDepthRawValue),
     JS_CGETSET_DEF("viewport_rect", GetViewportRect, SetViewportRectValue),
     JS_CGETSET_DEF("offscreen", GetOffscreen, SetOffscreenValue),
     JS_CGETSET_DEF("present_linear", GetPresentLinear, SetPresentLinearValue),
     JS_CGETSET_DEF("shade_mode", GetShadeMode, SetShadeModeValue),
-    // The PN-triangle amplification pass (§4.71).
-    JS_CGETSET_DEF("tessellation", GetTessellation, SetTessellationValue),
-    JS_CGETSET_DEF("tess_shadows", GetTessShadows, SetTessShadowsValue),
-    JS_CGETSET_DEF("pn_seam_fix", GetSeamFix, SetSeamFixValue),
-    JS_CGETSET_DEF("tess_set", GetTessSet, SetTessSetValue),
-    JS_CGETSET_DEF("tess_edge_pixels", Getedge_pixels, Setedge_pixelsValue),
-    JS_CGETSET_DEF("tess_max", Getmax_factor, Setmax_factorValue),
-    JS_CGETSET_DEF("tess_min", Getmin_factor, Setmin_factorValue),
-    JS_CGETSET_DEF("pn_strength", Getpn_strength, Setpn_strengthValue),
-    JS_CGETSET_DEF("pn_flat_threshold", Getpn_flat_threshold, Setpn_flat_thresholdValue),
-    JS_CGETSET_DEF("pn_max_offset", Getpn_max_offset, Setpn_max_offsetValue),
-    JS_CGETSET_DEF("tess_shadow_factor", Getshadow_factor, Setshadow_factorValue),
-    JS_CGETSET_DEF("msaa", GetMsaa, SetMsaaValue),
-    JS_CGETSET_DEF("hdr", GetHdr, SetHdrValue),
-    JS_CGETSET_DEF("linear_input", GetLinearInput, SetLinearInputValue),
-    JS_CGETSET_DEF("tonemap", GetTonemap, SetTonemapValue),
-    JS_CGETSET_DEF("exposure", GetExposure, SetExposureValue),
-    JS_CGETSET_DEF("tonemap_knee", GetTonemapKnee, SetTonemapKneeValue),
-    JS_CGETSET_DEF("tonemap_white", GetTonemapWhite, SetTonemapWhiteValue),
-    JS_CGETSET_DEF("bloom", GetBloom, SetBloomValue),
-    JS_CFUNC_DEF("bloom_layer", 2, BloomLayerFn),
-    JS_CGETSET_DEF("bloom_layers", GetBloomLayers, nullptr),
     JS_CGETSET_DEF("stock", GetStock, SetStockValue),
-    JS_CGETSET_DEF("per_pixel_lighting", GetPerPixelLighting, SetPerPixelLightingValue),
     JS_CGETSET_DEF("map_light_report", GetMapLightReport, nullptr),
-    JS_CGETSET_DEF("map_lighting", GetMapLighting, SetMapLightingValue),
-    JS_CGETSET_DEF("map_light_gain", GetMapLightGain, SetMapLightGainValue),
-    JS_CGETSET_DEF("map_lighting_all", GetMapLightingAll, SetMapLightingAllValue),
-    JS_CGETSET_DEF("map_light_cull", GetMapLightCull, SetMapLightCullValue),
-    JS_CGETSET_DEF("sun_shadows", GetSunShadows, SetSunShadowsValue),
-    JS_CGETSET_DEF("stencil_shadow", GetStencilShadow, SetStencilShadowValue),
-    JS_CGETSET_DEF("shadow_bias", GetShadowBias, SetShadowBiasValue),
-    JS_CGETSET_DEF("shadow_strength", GetShadowStrength, SetShadowStrengthValue),
-    JS_CGETSET_DEF("shadow_extent", GetShadowExtent, SetShadowExtentValue),
-    JS_CGETSET_DEF("shadow_cascades", GetShadowCascades, SetShadowCascadesValue),
-    JS_CGETSET_DEF("shadow_softness", GetShadowSoftness, SetShadowSoftnessValue),
-    JS_CGETSET_DEF("shadow_soft_min", GetShadowSoftMin, SetShadowSoftMinValue),
-    JS_CGETSET_DEF("shadow_soft_max", GetShadowSoftMax, SetShadowSoftMaxValue),
-    JS_CGETSET_DEF("shadow_soft_taps", GetShadowSoftTaps, SetShadowSoftTapsValue),
-    JS_CGETSET_DEF("shadow_soft_blur", GetShadowSoftBlur, SetShadowSoftBlurValue),
-    JS_CGETSET_DEF("map_shadows", GetMapShadows, SetMapShadowsValue),
-    JS_CGETSET_DEF("map_shadow_bias", GetMapShadowBias, SetMapShadowBiasValue),
-    JS_CGETSET_DEF("map_shadow_rate", GetMapShadowRate, SetMapShadowRateValue),
-    JS_CGETSET_DEF("map_shadow_indirect", GetMapShadowIndirect, SetMapShadowIndirectValue),
     JS_CGETSET_DEF("map_shadow_report", GetMapShadowReport, nullptr),
-    JS_CGETSET_DEF("ao", GetAo, SetAoValue),
-    JS_CGETSET_DEF("ao_radius", GetAoRadius, SetAoRadiusValue),
-    JS_CGETSET_DEF("ao_screen_radius", GetAoScreenRadius, SetAoScreenRadiusValue),
-    JS_CGETSET_DEF("ao_bias", GetAoBias, SetAoBiasValue),
-    JS_CGETSET_DEF("ao_strength", GetAoStrength, SetAoStrengthValue),
-    JS_CGETSET_DEF("ao_direct", GetAoDirect, SetAoDirectValue),
-    JS_CGETSET_DEF("ao_taps", GetAoTaps, SetAoTapsValue),
-    JS_CGETSET_DEF("ao_map_only", GetAoMapOnly, SetAoMapOnlyValue),
     JS_CGETSET_DEF("ao_debug", GetAoDebug, SetAoDebugValue),
     JS_CGETSET_DEF("force_lod", GetForceLod, SetForceLodValue),
-    JS_CGETSET_DEF("lighting_maps", GetLightingMaps, SetLightingMapsValue),
     JS_CGETSET_DEF("lighting_map_report", GetLightingMapReport, nullptr),
-    JS_CGETSET_DEF("bump_scale", Getbump_scale, Setbump_scaleValue),
-    JS_CGETSET_DEF("bump_diffuse", Getbump_diffuse, Setbump_diffuseValue),
-    JS_CGETSET_DEF("bump_diffuse_limit", Getbump_diffuse_limit,
-                   Setbump_diffuse_limitValue),
-    JS_CGETSET_DEF("specular_scale", Getspecular_scale, Setspecular_scaleValue),
-    JS_CGETSET_DEF("specular_from_diffuse", Getspecular_from_diffuse,
-                   Setspecular_from_diffuseValue),
-    JS_CGETSET_DEF("gloss_min", Getgloss_min, Setgloss_minValue),
-    JS_CGETSET_DEF("gloss_max", Getgloss_max, Setgloss_maxValue),
-    JS_CGETSET_DEF("chrome_scale", Getchrome_scale, Setchrome_scaleValue),
-    JS_CGETSET_DEF("chrome_blur", Getchrome_blur, Setchrome_blurValue),
-    JS_CGETSET_DEF("chrome_texgen", GetChromeTexgen, SetChromeTexgen),
     JS_CFUNC_DEF("probe", 5, ProbeQuad),
     JS_CFUNC_DEF("depth_probe", 5, DepthProbe),
     JS_CFUNC_DEF("viewport_probe", 5, ViewportProbe),
-    JS_CFUNC_DEF("material_override", 2, MaterialOverrideFn),
-    JS_CGETSET_DEF("material_overrides", GetMaterialOverrides, nullptr),
-    JS_CFUNC_DEF("clear_material_overrides", 0, ClearMaterialOverridesFn),
     JS_CGETSET_DEF("draw_range", GetDrawRange, SetDrawRangeValue),
     JS_CGETSET_DEF("draw_hide", GetDrawHide, SetDrawHideValue),
     JS_CGETSET_DEF("ref_range", GetRefRange, SetRefRangeValue),
@@ -2106,28 +2278,10 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CFUNC_DEF("seam_census", 0, SeamCensus),
     JS_CFUNC_DEF("frame_draws", 2, FrameDraws),
     JS_CGETSET_DEF("frame_lights", GetFrameLights, nullptr),
-    JS_CGETSET_DEF("local_lights", GetLocalLights, SetLocalLightsValue),
     JS_CGETSET_DEF("local_light_window", GetLocalLightWindow,
                    SetLocalLightWindowValue),
-    JS_CGETSET_DEF("local_shadows", GetLocalShadows, SetLocalShadowsValue),
-    JS_CGETSET_DEF("dynamic_shadows", GetDynamicShadows, SetDynamicShadowsValue),
-    JS_CGETSET_DEF("dynamic_shadow_arena_only", GetDynArenaOnly, SetDynArenaOnlyValue),
-    JS_CGETSET_DEF("dynamic_shadow_map_only", GetDynMapOnly, SetDynMapOnlyValue),
-    JS_CGETSET_DEF("local_shadow_taps", GetLocalShadowTaps, SetLocalShadowTapsValue),
-    JS_CGETSET_DEF("dynamic_shadow_sample", GetDynSample, SetDynSampleValue),
-    JS_CGETSET_DEF("dynamic_shadow_bias", GetDynamicShadowBias, SetDynamicShadowBiasValue),
     JS_CGETSET_DEF("dynamic_shadow_report", GetDynamicShadowReport, nullptr),
-    JS_CGETSET_DEF("dynamic_shadow_indirect", GetDynIndirect, SetDynIndirectValue),
-    JS_CGETSET_DEF("dynamic_shadow_cull", GetDynCull, SetDynCullValue),
-    JS_CGETSET_DEF("sun_shadow_cull", GetSunCull, SetSunCullValue),
-    JS_CGETSET_DEF("sun_shadow_indirect", GetSunIndirect, SetSunIndirectValue),
     JS_CGETSET_DEF("sun_shadow_report", GetSunShadowReport, nullptr),
-    JS_CGETSET_DEF("dynamic_shadow_max_lights", GetDynamicShadowMaxLights,
-                   SetDynamicShadowMaxLightsValue),
-    JS_CGETSET_DEF("dynamic_shadow_max_faces", GetDynamicShadowMaxFaces,
-                   SetDynamicShadowMaxFacesValue),
-    JS_CGETSET_DEF("dynamic_shadow_max_casters", GetDynamicShadowMaxCasters,
-                   SetDynamicShadowMaxCastersValue),
     JS_CGETSET_DEF("local_shadow_report", GetLocalShadowReport, nullptr),
     JS_CGETSET_DEF("draw_vertices", GetDrawVertices, SetDrawVerticesValue),
     JS_CGETSET_DEF("draw_state", GetDrawState, SetDrawStateValue),
@@ -2145,14 +2299,84 @@ const JSCFunctionListEntry RenderProps[] = {
     JS_CFUNC_DEF("verify_buffers", 0, VerifyBuffers),
     JS_CFUNC_DEF("capture_batch", 1, CaptureBatch),
     JS_CGETSET_DEF("staging_watch", GetStagingWatch, nullptr),
+    JS_CGETSET_DEF("bloom_report", GetBloomReport, nullptr),
+    JS_CGETSET_DEF("material_override_report", GetMaterialOverrideReport, nullptr),
     JS_CGETSET_DEF("renderdoc", GetCaptureStatus, nullptr),
     JS_CFUNC_DEF("capture", 0, Capture),
+    // The dynamic/sun-shadow bisects (notes 4.66): each one narrows the bake or
+    // swaps the submission path so a hang or a missing shadow can be halved. Not
+    // settings - `off` here is a hypothesis under test, not a preference.
+    JS_CGETSET_DEF("dynamic_shadow_arena_only", GetDynArenaOnly, SetDynArenaOnlyValue),
+    JS_CGETSET_DEF("dynamic_shadow_map_only", GetDynMapOnly, SetDynMapOnlyValue),
+    JS_CGETSET_DEF("dynamic_shadow_sample", GetDynSample, SetDynSampleValue),
+    JS_CGETSET_DEF("dynamic_shadow_cull", GetDynCull, SetDynCullValue),
+    JS_CGETSET_DEF("dynamic_shadow_indirect", GetDynIndirect, SetDynIndirectValue),
+    JS_CGETSET_DEF("sun_shadow_cull", GetSunCull, SetSunCullValue),
+    JS_CGETSET_DEF("sun_shadow_indirect", GetSunIndirect, SetSunIndirectValue),
+    JS_CGETSET_DEF("dynamic_shadow_max_lights", GetDynamicShadowMaxLights,
+                   SetDynamicShadowMaxLightsValue),
+    JS_CGETSET_DEF("dynamic_shadow_max_faces", GetDynamicShadowMaxFaces,
+                   SetDynamicShadowMaxFacesValue),
+    JS_CGETSET_DEF("dynamic_shadow_max_casters", GetDynamicShadowMaxCasters,
+                   SetDynamicShadowMaxCastersValue),
 };
+
 
 } // namespace
 
 JSValue NewRenderNamespace(JSContext *ctx) {
-  return NewNamespace(ctx, RenderProps, static_cast<int>(std::size(RenderProps)));
+  JSValue ns = NewNamespace(ctx, RenderProps, static_cast<int>(std::size(RenderProps)));
+  if (JS_IsException(ns)) {
+    return ns;
+  }
+  // The families as sub-objects. Ten of these groups are named for a knob that
+  // used to be the family's root - `render.ao`, `render.hdr` - so each is now
+  // `<group>.enabled`, which is what makes a group and its switch able to share
+  // a name at all.
+  const struct {
+    const char *name;
+    const JSCFunctionListEntry *props;
+    int len;
+  } Groups[] = {
+      {"tess", RenderTessProps, static_cast<int>(std::size(RenderTessProps))},
+      {"hdr", RenderHdrProps, static_cast<int>(std::size(RenderHdrProps))},
+      {"bloom", RenderBloomProps, static_cast<int>(std::size(RenderBloomProps))},
+      {"ao", RenderAoProps, static_cast<int>(std::size(RenderAoProps))},
+      {"sun_shadow", RenderSunShadowProps, static_cast<int>(std::size(RenderSunShadowProps))},
+      {"map_shadow", RenderMapShadowProps, static_cast<int>(std::size(RenderMapShadowProps))},
+      {"map_light", RenderMapLightProps, static_cast<int>(std::size(RenderMapLightProps))},
+      {"local_light", RenderLocalLightProps, static_cast<int>(std::size(RenderLocalLightProps))},
+      {"dynamic_shadow", RenderDynamicShadowProps, static_cast<int>(std::size(RenderDynamicShadowProps))},
+      {"lighting_map", RenderLightingMapProps, static_cast<int>(std::size(RenderLightingMapProps))},
+      {"material", RenderMaterialProps, static_cast<int>(std::size(RenderMaterialProps))},
+  };
+  for (const auto &g : Groups) {
+    JSValue sub = NewNamespace(ctx, g.props, g.len);
+    if (JS_IsException(sub)) {
+      JS_FreeValue(ctx, ns);
+      return sub;
+    }
+    if (JS_DefinePropertyValueStr(ctx, ns, g.name, sub,
+                                  JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE) < 0) {
+      JS_FreeValue(ctx, ns);
+      return JS_EXCEPTION;
+    }
+  }
+
+  JSValue debug = NewNamespace(ctx, RenderDebugProps,
+                               static_cast<int>(std::size(RenderDebugProps)));
+  if (JS_IsException(debug)) {
+    JS_FreeValue(ctx, ns);
+    return debug;
+  }
+  // Enumerable, unlike the collections' `count`: `render.debug` is a namespace a
+  // caller is meant to find by looking, not a hidden member of one.
+  if (JS_DefinePropertyValueStr(ctx, ns, "debug", debug,
+                                JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE) < 0) {
+    JS_FreeValue(ctx, ns);
+    return JS_EXCEPTION;
+  }
+  return ns;
 }
 
 } // namespace gk::js

@@ -3,6 +3,7 @@
 
 #include <detours.h>
 
+#include "ActorArg.h"
 #include "Core.h"
 #include "CustomLevel.h"
 #include "CustomMenu.h"
@@ -44,6 +45,11 @@ struct Subsystems {
   MusicSystem music;       // MusicTrack-ctor volume fix
   DebugSystem debug;       // DebugPrint* -> OutputDebugString
   GUISystem gui;           // ImGui/D3D overlay
+  // Independent of everything here: it detours ConsoleParseActorName, which
+  // nothing else touches, and stays inert until a JS command binding arms it.
+  // Its position does not matter, but it must exist for the process lifetime -
+  // the scope objects that arm it are created per dispatch, long after DllMain.
+  ActorArgSystem actor_args; // let a console handler be handed an Actor, not a name
   InputFixSystem inputfix; // suppress the vestigial DirectInput keyboard acquire
   // Independent of everything else here: it hooks RenderHudItems, which nothing
   // else touches, and reads no state any other subsystem owns.

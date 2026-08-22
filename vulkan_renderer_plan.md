@@ -13,7 +13,7 @@ Vulkan, and **every draw the game issues reaches the renderer**. Against the **r
 settled, paused level02 frame the whole frame is **0.13/255**, against a cross-launch d3d8-vs-d3d8
 floor of **0.034** — and **93% of the frame is bit-identical** (§4.38).
 
-**And it now draws something the game never could.** `render.material_override(name, spec)` names a
+**And it now draws something the game never could.** `render.material.override(name, spec)` names a
 `.rim` asset and retextures, tints or hides every draw that samples it — a rewrite of one entry in
 the per-frame material table rather than a per-draw interception, which is what §4.30's table was
 built for (§4.44). Verified on level02 paused: each of the three confined to the player character's
@@ -28,7 +28,7 @@ name**; nothing registers it. That makes it the first image this side creates, u
 bindless slot for — §5's missing half, where the material override could only ever point at a
 texture the game had already loaded. It **reaches 22% of the frame at 2.00/255** on level02 with a
 synthetic map - that is its coverage, not a score; what it looks like is a matter for the eye - and
-`render.lighting_maps = false` restores the frame **bit-identically**.
+`render.lighting_map.enabled = false` restores the frame **bit-identically**.
 
 Three defaults in it are measurements, not taste, and each would have shipped wrong: every light
 reaching level02's ground authors `specular 0 0 0` (so the highlight takes the light's *diffuse*
@@ -36,7 +36,7 @@ colour by default), the key light is `diffuse 4.0` (so `specular_scale` defaults
 reciprocal), and a bump that only shapes highlights is invisible wherever metallic is 0 (so the
 derived normal reaches the diffuse too, as a ratio).
 
-**And it now has ambient occlusion, with no blur pass** (§4.86). `render.ao` runs the technique
+**And it now has ambient occlusion, with no blur pass** (§4.86). `render.ao.enabled` runs the technique
 from <https://www.youtube.com/watch?v=vJU1PgGdH3k>: the sample offsets are generated in **2D**, from
 one fixed disc shared by every pixel, and what is reconstructed is the 3D position of the *tapped*
 pixel — so the kernel needs no per-pixel randomisation, the output is not noise, and nothing has to
@@ -54,7 +54,7 @@ application point is inert here** — scaling the ambient term reached 0.31% of 
 Gunlok has no ambient to occlude; what the term has to scale is the `STDLIGHT` rig, which is this
 game's environment lighting, while D3D's own lights already have shadow maps and are left alone.
 
-**And it now adds geometry, not just shading** (§4.71). `render.tessellation` runs a PN-triangle
+**And it now adds geometry, not just shading** (§4.71). `render.tess.enabled` runs a PN-triangle
 amplification pass over the level mesh: the generated points sit on a cubic Bézier patch fitted to
 each triangle's corner positions and corner **normals**, whose edge control point collapses to the
 linear one exactly when a corner's normal is its face normal — so **a flat wall reproduces itself
@@ -64,15 +64,15 @@ opt-in. Off by default, because it changes the level's silhouette rather than re
 That construction's watertightness turned out to be **conditional on the data** rather than free,
 and the level mesh fails the condition on one shared edge in five - an exporter splits a corner
 into two differently-normalled vertices at a material boundary, and the two patches then run
-between the same two points by different routes and tear apart. `render.pn_seam_fix` is the fix and
+between the same two points by different routes and tear apart. `render.tess.seam_fix` is the fix and
 is on by default: a corner the mesh has split is a corner it is calling hard, so its tangent term
-is zeroed and both sides build the same linear boundary. `render.seam_census()` is the instrument
+is zeroed and both sides build the same linear boundary. `render.debug.seam_census()` is the instrument
 and the check.
 
-The measurement that had to come first is the reusable part: `render.normal_census()` reports how
+The measurement that had to come first is the reusable part: `render.debug.normal_census()` reports how
 much of a frame carries smooth normals at all, and it **corrected the design** — only **6.4%** of
 level02's map triangles are fully flat, so the construction's free hard-edge identity covers far
-less of this game than its reputation suggests, and `render.pn_flat_threshold` exists because of
+less of this game than its reputation suggests, and `render.tess.pn_flat_threshold` exists because of
 that number. It stays watertight because the term it thresholds is a function of `(Pi, Pj, Ni)`
 alone.
 
@@ -84,7 +84,7 @@ the pipeline cache, which `rasterizationSamples` invalidates whole, so the switc
 and hangs off `ReconcileRenderTarget` rather than off the setter. It smooths geometric edges and
 the stencil shadow's border; it does nothing for alpha-**tested** cutouts.
 
-**And all of that goes away with one write** (§4.87). `render.stock = true` switches off every
+**And all of that goes away with one write** (§4.87). `render.debug.stock = true` switches off every
 deliberate departure at once — `per_pixel_lighting`, `map_lighting`, `lighting_maps`, the four
 shadow systems, `ao`, `tessellation` and `msaa` — which is the setup a comparison against
 `GKPLUS_RENDERER=d3d8` needs, inside a single **paused** frame instead of spread over ten.
@@ -111,7 +111,7 @@ is only ever one rectangle there — which is why it survived this long with eve
 The plan had named the shape of it in advance, next to `distinct viewport rects ever set`, and the
 marker fired the first time the screen was opened.
 
-Two API rules came out of `render.viewport_probe`, both measured against the real runtime because
+Two API rules came out of `render.debug.viewport_probe`, both measured against the real runtime because
 — as in §4.45 — every rectangle Gunlok had ever set was at 0,0, where the readings coincide:
 **D3D does not add the rectangle's origin to a pre-transformed vertex** (so `BuildMvp` subtracts
 it, cancelling what Vulkan's viewport adds), and **D3D clips to the rectangle** (so it is the
@@ -132,7 +132,7 @@ strictly contained D3D's, which is a missing condition and not a wrong scale.
 **One API rule was wrong from the first frame this renderer drew, and play found it** (§4.45):
 D3D does not run the viewport's depth range over a pre-transformed vertex — it clamps `z` into
 it — so every screen-space draw sat `MinZ * (1 - z)` too far away, and level02's flames came and
-went with camera distance. `render.depth_probe` is what settled it, and the lesson is the reason
+went with camera distance. `render.debug.depth_probe` is what settled it, and the lesson is the reason
 it exists: **both readings of that rule fit every draw Gunlok issues**, so the answer had to be
 asked of D3D directly rather than inferred from the game. Read §4.45 before trusting any
 whole-frame number below against a scene with effect layers in it.
@@ -145,7 +145,7 @@ No missing *feature* is known, and the 2.59 that stood for six sections is fixed
   viewport covering the swapchain scaled every 2D draw by 628/640 *during rasterisation* —
   resampling the texture, so no sample landed on a texel. The renderer now rasterises into an
   offscreen target at the backbuffer size and blits at the end, which is the order the original
-  does it in. Worth **2.55/255 over 65% of the frame** on one paused frame; `render.offscreen` is
+  does it in. Worth **2.55/255 over 65% of the frame** on one paused frame; `render.debug.offscreen` is
   the A/B, and off against the original reproduces 2.593 exactly.
 - **The A4R4G4B4 probe quad is bit-exact** — 0.0000 MAD, 100.0%, from §4.36's 4.00 and 31.6%. The
   CPU expansion was never wrong, so matching D3D's own expansion arithmetic and mapping the format
@@ -180,7 +180,7 @@ number:
   vertex buffers created against 333 live). So the arena and the game's buffer can agree perfectly
   on a version neither held when the draw was issued, which is exactly how the plate quad survived
   "0 of 12 vertices differ". Anything the game rewrites within a frame has to be read **at the
-  draw**: `render.draw_geometry` now does both and prints them side by side.
+  draw**: `render.debug.draw_geometry` now does both and prints them side by side.
 - **A feature is judged on its region, never on a whole-frame MAD** (§4.27).
 - **...but mean RGB per region is blind to a real difference** (§4.33). It cancels a per-texel
   error with zero bias — the reported junk pile matched d3d8 to 0.1 mean RGB while differing by
@@ -196,7 +196,7 @@ number:
 
 **Every "must be 0" counter reads zero for a draw that was never offered.** `DrawPrimitive` built
 no draw for the whole life of this renderer with every skip counter clean, because they count
-*reasons a draw was rejected* (§4.32). `draw calls seen` against `submitted` in `render.draws` is
+*reasons a draw was rejected* (§4.32). `draw calls seen` against `submitted` in `render.debug.draws` is
 the only reading that compares against what the **game** did rather than what the renderer chose —
 check it before believing a frame is complete.
 
@@ -208,7 +208,7 @@ a session, and the cavern's fog is a texture stage rather than D3D fog (§4.19, 
 specular over directional, point and spot lights, with range, the three attenuation
 coefficients, the spot cone, and each material colour tracked from whichever
 `D3DRS_*MATERIALSOURCE` names it. §4.20's HUD collapse is subsumed — it is what the same
-equation produces with no light enabled — and is kept only as `render.lighting = false`, so the
+equation produces with no light enabled — and is kept only as `render.debug.lighting = false`, so the
 feature can be A/B'd inside one paused frame.
 
 Two counters here were wrong and are worth knowing about before trusting a number:
@@ -237,7 +237,7 @@ and still forwards every call to d3d8to9 so the A/B stays available.
 | One canonical 48-byte vertex format | ✅ §4.10 |
 | Textures + surfaces wrapped, pixel path settled | ✅ §4.11, §4.12 |
 | Texture pixels in `VkImage`s, content-verified by readback | ✅ §4.13, §4.24 — 158/158 mip levels |
-| Buffer contents verified by readback (`render.verify_buffers()`) | ✅ §4.24 — 3467/3467 |
+| Buffer contents verified by readback (`render.debug.verify_buffers()`) | ✅ §4.24 — 3467/3467 |
 | Every image named by its `.rim` asset | ✅ §4.14 — 52/53 |
 | Bindless descriptor array + samplers | ✅ §4.15 — 4096 slots, 5 samplers |
 | **The world drawn by Vulkan**, textured | ✅ §4.16 — A/B matches d3d9 |
@@ -262,7 +262,7 @@ and still forwards every call to d3d8to9 so the A/B stays available.
 | **`DrawPrimitive`** — the fourth draw entry point, which built no DrawItem at all | ✅ §4.32 — and `seen`/`submitted` now reconcile, which is what would have caught it |
 | **The viewport's depth slice** — `D3DVIEWPORT8::MinZ`/`MaxZ`, six of them and never the default | ✅ §4.32 — the effect layers are no longer occluded by the world |
 | The effect layers still being dimmer than d3d9 | ✅ **found** — not dimmer, *substituted*: a shared dynamic vertex buffer's arena slot was overwritten by the second of two consecutive refills, so a HUD draw rendered the fire's glow quad (§4.42). §4.29's HUD columns are the same event |
-| **Bisecting the REFERENCE** — `render.ref_range` / `ref_hide` / `frame_draws`, working in `d3d8` mode | ✅ §4.42 — the reading that was missing on the reference side for three sections |
+| **Bisecting the REFERENCE** — `render.debug.ref_range` / `ref_hide` / `frame_draws`, working in `d3d8` mode | ✅ §4.42 — the reading that was missing on the reference side for three sections |
 | **Compare against the original**, not d3d8to9 — `GKPLUS_RENDERER=d3d8` | ✅ §4.33 — d3d8 vs d3d9 is 0.017-0.051 on a settled level02 frame, which is the cross-launch floor, so the two references agree and the residual was 2.59 against the real thing |
 | **The last residual against the original** — 2.9 on an oblique decal, and what a player sees as "the junk pile looks wrong" | ✅ **found**: the game renders 640x480 into a 628x468 swapchain, so every 2D draw was rasterised 2% small and resampled (§4.37). Not mips (§4.34), not alignment or alpha (§4.35), and A4R4G4B4 was the contrast agent rather than the cause (§4.36) |
 | **An offscreen colour target at the backbuffer size, blitted to the swapchain** — the fix for it | ✅ §4.38 — whole frame 2.593 → **0.13** against a 0.034 cross-launch floor, **93% of it bit-identical**, the HUD panel 0.000 and the A4R4G4B4 probe quad **100% bit-exact** |
@@ -273,7 +273,7 @@ and still forwards every call to d3d8to9 so the A/B stays available.
 | **A pre-transformed vertex's depth** — `clamp(z, MinZ, MaxZ)`, not the viewport transform | ✅ §4.45 — the flames that came and went with camera distance. Every screen-space draw sat `MinZ * (1 - z)` too far away; the flame's retention across a distance sweep goes from a 79% → 0.9% collapse to a flat ~92% |
 | **Ambient occlusion, with no blur pass** — a fixed lattice disc in screen space, world positions in a prepass | ✅ §4.86 — the first thing here with **no matrix in it at all**: the prepass writes world position per pixel, so the resolve inverts nothing and needs no camera transform, which is the very quantity `BuildSunCascades` records as unavailable on this side. **0.675 MAD over 21.14% of level02** against a 0.011 off-vs-off floor. The disc is the technique author's own **lattice** rather than blue noise, and the tap count is not a quality dial with a cheap end — 32 taps leaves a fan of every silhouette, 64 is smooth. **Off by default** |
 | **MSAA** — the world pass at N samples, resolved on the way out | ✅ §4.88 — the cheapest feature here, and the one that best shows what dynamic rendering bought: a resolve is three fields on the attachment, the image the pass drew into becomes the one it resolves into, and the blit, the overlay pass and the present barrier are all unaware. **0.069 MAD over 0.73% of a paused level02 at 4x** against a 0.008 floor — under 1% of pixels changed a lot, which is the signature of a silhouette-only effect. Validation clean over both resolve targets and a live 1→2→8→4 cycle. Costs the pipeline cache, which `rasterizationSamples` invalidates whole. **Off by default** |
-| **Geometry amplification** — PN triangles over the level mesh, and over the shadow passes with it | ✅ §4.71 — the first thing here that adds *geometry*. A corner whose normal is its face normal contributes nothing to the patch, so **hard edges stay hard by arithmetic rather than by a heuristic** while a boulder or a pipe rounds off; and the patch is watertight across a shared edge by construction - **conditionally**, on the two sides presenting the same normal, which the level mesh does not do at a material boundary: one shared map edge in five tore open until `render.pn_seam_fix` closed it with one bit per corner, verified at **0 open seams** by an independent re-derivation in `render.seam_census()`. **Off by default.** 1.667 MAD over 51.5% of level02, `pn_strength = 0` at the floor, and the off-state at the cross-launch floor against the pre-change build |
+| **Geometry amplification** — PN triangles over the level mesh, and over the shadow passes with it | ✅ §4.71 — the first thing here that adds *geometry*. A corner whose normal is its face normal contributes nothing to the patch, so **hard edges stay hard by arithmetic rather than by a heuristic** while a boulder or a pipe rounds off; and the patch is watertight across a shared edge by construction - **conditionally**, on the two sides presenting the same normal, which the level mesh does not do at a material boundary: one shared map edge in five tore open until `render.tess.seam_fix` closed it with one bit per corner, verified at **0 open seams** by an independent re-derivation in `render.debug.seam_census()`. **Off by default.** 1.667 MAD over 51.5% of level02, `pn_strength = 0` at the floor, and the off-state at the cross-launch floor against the pre-change build |
 | **Runtime map lighting** — the level's own `STDLIGHT` rig, per pixel, replacing the bake | ✅ §4.53 (loader), §4.54 (the fitted model), §4.55 (the substitution), **on by default in §4.60** — 1.83 ms on the level with 686 of them and nothing measurable on three others |
 | **The game's stencil, checked on every level** | ✅ §4.60 — 22 pipeline configurations over **sixteen** levels, **3** with stencil, all three flat-shaded, all three first seen on level01. §4.31's marker is now measured on the whole game rather than on two levels. `railway` is the one that could not be: `levels.start` on it takes gl.exe down inside its own `ConvertParsedObjects` |
 | **Frame-uniform data in a buffer**, not in push constants | ✅ §4.57 — the block went 128 → **56** bytes, bit-identical on every static region. The prerequisite phase 4 could not start without |
@@ -283,13 +283,13 @@ and still forwards every call to d3d8to9 so the A/B stays available.
 | **The sun casts a shadow** — a depth-only pass over the same draw list, 3x3 PCF | ✅ §4.58 — the first shadow in Gunlok that is not a blob under a unit |
 | **Cascades** — four halving boxes in a 2x2 atlas, on the camera's orbit **pivot** | ✅ §4.59 — 0.0085 world units per texel near the pivot against the single map's 0.068, for 1.7 ms. It also found the box had been centred on `CameraFocus`, which is only latched during a `SET CAMERA FOCUS` and is stale in ordinary play |
 | **The shadow knobs, swept** — bias in *texels*, and a strength that two levels disagree about | ✅ §4.59 — 2.5 / 0.7 / 70, each with the frame it came from |
-| **Soft sun shadows (PCSS)** — the blocker's distance sets the filter's radius | ✅ §4.100 — `render.shadow_softness`, **off by default**, and off is bit-identical to the 3x3 (0.00% of the frame, max 0). The knob is the sun's angular radius as a *tangent*, and the penumbra is computed in world units and converted to texels last, so it does not change across a cascade boundary. 20.9% of level04's frame at 0.10, **all of it confined to shadow edges** - which is the reading that says penumbra rather than a wider filter smearing the receiver. Free at 16 taps, 1.2 ms at 32. It also found a four-byte write past `pad_colour` that had been zeroing the tail of `GpuFrameData` since §4.91 |
-| **Rotation + a blur for those shadows** — the term resolved into a screen-space mask | ✅ §4.101 — `render.shadow_soft_blur`, **on**. 16 rotations over a 4x4 tile of the pixel's coordinates and a 4x4 bilateral blur, whose sizes match so the blur covers every rotation exactly once and leaves **no residual dither**. **The mask at 8 taps beats the inline lattice at 32** - RMS error against a 512-sample reference 0.0533 against 0.0758 - for the same 1.3 ms at 3060x1716. It is read only where the prepass saw the same surface, so a fragment it cannot serve falls back on the inline filter rather than going wrong. It also found that **the AO prepass has been rasterising the base mesh under the PN-displaced surface since §4.71**, which no AO measurement could see |
+| **Soft sun shadows (PCSS)** — the blocker's distance sets the filter's radius | ✅ §4.100 — `render.sun_shadow.softness`, **off by default**, and off is bit-identical to the 3x3 (0.00% of the frame, max 0). The knob is the sun's angular radius as a *tangent*, and the penumbra is computed in world units and converted to texels last, so it does not change across a cascade boundary. 20.9% of level04's frame at 0.10, **all of it confined to shadow edges** - which is the reading that says penumbra rather than a wider filter smearing the receiver. Free at 16 taps, 1.2 ms at 32. It also found a four-byte write past `pad_colour` that had been zeroing the tail of `GpuFrameData` since §4.91 |
+| **Rotation + a blur for those shadows** — the term resolved into a screen-space mask | ✅ §4.101 — `render.sun_shadow.soft_blur`, **on**. 16 rotations over a 4x4 tile of the pixel's coordinates and a 4x4 bilateral blur, whose sizes match so the blur covers every rotation exactly once and leaves **no residual dither**. **The mask at 8 taps beats the inline lattice at 32** - RMS error against a 512-sample reference 0.0533 against 0.0758 - for the same 1.3 ms at 3060x1716. It is read only where the prepass saw the same surface, so a fragment it cannot serve falls back on the inline filter rather than going wrong. It also found that **the AO prepass has been rasterising the base mesh under the PN-displaced surface since §4.71**, which no AO measurement could see |
 | **The map lights' static shadow atlas** — a cube per `STDLIGHT`, baked once per level | ✅ §4.61 — 682 light slots in 32 MB, and it costs **0.50 ms** to sample on the level with 686 of them. Reaches 73% of level02 at 6.9 MAD, whose 51 long-range lights otherwise shine through every wall, and 0.036 on level04's open terrain. **Off by default**, and that is a fidelity call rather than a cost one |
 | **`vkCmdDrawIndexedIndirect` for that bake** — one command a face, `SV_DrawIndex` for the record | ✅ §4.62 — **804,924 draw calls → 4,092**, and level01's whole bake goes from 1.9 s of hitch to *one frame at the steady-state frame time*. The two paths' atlases differ by **0.006 MAD against a same-path floor of 0.010** |
 | **The staging ring asks before it blocks** — `vkGetFenceStatus` per live slot, not `vkDeviceWaitIdle` | ✅ §4.63 — **511 stalls → 38** and **778 ms → 122** over thirty seconds of level01 play. It was filed as a level-load problem and is not: a load costs 70 ms and presents nothing |
 | **The map light rim** — the fitted falloff's tail, windowed to zero | ✅ §4.64 — play reported "an unnatural disk" around every light, and a scan across it measured a first-derivative jump rather than a step. Refitting the windowed tail over four levels costs **r 0.957 → 0.949** at worst, so the fix is measured against the same bake the model came from |
-| **Shadows from the game's OWN point and spot lights** — sixteen slots of §4.61's atlas | ✅ §4.65 — the last light system with no shadow at all. **The measurements dissolved the hard problem**: "a light has no identity across frames" is true, and `render.frame_lights` says a *level's* lights never move, so their contents are the identity. Reaches **1.92% of the frame at level02's fire camera** against a 2.34% ceiling, and the bias sweep is flat — which is the reading that says real occlusion rather than acne. Nothing measurable in frame time. **A light that moves gets no shadow rather than a wrong one** and costs nothing — which is the right behaviour and covers more than it first looked like: an *effect's* light rides a particle, so every explosion, flare and projectile light is in that class. Item 0 of "Next" is what would change it |
+| **Shadows from the game's OWN point and spot lights** — sixteen slots of §4.61's atlas | ✅ §4.65 — the last light system with no shadow at all. **The measurements dissolved the hard problem**: "a light has no identity across frames" is true, and `render.debug.frame_lights` says a *level's* lights never move, so their contents are the identity. Reaches **1.92% of the frame at level02's fire camera** against a 2.34% ceiling, and the bias sweep is flat — which is the reading that says real occlusion rather than acne. Nothing measurable in frame time. **A light that moves gets no shadow rather than a wrong one** and costs nothing — which is the right behaviour and covers more than it first looked like: an *effect's* light rides a particle, so every explosion, flare and projectile light is in that class. Item 0 of "Next" is what would change it |
 
 Steady state on level01, in level, under validation:
 
@@ -305,7 +305,7 @@ stages: 0 unimplemented ops, 0 needing more than two, 0 bound textures unresolve
 vertex: 10239 KB live / 32768 KB     index: 583 / 8192 KB     slots live: 3469
 images: 56 live / 62 created, 112 MB      bindless: 4096 slots, 5 samplers
 scratch: 1087 KB vtx + 84 KB idx peak, plus 185 KB draw records + 18 KB lights
-render.verify_buffers() 3468/3469     render.verify_textures() 158/158
+render.debug.verify_buffers() 3468/3469     render.debug.verify_textures() 158/158
 validation errors: 0
 ```
 
@@ -342,7 +342,7 @@ depth buffer the game asked for: D3DFMT_D24S8 (75)  <- what to match, §4.45
 pipelines: 13 (0 failures)
 stages: 0 unimplemented ops, 0 needing more than two, 0 bound textures unresolved
 lighting maps: 49 images from 49 files (0 refused)
-render.verify_buffers() 2952-2953/2953     render.verify_textures() 292-316/same
+render.debug.verify_buffers() 2952-2953/2953     render.debug.verify_textures() 292-316/same
 validation errors: 0
 ```
 
@@ -371,7 +371,7 @@ its re-upload experiment for that case. Earlier revisions of this block called i
 artefact and read the alternation as the evidence for that, which was the right shape and the wrong
 reason.
 
-There is no `material overrides:` line in either block, and that is the reading: `render.draws`
+There is no `material overrides:` line in either block, and that is the reading: `render.debug.draws`
 prints it only once something is registered, so `0 registered, 0 matched, 0 overridden, 0 hidden`
 on every report would read as an invariant rather than as "nobody asked for anything" (§4.44).
 
@@ -416,10 +416,10 @@ Read these before changing the draw path; each cost real time to establish.
 
 ## In progress: HDR, as a linear-light pipeline with an SDR tonemap
 
-**Phases 1-5 are in and measured** (§4.91, and §4.99 for bloom). `render.hdr` draws
+**Phases 1-5 are in and measured** (§4.91, and §4.99 for bloom). `render.hdr.enabled` draws
 the world into `R16G16B16A16_SFLOAT`, sRGB-decodes every albedo on the way in, lifts the D3DCOLOR
 clamps and tonemaps to the swapchain through a full-screen pass. Off by default and in
-`render.stock`'s set. On level02's settled camera it reaches ~84% of the frame - that is how far it
+`render.debug.stock`'s set. On level02's settled camera it reaches ~84% of the frame - that is how far it
 spreads, and it spreads everywhere because every lit pixel in the game is one multiply that changed.
 
 **What it looks like took two goes.** The first shipped decoding the albedos only, and a play report
@@ -462,7 +462,7 @@ It changes the arithmetic of every blend in the frame on purpose, so **the thing
 whether the game looks better, and no residual can answer that** - see "What a residual can and
 cannot say" above, which this feature is the clearest instance of: it moves 83% of the frame, which
 would be an alarming number for a reproduction change and is an unremarkable one here. §4.87's
-`render.stock` is what keeps the fidelity claim available alongside it - the departure set is one
+`render.debug.stock` is what keeps the fidelity claim available alongside it - the departure set is one
 switch away from the reference frame, and this joins it.
 
 **What it is.** The world pass renders into `R16G16B16A16_SFLOAT` instead of the swapchain's
@@ -500,7 +500,7 @@ happens on those encoded values - which is what fixed function did and is wrong.
 inputs means light falloff, alpha blends and the texture cascade all run on light rather than on
 its encoding. It breaks the residual against D3D8, and that is the accepted cost.
 
-`render.linear_input` is a separate knob from `render.hdr` for exactly this reason: `hdr` on with
+`render.hdr.linear_input` is a separate knob from `render.hdr.enabled` for exactly this reason: `hdr` on with
 `linear_input` off is the extended-range design, so the two can be told apart on one paused frame
 rather than argued about.
 
@@ -537,7 +537,7 @@ any of this - it is already its own pass on the swapchain image, downstream of t
 
 ### Phases
 
-1. ~~**The float target and the tonemap pass.**~~ **Done** (§4.91). `render.hdr` builds the offscreen and MSAA targets
+1. ~~**The float target and the tonemap pass.**~~ **Done** (§4.91). `render.hdr.enabled` builds the offscreen and MSAA targets
    as `R16G16B16A16_SFLOAT` and swaps the blit for a full-screen pass. The format change
    invalidates the world pipeline cache the same way `rasterizationSamples` does (§4.88), so it
    hangs off `ReconcileRenderTarget` for the same reason and gets the `vkDeviceWaitIdle` that is
@@ -552,8 +552,8 @@ any of this - it is already its own pass on the swapchain image, downstream of t
    exempt from this as well as from the operator (§4.92).
 3. ~~**Lift the clamps.**~~ **Done** (§4.91). The `saturate`s in `resolve_lit_colour` and the specular, behind the same
    knob, so the authored `diffuse 4.0` survives to the tonemap.
-4. ~~**Exposure and the operator.**~~ **Done** (§4.91, §4.93). `render.exposure`,
-   `render.tonemap_knee`, `render.tonemap_white`, and `render.tonemap` with six operators:
+4. ~~**Exposure and the operator.**~~ **Done** (§4.91, §4.93). `render.hdr.exposure`,
+   `render.hdr.knee`, `render.hdr.white`, and `render.hdr.tonemap` with six operators:
    `clamp` / `rolloff` / `reinhard` / `aces` / `filmic` / `agx`. `filmic` is Hable's Uncharted 2
    curve and shares `tonemap_white` with `reinhard`, both meaning "the linear value that maps to
    1.0"; **`agx` reads no parameter but `exposure`**, which is its design rather than a gap - its
@@ -567,8 +567,8 @@ any of this - it is already its own pass on the swapchain image, downstream of t
    `render.msaa` is on, and a pass may not mix sample counts - validation caught that), and
    `PipelineState::ldr_target` so its pipelines declare the right attachment format.
 
-5. ~~**Bloom.**~~ **Done** (§4.99). `render.bloom` plus
-   `render.bloom_layer(index, spec)` - three layers, each with its own `threshold`, `knee`,
+5. ~~**Bloom.**~~ **Done** (§4.99). `render.bloom.enabled` plus
+   `render.bloom.layer(index, spec)` - three layers, each with its own `threshold`, `knee`,
    `radius`, `intensity` and `blend`, extracted from the float target, blurred separably, and
    composited **inside the tonemap pass** before exposure and the operator. Which is the reason
    phase 1 put a shader between the world pass and the swapchain rather than keeping the blit: the
@@ -609,10 +609,10 @@ Two things phases 1-4 left, both cheap and both worth doing before judging phase
   worth anything on screen, and until that is measured "HDR" here is really "linear lighting".
 - **The characters got darker and nobody asked them to.** Same arithmetic as the shadow detail,
   at `L > 1` instead of `L < 1`: they were blowing out before and are in range now. Whether that
-  is an improvement or a rebalancing job for `render.exposure` and `map_light_gain` is a
+  is an improvement or a rebalancing job for `render.hdr.exposure` and `map_light_gain` is a
   judgement nobody has made yet.
 
-Every knob joins `render.stock`'s departure set (§4.87) and the Advanced Graphics page, and
+Every knob joins `render.debug.stock`'s departure set (§4.87) and the Advanced Graphics page, and
 `GKPLUS_VK_HDR` is the launch-time form.
 
 **The harness caveat.** `utils/rendertest` captures with `PrintWindow`, which reads the finished
@@ -634,7 +634,7 @@ In order, most visible first.
    Two things about that are worth carrying, because they are why it took a section. **The control
    being clean did not exonerate the shader** — the lookup's gate is the per-frame slot, which is
    -1 whenever the flag is false, so the flag was *arming* the fault rather than merely enabling a
-   bake. And `render.dynamic_shadow_sample`, the knob written specifically to split "the bake hangs"
+   bake. And `render.debug.dynamic_shadow_sample`, the knob written specifically to split "the bake hangs"
    from "sampling hangs", **was itself broken by the same permutation** and never stopped the
    sampling at all — a bisect knob is code, and it can be disabled by the defect it is bisecting
    for. Also: "dies after about three bakes" is at or below the frames-in-flight depth, which means
@@ -642,10 +642,10 @@ In order, most visible first.
    all three rings before any of them was written.
 
    The bake was proved innocent by measurement, not argument, using the caps this item recommended
-   — `render.dynamic_shadow_max_lights` / `_max_faces` / `_max_casters` and
-   `render.dynamic_shadow_indirect`, all kept. All lights, all faces and **one** caster runs at the
+   — `render.debug.dynamic_shadow_max_lights` / `_max_faces` / `_max_casters` and
+   `render.debug.dynamic_shadow_indirect`, all kept. All lights, all faces and **one** caster runs at the
    control's 16.60 ms/frame, which kills the pass-structure hypothesis on its own; the full
-   configuration runs at 16.65 over 1,201 frames with `render.validation` `[]`. No RenderDoc capture
+   configuration runs at 16.65 over 1,201 frames with `render.debug.validation` `[]`. No RenderDoc capture
    was needed. The rings are all kept — each closed a real defect that would have bitten later, and
    §4.62 carries the map bake's measurement.
 
@@ -669,7 +669,7 @@ In order, most visible first.
    were confirmed against a build with that ring stashed out, so neither is new, and both are
    cheap:
 
-   - ~~**`render.map_shadows` off vs on reads the FLOOR**~~ — **done** (§4.67). Not the flag and
+   - ~~**`render.map_shadow.enabled` off vs on reads the FLOOR**~~ — **done** (§4.67). Not the flag and
      not the bake: §4.66 added its four `GpuFrameData` words *above* `light_flags` in `src/VkDraw.h`
      and *below* it in `world.slang`, so the shader read `dyn_shadow_texture` — `kNoTexture`, every
      bit set — as the flags, and `local_lights` and `local_shadows` were equally stuck on. A
@@ -715,7 +715,7 @@ In order, most visible first.
    measured paused. §4.66's own A/Bs are the moving-frame reading for the *shadow* half, and they
    turned up the practical form of the same trap: **level02's fires survive a pause but its
    explosions do not**, and a paused frame at the fires still carries 6 registered lights. What is
-   still unread is `render.local_lights` while something is exploding — the ceiling on the *lighting*
+   still unread is `render.local_light.enabled` while something is exploding — the ceiling on the *lighting*
    half, which is a different measurement from the one §4.66 took.
 
    One more thing that run turned up and that a cone projection would need: **a spot light does
@@ -746,7 +746,7 @@ In order, most visible first.
      and it reads as inflation because the pipe is seen near-tangentially, where a displacement `δ`
      along the normal moves the silhouette by `δ / sin(grazing angle)`.
 
-     `render.pn_max_offset` came out of it — a world-unit ceiling on the control point's distance
+     `render.tess.pn_max_offset` came out of it — a world-unit ceiling on the control point's distance
      from its chord, which `pn_flat_threshold` cannot express because it is normalised by edge
      length by design. It bounds the tail (the census's worst is **1.104 units** against a 1.952-unit
      mean edge) and **does not cure the symptom**: the picture only moves below 0.05, by which point
@@ -773,7 +773,7 @@ In order, most visible first.
 1. **Where a material override comes FROM** (§5). **Half of this is closed by §4.48** — an image
    this side creates, uploads and owns a bindless slot for now exists, loaded from `src/Vfs` or the
    install by file name, and the lighting maps prove the whole path. What is left is the *override*
-   half: the only way to register one is `render.material_override` from a script or the REPL, so
+   half: the only way to register one is `render.material.override` from a script or the REPL, so
    it stays a session-scoped experiment rather than something a mod ships. The shape that closes it
    is a manifest in `gkplus/mods/*.zip` read through the VFS, so an override arrives with the
    assets it refers to — and `texture:` naming a file rather than another live image, which is now
@@ -788,7 +788,7 @@ In order, most visible first.
    `verify_textures` both read *now* and compare against what the game holds *now*, which is a
    weaker claim than either has been read as. Textures are safe — they do not move — but the
    buffer half cannot distinguish "the arena is wrong" from "the buffer moved on", and that gap
-   hid the plate quad through three sections. The at-draw columns in `render.draw_geometry` are
+   hid the plate quad through three sections. The at-draw columns in `render.debug.draw_geometry` are
    the pattern; nothing else has been converted to it.
 
 3. **A frames-in-flight question the fix does not answer.** The slot is now frozen for the rest of
@@ -881,7 +881,7 @@ level02 when starting fresh.
 | `GKPLUS_RENDER_UNFOCUSED=1` | keep rendering while the window is inactive (§4.2) |
 | `GKPLUS_WRAP_BUFFERS` | `none`/`vb`/`ib`/`both` — bisecting the buffer wrappers. **Did nothing until §4.13**: `ReadWrapMode()` was defined and never called, so any earlier bisect that used it proved nothing |
 | `GKPLUS_TEXTURE_UPLOAD` | `both`/`seed`/`blits` — the same bisect for the two halves of the texture upload |
-| `GKPLUS_RENDERDOC` | load RenderDoc so `render.capture()` works (§4.17). Must be set at launch — the layer cannot be added after the instance exists |
+| `GKPLUS_RENDERDOC` | load RenderDoc so `render.debug.capture()` works (§4.17). Must be set at launch — the layer cannot be added after the instance exists |
 | `GKPLUS_RENDERDOC_DLL` | override the path; the default is the **x86** build, not the one beside the UI |
 | `GKPLUS_VK_HEAPS=small` | arenas and rings cut to just above level01's peaks (82 MB → 24 MB). **Set this for any in-level RenderDoc capture** — at full size 15 resources are captured uninitialised because RenderDoc's readback allocations do not fit in gl.exe's 2 GB (§4.17). It changes staging behaviour, so it is not implied by `GKPLUS_RENDERDOC` |
 | `GKPLUS_NO_LIGHTING=1` | force `D3DRS_LIGHTING` off in the **forwarded** call only (§4.19) |
@@ -889,50 +889,50 @@ level02 when starting fresh.
 | `GKPLUS_NO_SPECULAR=1` | the same for `D3DRS_SPECULARENABLE`. Changes nothing on level01, which is how vertex specular was ruled out (§4.20) |
 | `GKPLUS_NO_MIPMAP=1` | forwarded only: `D3DTSS_MIPFILTER` to `D3DTEXF_NONE`, so the reference samples level 0 whatever the footprint (§4.29) |
 | `GKPLUS_NO_CULL=1` / `GKPLUS_NO_ZTEST=1` / `GKPLUS_NO_ATEST=1` / `GKPLUS_NO_BLEND=1` | forwarded only: `D3DRS_CULLMODE` to NONE, `D3DRS_ZENABLE` off, `D3DRS_ALPHATESTENABLE` off, `D3DRS_ALPHABLENDENABLE` off — the four states that make a draw vanish outright, or stop vanishing, rather than come out wrong (§4.29, §4.39, §4.40). A draw whose fragments are all discarded is indistinguishable from one that was never issued until you switch the test off in the **reference** and watch it appear. `NO_BLEND` is the fourth and it questions this layer's own mirror: forcing blending off in the original collapses its fire into hard orange blobs and dark rectangles — the same artefact class this renderer produces — which is what proved the layer covering the backdrop is the game's blended fire (§4.40) |
-| `GKPLUS_VK_TOPOLOGIES` | **On by default since §4.27.** The variable now selects a *subset*: `none`/`0` for none, `strip`/`line` to bisect the two, `all`/`1` (or unset) for both. Also settable at run time as `render.topologies`, which is what makes them A/B-able on one paused frame |
+| `GKPLUS_VK_TOPOLOGIES` | **On by default since §4.27.** The variable now selects a *subset*: `none`/`0` for none, `strip`/`line` to bisect the two, `all`/`1` (or unset) for both. Also settable at run time as `render.debug.topologies`, which is what makes them A/B-able on one paused frame |
 | `render.specular` | run-time only, on by default: the specular term of that sum. **The mirror image of `GKPLUS_NO_SPECULAR`**, which reaches only the forwarded call — with only one side switchable, "we add specular the original does not" and "we add three times as much" are the same measurement (§4.46). Turn it off in both and the bases can be diffed directly |
-| `render.lighting` | run-time only, on by default: the real light sum, or the §4.20 material collapse the build before it used. **The way to measure lighting** — toggle it on a paused frame and the difference image is exactly what it paints, at a 0.00 noise floor (§4.26) |
-| `render.sun_shadows` | **a feature**, on by default (§4.58, cascaded in §4.59): a real shadow map from the sun over a box around the camera's orbit pivot, 3x3 PCF, **four cascades in a 2x2 atlas of 2048² tiles**. The first shadow in Gunlok that is not a blob under a unit. Costs **2.1 ms** on level01 against `false`, of which 1.7 is the three extra cascades |
-| `GKPLUS_VK_PRESENT_MODE` | `immediate` \| `mailbox` \| `fifo`, launch-time only (§4.79). **Read this before quoting any frame time.** This surface offers no MAILBOX, so the renderer falls back to FIFO and a 60 Hz display puts a 16.67 ms floor under the frame — a frame marginally over it beats between one interval and two and averages ~23 ms, which is the "23 ms" three sections of A/Bs were measured against. `immediate` presents without waiting, so the number is the frame's own cost. Not the default because it tears, and because unthrottling the loop changes the game's own timing rather than only what reaches the screen. `render.vulkan_report` now prints the mode by name and the modes the surface offered |
-| `render.sun_shadow_cull` | **A feature, on by default** (§4.77): reject a caster the cascade's box does not contain. **Exact rather than approximate here**, which is unusual for shadow-caster culling — the cascades differ only in x/y half-extent and share a deliberately generous depth range, so there is no occluder outside the box along the light direction that still casts into it. On level02's settled start it rejects **5 of 684 caster-cascades**, because cascade 0's box is 17.5 world units across and the camera sits in the middle of a dense interior; the sweep is what says the machinery works — 90.2% drawn at `shadow_extent` 20, 66.6% at 5, 41.5% at 2. A cull is worth what the scene's spread makes it worth, and a cascade around the camera is the worst case for one |
-| `render.sun_shadow_indirect` | **A feature, on wherever the device has `multiDrawIndirect`** (§4.77): one `vkCmdDrawIndexedIndirect` per (cascade, bucket) instead of a `vkCmdPushConstants` + `vkCmdDrawIndexed` pair per caster per cascade — **684 draw calls to 8** on level02's start. The shader needed nothing: `map_shadow_vertex` already exists for the two bakes. Reads back false where the pipeline could not be built, and the direct path then draws the same culled set. `render.sun_shadow_report` prints both counts |
-| `render.shadow_cascades` | 1..4, **4** by default: how many cascades are live. **1 is §4.58's single map at the same texel density**, which is what makes cascading A/B-able on one paused frame. Four halving boxes put the near field at 0.0085 world units per texel against the single map's 0.068 |
-| `render.shadow_bias` | **in shadow texels**, 2.5 by default, and both halves of that are §4.59. Texels because that is the unit acne is measured in — the depth error across one texel is its world size times the surface's slope — so one value holds on every cascade, level and `shadow_extent`; a value in *depth* units does not. 2.5 is the knee of a sweep: below it level04 shadows itself everywhere, above it the shadow shrinks at 0.06–0.15% of the frame per texel. **Do not look for acne with a ragged-mask metric** — Gunlok's terrain is large flat polygons, so acne shadows a whole facet at a time and reads as a *solid* mask. The shadowed fraction is the instrument |
-| `render.shadow_strength` | 0.7, and **the one knob here that is not a fidelity question** — the game never had a real shadow, so there is no ground truth. 1.0 is the physically correct value (the shadow attenuates only the direct terms, so it is exactly "no sunlight arrives here"); 0.7 is where §4.59's two frames meet. §4.58's 0.55 leaves level04's unit shadows reading as a smudge, and 1.0 takes **level02's covered start to 36% of its authored brightness** — that level really is under a roof, the shadow map is right about it, and the level's own bake is what disagrees |
-| `render.shadow_extent` | 70, now with a measurement behind it (§4.59): it is the **outermost** cascade's half-extent, and Gunlok's own `camera.max_distance` is 75, so 70 covers everything the camera can ever see. Raising it to 200 buys 0.2% of the frame; dropping it to 40 costs 0.25% |
-| `render.map_shadows` | **a feature**, and **on by default since §4.64 — play settled it**: it shipped off because no measurement could say whether the picture with these shadows was right, and the first report from playing was that the map lights do not cast any. The level's own `STDLIGHT` rig casting real shadows, one 6-face cube per light in a 32 MB atlas, baked once per level. Sampling it costs **0.50 ms** on level01 (686 lights) and nothing measurable on level02. Its **reach** is 73.3% of level02 at 6.886 MAD — 51 lights with ranges up to 83 units that otherwise reach through every wall — 6.2% of level01 at 0.195, and 0.8% of level04 at 0.036, whose lights sit on open ground with nothing to occlude. Those are coverage figures and none of them is why it is on: **a play report is** (§4.64). **The bake is gated on the knob too**, so off costs nothing; turning it on starts it, and `render.map_shadow_report` is what says when it has finished. `off → on → off` is bit-identical |
-| `render.dynamic_shadows` | **A feature, on** (§4.66). The per-frame atlas: 4096² D16 ringed x2, 42 slots of 256-texel faces, rebuilt every frame from the frame's own caster list — map, props and units alike — so a light that moves needs no identity and a unit casts. **0.4 ms** on a frame off the vsync cap. It was off for one section because enabling it lost the device; that was §4.67's field permutation indexing the bindless sampler array with a float's bit pattern, not the bake. Knobs: `render.dynamic_shadow_map_only` (**narrow the casters to §4.65's set exactly — the A/B that prices props and units**), `render.dynamic_shadow_arena_only` (arena-sourced casters only; *not* the mobile-caster test, a unit draws from the arena as often as not), `render.dynamic_shadow_sample`, `render.dynamic_shadow_bias`, and four bisect caps kept from the hunt — `render.dynamic_shadow_indirect` (a draw call per caster instead of the batch) and `_max_lights` / `_max_faces` / `_max_casters`, 0 for no cap. **`render.dynamic_shadow_report` range-checks the batch it just built and prints a sample of it**, and now also prints which submission path and which caps are live — a capped bake that survives looks exactly like a healthy one |
-| `render.dynamic_shadow_cull` | **A feature, on by default** (§4.76): reject a caster the light's sphere cannot reach, then one the cube face's frustum does not contain, instead of drawing every caster into every face. A RenderDoc capture of a played frame is what found it — the bake was the second depth-only pass and almost all of the time, 304 casters x 54 faces = **16,416 pieces of geometry** against the world pass's 367. On level02's settled start it draws **689 of 5,130 caster-faces**, and later **416 of 5,130** once §4.77 tightened the bounds block. **No millisecond figure** — §4.79 found every frame time in §4.76–4.78 was taken against a 60 Hz FIFO vsync ceiling, and unthrottled this pass costs nothing measurable; the counts are what stand. **The atlas must not change and does not**: cull on against off is 0.035% of pixels at 0.0010 MAD, against a repeat floor of 0.055% and 0.0103 — so this is a cost knob with nothing to weigh, and `off` exists because a *bounds* defect would show up as one shadow missing from one face rather than as anything bounds-shaped. The boxes it tests had to be built from nothing: nothing in the renderer knew where a draw was, the arena is never mapped and the scratch is write-combined, so they are accumulated at every write (per 64-vertex block for the arena, per draw for a user-pointer one, per version for a parked refill) and **"unknown" always reads as "draw it"**. `dynamic_shadow_report` counts the unbounded casters per bucket, which is what caught the first build covering only the arena half and culling 67.2% instead of 86.6% |
-| `render.local_shadow_taps` | The PCF radius for **D3D's point and spot lights** — 0 a single tap, 1 a 3x3 (the default), 2 a 5x5, clamped at 3 (§4.69). Reaches whichever atlas serves them. **The map lights deliberately keep their single tap**: a fragment is in range of a mean of 11.5 of them and the sum already filters, so a kernel there would be a hundred taps a fragment for no visible change. One or two D3D lights reach a fragment and nothing averages them, which is what play reported as jagged. Below the noise to change — 21.92 / 21.74 / 21.56 / 21.51 ms at radius 0 / 1 / 2 / 3 |
-| `render.local_shadows` | **a feature**, on by default (§4.65): shadows from the game's **own D3D point and spot lights** — level02's fires, and anything a `.gcs` adds with `ADD LIGHT`. A different light system from `map_shadows`, sharing the same atlas: sixteen of its 682 slots are reserved for these, which only level01 notices (682 → 666 map slots, 4 → 20 refused). Reaches **1.92% of the frame at 0.336 MAD** at level02's fire camera against a 0.005 repeat floor, 0.77% at its settled start, and **0.000 over 0 pixels on level04**, whose lights have nothing to occlude — the last of those is the useful one, since it says the feature is correctly inert where there is nothing to shadow rather than saying anything about how it looks. Nothing measurable in frame time — the fetch is last, behind the range, `N·L` and cone rejections, and there are five of these lights where the map lights are 686 for 0.50 ms. **`GKPLUS_VK_LOCAL_SHADOWS=0` is the launch-time form**, and it is not a convenience: the run-time knob needs the REPL, the REPL needs a running game, and a GPU feature suspected of wedging the display cannot be switched off through the display |
-| `render.local_shadow_report` | what the local half of the atlas holds. **Not optional reading**, and the pair is `waiting out the stability gate` against `held still but found no free slot` — the first is the feature working (a light that moves lives there permanently and costs nothing), only the second is a limit. A moving light, a light past the sixteen slots, and a cube not yet baked all look identical on screen |
-| `render.local_lights` | run-time only, on by default: whether D3D's point and spot lights are in the light sum at all. **A diagnostic, and the one that priced §4.65** — off drops them and keeps the directionals, so a paused A/B paints exactly the pixels they reach, and since a shadow only ever *removes* light that set strictly contains anything shadowing them could change. The ceiling: **2.34% of the frame at level02's fire camera**, 0.75% at its settled start, 0.63% on level04, and the noise floor on level01, level05 and prison. Prison is the self-test — it has no point light, and the knob moves nothing there. **Every one of those is the STATIC lights only**, because pausing is what makes the comparison possible and also what removes the effect lights; the same knob on a moving frame is the reading item 0 needs and nobody has taken |
-| `render.frame_lights` | the last complete frame's D3D lights **deduplicated by contents**, with the draws each reached and the frames it has survived. Mirror-side like `frame_draws`, so it reads the same in every renderer mode. It exists because a `GpuLight` is deduplicated by enable mask *within* a frame and carries no identity across one, so "how many distinct point lights does a frame have" was unanswerable. Read `distinct this frame` against `distinct over the session`: a rig that never moves converges the second on the first (level02: **13 keys over 5,525 frames**), and one the game re-authors leaves a new key behind every frame |
-| `render.map_shadow_bias` | 1.0, **in atlas texels at the fragment's own distance**, and it is a *normal* offset rather than a depth one (§4.61): a 64-texel cube face is `distance / 32` world units across, so the depth error is dominated by the surface's slope and a depth offset big enough to cancel it would detach every shadow by metres. 1.0 is the larger of two knees — level02's acne is gone by 0.25, level04's needs about 1 — and above it the real occlusion goes with the acne. **`= 0` is the sharpest picture of what the atlas holds**: per-light acne with cube-face stair-stepping and coloured fringes, which is what said the projection was right |
-| `render.map_shadow_rate` | lights baked a frame, defaulting to **256 with indirect drawing and 4 without** — taken from the path at atlas creation. §4.62 is why: the 1.9 s the spreading existed for turned out to be draw-call *submission*, not GPU work, so with one command a face level01's 682 lights bake in three frames at the steady-state frame time. Changing it re-bakes from the start |
-| `render.map_shadow_indirect` | on wherever the device has `multiDrawIndirect` (§4.62): one `vkCmdDrawIndexedIndirect` per cube face instead of a draw call per caster per face — **804,924 → 4,092** on level01. **The two must produce the same atlas and this is the only thing that can say so**: it rebuilds the pipeline and re-bakes, and on a paused level02 frame the two differ by **0.006 MAD against a same-path floor of 0.010**. Setting it on a device without the feature does nothing and reads back false |
+| `render.debug.lighting` | run-time only, on by default: the real light sum, or the §4.20 material collapse the build before it used. **The way to measure lighting** — toggle it on a paused frame and the difference image is exactly what it paints, at a 0.00 noise floor (§4.26) |
+| `render.sun_shadow.enabled` | **a feature**, on by default (§4.58, cascaded in §4.59): a real shadow map from the sun over a box around the camera's orbit pivot, 3x3 PCF, **four cascades in a 2x2 atlas of 2048² tiles**. The first shadow in Gunlok that is not a blob under a unit. Costs **2.1 ms** on level01 against `false`, of which 1.7 is the three extra cascades |
+| `GKPLUS_VK_PRESENT_MODE` | `immediate` \| `mailbox` \| `fifo`, launch-time only (§4.79). **Read this before quoting any frame time.** This surface offers no MAILBOX, so the renderer falls back to FIFO and a 60 Hz display puts a 16.67 ms floor under the frame — a frame marginally over it beats between one interval and two and averages ~23 ms, which is the "23 ms" three sections of A/Bs were measured against. `immediate` presents without waiting, so the number is the frame's own cost. Not the default because it tears, and because unthrottling the loop changes the game's own timing rather than only what reaches the screen. `render.debug.vulkan_report` now prints the mode by name and the modes the surface offered |
+| `render.debug.sun_shadow_cull` | **A feature, on by default** (§4.77): reject a caster the cascade's box does not contain. **Exact rather than approximate here**, which is unusual for shadow-caster culling — the cascades differ only in x/y half-extent and share a deliberately generous depth range, so there is no occluder outside the box along the light direction that still casts into it. On level02's settled start it rejects **5 of 684 caster-cascades**, because cascade 0's box is 17.5 world units across and the camera sits in the middle of a dense interior; the sweep is what says the machinery works — 90.2% drawn at `shadow_extent` 20, 66.6% at 5, 41.5% at 2. A cull is worth what the scene's spread makes it worth, and a cascade around the camera is the worst case for one |
+| `render.debug.sun_shadow_indirect` | **A feature, on wherever the device has `multiDrawIndirect`** (§4.77): one `vkCmdDrawIndexedIndirect` per (cascade, bucket) instead of a `vkCmdPushConstants` + `vkCmdDrawIndexed` pair per caster per cascade — **684 draw calls to 8** on level02's start. The shader needed nothing: `map_shadow_vertex` already exists for the two bakes. Reads back false where the pipeline could not be built, and the direct path then draws the same culled set. `render.debug.sun_shadow_report` prints both counts |
+| `render.sun_shadow.cascades` | 1..4, **4** by default: how many cascades are live. **1 is §4.58's single map at the same texel density**, which is what makes cascading A/B-able on one paused frame. Four halving boxes put the near field at 0.0085 world units per texel against the single map's 0.068 |
+| `render.sun_shadow.bias` | **in shadow texels**, 2.5 by default, and both halves of that are §4.59. Texels because that is the unit acne is measured in — the depth error across one texel is its world size times the surface's slope — so one value holds on every cascade, level and `shadow_extent`; a value in *depth* units does not. 2.5 is the knee of a sweep: below it level04 shadows itself everywhere, above it the shadow shrinks at 0.06–0.15% of the frame per texel. **Do not look for acne with a ragged-mask metric** — Gunlok's terrain is large flat polygons, so acne shadows a whole facet at a time and reads as a *solid* mask. The shadowed fraction is the instrument |
+| `render.sun_shadow.strength` | 0.7, and **the one knob here that is not a fidelity question** — the game never had a real shadow, so there is no ground truth. 1.0 is the physically correct value (the shadow attenuates only the direct terms, so it is exactly "no sunlight arrives here"); 0.7 is where §4.59's two frames meet. §4.58's 0.55 leaves level04's unit shadows reading as a smudge, and 1.0 takes **level02's covered start to 36% of its authored brightness** — that level really is under a roof, the shadow map is right about it, and the level's own bake is what disagrees |
+| `render.sun_shadow.extent` | 70, now with a measurement behind it (§4.59): it is the **outermost** cascade's half-extent, and Gunlok's own `camera.max_distance` is 75, so 70 covers everything the camera can ever see. Raising it to 200 buys 0.2% of the frame; dropping it to 40 costs 0.25% |
+| `render.map_shadow.enabled` | **a feature**, and **on by default since §4.64 — play settled it**: it shipped off because no measurement could say whether the picture with these shadows was right, and the first report from playing was that the map lights do not cast any. The level's own `STDLIGHT` rig casting real shadows, one 6-face cube per light in a 32 MB atlas, baked once per level. Sampling it costs **0.50 ms** on level01 (686 lights) and nothing measurable on level02. Its **reach** is 73.3% of level02 at 6.886 MAD — 51 lights with ranges up to 83 units that otherwise reach through every wall — 6.2% of level01 at 0.195, and 0.8% of level04 at 0.036, whose lights sit on open ground with nothing to occlude. Those are coverage figures and none of them is why it is on: **a play report is** (§4.64). **The bake is gated on the knob too**, so off costs nothing; turning it on starts it, and `render.debug.map_shadow_report` is what says when it has finished. `off → on → off` is bit-identical |
+| `render.dynamic_shadow.enabled` | **A feature, on** (§4.66). The per-frame atlas: 4096² D16 ringed x2, 42 slots of 256-texel faces, rebuilt every frame from the frame's own caster list — map, props and units alike — so a light that moves needs no identity and a unit casts. **0.4 ms** on a frame off the vsync cap. It was off for one section because enabling it lost the device; that was §4.67's field permutation indexing the bindless sampler array with a float's bit pattern, not the bake. Knobs: `render.debug.dynamic_shadow_map_only` (**narrow the casters to §4.65's set exactly — the A/B that prices props and units**), `render.debug.dynamic_shadow_arena_only` (arena-sourced casters only; *not* the mobile-caster test, a unit draws from the arena as often as not), `render.debug.dynamic_shadow_sample`, `render.dynamic_shadow.bias`, and four bisect caps kept from the hunt — `render.debug.dynamic_shadow_indirect` (a draw call per caster instead of the batch) and `_max_lights` / `_max_faces` / `_max_casters`, 0 for no cap. **`render.debug.dynamic_shadow_report` range-checks the batch it just built and prints a sample of it**, and now also prints which submission path and which caps are live — a capped bake that survives looks exactly like a healthy one |
+| `render.debug.dynamic_shadow_cull` | **A feature, on by default** (§4.76): reject a caster the light's sphere cannot reach, then one the cube face's frustum does not contain, instead of drawing every caster into every face. A RenderDoc capture of a played frame is what found it — the bake was the second depth-only pass and almost all of the time, 304 casters x 54 faces = **16,416 pieces of geometry** against the world pass's 367. On level02's settled start it draws **689 of 5,130 caster-faces**, and later **416 of 5,130** once §4.77 tightened the bounds block. **No millisecond figure** — §4.79 found every frame time in §4.76–4.78 was taken against a 60 Hz FIFO vsync ceiling, and unthrottled this pass costs nothing measurable; the counts are what stand. **The atlas must not change and does not**: cull on against off is 0.035% of pixels at 0.0010 MAD, against a repeat floor of 0.055% and 0.0103 — so this is a cost knob with nothing to weigh, and `off` exists because a *bounds* defect would show up as one shadow missing from one face rather than as anything bounds-shaped. The boxes it tests had to be built from nothing: nothing in the renderer knew where a draw was, the arena is never mapped and the scratch is write-combined, so they are accumulated at every write (per 64-vertex block for the arena, per draw for a user-pointer one, per version for a parked refill) and **"unknown" always reads as "draw it"**. `dynamic_shadow_report` counts the unbounded casters per bucket, which is what caught the first build covering only the arena half and culling 67.2% instead of 86.6% |
+| `render.local_light.shadow_taps` | The PCF radius for **D3D's point and spot lights** — 0 a single tap, 1 a 3x3 (the default), 2 a 5x5, clamped at 3 (§4.69). Reaches whichever atlas serves them. **The map lights deliberately keep their single tap**: a fragment is in range of a mean of 11.5 of them and the sum already filters, so a kernel there would be a hundred taps a fragment for no visible change. One or two D3D lights reach a fragment and nothing averages them, which is what play reported as jagged. Below the noise to change — 21.92 / 21.74 / 21.56 / 21.51 ms at radius 0 / 1 / 2 / 3 |
+| `render.local_light.shadows` | **a feature**, on by default (§4.65): shadows from the game's **own D3D point and spot lights** — level02's fires, and anything a `.gcs` adds with `ADD LIGHT`. A different light system from `map_shadows`, sharing the same atlas: sixteen of its 682 slots are reserved for these, which only level01 notices (682 → 666 map slots, 4 → 20 refused). Reaches **1.92% of the frame at 0.336 MAD** at level02's fire camera against a 0.005 repeat floor, 0.77% at its settled start, and **0.000 over 0 pixels on level04**, whose lights have nothing to occlude — the last of those is the useful one, since it says the feature is correctly inert where there is nothing to shadow rather than saying anything about how it looks. Nothing measurable in frame time — the fetch is last, behind the range, `N·L` and cone rejections, and there are five of these lights where the map lights are 686 for 0.50 ms. **`GKPLUS_VK_LOCAL_SHADOWS=0` is the launch-time form**, and it is not a convenience: the run-time knob needs the REPL, the REPL needs a running game, and a GPU feature suspected of wedging the display cannot be switched off through the display |
+| `render.debug.local_shadow_report` | what the local half of the atlas holds. **Not optional reading**, and the pair is `waiting out the stability gate` against `held still but found no free slot` — the first is the feature working (a light that moves lives there permanently and costs nothing), only the second is a limit. A moving light, a light past the sixteen slots, and a cube not yet baked all look identical on screen |
+| `render.local_light.enabled` | run-time only, on by default: whether D3D's point and spot lights are in the light sum at all. **A diagnostic, and the one that priced §4.65** — off drops them and keeps the directionals, so a paused A/B paints exactly the pixels they reach, and since a shadow only ever *removes* light that set strictly contains anything shadowing them could change. The ceiling: **2.34% of the frame at level02's fire camera**, 0.75% at its settled start, 0.63% on level04, and the noise floor on level01, level05 and prison. Prison is the self-test — it has no point light, and the knob moves nothing there. **Every one of those is the STATIC lights only**, because pausing is what makes the comparison possible and also what removes the effect lights; the same knob on a moving frame is the reading item 0 needs and nobody has taken |
+| `render.debug.frame_lights` | the last complete frame's D3D lights **deduplicated by contents**, with the draws each reached and the frames it has survived. Mirror-side like `frame_draws`, so it reads the same in every renderer mode. It exists because a `GpuLight` is deduplicated by enable mask *within* a frame and carries no identity across one, so "how many distinct point lights does a frame have" was unanswerable. Read `distinct this frame` against `distinct over the session`: a rig that never moves converges the second on the first (level02: **13 keys over 5,525 frames**), and one the game re-authors leaves a new key behind every frame |
+| `render.map_shadow.bias` | 1.0, **in atlas texels at the fragment's own distance**, and it is a *normal* offset rather than a depth one (§4.61): a 64-texel cube face is `distance / 32` world units across, so the depth error is dominated by the surface's slope and a depth offset big enough to cancel it would detach every shadow by metres. 1.0 is the larger of two knees — level02's acne is gone by 0.25, level04's needs about 1 — and above it the real occlusion goes with the acne. **`= 0` is the sharpest picture of what the atlas holds**: per-light acne with cube-face stair-stepping and coloured fringes, which is what said the projection was right |
+| `render.map_shadow.rate` | lights baked a frame, defaulting to **256 with indirect drawing and 4 without** — taken from the path at atlas creation. §4.62 is why: the 1.9 s the spreading existed for turned out to be draw-call *submission*, not GPU work, so with one command a face level01's 682 lights bake in three frames at the steady-state frame time. Changing it re-bakes from the start |
+| `render.map_shadow.indirect` | on wherever the device has `multiDrawIndirect` (§4.62): one `vkCmdDrawIndexedIndirect` per cube face instead of a draw call per caster per face — **804,924 → 4,092** on level01. **The two must produce the same atlas and this is the only thing that can say so**: it rebuilds the pipeline and re-bakes, and on a paused level02 frame the two differ by **0.006 MAD against a same-path floor of 0.010**. Setting it on a device without the feature does nothing and reads back false |
 | `render.stencil_shadow` | off by default (§4.58): draw the game's **own** blob shadow as well. It is dropped while the sun casts, or a unit carries both. Its three passes are marked by `stencil_enable`, which §4.31 measured is exact on level01 and level02 — this knob is what checks that on a level those measurements never covered |
-| `render.map_light_cull` | run-time only, **on** by default (§4.56): bin the map lights into a world-space grid instead of looping every one per fragment. **Worth 28 ms a frame on level01** — 61.90 ms off against 33.67 on, which is the number §4.56 never took and §4.60 did. **Off must be bit-identical** — a light's range is a hard cutoff, so the grid drops nothing that would have been added, and that A/B is the only thing that can catch a cell quietly missing a light. Measured at 0.00000 MAD over 0 pixels once the blinking "ACTIVE PAUSE" indicator is excluded — which is worth knowing about, because with it in frame the same comparison reads 0.017 against a 0.007 floor and looks like a real defect |
-| `render.map_lighting` | **not a diagnostic — a feature**, and **on by default since §4.60**: replace the level's baked per-vertex colour with a per-pixel evaluation of its own `.rif` light rig. It was off on performance grounds and §4.60 took the reading — with §4.56's grid it costs **1.83 ms on level01** (686 lights, the most in the game) and nothing measurable on level02, level04 or level05; **without** the grid the same level costs **30 ms**, which is what it was off for. The model is **fitted against the bake itself** (§4.54, r 0.87-0.96 on three of four levels), and its one free parameter is validated on screen — level04's difference from the bake minimises at exactly the fitted gain of 1.35. Applies to the **map geometry only**; `render.map_lighting_all` lifts that, and measures worse, because a prop carries its own file's bake. `render.map_light_gain` is the lever (default **1.35**, the mean of the fitted values), `render.map_light_report` says what was loaded. **Judge it on level04 or level05, not level02**, whose 51 long-range lights fit at only r 0.37. The falloff's tail is **windowed** since §4.64: `1 - d/range` reaches zero with a non-zero slope, and per pixel that draws a visible rim around every light — which play reported and which the vertex fit could not have seen |
+| `render.map_light.cull` | run-time only, **on** by default (§4.56): bin the map lights into a world-space grid instead of looping every one per fragment. **Worth 28 ms a frame on level01** — 61.90 ms off against 33.67 on, which is the number §4.56 never took and §4.60 did. **Off must be bit-identical** — a light's range is a hard cutoff, so the grid drops nothing that would have been added, and that A/B is the only thing that can catch a cell quietly missing a light. Measured at 0.00000 MAD over 0 pixels once the blinking "ACTIVE PAUSE" indicator is excluded — which is worth knowing about, because with it in frame the same comparison reads 0.017 against a 0.007 floor and looks like a real defect |
+| `render.map_light.enabled` | **not a diagnostic — a feature**, and **on by default since §4.60**: replace the level's baked per-vertex colour with a per-pixel evaluation of its own `.rif` light rig. It was off on performance grounds and §4.60 took the reading — with §4.56's grid it costs **1.83 ms on level01** (686 lights, the most in the game) and nothing measurable on level02, level04 or level05; **without** the grid the same level costs **30 ms**, which is what it was off for. The model is **fitted against the bake itself** (§4.54, r 0.87-0.96 on three of four levels), and its one free parameter is validated on screen — level04's difference from the bake minimises at exactly the fitted gain of 1.35. Applies to the **map geometry only**; `render.map_light.all` lifts that, and measures worse, because a prop carries its own file's bake. `render.map_light.gain` is the lever (default **1.35**, the mean of the fitted values), `render.debug.map_light_report` says what was loaded. **Judge it on level04 or level05, not level02**, whose 51 long-range lights fit at only r 0.37. The falloff's tail is **windowed** since §4.64: `1 - d/range` reaches zero with a non-zero slope, and per pixel that draws a visible rim around every light — which play reported and which the vertex fit could not have seen |
 | `render.per_pixel_lighting` | **not a diagnostic — a feature**, and the first one that departs from the original on purpose (§4.52). On by default: D3D8's light sum evaluated per fragment rather than per vertex, same equation and same lights. `GKPLUS_VK_PER_PIXEL_LIGHTING=0` is the launch-time form, and `false` restores the fixed-function path **bit-identically**. Reaches 26.9% of level02 at 0.48/255 — and **judge it on the difference image, never on that number**, which is the general rule for every departure here: it concentrates on units and curved geometry and is zero on flat ground, which is exactly what Gouraud shading cannot represent, and *that* is the evidence |
-| `render.half_pixel` | run-time only, on by default: the D3D9 pixel-centre convention as a half-pixel viewport origin (§4.28). Off is the pre-§4.28 behaviour, and worth 1.34/255 over the whole frame |
-| `GKPLUS_VK_OFFSCREEN=0` / `render.offscreen` | on by default: rasterise the world at the **game's** backbuffer size into an offscreen target and blit it onto the swapchain, rather than drawing straight into the swapchain and letting the viewport scale every 2D draw (§4.37, §4.38). Off is the pre-§4.38 behaviour exactly, and worth **2.55/255 over 65% of the frame**. `render.vulkan_report` says which is running |
-| `render.present_linear` | run-time only, **off** by default: the filter for that final scale. NEAREST is a deduction, not a default — the original's own stretch preserves a 4-bit texture's sixteen distinct values, which a filtered downscale could not (§4.37) — and this is the A/B for it |
-| `render.lighting_maps` | **not a diagnostic — a mod-facing feature** (§4.48). On by default: load `graphics/<dir>/<stem> lighting.dds` (or `_lighting.dds`) beside every `.RIM` the renderer knows a name for, from a mod under `gkplus/mods` first and the install second, and give every material whose **stage 0** is that texture a bump/metallic/roughness response. Off interns every material exactly as the build before it did, so it A/Bs on one paused frame at a 0.000 floor — and setting it back to `true` **destroys every image and re-reads every file**, which is the authoring gesture: a map edited while the game runs is picked up by `false` then `true` and by nothing else. `render.lighting_map_report` is the readback, and it is not optional reading — a texture with no companion file is the *normal* case, so a misnamed file and a stock install look identical from the screen |
-| `render.bump_scale` / `bump_diffuse` / `bump_diffuse_limit` / `specular_scale` / `specular_from_diffuse` / `gloss_min` / `gloss_max` | the lighting maps' knobs, uniform per frame and therefore free to sweep on a paused frame. Three of the defaults are measurements (§4.48): `specular_scale` is **0.25** because level02's key light is `diffuse 4.0` and 1.0 saturates a floor to white; `specular_from_diffuse` is **1** because every light reaching that floor authors `specular 0 0 0`, so at 0 — the game's own answer, and what the fixed-function term uses — the metallic channel does nothing over most of a level; `bump_diffuse` is **1** because a bump that only shapes highlights is invisible wherever metallic is 0. `bump_diffuse_limit` is **4**, which is where that ratio's ceiling always was - the floor is new, and it is what stops a near-vertical surface near a light's terminator going black instead of dark (§4.98) |
-| `render.material_override(name, spec)` | **not a diagnostic — the first mod-facing feature** (§4.44). `name` is a case-insensitive substring of a live texture's `.rim` path; `spec` is `{texture, tint: [r,g,b,a?], hide}` or null to remove. Returns the readback, because a substring key that matches nothing — or matches more than was meant — is not an error and cannot be seen from the call. `render.material_overrides` re-reads it, `render.clear_material_overrides()` empties it. **An override that resolves and paints nothing looks exactly like a broken one**: check `draws overridden` in `render.draws`, and pick a target off `render.frame_draws()` so it is one the camera can see |
-| `render.rhw_depth_raw` | run-time only, on by default: a pre-transformed vertex's z is the depth value clamped to the viewport slice, which is what D3D does, rather than something to run the viewport's depth range over (§4.45). Off is the pre-§4.45 behaviour. Read at **record** time, so both halves — `BuildMvp`'s compensation and the pipeline's `depthClampEnable` — move together; the game re-issues the same draws while paused, so it still A/Bs on one frame |
-| `render.depth_probe(armed, quad_z, clear_z, min_z, max_z)` | draw one opaque magenta quad through the capture device against a depth buffer cleared to a known value under a known viewport slice, `ZFUNC LESS`, no depth write. The quad is either there or it is not, which is what settled §4.45 when nothing about Gunlok's own draws could. **Read it in `d3d8` or `d3d9`**: the clear goes straight to the forwarded runtime, because recording it would have made it the whole Vulkan frame's depth clear. Two rules for using it: discriminate **in both directions** — a monotonic map preserves ordering, so one row is always explicable by the other model plus an offset — and keep `quad_z` **inside** the slice unless the range handling is what you are measuring, or you measure the clamp and read it as the mapping |
-| `render.viewport_rect` | run-time only, on by default: honour `D3DVIEWPORT8`'s **rectangle** per draw, as the Vulkan viewport and scissor, rather than covering the whole render target (§4.47). Off is the pre-§4.47 behaviour. Read at **record** time for the same reason as `rhw_depth_raw` — the rectangle reaches both the `DrawItem` and `BuildMvp`'s origin term from there. **The one comparison that cannot use a paused frame**: the upgrade screen will not open while the game is paused, so this A/Bs on consecutive shots inside one session, against a 0.043 repeat floor |
-| `render.viewport_probe(armed, x, y, w, h)` | `depth_probe`'s sibling, for the other half of what a viewport does to a pre-transformed vertex: one opaque magenta `XYZRHW` quad 20 px in from the rectangle's own origin. **Read it in `d3d8`.** The reading is a *differential* — arm it twice with different origins and compare how far the quad moved against how far its own coordinates moved — which is what makes it independent of the frame behind it. It settled both rules in §4.47: the origin is not added, and the rectangle clips |
-| `render.probe(name, scale, mipmap, offset, alpha)` | draw one textured quad through the capture device, so d3d8, d3d9 and vulkan all get the same draw with the scene's lighting, stages, blending and depth removed (§4.35). `name` is a substring of a live texture's `.rim` path, `scale` is screen pixels per texel; `render.probe(null)` disarms |
-| `render.ref_range` / `render.ref_hide` | **`draw_range`/`draw_hide` for the REFERENCE** (§4.42): a draw outside the range, or inside the hide window, is simply not forwarded. Works in `d3d8` and `d3d9` mode, which is the whole point — for three sections "this renderer draws a quad the original does not" could be established and not followed, because every follow-up question is a `draw_range` question and `draw_range` only existed for us |
-| `render.draw_state = <index>` | the device state at the moment that draw was issued, diffed against the mirror — **and since §4.46 the lighting equation's inputs**: the material with its `POWER`, every enabled light's colour, range and attenuation, the four `D3DRS_*MATERIALSOURCE` states, the FVF, and the eye with the view matrix it was derived from. "Does the mirror agree" and "what was this draw actually lit with" are different questions, and only the first had an instrument. `render.state` answers neither per draw: it prints the *last* draw of the frame, which on level02 is the text |
-| `render.frame_draws([first, last])` | the capture layer's **own** draw list for the last complete frame — index, topology, primitives, FVF, buffered/user-pointer, blend, depth, cull, alpha test, depth slice, stage-0 `.rim` name. Mirror-side, so it works in every mode. It is what `ref_range` is aimed with: **an index does not carry between runs** (aiming at 222 because a `vulkan` session called the quad 222 landed on the HUD portraits), so find the draw by its signature in the mode you are in |
-| `render.force_lod` | run-time only, `-1` off: force every texture fetch to an explicit mip level. The probe that ruled mip selection out of the residual (§4.34); pair it with `GKPLUS_NO_MIPMAP=1` on the reference, which pins the original to level 0 |
-| `render.shade_mode` | run-time only, on by default: honour `D3DRS_SHADEMODE`, or interpolate everything the way every build before §4.31 did. Worth **0.000** on level01 and level02, because every flat-shaded draw there is the stencil shadow — kept because that is a fact about two levels, not about the game |
-| `render.msaa` | run-time, **1 (off)** by default: the world pass's sample count (§4.88). Anything not a supported power of two rounds **down**, so no value throws — `render.vulkan_report` prints the counts the device offers and flags a request that could not be met. **Reads back effective, not requested**, and the frame that adopts a new count is the next one, so a read straight after a write can still answer the old value; a UI control must hold its own pending value. Antialiases geometric edges and the stencil shadow's border, and nothing else — an alpha-**tested** cutout is a texkill, not a coverage question. `GKPLUS_VK_MSAA=4` sets what the first frame comes up at |
-| `GKPLUS_VK_LOCAL_SHADOWS=0` | the launch-time form of `render.local_shadows` (§4.65). It exists because the run-time knob is reachable only through the REPL, which is reachable only from a running game on a **usable display** |
+| `render.debug.half_pixel` | run-time only, on by default: the D3D9 pixel-centre convention as a half-pixel viewport origin (§4.28). Off is the pre-§4.28 behaviour, and worth 1.34/255 over the whole frame |
+| `GKPLUS_VK_OFFSCREEN=0` / `render.debug.offscreen` | on by default: rasterise the world at the **game's** backbuffer size into an offscreen target and blit it onto the swapchain, rather than drawing straight into the swapchain and letting the viewport scale every 2D draw (§4.37, §4.38). Off is the pre-§4.38 behaviour exactly, and worth **2.55/255 over 65% of the frame**. `render.debug.vulkan_report` says which is running |
+| `render.debug.present_linear` | run-time only, **off** by default: the filter for that final scale. NEAREST is a deduction, not a default — the original's own stretch preserves a 4-bit texture's sixteen distinct values, which a filtered downscale could not (§4.37) — and this is the A/B for it |
+| `render.lighting_map.enabled` | **not a diagnostic — a mod-facing feature** (§4.48). On by default: load `graphics/<dir>/<stem> lighting.dds` (or `_lighting.dds`) beside every `.RIM` the renderer knows a name for, from a mod under `gkplus/mods` first and the install second, and give every material whose **stage 0** is that texture a bump/metallic/roughness response. Off interns every material exactly as the build before it did, so it A/Bs on one paused frame at a 0.000 floor — and setting it back to `true` **destroys every image and re-reads every file**, which is the authoring gesture: a map edited while the game runs is picked up by `false` then `true` and by nothing else. `render.debug.lighting_map_report` is the readback, and it is not optional reading — a texture with no companion file is the *normal* case, so a misnamed file and a stock install look identical from the screen |
+| `render.lighting_map.bump_scale` / `bump_diffuse` / `bump_diffuse_limit` / `specular_scale` / `specular_from_diffuse` / `gloss_min` / `gloss_max` | the lighting maps' knobs, uniform per frame and therefore free to sweep on a paused frame. Three of the defaults are measurements (§4.48): `specular_scale` is **0.25** because level02's key light is `diffuse 4.0` and 1.0 saturates a floor to white; `specular_from_diffuse` is **1** because every light reaching that floor authors `specular 0 0 0`, so at 0 — the game's own answer, and what the fixed-function term uses — the metallic channel does nothing over most of a level; `bump_diffuse` is **1** because a bump that only shapes highlights is invisible wherever metallic is 0. `bump_diffuse_limit` is **4**, which is where that ratio's ceiling always was - the floor is new, and it is what stops a near-vertical surface near a light's terminator going black instead of dark (§4.98) |
+| `render.material.override(name, spec)` | **not a diagnostic — the first mod-facing feature** (§4.44). `name` is a case-insensitive substring of a live texture's `.rim` path; `spec` is `{texture, tint: [r,g,b,a?], hide}` or null to remove. Returns the readback, because a substring key that matches nothing — or matches more than was meant — is not an error and cannot be seen from the call. `render.material.overrides` re-reads it, `render.material.clear()` empties it. **An override that resolves and paints nothing looks exactly like a broken one**: check `draws overridden` in `render.debug.draws`, and pick a target off `render.debug.frame_draws()` so it is one the camera can see |
+| `render.debug.rhw_depth_raw` | run-time only, on by default: a pre-transformed vertex's z is the depth value clamped to the viewport slice, which is what D3D does, rather than something to run the viewport's depth range over (§4.45). Off is the pre-§4.45 behaviour. Read at **record** time, so both halves — `BuildMvp`'s compensation and the pipeline's `depthClampEnable` — move together; the game re-issues the same draws while paused, so it still A/Bs on one frame |
+| `render.debug.depth_probe(armed, quad_z, clear_z, min_z, max_z)` | draw one opaque magenta quad through the capture device against a depth buffer cleared to a known value under a known viewport slice, `ZFUNC LESS`, no depth write. The quad is either there or it is not, which is what settled §4.45 when nothing about Gunlok's own draws could. **Read it in `d3d8` or `d3d9`**: the clear goes straight to the forwarded runtime, because recording it would have made it the whole Vulkan frame's depth clear. Two rules for using it: discriminate **in both directions** — a monotonic map preserves ordering, so one row is always explicable by the other model plus an offset — and keep `quad_z` **inside** the slice unless the range handling is what you are measuring, or you measure the clamp and read it as the mapping |
+| `render.debug.viewport_rect` | run-time only, on by default: honour `D3DVIEWPORT8`'s **rectangle** per draw, as the Vulkan viewport and scissor, rather than covering the whole render target (§4.47). Off is the pre-§4.47 behaviour. Read at **record** time for the same reason as `rhw_depth_raw` — the rectangle reaches both the `DrawItem` and `BuildMvp`'s origin term from there. **The one comparison that cannot use a paused frame**: the upgrade screen will not open while the game is paused, so this A/Bs on consecutive shots inside one session, against a 0.043 repeat floor |
+| `render.debug.viewport_probe(armed, x, y, w, h)` | `depth_probe`'s sibling, for the other half of what a viewport does to a pre-transformed vertex: one opaque magenta `XYZRHW` quad 20 px in from the rectangle's own origin. **Read it in `d3d8`.** The reading is a *differential* — arm it twice with different origins and compare how far the quad moved against how far its own coordinates moved — which is what makes it independent of the frame behind it. It settled both rules in §4.47: the origin is not added, and the rectangle clips |
+| `render.debug.probe(name, scale, mipmap, offset, alpha)` | draw one textured quad through the capture device, so d3d8, d3d9 and vulkan all get the same draw with the scene's lighting, stages, blending and depth removed (§4.35). `name` is a substring of a live texture's `.rim` path, `scale` is screen pixels per texel; `render.debug.probe(null)` disarms |
+| `render.debug.ref_range` / `render.debug.ref_hide` | **`draw_range`/`draw_hide` for the REFERENCE** (§4.42): a draw outside the range, or inside the hide window, is simply not forwarded. Works in `d3d8` and `d3d9` mode, which is the whole point — for three sections "this renderer draws a quad the original does not" could be established and not followed, because every follow-up question is a `draw_range` question and `draw_range` only existed for us |
+| `render.debug.draw_state = <index>` | the device state at the moment that draw was issued, diffed against the mirror — **and since §4.46 the lighting equation's inputs**: the material with its `POWER`, every enabled light's colour, range and attenuation, the four `D3DRS_*MATERIALSOURCE` states, the FVF, and the eye with the view matrix it was derived from. "Does the mirror agree" and "what was this draw actually lit with" are different questions, and only the first had an instrument. `render.debug.state` answers neither per draw: it prints the *last* draw of the frame, which on level02 is the text |
+| `render.debug.frame_draws([first, last])` | the capture layer's **own** draw list for the last complete frame — index, topology, primitives, FVF, buffered/user-pointer, blend, depth, cull, alpha test, depth slice, stage-0 `.rim` name. Mirror-side, so it works in every mode. It is what `ref_range` is aimed with: **an index does not carry between runs** (aiming at 222 because a `vulkan` session called the quad 222 landed on the HUD portraits), so find the draw by its signature in the mode you are in |
+| `render.debug.force_lod` | run-time only, `-1` off: force every texture fetch to an explicit mip level. The probe that ruled mip selection out of the residual (§4.34); pair it with `GKPLUS_NO_MIPMAP=1` on the reference, which pins the original to level 0 |
+| `render.debug.shade_mode` | run-time only, on by default: honour `D3DRS_SHADEMODE`, or interpolate everything the way every build before §4.31 did. Worth **0.000** on level01 and level02, because every flat-shaded draw there is the stencil shadow — kept because that is a fact about two levels, not about the game |
+| `render.msaa` | run-time, **1 (off)** by default: the world pass's sample count (§4.88). Anything not a supported power of two rounds **down**, so no value throws — `render.debug.vulkan_report` prints the counts the device offers and flags a request that could not be met. **Reads back effective, not requested**, and the frame that adopts a new count is the next one, so a read straight after a write can still answer the old value; a UI control must hold its own pending value. Antialiases geometric edges and the stencil shadow's border, and nothing else — an alpha-**tested** cutout is a texkill, not a coverage question. `GKPLUS_VK_MSAA=4` sets what the first frame comes up at |
+| `GKPLUS_VK_LOCAL_SHADOWS=0` | the launch-time form of `render.local_light.shadows` (§4.65). It exists because the run-time knob is reachable only through the REPL, which is reachable only from a running game on a **usable display** |
 | `GKPLUS_VK_SKIP` | switch off this renderer's own features to bisect them: `t` topologies, `s` seeding a buffer from its own contents, `l` the material colour for unlit-vertex draws, `d` the API's initial state defaults |
 
 **The three `GKPLUS_NO_*` switches are the sharpest tool here, and they are not features.** Each
@@ -942,7 +942,7 @@ happens to look like missing X". They are what proved fog was not the gap and th
 stage was, after the plan had said the opposite for three sections — and then that lighting *was*
 one after all, on a frame the first A/B had not covered, and then that it was the *whole*
 remaining gap (§4.25). Add one per hypothesis rather than reading more of the renderer. All three
-modify only what is forwarded, so `render.state` keeps reporting the true state while one is set.
+modify only what is forwarded, so `render.debug.state` keeps reporting the true state while one is set.
 
 **Compare mean RGB per region, not whole-frame MAD, across two launches.** Two d3d9 runs of
 identical code differ by 13.04 MAD on a small crop purely from sub-pixel misalignment, which
@@ -955,18 +955,18 @@ MAD** against a d3d8-vs-d3d9 floor of **0.008** — 4,039 pixels brighter and 3,
 averages to nothing (§4.33). Having the real reference is what supplies the floor that makes the
 MAD readable; there was none against d3d9.
 
-Read results with `render.report` (the D3D capture side), `render.vulkan_report` (device,
-swapchain, arenas, images, scratch, bindless), `render.draws` (the draw list and what it
-skipped), `render.textures` (every image with its `.rim` name), `render.state` (below),
-`render.stats`, `render.vulkan` and `render.validation`.
+Read results with `render.debug.report` (the D3D capture side), `render.debug.vulkan_report` (device,
+swapchain, arenas, images, scratch, bindless), `render.debug.draws` (the draw list and what it
+skipped), `render.debug.textures` (every image with its `.rim` name), `render.debug.state` (below),
+`render.debug.stats`, `render.debug.vulkan` and `render.debug.validation`.
 
-**`render.draw_geometry`**, after setting `render.draw_state = <index>`, is what a **buffered**
+**`render.debug.draw_geometry`**, after setting `render.debug.draw_state = <index>`, is what a **buffered**
 draw actually pulled: the indices and vertices the shader reads out of the arena, beside the ones
 D3D holds in the game's own buffer, plus each stage's bound `.rim` name against the name of the
 bindless image it samples (§4.40). `verify_buffers` proves a slot holds what its buffer holds and
 `draw_info` prints the offsets a draw was given; neither says the draw addressed the right place,
 and the arena is one buffer every slot shares — so addressing it wrongly yields *other geometry*
-rather than garbage. `render.draw_vertices` is the user-pointer half and cannot see these.
+rather than garbage. `render.debug.draw_vertices` is the user-pointer half and cannot see these.
 
 **Read the AT-DRAW columns, not the deferred ones** (§4.42). It prints four: the arena, the game's
 buffer under a read-only lock *taken while the draw is being issued*, the arena read back with the
@@ -977,7 +977,7 @@ at-draw column is the reading that matters, and the buffer's own bookkeeping is 
 table (slot offset, unlocks, which frame drew from it, which frame its scratch version is from),
 because that is what decides whether a draw reads the slot or a scratch version.
 
-**`render.verify_state()` and `render.draw_state = <index>`** read the fixed-function state back
+**`render.debug.verify_state()` and `render.debug.draw_state = <index>`** read the fixed-function state back
 off the device and diff it against the shadow mirror — now, or at the moment one draw is issued
 (§4.40). Every counter here is computed *from* the mirror, so this is the only reading that can
 say the mirror itself is right; §4.39's state-block bug diverged it for a whole scene with every
@@ -985,14 +985,14 @@ counter clean. It compares the states and stage states the game has set, the bou
 FVF, the transforms, the viewport, the material, the lights and **the stream bindings**.
 `GKPLUS_NO_CULL=1` is its self-test: it must report a CULLMODE mismatch and nothing else.
 
-**`render.draw_vertices = <index>`**, then read it back a frame later, for the converted vertices
+**`render.debug.draw_vertices = <index>`**, then read it back a frame later, for the converted vertices
 and indices one draw was actually handed (§4.32). It is what distinguishes "this draw paints the
 wrong shape" from "this draw is fine and something else covers it", and it is user-pointer draws
 only — a buffered draw's vertices are in an arena that is never mapped, which is what
-`render.verify_buffers()` is for.
+`render.debug.verify_buffers()` is for.
 
-**To attribute a pixel to a draw, use `render.draw_hide = [a, b]`** — record everything except
-that window — then `render.draw_info(i)` for the culprit's full state. `render.draw_range =
+**To attribute a pixel to a draw, use `render.debug.draw_hide = [a, b]`** — record everything except
+that window — then `render.debug.draw_info(i)` for the culprit's full state. `render.debug.draw_range =
 [a, b]` renders only that window, which is how to see what one draw paints against an empty
 frame. Two ways to get a wrong answer out of them, both of which did (§4.29): **bisect by hiding,
 never by truncating a prefix**, because a prefix truncates the depth and stencil buffers too and a
@@ -1000,7 +1000,7 @@ draw that is merely unoccluded reads as the one that painted the pixel; and **al
 between setting the range and capturing**, or the shot lags one step behind and the bisect
 converges neatly on the wrong draw.
 
-**`render.state` is what to read before implementing any fixed-function behaviour.** Every state
+**`render.debug.state` is what to read before implementing any fixed-function behaviour.** Every state
 the renderer has to reproduce — fog, lighting, blend, depth, stencil, colour write — as it
 stands *and* every value it has ever been set to, and then six histograms of what was actually
 drawn with, ordered by draw count:
@@ -1104,7 +1104,7 @@ Quote the residual as reach. Do not quote it as worth.
 One run per renderer, then a numeric difference. Three-way — `d3d8`, `d3d9`, `vulkan` — is one
 extra launch of the same script and is what tells a translation-layer defect from a real one.
 
-**Switch the departures off with `render.stock = true`, not one at a time** (§4.87). There are ten
+**Switch the departures off with `render.debug.stock = true`, not one at a time** (§4.87). There are ten
 of them now, and the comparison that matters is on a *paused* frame — ten writes is ten frames of
 drift on anything animating, which is precisely the floor of order 1 the rest of this section is
 about. One write is one frame. `GKPLUS_VK_STOCK=1` does it from launch for a run that is only ever
@@ -1124,20 +1124,20 @@ exactly like a renderer defect (§4.32).
 
 - **`levels.start` lands on the briefing screen**, and it renders plausibly — a character portrait
   over rock — so a run that misses it looks like a broken renderer rather than a game waiting for
-  a keypress. `render.draws` sits at ~4 draws a frame. `Dismiss-Briefing` presses space *until
+  a keypress. `render.debug.draws` sits at ~4 draws a frame. `Dismiss-Briefing` presses space *until
   `actors.count` is non-zero*, because when the briefing appears depends on how long the load
   took and a single press at a fixed delay lands before it exists about half the time.
 - **`level02` is the level to shoot.** It has no cutscene, and all three renderers settle to
   bit-identical camera values and the same 178 actors, which is what makes the comparison mean
   anything. Use `level01` only to reproduce a level01 number.
 
-`find-draw.ps1` beside it binary-searches `render.draw_hide` for the draw that painted a given
+`find-draw.ps1` beside it binary-searches `render.debug.draw_hide` for the draw that painted a given
 pixel.
 
-**`render.stats.frames` is not a liveness test for the renderer, and "the counter moved" is not
+**`render.debug.stats.frames` is not a liveness test for the renderer, and "the counter moved" is not
 one either** (§4.66). It is the *capture layer's* `Present` count and it keeps climbing whether or
 not Vulkan is alive, because every call is still forwarded to d3d8to9 — on a session whose device
-was already lost it read 10,109 → 10,456 over four seconds while `render.vulkan.frames_presented`
+was already lost it read 10,109 → 10,456 over four seconds while `render.debug.vulkan.frames_presented`
 sat frozen at 1,716. **That one is the liveness test — read as a RATE against a baseline.** Both
 halves cost a wrong conclusion inside one section: first the wrong counter, then the right counter
 read as "it advanced" when it had advanced five frames in eight seconds against a healthy 16.63
@@ -1154,7 +1154,7 @@ outright.
 
 **Assert the draw count and the actor count, not just the camera.** A relaunch here landed the
 camera somewhere empty and produced **31.77 MAD against everything**, which reads as a catastrophic
-regression until you notice `draws: 20 this frame` in `render.draws`.
+regression until you notice `draws: 20 this frame` in `render.debug.draws`.
 
 **Stability is evidence about which defect you have, not whether you have one.** §4.22 needed a
 moving scene and vanished on a still one; §4.23 was perfectly stable — 60 consecutive menu
@@ -1184,11 +1184,11 @@ cross-renderer difference above ~0.1 is real and can be read as a whole-frame nu
 
 Set `camera.position`, `yaw`, `pitch`, `roll` and `distance` explicitly rather than trusting the
 settle — and read those values back out of the session you are comparing against, because the
-same literals replayed later framed something else. `render.draws` collapsing to a couple of
+same literals replayed later framed something else. `render.debug.draws` collapsing to a couple of
 dozen a frame is the tell that the camera went somewhere empty.
 
-Where a feature can be toggled at run time — `render.topologies`, `render.lighting`,
-`render.half_pixel`, `render.shade_mode` — that is still sharper: pause and shoot the same frame
+Where a feature can be toggled at run time — `render.debug.topologies`, `render.debug.lighting`,
+`render.debug.half_pixel`, `render.debug.shade_mode` — that is still sharper: pause and shoot the same frame
 twice, at a **0.000** floor, and the difference image is exactly the pixels the feature touched.
 It is also the only comparison that can honestly return *zero*: §4.31's shade mode moves no pixel
 at all, which no cross-launch measurement could have distinguished from noise.
@@ -1241,10 +1241,10 @@ mean RGB is what turned that into the +8 / +13 / +23 numbers in §4.19.
 
 Two checks that go beyond counters, and both exist because counters were not enough:
 
-- **`render.verify_textures()`** reads each image back off the GPU and compares it against the
-  D3D texture. Run it with `render.validation` in the same breath — the readback is itself
+- **`render.debug.verify_textures()`** reads each image back off the GPU and compares it against the
+  D3D texture. Run it with `render.debug.validation` in the same breath — the readback is itself
   Vulkan work, and a broken verifier reports mismatches that are its own (§4.13).
-- **`render.capture()`** takes a RenderDoc capture of the next frame, needing
+- **`render.debug.capture()`** takes a RenderDoc capture of the next frame, needing
   `GKPLUS_RENDERDOC=1` at launch (§4.17). Two traps, both reported as
   `VK_ERROR_OUT_OF_DEVICE_MEMORY` and neither about VRAM:
   - **the REPLAY process must be 32-bit.** Launching the game from the x86 tooling does *not*
@@ -1268,7 +1268,7 @@ wrong, take the screenshot first.
 **A counter that says "nothing I was given went wrong" cannot see work that never reached it.**
 `DrawPrimitive` built no draw for the whole life of this renderer while every skip counter read 0,
 because they all count *reasons a draw was rejected* and that one was never offered (§4.32). The
-reading that catches this class is `draw calls seen` against `submitted` in `render.draws` — the
+reading that catches this class is `draw calls seen` against `submitted` in `render.debug.draws` — the
 only number here that compares against what the **game** did rather than against what the renderer
 chose. Check it before believing a frame is complete.
 
@@ -1305,7 +1305,7 @@ the crashed process that makes the harness lie; kill `WerFault.exe` first.
   correct, but a level with far more geometry than level01 could exhaust 32 MB. `arena_full`
   counts it; nothing recovers from it.
 - **1–3 mip levels in 150 drift** (§4.13), always level ≥1 and always small; level 0 matches
-  everywhere. `render.verify_textures()` detects it; the writing route is still unidentified.
+  everywhere. `render.debug.verify_textures()` detects it; the writing route is still unidentified.
 - **112 MB of images on level01**, roughly half of it the `A4R4G4B4`→`R8G8B8A8` CPU expansion.
   Mapping that format natively would halve it, at the price of a per-device support matrix —
   worth revisiting only if memory ever matters.
@@ -1316,7 +1316,7 @@ the crashed process that makes the harness lie; kill `WerFault.exe` first.
   to `kMaxDrawsPerFrame` on purpose, so the draw limit is the only one that can bite — which is
   also what makes `dropped_materials` mean "the scratch is unusable" rather than "a busy frame".
 - **A device with no stencil-capable depth format falls back to depth only**, logs a line, and
-  draws no shadow mask (§4.27). `render.draws` reports the chosen format and
+  draws no shadow mask (§4.27). `render.debug.draws` reports the chosen format and
   `stencil_draws_without_buffer`, so it announces itself rather than looking like a shading bug —
   but nothing has been tested on such a device, because none is known.
 - **Specular is computed with the local-viewer form only.** `D3DRS_LOCALVIEWER` is on for every
@@ -1325,10 +1325,10 @@ the crashed process that makes the harness lie; kill `WerFault.exe` first.
 - **`D3DRS_SHADEMODE` is honoured, and it has never yet mattered** (§4.31). Every flat-shaded
   draw on level01 and level02 is one of the stencil shadow's three passes — two of which write no
   colour at all and one of which is a single-colour full-screen quad — so toggling
-  `render.shade_mode` on a paused frame moves **0 pixels** in either level. Two levels are not
-  fifteen; `flat_shaded_draws` in `render.draws` and the `shade` column of `render.state`'s
+  `render.debug.shade_mode` on a paused frame moves **0 pixels** in either level. Two levels are not
+  fifteen; `flat_shaded_draws` in `render.debug.draws` and the `shade` column of `render.debug.state`'s
   pipeline histogram are what would show a level using it for something real.
-- **`render.verify_buffers()` reads one short — 2952/2953 on level02, 3468/3469 on level01 — and
+- **`render.debug.verify_buffers()` reads one short — 2952/2953 on level02, 3468/3469 on level01 — and
   §4.42 is why.** The odd buffer is the shared pre-transformed one (`fvf 0x1c4`, ~5 refills a
   frame), and it **must** differ: its arena slot is deliberately frozen for the rest of the frame
   once a draw reads it, so a verifier comparing that slot against a buffer the game has refilled
@@ -1348,7 +1348,7 @@ the crashed process that makes the harness lie; kill `WerFault.exe` first.
   §4.7's max-2-active-stages in particular is worth re-checking on a level with richer materials
   before shrinking `GpuMaterial`. `level02` is the cheapest second data point — it is the level
   automated runs should be loading anyway (see "Working on this"), so widening these is a matter
-  of reading `render.state` on a run that is happening regardless.
+  of reading `render.debug.state` on a run that is happening regardless.
 - **The overlay is tiny at 4K** (§4.5) — cosmetic, ImGui is drawing 1:1 into the swapchain.
 
 ---
@@ -1372,7 +1372,7 @@ whether the real thing was available.
 
 **The whole-frame residual against the original is 0.13/255 and 93% of the frame is bit-identical**
 (§4.38), against a **cross-launch d3d8-vs-d3d8 floor of 0.034**. That is a **reproduction** claim
-and is measured with the departures off (`render.stock`); it is the merit figure for the fidelity
+and is measured with the departures off (`render.debug.stock`); it is the merit figure for the fidelity
 work and it is emphatically *not* a bar a new feature is held to. A feature whose job is to change
 the look makes this number large by design - see "What a residual can and cannot say". It was 2.59 for six sections, and
 it was one defect: Gunlok renders into a **640x480** backbuffer while the window's client area —
@@ -1384,7 +1384,7 @@ the original does it in. Sizing the viewport alone is *not* the fix: it reproduc
 texel for texel and costs the framing (2.59 → 13.07), because a larger viewport on a smaller
 swapchain clips where D3D stretches.
 
-Three things that follow, and are the reason to trust the number: `render.offscreen` toggles it on
+Three things that follow, and are the reason to trust the number: `render.debug.offscreen` toggles it on
 one paused frame — worth **2.55/255 over 65% of the frame**, and on→off→on is bit-identical; the
 A4R4G4B4 probe quad went from 4.00 MAD / 31.6% bit-exact to **0.0000 / 100%**, which takes the CPU
 expansion off the correctness list for good and leaves it a memory question; and of the 6.8% of
@@ -1411,7 +1411,7 @@ Four measurement rules, each of which cost a wrong conclusion:
 `DrawPrimitive` — one of D3D8's four draw entry points — built no draw at all for the whole life
 of the renderer, with **every "must be 0" counter reading zero**, because they count *reasons a
 draw was rejected* and a draw that is never offered has no reason to be rejected (§4.32). The
-reading that catches that class is `draw calls seen` against `submitted` in `render.draws`, the
+reading that catches that class is `draw calls seen` against `submitted` in `render.debug.draws`, the
 only number that compares against what the **game** did rather than what the renderer chose.
 Separately, the non-triangle-list topologies are on by default now that a stencil buffer exists.
 
@@ -1424,7 +1424,7 @@ scenery. It is per-draw dynamic state now.
 
 **...but it does not apply to a pre-transformed draw the way Vulkan applies it** (§4.45). D3D
 skips the viewport transform for a `D3DFVF_XYZRHW` vertex and **clamps** instead —
-`depth = clamp(z, MinZ, MaxZ)`, no scale and no bias — measured with `render.depth_probe` against
+`depth = clamp(z, MinZ, MaxZ)`, no scale and no bias — measured with `render.debug.depth_probe` against
 the real D3D8, because both readings fit everything Gunlok itself draws. Vulkan has no bypass, so
 every screen-space draw sat `MinZ * (1 - z)` too far from the camera; an error that shrinks toward
 the far plane, which is why level02's flames came and went with camera distance instead of being
@@ -1438,7 +1438,7 @@ bytes, and describe no draw at all. That is what makes a second pass over the fr
 the draw array rather than a replay of the recording loop.
 
 **That table is what the material override rewrites** (§4.44), and it is the first thing this
-renderer does that the game never could: `render.material_override("<.rim substring>", {texture,
+renderer does that the game never could: `render.material.override("<.rim substring>", {texture,
 tint, hide})` retextures, tints or hides every draw sampling one asset, as one entry rather than a
 per-draw interception. **The key is the `.rim` name because a bindless index is load-order
 dependent** — the same key re-resolved image 34 → 35 across a level reload, which is the
@@ -1448,13 +1448,13 @@ un-overridden material carries `tint = 0xffffffff`, which multiplies by exactly 
 counts into the `seen == submitted + skips` reconciliation, or the one feature that drops draws on
 purpose would read as §4.32's regression. Two traps: an override that resolves and paints nothing
 looks exactly like a broken one (its asset may be out of view — read `draws overridden`, and pick a
-target off `render.frame_draws()`), and a paused frame drifts over a long session, so re-shoot the
+target off `render.debug.frame_draws()`), and a paused frame drifts over a long session, so re-shoot the
 baseline before believing a difference.
 
 Fog is measured absent — 0 of 12M draws enable it. **`D3DRS_SHADEMODE` is honoured and has never
 mattered** (§4.31): every flat-shaded draw on level01 and level02 is one of the stencil shadow's
 three passes, two of which write no colour and one of which is a single-colour quad, so
-`render.shade_mode` moves 0 pixels in either. It is also the section on *how* to decide a question
+`render.debug.shade_mode` moves 0 pixels in either. It is also the section on *how* to decide a question
 like that — the pipeline histogram says which draws use a state where a count only says how many,
 and that chose an extra varying over doubling the pipeline table. **The light sum is D3D8's whole
 per-vertex equation** — ambient, diffuse and specular over directional, point and spot lights,
@@ -1466,12 +1466,12 @@ Six instruments answer questions no counter can, and each exists because one was
 
 | | |
 |---|---|
-| `render.draw_range` / `draw_hide` / `draw_info(i)` | attribute a pixel to a draw. Bisect by **hiding a window, never truncating a prefix** — a prefix truncates the depth and stencil buffers too (§4.29) |
-| `render.ref_range` / `ref_hide` / `frame_draws()` | the same, pointed at the runtime the capture layer **forwards** to, so the *original* can be bisected — and it works in `d3d8` mode, where there is no Vulkan draw list (§4.42). `frame_draws` is the mirror-side draw list it has to be aimed with: an index does not carry between runs |
-| `render.draw_vertices = i` | the converted vertices and indices a draw was actually handed, following its own indices rather than the head of the slice. Answers "wrong shape" vs "something covers it" (§4.32) |
-| `render.draw_geometry` | what a **buffered** draw pulled, in four columns — and only two of them are read **at the draw** (§4.42). A deferred readback proves consistency, not correctness: the game refills a dynamic buffer several times a frame, so the arena and the buffer can agree perfectly on a version neither held when the draw was issued |
-| `render.force_lod` | force every texture fetch to an explicit mip level. Pair with `GKPLUS_NO_MIPMAP=1` on the reference to pin both sides to level 0 (§4.34) |
-| `render.probe(name, scale, mipmap, offset, alpha)` | one textured quad drawn **through the capture device**, so d3d8, d3d9 and vulkan all get the same draw with the scene's lighting, stages, blending and depth removed (§4.35) |
+| `render.debug.draw_range` / `draw_hide` / `draw_info(i)` | attribute a pixel to a draw. Bisect by **hiding a window, never truncating a prefix** — a prefix truncates the depth and stencil buffers too (§4.29) |
+| `render.debug.ref_range` / `ref_hide` / `frame_draws()` | the same, pointed at the runtime the capture layer **forwards** to, so the *original* can be bisected — and it works in `d3d8` mode, where there is no Vulkan draw list (§4.42). `frame_draws` is the mirror-side draw list it has to be aimed with: an index does not carry between runs |
+| `render.debug.draw_vertices = i` | the converted vertices and indices a draw was actually handed, following its own indices rather than the head of the slice. Answers "wrong shape" vs "something covers it" (§4.32) |
+| `render.debug.draw_geometry` | what a **buffered** draw pulled, in four columns — and only two of them are read **at the draw** (§4.42). A deferred readback proves consistency, not correctness: the game refills a dynamic buffer several times a frame, so the arena and the buffer can agree perfectly on a version neither held when the draw was issued |
+| `render.debug.force_lod` | force every texture fetch to an explicit mip level. Pair with `GKPLUS_NO_MIPMAP=1` on the reference to pin both sides to level 0 (§4.34) |
+| `render.debug.probe(name, scale, mipmap, offset, alpha)` | one textured quad drawn **through the capture device**, so d3d8, d3d9 and vulkan all get the same draw with the scene's lighting, stages, blending and depth removed (§4.35) |
 
 The one fact that shapes everything: **the seam is `Direct3DCreate8`, not the AWAPI render
 queue.** The queue looked obvious and is not total — `rendering_notes.md` §4.1 — so
@@ -1507,21 +1507,21 @@ Things worth knowing before editing:
   the first statement there — a delay-load stub that cannot find the DLL raises an exception
   nothing here handles. §4.89; the `Import`-vs-`DelayImport` check is in it, because grepping the
   import table finds the name either way.
-- **Every "must be 0" counter in `render.report` is a real invariant.** Each one exists
+- **Every "must be 0" counter in `render.debug.report` is a real invariant.** Each one exists
   because getting it wrong once cost a debugging session.
 - **Some defects only a picture can find.** The arena's 16-byte slot alignment against a 48-byte
   vertex was invisible to every counter *and* to the texture readback verification, because
-  nothing was wrong with the uploads — only with how a draw addressed them. `render.capture()`
+  nothing was wrong with the uploads — only with how a draw addressed them. `render.debug.capture()`
   (RenderDoc) and a window screenshot are the tools for that class; §4.16 also records two wrong
   guesses that cost a rebuild each before the picture was consulted.
 - **A counter says the plumbing ran, not that it moved the right bytes.**
-  `render.verify_textures()` and `render.verify_buffers()` read each image and each arena slot
+  `render.debug.verify_textures()` and `render.debug.verify_buffers()` read each image and each arena slot
   back off the GPU and compare them against the D3D resource they came from — between them they
   have found five defects with every counter reading clean (notes §4.13, §4.24). Both must read
   `158/158` and `3467/3467` on level01. The **ratio** is the invariant, not those two numbers —
   a run on `level02` (which is what automated testing should load, see "Debugging the running
   game") has its own totals, and a mismatch is any run where the two halves differ. Check
-  `render.validation` in the same breath as any readback: a verifier that is itself invalid
+  `render.debug.validation` in the same breath as any readback: a verifier that is itself invalid
   reports its own mismatches as the code's, which cost an afternoon.
 - **...but a readback taken later proves consistency, not correctness** (§4.42). Both verifiers
   read *now* and compare against what the game holds *now*, and now is a frame or more after any
@@ -1542,7 +1542,7 @@ Things worth knowing before editing:
   the next captures it. But at full heaps the capture dies on RenderDoc's own readback window
   (§4.17's 32-bit limit again), and at `GKPLUS_VK_HEAPS=small` the upload defects mostly stop
   happening, because a smaller ring flushes 100x more often. `GKPLUS_VK_WATCH_DST` +
-  `render.staging_watch` is what works: log every upload to one arena offset with its batch.
+  `render.debug.staging_watch` is what works: log every upload to one arena offset with its batch.
 - **To find out what the renderer is missing, make the GAME render without it.** Three env vars
   force `D3DRS_LIGHTING`, `D3DRS_SPECULARENABLE` and the texture stages past the first off, in
   the *forwarded* call only. That is what proved D3D fog was not the gap and the second texture
@@ -1557,7 +1557,7 @@ Things worth knowing before editing:
 - **Two launches are not a comparison.** The renderers run at different frame rates, so at a
   fixed delay the *game* is in a different state — three Vulkan runs of identical code differ by
   up to 8/255, which is bigger than most of what is worth measuring. Toggle the feature at run
-  time with the game paused instead (`screen.toggle_pause()`, then `render.topologies`): same
+  time with the game paused instead (`screen.toggle_pause()`, then `render.debug.topologies`): same
   frame, noise floor 0.03, and the difference image is exactly what the feature painted. For a
   cross-renderer shot, pause *and* set the camera explicitly (§4.21).
 - **A screenshot of gl.exe needs `SetProcessDPIAware()` in the capturing process**, or
@@ -1579,7 +1579,7 @@ Things worth knowing before editing:
 | `src/VkResources.h/cpp` | VMA arenas, the staging ring, the texture images (creation, format mapping, upload, readback verification) and the bindless descriptor set. Nothing device-local is ever mapped. **The vertex arena aligns slots to `sizeof(CanonicalVertex)`, not 16** — a draw addresses its buffer as a vertex index, and a 16-byte-aligned slot silently pulls the wrong vertices (notes §4.16) |
 | `src/VkDraw.h/cpp` | The world pass: one `VkPipeline` per distinct blend/depth/cull state (five on level01, built on first sight — notes §4.19), the depth buffer, the per-frame draw list, and the **shader ABI** (`GpuLight`, `GpuDrawRecord`, `GpuMaterial` — the three arrays a draw is looked up in, §4.26 and §4.30). A draw binds nothing and its push constants describe nothing: four device addresses and three indices, 44 bytes of the 72 the block is (the rest is frame-uniform knobs — the LOD probe and §4.48's lighting-map parameters — which ride a push because it is the cheapest way to deliver a float that is the same for every draw). Vertices, its own record, its material and the lights are all pulled by address, from the arena for buffered draws and from a per-frame host-visible scratch for user-pointer ones (§4.18). **Materials are interned per frame** — 274 draws on level02 are 29 of them — which is what makes a second pass over the frame a walk over the draw array rather than a replay of the recording loop. **The list is never sorted**: the game's own order is what makes blending correct |
 | `src/VkLighting.h/cpp` | **Lighting maps** (§4.48): the companion `<texture> lighting.dds` beside a `.RIM`, its two lookup roots and two suffix spellings, the per-name cache (**including the misses**, which is what keeps a texture with no companion from costing a file probe per frame), the images this side creates, and the base-slot → lighting-slot table. Keyed and resolved exactly like the material override — by `.rim` name, on `TextureRegistryGeneration()` — and it depends on nothing in the capture layer, because a lighting map is a texture D3D never sees. The decoder is `src/Dds`, unchanged and shared with the engine-facing codec |
-| `src/VkCapture.h/cpp` | RenderDoc via its in-app API, so `render.capture()` grabs one frame from the REPL. Off unless `GKPLUS_RENDERDOC` is set, and loaded before the Vulkan instance because it captures by inserting a layer. **Opening a capture has two traps, both reported as `VK_ERROR_OUT_OF_DEVICE_MEMORY` and neither about VRAM** — the *replayer* must be 32-bit (launching from the x86 tooling does not help; the UI replays in its own x64 process, so it needs `x86\renderdoccmd.exe remoteserver`), and an in-level capture needs `GKPLUS_VK_HEAPS=small` (notes §4.17) |
+| `src/VkCapture.h/cpp` | RenderDoc via its in-app API, so `render.debug.capture()` grabs one frame from the REPL. Off unless `GKPLUS_RENDERDOC` is set, and loaded before the Vulkan instance because it captures by inserting a layer. **Opening a capture has two traps, both reported as `VK_ERROR_OUT_OF_DEVICE_MEMORY` and neither about VRAM** — the *replayer* must be 32-bit (launching from the x86 tooling does not help; the UI replays in its own x64 process, so it needs `x86\renderdoccmd.exe remoteserver`), and an in-level capture needs `GKPLUS_VK_HEAPS=small` (notes §4.17) |
 | `src/shaders/*.slang`, `src/gen-shaders.py` | The shaders, in **Slang**, compiled to `<binary dir>/generated/Shaders.gen.inc.h`. It is a **build product, not checked in** — which makes `slangc` and Python hard build requirements, and CMake says so with `FATAL_ERROR` rather than letting the compiler report a missing header. `--output` is where CMake points it; `--check` and `--deps` are the other two modes. `ENTRY_POINTS` is the single source of truth for the build's shader dependencies |
 | `src/gen-shader-abi.py` | **The shader ABI, checked by the compiler** (§4.68). Parses the Slang structs and emits `<binary dir>/generated/ShaderAbi.gen.inc.h` — an `offsetof` per field and a `sizeof` per struct for all **twelve** C++/Slang pairs, so a struct that drifts from the shader it feeds is a compile error naming the field. Needs no slangc, hence its own CMake edge - it still runs where the SPIR-V cannot be rebuilt. Also fails the build on a struct whose layout differs under scalar and std430 rules, which is the design rule `world.slang`'s `Vertex` comment states and relies on |
 | `src/VertexFormat.h/cpp` | Every FVF the game uses → one canonical 48-byte vertex. Pure CPU, no Vulkan and no D3D headers |

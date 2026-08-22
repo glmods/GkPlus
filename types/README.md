@@ -8,6 +8,7 @@ and no TypeScript at runtime, since the game loads the `.mjs` as-is.
 | File | What it covers | Maintained |
 |------|----------------|------------|
 | `gk.d.ts` | the `"gk"` module: `camera`, `console`, `actors`, `roles`, `tokens`, `triggers`, `levels`, `make`, `gls`, plus the `setup_menus` / `draw_gui` / level-module contracts. `menus` is *not* an export - it is `setup_menus`' argument - and there is no global `console`: `log`/`info`/`warn`/`error`/`debug` are on the `console` this module exports | by hand, from `src/Js*.cpp` |
+| `check-surface.py` | not a declaration file: it compares every `JSCFunctionListEntry` table in `src/Js*.cpp` against the interface that declares it, both directions. `tsc` cannot do this, because the bindings are C++ | a check - run `python3 types/check-surface.py` |
 | `imgui.d.ts` | the `ImGui` interface: 199 functions and 28 enums. A type only - there is no `"ImGui"` module and no global to call, because the calls are only valid inside `draw_gui` | **generated** - run `python3 types/gen-imgui-dts.py` |
 
 ## Using them
@@ -54,6 +55,17 @@ export function draw_gui(ImGui) { … }
   trailing arguments are an options object, not positional.
 - **`menu.item.value` is `boolean | undefined`** - undefined for a plain item,
   which makes `value !== undefined` the "is this a toggle" test.
+- **An actor is always the object.** No member takes an id or a token name, in
+  either half of the surface. `actor.set_target(other)`, `camera.track(a)`,
+  `units.set_ai(a, "turret")`, `triggers.create({targets: [a]})`.
+- **Failure throws.** A boolean return means a question was answered -
+  `actor.damage()` is "did it land", `settings.remove()` is "was there a key" -
+  not "did it work".
+- **A position is `{x, y, z}` and an array is not one.** `[1, 2, 3]` is rejected;
+  it used to be accepted and silently do nothing.
+- **`render` is exactly typed and `render.debug` is not.** The measurement
+  surface carries the index signature, so a typo in a *setting* is a compile
+  error. Every `render` setting persists; nothing on `render.debug` does.
 
 ## Keeping them honest
 
@@ -62,3 +74,17 @@ The bindings are the source of truth, not these files. After changing
 generator. Both are checked by `types/typecheck.ts`, which uses
 `@ts-expect-error` on every construct that *must* be rejected - so it fails both
 when something legal stops compiling and when something illegal starts.
+
+`typecheck.ts` proves the declarations are self-consistent. It cannot prove they
+match the bindings, which is a separate failure and a real one: `render` once
+carried 50 undeclared members behind an index signature, and a deleted
+`units.remove_trigger` stayed declared after its C++ entry was gone. That is what
+`check-surface.py` is for - run it too:
+
+```bash
+python3 types/check-surface.py
+```
+
+Adding a namespace means adding a row to its `PAIRS`. Leaving one out is never
+right: "not checked" would then be the silent default, which is the failure mode
+the whole file exists to close.

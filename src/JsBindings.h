@@ -165,6 +165,29 @@ JSValue NewRoleWrapper(JSContext *ctx, Role *role);
 // a miss - callers use it to accept "a Role, or nothing", so it has to be a test.
 Role *RoleFromWrapper(JSValueConst v);
 
+// --- actor identity ----------------------------------------------------------
+//
+// An actor crosses into a binding as the wrapper object and nothing else. There
+// is deliberately no id or name overload: `JS_ToInt32` on an object yields 0
+// rather than throwing, so an id-taking member silently retargeted actor 0 when
+// handed an actor, and a name-taking one could not express a spawned actor at
+// all. Every member that names an actor goes through ActorFromValue.
+
+// The Actor behind a wrapper of any subclass, re-derived from its id. Throws for
+// anything that is not an actor, and for an actor the game has destroyed.
+Actor *ActorFromValue(JSContext *ctx, JSValueConst v);
+
+// Whether `v` is an actor wrapper, without resolving it and without throwing.
+// The console-argument formatter needs the test separately: an actor wrapper is
+// an ordinary object too, so without this it lands in the {x, y, z} case and
+// appends "0 0 0".
+bool IsActorValue(JSValueConst v);
+
+// The token naming `actor`, for the places where the engine itself stores an
+// actor by name (a trigger's target list). Throws when no token does, because
+// then the engine cannot express that actor there at all. Mints nothing.
+bool ActorTokenName(JSContext *ctx, Actor *actor, std::string *out);
+
 // --- the namespace builders ---------------------------------------------------
 
 JSValue NewCameraNamespace(JSContext *ctx);

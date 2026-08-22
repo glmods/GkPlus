@@ -17,7 +17,10 @@ namespace {
 
 // Reads one float component off an object, leaving *out alone when absent.
 bool ReadComponent(JSContext *ctx, JSValueConst obj, const char *name,
-                   float *out) {
+                   float *out, bool *present = nullptr) {
+  if (present) {
+    *present = false;
+  }
   JSValue v = JS_GetPropertyStr(ctx, obj, name);
   if (JS_IsException(v)) {
     return false;
@@ -25,6 +28,9 @@ bool ReadComponent(JSContext *ctx, JSValueConst obj, const char *name,
   if (JS_IsUndefined(v) || JS_IsNull(v)) {
     JS_FreeValue(ctx, v);
     return true;
+  }
+  if (present) {
+    *present = true;
   }
   double d = 0.0;
   int rc = JS_ToFloat64(ctx, &d, v);
@@ -351,6 +357,53 @@ const JSClassExoticMethods CollectionExotic = {
 
 } // namespace
 
+Severity CurrentLevel = Severity::Debug;
+
+const char *SeverityName(Severity level) {
+  switch (level) {
+  case Severity::Debug: return "debug";
+  case Severity::Info:  return "info";
+  case Severity::Warn:  return "warn";
+  case Severity::Error: return "error";
+  case Severity::Log:   break;
+  }
+  return "log";
+}
+
+bool SeverityFromName(const char *name, Severity *out) {
+  if (!name) {
+    return false;
+  }
+  const Severity all[] = {Severity::Debug, Severity::Log, Severity::Info,
+                          Severity::Warn, Severity::Error};
+  for (Severity level : all) {
+    if (std::strcmp(SeverityName(level), name) == 0) {
+      *out = level;
+      return true;
+    }
+  }
+  return false;
+}
+
+void SetLogLevel(Severity level) { CurrentLevel = level; }
+Severity LogLevel() { return CurrentLevel; }
+
+void LogAt(Severity level, const char *text) {
+  if (static_cast<int>(level) < static_cast<int>(CurrentLevel)) {
+    return;
+  }
+  // Only the two that mean something went wrong are marked on screen. Prefixing
+  // `log` and `info` too would put a word in front of most of the console for no
+  // information; the debugger line below carries the level either way, which is
+  // what a DebugView filter needs.
+  if (level == Severity::Warn || level == Severity::Error) {
+    std::string marked = std::string(SeverityName(level)) + ": " + (text ? text : "");
+    Log(marked.c_str());
+    return;
+  }
+  Log(text);
+}
+
 void Log(const char *text) {
   if (!text) {
     return;
@@ -435,25 +488,61 @@ JSValue NewVec4(JSContext *ctx, const Vec4 &v) {
   return obj;
 }
 
+// Reads the named components, reporting whether ANY of them was present. An
+// object carrying none is refused by the two callers rather than read as "leave
+// everything alone": that made `camera.position = [1, 2, 3]` a **silent no-op**,
+// because an array is an object, the type guard passed, and every lookup missed.
+// A partial update is deliberate and useful (`{x: 1}` moves one axis); a
+// whole-object miss never is.
+bool ReadComponents(JSContext *ctx, JSValueConst v, const char *const *names,
+                    float *const *slots, int count, bool *any) {
+  *any = false;
+  for (int i = 0; i < count; ++i) {
+    bool present = false;
+    if (!ReadComponent(ctx, v, names[i], slots[i], &present)) {
+      return false;
+    }
+    *any = *any || present;
+  }
+  return true;
+}
+
 bool ToVec3(JSContext *ctx, JSValueConst v, Vec3 *out) {
+  static const char *const kNames[] = {"x", "y", "z"};
   if (!JS_IsObject(v)) {
     JS_ThrowTypeError(ctx, "expected an object with x/y/z");
     return false;
   }
-  return ReadComponent(ctx, v, "x", &out->x) &&
-         ReadComponent(ctx, v, "y", &out->y) &&
-         ReadComponent(ctx, v, "z", &out->z);
+  float *const slots[] = {&out->x, &out->y, &out->z};
+  bool any = false;
+  if (!ReadComponents(ctx, v, kNames, slots, 3, &any)) {
+    return false;
+  }
+  if (!any) {
+    JS_ThrowTypeError(ctx, "expected an object with x, y or z - an array like "
+                           "[1, 2, 3] is not a position here");
+    return false;
+  }
+  return true;
 }
 
 bool ToVec4(JSContext *ctx, JSValueConst v, Vec4 *out) {
+  static const char *const kNames[] = {"x", "y", "z", "w"};
   if (!JS_IsObject(v)) {
     JS_ThrowTypeError(ctx, "expected an object with x/y/z/w");
     return false;
   }
-  return ReadComponent(ctx, v, "x", &out->x) &&
-         ReadComponent(ctx, v, "y", &out->y) &&
-         ReadComponent(ctx, v, "z", &out->z) &&
-         ReadComponent(ctx, v, "w", &out->w);
+  float *const slots[] = {&out->x, &out->y, &out->z, &out->w};
+  bool any = false;
+  if (!ReadComponents(ctx, v, kNames, slots, 4, &any)) {
+    return false;
+  }
+  if (!any) {
+    JS_ThrowTypeError(ctx, "expected an object with x, y, z or w - an array like "
+                           "[0, 0, 0, 1] is not an orientation here");
+    return false;
+  }
+  return true;
 }
 
 bool GetInt32Prop(JSContext *ctx, JSValueConst obj, const char *name,
