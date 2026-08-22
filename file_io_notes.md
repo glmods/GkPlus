@@ -236,7 +236,7 @@ are defined: while they sat as raw bytes `getReferencesTo(0x005c8360)` returned 
 for a function with seven. All seven are defined now and the query returns seven call edges, which
 is the confirmation this section was written to predict. A zero-xref count on a registration
 function is evidence about the *database*, not about the binary — the same trap as an undefined
-vtable (CLAUDE.md, Analysis Traps).
+vtable (`ghidra_analysis_notes.md`, Analysis Traps).
 
 **Seven is the complete set**, and that is now confirmed rather than assumed: a survey went looking
 for further image codecs and found none. The 17 static-init entries immediately after the seven are
@@ -438,9 +438,11 @@ backing store is not ours: `pool_alloc_page` calls `AllocateMemory` @ 0x00601f4a
 thunk into **gl.exe's own statically linked CRT allocator**, initialised by that exe's
 `_mainCRTStartup`. The loader calls our `DllMain(DLL_PROCESS_ATTACH)` before that, since
 we are an implicit-load dependency. The game's own seven codecs register from `.CRT$XC`,
-i.e. from `_initterm` - the earliest safe point. `ImageCodecSystem` therefore registers
-from a detour on `SetupMenus`, which is later still and costs nothing: every texture the
-game loads before then is a hardcoded `.RIM` literal.
+i.e. from `_initterm` - the earliest safe point. `RegisterDdsCodec()` therefore registers
+from `FileHookSystem`'s **first intercepted open** (`EnsureFirstOpen` in `src/FileHooks.cpp`),
+which is later still and costs nothing: the game only opens a file from `WinMain` onwards, and
+a file is always opened before its bytes can be sniffed. It is not a detour of its own because
+two subsystems detouring one target do not chain - see `CLAUDE.md`'s Conventions.
 
 There is also **no unregistration** - the trie has no removal - so a detach would leave a
 factory pointer into an unloaded module. Tolerable only because `d3d8.dll` goes away at

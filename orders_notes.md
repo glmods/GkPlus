@@ -605,7 +605,7 @@ with the third argument a literal 0.
 {`0x1d`, `0x1f`}**, so `ZF` provably can never be set there. The full decode also confirms the
 neighbours: 0x00509e5c ← {`0x1e`, `0x20`}, 0x00509e91 ← {`0x0a`, `0x0c`}, 0x00509fae ←
 {`0x0b`, `0x0d`}. Cross-referenced as `game_defects_notes.md` §18. The general lesson is in
-CLAUDE.md's Analysis Traps: an arm's compare against a constant means nothing until you know which
+`ghidra_analysis_notes.md`'s Analysis Traps: an arm's compare against a constant means nothing until you know which
 ids reach the arm.
 
 ### 8.3 Slot 80 is the decoy throw, not a movement order

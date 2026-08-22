@@ -882,7 +882,7 @@ there is no per-mesh LOD curve, just "near" and "two levels coarser". `ModelDeta
 exactly two references in the image, the `LoadLevel` write and this read. There is one virtual call
 site in the `Unit` tree, inside `Unit_Draw` @ 0x004b707d; a displacement scan for `+0x10c` also
 finds `MineDetonate` and three others, but those are **`Actor`**-tree objects and a different slot
-67 — the two trees' slot numbers are not comparable (CLAUDE.md, Analysis Traps).
+67 — the two trees' slot numbers are not comparable (`ghidra_analysis_notes.md`, Analysis Traps).
 
 ## 6. What the fields turned out to be
 

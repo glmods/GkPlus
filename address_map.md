@@ -3,7 +3,7 @@
 Every global, function address, struct offset and enum recovered so far, moved out of
 `CLAUDE.md` so it is looked up rather than carried in every session's context. Addresses
 are offsets from the image base; see `CLAUDE.md` for how `GetObjectAtOffset` resolves them,
-and **read the calling-convention warning in `CLAUDE.md`'s Analysis Traps before wrapping
+and **read the calling-convention warning in `ghidra_analysis_notes.md`'s Analysis Traps before wrapping
 any function here** - a wrong `RET` form drifts ESP and faults somewhere unrelated.
 
 ### Game Binary Layout
