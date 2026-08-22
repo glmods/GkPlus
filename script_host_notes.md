@@ -47,6 +47,19 @@ the other left. Pointing both keys at one file evaluates it **once** — `LoadMo
 of paths it has been through, because `JS_Eval` compiles a fresh module per call rather than
 consulting the loader's cache, so nothing else would stop the top level running twice.
 
+**A third kind of module runs here too: an enabled mod's own** (`RunModScripts`, and
+`mod_loading_notes.md` for the mod-side contract). It is not the profile's, and the difference is
+in the slots rather than in the mechanism — a mod's `draw_gui`/`setup_menus` are *its own* and are
+called alongside the profile's, because "last loaded wins" is a coherent rule for one profile and
+no rule at all across many mods. Four consequences worth knowing before touching `src/Script.cpp`:
+`OnOverlayDraw` and `CallSetupMenus` walk the mod list **by index** and not with a range-for,
+since a callback may enable another mod and append to it mid-walk; the module name is a
+`mod:` scheme served out of the `Mod` record rather than off disk, so `ModuleLoader` has two
+sources now; `import.meta.mod` is set on every module loaded through that scheme, which is the
+only thing `JS_GetImportMeta` is used for here; and evaluation goes through
+`Await(ctx, JS_LoadModule(...))` — the route this file's last paragraph prescribes — which makes
+it idempotent for free, an already-evaluated module handing back its existing promise.
+
 #### The two boot points
 
 `core.script` boots where the host always did. `core.boot` exists because that is far too late for

@@ -81,14 +81,20 @@ const enabled = mods.enable(loaded);
 //
 // Every mod is expected to carry a `metadata` directory:
 //
-//   metadata/info.json          name, author, website, license, version
+//   metadata/info.json          name, author, website, license, version, script
 //   metadata/README.md          what it does, in full
 //   metadata/icon_small.png     optional
 //   metadata/icon_big.png       optional
 //
 // A mod missing any of that still loads and still enables - `mod.problems` says
 // what was missing, and `mod.name` falls back to the name on disk. So this loop
-// reports rather than refuses:
+// reports rather than refuses.
+//
+// `script` is the one field that *does* something: it names a module inside
+// `metadata/`, which the host evaluates as part of the `enable()` above - so a
+// mod can register a menu item or an overlay panel of its own, not only replace
+// assets. Nothing extra is needed here; `mod.script` is what it named, and ""
+// when it named nothing. `examples/mods/hello-mod` is the worked example.
 
 for (const mod of mods) {
   const version = mod.version ? ` ${mod.version}` : "";

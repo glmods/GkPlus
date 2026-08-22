@@ -93,6 +93,13 @@ std::string ToBackslashes(std::string s) {
   return s;
 }
 
+// The other way round, for the two things that are *not* Win32 paths: a VFS path
+// and a mod's own metadata-relative script name.
+std::string ToForwardSlashes(std::string s) {
+  std::replace(s.begin(), s.end(), '\\', '/');
+  return s;
+}
+
 std::string Lower(std::string s) {
   std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
     return static_cast<char>(std::tolower(c));
@@ -415,6 +422,17 @@ constexpr const char *kReadmeFile = "README.md";
 constexpr const char *kIconSmallFile = "icon_small.png";
 constexpr const char *kIconBigFile = "icon_big.png";
 
+// A mod's scripts are cached whole at Load time (see ModFile in Vfs.h for why
+// they have to be), so both of these are bounds on what a mod can make this
+// process hold for the rest of its life rather than on what is sensible to write.
+// A mod over either is reported and keeps whatever it fit under it.
+constexpr size_t kMaxScriptFiles = 64;
+constexpr size_t kMaxScriptBytes = 1024 * 1024;
+// How far below `metadata/` the scan for those goes. One level of `lib/` is a
+// layout worth having; a walk with no bound is not, since the directory comes
+// from whatever archive was handed to Load.
+constexpr int kMaxScriptDepth = 4;
+
 // The mount point Load() reads a mod's metadata through, and it has to be a
 // mount point rather than the ordinary search path for two reasons. The mod is
 // being inspected *before* anything decides to enable it, so it must not be
@@ -536,6 +554,148 @@ void ReadIcon(const std::string &dir, const char *want, std::vector<char> *out,
   }
 }
 
+// --- a mod's scripts -----------------------------------------------------------
+
+PHYSFS_EnumerateCallbackResult CollectChild(void *data, const char *,
+                                           const char *fname) {
+  static_cast<std::vector<std::string> *>(data)->emplace_back(fname);
+  return PHYSFS_ENUM_OK;
+}
+
+// Every entry of one directory, so the walk below can stat, read and recurse
+// *outside* the enumerate callback instead of inside it. PhysicsFS's state lock
+// is a CRITICAL_SECTION and would therefore tolerate the nesting on Windows, but
+// nothing about this walk needs to depend on that.
+std::vector<std::string> Children(const std::string &dir) {
+  std::vector<std::string> out;
+  PHYSFS_enumerate(dir.c_str(), CollectChild, &out);
+  return out;
+}
+
+bool IsScriptName(const std::string &name) {
+  const size_t dot = name.find_last_of('.');
+  if (dot == std::string::npos) {
+    return false;
+  }
+  const std::string ext = Lower(name.substr(dot));
+  return ext == ".mjs" || ext == ".js";
+}
+
+struct ScriptScan {
+  Mod *mod;
+  size_t bytes = 0;
+  // A cap was hit, so this mod's script set is incomplete and the walk stopped.
+  bool truncated = false;
+};
+
+// Reads every `.mjs`/`.js` at or below `dir` into `scan->mod->scripts`, keyed by
+// its path relative to the `metadata` directory. `prefix` is where the walk has
+// got to ("", then "lib/").
+void ScanScripts(ScriptScan *scan, const std::string &dir,
+                 const std::string &prefix, int depth) {
+  for (const std::string &child : Children(dir)) {
+    if (scan->truncated) {
+      return;
+    }
+    const std::string path = dir + "/" + child;
+    PHYSFS_Stat stat{};
+    if (!PHYSFS_stat(path.c_str(), &stat)) {
+      continue;
+    }
+    if (stat.filetype == PHYSFS_FILETYPE_DIRECTORY) {
+      if (depth < kMaxScriptDepth) {
+        ScanScripts(scan, path, prefix + child + "/", depth + 1);
+      }
+      continue;
+    }
+    if (stat.filetype != PHYSFS_FILETYPE_REGULAR || !IsScriptName(child)) {
+      continue;
+    }
+    if (scan->mod->scripts.size() >= kMaxScriptFiles) {
+      scan->truncated = true;
+      return;
+    }
+    std::vector<char> data;
+    std::string why;
+    if (!ReadMetadataFile(path, &data, &why)) {
+      scan->mod->problems.push_back(std::string("metadata/") + prefix + child +
+                                    ": " + why);
+      continue;
+    }
+    if (scan->bytes + data.size() > kMaxScriptBytes) {
+      scan->truncated = true;
+      return;
+    }
+    scan->bytes += data.size();
+    scan->mod->scripts.push_back(
+        ModFile{prefix + child, std::string(data.begin(), data.end())});
+  }
+}
+
+// Whether `path` is a name a mod may point `script` at: relative to `metadata/`,
+// inside it, and not the shape of something on disk. Every one of these would
+// otherwise be a lookup that simply misses, so they are refused by shape to say
+// *why*.
+bool ScriptPathIsSane(const std::string &path, std::string *why) {
+  if (path.empty()) {
+    *why = "it names nothing";
+    return false;
+  }
+  if (path.front() == '/' || path.front() == '\\' ||
+      (path.size() >= 2 && path[1] == ':')) {
+    *why = "it must be relative to metadata/, not an absolute path";
+    return false;
+  }
+  // The walk resolves nothing, so a `..` here could only ever miss - and a mod
+  // reaching outside its own metadata directory is not a thing to support
+  // quietly.
+  if (path == ".." || path.find("../") != std::string::npos ||
+      path.find("..\\") != std::string::npos) {
+    *why = "it must stay inside metadata/";
+    return false;
+  }
+  if (!IsScriptName(path)) {
+    *why = "it must name a .mjs or .js file";
+    return false;
+  }
+  return true;
+}
+
+// Matches what `script` said against what the mod actually ships, and clears the
+// field unless it named one of them. Case-insensitively and with either slash,
+// for the reason FindChild is an enumeration: what an author writes in JSON and
+// what the archive holds need not agree on either.
+void ResolveScriptField(Mod *mod) {
+  if (mod->info.script.empty()) {
+    return;
+  }
+  const std::string given = mod->info.script;
+  std::string why;
+  if (!ScriptPathIsSane(given, &why)) {
+    mod->problems.push_back(std::string("metadata/") + kInfoFile +
+                            ": `script` is '" + given + "' - " + why);
+    mod->info.script.clear();
+    return;
+  }
+  std::string wanted = ToForwardSlashes(given);
+  for (const ModFile &file : mod->scripts) {
+    if (_stricmp(file.path.c_str(), wanted.c_str()) == 0) {
+      mod->info.script = file.path; // the spelling the mod actually ships
+      return;
+    }
+  }
+  // The prefix is the mistake worth naming: info.json *is* in metadata/, so
+  // `"script": "metadata/mod.mjs"` is the obvious thing to write and would
+  // otherwise report only that a file nobody named is missing.
+  const bool prefixed = Lower(wanted).rfind("metadata/", 0) == 0;
+  mod->problems.push_back(
+      std::string("metadata/") + kInfoFile + ": `script` names metadata/" +
+      wanted + ", which this mod does not ship" +
+      (prefixed ? " - `script` is relative to metadata/, so drop that prefix"
+                : ""));
+  mod->info.script.clear();
+}
+
 // Fills `mod`'s info, readme, icons and problems from its `metadata` directory.
 //
 // False only when PhysicsFS cannot open the mod **at all**, which is what makes a
@@ -593,6 +753,7 @@ bool ReadMetadata(Mod *mod, std::string *error) {
           ReadInfoField(doc, "website", &mod->info.website, &mod->problems);
           ReadInfoField(doc, "license", &mod->info.license, &mod->problems);
           ReadInfoField(doc, "version", &mod->info.version, &mod->problems);
+          ReadInfoField(doc, "script", &mod->info.script, &mod->problems);
         }
       }
     }
@@ -630,6 +791,20 @@ bool ReadMetadata(Mod *mod, std::string *error) {
 
     ReadIcon(dir, kIconSmallFile, &mod->icon_small, &mod->problems);
     ReadIcon(dir, kIconBigFile, &mod->icon_big, &mod->problems);
+
+    // After the info block on purpose: `script` is matched against the files the
+    // mod actually ships, so the set has to be read first. It is read whether or
+    // not info.json named one, because that is what makes a relative import
+    // inside the entry module resolvable - the alternative would be reading the
+    // graph a file at a time, which the inspection mount cannot do later.
+    ScriptScan scan{mod};
+    ScanScripts(&scan, dir, "", 1);
+    if (scan.truncated) {
+      mod->problems.push_back(
+          "metadata holds more scripts than GkPlus will read (64 files or 1 MB); "
+          "the rest were skipped");
+    }
+    ResolveScriptField(mod);
   }
 
   // Every file above is closed, so this cannot fail for the one reason
@@ -814,6 +989,21 @@ std::vector<const Mod *> Loaded() {
     out.push_back(mod.get());
   }
   return out;
+}
+
+const std::string *ModScript(const Mod *mod, const char *path) {
+  if (!mod || !path || !*path) {
+    return nullptr;
+  }
+  // No lock: `scripts` is filled once, inside Load, before the record is
+  // published, and never touched again.
+  const std::string wanted = ToForwardSlashes(path);
+  for (const ModFile &file : mod->scripts) {
+    if (_stricmp(file.path.c_str(), wanted.c_str()) == 0) {
+      return &file.source;
+    }
+  }
+  return nullptr;
 }
 
 int Enable(const std::vector<std::string> &paths, std::string *error) {

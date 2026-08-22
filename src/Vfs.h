@@ -24,6 +24,8 @@
 //     D:\mods\bigger-bugs.zip
 //       metadata/info.json         <- who this mod is (see ModInfo)
 //       metadata/README.md
+//       metadata/bugs.mjs          <- run when this mod is enabled, if info.json
+//                                     names it (see ModFile, and src/Script.h)
 //       rif/units/bug.rif          <- replaces <Gunlok>\rif\units\bug.rif
 //       scripts/defaults.gsh       <- replaces <Gunlok>\scripts\defaults.gsh
 //       sound/robots.dat
@@ -36,7 +38,10 @@
 // `fmv`, `rif`, `graphics`, `sound`, `fonts` and `Screenshots`.
 //
 // `metadata` is the one directory that is *not* game content: the game has no
-// such category, so nothing an engine open asks for can ever land in it.
+// such category, so nothing an engine open asks for can ever land in it. That is
+// also why a mod's scripts live there and are named relative to it - a `.mjs` in
+// `scripts/` would be sitting in a directory the engine does chdir into, and
+// every mod's copy would collide in the merged view besides.
 //
 // Where the mod itself sits, on the other hand, is nobody's convention: there is
 // no blessed location and no mods directory, and nothing here knows where a mod
@@ -116,6 +121,28 @@ struct ModInfo {
   std::string website;
   std::string license;
   std::string version;
+  // What `script` names, relative to `metadata/` and with forward slashes - the
+  // module the script host evaluates when this mod is enabled. "" when info.json
+  // names none, **and also when it names one that is not there**: the miss is a
+  // Mod::problem and clearing the field is what keeps the host from having to
+  // re-check something Load already knows.
+  std::string script;
+};
+
+// One JavaScript file out of a mod's `metadata` directory, held as source.
+//
+// The bytes are read at Load() time and kept, which is not an optimization: it
+// is the only moment a mod can be read **on its own**. PHYSFS_mount silently
+// succeeds without mounting when the archive is already in the search path
+// (doMount returns 1 on a strcmp match, whatever mount point it is handed), so
+// an enabled mod cannot be re-mounted for inspection later - and the
+// PHYSFS_unmount that followed would take the real mount with it. Reading a
+// mod's scripts at Load, under the inspection mount that is already open, is
+// what avoids that entirely.
+struct ModFile {
+  // Path relative to `metadata/`, forward slashes, as it was spelled on disk.
+  std::string path;
+  std::string source;
 };
 
 // One mod: a candidate that has been Load()ed, whether or not it is enabled.
@@ -141,9 +168,15 @@ struct Mod {
   // metadata/icon_small.png and icon_big.png, verbatim. Empty when absent.
   std::vector<char> icon_small;
   std::vector<char> icon_big;
+  // Every `.mjs` / `.js` under `metadata/`, in enumeration order. The one
+  // info.name's `script` field points at is the entry point; the rest are here so
+  // that an `import "./helper.mjs"` inside it resolves - which nothing else could
+  // do for an archive mod, since the file has no path on disk to read.
+  std::vector<ModFile> scripts;
   // What is wrong with this mod's metadata, in the order it was found: a missing
   // info.json, a malformed one, a field of the wrong type, an icon that is not a
-  // PNG. Empty means the metadata contract is met.
+  // PNG, a `script` naming a file the mod does not ship. Empty means the metadata
+  // contract is met.
   std::vector<std::string> problems;
 
   // Position in Enabled(), where the **highest number wins** a conflict. -1 when
@@ -192,6 +225,16 @@ const Mod *Load(const char *path, std::string *error);
 
 // Every Load()ed mod, in the order they were first loaded, enabled or not.
 std::vector<const Mod *> Loaded();
+
+// The source text of one of `mod`'s cached `metadata` scripts, by its path
+// relative to `metadata/` - case-insensitively, and with either slash - or null.
+//
+// This layer **stores and serves those bytes and decides nothing about them**.
+// What `info.json`'s `script` names is Mod::info.script, when it is run is
+// src/Script.h's (the mod becoming enabled), and the module names they are
+// evaluated under are the host's too. The pointer is good for the life of the
+// process, records being interned and never freed.
+const std::string *ModScript(const Mod *mod, const char *path);
 
 // --- Enabling ------------------------------------------------------------------
 

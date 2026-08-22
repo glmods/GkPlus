@@ -345,7 +345,9 @@ is re-lexed inside a `# line` directive so it must not contain a quote) are in
 
 ### Script host and the REPL channel (`src/Script`, `src/Repl`)
 
-One `JSRuntime`, **two modules the profile names**, plus an optional loopback JavaScript REPL
+One `JSRuntime`, **two modules the profile names** plus one per enabled mod that asks for it
+(`RunModScripts`, see "Mod loading" below — a mod's callbacks are its own slots, called alongside
+the profile's), plus an optional loopback JavaScript REPL
 behind `GKPLUS_REPL_PORT`. `core.script` (`<profile>\main.mjs`) is the entry module and boots from
 a detour on `SetupMenus`, where the front end is already up; `core.boot` (`<profile>\boot.mjs`) is
 the **boot module** and runs far earlier, at `FileHookSystem`'s first intercepted open, because
@@ -596,10 +598,27 @@ revision that presented the install as a `Mod` at the bottom of the order ended 
 whole install, which is why the refusal is explicit.
 
 **Every mod is expected to carry `metadata/`** — `info.json` (name, author, website, license,
-version; all strings, all optional), `README.md`, and optionally `icon_small.png` /
+version, script; all strings, all optional), `README.md`, and optionally `icon_small.png` /
 `icon_big.png`. A mod that fails any of that **still loads and still enables**: `mod.name`
 falls back to the name on disk and `mod.problems` lists what was wrong, because being strict
 would have stopped every mod predating the contract rather than reporting it.
+
+**`script` is the one field with behaviour behind it**: it names a JavaScript module inside
+`metadata/` which the script host evaluates when the mod is **enabled**, so a mod can register a
+menu item or an overlay panel of its own rather than only replacing assets
+(`examples/mods/hello-mod`). Opt-in, no default name, and a mod naming a file it does not ship
+reports that in `problems` and enables anyway. Two of its decisions are measurements.
+**A mod's scripts are read at `Load` time**, all of them (`.mjs`/`.js` under `metadata/`, 64 files
+/ 1 MB / 4 deep), because that is the only moment a mod can be read *on its own*: `PHYSFS_mount`
+silently succeeds **without mounting** when the archive is already in the search path, so an
+enabled mod cannot be re-inspected later and the `PHYSFS_unmount` that followed would take the
+real mount with it. Caching the whole set is also what makes an ordinary
+`import "./lib/util.mjs"` work **inside a `.zip`**, where neither file has a path on disk. And
+they live in `metadata/` precisely because that is the one directory in a mod that is not game
+content — nothing the engine opens can collide with one, and every mod may call its script
+whatever it likes. `import.meta.mod` is how such a module knows which mod it is; a mod's
+`draw_gui`/`setup_menus` are its own slots and are called alongside the profile's, each disabled
+on its own if it throws. `RunModScripts` in `src/Script.h` is the host side.
 
 `mod_loading_notes.md` has the metadata contract, the private inspection mount it is read
 through, the interning rule, the six decisions that shape the rest and the three that are easy
@@ -870,6 +889,7 @@ reference. Test invocations are under "Running the test suites" above.
 | `imgui-quickjs/` | Static library: the ImGui bindings, linked into `d3d8.dll`. **Not a QuickJS module** — `js_imgui_new_namespace(ctx)` builds a plain object the host passes to `draw_gui`, since an ImGui call outside that frame does not work. `JS_SetPropertyFunctionList` handles the whole export list, `JS_DEF_CGETSET` included (see the QuickJS conventions). **`types/imgui.d.ts` is generated from this file** — run `python3 types/gen-imgui-dts.py` after touching it and check the `any` count it prints is still 0, since it infers each parameter's type from the `JS_To*` the wrapper actually calls |
 | `examples/main.mjs` | A working entry module, JSDoc-annotated against `types/`. Install it in a profile as `main.mjs` (i.e. `<Gunlok>\gkplus\main.mjs` by default); `examples/jsconfig.json` is what type-checks it. **It imports `levels/` which imports `headers/`, so install all three** — a module the host cannot find takes the whole entry module with it and registers no hooks at all, so the symptom is that nothing happens rather than that one level is missing |
 | `examples/boot.mjs` | A working **boot** module — it names its mods from a list in `settings.json` (`boot.mods`), since nothing scans the directory, survives an entry that is not a mod, and reports each one's metadata and problems. Install as `<profile>\boot.mjs`. Without one, no mod is enabled at all, which is the single most likely reason a previously-working install stops picking up its mods |
+| `examples/mods/hello-mod` | A working **mod script** — the `script` field in `metadata/info.json`, a helper it imports out of `metadata/lib/`, `import.meta.mod` for its own identity, its own section of `settings.json`, and both callbacks. **Nothing here runs by being present**: a profile's `boot.mjs` still has to name the directory, and the script is evaluated at that moment — which from a boot module is inside `WinMain` with no console, no resource strings and no menus, so anything needing those goes in `setup_menus` |
 | `examples/render-panel.mjs` | Every `render` knob as ImGui, in collapsing sections, drawn into the caller's window. Its own module because it is longer than the rest of the example put together and is the piece most worth copying. **Its one rule is write-on-`changed`**: `draw_gui` runs every frame, and `lighting_maps = true` re-reads every file while `map_shadow_rate` re-bakes the shadow atlas |
 | `examples/prof-panel.mjs` | The profiler as ImGui, in the same shape as `render-panel.mjs` — frame graph, zones, sampled profile, stacks, the trigger and its captures, and the ring configuration. **Its rule is query-on-a-cadence**: `zones`/`samples`/`stacks` build one JS object per row and reading them per frame would cost more than the frame they describe, invisibly — `overhead_ms` cannot see time spent on our side of the binding. So each section snapshots, and a collapsed one queries nothing. The other trap is the trigger: an options object with no `enabled` *arms* it, so every write passes the current value explicitly |
 | `examples/levels/arena.mjs` | A working level module for `levels.add` — `map` + `includes` + `define` + `populate` + `setup` |

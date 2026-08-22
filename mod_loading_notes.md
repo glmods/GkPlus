@@ -99,9 +99,10 @@ below).
 
 ### The metadata contract
 
-`metadata/info.json` gives `name`, `author`, `website`, `license` and `version`; every field
-is a **string** and every field is optional. `metadata/README.md` is expected too; the two
-icons are optional and must be real PNGs.
+`metadata/info.json` gives `name`, `author`, `website`, `license`, `version` and `script`; every
+field is a **string** and every field is optional. `metadata/README.md` is expected too; the two
+icons are optional and must be real PNGs. `script` is the one field with behaviour behind it —
+see "A mod's own script" below.
 
 **A mod that fails any of that still loads and still enables.** `mod.name` falls back to the
 entry name on disk and `mod.problems` lists what was missing or malformed — a manager UI shows
@@ -127,6 +128,66 @@ Four things there are decisions rather than defaults:
   to whatever ends up decoding it. `icon_small()` / `icon_big()` are **methods**, because each
   returns a copy of the file's bytes and a getter reached from a per-frame panel would
   allocate the whole PNG every frame with nothing to say so.
+
+### A mod's own script
+
+`info.json` has a sixth field, and it is the only one that *does* anything: `script` names a
+JavaScript module inside `metadata/`, which the script host evaluates when the mod is
+**enabled**. So a mod can register a menu item, an overlay panel or a console command of its
+own rather than only replacing assets. It is opt-in and there is no default name — a mod with
+no `script` field runs nothing, and one naming a file it does not ship reports that in
+`problems` and still enables.
+
+```json
+{ "name": "Hello Mod", "script": "hello.mjs" }
+```
+
+`examples/mods/hello-mod` is the worked example; `src/Script.h`'s `RunModScripts` is the host
+side. Six things there are decisions, and the first two are measurements rather than taste:
+
+- **A mod's scripts are read at `Load` time, not when they are run**, and that is not an
+  optimization — it is the only moment a mod can be read **on its own**. `PHYSFS_mount`
+  silently *succeeds without mounting* when the archive is already in the search path
+  (`doMount` returns 1 on a `strcmp` match of `dirName`, whatever mount point it was handed),
+  so an enabled mod cannot be re-mounted at `gkplus-inspect` later — and the `PHYSFS_unmount`
+  that followed would take the **real** mount with it, silently disabling the mod. Reading
+  under the inspection mount that `ReadMetadata` already holds avoids the whole question.
+- **Every `.mjs`/`.js` under `metadata/` is read, not just the one named**, which is what makes
+  an ordinary `import "./lib/util.mjs"` work — including inside a `.zip`, where neither file has
+  a path on disk for the loader to read. The alternative was resolving the import graph a file at
+  a time, which the point above rules out. Bounded at 64 files and 1 MB, four levels deep, with a
+  `problems` entry when a mod exceeds it; a mod that is loaded and never enabled pays this too.
+- **They live in `metadata/`, and `script` is relative to it.** `metadata` is the one directory
+  in a mod that is not game content, so a script cannot collide with an asset the engine asks
+  for, and two mods can both call theirs `mod.mjs`. A `.mjs` in `scripts/` would be sitting in a
+  directory the engine does `chdir` into. The `"script": "metadata/mod.mjs"` spelling is the
+  obvious mistake and gets its own half of the error message rather than only "that file is
+  missing".
+- **The module name is `mod:<mod path>/<path in metadata>`**, which is what makes the relative
+  import above resolve. QuickJS's default normalizer only ever splits on `/`, and a mod's path is
+  backslashed — so it is one opaque segment that a `..` cannot climb out of: one too many
+  collapses the whole prefix and leaves a name no mod claims. The host resolves by longest
+  matching prefix over `vfs::Loaded()`, so a mod inside another mod's directory still gets its
+  own files.
+- **It runs at `enable`, in load order, after every mount is in place** — so a mod's script can
+  already read a file belonging to a mod *later* in the load order. From a boot module that means
+  inside `WinMain` with none of the game up, which is the same constraint `core.boot` runs under;
+  `setup_menus` is called at the SetupMenus point for a mod enabled before it and **immediately**
+  for one enabled after, so "the front end exists" is something a mod is told rather than
+  something it may assume. A script is evaluated once per process, keyed by the mod's canonical
+  path: re-enabling the same set does not re-run it, which is what keeps `mods.enable` usable as
+  a reordering operation.
+- **A mod's callbacks are its own, not the profile's two.** There is one profile, so
+  "whichever module loaded last wins" is a coherent rule for `core.boot` versus `core.script`;
+  across mods it is not a rule at all, so each mod gets its own `draw_gui`/`setup_menus` slots and
+  they are all called. A `draw_gui` that throws is disabled on its own and takes nobody else's
+  panel with it. Failure is contained the same way everywhere here: a script that is missing,
+  fails to compile or throws is reported and skipped, the mod stays enabled, and `mods.enable`
+  throws nothing — a boot module that lost its remaining work to one bad mod would be the worst
+  possible trade.
+- **`import.meta.mod` is how a script knows which mod it is**, and it is the only way: the file
+  may be inside an archive and has no name of its own to go on, and the `mods` collection cannot
+  be searched for "me". Every module the host loads out of a mod gets it, helpers included.
 
 The metadata is read through a **private mount point** (`gkplus-inspect`), never the ordinary
 search path, and that is load-bearing twice over: the mod is being inspected before anything
@@ -245,7 +306,37 @@ that the boot module does not name:
 - and a real `level02` load with `mods.served` rising and `mods.recent` naming the mod's own
   `scripts/defaults.gsh`.
 
-It is a check that can fail: an earlier revision of this design, in which the install was
+**A mod's script was verified the same way**, 29 checks over a throwaway profile whose boot
+module enables six mods — a directory mod with a helper in `metadata/lib/`, a `.zip` whose entry
+module imports a sibling *inside the archive*, one naming `metadata/nope.mjs`, one that throws at
+module scope, one after it, and one whose `draw_gui` throws — with a seventh enabled from the REPL
+after the front end was up. Each script records into its own `settings.json` section, which is
+what makes all of it readable from outside:
+
+- the run order is `a;b;d;e;g;` — every enabled mod with a script, in load order, and `e` proves
+  the loop carried on past the one that threw;
+- the relative import resolves in the directory mod **and inside the `.zip`**, which is the whole
+  reason the sources are cached at load;
+- `import.meta.mod` reports the mod's own `name`/`entry`/`version`/`order`/`enabled`/`script`, and
+  `path` compares equal to the record the `mods` collection hands out — one identity, not a copy;
+- a script sees `scripts/from-e.txt` out of a mod **later** in the load order, so every mount is
+  in place before any script runs;
+- `setup_menus` was called with a real `menus` object; the overlay (toggled with a posted
+  `WM_KEYDOWN`/`VK_F11`, which reaches `HookedWndProc` where a synthetic game key would not) drew
+  the mod's panel every frame, while the mod whose panel throws ran **exactly once** and was
+  disabled without touching the other;
+- the mod naming a file it does not ship reports `script` as `""` and carries the prefix hint in
+  `problems`, and enables anyway;
+- enabling a seventh mod from the REPL ran its script *and* its `setup_menus` immediately, while
+  the six already through were **not** re-evaluated.
+
+It is a check that can fail. Renaming the directory mod's `metadata/lib/greeting.mjs` aside —
+one unresolvable import — turns 29/29 into 14/29, and what the failures say is as much the point
+as that they happen: that mod's whole section is absent, its `setup_menus` never ran and its panel
+never drew, while `b`, `d`, `e`, `g` and the late `f` all still ran and the run order comes back
+`b;d;e;g;f;`. Containment is the claim, and that is the measurement of it.
+
+An earlier revision of this design, in which the install was
 itself a `Mod` at the bottom of the order, is what the harness caught mounting the whole game
 directory. `examples/boot.mjs` has a second harness of its own — Node plus a stub `gk` and a
 recording console — which asserts that it names each mod out of config, survives one bad entry,

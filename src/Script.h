@@ -67,6 +67,30 @@ public:
 // nothing else should, and calling it after the host has booted is a no-op.
 void BootScriptProfile();
 
+// Runs the entry module of every **enabled mod** that names one in its
+// `metadata/info.json` and has not been through yet, in load order, and picks up
+// whichever of the two callbacks each exports. Called by `mods.enable` once the
+// mounts are in place - which is the only caller, since enabling is reachable
+// only from a script and therefore only with the runtime already up.
+//
+// A mod's script is evaluated **where it was enabled**: from a boot module, that
+// is inside `WinMain` with none of the game up (the same constraints core.boot
+// runs under), and from anything later it is right there. What it must not do is
+// depend on the game existing at module scope - `setup_menus` is called at the
+// SetupMenus point for a mod enabled before it and immediately for one enabled
+// after, so "the front end is up" is a thing to be told rather than to assume.
+//
+// Each mod gets its own callback slots rather than sharing the profile's two.
+// There is one profile, so "whichever module was loaded last wins" is a coherent
+// rule for it; there are many mods, and a mod silently replacing another mod's
+// overlay panel by loading second is not a rule at all.
+//
+// Nothing here throws into its caller: a mod whose script is missing, fails to
+// compile or throws is reported and skipped, and it stays enabled - its files are
+// being served either way, and a `mods.enable` that threw would take the rest of
+// the boot module with it.
+void RunModScripts();
+
 // Phase two: runs `core.script` and calls its setup_menus, creating the runtime
 // first if phase one did not. The SetupMenus detour calls this once; calling it
 // again is a no-op. In the game nothing else should - it is public so the host

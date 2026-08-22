@@ -2,6 +2,10 @@
 
 #include <quickjs.h>
 
+namespace gk::vfs {
+struct Mod;
+}
+
 namespace gk::js {
 // Registers the "gk" C module in `ctx`. Call once per context, before evaluating
 // any script that imports it; returns false if any registration step failed.
@@ -31,6 +35,14 @@ bool RegisterGkModule(JSContext *ctx);
 // being importable from anywhere. A script that wants it later (menus.current,
 // menu.open) keeps the argument.
 JSValue NewMenusNamespace(JSContext *ctx);
+
+// One `Mod` object, the same kind the `mods` collection hands out. Also not a
+// "gk" export, and for a related reason: the host sets it as `import.meta.mod` on
+// every module it loads out of a mod, which is the only way a mod's script can
+// know which mod it is - the module has no path on disk to read its name out of,
+// and the mods collection cannot be searched for "me". Undefined for a null
+// record; the wrapper needs no finalizer, records being interned and never freed.
+JSValue NewModValue(JSContext *ctx, const vfs::Mod *mod);
 
 // Writes one script-facing line to the game console and to the debugger. Splits
 // on newlines, because the console draws one list entry per line.

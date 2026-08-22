@@ -2,7 +2,9 @@
 
 #include "Core.h"
 #include "FileHooks.h"
+#include "Js.h"
 #include "JsBindings.h"
+#include "Script.h"
 
 #include <cstdio>
 #include <cstring>
@@ -56,6 +58,7 @@ GK_MOD_STRING_GETTER(GetModAuthor, info.author)
 GK_MOD_STRING_GETTER(GetModWebsite, info.website)
 GK_MOD_STRING_GETTER(GetModLicense, info.license)
 GK_MOD_STRING_GETTER(GetModVersion, info.version)
+GK_MOD_STRING_GETTER(GetModScript, info.script)
 GK_MOD_STRING_GETTER(GetModReadme, readme)
 
 #undef GK_MOD_STRING_GETTER
@@ -157,6 +160,7 @@ const JSCFunctionListEntry ModProto[] = {
     JS_CGETSET_DEF("website", GetModWebsite, nullptr),
     JS_CGETSET_DEF("license", GetModLicense, nullptr),
     JS_CGETSET_DEF("version", GetModVersion, nullptr),
+    JS_CGETSET_DEF("script", GetModScript, nullptr),
     JS_CGETSET_DEF("readme", GetModReadme, nullptr),
     JS_CGETSET_DEF("problems", GetModProblems, nullptr),
     JS_CGETSET_DEF("has_icon_small", GetModHasIconSmall, nullptr),
@@ -427,6 +431,11 @@ JSValue ModsEnable(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv) {
   if (!error.empty()) {
     DebugWrite("gkplus: mods.enable skipped {}\n", error);
   }
+  // After every mount is in place, so a mod's script can already read any enabled
+  // mod's files - including the ones enabled after it in the load order. This is
+  // the only caller: enabling is reachable only from a script, so the runtime is
+  // up by construction. It throws nothing (see gk::RunModScripts).
+  RunModScripts();
   return JS_NewInt32(ctx, enabled);
 }
 
@@ -558,6 +567,17 @@ JSValue NewModsNamespace(JSContext *ctx) {
     return JS_EXCEPTION;
   }
   return NewCollection(ctx, &ModsClassId, &ModsOps);
+}
+
+JSValue NewModValue(JSContext *ctx, const vfs::Mod *mod) {
+  // The class is registered by NewModsNamespace, which every context gets from
+  // RegisterGkModule long before a module can be loaded - but a wrapper with no
+  // class would be an ordinary object silently missing every accessor, so this
+  // says so instead.
+  if (!ModClassId) {
+    return JS_ThrowInternalError(ctx, "the Mod class is not registered");
+  }
+  return NewModWrapper(ctx, mod);
 }
 
 } // namespace gk::js

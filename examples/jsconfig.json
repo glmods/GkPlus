@@ -26,6 +26,8 @@
     "levels/*.mjs",
     "headers/*.mjs",
     "leveltest/*.mjs",
+    "mods/*/metadata/*.mjs",
+    "mods/*/metadata/lib/*.mjs",
     "../types/*.d.ts",
     "types/*.d.ts"
   ]

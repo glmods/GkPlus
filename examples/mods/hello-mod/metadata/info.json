@@ -1,0 +1,7 @@
+{
+  "name": "Hello Mod",
+  "author": "GkPlus",
+  "version": "1.0",
+  "license": "MIT",
+  "script": "hello.mjs"
+}

@@ -2329,6 +2329,17 @@ declare module "gk" {
     readonly website: string;
     readonly license: string;
     readonly version: string;
+    /** What `info.json`'s `script` names, relative to `metadata/`, or `""`.
+     *
+     *  That module is evaluated once, when this mod is **enabled** - so from a
+     *  boot module it runs inside `WinMain` with none of the game up, and from
+     *  anything later it runs right there. It may export `setup_menus(menus)` and
+     *  `draw_gui(ImGui)`, which are called alongside the profile's rather than
+     *  replacing them, and it reaches its own `Mod` through `import.meta.mod`.
+     *
+     *  `""` also means "named one that is not there": the miss is in `problems`
+     *  and the field is cleared, so this reads as "there is a script to run". */
+    readonly script: string;
     /** `metadata/README.md`, with CRLF normalised to LF, or `""`. */
     readonly readme: string;
     /** What is wrong with this mod's metadata - a missing `info.json` or
@@ -4376,3 +4387,16 @@ declare module "gk" {
 // installs none: QuickJS core has no console object, and GkPlus puts log/info/
 // warn/error/debug on the `console` exported by "gk" instead of adding a second
 // one. `import { console } from "gk"` is how a script gets it.
+
+/** `import.meta` for a module the host loaded **out of a mod** - the entry module
+ *  `metadata/info.json`'s `script` names, and anything that imports from it.
+ *
+ *  `mod` is how such a module knows which mod it is, and it is the only way: the
+ *  file has no path on disk to read a name out of (it may be inside a zip), and
+ *  the `mods` collection cannot be searched for "me". A profile's own
+ *  `main.mjs` / `boot.mjs` is not loaded that way and its `import.meta` is bare,
+ *  so this is typed as present because there is no way to distinguish the two
+ *  here - reading it from a profile module gives `undefined`. */
+interface ImportMeta {
+  readonly mod: import("gk").Mod;
+}
