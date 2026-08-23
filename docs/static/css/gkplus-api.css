@@ -1,0 +1,207 @@
+/* ============================================================================
+   GkPlus documentation: the skin for the two generated API trees.
+
+   Loaded after each generator's own stylesheet, together with
+   gkplus-tokens.css, by the injection in docs/tools/unify-api.py.
+
+   clang-doc and TypeDoc both drive their entire appearance from CSS custom
+   properties, so this file retunes those properties to the site's palette
+   rather than fighting their layouts with overrides. Nothing here restyles a
+   component directly unless a generator hard-codes a colour.
+   ============================================================================ */
+
+/* ------------------------------------------------- the site's header bar */
+
+.gkplus-banner {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 1.4rem;
+  margin: 0; padding: .75rem 1.4rem;
+  background-color: var(--void-2);
+  border-bottom: 1px solid var(--edge);
+  font: 400 16px/1.55 var(--body);
+  position: relative; z-index: 5;
+}
+.gkplus-banner .gkplus-brand {
+  font-family: var(--display); text-transform: uppercase;
+  font-size: 1.12rem; letter-spacing: .17em;
+  color: #fff; text-decoration: none; border: 0; white-space: nowrap;
+}
+.gkplus-banner nav { display: flex; flex-wrap: wrap; gap: 0 1.3rem; }
+.gkplus-banner nav a {
+  font-family: var(--display); text-transform: uppercase;
+  font-size: .74rem; letter-spacing: .16em;
+  color: var(--ink-dim); text-decoration: none; border: 0;
+  padding: .3rem 0; border-bottom: 2px solid transparent;
+}
+.gkplus-banner nav a:hover { color: #fff; border-bottom-color: var(--alert); }
+.gkplus-banner .gkplus-where {
+  font-family: var(--display); text-transform: uppercase;
+  font-size: .66rem; letter-spacing: .2em;
+  color: var(--ch); margin-left: auto;
+}
+.gkplus-banner a:focus-visible { outline: 2px solid var(--ch); outline-offset: 3px; }
+
+@media (max-width: 40rem) {
+  .gkplus-banner { padding: .6rem 1rem; }
+  .gkplus-banner .gkplus-where { margin-left: 0; flex-basis: 100%; }
+}
+
+/* ------------------------------------------------------------- clang-doc */
+
+/* Its five surface/text/brand variables carry the whole theme. The generated
+   pages are the C++ reference, so they take the reference channel. */
+body.gkplus-cpp {
+  --ch: var(--ch-reference);
+
+  --brand-light:    #c79bff;  --brand-dark:    #c79bff;
+  --text1-light:    #ece9f2;  --text1-dark:    #ece9f2;
+  --text2-light:    #a49ab5;  --text2-dark:    #a49ab5;
+  --surface1-light: #06050b;  --surface1-dark: #06050b;
+  --surface2-light: #140a1d;  --surface2-dark: #140a1d;
+
+  --brand: #c79bff;
+  --text1: #ece9f2;
+  --text2: #a49ab5;
+  --surface1: #06050b;
+  --surface2: #140a1d;
+
+  color-scheme: dark;
+  background-color: var(--void);
+  font-family: var(--body);
+}
+body.gkplus-cpp code, body.gkplus-cpp pre, body.gkplus-cpp .code-clang-doc {
+  font-family: var(--mono);
+}
+body.gkplus-cpp h1, body.gkplus-cpp h2, body.gkplus-cpp h3,
+body.gkplus-cpp .hero__title, body.gkplus-cpp .hero__title-large {
+  font-family: var(--display);
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  font-weight: 400;
+}
+/* Its own nav bar sits directly under ours and carries only a project logo and
+   a Home link - the logo is now the second brand on the page, so it goes. The
+   bar itself stays, because Home is the only link back to the tree root.
+   TypeDoc's equivalent bar is left intact: it holds the search box. */
+body.gkplus-cpp header .navbar { border-top: 0; }
+body.gkplus-cpp .navbar__logo { display: none; }
+body.gkplus-cpp .table-wrapper th { font-family: var(--display); letter-spacing: .1em; font-size: .72rem; }
+body.gkplus-cpp a { color: var(--lattice); }
+body.gkplus-cpp a:hover { color: var(--alert); }
+
+/* --------------------------------------------------------------- TypeDoc */
+
+/* TypeDoc resolves --color-* from --light-color-* or --dark-color-* depending
+   on the reader's theme. Setting both to the same values means the palette
+   holds whichever theme the reader has chosen, with no theme forcing and no
+   fight with its toggle. */
+body.gkplus-js {
+  --ch: var(--ch-reference);
+  font-family: var(--body);
+}
+:root:has(body.gkplus-js), body.gkplus-js {
+  --light-color-background:           #06050b;  --dark-color-background:           #06050b;
+  --light-color-background-secondary: #100a18;  --dark-color-background-secondary: #100a18;
+  --light-color-background-active:    #241533;  --dark-color-background-active:    #241533;
+  --light-color-background-warning:   #3a2a10;  --dark-color-background-warning:   #3a2a10;
+  --light-color-warning-text:         #ffb03a;  --dark-color-warning-text:         #ffb03a;
+  --light-color-accent:               #3a1c4e;  --dark-color-accent:               #3a1c4e;
+  --light-color-active-menu-item:     #241533;  --dark-color-active-menu-item:     #241533;
+  --light-color-text:                 #ece9f2;  --dark-color-text:                 #ece9f2;
+  --light-color-contrast-text:        #ffffff;  --dark-color-contrast-text:        #ffffff;
+  --light-color-text-aside:           #a49ab5;  --dark-color-text-aside:           #a49ab5;
+  --light-color-icon-background:      #100a18;  --dark-color-icon-background:      #100a18;
+  --light-color-icon-text:            #ece9f2;  --dark-color-icon-text:            #ece9f2;
+  --light-color-comment-tag-text:     #ece9f2;  --dark-color-comment-tag-text:     #ece9f2;
+  --light-color-comment-tag:          #140a1d;  --dark-color-comment-tag:          #140a1d;
+  --light-color-link:                 #7cc7e8;  --dark-color-link:                 #7cc7e8;
+  --light-color-focus-outline:        #c79bff;  --dark-color-focus-outline:        #c79bff;
+  --light-color-document:             #ffffff;  --dark-color-document:             #ffffff;
+
+  /* The symbol-kind colours. TypeDoc ships fourteen highly saturated hues that
+     read as confetti against this ground; these collapse them onto the site's
+     four channels plus ink, so kind is still distinguishable but the page is
+     one palette. */
+  --light-color-ts-keyword:    #c79bff;  --dark-color-ts-keyword:    #c79bff;
+  --light-color-ts-project:    #c79bff;  --dark-color-ts-project:    #c79bff;
+  --light-color-ts-module:     #c79bff;  --dark-color-ts-module:     #c79bff;
+  --light-color-ts-namespace:  #c79bff;  --dark-color-ts-namespace:  #c79bff;
+  --light-color-ts-enum:       #ffb03a;  --dark-color-ts-enum:       #ffb03a;
+  --light-color-ts-enum-member:#ffb03a;  --dark-color-ts-enum-member:#ffb03a;
+  --light-color-ts-variable:   #7cc7e8;  --dark-color-ts-variable:   #7cc7e8;
+  --light-color-ts-function:   #57f08c;  --dark-color-ts-function:   #57f08c;
+  --light-color-ts-class:      #6fd0f2;  --dark-color-ts-class:      #6fd0f2;
+  --light-color-ts-interface:  #6fd0f2;  --dark-color-ts-interface:  #6fd0f2;
+  --light-color-ts-constructor:#6fd0f2;  --dark-color-ts-constructor:#6fd0f2;
+  --light-color-ts-property:   #ece9f2;  --dark-color-ts-property:   #ece9f2;
+  --light-color-ts-method:     #57f08c;  --dark-color-ts-method:     #57f08c;
+  --light-color-ts-reference:  #a49ab5;  --dark-color-ts-reference:  #a49ab5;
+  --light-color-ts-parameter:  #7cc7e8;  --dark-color-ts-parameter:  #7cc7e8;
+  --light-color-ts-type-parameter: #ffb03a; --dark-color-ts-type-parameter: #ffb03a;
+  --light-color-ts-accessor:   #ff5a5a;  --dark-color-ts-accessor:   #ff5a5a;
+  --light-color-ts-type-alias: #c79bff;  --dark-color-ts-type-alias: #c79bff;
+}
+
+body.gkplus-js code, body.gkplus-js pre, body.gkplus-js .tsd-signature { font-family: var(--mono); }
+body.gkplus-js h1, body.gkplus-js h2 {
+  font-family: var(--display); text-transform: uppercase;
+  letter-spacing: .06em; font-weight: 400;
+}
+/* Its member headings carry symbol names, which must not be uppercased. */
+body.gkplus-js .tsd-panel h1, body.gkplus-js .tsd-panel h2,
+body.gkplus-js h3, body.gkplus-js h4, body.gkplus-js .tsd-page-title h1 {
+  font-family: var(--body); text-transform: none; letter-spacing: 0; font-weight: 600;
+}
+body.gkplus-js .tsd-page-toolbar { border-bottom: 1px solid var(--edge); }
+
+/* TypeDoc's syntax highlighting is a separate variable set (a VS Code palette
+   in assets/highlight.css) and is not reached by the --color-* overrides
+   above, whose code blocks stayed light on this dark ground. Remapped onto the
+   same four accents the Hugo pages use for Chroma, so a code block reads
+   identically whether Hugo, clang-doc or TypeDoc rendered it. */
+:root:has(body.gkplus-js), body.gkplus-js {
+  --light-code-background: #0c0714;  --dark-code-background: #0c0714;
+
+  --light-hl-0: #ece9f2;  --dark-hl-0: #ece9f2;   /* plain text     */
+  --light-hl-1: #c79bff;  --dark-hl-1: #c79bff;   /* control keyword */
+  --light-hl-2: #ece9f2;  --dark-hl-2: #ece9f2;   /* identifier     */
+  --light-hl-3: #57f08c;  --dark-hl-3: #57f08c;   /* string         */
+  --light-hl-4: #c79bff;  --dark-hl-4: #c79bff;   /* keyword        */
+  --light-hl-5: #7cc7e8;  --dark-hl-5: #7cc7e8;   /* constant       */
+  --light-hl-6: #7cc7e8;  --dark-hl-6: #7cc7e8;   /* function       */
+  --light-hl-7: #ffb03a;  --dark-hl-7: #ffb03a;   /* number         */
+  --light-hl-8: #ece9f2;  --dark-hl-8: #ece9f2;
+}
+body.gkplus-js pre, body.gkplus-js code.tsd-tag, body.gkplus-js .tsd-signature {
+  border: 1px solid var(--edge);
+}
+
+/* clang-doc draws its rules from --text1 and --text2, which are ink colours -
+   at full strength they read as bright white boxes rather than as structure.
+   Rules take the violet edge; the text variables stay where they are. */
+body.gkplus-cpp .navbar,
+body.gkplus-cpp .navbar-breadcrumb-container,
+body.gkplus-cpp .section-container h2,
+body.gkplus-cpp .sidebar { border-color: var(--edge); }
+body.gkplus-cpp .table-wrapper th,
+body.gkplus-cpp .table-wrapper td { border-color: var(--edge-soft); }
+
+/* Its code blocks are tokenised by highlight.js, whose theme comes from a CDN
+   and colours type names red - the one colour reserved here for alerts. These
+   put the tokens on the same four accents as Chroma and TypeDoc, and they hold
+   whether or not that CDN stylesheet loaded. */
+body.gkplus-cpp .hljs-keyword,
+body.gkplus-cpp .hljs-meta,
+body.gkplus-cpp .hljs-built_in    { color: var(--ch-reference); }
+body.gkplus-cpp .hljs-title,
+body.gkplus-cpp .hljs-class,
+body.gkplus-cpp .hljs-type,
+body.gkplus-cpp .hljs-name        { color: var(--lattice); }
+body.gkplus-cpp .hljs-string      { color: var(--ch-tutorials); }
+body.gkplus-cpp .hljs-number      { color: var(--ch-explanation); }
+body.gkplus-cpp .hljs-comment     { color: var(--ink-faint); font-style: italic; }
+body.gkplus-cpp .hljs,
+body.gkplus-cpp .code-clang-doc   { background: transparent; color: var(--ink); }
+
+@media print {
+  .gkplus-banner { display: none; }
+}

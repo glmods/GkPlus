@@ -1,0 +1,339 @@
+/* ============================================================================
+   GkPlus documentation: the Hugo site's own typography, layout and chrome.
+
+   Loaded only by the templates in docs/layouts/. The palette, the webfonts and
+   the two shared primitives (.gk-lattice, .gk-plate) live in
+   gkplus-tokens.css, which this file assumes has already been loaded; the
+   generated API trees load that same token file plus gkplus-api.css instead,
+   which is how three differently-built surfaces end up looking like one site.
+   ============================================================================ */
+
+/* ------------------------------------------------------------- typography */
+
+h1, h2, .gk-brand, .gk-eyebrow, .gk-tag, th {
+  font-family: var(--display);
+  font-weight: 400;
+  text-transform: uppercase;
+}
+
+h1 {
+  font-size: clamp(1.75rem, 1.15rem + 2.3vw, 2.7rem);
+  line-height: 1.12;
+  letter-spacing: .045em;
+  margin: 0 0 .5rem;
+  color: #fff;
+}
+
+h2 {
+  font-size: 1.16rem;
+  letter-spacing: .1em;
+  line-height: 1.35;
+  margin: 2.6rem 0 .9rem;
+  padding-left: .85rem;
+  border-left: var(--bracket-w) solid var(--ch);
+  color: #fff;
+}
+
+h2 a { color: var(--ch); border-bottom: 0; }
+h2 a:hover { color: var(--alert); }
+
+/* Below h2 the display face steps aside: h3 and h4 are often full sentences,
+   and a sentence in tracked caps is a wall. */
+h3 {
+  font-family: var(--body);
+  font-weight: 600;
+  font-size: 1.04rem;
+  letter-spacing: 0;
+  text-transform: none;
+  margin: 1.9rem 0 .4rem;
+  color: #fff;
+}
+h4, h5, h6 {
+  font-family: var(--body);
+  font-weight: 600;
+  font-size: .95rem;
+  text-transform: none;
+  margin: 1.4rem 0 .35rem;
+  color: var(--ink);
+}
+
+p, li { max-width: var(--measure); }
+p { margin: 0 0 1rem; }
+
+.gk-eyebrow {
+  display: block;
+  font-size: .68rem;
+  letter-spacing: .24em;
+  color: var(--ch);
+  margin: 0 0 .7rem;
+}
+
+.gk-lede {
+  font-size: 1.06rem;
+  color: var(--ink-dim);
+  max-width: var(--measure);
+  margin: 0 0 2rem;
+}
+
+a { color: var(--lattice); text-decoration: none; border-bottom: 1px solid rgba(124, 199, 232, .3); }
+a:hover { color: var(--alert); border-bottom-color: var(--alert); }
+a:focus-visible { outline: 2px solid var(--ch); outline-offset: 3px; border-radius: 0; }
+
+strong { color: #fff; font-weight: 600; }
+em { color: var(--ink); }
+hr { border: 0; border-top: 1px solid var(--edge-soft); margin: 2.4rem 0; }
+
+ul, ol { padding-left: 1.15rem; margin: 0 0 1rem; }
+li { margin: .3rem 0; }
+li::marker { color: var(--ch); }
+
+blockquote {
+  margin: 1.3rem 0;
+  padding: .1rem 0 .1rem 1rem;
+  border-left: var(--bracket-w) solid var(--edge);
+  color: var(--ink-dim);
+}
+
+/* -------------------------------------------------------------- code */
+
+code, pre, kbd, samp { font-family: var(--mono); font-size: .875em; }
+
+/* No border and almost no padding: a technical page is dense with inline
+   code, and a bordered chip per identifier turns a paragraph into a rash. */
+code {
+  background: rgba(199, 155, 255, .09);
+  color: #d7c6ef;
+  padding: .05em .25em;
+  white-space: nowrap;
+}
+
+pre {
+  background: #0c0714;
+  border: 1px solid var(--edge);
+  padding: .95rem 1.1rem;
+  overflow-x: auto;
+  margin: 1.2rem 0;
+  line-height: 1.55;
+}
+pre code {
+  background: none; border: 0; padding: 0; color: var(--ink); white-space: pre;
+}
+
+/* Chroma tokens. Deliberately few: this is a documentation site, not an
+   editor, and four colours carry every distinction that matters here. */
+.chroma .c, .chroma .c1, .chroma .cm, .chroma .cs, .chroma .cp { color: var(--ink-faint); font-style: italic; }
+.chroma .k, .chroma .kd, .chroma .kn, .chroma .kr, .chroma .kt, .chroma .kc { color: var(--ch-reference); }
+.chroma .s, .chroma .s1, .chroma .s2, .chroma .sb, .chroma .sc, .chroma .sd, .chroma .se { color: var(--ch-tutorials); }
+.chroma .m, .chroma .mi, .chroma .mf, .chroma .mh, .chroma .mo, .chroma .il { color: var(--ch-explanation); }
+.chroma .nf, .chroma .nd { color: var(--lattice); }
+.chroma .err { color: var(--alert); background: none; }
+.chroma .gd { color: var(--alert); }
+.chroma .gi { color: var(--ch-tutorials); }
+
+/* -------------------------------------------------------------- tables */
+
+table {
+  border-collapse: collapse;
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+  margin: 1.3rem 0;
+  font-size: .93rem;
+}
+th, td {
+  border: 1px solid var(--edge-soft);
+  padding: .45rem .7rem;
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  background: var(--plate-2);
+  color: #fff;
+  font-size: .72rem;
+  letter-spacing: .13em;
+  white-space: nowrap;
+}
+tbody tr:nth-child(even) td { background: rgba(255, 255, 255, .015); }
+
+/* Inline code stays unbreakable in prose, where a split identifier misleads -
+   but inside a table cell that same rule sets the column width to the longest
+   symbol in it, and a four-column reference table has no width to spare. */
+td code, th code { white-space: normal; overflow-wrap: break-word; }
+
+img { max-width: 100%; height: auto; }
+
+/* ------------------------------------------------------------ site chrome */
+
+.gk-skip {
+  position: absolute; left: -9999px;
+  background: var(--plate); color: #fff; padding: .6rem 1rem;
+  border: 1px solid var(--ch); z-index: 20;
+}
+.gk-skip:focus { left: 1rem; top: 1rem; }
+
+.gk-header {
+  border-bottom: 1px solid var(--edge);
+  padding: .75rem 1.4rem;
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: .2rem 1.6rem;
+}
+
+.gk-brand {
+  font-size: 1.12rem;
+  letter-spacing: .17em;
+  color: #fff;
+  border: 0;
+  white-space: nowrap;
+}
+.gk-brand:hover { color: #fff; }
+
+.gk-nav { display: flex; flex-wrap: wrap; gap: 0 1.3rem; }
+.gk-nav a {
+  font-family: var(--display);
+  text-transform: uppercase;
+  font-size: .74rem;
+  letter-spacing: .16em;
+  color: var(--ink-dim);
+  border: 0;
+  padding: .3rem 0;
+  border-bottom: 2px solid transparent;
+  transition: color .14s ease, border-color .14s ease;
+}
+.gk-nav a:hover { color: #fff; border-bottom-color: var(--alert); }
+.gk-nav a[aria-current="true"] { color: #fff; border-bottom-color: var(--ch); }
+
+.gk-wrap {
+  display: flex; align-items: flex-start; gap: 2.6rem;
+  max-width: 78rem; margin: 0 auto; padding: 2rem 1.4rem 4.5rem;
+}
+
+.gk-side { flex: 0 0 15.5rem; position: sticky; top: 1.4rem; font-size: .875rem; }
+.gk-side .gk-sidetitle {
+  font-family: var(--display); text-transform: uppercase;
+  font-size: .72rem; letter-spacing: .2em; margin: 0 0 .8rem;
+}
+.gk-side .gk-sidetitle a { color: var(--ch); border: 0; }
+.gk-side ul { list-style: none; margin: 0 0 .9rem; padding: 0; }
+.gk-side ul ul { margin: .3rem 0 .8rem; padding-left: .8rem; border-left: 1px solid var(--edge-soft); }
+.gk-side li { margin: .28rem 0; max-width: none; }
+.gk-side li::marker { content: none; }
+.gk-side a { color: var(--ink-dim); border: 0; display: block; padding: .1rem 0 .1rem .7rem; border-left: 2px solid transparent; }
+.gk-side a:hover { color: #fff; border-left-color: var(--edge); }
+.gk-side a.gk-here { color: #fff; border-left-color: var(--ch); }
+
+.gk-main { flex: 1 1 auto; min-width: 0; }
+.gk-main > article > *:first-child { margin-top: 0; }
+
+.gk-tags { display: flex; flex-wrap: wrap; gap: .4rem; margin: 0 0 1.8rem; padding: 0; list-style: none; }
+.gk-tag {
+  font-size: .62rem; letter-spacing: .18em;
+  color: var(--ink-dim);
+  border: 1px solid var(--edge);
+  padding: .18rem .5rem;
+  margin: 0; max-width: none;
+}
+.gk-tag::marker { content: none; }
+
+.gk-pages { list-style: none; padding: 0; margin: 1.6rem 0 0; }
+.gk-pages li { margin: 0 0 .55rem; max-width: none; }
+.gk-pages li::marker { content: none; }
+.gk-pages a { display: block; padding: .7rem .95rem; border: 1px solid var(--edge-soft); color: var(--ink); }
+.gk-pages a:hover { border-color: var(--ch); color: #fff; background: var(--plate); }
+.gk-pages .gk-name { font-weight: 600; }
+.gk-pages .gk-desc { display: block; color: var(--ink-dim); font-size: .88rem; margin-top: .15rem; }
+
+.gk-footer {
+  border-top: 1px solid var(--edge);
+  padding: 1.6rem 1.4rem 2.4rem;
+  color: var(--ink-faint);
+  font-size: .82rem;
+}
+.gk-footer p { max-width: 60rem; margin: 0 0 .4rem; }
+.gk-footer a { color: var(--ink-dim); border-bottom-color: var(--edge); }
+.gk-footer a:hover { color: var(--alert); }
+
+/* --------------------------------------------------------------- index */
+
+/* The entry point is an index: a masthead, then routes, then prose about how
+   the documentation is organised. It deliberately has no wordmark, no tagline
+   and no architecture diagram - those answer "what is this project?", which is
+   not the question someone opening a documentation index is asking, and the
+   answer already has its own explanation page. */
+
+.gk-index > h2 { margin-top: 2.2rem; }
+
+/* The routes take the tutorials channel rather than the page default, because
+   every one of them opens with a tutorial - and the default would otherwise be
+   the lattice cyan, which on this site already means "how-to". */
+.gk-routes {
+  --ch: var(--ch-tutorials);
+  display: grid; gap: 1rem; margin: 1.2rem 0 2.8rem;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+}
+.gk-route { padding: 1.15rem 1.25rem 1.3rem; display: flex; flex-direction: column; }
+.gk-route .gk-eyebrow { margin-bottom: .55rem; }
+.gk-route .gk-want {
+  font-size: .9rem; color: var(--ink-dim); margin: 0 0 .9rem; max-width: none;
+}
+.gk-route .gk-start { margin: 0 0 .7rem; max-width: none; }
+.gk-route .gk-start a {
+  font-family: var(--display); text-transform: uppercase;
+  font-size: .82rem; letter-spacing: .07em;
+  color: #fff; border-bottom: 1px solid var(--ch);
+}
+.gk-route .gk-start a:hover { color: var(--ch); }
+.gk-route .gk-next { list-style: none; padding: 0; margin: 0 0 1rem; font-size: .86rem; }
+.gk-route .gk-next li { margin: .2rem 0; max-width: none; }
+.gk-route .gk-next li::marker { content: none; }
+.gk-route .gk-next a { color: var(--ink-dim); border-bottom-color: var(--edge); }
+.gk-route .gk-next a:hover { color: var(--alert); border-bottom-color: var(--alert); }
+.gk-route .gk-count {
+  margin: auto 0 0; padding-top: .6rem;
+  font-family: var(--display); text-transform: uppercase;
+  font-size: .62rem; letter-spacing: .16em; color: var(--ink-faint);
+  max-width: none;
+}
+
+/* Each of the four kind-of-page headings takes its channel colour from where it
+   points, so the index is colour-keyed to the rest of the site without a
+   position-dependent rule that would break the moment one was reordered. */
+.gk-index h3 a[href^="/tutorials/"]   { color: var(--ch-tutorials); }
+.gk-index h3 a[href^="/how-to/"]      { color: var(--ch-how-to); }
+.gk-index h3 a[href^="/reference/"]   { color: var(--ch-reference); }
+.gk-index h3 a[href^="/explanation/"] { color: var(--ch-explanation); }
+.gk-index h3 a { border-bottom: 0; }
+.gk-index h3 a:hover { color: var(--alert); }
+
+/* ---------------------------------------------------------- motion */
+
+@media (prefers-reduced-motion: no-preference) {
+  .gk-route { animation: gk-bracket .45s ease both; }
+  .gk-route:nth-child(2) { animation-delay: .06s; }
+  .gk-route:nth-child(3) { animation-delay: .12s; }
+}
+@keyframes gk-bracket {
+  from { opacity: 0;
+         background-size: 0 var(--bracket-w), var(--bracket-w) 0, 0 var(--bracket-w), var(--bracket-w) 0,
+                          0 var(--bracket-w), var(--bracket-w) 0, 0 var(--bracket-w), var(--bracket-w) 0; }
+  to   { opacity: 1; }
+}
+
+/* ------------------------------------------------------------ responsive */
+
+@media (max-width: 62rem) {
+  .gk-wrap { display: block; padding-top: 1.4rem; }
+  .gk-side {
+    position: static; margin: 0 0 2rem; padding: 0 0 1.4rem;
+    border-bottom: 1px solid var(--edge-soft);
+  }
+}
+@media (max-width: 34rem) {
+  body { font-size: 16px; }
+  .gk-header { padding: .7rem 1rem; }
+  .gk-wrap { padding-left: 1rem; padding-right: 1rem; }
+}
+
+@media print {
+  body { background: #fff; color: #000; }
+  .gk-header, .gk-side, .gk-footer { display: none; }
+  a { color: #000; }
+}

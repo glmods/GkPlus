@@ -37,6 +37,8 @@ MusicTrack *GetCurrentMusicTrack();
 
 // Battle Music Volume setting (0..9) @ 0x006abe08.
 int GetBattleMusicVolume();
+/// Sets the Battle Music Volume setting. \p volume is the front end's 0..9
+/// scale, not the Bink 0..0x8000 one SetMusicVolume() takes.
 void SetBattleMusicVolume(int volume);
 
 // SetVolume @ 0x00587ca0 (Bink scale 0..0x8000); a streaming track picks the

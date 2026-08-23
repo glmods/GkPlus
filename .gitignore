@@ -22,3 +22,5 @@ CMakeUserPresets.json
 # in src/, and the quoted-include form would have let one shadow the generated header - so make
 # sure a stray one can never be committed back.
 /src/*.gen.inc.h
+# The docs site's generated output is ignored by docs/.gitignore, which names the two
+# generated API trees exactly rather than the whole of docs/static/.

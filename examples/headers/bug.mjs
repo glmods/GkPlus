@@ -83,7 +83,8 @@ export const Chr_SuperBug = {
 // levels - so these are functions, called from a level's `define` hook once per
 // load, not values built at module scope.
 
-/** @returns {import("gk").Role} */
+/** Registers the ordinary bug: a background creature with `Chr_Bug`'s stats.
+ *  @returns {import("gk").Role} */
 export function Rol_Bug() {
   return make.role({
     ...Rol_DefaultRobot,
@@ -95,7 +96,9 @@ export function Rol_Bug() {
   });
 }
 
-/** @returns {import("gk").Role} */
+/** Registers the exaggerated variant - a full `bot` that fights back, and
+ *  explodes rather than falling over.
+ *  @returns {import("gk").Role} */
 export function Rol_SuperBug() {
   return make.role({
     ...Rol_DefaultRobot,

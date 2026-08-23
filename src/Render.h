@@ -757,15 +757,25 @@ RenderQueue *GetRenderQueue();
 // does exactly that.
 void FlushRenderQueue(RenderQueue *queue);
 
+/// The material the device is currently set to. Borrowed; AWAPI owns it.
 AwMaterial *GetCurrentMaterial();
+/// Sets \p material on the device now, outside the queue's own state sort.
 void ApplyMaterial(AwMaterial *material);
+/// One of AWAPI's built-in materials. Borrowed and process-lived.
 AwMaterial *GetBuiltinMaterial(BuiltinMaterial which);
 
+/// The light set the device is currently set to. Borrowed.
 LightSet *GetCurrentLightSet();
+/// The scene's own light set, i.e. what the queue state-sorts against. Borrowed,
+/// and null outside a loaded level.
 LightSet *GetSceneLightSet();
+/// Sets \p set on the device now, outside the queue's own state sort.
 void ApplyLightSet(LightSet *set);
+/// How many simultaneous D3D lights AWAPI will use.
 int GetMaxD3DLights();
 
+/// The renderer's global state word, `RenderStateFlags` @ 0x007b9c74: the
+/// bitfield the wireframe toggle and its neighbours live in.
 unsigned GetRenderStateFlags();
 
 // The universal "draw this" verb - 102 call sites across 31 producers. All nine

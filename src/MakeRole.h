@@ -120,6 +120,10 @@ struct LightDesc {
   double specular_blue = 0;  // 0x27
   double range = 0;          // 0x28
 };
+/// Builds a Light from \p desc. The caller owns the result until it is handed
+/// to something that adopts it: a Role, or a ProjectileDesc's `hit_light`.
+/// Pool memory: release it with pool_free(), never `::free`.
+/// \return the new Light, or nullptr if the allocation failed.
 Light *MakeLight(const LightDesc &desc);
 
 // --- projectile -------------------------------------------------------------------
@@ -137,6 +141,10 @@ struct ProjectileDesc {
   // Light, and the Projectile takes ownership (ProjectileDtor pool-frees it).
   Light *hit_light = nullptr; // 0x1f
 };
+/// Builds a Projectile from \p desc, caching `blast_range` squared as the
+/// converter does. Takes ownership of `desc.hit_light`. The caller owns the
+/// result until a Role adopts it.
+/// \return the new Projectile, or nullptr if the allocation failed.
 Projectile *MakeProjectile(const ProjectileDesc &desc);
 
 // --- particle generator -------------------------------------------------------------
@@ -167,6 +175,10 @@ struct ParticleGeneratorDesc {
   int32_t life_low = 0;  // -> +0x08
   int32_t life_high = 0; // -> +0x0c
 };
+/// Builds a ParticleGenerator from \p desc, default-initialising the emitter
+/// template state the script does not supply. The caller owns the result until
+/// a Role adopts it.
+/// \return the new ParticleGenerator, or nullptr if the allocation failed.
 ParticleGenerator *MakeParticleGenerator(const ParticleGeneratorDesc &desc);
 
 // --- destructibility ----------------------------------------------------------------
@@ -189,6 +201,10 @@ struct FragDataDesc {
   double blast_range = 0;       // 0x28
   double blast_damage = 0;      // 0x2c
 };
+/// Builds a FragData from \p desc, copying `remove` onto the game heap. The
+/// two Role pointers are borrowed rather than adopted; they belong to the entity
+/// hash. The caller owns the result until a Role adopts it.
+/// \return the new FragData, or nullptr if the allocation failed.
 FragData *MakeFragData(const FragDataDesc &desc);
 
 // The "run a script on death" destructibility variant - ToReplaceDestructibility
@@ -325,6 +341,13 @@ struct AmmoInfoDesc {
   int32_t description = 0;    // 0x1a GL_RESOURCE_ID
   int32_t max_per_slot = 0;   // 0x1d
 };
+/// Writes \p desc into the global AmmoInfos table at `desc.ammo_type`,
+/// replacing whatever is there. Unlike the other converters this one mutates
+/// engine state rather than returning an object.
+/// A `shape` wins over a `hierarchy`, and the other is nulled, never both,
+/// exactly as the converter does.
+/// \return false when `ammo_type` is outside 0..MaxAmmoType; nothing is
+///         written in that case.
 bool MakeAmmoInfo(const AmmoInfoDesc &desc);
 
 // --- camera track --------------------------------------------------------------------
@@ -348,6 +371,10 @@ struct CameraTrackDesc {
   ParticleGenerator *pgen = nullptr;  // 0x07
   ParticleGenerator *pgen2 = nullptr; // 0x08
 };
+/// Registers the camera track described by \p desc. Requires a loaded level.
+/// \return false when `name` or `file` is null, when the rif does not load, or
+///         when no cutscene in it carries that name, in which case the
+///         part-built object is destroyed again, as the converter does.
 bool MakeCameraTrack(const CameraTrackDesc &desc);
 
 // --- the conversions, exposed because they are the whole point -----------------

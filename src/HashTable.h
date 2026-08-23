@@ -23,6 +23,12 @@
 
 namespace gk {
 
+/// The vptr-less hash-table header: separate chaining, power-of-two table, no
+/// rehashing, `n_entries` at +0x00. `roles` @ 0x007b48f0 is one of these.
+///
+/// Gunlok uses **both** shapes and they differ by four bytes on every field:
+/// HashTable carries the three-slot node-allocation vtable and starts its
+/// fields at +0x04. Check which you have.
 template <typename T> struct HashTableBase {
   // AvP's `class Node { TYPE d; Node *nextP; }`. Note the payload comes first:
   // a chain walk reads `*node` for the value and `node[1]` for the link, which is

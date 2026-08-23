@@ -10,6 +10,7 @@ and no TypeScript at runtime, since the game loads the `.mjs` as-is.
 | `gk.d.ts` | the `"gk"` module: `camera`, `console`, `actors`, `roles`, `tokens`, `triggers`, `levels`, `make`, `gls`, plus the `setup_menus` / `draw_gui` / level-module contracts. `menus` is *not* an export - it is `setup_menus`' argument - and there is no global `console`: `log`/`info`/`warn`/`error`/`debug` are on the `console` this module exports | by hand, from `src/Js*.cpp` |
 | `check-surface.py` | not a declaration file: it compares every `JSCFunctionListEntry` table in `src/Js*.cpp` against the interface that declares it, both directions. `tsc` cannot do this, because the bindings are C++ | a check - run `python3 types/check-surface.py` |
 | `imgui.d.ts` | the `ImGui` interface: 199 functions and 28 enums. A type only - there is no `"ImGui"` module and no global to call, because the calls are only valid inside `draw_gui` | **generated** - run `python3 types/gen-imgui-dts.py` |
+| `typedoc.json` | not a declaration file: the TypeDoc configuration that turns the two above into the browsable API reference under `docs/static/api/js/`. The TSDoc comments in `gk.d.ts` are what it renders | a config - see below |
 
 ## Using them
 
@@ -66,6 +67,24 @@ export function draw_gui(ImGui) { … }
 - **`render` is exactly typed and `render.debug` is not.** The measurement
   surface carries the index signature, so a typo in a *setting* is a compile
   error. Every `render` setting persists; nothing on `render.debug` does.
+
+## Generating the browsable reference
+
+The TSDoc comments in `gk.d.ts` are also the source of the generated HTML reference:
+
+```bash
+npx -y -p typedoc@0.28 -p typescript@5.9 typedoc --options types/typedoc.json
+```
+
+Output lands in `docs/static/api/js/`, which is served at `/api/js/` on the docs
+site. Both pins are load-bearing: TypeDoc is not a dependency of this repo (same
+reason as `tsc`), and `-p typescript@5.9` is needed because a bare `-p typescript`
+resolves to a major TypeDoc does not accept as a peer.
+
+It runs with **zero warnings**, and it is worth keeping that way - every warning it
+emits is a `{@link}` pointing at a member that no longer exists, which is the
+declaration drifting from the bindings in the one way `tsc` and `check-surface.py`
+both look straight past.
 
 ## Keeping them honest
 

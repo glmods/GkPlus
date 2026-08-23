@@ -8,6 +8,8 @@ namespace gk {
 // to the script's `draw_gui` export. The callback runs on the render thread
 // inside an active ImGui frame, so it may issue ImGui:: calls directly.
 using OverlayDrawCallback = void (*)();
+/// Installs the overlay draw callback, replacing whatever was there. One slot,
+/// not a list. Pass nullptr to remove it.
 void SetOverlayDrawCallback(OverlayDrawCallback callback);
 
 // Per-frame heartbeat, called from the PresentScene hook once per presented
@@ -15,6 +17,8 @@ void SetOverlayDrawCallback(OverlayDrawCallback callback);
 // the overlay is visible, and *outside* any ImGui frame - so it must not issue
 // ImGui:: calls. The script host uses it to drain the QuickJS job queue.
 using FrameCallback = void (*)();
+/// Installs the per-frame heartbeat callback, replacing whatever was there.
+/// One slot. Pass nullptr to remove it.
 void SetFrameCallback(FrameCallback callback);
 
 // Invokes whatever SetFrameCallback installed, if anything. Idempotent and
@@ -42,7 +46,15 @@ void RunFrameCallback();
 // Returns false if the game window is not resolved yet, or if PostMessage
 // failed - in which case the work was NOT scheduled.
 using MessageLoopCallback = void (*)();
+/// Installs the message-loop callback, replacing whatever was there. One slot;
+/// `src/Session.cpp` owns it.
 void SetMessageLoopCallback(MessageLoopCallback callback);
+/// Posts the private WM_APP message that makes the wndproc run the
+/// message-loop callback. Safe to call from inside a frame, since it returns
+/// immediately rather than running the callback.
+///
+/// \return false if the game window is not resolved yet or `PostMessage`
+///         failed, in which case the work was **not** scheduled.
 bool PostMessageLoopWork();
 
 // Enables (or removes) a WM_TIMER on the game window that runs the frame

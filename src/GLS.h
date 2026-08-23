@@ -38,6 +38,8 @@ enum class SectionType {
   Directory,
 };
 
+/// The storage class of a GLS field, and therefore which member of
+/// ParsedValue carries it.
 enum class FieldType : int32_t {
   None = 0,
   Boolean = 1,
@@ -189,8 +191,10 @@ enum class FieldId : int32_t {
   Count = 0x89,
 };
 
+/// How many FieldId values there are, i.e. the stride of every per-field table.
 inline constexpr size_t NumFields = static_cast<size_t>(FieldId::Count);
 
+/// One parsed GLS section, before conversion into a live game object.
 struct ParsedThing;
 
 // 8-byte value slot. Interpretation depends on the field's FieldType:
@@ -218,6 +222,10 @@ struct ParsedField {
 static_assert(offsetof(ParsedField, value) == 0x8);
 static_assert(sizeof(ParsedField) == 0x10);
 
+/// A ParsedThing's vtable, modelled as typed function pointers rather than as
+/// pure virtuals. This is the one deliberate exception to that convention in this
+/// codebase, because GkPlus *calls* these slots rather than only describing
+/// them. Eight slots, in vtable order.
 struct ParsedThingVtbl {
   ThisCall<void *, ParsedThing *, unsigned char> dtor; // flags & 1: free memory
   ThisCall<bool, ParsedThing *> is_valid;      // all required fields assigned
@@ -458,12 +466,19 @@ ParsedThing *Create(SectionType type);
 // The GLS section keyword - "role", "camera track", ... - and its inverse
 // (case-insensitive, and both "camera track" and "camera_track" resolve).
 const char *SectionTypeName(SectionType type);
+/// The SectionType \p name is the keyword for, or SectionType::Unknown.
+/// Case-insensitive, and a space and an underscore are the same character, so
+/// both `camera track` and `camera_track` resolve.
 SectionType SectionTypeFromName(const char *name);
 
 // Every section type in declaration order, terminated by SectionType::Unknown.
 // SectionType::Directory is included but converting one changes a game directory.
 const SectionType *AllSectionTypes();
 
+/// What one field of one section type accepts: its keyword, its storage class,
+/// whether it may be omitted, and its bounds. Built by asking a throwaway
+/// instance what its constructor declared, rather than being transcribed,
+/// which is why it cannot drift from the binary.
 struct FieldInfo {
   FieldId id;
   const char *name; // the GLS keyword, e.g. "walking speed"
@@ -564,7 +579,11 @@ bool Set(ParsedThing &thing, FieldId id, ParsedThing *object);   // Custom;
 // section allows it - see the "none ok" column in gls_system_notes.md).
 bool SetNone(ParsedThing &thing, FieldId id);
 
+/// Whether every field the section marks required has been assigned, i.e. the
+/// engine's own gate on converting \p thing into a game object. A thing that
+/// fails this is still usable as an `abstract` parent.
 bool IsValid(const ParsedThing &thing);     // all required fields assigned
+/// IsValid() applied recursively through every Custom sub-object.
 bool IsValidDeep(const ParsedThing &thing); // ... recursively in sub-objects
 
 // Converts the object into live game data via its toGameObject vtable slot:

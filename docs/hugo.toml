@@ -1,0 +1,83 @@
+baseURL = "/"
+# `locale` on Hugo >= 0.158; older releases ignore the key and fall back to the
+# default content language, which is what the templates read.
+locale = "en-gb"
+title = "GkPlus Documentation"
+enableRobotsTXT = true
+
+# No theme. The whole site renders from the four templates in layouts/_default/ plus
+# layouts/index.html, and static/ is served as-is, which is where the two generated
+# API trees land (static/api/cpp/, static/api/js/).
+disableKinds = ["taxonomy", "term"]
+
+[params]
+  description = "Tutorials, how-to guides, reference and explanation for GkPlus, the Gunlok modding framework."
+
+[markup.goldmark.renderer]
+  # Every angle bracket in this content is inside a fenced code block, so raw HTML
+  # stays off.
+  unsafe = false
+
+[markup.highlight]
+  # Emit Chroma classes rather than inline styles: the syntax colours are part
+  # of the palette and live in static/css/gkplus.css with everything else. The
+  # previous `style = "bw"` inlined black text, which is invisible on this
+  # site's ground.
+  noClasses = false
+  guessSyntax = false
+
+[markup.tableOfContents]
+  startLevel = 2
+  endLevel = 3
+
+# The three readerships this documentation is written for. Kept here rather than
+# in the home page's Markdown because the entry point renders them as routes and
+# counts the pages tagged for each from the `audience:` front matter - a written
+# count would drift the first time a guide was added.
+[[params.audiences]]
+  id = "player"
+  name = "Player"
+  want = "You own Gunlok and want it running under GkPlus, with mods and a better renderer."
+  startUrl = "/tutorials/installing-gkplus/"
+  startTitle = "Installing GkPlus"
+  [[params.audiences.next]]
+    title = "Set up a profile"
+    url = "/how-to/modding/set-up-a-profile/"
+  [[params.audiences.next]]
+    title = "Enable and order mods"
+    url = "/how-to/modding/enable-and-order-mods/"
+  [[params.audiences.next]]
+    title = "Turn on renderer features"
+    url = "/how-to/modding/turn-on-renderer-features/"
+
+[[params.audiences]]
+  id = "mod-author"
+  name = "Mod author"
+  want = "You want to replace assets, write scripts, author levels, or ship a mod."
+  startUrl = "/tutorials/your-first-script/"
+  startTitle = "Your first GkPlus script"
+  [[params.audiences.next]]
+    title = "Modding how-to guides"
+    url = "/how-to/modding/"
+  [[params.audiences.next]]
+    title = "JavaScript API"
+    url = "/reference/javascript/"
+  [[params.audiences.next]]
+    title = "Mod metadata"
+    url = "/reference/data/mod-metadata/"
+
+[[params.audiences]]
+  id = "developer"
+  name = "Developer"
+  want = "You want to build d3d8.dll and work on GkPlus itself."
+  startUrl = "/tutorials/building-gkplus/"
+  startTitle = "Building GkPlus"
+  [[params.audiences.next]]
+    title = "Development how-to guides"
+    url = "/how-to/development/"
+  [[params.audiences.next]]
+    title = "C++ API"
+    url = "/reference/cpp/"
+  [[params.audiences.next]]
+    title = "Design records index"
+    url = "/reference/data/notes-index/"

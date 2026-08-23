@@ -15,12 +15,17 @@
 declare module "gk" {
   // --- vectors ---------------------------------------------------------------
 
+  /** A point or direction in world space, in the engine's own units. Every
+   *  position in this module reads back as one of these; an array is not
+   *  accepted anywhere. */
   export interface Vec3 {
     x: number;
     y: number;
     z: number;
   }
 
+  /** Four components. Where one is an orientation it is a quaternion, and
+   *  identity is `{x: 0, y: 0, z: 0, w: 1}`. */
   export interface Vec4 {
     x: number;
     y: number;
@@ -49,6 +54,9 @@ declare module "gk" {
    *  same rule `camera.position` follows. */
   export type CameraOrientationLike = Partial<CameraOrientation>;
 
+  /** `camera` - the world camera. Reads and writes the same globals the
+   *  `SET CAMERA` console commands and a `.gcs` write, and rebuilds the view
+   *  matrix on every write that needs it. */
   export interface Camera {
     /** The camera's world position. Assigning a partial object moves only the
      *  components it names. Assigning also rebuilds the view matrix, which is
@@ -122,9 +130,8 @@ declare module "gk" {
 
   // --- console ---------------------------------------------------------------
 
-  /** The *game's* console (` to open), not the host's global `console`. */
-  /** The game's console and the host's logging, in one object. There is no
-   *  global `console`: import this one. */
+  /** The game's console (` to open) and the host's logging, in one object.
+   *  There is no global `console`: import this one. */
   export interface Console {
     /** Writes one line to the game console. */
     print(text: string): void;
@@ -174,6 +181,13 @@ declare module "gk" {
      *  `@` command is this toggled for the span of one line. */
     echo: boolean;
 
+    /** Whether the game's console exists yet. It is false in exactly one place -
+     *  a profile's boot module (`core.boot`), which is anchored before
+     *  `InitConsole` - and there it is worth asking, because `print` and `log`
+     *  reach the screen only when this is true. The debugger half of `log` works
+     *  either way, so a boot module is not silent, only invisible in game. */
+    readonly ready: boolean;
+
     /** Every command the game has registered - 280 registrations, 272 distinct
      *  names, rebuilt on each read.
      *
@@ -184,12 +198,6 @@ declare module "gk" {
      *  under strings from `glres<lang>.dll`, so a hard-coded
      *  `execute("QUIT")` does nothing on a French or German install. Searching
      *  this list is the portable way to spell them. */
-    /** Whether the game's console exists yet. It is false in exactly one place -
-     *  a profile's boot module (`core.boot`), which is anchored before
-     *  `InitConsole` - and there it is worth asking, because `print` and `log`
-     *  reach the screen only when this is true. The debugger half of `log` works
-     *  either way, so a boot module is not silent, only invisible in game. */
-    readonly ready: boolean;
     readonly commands: ConsoleCommand[];
 
     // --- administration -------------------------------------------------------
@@ -197,17 +205,22 @@ declare module "gk" {
     // Six of these are registered under localized names, which is exactly why
     // they are bound rather than left to `execute`.
 
+    /** Closes the console overlay. */
     hide(): void;
     /** Writes a note to the game's LOGFILE.TXT. */
     write_log(note: string): void;
+    /** Prints the game's version banner to the console. */
     print_version(): void;
     /** Visible lines on the console. */
     set_lines(lines: number): void;
     /** True makes the console appear instantly instead of dropping down. */
     set_appear(instant: boolean): void;
+    /** Empties the command-history buffer. */
     clear_history(): void;
     /** With no argument, prints the current size. */
     history_size(lines?: number): void;
+    /** The pending-command queue's capacity in entries. With no argument,
+     *  prints the current size. */
     queue_size(entries?: number): void;
   }
 
@@ -216,6 +229,8 @@ declare module "gk" {
     /** As registered. Matching is case-insensitive and by longest prefix, so
      *  `SET CAMERA POS` wins over `SET` for a line starting with it. */
     name: string;
+    /** The one-line help the registration carried, or null when it carried
+     *  none. */
     help: string | null;
     /** The minimum `CommandCondition` the engine requires before dispatching
      *  this command. Registrations use 0, 1 and 3. */
@@ -249,8 +264,7 @@ declare module "gk" {
   /** The members every actor has, whatever its class. Written out as a separate
    *  interface so each class can carry its own literal `kind` and `Actor` can be
    *  a discriminated union - `if (a.kind === "turret") a.turret_enabled` is the
-   *  intended way to reach a subclass member. */
-  /** The members every actor has, whatever its class.
+   *  intended way to reach a subclass member.
    *
    *  **Not every mutator replicates.** Some engine setters broadcast on their
    *  way through and some do not, and the ones that do not are the ones the
@@ -275,10 +289,14 @@ declare module "gk" {
     /** The token that names this actor, or null if none does. Actors have no
      *  name field: the engine names them through the token table. */
     readonly name: string | null;
+    /** Which Actor subclass this is. Narrows the {@link Actor} union, and is the
+     *  only way to reach a subclass-only member. */
     readonly kind: ActorKind;
     /** False once the game has destroyed this actor. Never throws, so it is the
      *  one member safe to read on a wrapper you have held across frames. */
     readonly valid: boolean;
+    /** The role this actor was spawned from. Null when the role has already been
+     *  destroyed, which happens wholesale on level unload. */
     readonly role: Role | null;
     /** What this actor is currently attacking. */
     readonly target: Actor | null;
@@ -289,16 +307,28 @@ declare module "gk" {
     /** The actor's centre, which is not its position - `set_position` moves the
      *  origin, this is the middle of its bounding volume. */
     readonly center: Vec3;
+    /** The hierarchy node an attached object snaps to, from the role. Null when
+     *  the role named none. */
     readonly hotspot: string | null;
+    /** Rounds left in the equipped weapon. */
     readonly ammo: number;
+    /** The actor's scale factor, from the role's character block. */
     readonly size: number;
 
+    /** Strength above zero. False for a corpse that has not been removed. */
     readonly alive: boolean;
+    /** Currently firing at something. */
     readonly attacking: boolean;
+    /** The actor participates in the simulation. A disabled actor is still in
+     *  `actors`. */
     readonly enabled: boolean;
+    /** Currently travelling. */
     readonly moving: boolean;
+    /** Drawn this frame. */
     readonly visible: boolean;
+    /** May be acquired as a target by another actor. */
     readonly targetable: boolean;
+    /** May be used or picked up by the player. */
     readonly interactable: boolean;
     /** Crouched. Slot 63, and it is `MobileActor`-only: `PickupActor` carries
      *  the base implementation, which always answers false. */
@@ -344,9 +374,11 @@ declare module "gk" {
     /** Attaches a trigger script, run when the actor is used or picked up. A
      *  string is a .gcs by name; anything else is a `ScriptMessage`. */
     associate(script: string | ScriptMessage, one_shot?: boolean): void;
+    /** Removes whatever `associate` attached. */
     dissociate(): void;
     /** Takes the target's **id**, not the wrapper - see `actor.id`. */
     set_target(target: Actor, mode?: number): void;
+    /** Forgets the current target. */
     clear_target(): void;
     /** Moves the actor to another team. Read the current one with `actor.team`.
      *
@@ -435,10 +467,17 @@ declare module "gk" {
     readonly kind: "actor";
   }
 
+  /** An actor that moves but has no combat behaviour - `kind === "mobile"`.
+   *  Spawned for `role.ai === "mine"`, and for a character role whose `weapon`
+   *  is 33. Carries {@link MobileMembers} on top of {@link ActorBase}. */
   export interface MobileActor extends ActorBase, MobileMembers {
     readonly kind: "mobile";
   }
 
+  /** A combatant - `kind === "character"`. The class most actors in a level
+   *  are: `role.ai === "bot"`, and every AI type with no case of its own that
+   *  has a character sub-object. Carries {@link MobileMembers} and
+   *  {@link CharacterMembers}. */
   export interface CharacterActor
     extends ActorBase,
       MobileMembers,
@@ -446,10 +485,14 @@ declare module "gk" {
     readonly kind: "character";
   }
 
+  /** `role.ai === "popup"` - `kind === "popup"`. A character that raises and
+   *  lowers itself; the base class of {@link TurretActor}. */
   export interface PopupActor extends ActorBase, MobileMembers, CharacterMembers {
     readonly kind: "popup";
   }
 
+  /** `role.ai === "turret"` - `kind === "turret"`. The only class carrying
+   *  {@link TurretMembers}, which is where `turret_enabled` lives. */
   export interface TurretActor
     extends ActorBase,
       MobileMembers,
@@ -458,6 +501,8 @@ declare module "gk" {
     readonly kind: "turret";
   }
 
+  /** `role.ai === "centibody"` - `kind === "centibody"`. One segment of a
+   *  multi-part creature; the base class of {@link CentipedeActor}. */
   export interface CentibodyActor
     extends ActorBase,
       MobileMembers,
@@ -465,6 +510,8 @@ declare module "gk" {
     readonly kind: "centibody";
   }
 
+  /** `role.ai === "centipede"` - `kind === "centipede"`. The head of the
+   *  segmented creature whose segments are {@link CentibodyActor}. */
   export interface CentipedeActor
     extends ActorBase,
       MobileMembers,
@@ -472,38 +519,65 @@ declare module "gk" {
     readonly kind: "centipede";
   }
 
+  /** `role.ai === "node"` or `"node_waiting"` - `kind === "node"`. Mobile, but
+   *  with no character sub-object, so it carries no {@link CharacterMembers}.
+   *  `units.alert_node` is the member that addresses one. */
   export interface NodeActor extends ActorBase, MobileMembers {
     readonly kind: "node";
   }
 
+  /** `role.ai === "president"` - `kind === "president"`.
+   *
+   *  Its vtable is the last one in the binary's `.rdata`, with nothing valid
+   *  past its final slot; see `actor_vtable_notes.md`. Nothing in this module
+   *  dispatches past that point, but it is why the class is worth telling
+   *  apart. */
   export interface PresidentActor extends ActorBase, MobileMembers {
     readonly kind: "president";
   }
 
+  /** `role.ai === "pickup"` - `kind === "pickup"`. Stationary; the only class
+   *  carrying {@link PickupMembers}. Which kind of pickup it is comes from the
+   *  role, not from the class. */
   export interface PickupActor extends ActorBase, PickupMembers {
     readonly kind: "pickup";
   }
 
+  /** `role.ai === "blocker"` - `kind === "blocker"`. An obstruction: no
+   *  movement, no combat, so only {@link ActorBase}. */
   export interface BlockerActor extends ActorBase {
     readonly kind: "blocker";
   }
 
+  /** A shot in flight - `kind === "projectile"`. Every shot in the game builds
+   *  one; there is no hitscan. Created by the engine rather than by an `ai`
+   *  keyword, and short-lived, so a wrapper held across frames goes stale
+   *  quickly - check `.valid`. */
   export interface ProjectileActor extends ActorBase {
     readonly kind: "projectile";
   }
 
+  /** `role.ai === "track_object"` - `kind === "track_object"`. An object driven
+   *  along a camera track rather than by the AI; see the `tracks` namespace. */
   export interface TrackObjectActor extends ActorBase {
     readonly kind: "track_object";
   }
 
+  /** `role.ai === "tumbleweed"` - `kind === "tumbleweed"`. Scenery that drifts;
+   *  no character sub-object and no orders. */
   export interface TumbleweedActor extends ActorBase {
     readonly kind: "tumbleweed";
   }
 
+  /** `role.ai === "background_creature"` - `kind === "background_creature"`.
+   *  Ambient life; the base class of
+   *  {@link FlyingBackgroundCreatureActor}. */
   export interface BackgroundCreatureActor extends ActorBase {
     readonly kind: "background_creature";
   }
 
+  /** `role.ai === "flying_background_creature"` -
+   *  `kind === "flying_background_creature"`. */
   export interface FlyingBackgroundCreatureActor extends ActorBase {
     readonly kind: "flying_background_creature";
   }
@@ -540,6 +614,8 @@ declare module "gk" {
     | NodeActor
     | PresidentActor;
 
+  /** Every actor with a character sub-object - what
+   *  `instanceof actors.classes.CharacterActor` narrows to. */
   export type AnyCharacterActor =
     | CharacterActor
     | PopupActor
@@ -547,8 +623,11 @@ declare module "gk" {
     | CentibodyActor
     | CentipedeActor;
 
+  /** What `instanceof actors.classes.PopupActor` narrows to. */
   export type AnyPopupActor = PopupActor | TurretActor;
+  /** What `instanceof actors.classes.CentibodyActor` narrows to. */
   export type AnyCentibodyActor = CentibodyActor | CentipedeActor;
+  /** What `instanceof actors.classes.BackgroundCreatureActor` narrows to. */
   export type AnyBackgroundCreatureActor =
     | BackgroundCreatureActor
     | FlyingBackgroundCreatureActor;
@@ -584,11 +663,18 @@ declare module "gk" {
     readonly FlyingBackgroundCreatureActor: ActorClass<FlyingBackgroundCreatureActor>;
   }
 
+  /** The named members of {@link Actors}, as opposed to its id and name keys.
+   *  All non-enumerable, so an id lookup and `Object.keys` are unaffected by
+   *  them. */
   export interface ActorsMembers {
     /** How many actors exist. Not enumerable, so it stays out of
      *  Object.keys(actors). */
     readonly count: number;
+    /** The constructor objects `instanceof` narrows against, one per class in
+     *  `src/ActorClasses.inc.h`. They are not callable. */
     readonly classes: ActorClasses;
+    /** Iterates every live actor, in the order the engine's table holds them -
+     *  which is not id order and is not stable across a spawn. */
     [Symbol.iterator](): IterableIterator<Actor>;
   }
 
@@ -631,57 +717,117 @@ declare module "gk" {
   /** A snapshot of `role.character`, not a live view: re-read the property to
    *  see later changes. Speeds are in the engine's own units. */
   export interface CharacterInfo {
+    /** 16.16 fixed point as stored: divide by 65536 for the cycles/sec that
+     *  {@link CharacterDesc} and the `.gls` `walking speed` field use. Read as a
+     *  float it would report a denormal, so the binding widens the int. */
     walking_speed: number;
+    /** Stored units, not revolutions/sec: the converter multiplies the `.gls`
+     *  value by 4096. */
     turning_speed: number;
+    /** Spread, in the engine's 4096-step circle rather than degrees. Bigger is
+     *  less accurate. */
     aim: number;
+    /** Seconds between perception scans. */
     scan_delay: number;
+    /** The **half**-angle of the vision cone, in the 4096-step circle. The
+     *  `.gls` field it comes from is degrees left or right of forward. */
     sight_angle: number;
+    /** Engine distance units. */
     sight_range: number;
+    /** Engine distance units. */
     hearing_range: number;
+    /** How far an alert propagates, in engine distance units. */
     alert_radius: number;
+    /** Overloaded: on a pickup role, `round(aggression * 10)` is the pickup
+     *  class. See `role_system_notes.md` section 7. */
     aggression: number;
+    /** The role's scale factor, which `walking_speed` is re-scaled by when both
+     *  it and `turning_speed` are positive. */
     size: number;
+    /** Multiplier on damage this character deals. */
     damage_multiplier: number;
+    /** Multiplier on the speed of the projectiles it fires. */
     shot_speed_multiplier: number;
+    /** Seconds before it will reconsider its target. */
     target_cycle_delay: number;
+    /** Seconds between raising the alarm, read by the actor constructor. */
     alarm_delay: number;
+    /** Seconds between shots of the primary weapon. */
     weapon_cycle_time: number;
+    /** Hit points at full health; the actor constructor folds it into starting
+     *  health. */
     strength: number;
+    /** Inventory capacity: weapon slots. */
     max_weapon: number;
+    /** Inventory capacity: ammunition slots. */
     max_ammo: number;
+    /** Inventory capacity: module slots. */
     max_module: number;
+    /** Primary weapon id. **33 is "none"**, and it is what makes a character
+     *  role spawn as a {@link MobileActor} rather than a
+     *  {@link CharacterActor}. */
     weapon: number;
+    /** Secondary weapon id, on the same numbering. */
     secondary_weapon: number;
+    /** Whether it may turn on the spot. */
     can_turn: boolean;
+    /** Whether an alert broadcast reaches it at all. */
     alertable: boolean;
+    /** Never handed to a player, even in multiplayer. */
     always_cpu_controlled: boolean;
+    /** Resolved through the localized string table at conversion time, so it is
+     *  already text rather than an id. Null when the role set none. */
     description: string | null;
   }
 
+  /** A snapshot of `role.projectile` - what a shot fired from this role does.
+   *  Null on a role that fires nothing. */
   export interface ProjectileInfo {
+    /** The shot follows a ballistic arc rather than a straight line. */
     gravity: boolean;
     /** Negative damage heals. */
     damage: number;
+    /** Sound id played on firing. */
     sound: number;
+    /** Beyond this the shot expires, in engine distance units. */
     max_range: number;
+    /** Splash damage at the point of impact. Splash has **no falloff**: within
+     *  `blast_range` every target takes this in full. */
     blast_damage: number;
+    /** Splash radius, in engine distance units. */
     blast_range: number;
   }
 
+  /** A snapshot of `role.light` - the dynamic light an actor of this role
+   *  carries. Null on a role with none. */
   export interface LightInfo {
+    /** Diffuse red. The shipped rig authors these well over 1. */
     red: number;
+    /** Diffuse green. */
     green: number;
+    /** Diffuse blue. */
     blue: number;
+    /** Specular red. Gunlok's own roles author black specular throughout. */
     specular_red: number;
+    /** Specular green. */
     specular_green: number;
+    /** Specular blue. */
     specular_blue: number;
+    /** Attenuation range, in engine distance units. */
     range: number;
   }
 
+  /** A snapshot of `role.inventory_info` - what this role is when it is carried
+   *  or picked up. Null on a role that is neither. */
   export interface InventoryInfo {
+    /** Already resolved through the localized string table. */
     description: string | null;
+    /** The name shown when the item is offered for collection. */
     pickup_name: string | null;
+    /** How close an actor must get, in engine distance units. */
     pickup_radius: number;
+    /** What the carrier does with the item when it dies, as the engine's own
+     *  numbering. */
     action_on_death: number;
   }
 
@@ -693,11 +839,22 @@ declare module "gk" {
     readonly valid: boolean;
     /** Writable, but only affects actors spawned afterwards. */
     ai: AIType;
+    /** The hierarchy node an attached object snaps to, by name. Null on a role
+     *  that named none. */
     readonly hotspot: string | null;
+    /** The second attachment node, same rule. */
     readonly alternate_hotspot: string | null;
+    /** Where `hotspot` resolved to within the role's hierarchy. All zero on a
+     *  role built from a shape or a particle generator rather than a
+     *  hierarchy. */
     readonly hotspot_point: Vec3;
+    /** Where `alternate_hotspot` resolved to; same rule. */
     readonly alternate_hotspot_point: Vec3;
+    /** The role's sound-set name. Null when it named none. */
     readonly meta_sound: string | null;
+    /** The body-part names a corpse can come apart at, already split from the
+     *  GLS `sever point` field on commas. Empty when the role named none, which
+     *  is also what stops the engine broadcasting gore for it. */
     readonly sever_points: string[];
 
     /** Null for a role that has no such sub-object. */
@@ -706,23 +863,45 @@ declare module "gk" {
     readonly light: LightInfo | null;
     readonly inventory_info: InventoryInfo | null;
 
+    /** A flat absorb **threshold**, not a percentage: a hit at or below this is
+     *  absorbed whole, and a bigger one is reduced by it. Defaults to 0. */
     armor: number;
+    /** A pool that is drained before armour is consulted, unlike `armor`.
+     *  Defaults to 0. */
     shields: number;
+    /** How fast `shields` refills. Defaults to 0. */
     recharge_rate: number;
+    /** 0..1, scaling damage from the weapon class `resistance` names. */
     resistance_factor: number;
+    /** 0..1 opacity; 1 is opaque. */
     alpha: number;
+    /** Which weapon class this role resists, as the engine's own numbering:
+     *  2 laser, 4 explosives, 6 epulsar, 8 small arms, 0 none. **Not a
+     *  bitmask** - the values step by 2 and cannot be combined. */
     readonly resistance: number;
+    /** The cap on how many actors of this role may exist at once. 0 is no
+     *  limit. */
     readonly limit: number;
 
+    /** Fog is applied to the whole object at once rather than per vertex. */
     alpha_fogging: boolean;
+    /** Fog is evaluated per vertex. */
     per_vertex_fogging: boolean;
+    /** The object is drawn at full brightness, unlit. */
     no_lighting: boolean;
+    /** The object takes the environment-map pass. */
     reflective: boolean;
+    /** A move order may name this object as its destination. */
     destination_selectable: boolean;
+    /** The object is removed when its item is collected. */
     destroy_after_collection: boolean;
+    /** Shots and picking pass straight through it. */
     hit_test_ignore: boolean;
+    /** The object fragments on death under the role's `destructibility`. */
     frag_control: boolean;
+    /** The object rides a lift rather than staying put as one moves. */
     moves_on_lifts: boolean;
+    /** The object gets a health bar in the HUD. */
     status_display: boolean;
 
     /** Spawns an actor from this role. Null if the engine refused - which it
@@ -736,7 +915,9 @@ declare module "gk" {
     toString(): string;
   }
 
+  /** The named members of {@link Roles}, as opposed to its id and name keys. */
   export interface RolesMembers {
+    /** How many roles the level defined. */
     readonly count: number;
     /** name -> numeric AIType, for comparing against a raw engine value. */
     readonly ai_types: Readonly<Record<AIType, number>>;
@@ -781,6 +962,9 @@ declare module "gk" {
 
   // --- game ------------------------------------------------------------------
 
+  /** `game` - session state: which process is simulating, the mode and
+   *  difficulty, god mode, the selection, the actor under the cursor, and
+   *  pausing and quitting. */
   export interface Game {
     /** Whether the simulation runs in **this** process: true in single player
      *  and on a multiplayer host, false on a joining client and before a level
@@ -897,6 +1081,8 @@ declare module "gk" {
     quit(): void;
   }
 
+  /** What `game.difficulty` reads back, and what it accepts alongside the raw
+   *  number. */
   export type DifficultyName = "easy" | "medium" | "hard" | "extreme";
 
 
@@ -989,9 +1175,8 @@ declare module "gk" {
     add_blinking(where: Vec3Like, r: number, g: number, b: number): void;
     /** Shadowing on an actor. Broadcasts (0xc4). */
     shadow(actor: Actor): void;
-    /** `ASSOCIATELIGHT lift actor dummy r g b a` - binds a corona light to a
-     *  lift so it travels with it. */
-    /** Ties a light to a lift, so it travels with it.
+    /** `ASSOCIATELIGHT lift actor dummy r g b a` - ties a corona light to a
+     *  lift, so it travels with it.
      *
      *  Both actors, not just the second: `CommandAssociateLight` @ 0x0044a5c0
      *  resolves the lift through `ConsoleParseActorName` and passes its **id** to
@@ -1353,6 +1538,8 @@ declare module "gk" {
     bottom?: number;
   }
 
+  /** Everything {@link Text.draw} takes, in one object. Every field but `text`
+   *  is optional. */
   export interface TextDrawOptions {
     /** The string. Longer than `text.max_length` is **truncated**, not refused:
      *  the engine's layout buffer is 1028 bytes and unbounded, and a longer
@@ -1501,6 +1688,9 @@ declare module "gk" {
 
   // --- triggers --------------------------------------------------------------
 
+  /** The 22 trigger kinds, by name. `triggers.kinds` maps each to the number
+   *  {@link TriggerOptions.kind} takes. Full semantics per kind are in
+   *  `trigger_system_notes.md`. */
   export type TriggerKindName =
     | "death"
     | "location"
@@ -1525,6 +1715,9 @@ declare module "gk" {
     | "time_if_alive"
     | "been_alerted";
 
+  /** What {@link Triggers.create} takes. Most fields are overloaded by kind -
+   *  the same slot means different things to a location trigger and a time
+   *  trigger - so read the per-field notes rather than the names. */
   export interface TriggerOptions {
     /** One of `triggers.kind`. */
     kind: number;
@@ -1580,6 +1773,7 @@ declare module "gk" {
     toString(): string;
   }
 
+  /** `triggers` - the level's trigger list. */
   export interface Triggers {
     /** Registers a trigger and returns a handle to it.
      *
@@ -1684,6 +1878,9 @@ declare module "gk" {
     toString(): string;
   }
 
+  /** What a menu item calls when it is activated. The argument is the same
+   *  {@link MenuItem} `add_item` returned, so it carries the item's current
+   *  index and, for a toggle, the value it has **already** flipped to. */
   export type MenuItemCallback = (item: MenuItem) => void;
 
   /** One of the 36 front-end menus. In-game (HUD) menus are not exposed. */
@@ -1717,6 +1914,9 @@ declare module "gk" {
     toString(): string;
   }
 
+  /** The named members of {@link Menus}, on top of one property per menu name.
+   *  Menus are also keyed by id, so `menus[0]`, `menus.Main` and
+   *  `menus["main"]` are the same menu. */
   export interface MenusMembers extends Record<MenuName, Menu> {
     /** Always 36. */
     readonly count: number;
@@ -1842,6 +2042,9 @@ declare module "gk" {
     shadow_hierarchy?: AssetRef;
   }
 
+  /** A `light` block, in .gls units. Every field is optional and an absent one
+   *  takes the game's own default. Unlike {@link LightInfo}, which reads a
+   *  converted role back, this is what goes in. */
   export interface LightDesc {
     red?: number;
     green?: number;
@@ -1852,6 +2055,8 @@ declare module "gk" {
     range?: number;
   }
 
+  /** A `projectile` block, in .gls units - metres and seconds. Every field is
+   *  optional. */
   export interface ProjectileDesc {
     gravity?: boolean;
     damage?: number;
@@ -1862,6 +2067,7 @@ declare module "gk" {
     hit_light?: LightDesc;
   }
 
+  /** A `pgenerator` block, in .gls units. Every field is optional. */
   export interface ParticleGeneratorDesc {
     /** A particle keyword (`smoke`, `corona`, `laser trail`, ...) or its id. */
     type?: string | number;
@@ -1969,6 +2175,8 @@ declare module "gk" {
     status_display?: boolean;
   }
 
+  /** An `ammo` block - one weapon's firing behaviour, in .gls units (seconds
+   *  for the timers). Every field is optional. */
   export interface AmmoDesc {
     ammo_type?: string | number;
     weapon_type?: string | number;
@@ -1984,6 +2192,8 @@ declare module "gk" {
     role?: Role;
   }
 
+  /** An `ammoinfo` block - how one ammunition type appears in an inventory,
+   *  as opposed to what firing it does. Every field is optional. */
   export interface AmmoInfoDesc {
     ammo_type?: string | number;
     shape?: AssetRef;
@@ -2217,7 +2427,10 @@ declare module "gk" {
     map: LevelMap;
   }
 
+  /** The named members of {@link Levels}, as opposed to its keys. */
   export interface LevelsMembers {
+    /** How many levels are registered - the shipped set plus every one added
+     *  with `add`. */
     readonly count: number;
     /** The level being loaded right now, or null outside a load callback. */
     readonly current: Level | null;
@@ -2365,6 +2578,8 @@ declare module "gk" {
     icon_big(): ArrayBuffer | null;
   }
 
+  /** The named members of {@link Mods}. The collection iterates the **enabled**
+   *  mods in load order, which is also the order the last one wins in. */
   export interface ModsMembers {
     /** How many mods are enabled. */
     readonly count: number;
@@ -2610,7 +2825,7 @@ declare module "gk" {
    *
    *  Every field is optional; an override with none of them registers a key
    *  that matches images and changes nothing, which is a legitimate way to ask
-   *  `render.material_overrides` what a key would match. */
+   *  `render.material.overrides` what a key would match. */
   export interface MaterialOverrideSpec {
     /** A case-insensitive substring of another loaded texture's `.rim` path.
      *  Draws sampling the overridden texture sample this one instead, at
@@ -2643,12 +2858,11 @@ declare module "gk" {
    *    brighter. */
   export type BloomBlend = "off" | "add" | "screen" | "max";
 
-  /** One bloom layer, as `render.bloom_layer` returns it. */
   /** Why the bloom pass is or is not contributing. Four states rather than two,
-   *  because they are four different things and `render.bloom` reads back as
-   *  *requested* - so the switch alone cannot tell them apart.
+   *  because they are four different things and `render.bloom.enabled` reads back
+   *  as *requested* - so the switch alone cannot tell them apart.
    *
-   *  `inert` in particular is not a failure: bloom needs `render.hdr`, because an
+   *  `inert` in particular is not a failure: bloom needs `render.hdr.enabled`, because an
    *  8-bit target has no over-range light for a threshold to select. */
   export type BloomStatus = "off" | "unavailable" | "inert" | "idle" | "active";
 
@@ -2670,7 +2884,7 @@ declare module "gk" {
     readonly capped: boolean;
   }
 
-  /** What `render.bloom_layers` reads back.
+  /** What {@link RenderBloom.layers} reads back.
    *
    *  It was a preformatted string until the surface was tidied. The argument for
    *  the string - that the interesting part is what a caller cannot compute from
@@ -2701,7 +2915,10 @@ declare module "gk" {
     readonly owned: boolean;
   }
 
+  /** One registered material-override key, as {@link RenderMaterial.override}
+   *  and {@link RenderMaterial.overrides} report it. */
   export interface MaterialOverrideState {
+    /** The substring the override was registered under, as given. */
     readonly key: string;
     /** The replacement asked for, or null for none. */
     readonly texture: string | null;
@@ -2709,24 +2926,41 @@ declare module "gk" {
      *  which case the original is drawn, which is otherwise indistinguishable
      *  from the override never having been registered. */
     readonly texture_image: number | null;
+    /** `[r, g, b, a]` in 0..1. `[1, 1, 1, 1]` for an override that sets no tint. */
     readonly tint: readonly [number, number, number, number];
+    /** Draws sampling a matched image are skipped entirely. */
     readonly hide: boolean;
     /** Every live image the key matches. A substring key matching nothing and
      *  one matching half the level look identical from the call site. */
     readonly images: readonly MaterialOverrideImage[];
   }
 
+  /** Every material override at once, plus what the last frame did with them.
+   *  Returned by both {@link RenderMaterial.override} and
+   *  {@link RenderMaterial.overrides}. */
   export interface MaterialOverridesState {
+    /** In registration order, which is the order keys are matched in: the first
+     *  key to claim an image owns it. */
     readonly entries: readonly MaterialOverrideState[];
+    /** Draws in the last frame that sampled an overridden image. 0 with
+     *  registrations present means the camera cannot see any of them. */
     readonly overridden_draws: number;
+    /** Draws in the last frame skipped by a `hide` override. */
     readonly hidden_draws: number;
   }
 
+  /** One bloom layer's five knobs, as {@link RenderBloom.layer} returns them -
+   *  the values in force after any clamping, not the values asked for. */
   export interface BloomLayer {
+    /** Linear luminance at which a pixel starts to contribute. */
     threshold: number;
+    /** Width of the soft ramp above `threshold`, in the same units. */
     knee: number;
+    /** Blur radius as a fraction of frame **height**. */
     radius: number;
+    /** Multiplier on this layer's contribution to the composite. */
     intensity: number;
+    /** How the layer is combined with the tonemapped image. */
     blend: BloomBlend;
   }
 
@@ -2735,7 +2969,7 @@ declare module "gk" {
   export interface BloomLayerSpec {
     /** Linear (Rec.709) luminance at which a pixel starts to contribute. **1.0
      *  is the meaningful value rather than a round number**: under
-     *  `render.linear_input` a fully lit opaque surface is exactly 1, so a
+     *  `render.hdr.linear_input` a fully lit opaque surface is exactly 1, so a
      *  threshold there selects precisely what the 8-bit pipeline could not
      *  represent. Defaults are 1.0, 1.2 and 1.6 by layer. */
     threshold?: number;
@@ -2761,25 +2995,6 @@ declare module "gk" {
     blend?: BloomBlend;
   }
 
-  /** The renderer's settings - every knob a player or a mod would choose, and
-   *  **every one of them persists**. A write here is saved to
-   *  `core.render.<name>` in `settings.json` once it has settled, exactly as
-   *  clicking the same knob on the Advanced Graphics page is; the two used to
-   *  disagree, so `render.hdr = true` was forgotten on the next launch while the
-   *  menu's own HDR toggle was not.
-   *
-   *  Two knobs are restored but never written back, because their getters report
-   *  what is *happening* rather than what was asked for: `tessellation` reads
-   *  false on a device with no `tessellationShader`, and `msaa` reads the count
-   *  the device agreed to. Persisting either would let one launch on a weaker
-   *  machine erase the preference for every other.
-   *
-   *  An environment variable still outranks the file, per knob rather than
-   *  wholesale - `GKPLUS_VK_MSAA` pins the sample count and says nothing about
-   *  HDR.
-   *
-   *  The Vulkan investigation's measurement surface is `render.debug`, which
-   *  persists nothing. */
   /** `render.tess` - the PN-triangle amplification pass.
    *
    *  Every knob here persists; see {@link Render}. */
@@ -2818,7 +3033,7 @@ declare module "gk" {
      *  `"all"` (props and units too) or `"off"`.
      *
      *  **`"map"` is the right default, and that is measured rather than assumed.**
-     *  `render.normal_census()` across all sixteen shipped levels: the props and
+     *  `render.debug.normal_census()` across all sixteen shipped levels: the props and
      *  units are **88.6% flat corners and 86.7% fully-flat triangles**, with only
      *  7.6% genuinely curved and 77% of their corners carrying no normal at all.
      *  `"all"` therefore amplifies ~9,450 prop triangles to change 7.6% of their
@@ -2859,7 +3074,7 @@ declare module "gk" {
      *  a safe one: a corner the mesh has split is one it is saying is not smooth
      *  there, so an intentional hard edge stays hard.
      *
-     *  `render.seam_census()` is the check -- "still open with the rule applied"
+     *  `render.debug.seam_census()` is the check -- "still open with the rule applied"
      *  has to read 0. Turning this off reproduces the tear. The table is built
      *  from an arena readback spread over a few frames after a level loads, so
      *  the census's `still queued` is non-zero while it converges. */
@@ -2942,19 +3157,19 @@ declare module "gk" {
      *  are crushed without this and survive to the tonemap with it.
      *
      *  **Takes effect on the next frame**, through exactly the machinery
-     *  {@link msaa} uses: the colour format is baked into every world pipeline,
+     *  {@link Render.msaa} uses: the colour format is baked into every world pipeline,
      *  so the write records a request and the rebuild happens between frames.
      *  Unlike `msaa` this reads back **as requested**, so a control can bind to
-     *  it directly; `render.status` is where "requested but not engaged" shows
+     *  it directly; `render.debug.vulkan.status` is where "requested but not engaged" shows
      *  up, which is what a device with no tonemap pass reads as.
      *
-     *  Needs the offscreen target, so it is inert with {@link offscreen} off or
+     *  Needs the offscreen target, so it is inert with `render.debug.offscreen` off or
      *  on a surface that will not take `TRANSFER_DST`.
-     *  In {@link stock}'s set. `GKPLUS_VK_HDR=1` is the launch-time form. */
+     *  In {@link RenderDebug.stock}'s set. `GKPLUS_VK_HDR=1` is the launch-time form. */
     enabled: boolean;
 
     /** sRGB-decode the fragment's **final** colour, so the framebuffer blend
-     *  and the tonemap run on light. On by default, inert without {@link hdr}.
+     *  and the tonemap run on light. On by default, inert without {@link Render.hdr}.
      *
      *  **It decodes the output, not the inputs.** The light sum, the material
      *  terms, the texture cascade and the specular add all run exactly as
@@ -2981,19 +3196,19 @@ declare module "gk" {
      *  nothing on this machine".
      *
      *  - `clamp` - what the 8-bit target did by itself. The bisect setting.
-     *  - `rolloff` - exactly the identity below {@link tonemap_knee},
+     *  - `rolloff` - exactly the identity below {@link RenderHdr.knee},
      *    compressing only above it, asymptotic to 1. The default.
-     *  - `reinhard` - extended Reinhard, exactly 1.0 at {@link tonemap_white}.
+     *  - `reinhard` - extended Reinhard, exactly 1.0 at {@link RenderHdr.white}.
      *    Nowhere the identity, so it lifts the whole world image.
      *  - `aces` - Narkowicz's fit to the ACES filmic curve. A toe and a
      *    shoulder; contrasty, and it warms saturated highlights.
      *  - `filmic` - the Uncharted 2 (Hable) curve, normalised so
-     *    {@link tonemap_white} lands on 1.0. Gentler shoulder than ACES.
+     *    {@link RenderHdr.white} lands on 1.0. Gentler shoulder than ACES.
      *  - `agx` - Troy Sobotka's AgX. What it buys over the two curves above is
      *    **hue stability at the top end**: a bright saturated light desaturates
      *    towards white instead of clipping one channel at a time and sliding
-     *    towards a primary. It reads neither {@link tonemap_knee} nor
-     *    {@link tonemap_white} - its range is fixed by its own log window, so
+     *    towards a primary. It reads neither {@link RenderHdr.knee} nor
+     *    {@link RenderHdr.white} - its range is fixed by its own log window, so
      *    {@link exposure} is its only control.
      *
      *  **Every operator is safe for the 2D half of the game.** The menus, the
@@ -3005,7 +3220,7 @@ declare module "gk" {
      *
      *  `rolloff` is the default because it is the conservative one, not because
      *  anything depends on it - it is exactly the identity below
-     *  {@link tonemap_knee}, so it only ever touches what genuinely exceeds it.
+     *  {@link RenderHdr.knee}, so it only ever touches what genuinely exceeds it.
      *
      *  `clamp` is what the 8-bit target did by itself; with `linear_input` off
      *  it makes the pass a reproduction of the blit it replaced. */
@@ -3037,21 +3252,21 @@ declare module "gk" {
 
     /** Bloom: the over-range part of the world image, blurred at three
      *  separate scales and added back inside the tonemap pass. Off by default
-     *  and in {@link stock}'s set.
+     *  and in {@link RenderDebug.stock}'s set.
      *
-     *  **It needs {@link hdr} and does nothing without it.** That is structural
+     *  **It needs {@link Render.hdr} and does nothing without it.** That is structural
      *  rather than a policy: a threshold is a statement about light, and every
      *  value in an 8-bit target is already clamped to 1, so "brighter than
      *  white" cannot be asked of it. With a float target the question has an
      *  answer, and in this game it is the additive fires, the flares and
-     *  whatever a `diffuse 4.0` light lands on. {@link bloom_layers} says so in
+     *  whatever a `diffuse 4.0` light lands on. {@link RenderBloom.layers} says so in
      *  words when this reads `true` and the frame is still 8-bit.
      *
      *  It applies to the **world alone**, for free rather than by design: the 2D
      *  layers are drawn after the tonemap, which is where the composite happens,
      *  so no glow reaches the menus, the briefing screens or the HUD.
      *
-     *  Reads back as *requested*, like {@link hdr} - so a checkbox can bind here
+     *  Reads back as *requested*, like {@link Render.hdr} - so a checkbox can bind here
      *  directly. `GKPLUS_VK_BLOOM=1` is the launch-time form. */
     enabled: boolean;
 
@@ -3070,10 +3285,10 @@ declare module "gk" {
      *  in all three: in a downsample chain, layer 2 would be thresholding layer
      *  1's output.
      *
-     *      render.bloom = true;
-     *      render.bloom_layer(0, {threshold: 1.0, intensity: 0.6});
-     *      render.bloom_layer(2, {blend: "off"});
-     *      render.bloom_layer(1).radius;   // reads, writes nothing
+     *      render.bloom.enabled = true;
+     *      render.bloom.layer(0, {threshold: 1.0, intensity: 0.6});
+     *      render.bloom.layer(2, {blend: "off"});
+     *      render.bloom.layer(1).radius;   // reads, writes nothing
      *
      *  @throws if `index` is not 0, 1 or 2, or if `blend` is not one of the four
      *  names - a typo behaving as `off` would read as "bloom does nothing on
@@ -3087,7 +3302,7 @@ declare module "gk" {
      *  A string, because the interesting part is what a caller cannot compute
      *  from the knobs: the layer extents, whether a kernel hit its tap cap, and
      *  which of "off", "the pass did not build on this device" and "inert - it
-     *  needs {@link hdr}" is the case. */
+     *  needs {@link Render.hdr}" is the case. */
     readonly layers: BloomState;
   }
 
@@ -3206,7 +3421,7 @@ declare module "gk" {
      *
      *  On by default. A level with no sun set produces no matrix and therefore
      *  no shadow, which from the screen is the same as this being off -
-     *  `render.draws` is what tells the two apart. */
+     *  `render.debug.draws` is what tells the two apart. */
     enabled: boolean;
 
     /** The sun shadow's depth offset, **in shadow-map texels of whichever cascade
@@ -3577,9 +3792,9 @@ declare module "gk" {
      *  go wrong is silent: a substring matching no live image, or matching more
      *  than was meant, is not an error and cannot be seen from the call.
      *
-     *      render.material_override("gunlok_mk2", {tint: [1, 0, 1]});
-     *      render.material_override("gunlok_mk2", {texture: "hark_512"});
-     *      render.material_override("gunlok_mk2", null);
+     *      render.material.override("gunlok_mk2", {tint: [1, 0, 1]});
+     *      render.material.override("gunlok_mk2", {texture: "hark_512"});
+     *      render.material.override("gunlok_mk2", null);
      */
     override(
       name: string,
@@ -3593,12 +3808,37 @@ declare module "gk" {
     clear(): void;
   }
 
+  /** `render` - the Vulkan renderer's settings: every knob a player or a mod
+   *  would choose. Four of its own, eleven feature sub-objects, and the
+   *  measurement surface under {@link RenderDebug}.
+   *
+   *  **Everything on `render` itself and on the eleven sub-objects persists.** A
+   *  write is saved to `core.render.<name>` in the profile's `settings.json`
+   *  once it has settled, from whatever source made it - a script, the REPL, or
+   *  the Advanced Graphics page clicking the same knob. The two used to
+   *  disagree, so `render.hdr.enabled = true` was forgotten on the next launch
+   *  while the menu's own HDR toggle was not. Nothing on `render.debug`
+   *  persists.
+   *
+   *  Two knobs are restored but never written back, because their getters report
+   *  what is *happening* rather than what was asked for: `tess.enabled` reads
+   *  false on a device with no `tessellationShader`, and `msaa` reads the count
+   *  the device agreed to. Persisting either would let one launch on a weaker
+   *  machine erase the preference for every other.
+   *
+   *  An environment variable outranks the file, per knob rather than wholesale -
+   *  `GKPLUS_VK_MSAA` pins the sample count and says nothing about HDR. A knob
+   *  with one set is neither restored from the file nor written back to it.
+   *
+   *  Every member is readable and writable under any renderer. Only
+   *  `GKPLUS_RENDERER=vulkan` draws with them - under `d3d8` or `d3d9` a write
+   *  is recorded and has no effect on the frame. */
   export interface Render {
 
     /** The world pass's MSAA sample count. `1` is off and is the default.
      *
      *  Write `2`, `4` or `8`; anything else **rounds down** to a power of two
-     *  the device supports, so no value throws and `render.status` is where an
+     *  the device supports, so no value throws and `render.debug.vulkan.status` is where an
      *  unsupported request shows up. Antialiases geometric edges, the stencil
      *  shadow volumes included - it does nothing for the alpha-*tested*
      *  cutouts (sprites, foliage), which need alpha-to-coverage.
@@ -3703,10 +3943,14 @@ declare module "gk" {
     [K in keyof T]-?: T[K] extends boolean ? K : never;
   }[keyof T];
 
+  /** The numeric members of one `render` group, in the same shape as
+   *  {@link RenderBoolKey}. */
   export type RenderNumberKey<T> = {
     [K in keyof T]-?: T[K] extends number ? K : never;
   }[keyof T];
 
+  /** The string members of one `render` group, in the same shape as
+   *  {@link RenderBoolKey}. */
   export type RenderStringKey<T> = {
     [K in keyof T]-?: T[K] extends string ? K : never;
   }[keyof T];
@@ -3849,7 +4093,7 @@ declare module "gk" {
      *
      *  Handles a deliberately narrow case (XYZRHW destination, mirrored
      *  transform, readable source) and forwards anything else, so
-     *  `render.stats.process_vertices_forwarded` is the coverage figure - 96.5%
+     *  `render.debug.stats.process_vertices_forwarded` is the coverage figure - 96.5%
      *  of calls and 100% of vertices are handled on level02, the remainder being
      *  calls with no vertices at all.
      *
@@ -3883,7 +4127,7 @@ declare module "gk" {
     /** Which vertex buffers the converter is spending its time on, and whether
      *  anything draws the result, as text.
      *
-     *  `render.stats.converted_layouts` counts by *layout* and that is one
+     *  `render.debug.stats.converted_layouts` counts by *layout* and that is one
      *  question short: it cannot say whether 28 calls a frame are one buffer
      *  refilled 28 times or 28 buffers refilled once, and it cannot say whether
      *  the result is ever read. Each row carries the FVF, size, converted and
@@ -4066,7 +4310,9 @@ declare module "gk" {
     readonly pct: number;
   }
 
+  /** The sampling thread's own state, as {@link Prof.sampler} reports it. */
   export interface ProfSampler {
+    /** Whether the thread is suspending the game's threads and recording. */
     readonly running: boolean;
     /** What was asked for. */
     readonly hz: number;
@@ -4102,7 +4348,7 @@ declare module "gk" {
   /** Which frames a query covers. A plain number is `{last: n}`.
    *
    *  `around` is the one that matters for a stutter: `prof.worst()` will find a slow frame long
-   *  after it happened, and without this there was no way to narrow a query onto it — "the last
+   *  after it happened, and without this there was no way to narrow a query onto it: "the last
    *  n frames" was the only expressible window, so a frame whose samples were still in the ring
    *  could be seen and not profiled. */
   export type ProfWindow =
@@ -4120,7 +4366,7 @@ declare module "gk" {
     readonly ms: number;
     /** The median it was measured against. */
     readonly baseline_ms: number;
-    /** Whether that frame was waiting for a vertical blank anyway — if so the trigger was
+    /** Whether that frame was waiting for a vertical blank anyway. If so, the trigger was
      *  measuring the monitor and the capture is probably not what you wanted. */
     readonly throttled: boolean;
     readonly frames: number;
@@ -4134,7 +4380,7 @@ declare module "gk" {
   /** When the profiler should save a window out of the rings by itself. */
   export interface ProfTrigger {
     enabled: boolean;
-    /** A frame fires it when it exceeds **both** — an absolute floor so a fast steady game does
+    /** A frame fires it when it exceeds **both**: an absolute floor so a fast steady game does
      *  not trip on jitter, and a multiple of the running median so one number is not wrong for
      *  every scene. */
     min_ms: number;
@@ -4152,13 +4398,13 @@ declare module "gk" {
   export interface ProfSymbolLoad {
     readonly entries: number;
     /** The map's recorded file size disagrees with the module actually loaded, so every name it
-     *  produces is suspect — a different build shifts every RVA, which makes the names
+     *  produces is suspect, since a different build shifts every RVA, which makes the names
      *  confidently wrong rather than absent. It still loads; `note` says what happened. */
     readonly stale: boolean;
     readonly note: string;
   }
 
-  /** How the rings are currently sized — the same keys `configure` takes. */
+  /** How the rings are currently sized, in the same keys `configure` takes. */
   export interface ProfConfig {
     readonly mask: number;
     readonly events_per_thread: number;
@@ -4173,8 +4419,12 @@ declare module "gk" {
     readonly capture_samples: number;
   }
 
+  /** One profiled thread and the state of its event ring. A thread appears here
+   *  only once it has recorded something. */
   export interface ProfThread {
+    /** Its index in the profiler's own thread table. */
     readonly slot: number;
+    /** The OS thread id. */
     readonly id: number;
     /** "main", "executor", or "thread-<id>". */
     readonly name: string;
@@ -4221,7 +4471,7 @@ declare module "gk" {
 
     /** Newest last; no argument means the whole ring. */
     frames(count?: number): ProfFrame[];
-    /** The slowest frames in the ring, worst first. Where a stutter is — the frame ring is far
+    /** The slowest frames in the ring, worst first. Where a stutter is. The frame ring is far
      *  cheaper per entry than the event ring, so this reaches much further back than anything
      *  that can still be profiled. Use the `frame_index` it reports with `{around: …}`. */
     worst(count?: number): ProfFrame[];
@@ -4230,13 +4480,13 @@ declare module "gk" {
     /** The flat sampled profile over the same window, sorted by count. */
     samples(window?: ProfWindow): ProfSample[];
 
-    /** The flight recorder. A stutter rarer than the event ring's reach — 10 to 60 seconds, and
-     *  shrinking the faster the game runs — cannot be caught by looking afterwards, because its
+    /** The flight recorder. A stutter rarer than the event ring's reach (10 to 60 seconds, and
+     *  shrinking the faster the game runs) cannot be caught by looking afterwards, because its
      *  zones are overwritten before anyone notices. This watches for one and copies the
      *  surrounding window somewhere the rings cannot reach.
      *
      *  **Unthrottle first.** Under FIFO the frame time is quantized to the refresh interval, so
-     *  a 6 ms hitch is absorbed entirely and a 20 ms one reads as one extra interval — both the
+     *  a 6 ms hitch is absorbed entirely and a 20 ms one reads as one extra interval, so both the
      *  threshold and the baseline would be measuring the monitor.
      *  `GKPLUS_VK_PRESENT_MODE=immediate`.
      *
@@ -4244,7 +4494,7 @@ declare module "gk" {
      *  it unless `enabled: false` is given explicitly). */
     trigger: boolean | Partial<Omit<ProfTrigger, "baseline_ms">> | ProfTrigger;
     /** Windows the trigger has saved, oldest first. **`index` is the handle, not the array
-     *  position** — the ring drops the oldest, so the two diverge. Read one with
+     *  position**, since the ring drops the oldest, so the two diverge. Read one with
      *  `{capture: c.index}`. */
     readonly captures: readonly ProfCapture[];
     clear_captures(): void;
@@ -4252,7 +4502,7 @@ declare module "gk" {
      *  was armed with `stacks` (`GKPLUS_PROFILER=stacks`, or
      *  `prof.configure({stacks: true})`). `limit` defaults to 40; 0 means all.
      *
-     *  gl.exe keeps frame pointers, so a walk runs straight through the game — on level02 the
+     *  gl.exe keeps frame pointers, so a walk runs straight through the game. On level02 the
      *  hot chain reads `BuildDrawRecord <- Aw_DrawIndexedPrimitiveUP <- SubMesh_DrawIndexed <-
      *  SceneNode_Render`, and `SceneNode_Render` recursing down the scene graph is what
      *  saturates the default depth of 12. */
@@ -4270,7 +4520,7 @@ declare module "gk" {
      *  `chrome://tracing` or ui.perfetto.dev. Returns the path. */
     trace(path: string, window?: ProfWindow): string;
     /** Where a map is looked for automatically: `<game dir>\gkplus\symbols\`. The first time a
-     *  name is wanted for a module, `<module>.sym` is tried there once — so installing a map is
+     *  name is wanted for a module, `<module>.sym` is tried there once, so installing a map is
      *  all it takes, with no call to `symbols()`. */
     readonly symbol_dir: string;
     /** Loads `<hex rva> <hex size> <name>` lines for one module, so a sampled profile reads in
@@ -4301,32 +4551,213 @@ declare module "gk" {
 
   // --- the module ------------------------------------------------------------
 
+  /** The CPU profiler: instrumented zones, the sampling thread, the frame
+   *  history and the stutter trigger. See {@link Prof}.
+   *
+   *  Armed by `GKPLUS_PROFILER`; with it unset every query still answers, with
+   *  nothing recorded. `examples/prof-panel.mjs` is the worked reader.
+   *
+   *  @example
+   *  ```js
+   *  import { prof } from "gk";
+   *  const frames = prof.frames({ count: 120 });
+   *  ```
+   */
   export const prof: Prof;
+
+  /** The Vulkan renderer's settings, in eleven sub-objects plus four knobs of
+   *  its own, and the measurement surface under `render.debug`. See
+   *  {@link Render}.
+   *
+   *  Every setting on `render` persists to `core.render.*` in the profile's
+   *  `settings.json`; nothing on `render.debug` does. Reachable under any
+   *  renderer, but only `GKPLUS_RENDERER=vulkan` draws with them.
+   *  `examples/render-panel.mjs` binds all of them to ImGui.
+   *
+   *  @example
+   *  ```js
+   *  import { render } from "gk";
+   *  render.hdr.enabled = true;
+   *  render.hdr.tonemap = "agx";
+   *  ```
+   */
   export const render: Render;
+
+  /** The world camera: position, orientation, distance, focus, and the tracking
+   *  and interpolation the `SET CAMERA` commands drive. See {@link Camera}.
+   *
+   *  @example
+   *  ```js
+   *  import { camera } from "gk";
+   *  camera.orientation = { yaw: 90 };
+   *  ```
+   */
   export const camera: Camera;
+
+  /** The in-game console: printing, command registration and dispatch, the
+   *  history, and `log`/`info`/`warn`/`error`/`debug`. See {@link Console}.
+   *
+   *  **This is the only console.** The host installs no global one, so a script
+   *  that has not imported this has nowhere to log to.
+   *
+   *  @example
+   *  ```js
+   *  import { console } from "gk";
+   *  console.log("main.mjs loaded");
+   *  ```
+   */
   export const console: Console;
+
+  /** Every actor currently in the world, keyed by id and by name, and iterable.
+   *  See {@link Actors} and the {@link Actor} union.
+   *
+   *  @example
+   *  ```js
+   *  import { actors } from "gk";
+   *  for (const actor of actors) {
+   *    if (actor.alive) actor.health = 100;
+   *  }
+   *  ```
+   */
   export const actors: Actors;
+
+  /** Every role the level defined - the spawnable templates actors are made
+   *  from - keyed by id and by GLS identifier. See {@link Roles}.
+   *
+   *  @example
+   *  ```js
+   *  import { roles } from "gk";
+   *  roles["Rol_Gunlok"]?.spawn(0, { x: 0, y: 0, z: 0 });
+   *  ```
+   */
   export const roles: Roles;
+
+  /** The engine's named float table, which is also how it names actors. The
+   *  only writable collection in this module. See {@link Tokens}.
+   */
   export const tokens: Tokens;
+
+  /** The level's triggers: create, enumerate, arm and disarm. See
+   *  {@link Triggers}.
+   */
   export const triggers: Triggers;
+
+  /** Levels: the shipped set, the script-defined ones registered with
+   *  `levels.add`, and starting one with no menus and no briefing. See
+   *  {@link Levels}.
+   *
+   *  @example
+   *  ```js
+   *  import { levels } from "gk";
+   *  import * as arena from "./levels/arena.mjs";
+   *  levels.add("Test Arena", arena);
+   *  ```
+   */
   export const levels: Levels;
+
+  /** Native constructors for the objects a `.gls` section defines, taking plain
+   *  description objects in `.gls` units. See {@link Make}.
+   */
   export const make: Make;
+
+  /** The GLS parser itself: the section schema, a parse probe, and a full parse
+   *  of source text held in memory. See {@link Gls}.
+   */
   export const gls: Gls;
+
+  /** Session state: game mode, difficulty, god mode, the selection, the actor
+   *  under the cursor, pausing and quitting. See {@link Game}.
+   */
   export const game: Game;
+
+  /** The level's atmosphere: the sun, ambient light and fog. See {@link World}.
+   *
+   *  `world.fog` reads through a pointer that is null outside a level, which is
+   *  what `fog.available` reports.
+   */
   export const world: World;
+
+  /** The engine's text layer: fonts, measurement, and queueing a string for one
+   *  frame. See {@link Text}.
+   */
   export const text: Text;
+
+  /** The loopback REPL: the port it bound, and the unsolicited notification
+   *  backchannel. See {@link Repl}.
+   *
+   *  Present whether or not the REPL is listening; `GKPLUS_REPL_PORT` is what
+   *  opens it.
+   */
   export const repl: Repl;
+
+  /** Mods: reading one's metadata, declaring the active load order, and the
+   *  file-service diagnostics. See {@link Mods}.
+   *
+   *  Nothing is discovered on its own - a mod is a path something named - and
+   *  `enable` is the only call that puts a file in front of the engine. From a
+   *  boot module, this is the whole of what the phase is for.
+   *
+   *  @example
+   *  ```js
+   *  import { mods } from "gk";
+   *  mods.enable(["mods/10-alpha", "mods/20-beta"]);
+   *  ```
+   */
   export const mods: Mods;
+
+  /** The profile's `settings.json`, as a live object tree plus dotted-path
+   *  accessors. See {@link Settings}.
+   *
+   *  A shared repository: `core` is GkPlus's section and any other top-level key
+   *  belongs to whoever wrote it, surviving a rewrite by a build that has never
+   *  heard of it.
+   *
+   *  @example
+   *  ```js
+   *  import { settings } from "gk";
+   *  const wanted = settings.boot?.mods ?? [];
+   *  ```
+   */
   export const settings: Settings;
+
+  /** World effects and particles - water, lava, electricity, airstrikes, smoke.
+   *  See {@link Fx}.
+   */
   export const fx: Fx;
+
+  /** The one-shot lighting commands: fades, coronas, dynamic lights. See
+   *  {@link Light}. State that reads back is on `world`.
+   */
   export const light: Light;
+
+  /** Mission objectives and the training-level text. See {@link Objectives}. */
   export const objectives: Objectives;
+
+  /** CD music and sound effects. See {@link Music}. */
   export const music: Music;
+
+  /** Presentation: borders, the cursor, briefing and debrief text, bitmaps,
+   *  FMVs, cutscenes and the end-of-mission statistics. See {@link Screen}.
+   */
   export const screen: Screen;
+
+  /** Commands that act on a unit - AI, activity, waypoints, boarding, control.
+   *  See {@link Units}.
+   */
   export const units: Units;
+
+  /** Giving, taking and querying inventory items. See {@link Inventory}. */
   export const inventory: Inventory;
+
+  /** Camera tracks and the cutscene playback commands. See {@link Tracks}. */
   export const tracks: Tracks;
+
+  /** The demo record and playback commands. See {@link Demo}. */
   export const demo: Demo;
+
+  /** Pacing for the game's own script queue: waits, gates and the batch
+   *  controls. See {@link ScriptPacing}.
+   */
   export const script: ScriptPacing;
 
   // `menus` is not exported: it is only ever setup_menus' argument, because
@@ -4371,7 +4802,17 @@ declare module "gk" {
    *  the game has filled its own menus.
    *
    *  The argument is the only way to reach `menus`: there is no export for it,
-   *  because the game's own items must be in place before a script adds one. */
+   *  because the game's own items must be in place before a script adds one.
+   *
+   *  @example
+   *  ```js
+   *  export function setup_menus(menus) {
+   *    menus.Main.add_item("Press F11 for GkPlus", (item) => {
+   *      console.log(`clicked '${item.label}' at index ${item.index}`);
+   *    });
+   *  }
+   *  ```
+   */
   export type SetupMenus = (menus: Menus) => void;
 
   /** The shape of `export function draw_gui`. Called every frame the F11
@@ -4379,7 +4820,20 @@ declare module "gk" {
    *  the rest of the session.
    *
    *  The argument is the only way to reach ImGui: there is no module to import
-   *  it from, because nothing it offers works outside this callback. */
+   *  it from, because nothing it offers works outside this callback.
+   *
+   *  `End` is unconditional: ImGui requires it even when `Begin` returned false.
+   *
+   *  @example
+   *  ```js
+   *  export function draw_gui(ImGui) {
+   *    if (ImGui.Begin("GkPlus")) {
+   *      ImGui.Text(`${actors.count} actors`);
+   *    }
+   *    ImGui.End();
+   *  }
+   *  ```
+   */
   export type DrawGui = (imgui: ImGui) => void;
 }
 

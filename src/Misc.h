@@ -61,6 +61,11 @@ static_assert(offsetof(Cheats, IsInfiniteAmmo) == 1);
 
 // --- Native API over game-state globals -------------------------------------
 
+// Each line below is a getter and a setter over one global, both plain reads
+// and writes with no side effects. `GetGameMode` is the engine's 0..5 mode
+// (see GameModeName); `GetGameState` is the coarse phase a level load moves
+// through; `GetFoobar` keeps the binary's own name for a global whose meaning
+// has not been recovered.
 int GetGameMode();       void SetGameMode(int mode);       // 0x007b9e28
 int GetGameState();      void SetGameState(int state);     // 0x006b02b4
 int GetBattleNumber();   void SetBattleNumber(int n);      // 0x006a79b4
@@ -79,6 +84,9 @@ enum class Difficulty : int {
   Hard = 2,
   Extreme = 3,
 };
+/// The lower-case name of a Difficulty value (`"easy"`, `"medium"`, `"hard"`,
+/// `"extreme"`), or `"unknown"` outside 0..3. The pointer is to a literal and
+/// is never null.
 const char *DifficultyName(int difficulty);
 
 // The remaining single-global toggles the console exposes, in command order:
@@ -129,6 +137,8 @@ bool GetControlsDisabled();   void SetControlsDisabled(bool v);// 0x007b9ca0, by
 bool GetFriendlyFireOn();     void SetFriendlyFireOn(bool v);
 int GetTrainingArea();        void SetTrainingArea(int area);  // 0x007b9d14
 int GetSelectedActorId();     void SetSelectedActorId(int id); // 0x006a3004
+/// Whether Active Pause is engaged. Read-only here: the engine has no
+/// single-global setter for it.
 bool IsActivePauseOn();                                        // 0x00738f78
 bool GetConsoleEchoEnabled(); void SetConsoleEchoEnabled(bool v); // 0x007b9c9a
 
@@ -164,6 +174,9 @@ bool IsSimulationRunning();
 //
 // Cost is a thread round trip, so it belongs around a whole operation, never inside a loop.
 void SuspendExecutor();
+/// Releases the executor thread suspended by SuspendExecutor(). Must be paired
+/// with it; prefer ExecutorPause, because an early return between the two
+/// parks the executor forever and presents as a total game freeze.
 void ResumeExecutor();
 
 // Scope guard. Prefer this to the bare pair: an early return between them would otherwise
@@ -175,8 +188,14 @@ struct ExecutorPause {
   ExecutorPause &operator=(const ExecutorPause &) = delete;
 };
 
+/// The actor the mouse is over, or nullptr. Borrowed; the pointer is only good
+/// for the current frame.
 Actor *GetActorUnderCursor();   // 0x007b68e8
+/// The live GLKeys settings block, writable in place. Writes here are what the
+/// front end's own menus write; they reach `GLkeys.cfg` only on a clean exit.
 GLKeysSettings *GetSettings();  // 0x006abdd0
+/// The two cheat bytes, writable in place. Never widen these to `int`: the
+/// dword past them is the renderer's state word.
 Cheats *GetCheats();            // 0x007b9c70
 
 // Name of a game mode (0..5): "single_player", "cooperative", ...

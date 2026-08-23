@@ -3,9 +3,25 @@
 #include <memory>
 
 namespace gk {
+/// The game's own allocator, `pool_alloc` @ 0x00571470: a page-based
+/// sub-allocator over gl.exe's CRT heap, and the *only* heap the engine uses.
+///
+/// \param sz bytes to allocate.
+/// \return the block, or nullptr on failure. The memory is uninitialised and
+///         no constructor has run on it.
+///
+/// Not usable from `DllMain`: gl.exe's static CRT, which this bottoms out in,
+/// is not initialised until `_mainCRTStartup`. Anything allocated here must be
+/// released with pool_free(), never with this DLL's own `::free`.
 void *pool_alloc(size_t sz);
+
+/// Releases a block from pool_alloc() (or from the engine's `malloc`/`strdup`
+/// thunks, which are the same allocator). Passing nullptr is a no-op; passing
+/// a pointer from any other heap corrupts that heap.
 void pool_free(void *ptr);
 
+/// Destroys `*ptr` and returns its storage to the pool. The deleter behind
+/// pool_unique_ptr; empty, so it costs no space in a struct mirror.
 template <typename T> struct pool_deleter {
   void operator()(T *ptr) {
     ptr->~T();

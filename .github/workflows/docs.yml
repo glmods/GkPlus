@@ -1,0 +1,345 @@
+name: Documentation
+
+# Builds docs/ into a publishable site and checks that every internal link in it
+# resolves. Runs on anything that can change the site: the docs themselves, the
+# two sources the JavaScript reference is generated from, and src/, from which
+# the C++ reference is generated.
+#
+# The webfonts are NOT in the repository - docs/tools/fetch-fonts.py fetches and
+# subsets them here, which is why the Python step comes before Hugo. See
+# docs/static/fonts/README.md.
+#
+# The C++ API reference needs Windows: clang-doc reads
+# build/compile_commands.json, and CMakeLists.txt stops with FATAL_ERROR
+# anywhere but 32-bit Windows. The cpp-api job does it on a Windows runner and
+# hands the tree to the site job as an artifact. It is best-effort and never
+# blocks publishing; when it is skipped or fails, api-placeholder.py writes a
+# page at /api/cpp/ saying so, so the site never ships the 118 dead links a bare
+# 404 would leave.
+
+on:
+  push:
+    branches: [main]
+    # Spelled out twice rather than shared with a YAML anchor: GitHub's workflow
+    # parser accepts anchors but does not document them, and a parse failure
+    # here means the workflow never runs at all.
+    paths:
+      - 'docs/**'
+      - 'types/**'
+      - 'examples/**'
+      # The C++ reference is generated from these, so they change the site too.
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'ports/**'
+      - 'vcpkg.json'
+      - 'vcpkg-configuration.json'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'types/**'
+      - 'examples/**'
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'ports/**'
+      - 'vcpkg.json'
+      - 'vcpkg-configuration.json'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A superseded docs build is worth nothing, but never cancel a deploy midway.
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  HUGO_VERSION: '0.165.0'
+  HUGO_SHA256: '5c3a37a5450b3e386e5b75a87a790fea2d04a796d75e171216c80ef48a32b432'
+  TYPEDOC_VERSION: '0.28'
+  TYPESCRIPT_VERSION: '5.9'
+  # Pinned: vcpkg.json sets no builtin-baseline, so the registry commit is what
+  # decides the dependency versions. This is the one this project resolves against.
+  VCPKG_COMMIT: '908da3a305a0a8028d9602ab241b433652b3df69'
+  SLANG_VERSION: '2026.16'
+  # Pinned rather than "whatever the runner image ships": clang-doc's older
+  # HTML backend bakes the build machine's own absolute output path into
+  # index_json.js as `RootPath`, and every sidebar link on every generated
+  # page is built from it at runtime - on a GitHub-hosted runner that is
+  # literally `D:/a/GkPlus/GkPlus/...`, so the whole published reference comes
+  # up broken with no link in the HTML itself ever pointing anywhere wrong.
+  # LLVM 22.1.0 uses the newer mustache backend instead, whose pages carry
+  # real per-page relative links and no RootPath at all - confirmed by
+  # generating both locally and diffing the two. There is no flag to choose
+  # the backend; it is purely a function of the LLVM version.
+  LLVM_VERSION: '22.1.0'
+
+jobs:
+  # ------------------------------------------------------------- C++ API
+  #
+  # Produces docs/static/api/cpp/ with clang-doc and hands it to the site job.
+  #
+  # Only a CMake *configure* is needed, not a build of d3d8.dll:
+  # compile_commands.json is written at generate time, and the two headers
+  # clang-doc would otherwise miss are produced by two Python scripts that each
+  # take --output. That turns this from a full 32-bit compile into a configure
+  # plus a few seconds. Installing the dependencies is what costs, and vcpkg's
+  # GitHub Actions binary cache absorbs that after the first run.
+  #
+  # Runs only on main and on manual dispatch: Windows minutes bill at 2x, and a
+  # pull-request build is an artifact nobody publishes, so it can use the
+  # placeholder instead.
+  cpp-api:
+    name: Generate the C++ API reference
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: windows-latest
+    timeout-minutes: 90
+    # Best-effort by construction: the site must publish whatever happens here.
+    continue-on-error: true
+    env:
+      VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # vcpkg reads these two to reach the Actions cache; they are not exported
+      # to `run` steps by default.
+      - name: Enable the vcpkg binary cache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      # CMakeLists.txt stops with FATAL_ERROR without slangc. The standalone
+      # Slang release is a fraction of the Vulkan SDK and is all that is wanted
+      # here: its SPIR-V goes into a generated header clang-doc does not
+      # document, so the exact version cannot affect this output.
+      - name: Install slangc
+        shell: pwsh
+        run: |
+          $url = "https://github.com/shader-slang/slang/releases/download/v$env:SLANG_VERSION/slang-$env:SLANG_VERSION-windows-x86_64.zip"
+          Invoke-WebRequest -Uri $url -OutFile slang.zip
+          Expand-Archive slang.zip -DestinationPath "$env:RUNNER_TEMP\slang"
+          "$env:RUNNER_TEMP\slang\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # Always installs the pinned version rather than trusting what the
+      # runner image already has on PATH - it silently shipped a version with
+      # the broken HTML backend once already (see LLVM_VERSION above), and
+      # that regression produced no error anywhere in this job, only a
+      # published reference whose sidebar links all pointed at this runner's
+      # own filesystem. The official installer is NSIS-based and silent under
+      # `/S`, installing to `C:\Program Files\LLVM` by default.
+      - name: Install a pinned LLVM (clang-cl, clang-doc)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/LLVM-$env:LLVM_VERSION-win64.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\llvm-installer.exe"
+          Start-Process "$env:RUNNER_TEMP\llvm-installer.exe" -ArgumentList "/S" -Wait
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Report the toolchain
+        shell: pwsh
+        run: |
+          foreach ($tool in 'clang-cl', 'clang-doc', 'slangc', 'ninja', 'python') {
+            $cmd = Get-Command $tool -ErrorAction SilentlyContinue
+            if ($cmd) { Write-Host "$tool -> $($cmd.Source)" }
+            else { Write-Error "$tool not found on PATH"; exit 1 }
+          }
+          clang-doc --version
+
+      # The repo's own `builtin-vcpkg` preset expects vcpkg at ./vcpkg.
+      - name: Fetch vcpkg
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git vcpkg
+          git -C vcpkg checkout --detach $env:VCPKG_COMMIT
+          .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      # Installs every dependency and writes build/compile_commands.json. It
+      # does not compile a line of GkPlus.
+      #
+      # Both options default to ON and both resolve a REQUIRED package out of
+      # the machine's registry, so both fail on a runner that has neither
+      # installed - `cmake/FindRenderDoc.cmake` looks for renderdoc_app.h under
+      # Program Files, `cmake/FindSteam.cmake` for steam.exe under the 32-bit
+      # view of it. They exist for a developer's own machine (a capture, and the
+      # `copy` target that deploys into the game directory); neither has
+      # anything to do with generating documentation.
+      #
+      # Turning RenderDoc off costs this reference nothing: it swaps
+      # src/VkCapture.cpp for src/VkCapture_dummy.cpp, and VkCapture.h - where
+      # all nine of the capture declarations live - is still included by
+      # JsRender.cpp, VkContext.cpp, VkRenderer.cpp and VkResources.cpp, so
+      # clang-doc still sees every one of them.
+      - name: Configure
+        run: >
+          cmake --preset builtin-vcpkg
+          -DGKPLUS_RENDERDOC_INTEGRATION=OFF
+          -DGKPLUS_COPY_DLL=OFF
+
+      # The two headers generated into the build tree. Without them the Vulkan
+      # translation units lose declarations clang-doc would otherwise record.
+      # Seconds, against minutes for a full build.
+      - name: Generate the shader headers
+        run: |
+          python src/gen-shaders.py --output build/generated/Shaders.gen.inc.h
+          python src/gen-shader-abi.py --output build/generated/ShaderAbi.gen.inc.h
+
+      - name: Run clang-doc
+        run: clang-doc --executor=all-TUs build/compile_commands.json --format=html --output=docs/static/api/cpp --project-name=GkPlus --public --ignore-map-errors --extra-arg=-Xclang --extra-arg=-fparse-all-comments --extra-arg=-ferror-limit=0
+
+      # clang-doc exits 0 having written almost nothing if the compilation
+      # database was unusable, which would publish an empty reference. A local
+      # run produces 246 pages.
+      - name: Check it produced something
+        shell: pwsh
+        run: |
+          $pages = (Get-ChildItem -Recurse -Filter *.html docs/static/api/cpp -ErrorAction SilentlyContinue).Count
+          Write-Host "clang-doc wrote $pages HTML pages"
+          if ($pages -lt 50) { Write-Error "too few pages - treating this as a failed run"; exit 1 }
+
+          # Refuse the older HTML backend outright rather than publish it: it
+          # writes index_json.js instead of clang-doc-mustache.css, and every
+          # sidebar link on every page is built at runtime from that file's
+          # `RootPath` - this runner's own absolute output directory - which
+          # is meaningless once the tree is published anywhere else. This is
+          # the backstop for the day LLVM_VERSION needs to move and the new
+          # value is not checked against this project's assumptions first.
+          if (Test-Path "docs/static/api/cpp/html/index_json.js") {
+            Write-Error "clang-doc used the pre-mustache HTML backend - every sidebar link would embed this runner's own build path. Pin a different LLVM_VERSION."
+            exit 1
+          }
+
+      - name: Upload the C++ tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpp-api-tree
+          path: docs/static/api/cpp
+          retention-days: 7
+
+  # ---------------------------------------------------------------- site
+  build:
+    name: Build site
+    needs: [cpp-api]
+    # cpp-api is skipped on pull requests and may fail on main; neither is a
+    # reason not to publish the site.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install font tooling
+        run: python -m pip install --disable-pip-version-check fonttools brotli
+
+      # Fetched, not committed: they are third-party binaries under their own
+      # licences and are reproducible byte-for-byte from pinned sources.
+      - name: Fetch and subset webfonts
+        run: python3 docs/tools/fetch-fonts.py
+
+      - name: Verify every font arrived
+        run: python3 docs/tools/fetch-fonts.py --check
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Generate the JavaScript API reference
+        run: |
+          npx -y -p typedoc@${{ env.TYPEDOC_VERSION }} \
+                 -p typescript@${{ env.TYPESCRIPT_VERSION }} \
+                 typedoc --options types/typedoc.json
+
+      # Present only when the Windows job ran and succeeded.
+      - name: Collect the C++ API reference
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: cpp-api-tree
+          path: docs/static/api/cpp
+
+      # A no-op when the download above delivered a real tree.
+      - name: Stand in for the C++ API reference
+        run: python3 docs/tools/api-placeholder.py cpp
+
+      - name: Fold the generated trees into the site
+        run: python3 docs/tools/unify-api.py
+
+      - name: Install Hugo
+        run: |
+          url="https://github.com/gohugoio/hugo/releases/download/v${HUGO_VERSION}/hugo_${HUGO_VERSION}_linux-amd64.tar.gz"
+          curl -sSLo /tmp/hugo.tar.gz "$url"
+          echo "${HUGO_SHA256}  /tmp/hugo.tar.gz" | sha256sum --check --strict
+          tar -xzf /tmp/hugo.tar.gz -C /tmp hugo
+          sudo install -m 0755 /tmp/hugo /usr/local/bin/hugo
+          hugo version
+
+      # Resolves the path this site will actually be served under. A project
+      # Pages site lives at /<repo>/, a user site or a custom domain at the
+      # root, and every link on this site is root-absolute - so the answer
+      # decides whether the rebase step below has to run at all. Only consulted
+      # when we are really deploying; a pull request builds at the root.
+      - name: Resolve the Pages base path
+        id: pages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/configure-pages@v5
+        # If Pages is not enabled on the repository this step fails; the build
+        # and the link check should still run and still produce an artifact, so
+        # the failure is left to the deploy job, where it is actionable.
+        continue-on-error: true
+
+      - name: Build the site
+        run: hugo --gc --minify --source docs
+
+      # Markdown authored `/how-to/...` and a Python injector wrote `/css/...`;
+      # neither passes through Hugo's URL rewriting, so a subpath deployment is
+      # fixed here, over the output, once.
+      - name: Move the site under the serving prefix
+        if: steps.pages.outputs.base_path != '' && steps.pages.outputs.base_path != '/'
+        run: python3 docs/tools/rebase-links.py "${{ steps.pages.outputs.base_path }}"
+
+      # The three surfaces are built by three different tools and link into each
+      # other. This is the only thing that checks the joins.
+      - name: Check every internal link
+        run: |
+          python3 docs/tools/check-links.py \
+            --prefix "${{ steps.pages.outputs.base_path }}"
+
+      - name: Upload the site
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-site
+          path: docs/public
+          retention-days: 14
+
+      - name: Upload for Pages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/public
+
+  deploy:
+    name: Publish to GitHub Pages
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

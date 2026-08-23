@@ -1,0 +1,17 @@
+# Hugo build output.
+/public/
+/resources/
+
+# The two generated API trees. Both are large (8.4 MB and 6.2 MB), both are regenerated in
+# full by a single command, and neither is hand-edited - see README.md. The repository root
+# .gitignore covers none of this: it has build/, not public/, resources/ or static/api/.
+/static/api/cpp/
+/static/api/js/
+
+# Hugo leaves this behind on every build.
+/.hugo_build.lock
+
+# The webfonts, fetched and subset by tools/fetch-fonts.py rather than committed.
+# See static/fonts/README.md - that file, and only that file, is tracked here.
+/static/fonts/*.woff2
+/static/fonts/OFL-*.txt

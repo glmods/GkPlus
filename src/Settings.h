@@ -59,6 +59,8 @@ std::string GetJson(const char *path);
 // wants the change on disk calls Save(), which is one write for any number of
 // changes.
 bool SetJson(const char *path, const char *json);
+/// Deletes the value at `path` and everything under it. False when there was
+/// nothing there. Does not save.
 bool Remove(const char *path);
 
 // What shape the value at `path` has, and what is in it if that is an object.
@@ -67,16 +69,24 @@ bool Remove(const char *path);
 // An empty path is the document itself - the one place that is meaningful, see
 // json::Document::KindAt.
 json::Kind KindAt(const char *path);
+/// The own keys of the object at `path`, in document order. Empty when `path`
+/// is absent or is not an object.
 std::vector<std::string> Keys(const char *path);
 
 // Typed convenience over the two above. A value of the wrong type reads as
 // absent rather than being coerced: a `true` where a number belongs is a mistake
 // in the file, and silently making it 1 would hide it.
 bool GetBool(const char *path, bool fallback);
+/// The number at `path`, or \p fallback when it is absent or not a number.
 double GetNumber(const char *path, double fallback);
+/// The string at `path`, or \p fallback when it is absent or not a string.
 std::string GetString(const char *path, const char *fallback);
+/// Writes a boolean at `path`, creating the intermediate objects the path
+/// names. Does not save. False means the path could not be written.
 bool SetBool(const char *path, bool value);
+/// Writes a number at `path`, creating intermediate objects. Does not save.
 bool SetNumber(const char *path, double value);
+/// Writes a string at `path`, creating intermediate objects. Does not save.
 bool SetString(const char *path, const char *value);
 
 // Whether `path` has a value at all - which is how "the file says nothing about

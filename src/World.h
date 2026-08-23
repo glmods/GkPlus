@@ -19,9 +19,16 @@ namespace gk {
 // Both angles are degrees. `SunAngle2` @ 0x006a311c is stored in **BAM**
 // (4096 to a turn) rather than degrees, unlike everything else here.
 float GetSunAngle();
+/// Sets the sun's first angle from \p degrees and rebuilds the direction
+/// vector from both angles. Round-tripping through GetSunAngle() is lossy in
+/// the last bits, because the vector is what is stored.
 void SetSunAngle(float degrees); // 0x0043e540, __stdcall, RET 0x4
 
+/// The sun's second angle, in degrees. The stored global is in BAM, so this
+/// converts on the way out.
 float GetSunAngle2();
+/// Sets the sun's second angle from \p degrees, converting to BAM, and
+/// re-applies the first angle the way `SUNANGLE2` does.
 void SetSunAngle2(float degrees);
 
 // 0x0043e710, __stdcall(r, g, b, a), RET 0x10. Components run 0..1.
@@ -71,6 +78,9 @@ bool HasFog(); // is FogSystem non-null - i.e. is a level loaded
 // flag - 3 when the device supports the two extensions it probes - so there is
 // no matching getter and `GetFogMode` reports the raw value instead.
 void SetFogEnabled(bool enabled);
+/// The fog mode in force: 1, 2 or 3, and 0 when there is no level. Not a
+/// boolean: SetFogEnabled(true) picks 3 on a device that supports both
+/// extensions it probes and a lower mode otherwise.
 int GetFogMode(); // 0 when there is no level
 
 // Plain floats on the fog object. `transition` also maintains the reciprocal the
@@ -112,5 +122,9 @@ float GetFogTransition(); void SetFogTransition(float metres); // +0xac, +0xb0
 // every texel, so skipping the upload there would leave the old colour on
 // screen.
 void GetFogColor(float *rgba);
+/// Sets the fog colour through the engine's own `FogOfWar_SetColour`, which
+/// re-expands and re-uploads the fog texture, the expensive path described
+/// above. Components run 0..1. A no-op when no level is loaded, since the fog
+/// system is then null.
 void SetFogColor(float r, float g, float b, float a);
 } // namespace gk

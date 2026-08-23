@@ -84,6 +84,9 @@ void Instant(uint16_t site);
 // Plotted against the frame timeline rather than summed.
 void Counter(uint16_t site, uint32_t value);
 
+/// RAII scope timer. Opens on construction when its category is in the active
+/// mask and closes on destruction; when the category is off, the whole thing
+/// is a load, a test and a not-taken branch.
 class Zone {
 public:
   Zone(uint16_t site, Cat cat) : begin_(0), site_(site) {
@@ -182,8 +185,13 @@ inline constexpr uint32_t kMaxStackFrames = 32;
 // Main thread only - it allocates, and the sampler thread it starts must not be created from
 // inside a suspended-thread window.
 bool Arm(const Config &config);
+/// Stops the sampler and clears the active mask, so no further zone records.
+/// The rings stay allocated; see Arm(). Main thread only.
 void Disarm();
+/// Whether recording is currently on.
 bool Armed();
+/// The Config in force, or the defaults before the first Arm(). The reference
+/// stays valid across an Arm(), whose values it then reflects.
 const Config &CurrentConfig();
 
 // Changes which categories record. Remembered for the next Arm either way, but only published
@@ -209,6 +217,8 @@ struct FrameSummary {
   uint64_t t_begin = 0;
 };
 
+/// One instrumented zone's totals over a window, as Zones() returns them.
+/// `self_ms` is inclusive time minus the time attributed to nested zones.
 struct ZoneRow {
   const char *name = "";
   uint32_t calls = 0;
@@ -218,6 +228,8 @@ struct ZoneRow {
   uint32_t thread = 0; // slot index; see Threads()
 };
 
+/// One sampled address and how often the sampler landed on it, as Samples()
+/// returns them. Flat: no caller information, which is Stacks()'s job.
 struct SampleRow {
   uint32_t address = 0; // absolute EIP, resolved to module+rva at format time
   uint32_t samples = 0;
@@ -234,6 +246,8 @@ struct StackRow {
   uint32_t thread = 0;
 };
 
+/// One thread the profiler has seen record something, as Threads() returns
+/// them. `slot` is what a ZoneRow's or SampleRow's `thread` refers to.
 struct ThreadInfo {
   uint32_t slot = 0;
   uint32_t id = 0;
@@ -284,6 +298,8 @@ std::vector<SampleRow> Samples(const Window &window);
 // armed with `stacks`. `limit` of 0 means all.
 std::vector<StackRow> Stacks(const Window &window, uint32_t limit);
 
+/// The threads the profiler knows about. A thread appears only once it has
+/// *recorded* something; there is no discovery pass, deliberately.
 std::vector<ThreadInfo> Threads();
 
 // --- the trigger ----------------------------------------------------------------------------
@@ -312,6 +328,7 @@ struct TriggerConfig {
   uint32_t post = 30;
 };
 
+/// One window the trigger copied out of the rings, as Captures() returns them.
 struct CaptureInfo {
   uint32_t index = 0;        // position in Captures(), which is what CaptureWindow takes
   uint64_t frame_index = 0;  // the frame that fired it
@@ -326,14 +343,22 @@ struct CaptureInfo {
   bool truncated = false;
 };
 
+/// Replaces the trigger configuration wholesale, so every field is taken from
+/// \p config, so a partial update has to read Trigger() first.
 void SetTrigger(const TriggerConfig &config);
+/// The trigger configuration in force.
 const TriggerConfig &Trigger();
 // The running median frame time the trigger compares against, over the last 64 frames. Exposed
 // because a threshold nobody can see the baseline for is a threshold nobody can set.
 double BaselineMs();
+/// The captures the trigger has taken, oldest first. Each one's index is what
+/// the window's `capture` selector takes.
 std::vector<CaptureInfo> Captures();
+/// Discards every capture and frees the storage they hold.
 void ClearCaptures();
 
+/// One registered instrumentation site, as SiteList() returns them. A site
+/// appears once its code has executed at least once, armed or not.
 struct SiteInfo {
   const char *name = "";
   Cat cat = Cat::None;
@@ -342,6 +367,7 @@ struct SiteInfo {
 // armed or not. What `prof.sites` lists, and the answer to "is this path instrumented".
 std::vector<SiteInfo> SiteList();
 
+/// The sampling thread's own counters, as Sampler() returns them.
 struct SamplerStats {
   bool running = false;
   uint32_t hz = 0;      // what was asked for
@@ -362,6 +388,9 @@ struct SamplerStats {
   // and got 566 - and a flat profile is only proportional to time if the sampling is uniform.
   double effective_hz = 0.0;
 };
+/// The sampler's own counters. Read `effective_hz` rather than the requested
+/// rate: a flat profile is only proportional to time if the sampling was
+/// uniform.
 const SamplerStats &Sampler();
 
 // What the profiler costs itself: the per-frame bookkeeping, timed by the same clock. Read it
@@ -372,6 +401,7 @@ double OverheadMs();
 // Read-time only - the sampler stores raw addresses.
 std::string Describe(uint32_t address);
 
+/// The outcome of a LoadSymbols() call.
 struct SymbolLoad {
   bool ok = false;
   uint32_t entries = 0;
@@ -399,6 +429,10 @@ std::string SymbolDirectory();
 // developer artifact, not game data.
 bool WriteTrace(const std::string &path, const Window &window, std::string *error);
 
+/// Rewinds every ring head, the frame count and the sampler counters, leaving
+/// the profiler armed and the configuration untouched. What to call before a
+/// measurement so the window contains only the run under test. Captures
+/// already taken are kept; see ClearCaptures().
 void Reset();
 
 } // namespace gk::prof

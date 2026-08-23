@@ -63,12 +63,15 @@ void LogAt(Severity level, const char *text);
 // The threshold, default `Severity::Debug` (everything). `console.level` is the
 // script-facing name.
 void SetLogLevel(Severity level);
+/// The threshold currently in force.
 Severity LogLevel();
 
 // The lowercase name of a level, and the reverse. The reverse returns false for
 // an unknown name rather than guessing, so a typo in `console.level` raises
 // instead of silently going quiet.
 const char *SeverityName(Severity level);
+/// The Severity \p name stands for, written to \p out.
+/// \return false, leaving \p out untouched, for an unknown name.
 bool SeverityFromName(const char *name, Severity *out);
 
 // Reports (and clears) ctx's pending exception through Log, prefixed with

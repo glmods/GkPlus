@@ -120,6 +120,8 @@ CustomLevel *AddCustomLevel(const char *title, const CustomLevelMap &map,
                             CustomLevelSetup setup,
                             CustomLevelMessage message, void *user);
 
+/// The title \p level was registered under, as given. Borrowed and stable,
+/// since registrations are never freed and never move.
 const char *CustomLevelTitle(const CustomLevel *level);
 // This level's ScriptFileName - a virtual name, not a file that exists.
 const char *CustomLevelScriptFile(const CustomLevel *level);
@@ -131,6 +133,8 @@ const char *CustomLevelScriptFile(const CustomLevel *level);
 // empty list it insists on - so this finds a level from the moment
 // AddCustomLevel returns, which the game's own list does not.
 CustomLevel *CustomLevelByTitle(const char *title);
+/// The `map` description \p level was registered with. A reference into the
+/// registration, which outlives every caller.
 const CustomLevelMap &CustomLevelDescription(const CustomLevel *level);
 
 // The custom level LoadLevel is building right now, or null when the game is

@@ -23,6 +23,10 @@ struct LevelMeshTri {
 };
 static_assert(sizeof(LevelMeshTri) == 0x1c);
 
+/// One quad of the level's collision/navigation mesh, 0x20 bytes. Same shape
+/// as LevelMeshTri with a fourth vertex; `flags` bit 0x100 means blocked, and
+/// a face is walkable iff that bit is clear and `plane`'s Y component is
+/// negative (`level_loading_notes.md` §5.5).
 struct LevelMeshQuad {
   Vec3 *v0;
   Vec3 *v1;
@@ -33,6 +37,10 @@ struct LevelMeshQuad {
 };
 static_assert(sizeof(LevelMeshQuad) == 0x20);
 
+/// The header of one level-geometry section, 0x18 bytes: counts and pointers
+/// for the triangles, quads and shared vertices it owns. The vertices are
+/// shared by pointer, which is why a weld can leave a triangle degenerate,
+/// the cause of the `/GS` fast-fail in `game_defects_notes.md` §5.
 struct LevelMeshHeader {
   int tri_count;
   LevelMeshTri *tris;
@@ -137,6 +145,15 @@ struct RefCountedBase {
 };
 static_assert(sizeof(RefCountedBase) == 0x8);
 
+/// The loaded level. The engine's own `Map`, and one of the two places in this
+/// codebase that models real multiple inheritance: MapBase is 0xa4 bytes, so
+/// RefCountedBase's vptr lands at 0xa4 exactly. Each base carries its own
+/// `static_assert(sizeof(...))`, and `offsetof(Map, refcount) == 0xa8` on the
+/// composite is what proves the split; see the convention note in
+/// `CLAUDE.md`.
+///
+/// The remaining field offsets are in `address_map.md`; how one is built is
+/// `level_loading_notes.md`.
 struct Map : MapBase, RefCountedBase {
   bool adjacency_built;   // 0x0ac run-once gate in LoadOrBuildSectionAdjacency
   bool field0xad;         // 0x0ad
@@ -227,6 +244,8 @@ static_assert(sizeof(TeamSlot) == 0xc4);
 Map *GetCurrentMap();
 // TeamSlots @ 0x007b3ec4 (stride 0xc4) / NumTeamSlots @ 0x007b3ec0.
 TeamSlot *GetTeamSlots();
+/// How many entries GetTeamSlots() has. The bound every team index is checked
+/// against; it is a fixed table, not a per-level count.
 int GetNumTeamSlots();
 
 // The map origin the level was built with. Map stores it negated (see neg_origin);

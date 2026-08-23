@@ -71,11 +71,16 @@ std::vector<std::string> RecentVirtualizedOpens();
 // bound by syscall count, not by bytes. `sites` is what names the caller: an RVA
 // into gl.exe, resolvable against the Ghidra database or the profiler's symbol map.
 struct ReadStats {
+  /// One calling site in gl.exe and what it read. `rva` is an offset into the
+  /// module, resolvable against the Ghidra database or the profiler's symbol
+  /// map, rather than a runtime address.
   struct Site {
     uintptr_t rva;
     uint64_t calls;
     uint64_t bytes;
   };
+  /// One bucket of the read-size histogram: how many calls asked for at least
+  /// `at_least` bytes and fewer than the next bucket's.
   struct Bucket {
     uint32_t at_least;
     uint64_t calls;
@@ -87,7 +92,11 @@ struct ReadStats {
   std::vector<Site> sites; // most calls first
 };
 
+/// A snapshot of the read counters. With `GKPLUS_FILE_STATS` unset the result
+/// has `enabled == false` and every count zero rather than being unavailable.
 ReadStats ReadAccounting();
+/// Zeroes the read counters, so a measurement can be scoped to one level load
+/// rather than to the session.
 void ResetReadAccounting();
 
 // RAII, like every other *System: construct inside a Detours transaction from

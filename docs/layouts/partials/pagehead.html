@@ -1,0 +1,16 @@
+{{- /* Eyebrow, title, audience tags, lede: the same masthead on every page.
+
+     The eyebrow names the quadrant, which is the one thing a reader needs to
+     know before reading a word: a tutorial and a reference page make very
+     different promises. The audience tags come from each page's own
+     `audience:` front matter, so they are content rather than decoration. */ -}}
+{{- with .FirstSection }}{{ if ne .RelPermalink $.RelPermalink }}
+<span class="gk-eyebrow">{{ .Title }}</span>
+{{- end }}{{ end }}
+<h1>{{ .Title }}</h1>
+{{- with .Params.audience }}
+<ul class="gk-tags">
+  {{- range . }}<li class="gk-tag">{{ replace . "-" " " }}</li>{{ end }}
+</ul>
+{{- end }}
+{{- with .Description }}<p class="gk-lede">{{ . }}</p>{{ end }}

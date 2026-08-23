@@ -1,0 +1,153 @@
+/* ============================================================================
+   GkPlus documentation: one stylesheet for every surface.
+
+   Loaded by the Hugo templates AND injected into the generated clang-doc and
+   TypeDoc trees by docs/tools/unify-api.py, which is what makes the API
+   reference look like the rest of the site instead of two foreign islands.
+
+   The palette is measured off the game's own shipped manual
+   (<Gunlok>/html manual/), not invented:
+
+     manual.htm   bgColor=#000000  bgcolor=#330033  text=#ffffff  link=#ff0000
+     purp_bg.jpg  black ground, violet nebula, fine cyan circuit lattice
+     cover.jpg    heavy squarish white caps over violet blueprint linework
+     tab.jpg      a black plate, a violet frame rule, an acid-green readout,
+                  white tracked caps callouts
+
+   The one deliberate departure: the manual's links are pure red. Red is kept
+   here as a signal (hover, alerts, danger) rather than as the body link
+   colour, because a documentation page carries hundreds of links and a page
+   of red text reads as a page of errors.
+   ============================================================================ */
+
+/* ---------------------------------------------------------------- fonts */
+
+/* Squarish Sans CT, by Tim Larson, SIL Open Font License. A Bank Gothic in the
+   same lineage as the lettering on the Gunlok box and the manual's callouts.
+   One weight only, so hierarchy is carried by size, tracking and colour. */
+@font-face {
+  font-family: "Squarish Sans CT";
+  src: url("/fonts/squarish-sans-ct.woff2") format("woff2");
+  font-weight: 400; font-style: normal; font-display: swap;
+}
+/* IBM Plex Sans, SIL OFL. Variable, 100-700 from one file. */
+@font-face {
+  font-family: "IBM Plex Sans";
+  src: url("/fonts/ibm-plex-sans-var.woff2") format("woff2-variations"),
+       url("/fonts/ibm-plex-sans-var.woff2") format("woff2");
+  font-weight: 100 700; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  src: url("/fonts/ibm-plex-sans-var-italic.woff2") format("woff2-variations"),
+       url("/fonts/ibm-plex-sans-var-italic.woff2") format("woff2");
+  font-weight: 100 700; font-style: italic; font-display: swap;
+}
+/* IBM Plex Mono, SIL OFL. Chosen over the alternatives because this repo's
+   prose is full of hex (0x004ae960) and its 0/O and 1/l/I stay distinct. */
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("/fonts/ibm-plex-mono-400.woff2") format("woff2");
+  font-weight: 400; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("/fonts/ibm-plex-mono-600.woff2") format("woff2");
+  font-weight: 600; font-style: normal; font-display: swap;
+}
+
+/* --------------------------------------------------------------- tokens */
+
+:root {
+  --void:      #06050b;   /* the ground: manual.htm's bgColor, lifted off pure black */
+  --void-2:    #0a0812;   /* header and footer band */
+  --plate:     #140a1d;   /* panel fill: #330033 desaturated for large areas */
+  --plate-2:   #1c1029;   /* raised panel, table header */
+  --edge:      #3a1c4e;   /* the violet frame rule around every manual figure */
+  --edge-soft: #241533;
+
+  --ink:       #ece9f2;
+  --ink-dim:   #a49ab5;
+  --ink-faint: #837a99;   /* AA at body size on both the void and a plate */
+
+  --lattice:   #7cc7e8;   /* the cyan grid in purp_bg.jpg */
+  --alert:     #ff5a5a;   /* manual.htm link=#ff0000, held back for signals */
+
+  /* The four reading modes, colour-coded the way the game colour-codes its
+     HUD. These are wayfinding, not decoration: a page's channel says which
+     kind of page it is before a word is read. */
+  --ch-tutorials:   #57f08c;
+  --ch-how-to:      #6fd0f2;
+  --ch-reference:   #c79bff;
+  --ch-explanation: #ffb03a;
+
+  --ch: var(--lattice);   /* current channel; set per section on <body> */
+
+  --measure: 46rem;
+  --bracket: 13px;        /* arm length of the HUD corner bracket */
+  --bracket-w: 2px;
+
+  --display: "Squarish Sans CT", "Bank Gothic", "Eurostile", "Arial Narrow", sans-serif;
+  --body: "IBM Plex Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --mono: "IBM Plex Mono", "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+}
+
+body[data-section="tutorials"]   { --ch: var(--ch-tutorials); }
+body[data-section="how-to"]      { --ch: var(--ch-how-to); }
+body[data-section="reference"]   { --ch: var(--ch-reference); }
+body[data-section="explanation"] { --ch: var(--ch-explanation); }
+
+/* ------------------------------------------------------------ primitives */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--void);
+  color: var(--ink);
+  font: 400 17px/1.65 var(--body);
+  font-feature-settings: "kern" 1;
+  text-rendering: optimizeLegibility;
+}
+
+/* The lattice from purp_bg.jpg: a fine circuit grid over a violet nebula.
+   Applied to chrome only, never behind running prose, where it would cost
+   contrast for nothing. */
+.gk-lattice {
+  background-color: var(--void-2);
+  background-image:
+    radial-gradient(120% 90% at 18% -10%, rgba(126, 45, 196, .30), transparent 62%),
+    radial-gradient(90% 70% at 88% 0%, rgba(60, 120, 190, .16), transparent 60%),
+    repeating-linear-gradient(to right,  rgba(124, 199, 232, .055) 0 1px, transparent 1px 48px),
+    repeating-linear-gradient(to bottom, rgba(124, 199, 232, .055) 0 1px, transparent 1px 48px),
+    repeating-linear-gradient(to right,  rgba(124, 199, 232, .028) 0 1px, transparent 1px 12px),
+    repeating-linear-gradient(to bottom, rgba(124, 199, 232, .028) 0 1px, transparent 1px 12px);
+}
+
+/* The signature: a HUD plate with four L-shaped corner brackets, exactly the
+   frame the game draws around a selected unit and around every panel in
+   tab.jpg. Eight gradients rather than pseudo-elements, so ::before and
+   ::after stay free for content and any element can become a plate. */
+.gk-plate {
+  position: relative;
+  background-color: var(--plate);
+  border: 1px solid var(--edge);
+  background-image:
+    linear-gradient(var(--ch), var(--ch)), linear-gradient(var(--ch), var(--ch)),
+    linear-gradient(var(--ch), var(--ch)), linear-gradient(var(--ch), var(--ch)),
+    linear-gradient(var(--ch), var(--ch)), linear-gradient(var(--ch), var(--ch)),
+    linear-gradient(var(--ch), var(--ch)), linear-gradient(var(--ch), var(--ch));
+  background-size:
+    var(--bracket) var(--bracket-w), var(--bracket-w) var(--bracket),
+    var(--bracket) var(--bracket-w), var(--bracket-w) var(--bracket),
+    var(--bracket) var(--bracket-w), var(--bracket-w) var(--bracket),
+    var(--bracket) var(--bracket-w), var(--bracket-w) var(--bracket);
+  background-position:
+    0 0, 0 0,
+    100% 0, 100% 0,
+    0 100%, 0 100%,
+    100% 100%, 100% 100%;
+  background-repeat: no-repeat;
+}

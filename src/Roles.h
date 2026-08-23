@@ -43,6 +43,13 @@ enum class AIType : int {
   Count,
 };
 
+/// The GLS `character` sub-object of a Role, 0xb8 bytes: perception, movement,
+/// combat and the AI type that decides which Actor subclass the role spawns.
+/// Built by `ToCharacter` @ 0x0047db80, which is also where the unit
+/// conversions live; field by field in `role_subobjects_notes.md`.
+///
+/// Several fields are 16.16 fixed point stored in an `int` rather than floats;
+/// see the comment on each.
 struct Character {
   // 16.16 fixed point, and an **int** - not a float. ToCharacter @ 0x0047db80
   // stores it with FISTP and re-reads its own stored integer with FILD; every
@@ -126,6 +133,12 @@ struct Character {
 };
 static_assert(sizeof(Character) == 0xb8);
 
+/// The GLS `light` sub-object of a Role, 0x1c bytes, the size `RoleDtor` and
+/// `ProjectileDtor` pool-free, which is what pins it.
+///
+/// The engine's lights author a **black specular** and a diffuse well above 1
+/// (`vulkan_renderer_notes.md` §4.48), so the three `specular_*` channels are
+/// usually zero even on a light that visibly highlights.
 struct Light {
   float red;
   float green;
@@ -137,6 +150,9 @@ struct Light {
 };
 static_assert(sizeof(Light) == 0x1c); // the size RoleDtor/ProjectileDtor pool-free
 
+/// The GLS `projectile` sub-object of a Role, 0x20 bytes. Every shot in the
+/// game builds an actor from one of these; there is no hitscan anywhere
+/// (`combat_notes.md`).
 struct Projectile { // GLS 'projectile'; see role_subobjects_notes.md
   bool gravity;         // 0x00 GLS 0x33
   uint8_t field0x1;     // padding
@@ -277,11 +293,17 @@ enum class DestructibilityKind : int {
   ReplaceDestructibility = 4,
 };
 
+/// What happens when a Role's actor dies: the base variant of a three-way
+/// family, 0x8 bytes, carrying nothing but the tag. `Frag` @ 0x0052e220
+/// dispatches on that tag, so the variant is chosen by value and not by
+/// vtable, so read `tag` before casting to FragData or ReplaceDestructibility.
 struct Destructibility {
   virtual ~Destructibility() = 0;
   DestructibilityKind tag; // Explode/Splatter for this base variant; else FragData/ReplaceDestructibility
 };
 
+/// The `DestructibilityKind::FragData` variant, 0x24 bytes: break into pieces,
+/// optionally spawning a replacement Role in place.
 struct FragData { // GLS `frag data`
   virtual ~FragData() = 0;
   DestructibilityKind tag; // = FragData
@@ -298,6 +320,8 @@ struct FragData { // GLS `frag data`
 };
 static_assert(sizeof(FragData) == 0x24);
 
+/// The `DestructibilityKind::ReplaceDestructibility` variant, 0x10 bytes:
+/// "run a script when the object dies".
 struct ReplaceDestructibility {
   virtual ~ReplaceDestructibility() = 0;
   DestructibilityKind tag; // = ReplaceDestructibility
@@ -347,6 +371,9 @@ inline constexpr int AmmoTypeCount = 19; // the stride of the Ammo table below
 inline constexpr int MaxAmmoType = 19;
 inline constexpr int MaxWeaponType = 33;
 
+/// What a Role looks like and reads as when it is sitting in an inventory: the
+/// held model, its shape, and the localized description. Assembled by `ToRole`
+/// and torn down by the dtor @ 0x004add40.
 struct InventoryInfo {
   // Refcounted, not pool-owned: the InventoryInfo dtor @ 0x004add40 releases
   // these through the hierarchy/shape release functions (0x00594b10 / 0x00599110).
@@ -458,7 +485,11 @@ static_assert(offsetof(Roles, chains) == 0x0c);
 // The global role/entity hash @ 0x007b48f0. Iterate with begin()/end().
 Roles *GetRolesTable();
 
+/// The Role registered under \p name, or nullptr. The name is the GLS
+/// identifier; the table owns the Role, so the pointer is borrowed and stays
+/// valid until `DestroyRoles`.
 Role *GetRoleByName(const char *name); // 0x004ae030
+/// The Role with \p id, or nullptr. Borrowed, as above.
 Role *GetRoleById(int id);             // 0x004ae0d0
 
 // SpawnRole @ 0x00503710 -> spawned actor id.
@@ -468,6 +499,7 @@ int SpawnRole(int team_id, Role *role, Vec3 *position, Vec4 *orientation,
 // Lowercase name for an AIType (e.g. AIType::TrackObject -> "track_object"), or
 // nullptr if out of range; and the inverse (AIType::Count if the name is unknown).
 const char *AITypeName(AIType type);
+/// The AIType \p name stands for, or AIType::Count when the name is unknown.
 AIType AITypeFromName(const char *name);
 
 // --- GLS enum keyword tables --------------------------------------------------
@@ -498,21 +530,33 @@ struct EnumEntry {
 // section default meaning "none", which has no keyword: `weapon type none` is a
 // syntax error, and the default is reachable only by omitting the field.
 const EnumEntry *WeaponTypeNames(size_t *count);
+/// The GLS keyword for a weapon type, or nullptr when \p value is not one of
+/// the recovered entries, which includes 10, 15 and everything above 33.
 const char *WeaponTypeName(int value);   // nullptr when unknown
+/// The weapon type \p name stands for, or -1 when the name is unknown.
 int WeaponTypeFromName(const char *name); // -1 when unknown
 
 // GLS `ammo type` (0x17). Complete: 0..18, bounded 0..19 by the constructor.
 const EnumEntry *AmmoTypeNames(size_t *count);
+/// The GLS keyword for an ammo type, or nullptr when \p value is not one.
 const char *AmmoTypeName(int value);
+/// The ammo type \p name stands for, or -1 when the name is unknown.
 int AmmoTypeFromName(const char *name);
 
 // The two small role enums above, by name.
 const char *ActionOnDeathName(ActionOnDeath value);
+/// The ActionOnDeath \p name stands for, or ActionOnDeath::Unspecified when
+/// the name is unknown. An unknown name is not distinguishable from the
+/// keyword for Unspecified.
 ActionOnDeath ActionOnDeathFromName(const char *name); // Unspecified when unknown
+/// The GLS keyword for a Resistance value.
 const char *ResistanceName(Resistance value);
+/// The Resistance \p name stands for, or Resistance::None when unknown.
 Resistance ResistanceFromName(const char *name); // None when unknown
 // GLS `type` in a pgenerator (0x41), bounded 0..12 - the 13 ParticleTypeInfos.
 const char *ParticleTypeName(ParticleType value);
+/// The ParticleType \p name stands for, or ParticleType::Explosion when
+/// unknown, which is also the keyword `explosion`'s own value.
 ParticleType ParticleTypeFromName(const char *name); // Explosion when unknown
 
 // AmmoInfos @ 0x007b5d40, indexed by ammo type.
@@ -524,5 +568,8 @@ AmmoInfo *GetAmmoInfos();
 // AmmoInfo that laps into the first slots of this table. No shipped script does,
 // but that is the game's bound, not a safe one.
 Ammo **GetAmmoTable();
+/// The Ammo entry for one (\p ammo_type, \p weapon_type) pair, i.e. the game's own
+/// compatibility test, since an incompatible pair has no entry. Borrowed;
+/// nullptr for an empty slot or an index outside the table.
 Ammo *GetAmmo(int ammo_type, int weapon_type);
 } // namespace gk

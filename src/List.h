@@ -32,6 +32,9 @@ namespace gk {
 
 template <typename T> struct List_Member;
 
+/// The part of a list node that carries no payload: vptr, `prev`, `next`.
+/// 0x0c bytes, and the type of the **sentinel**, which is why a sentinel has no
+/// `data` to read.
 template <typename T> struct List_Member_Base {
   // AvP declares `virtual ~List_Member_Base() {}`, so every node - including the
   // sentinel - carries a vptr at offset 0x00. The engine calls it as a scalar
@@ -42,6 +45,9 @@ template <typename T> struct List_Member_Base {
   List_Member_Base *next; // 0x08
 };
 
+/// A list node with its payload. `data` sits at 0x0c rounded up to
+/// `alignof(T)`: 0x0c for a pointer, 0x10 for an 8-aligned value type, which
+/// is what makes a `MenuListItem` node 0x78 rather than 0x10.
 template <typename T> struct List_Member : List_Member_Base<T> {
   T data;
 };
@@ -53,6 +59,17 @@ inline List_Member<T> *entry_of(List_Member_Base<T> *node) {
   return static_cast<List_Member<T> *>(node);
 }
 
+/// The list header the engine embeds wherever it keeps a collection: 0x10
+/// bytes of `{sentinel, n_entries, entry_pointers, calculated_indices}`.
+///
+/// A view over game memory, never something GkPlus constructs; there are no
+/// mutators here on purpose. Range-for over one terminates on the sentinel
+/// correctly by construction, which is the whole reason the template exists.
+///
+/// There is a **second, incompatible** list header in this binary whose
+/// sentinel is behind a pointer, putting `count` at +0x04 instead of +0x0c.
+/// Modelling one as the other shifts every field by 8, so check which you have
+/// before embedding this. `CLAUDE.md` names the known instances.
 template <typename T> struct List {
   using value_type = T;
 
@@ -65,6 +82,8 @@ template <typename T> struct List {
   T **entry_pointers;            // 0x08
   bool calculated_indices;       // 0x0c 1 = entry_pointers is up to date
 
+  /// Forward iterator over the payloads, sentinel-safe: `end()` is the
+  /// sentinel itself and is never dereferenced.
   struct iterator {
     using iterator_category = std::forward_iterator_tag;
     using value_type = T;

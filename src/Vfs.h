@@ -194,6 +194,8 @@ struct Mod {
 // forever and the game runs unmodified. That is also what happens when there is
 // no mods directory, which is the common case.
 bool Initialize();
+/// Whether Initialize() has run and succeeded. False both before the first
+/// intercepted open and after a failure the layer has remembered.
 bool IsInitialized();
 // Unmounts everything and removes the materialization directory. Nothing may
 // call into this namespace afterwards except Initialize().
@@ -287,6 +289,12 @@ std::optional<std::string> Resolve(const char *engine_path);
 // `User Interface/Main Menu.RIF`).
 
 bool Exists(const char *vpath);
+/// Reads the whole of `vpath` into \p out, replacing whatever was there.
+///
+/// \return false when no enabled mod provides `vpath`, or the read failed; the
+///         contents of \p out are then unspecified. A miss is the ordinary
+///         case and is what makes the engine fall through to the real file;
+///         this never consults the base install.
 bool Read(const char *vpath, std::vector<char> *out);
 // `modtime` is Unix seconds, or -1 when the archive does not record one.
 bool Stat(const char *vpath, uint64_t *size, int64_t *modtime);

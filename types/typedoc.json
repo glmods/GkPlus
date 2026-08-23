@@ -1,0 +1,17 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["gk.d.ts", "imgui.d.ts"],
+  "tsconfig": "tsconfig.json",
+  "out": "../docs/static/api/js",
+  "name": "GkPlus scripting API",
+  "readme": "none",
+  "excludeExternals": true,
+  "includeVersion": false,
+  "githubPages": false,
+  "hideGenerator": true,
+  "navigationLinks": {
+    "Reference index": "/reference/javascript/"
+  },
+  "sort": ["source-order"],
+  "categorizeByGroup": true
+}

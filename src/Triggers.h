@@ -7,6 +7,9 @@
 #include <type_traits>
 
 namespace gk {
+/// Which condition a trigger fires on. The 22 kinds and the console syntax
+/// that creates each are in `trigger_system_notes.md`; the enum's values are
+/// the engine's own, taken from the `ADD TRIGGER` keyword table.
 enum class TriggerKind {
   Death,
   Location,
@@ -74,6 +77,14 @@ struct TriggerListHead {
   bool cache_valid;
 };
 
+/// One registered trigger, 0x68 bytes: the engine's record of "when this
+/// happens, run that script". One layout serves all 22 kinds, so which of
+/// `coords`, `time_or_radius` and `team_or_warning` carries meaning depends on
+/// `kind`; `trigger_system_notes.md` has the per-kind table.
+///
+/// `script_name` is where the `{kind, body}` envelope lives
+/// (`src/ScriptQueue.h`), so it is not always a file name, and `SaveGame`
+/// writes it verbatim.
 struct TriggerData {
   TriggerKind kind;
   Vec3 coords[4];
@@ -91,11 +102,20 @@ static_assert(sizeof(TriggerData) == 0x68);
 // --- Native API over the trigger system -------------------------------------
 
 TriggerList *CopyList(TriggerList *dst, TriggerList *src);   // 0x0044c950
+/// Initialises \p list as an empty target list: sentinel, zero count.
+/// \return \p list.
 TriggerList *InitList(TriggerList *list);                    // 0x0044ca10
+/// Initialises \p list with one entry. At every call site in the game the
+/// element is the empty string, not an actor name, despite the exported name.
+/// \return \p list.
 TriggerList *InitListWithActorName(TriggerList *list,
                                    const char **name);       // 0x0044c900
+/// Builds a trigger over \p list and registers it in the global trigger list.
+/// \return the new trigger, owned by that global list.
 ITrigger *CreateTrigger(TriggerList *list,
                         const char **actor_name);            // 0x0044e8c0
+/// Destroys every node of \p list and its sentinel. The header itself is the
+/// caller's.
 void DeleteList(TriggerList *list);                          // 0x0044ce40
 // AddTriggerToGlobalList @ 0x0043e240 - registers exactly ONE trigger (it
 // pool_allocs one 0x68 TriggerData and one 0x10 node, links it into the single

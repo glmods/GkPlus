@@ -51,6 +51,8 @@ enum class Format {
   Argb32, // uncompressed B,G,R,A         - truecolour, see below
 };
 
+/// Whether \p format is one of the S3TC block formats, and therefore whether
+/// the 4x4 block rules below apply to it.
 constexpr bool IsCompressed(Format format) {
   return format == Format::Dxt1 || format == Format::Dxt3;
 }
@@ -93,6 +95,8 @@ constexpr uint32_t FourCc(Format format) {
 // through to the 32-bit descriptor. See the note above.
 constexpr int AlphaBits(Format format) { return format == Format::Dxt1 ? 0 : 8; }
 
+/// Bytes one 4x4 block occupies: 8 for DXT1, 16 for DXT3. Meaningless for the
+/// uncompressed formats, where LevelBytes() does not consult it.
 constexpr unsigned BlockBytes(Format format) { return format == Format::Dxt1 ? 8u : 16u; }
 
 // Bytes one mip level occupies, by the standard S3TC rule: whole 4x4 blocks, with

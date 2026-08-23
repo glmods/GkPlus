@@ -549,6 +549,10 @@ static_assert(offsetof(MotionSnapshot, position) == 0x04);
 static_assert(offsetof(MotionSnapshot, orientation) == 0x10);
 static_assert(offsetof(MotionSnapshot, velocity) == 0x20);
 
+/// An actor that can move: the base of everything with a nav agent, a
+/// perception cone and an order queue. 0x230 bytes, extending Actor's 0x120,
+/// pinned by the static_asserts below; the hierarchy and every subclass size
+/// are in `address_map.md`, the slot numbering in `actor_vtable_notes.md`.
 struct MobileActor : Actor {
   char pad0x120[0x40];
   Character *character;        // 0x160 cached role->character
@@ -707,6 +711,10 @@ struct BlockerActor : Actor {
 static_assert(sizeof(BlockerActor) == 0x130);
 static_assert(offsetof(BlockerActor, blocked_polys) == 0x120);
 
+/// A collectable or activatable object: a weapon, an item, a door panel.
+/// 0x150 bytes. Its class is not a field of its own: `pickup_type` is the
+/// role's `character->aggression * 10`, which `role_system_notes.md` maps to
+/// the pickup classes `body_slot_upgrades.gsh` names.
 struct PickupActor : Actor {
   int enabled;              // 0x120 slot 13
   int action_on_death;      // 0x124
@@ -782,6 +790,9 @@ static_assert(sizeof(ProjectileActor) == 0x178);
 static_assert(offsetof(ProjectileActor, flags) == 0x150);
 static_assert(offsetof(ProjectileActor, target_position) == 0x168);
 
+/// A piece of level geometry that moves along an authored spline: a lift, a
+/// door, a bridge. 0x1b8 bytes. Its path comes from the track list at
+/// `Map+0x24` and is evaluated as a cubic in `coeffs` rather than resampled.
 struct TrackObjectActor : Actor {
   bool affects_map;       // 0x120
   bool path_valid;        // 0x121
@@ -804,12 +815,18 @@ static_assert(sizeof(TrackObjectActor) == 0x1b8);
 static_assert(offsetof(TrackObjectActor, geometry) == 0x130);
 static_assert(offsetof(TrackObjectActor, riders) == 0x1a8);
 
+/// Scenery blown across the ground. Adds no fields to Actor (0x120); it is a
+/// distinct class only for its vtable overrides.
 struct TumbleweedActor : Actor {};
 static_assert(sizeof(TumbleweedActor) == 0x120);
 
+/// Ambient wildlife. Adds no fields to Actor (0x120).
 struct BackgroundCreatureActor : Actor {};
 static_assert(sizeof(BackgroundCreatureActor) == 0x120);
 
+/// A combatant: anything that carries a weapon and can attack. 0x308 bytes,
+/// and the most-subclassed node in the tree: `CentibodyActor`, `PopupActor`
+/// and through it `TurretActor` all extend it.
 struct CharacterActor : MobileActor {
   char pad0x230[0x28];
   float weapon_cycle_time;    // 0x258
@@ -886,6 +903,10 @@ static_assert(offsetof(CharacterActor, is_attacking) == 0x2d4);
 static_assert(offsetof(CharacterActor, attack_target) == 0x2d8);
 static_assert(offsetof(CharacterActor, field0x304) == 0x304);
 
+/// A spawner: a mobile actor whose job is to emit others along authored paths.
+/// 0x278 bytes. Despite the size it sits beside CharacterActor rather than
+/// under it; `address_map.md` records the round the tree drawing had this
+/// wrong.
 struct NodeActor : MobileActor {
   char pad0x230[8];    // 0x230/0x234 int64 spawn timestamp
   char pad0x238[0x20];
@@ -912,9 +933,12 @@ struct PresidentActor : MobileActor {
 static_assert(sizeof(PresidentActor) == 0x240);
 static_assert(offsetof(PresidentActor, exit_position) == 0x230);
 
+/// Airborne ambient wildlife. Adds no fields to BackgroundCreatureActor.
 struct FlyingBackgroundCreatureActor : BackgroundCreatureActor {};
 static_assert(sizeof(FlyingBackgroundCreatureActor) == 0x120);
 
+/// One segment of a multi-part creature, 0x310 bytes: a CharacterActor plus a
+/// link to the segment behind it. `CentipedeActor` is this with no additions.
 struct CentibodyActor : CharacterActor {
   Actor *next_segment; // 0x308 refcounted; the follow-the-leader body chain
   char pad0x30c[4];
@@ -922,6 +946,8 @@ struct CentibodyActor : CharacterActor {
 static_assert(sizeof(CentibodyActor) == 0x310);
 static_assert(offsetof(CentibodyActor, next_segment) == 0x308);
 
+/// A CharacterActor that stows and deploys, 0x310 bytes. The base of
+/// TurretActor; the two booleans are the whole of the extension.
 struct PopupActor : CharacterActor {
   bool deployed;                // 0x308
   bool transition_in_progress;  // 0x309
@@ -930,9 +956,13 @@ struct PopupActor : CharacterActor {
 static_assert(sizeof(PopupActor) == 0x310);
 static_assert(offsetof(PopupActor, deployed) == 0x308);
 
+/// The head of a centipede. Adds no fields to CentibodyActor (0x310); the
+/// difference is behavioural, in the vtable.
 struct CentipedeActor : CentibodyActor {};
 static_assert(sizeof(CentipedeActor) == 0x310);
 
+/// A deployable emplaced weapon, 0x320 bytes and the deepest class in the
+/// tree (Actor -> MobileActor -> CharacterActor -> PopupActor -> here).
 struct TurretActor : PopupActor {
   bool turret_enabled;      // 0x310 slots 100/103
   char pad0x311[7];         // 0x311 alignment; never read/written (ctor skips it)

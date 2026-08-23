@@ -26,6 +26,7 @@ using CustomMenuRefresh = void (*)(CustomMenuItem *item, void *user);
 // renderer resolved, what the device can do - not for anything that changes.
 using CustomMenuAvailable = bool (*)(void *user);
 
+/// Which of the game's item types a registration is drawn as.
 enum class CustomMenuItemKind {
   Action, // plain label; the click is the whole behaviour
   Toggle, // ON / OFF, drawn by the game from `value`
@@ -73,6 +74,10 @@ struct CustomMenuItem {
 CustomMenuItem *AddCustomMenuItem(MenuIndex menu, const char *label,
                                   CustomMenuAction action, void *user,
                                   CustomMenuOwner owner = CustomMenuOwner::Script);
+/// The same, as an ON/OFF row starting at \p initial. The registration owns
+/// the `int` the game binds by address, and \p action is called *after* the
+/// dispatch has flipped it. The game has no generic toggle handler, so this
+/// layer does the flip itself.
 CustomMenuItem *AddCustomMenuToggle(MenuIndex menu, const char *label,
                                     bool initial, CustomMenuAction action,
                                     void *user,
@@ -85,7 +90,13 @@ CustomMenuItem *AddCustomMenuValue(MenuIndex menu, const char *label,
                                    CustomMenuAction action, void *user,
                                    CustomMenuOwner owner = CustomMenuOwner::Script);
 
+/// Installs \p item's refresh callback, run once per reconcile and before the
+/// append pass, so a row that mirrors state something else owns is already
+/// correct on the frame it first appears.
 void SetCustomMenuRefresh(CustomMenuItem *item, CustomMenuRefresh refresh);
+/// Installs \p item's availability predicate. Consulted only when the item is
+/// about to be appended, so it filters at registration time and cannot take an
+/// item off a menu it is already on.
 void SetCustomMenuAvailable(CustomMenuItem *item, CustomMenuAvailable available);
 // Copies `text` into the item's own buffer, truncating at 31 characters. The
 // buffer never moves, which is the whole point: the game holds the pointer and

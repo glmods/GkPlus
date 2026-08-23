@@ -27,6 +27,10 @@ struct CommandData {
   int condition;
 };
 
+/// One node of the console's command registry: a singly-linked list, walked by
+/// longest-prefix match rather than by exact name. The whole registry, 280
+/// registrations and how the dispatch works, is in
+/// `console_command_notes.md`.
 struct CommandListElem {
   CommandData *command;
   CommandListElem *next;
@@ -47,7 +51,14 @@ struct CommandListElem {
 // know rather than to print asks here.
 bool ConsoleReady();
 
+/// Writes one line to the in-game console. A no-op until ConsoleReady(), so it
+/// is safe to call from the boot module even though nothing appears there.
+/// \param what CP_ACP text; the console draws bytes, not UTF-8.
 void Print(const char *what);                 // 0x004d4b50, a no-op until ready
+
+/// Dispatches one already-assembled command line through the registry's
+/// longest-prefix match, on the calling thread. Reports nothing: an unknown
+/// command is not an error here.
 void ExecuteCommandLine(const char *cmdline); // 0x004d59e0
 
 // ConsoleCommandLine @ 0x007b6958 is `char[252]`, so a command line may hold 251
@@ -64,6 +75,11 @@ void ExecuteCommandLine(const char *cmdline); // 0x004d59e0
 // can, so `ExecuteCommand` refuses anything longer and returns false rather than
 // truncating: a half-command is not a safer thing to run than none.
 inline constexpr int kConsoleCommandLineMax = 251;
+/// Copies \p cmd into the game's command-line buffer and runs it.
+/// \return false, having done nothing, when \p cmd is null or longer than
+///         kConsoleCommandLineMax. The bound is GkPlus's, added because the
+///         engine's copy loop has none. Otherwise true, which says the command
+///         was dispatched, not that it succeeded.
 bool ExecuteCommand(const char *cmd); // 0x004d6090
 
 // 0x0043f250. Appends the file's lines to the command queue - it does not run
@@ -77,6 +93,16 @@ bool ExecuteCommand(const char *cmd); // 0x004d6090
 // garbage - so it is a bool return, and none of the game's own six callers
 // reads it. The path is only ever handed to fopen, hence const.
 bool ExecuteCommandFile(const char *fileName);
+/// Adds a command to the registry.
+///
+/// \param name     matched by longest prefix, case-insensitively; the pointer
+///                 is stored, not copied, so it must outlive the process.
+/// \param help     the line `HELP` prints; likewise stored, not copied.
+/// \param callback invoked with the rest of the line still to be parsed.
+/// \param flags    the registration flags the engine's own commands use.
+///
+/// There is no unregister, and registering a name the engine already uses
+/// shadows it rather than being refused.
 void RegisterConsoleCommand(const char *name, const char *help,
                             ConsoleCommandCallback callback,
                             int flags); // 0x004d5d50
@@ -84,7 +110,9 @@ void RegisterConsoleCommand(const char *name, const char *help,
 // Console globals: CommandLine (char[252]) @ 0x007b6958, TextColor @ 0x007b6950,
 // CursorColor @ 0x007c149c.
 char *GetConsoleCommandLine();
+/// A pointer to the console's text colour global, writable in place.
 unsigned *GetConsoleTextColor();
+/// A pointer to the console's cursor colour global, writable in place.
 unsigned *GetConsoleCursorColor();
 
 // The registry, walked bucket by bucket. `NumRegisteredCommands` @ 0x007b6a70 is
@@ -99,7 +127,10 @@ unsigned *GetConsoleCursorColor();
 // ("QUIT")` does nothing on a French or German install. Enumerating the registry
 // is the only way to spell those portably.
 int GetRegisteredCommandCount();      // 0x007b6a70
+/// How many buckets GetCommandTable() has, i.e. the bound for walking it.
 int GetCommandTableBucketCount();     // 0x007b6a74
+/// The registry itself: an array of GetCommandTableBucketCount() chain heads,
+/// each a CommandListElem list. Borrowed; the engine owns every node.
 CommandListElem **GetCommandTable();  // 0x007b6a7c
 
 // The gate ConsoleExecuteCommandLine tests each CommandData::condition against.

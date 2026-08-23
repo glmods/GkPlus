@@ -30,8 +30,11 @@ enum class MenuItemType : int {
 
 // ChosenMenuItem pseudo-values. Real items use their 0-based index.
 inline constexpr int MenuItemNone = 0x100;
+/// ChosenMenuItem pseudo-value: the Back control rather than a list item.
 inline constexpr int MenuItemBack = 0x101;
+/// ChosenMenuItem pseudo-value: the scroll-up control.
 inline constexpr int MenuItemScrollUp = 0x102;
+/// ChosenMenuItem pseudo-value: the scroll-down control.
 inline constexpr int MenuItemScrollDown = 0x103;
 
 // Only six rows are ever visible; Menu::scroll_offset picks the first.
@@ -148,14 +151,22 @@ const char *ResourceString(unsigned id);
 
 // Menus[36] @ 0x007b76d0 and InGameMenus[7] @ 0x007b7578.
 Menu *GetMenus();
+/// InGameMenus[7]. A separate array with its own dispatch
+/// (`InGameMenu::OnItemActivated`), which `src/CustomMenu.h` does not cover.
 Menu *GetInGameMenus();
 
 // ChosenMenu @ 0x007b732c / ChosenMenuItem @ 0x006a7d6c (see the MenuItem* pseudo-
 // values). InGameMenuIndex @ 0x007b7270 / InGameMenuSelectedItem @ 0x006a89b4.
 MenuIndex GetChosenMenu();
+/// The highlighted item on the front-end menu, or one of the MenuItem*
+/// pseudo-values. GoToMenu() leaves it at 0x100, meaning nothing selected.
 int GetChosenMenuItem();
+/// Moves the highlight. Takes an item index or a MenuItem* pseudo-value; it is
+/// not range-checked against the menu's item count.
 void SetChosenMenuItem(int item);
+/// Which of the seven in-game menus is open.
 int GetInGameMenuIndex();
+/// The highlighted item on that in-game menu.
 int GetInGameMenuSelectedItem();
 
 // GoToMenu @ 0x004fbfa0 (remember = push the current menu as parent).
@@ -164,6 +175,7 @@ void GoToMenu(MenuIndex target, bool remember);
 // LevelList @ 0x007b74dc (the single-player campaign, seeded by
 // EnterMainMenuScreen) and MultiplayerLevelList @ 0x007b76b0.
 LevelList *GetLevelList();
+/// The multiplayer level list. Populated separately from the campaign one.
 LevelList *GetMultiplayerLevelList();
 
 // AddLevel @ 0x004efcc0 - the game's own level registration, and what the
@@ -185,6 +197,9 @@ void AddLevel(const char *title, const char *script_file,
 // OnMenuItemClicked and SetupCooperativeGameMenu re-read it. Anything wanting to
 // reach menu 5 after boot has to bring its own entry point.
 bool GetChooseLevelEnabled();
+/// Writes the flag. Setting it after `SetupMenus` has run does **not** add the
+/// "Choose Level" item; only the click dispatch and the cooperative-game
+/// menu re-read it.
 void SetChooseLevelEnabled(bool enabled);
 
 // PlayUiSound @ 0x0058cdd0 - __fastcall with the sound id in ECX and nothing in
@@ -205,7 +220,11 @@ void SetChooseLevelEnabled(bool enabled);
 // OnMenuItemClicked opens with UiSoundMenuSelect for *every* activation, so
 // anything that handles a click instead of the game has to play it too or the
 // item feels dead.
+/// The click sound `OnMenuItemClicked` opens with for every activation.
 inline constexpr int UiSoundMenuSelect = 0x57;
+/// Plays a UI sound.
+/// \return the sound engine's voice index, or one of 0, -1, -2 on its three
+///         distinct failures.
 int PlayUiSound(int sound_id);
 // IsAnyInGameMenuOpen @ 0x00569550.
 bool IsAnyInGameMenuOpen();
@@ -217,9 +236,20 @@ void CloseInGameMenu(int kind);
 // outlive the menu. AddItem @ 0x004f7a60, AddValueItem @ 0x004f7ae0,
 // AddToggleItem @ 0x004f7950, AddMultiValueItem @ 0x004f79d0.
 void MenuAddItem(Menu *menu, const char *label);
+/// Appends a `LabelWithValue` row whose right-hand text is a plain string,
+/// the only way to put arbitrary text on a Gunlok menu.
+/// \param label_is_static   false hands the label to `ClearItems` to free.
+/// \param value_text_owned  true hands the value text to it as well.
 void MenuAddValueItem(Menu *menu, const char *label, const char *value,
                       bool label_is_static, bool value_text_owned);
+/// Appends an ON/OFF row bound to `*value` **by address**: the game reads and
+/// writes through the pointer for as long as the item is on screen, so it must
+/// outlive the menu.
 void MenuAddToggleItem(Menu *menu, const char *label, int *value);
+/// Appends a cycling row bound to `*index` by address. \p labels is **doubly
+/// indirect**: the drawn text is `GetResourceString((*labels)[*index])`, so
+/// every choice must already exist in the localized string table. Both
+/// pointers must outlive the menu.
 void MenuAddMultiValueItem(Menu *menu, const char *label, int *index,
                            unsigned **labels);
 // ClearItems @ 0x004f7cd0 - all-or-nothing; there is no way to remove one item.

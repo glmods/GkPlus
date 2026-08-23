@@ -1,0 +1,17 @@
+{{ define "main" }}
+<article>
+  {{ partial "pagehead.html" . }}
+  {{ partial "body.html" . }}
+
+  {{ if not .RawContent }}
+    {{/* Pages are auto-listed only when the section wrote no prose of its own -
+         every _index.md here lists its pages already, and two lists of the same
+         links is worse than either. */}}
+    {{ with .RegularPages.ByWeight }}
+      <ul class="gk-pages">
+      {{ range . }}<li><a href="{{ .RelPermalink }}"><span class="gk-name">{{ .Title }}</span>{{ with .Description }}<span class="gk-desc">{{ . }}</span>{{ end }}</a></li>{{ end }}
+      </ul>
+    {{ end }}
+  {{ end }}
+</article>
+{{ end }}

@@ -61,16 +61,27 @@ CameraData *GetCameraData();
 // `SET CAMERA POS` does - writing the global alone leaves the view matrix stale
 // until something else happens to rebuild it.
 Vec3 GetCameraPosition();
+/// Moves the camera to \p pos in world units and rebuilds the view matrix, the
+/// way `SET CAMERA POS` does.
 void SetCameraPosition(Vec3 pos);
 
 // Yaw/roll/pitch in **degrees**, the units the console and the .gcs use.
 // SetCameraOrientation is `SET CAMERA ORI`: all three, then one matrix rebuild.
 float GetCameraYaw();
+/// The camera's roll, in degrees.
 float GetCameraRoll();
+/// The camera's pitch, in degrees.
 float GetCameraPitch();
+/// Sets the yaw, in degrees, and rebuilds the matrix. The engine converts to
+/// BAM internally to index its sine table, so the stored value read back may
+/// differ from \p degrees by the table's quantisation.
 void SetCameraYaw(float degrees);
+/// Sets the roll, in degrees, and rebuilds the matrix.
 void SetCameraRoll(float degrees);
+/// Sets the pitch, in degrees, and rebuilds the matrix.
 void SetCameraPitch(float degrees);
+/// Sets all three angles in degrees and rebuilds the matrix once, which is what
+/// `SET CAMERA ORI` does. Prefer it to three separate setters.
 void SetCameraOrientation(float yaw, float roll, float pitch);
 
 // CameraData::UpdateCameraMatrix @ 0x0044e560. Rebuilds the view matrix from the
@@ -84,9 +95,13 @@ void UpdateCameraMatrix();
 // DISTANCE` writes both, so these do too. Same story for the zoom-out limit:
 // MaxCameraDist1 @ 0x006a5748 and MaxCameraDist2 @ 0x007b9d18.
 float GetCameraDistance();
+/// Sets the camera's distance from its focus, writing both globals so the
+/// interpolator cannot undo it.
 void SetCameraDistance(float dist);
 
+/// The zoom-out limit currently in force.
 float GetMaxCameraDistance();
+/// Sets the zoom-out limit, writing both globals.
 void SetMaxCameraDistance(float dist);
 
 // CameraFocus @ 0x007b3e58, plus the two mode flags SetCameraFocusLocked
@@ -94,8 +109,13 @@ void SetMaxCameraDistance(float dist);
 // @ 0x007b3d0e. Setting a focus is `SET CAMERA FOCUS`, clearing it is
 // `FREE CAMERA FOCUS`.
 Vec3 GetCameraFocus();
+/// Points the camera at \p focus and latches both mode flags, as
+/// `SET CAMERA FOCUS` does.
 void SetCameraFocus(Vec3 focus);
+/// Releases the focus point, as `FREE CAMERA FOCUS` does. The value returned by
+/// GetCameraFocus() afterwards is stale rather than cleared.
 void ClearCameraFocus();
+/// Whether a focus point is currently latched.
 bool IsCameraFocusSet();
 
 // The camera's actor-tracking list, CameraTrackList @ 0x007b3e90 with its count
@@ -103,6 +123,9 @@ bool IsCameraFocusSet();
 // is `TRACK <id>`, which the engine does by broadcasting update 0xb4 rather than
 // by touching the list locally, so it has no local-only equivalent.
 bool IsCameraTracking();
+/// Empties the track list and clears the controls-disabled flag the engine
+/// sets while tracking. There is no local-only way to *start* a track; see
+/// above.
 void StopCameraTracking(); // ClearCameraTrack @ 0x00487e30, + ControlsDisabled
 
 // CurrentCameraIsPerspective @ 0x007c1470 - the engine's own record of whether the

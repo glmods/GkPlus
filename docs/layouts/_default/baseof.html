@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="{{ .Site.Language.Lang | default "en" }}">
+{{- $section := index (split (strings.TrimPrefix "/" .RelPermalink) "/") 0 -}}
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ if .IsHome }}{{ .Site.Title }}{{ else }}{{ .Title }} &middot; {{ .Site.Title }}{{ end }}</title>
+{{ with .Description | default .Site.Params.description }}<meta name="description" content="{{ . }}">{{ end }}
+<link rel="preload" href="/fonts/squarish-sans-ct.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/fonts/ibm-plex-sans-var.woff2" as="font" type="font/woff2" crossorigin>
+{{/* Tokens first, then the site's own rules. The generated API trees load that
+     same tokens file plus gkplus-api.css, which is what keeps three
+     differently-built surfaces on one palette and one set of webfonts. */}}
+<link rel="stylesheet" href="/css/gkplus-tokens.css">
+<link rel="stylesheet" href="/css/gkplus.css">
+</head>
+<body{{ with $section }} data-section="{{ . }}"{{ end }}>
+
+<a class="gk-skip" href="#gk-content">Skip to content</a>
+
+<header class="gk-header gk-lattice">
+  <a class="gk-brand" href="{{ "/" | relURL }}">GkPlus</a>
+  <nav class="gk-nav" aria-label="Sections">
+    {{- range .Site.Home.Sections.ByWeight }}
+    <a href="{{ .RelPermalink }}"{{ if eq (index (split (strings.TrimPrefix "/" .RelPermalink) "/") 0) $section }} aria-current="true"{{ end }}>{{ .Title }}</a>
+    {{- end }}
+    <a href="{{ "/api/cpp/" | relURL }}">C++&nbsp;API</a>
+    <a href="{{ "/api/js/" | relURL }}">JS&nbsp;API</a>
+  </nav>
+</header>
+
+
+<div class="gk-wrap">
+{{ if not .IsHome }}{{ $root := .FirstSection }}{{ if $root }}
+<nav class="gk-side" aria-label="In this section">
+  <p class="gk-sidetitle"><a href="{{ $root.RelPermalink }}">{{ $root.Title }}</a></p>
+  {{ with $root.Sections.ByWeight }}<ul>
+    {{ range . }}<li><a href="{{ .RelPermalink }}"{{ if eq .RelPermalink $.RelPermalink }} class="gk-here"{{ end }}>{{ .Title }}</a>
+      {{ with .RegularPages.ByWeight }}<ul>
+        {{ range . }}<li><a href="{{ .RelPermalink }}"{{ if eq .RelPermalink $.RelPermalink }} class="gk-here"{{ end }}>{{ .Title }}</a></li>{{ end }}
+      </ul>{{ end }}
+    </li>{{ end }}
+  </ul>{{ end }}
+  {{ with $root.RegularPages.ByWeight }}<ul>
+    {{ range . }}<li><a href="{{ .RelPermalink }}"{{ if eq .RelPermalink $.RelPermalink }} class="gk-here"{{ end }}>{{ .Title }}</a></li>{{ end }}
+  </ul>{{ end }}
+</nav>
+{{ end }}{{ end }}
+
+<main class="gk-main" id="gk-content">
+{{ block "main" . }}{{ end }}
+</main>
+</div>
+
+<footer class="gk-footer">
+  <p>{{ .Site.Title }} &mdash; organised by <a href="https://diataxis.fr/">Di&aacute;taxis</a>:
+  {{ range $i, $s := .Site.Home.Sections.ByWeight }}{{ if $i }} &middot; {{ end }}<a href="{{ $s.RelPermalink }}">{{ $s.Title }}</a>{{ end }}.
+  Generated API references: <a href="{{ "/api/cpp/" | relURL }}">C++</a> &middot; <a href="{{ "/api/js/" | relURL }}">JavaScript</a>.</p>
+  <p>Set in Squarish Sans CT by Tim Larson and IBM Plex, both under the SIL Open Font License.
+  Colours taken from Gunlok&rsquo;s own shipped manual. GkPlus is an unofficial project and ships no game content.</p>
+</footer>
+
+</body>
+</html>

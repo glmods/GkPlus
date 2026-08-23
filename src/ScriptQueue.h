@@ -155,6 +155,8 @@ std::string ScriptQueuePayload(const char *stored, bool *repaired = nullptr);
 // document. They exist so that the kind vocabulary stays in ScriptQueue.cpp -
 // nothing else in the codebase spells "file" or "message".
 std::string FileScriptPayload(const char *name);
+/// A complete `message` envelope around \p body_json, which must itself be one
+/// valid JSON document in UTF-8.
 std::string MessageScriptPayload(const char *body_json);
 
 // Receives the **body** of a `message` payload - what the sender passed, not the
@@ -187,6 +189,8 @@ void SetScriptMessageHandler(ScriptMessageHandler handler);
 // onto the loopback queue under its own lock, but a multiplayer host sends
 // DirectPlay traffic from wherever this is called.
 bool QueueScriptPayload(const char *envelope);
+/// Wraps \p body_json in a `message` envelope and queues it. \p body_json must
+/// be one valid JSON document in UTF-8.
 bool QueueScriptMessage(const char *body_json);
 
 // Hooks both ends of the channel. The four writers above encode a name as it is

@@ -1,0 +1,8 @@
+{{- /* Page body, with a leading <h1> removed.
+
+     Every page's title comes from front matter and the masthead renders it, but
+     three of the tutorials also open with a Markdown `# Heading`, which is
+     right for the raw file (GitHub renders no front matter) and wrong for the
+     site, where it produced the title twice and two <h1> elements on one page.
+     Stripping it here keeps both readings correct. */ -}}
+{{ .Content | replaceRE `(?s)\A\s*<h1[^>]*>.*?</h1>` "" | safeHTML }}

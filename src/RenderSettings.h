@@ -59,14 +59,22 @@ void SyncToSettings();
 // reads as "HDR does nothing on this machine".
 
 const char *TonemapName(std::uint32_t op);
+/// The tonemap operator \p name stands for, written to \p out.
+/// \return false, leaving \p out untouched, for a name that is not one of the
+///         operators, and never an approximation.
 bool TonemapFromName(const char *name, std::uint32_t *out);
 
 // A bloom layer's blend mode, spelled once for the same reason: it is written to
 // `settings.json` and handed back by `render.bloom_layers`.
 const char *BloomBlendName(vulkan::BloomBlend blend);
+/// The blend mode \p name stands for, written to \p out. False, and \p out
+/// untouched, for an unknown name.
 bool BloomBlendFromName(const char *name, vulkan::BloomBlend *out);
 
+/// The name a tessellation set is stored under.
 const char *TessSetName(vulkan::TessSet set);
+/// The tessellation set \p name stands for, written to \p out. False, and
+/// \p out untouched, for an unknown name.
 bool TessSetFromName(const char *name, vulkan::TessSet *out);
 
 } // namespace gk::render_settings

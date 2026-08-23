@@ -1,0 +1,45 @@
+{{ define "main" }}
+<article class="gk-index">
+
+  {{/* A documentation index, not a project home page. The eyebrow carries what
+       GkPlus is in four words so the title does not have to, and the title says
+       what this site is. Nothing here sells the software: what it is and why it
+       is shaped the way it is belongs to explanation, and is linked as such.
+
+       The wordmark, the tagline and the architecture diagram that used to open
+       this page were all answering "what is this project?" - a question the
+       reader of a documentation index has already answered for themselves. */}}
+  <span class="gk-eyebrow">GkPlus &middot; Gunlok modding framework</span>
+  <h1>{{ .Title }}</h1>
+  {{ with .Description }}<p class="gk-lede">{{ . }}</p>{{ end }}
+
+  {{/* Routes before prose. Someone arriving here is one of three people and
+       wants one of three first pages. The count beside each is derived from the
+       `audience:` front matter rather than written down, so it cannot drift
+       from what the site actually holds. */}}
+  {{ with .Site.Params.audiences }}
+  <h2 id="start-here">Start here</h2>
+  <div class="gk-routes">
+    {{- range . }}
+    {{/* site.Pages, not site.RegularPages: two section landing pages carry an
+           audience tag of their own, and RegularPages excludes them - which had the
+           developer count reading 24 against a true 26. */}}
+    {{- $tagged := where site.Pages "Params.audience" "intersect" (slice .id) }}
+    <div class="gk-route gk-plate">
+      <span class="gk-eyebrow">{{ .name }}</span>
+      <p class="gk-want">{{ .want }}</p>
+      <p class="gk-start"><a href="{{ .startUrl }}">{{ .startTitle }}</a></p>
+      {{- with .next }}
+      <ul class="gk-next">
+        {{- range . }}<li><a href="{{ .url }}">{{ .title }}</a></li>{{ end }}
+      </ul>
+      {{- end }}
+      <p class="gk-count">{{ len $tagged }} page{{ if ne (len $tagged) 1 }}s{{ end }} tagged for you</p>
+    </div>
+    {{- end }}
+  </div>
+  {{ end }}
+
+  {{ partial "body.html" . }}
+</article>
+{{ end }}
