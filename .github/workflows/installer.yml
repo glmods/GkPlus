@@ -136,15 +136,20 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
-      # NSIS ships on the windows-latest runner image but is not on PATH - the same thing
-      # a developer's own machine needs (see the Build section of CLAUDE.md), just already
-      # installed here instead of something this job has to fetch.
-      - name: Package the installer
+      # windows-latest does not carry NSIS - confirmed by running this job and reading its own
+      # failure ("Cannot find NSIS compiler makensis"), not assumed. Chocolatey does ship on the
+      # runner image, and its nsis package installs to this fixed path; GITHUB_PATH, not an
+      # inline $env:PATH edit, is what the other installed-tool steps above use too, since a
+      # choco-mutated machine PATH is not guaranteed to be visible to the *next* step's process.
+      - name: Install NSIS
         shell: pwsh
-        working-directory: build
         run: |
-          $env:PATH = "C:\Program Files (x86)\NSIS;$env:PATH"
-          cpack -G NSIS -C Release
+          choco install nsis --no-progress -y
+          "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Package the installer
+        working-directory: build
+        run: cpack -G NSIS -C Release
 
       - name: Upload the installer
         uses: actions/upload-artifact@v4
