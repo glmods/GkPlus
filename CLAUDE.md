@@ -39,6 +39,22 @@ cmake --build build --config RelWithDebInfo
 cmake --build build --target copy --config RelWithDebInfo
 ```
 
+`copy` is for iterating against a dev machine's own install and only ever looks at Steam's main
+library (`cmake/FindSteam.cmake` reads one registry key and stops). For handing `d3d8.dll` to
+someone else, `cpack -G NSIS` (from the build directory, needs NSIS's `makensis` on `PATH`) builds
+an installer whose Directory page defaults to wherever *their* Gunlok actually is: it reads Steam's
+own registry key, then - since Gunlok can be in any of their Steam libraries, not just the main one
+- reads `libraryfolders.vdf` (Valve's KeyValues format) to check every library in turn. That
+detection is `cmake/nsis/GunlokDetect.nsh`, hand-written NSIS script rather than a real VDF parser,
+wired in through `cmake/Packaging.cmake`'s `CPACK_NSIS_DEFINES` and MUI2's
+`MUI_PAGE_CUSTOMFUNCTION_PRE`/`_LEAVE` hooks on the Directory page. Two of its details are
+measurements, both found by actually running `cpack -G NSIS` and reading `NSISOutput.log` rather
+than by configuring clean: `CPACK_NSIS_DEFINES` is re-serialized into `CPackConfig.cmake` through a
+`set()` that escapes neither an embedded `"` nor an embedded `\`, so the `!include` path in it has
+to stay unquoted and its backslashes doubled or the *second* parse (by `cpack` itself) breaks; and
+`makensis`'s own `!include` fails a forward-slash absolute path outright ("could not find"), so
+that path has to be backslashed despite every other path in this codebase being forward-slashed.
+
 Two things had to be fixed before that build existed at all, and both failed in ways that do not
 look like themselves — if either regresses, this is the section to re-read:
 

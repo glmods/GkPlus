@@ -147,6 +147,10 @@ set_target_properties(GkPlus
     OUTPUT_NAME "d3d8"
     CXX_STANDARD 23)
 
+# The only file the NSIS installer (cmake/Packaging.cmake) packages - straight into the install
+# root, since that root is made to be Gunlok's own directory rather than one of GkPlus's own.
+install(TARGETS GkPlus LIBRARY DESTINATION . RUNTIME DESTINATION .)
+
 # The two generated headers are **build products in the binary tree**, not checked-in sources:
 # `${CMAKE_CURRENT_BINARY_DIR}/generated`, on GkPlus's include path and nowhere else.
 #
@@ -277,3 +281,6 @@ if(GKPLUS_COPY_DLL)
         ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:GkPlus>" "${STEAM_PATH}/steamapps/common/Gunlok/"
     )
 endif()
+
+# Must come after every install() above, and last in this file - CPack's own documented rule.
+include(cmake/Packaging.cmake)
