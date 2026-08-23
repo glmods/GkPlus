@@ -11,8 +11,14 @@ and no TypeScript at runtime, since the game loads the `.mjs` as-is.
 | `check-surface.py` | not a declaration file: it compares every `JSCFunctionListEntry` table in `src/Js*.cpp` against the interface that declares it, both directions. `tsc` cannot do this, because the bindings are C++ | a check - run `python3 types/check-surface.py` |
 | `imgui.d.ts` | the `ImGui` interface: 199 functions and 28 enums. A type only - there is no `"ImGui"` module and no global to call, because the calls are only valid inside `draw_gui` | **generated** - run `python3 types/gen-imgui-dts.py` |
 | `typedoc.json` | not a declaration file: the TypeDoc configuration that turns the two above into the browsable API reference under `docs/static/api/js/`. The TSDoc comments in `gk.d.ts` are what it renders | a config - see below |
+| `package.json` / `index.d.ts` | packages this folder as the npm module `@glmods/gkplus-types` (unpublished - `private: true`, `license: UNLICENSED`). `index.d.ts` has no content of its own, only `/// <reference>`s to `gk.d.ts` and `imgui.d.ts`, since neither is importable - one is an ambient module, the other a global | by hand, mechanical |
 
 ## Using them
+
+There are two ways to get these into a mod's own type checking; both end up
+checking the same two files.
+
+### Copied next to the script
 
 Copy `examples/jsconfig.json` and this folder next to your script:
 
@@ -28,6 +34,28 @@ VS Code picks `jsconfig.json` up on its own. On the command line:
 ```bash
 npx -y -p typescript tsc -p jsconfig.json
 ```
+
+### As an npm package
+
+For a mod that already has a `package.json` (an npm-based build, a monorepo of
+several mods), `types/` doubles as the source of an installable package
+without a registry: `npm pack` in this directory produces
+`glmods-gkplus-types-<version>.tgz`, which `npm install <path-to-tgz>` (or a
+`git+https://...#path:types` dependency, or a plain relative `file:` dependency
+pointing at this folder) installs like any other package. It is not published
+to the public registry - the license is intentionally `UNLICENSED` until that
+decision is made, so `npm publish` refuses to run.
+
+Once installed, point the consuming `tsconfig.json`/`jsconfig.json` at it by
+name rather than by path:
+
+```json
+{ "compilerOptions": { "types": ["@glmods/gkplus-types"] } }
+```
+
+which is what makes `import { actors } from "gk"` and the global `ImGui` type
+resolve - `@glmods/gkplus-types`'s `index.d.ts` is the thing being referenced,
+and it in turn references `gk.d.ts` and `imgui.d.ts`.
 
 Annotate the two entry points so the checker knows what it is looking at -
 `examples/main.mjs` shows the whole pattern:

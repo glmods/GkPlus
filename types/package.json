@@ -1,0 +1,30 @@
+{
+  "name": "@glmods/gkplus-types",
+  "version": "0.1.0",
+  "description": "TypeScript definitions for the GkPlus scripting API - the \"gk\" module and the ImGui overlay",
+  "private": true,
+  "license": "UNLICENSED",
+  "types": "index.d.ts",
+  "files": [
+    "index.d.ts",
+    "gk.d.ts",
+    "imgui.d.ts"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/glmods/GkPlus.git",
+    "directory": "types"
+  },
+  "homepage": "https://github.com/glmods/GkPlus/tree/main/types",
+  "bugs": "https://github.com/glmods/GkPlus/issues",
+  "keywords": [
+    "gkplus",
+    "gunlok",
+    "typescript",
+    "types",
+    "quickjs"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

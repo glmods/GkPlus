@@ -24,3 +24,5 @@ CMakeUserPresets.json
 /src/*.gen.inc.h
 # The docs site's generated output is ignored by docs/.gitignore, which names the two
 # generated API trees exactly rather than the whole of docs/static/.
+# `npm pack` writes its tarball beside types/package.json.
+/types/*.tgz

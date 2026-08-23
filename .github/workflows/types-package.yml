@@ -1,0 +1,59 @@
+name: Types package
+
+# Packages types/ as the npm module @glmods/gkplus-types (types/package.json) and uploads
+# the resulting tarball as a workflow artifact, so a PR touching the scripting API types
+# always produces something downloadable to sanity-check or hand to a mod author, without
+# publishing anywhere. The package is `private: true` and `UNLICENSED` (types/README.md),
+# so this never runs `npm publish` - only `npm pack`.
+#
+# Spelled out twice rather than shared with a YAML anchor, same as docs.yml: GitHub's
+# workflow parser accepts anchors but does not document them, and a parse failure here
+# means the workflow never runs at all.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'types/**'
+      - '.github/workflows/types-package.yml'
+  pull_request:
+    paths:
+      - 'types/**'
+      - '.github/workflows/types-package.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A superseded package build is worth nothing.
+concurrency:
+  group: types-package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: Package and upload
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Proves the declarations still type-check as the package a consumer actually
+      # installs (types/index.d.ts + the ambient gk.d.ts/imgui.d.ts), not just as the
+      # loose files types/tsconfig.json has always checked.
+      - name: Type-check
+        run: npx -y -p typescript tsc -p types/tsconfig.json
+
+      - name: Build the tarball
+        working-directory: types
+        run: npm pack
+
+      - name: Upload the package
+        uses: actions/upload-artifact@v4
+        with:
+          name: gkplus-types
+          path: types/*.tgz
+          retention-days: 14
