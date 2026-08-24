@@ -40,6 +40,27 @@ set(_xwin_crt_lib      "${XWIN_ROOT}/crt/lib/x86")
 set(_xwin_sdk_lib_um   "${XWIN_ROOT}/sdk/lib/um/x86")
 set(_xwin_sdk_lib_ucrt "${XWIN_ROOT}/sdk/lib/ucrt/x86")
 
+# Standard CMake cross-compiling hygiene, and not optional here: without it, a dependency's
+# own `find_library(M_LIB m)` (libspng's own CMakeLists.txt does exactly this, the ordinary
+# portable-CMake way to ask "do I need -lm on this platform") searches the *host's* library
+# paths by default even though CMAKE_SYSTEM_NAME says the target is Windows - and finds the
+# host's real libm.so, not a Windows library at all, then hands lld-link a request for a
+# nonexistent "m.lib". PROGRAM stays NEVER: host tools (python3, cmake helper scripts) live on
+# the host, not under XWIN_ROOT, and asking to find *those* only under the sysroot would break
+# every port that shells out to one during its build.
+#
+# APPEND, not set: vcpkg's own toolchain script has already populated CMAKE_FIND_ROOT_PATH
+# with vcpkg_installed/<triplet> by the time it chainloads this file, which is how
+# find_package(Vulkan) and friends find that tree's own exported *Config.cmake files -
+# overwriting it broke exactly that, measured, not assumed (the `vulkan` meta-port's own
+# portfile calls find_package(Vulkan) as its whole body, so it is a clean, minimal repro of
+# this specific mistake).
+list(APPEND CMAKE_FIND_ROOT_PATH "${XWIN_ROOT}")
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+
 find_program(CMAKE_C_COMPILER NAMES clang-cl clang-cl-22 clang-cl-21 clang-cl-20 REQUIRED)
 find_program(CMAKE_CXX_COMPILER NAMES clang-cl clang-cl-22 clang-cl-21 clang-cl-20 REQUIRED)
 find_program(CMAKE_LINKER NAMES lld-link REQUIRED)
@@ -81,10 +102,17 @@ set(_xwin_includes
 )
 list(JOIN _xwin_includes " " _xwin_includes_str)
 
+# Real cl.exe has enabled SSE2 codegen by default on x86 since VS2012, so code across the
+# vcpkg dependency set (libspng's PNG defilter, confirmed) uses <emmintrin.h> intrinsics with
+# no feature-detection guard of its own, assuming that default. clang-cl's own default for a
+# plain i686 target does not include it, and unlike the missing vcruntime/ucrt defaultlibs,
+# this cannot be pushed onto the one target that needs it - it would have to be pushed onto
+# every dependency that turns out to need it, discovered one at a time. -msse2 once, here,
+# matches what these dependencies already assume they can rely on.
 set(CMAKE_C_FLAGS_INIT
-    "-m32 -fms-compatibility -fms-extensions ${_xwin_includes_str}")
+    "-m32 -msse2 -fms-compatibility -fms-extensions ${_xwin_includes_str}")
 set(CMAKE_CXX_FLAGS_INIT
-    "-m32 -fms-compatibility -fms-extensions -fdelayed-template-parsing ${_xwin_includes_str}")
+    "-m32 -msse2 -fms-compatibility -fms-extensions -fdelayed-template-parsing ${_xwin_includes_str}")
 
 # CMake's clang-cl+llvm-rc .rc handling preprocesses through the C compiler in a separate
 # invocation (`cmake -E cmake_llvm_rc`) that only inherits CMAKE_RC_FLAGS, not

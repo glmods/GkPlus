@@ -1,0 +1,20 @@
+libspng's own CMakeLists.txt decides whether to link libm by checking CMAKE_HOST_WIN32 -
+the OS actually running CMake - rather than WIN32, which reflects the *target* platform
+(honors CMAKE_SYSTEM_NAME). The two only diverge when cross-compiling, which is exactly what
+cmake/xwin-toolchain.cmake does: building from a Linux host for a Windows target, where
+CMAKE_HOST_WIN32 is (correctly) false, so libspng always added libm - and since the resulting
+SPNGTargets.cmake bakes in a bare "m" with no full path, lld-link failed with "could not open
+'m.lib'" the first time anything actually linked against spng (rimutil, in this repo). A
+native Windows build (where host and target agree) is unaffected either way.
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -17,7 +17,7 @@
+ include(GNUInstallDirs)
+ include(CMakePackageConfigHelpers)
+ 
+-if(NOT CMAKE_HOST_WIN32)
++if(NOT WIN32)
+     set(MATH_LIBRARY "m")
+ else()
+     set(MATH_LIBRARY "")

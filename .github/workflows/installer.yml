@@ -10,14 +10,34 @@ name: Installer
 # GitHub's workflow parser accepts anchors but does not document them, and a parse failure here
 # means the workflow never runs at all.
 #
-# Needs Windows: CMakeLists.txt stops with FATAL_ERROR anywhere but 32-bit Windows. Unlike
-# docs.yml's cpp-api job, which only configures to get compile_commands.json, this runs a real
-# build - it pays the full vcpkg-install cost every run the binary cache doesn't cover, and the
-# toolchain setup below (slangc, a pinned clang-cl) is duplicated from that job rather than
-# factored out, for the same anchor reason as above.
+# Needs 32-bit Windows as its *target* (CMakeLists.txt stops with FATAL_ERROR anywhere else),
+# but not as its *host*: this runs on ubuntu-latest, cross-compiling with clang-cl + lld-link
+# against a real MSVC CRT/Windows SDK sysroot fetched by `xwin` (cmake/xwin-toolchain.cmake,
+# the `x86-windows-static-md-xwin` triplet) - the same clang-cl frontend `cmake/clang-toolchain.cmake`
+# uses for the Windows-hosted dev build, just pointed at a fetched sysroot instead of a real
+# Visual Studio install. This replaced a windows-latest job that downloaded and silently
+# installed a ~500MB LLVM Windows installer and chocolatey's NSIS package; here the same tools
+# are `apt-get install clang lld nsis` and a couple of tarball fetches, and the runner itself
+# bills at 1x instead of 2x. Every step below - the full vcpkg dependency set (including the
+# custom overlay ports), the Slang shader pipeline, the final d3d8.dll link, and `cpack -G NSIS`
+# itself - was verified end to end before this file was rewritten to use it, not assumed from
+# the toolchain working in isolation.
+#
+# Two real, cross-compilation-only build failures live behind the fixes now baked into
+# cmake/xwin-toolchain.cmake and the ports/ overlays - see those files' own comments for what
+# each one actually was (a missing -msse2 default, a stray CMAKE_FIND_ROOT_PATH gap, an
+# upstream libspng bug that only shows up when host and target disagree). None of them are
+# specific to this workflow; they would bite any project built this way.
+#
+# Unlike docs.yml's cpp-api job, which only configures to get compile_commands.json, this runs
+# a real build - it pays the full vcpkg-install cost every run the binary cache doesn't cover.
 #
 # Release, not the Ninja Multi-Config default of Debug - this file's own build section is
-# explicit that Debug is for hook/correctness work and never what ships.
+# explicit that Debug is for hook/correctness work and never what ships. It is also the only
+# config this toolchain can produce at all right now: `xwin` does not fetch the debug CRT's
+# static import libs (msvcrtd.lib and friends), so a Debug-config link fails before it gets
+# anywhere near this project's own code - cmake/vcpkg-triplets/x86-windows-static-md-xwin.cmake
+# restricts vcpkg itself to release-only for the same reason.
 #
 # Both GKPLUS_RENDERDOC_INTEGRATION and GKPLUS_COPY_DLL are turned off for the same reason
 # docs.yml's cpp-api job turns them off: each does a REQUIRED find_package against something
@@ -68,19 +88,21 @@ concurrency:
 
 env:
   # Pinned rather than "whatever the runner image ships", and matched to docs.yml's cpp-api
-  # job rather than picked independently - both jobs build this project against vcpkg, and
-  # divergent pins would mean each is proving a different dependency set works.
+  # job rather than picked independently.
   #
   # vcpkg.json sets no builtin-baseline, so this commit is what decides the dependency
   # versions.
   VCPKG_COMMIT: '908da3a305a0a8028d9602ab241b433652b3df69'
   SLANG_VERSION: '2026.16'
-  LLVM_VERSION: '22.1.0'
+  # The prebuilt Linux x86_64 xwin binary - not the CRT/SDK sysroot it fetches, which is
+  # cached separately below and has no version of its own beyond whatever xwin's manifest
+  # resolves to on the day the cache is populated.
+  XWIN_VERSION: '0.10.0'
 
 jobs:
   build:
     name: Build and package
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
       VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite'
@@ -100,52 +122,69 @@ jobs:
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
+      # clang-cl is a driver mode of ordinary clang, not a separate binary - Ubuntu's clang
+      # package just does not symlink the name. llvm-20 is where llvm-lib/llvm-rc (the
+      # toolchain's static-lib archiver and .rc compiler) actually live - not clang-20 or
+      # lld-20, which is easy to miss since apt happens to pull it in as a dependency of
+      # either anyway, but this is explicit rather than relying on that. python3-venv is
+      # dear-bindings' own build step (it sets up a venv to run its code generator); nsis
+      # provides `makensis` for the final packaging step; pkg-config is a
+      # `vcpkg_fixup_pkgconfig()` dependency several ports hit.
+      - name: Install the Linux build toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-20 lld-20 llvm-20 pkg-config python3-venv nsis
+          sudo ln -sf /usr/bin/clang-20 /usr/local/bin/clang-cl
+          sudo ln -sf /usr/bin/lld-link-20 /usr/local/bin/lld-link
+
+      # xwin supplies the real Microsoft CRT/Windows SDK headers and import libs clang-cl needs
+      # to reproduce MSVC's ABI - see cmake/xwin-toolchain.cmake for why that specifically (and
+      # not mingw-w64) is what keeps this codebase's struct/vtable mirroring correct. x86 only:
+      # this project is 32-bit-only. The splat output itself is cached below rather than the
+      # xwin binary's own small download cache, since it is the ~800MB that is actually worth
+      # not repeating.
+      - name: Fetch xwin
+        run: |
+          curl -sL "https://github.com/Jake-Shadle/xwin/releases/download/${XWIN_VERSION}/xwin-${XWIN_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            -o xwin.tar.gz
+          tar xzf xwin.tar.gz
+          echo "$PWD/xwin-${XWIN_VERSION}-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
+
+      - name: Cache the xwin sysroot
+        id: xwin-cache
+        uses: actions/cache@v4
+        with:
+          path: xwin-root
+          key: xwin-root-${{ env.XWIN_VERSION }}-x86
+
+      - name: Splat the xwin sysroot
+        if: steps.xwin-cache.outputs.cache-hit != 'true'
+        run: xwin --accept-license --arch x86 splat --output xwin-root
+
       # CMakeLists.txt stops with FATAL_ERROR without slangc.
       - name: Install slangc
-        shell: pwsh
         run: |
-          $url = "https://github.com/shader-slang/slang/releases/download/v$env:SLANG_VERSION/slang-$env:SLANG_VERSION-windows-x86_64.zip"
-          Invoke-WebRequest -Uri $url -OutFile slang.zip
-          Expand-Archive slang.zip -DestinationPath "$env:RUNNER_TEMP\slang"
-          "$env:RUNNER_TEMP\slang\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          curl -sL "https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-linux-x86_64.tar.gz" \
+            -o slang.tar.gz
+          mkdir -p slang
+          tar xzf slang.tar.gz -C slang
+          echo "$PWD/slang/bin" >> "$GITHUB_PATH"
 
-      # cmake/clang-toolchain.cmake builds with clang-cl specifically. The official installer
-      # is NSIS-based and silent under `/S`, installing to `C:\Program Files\LLVM` by default.
-      - name: Install a pinned LLVM (clang-cl)
-        shell: pwsh
-        run: |
-          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/LLVM-$env:LLVM_VERSION-win64.exe"
-          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\llvm-installer.exe"
-          Start-Process "$env:RUNNER_TEMP\llvm-installer.exe" -ArgumentList "/S" -Wait
-          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      # The repo's own `builtin-vcpkg` preset expects vcpkg at ./vcpkg.
+      # The repo's own `builtin-vcpkg-xwin` preset expects vcpkg at ./vcpkg.
       - name: Fetch vcpkg
-        shell: pwsh
         run: |
           git clone https://github.com/microsoft/vcpkg.git vcpkg
-          git -C vcpkg checkout --detach $env:VCPKG_COMMIT
-          .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          git -C vcpkg checkout --detach "$VCPKG_COMMIT"
+          ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
       - name: Configure
         run: >
-          cmake --preset builtin-vcpkg
+          cmake --preset builtin-vcpkg-xwin
           -DGKPLUS_RENDERDOC_INTEGRATION=OFF
           -DGKPLUS_COPY_DLL=OFF
 
       - name: Build
         run: cmake --build build --config Release
-
-      # windows-latest does not carry NSIS - confirmed by running this job and reading its own
-      # failure ("Cannot find NSIS compiler makensis"), not assumed. Chocolatey does ship on the
-      # runner image, and its nsis package installs to this fixed path; GITHUB_PATH, not an
-      # inline $env:PATH edit, is what the other installed-tool steps above use too, since a
-      # choco-mutated machine PATH is not guaranteed to be visible to the *next* step's process.
-      - name: Install NSIS
-        shell: pwsh
-        run: |
-          choco install nsis --no-progress -y
-          "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Package the installer
         working-directory: build

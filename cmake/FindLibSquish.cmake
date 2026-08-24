@@ -11,6 +11,9 @@ FIND_LIBRARY(LibSquish_LIBRARY_RELEASE
     "local/lib"
 )
 
+# See Finddetours.cmake/Findd3d8to9.cmake: only release is REQUIRED. A debug variant may not
+# exist at all - vcpkg's x86-windows-static-md-xwin triplet builds release-only, since `xwin`
+# has no debug CRT static libs to link a debug config against.
 FIND_LIBRARY(LibSquish_LIBRARY_DEBUG
     NAMES
     squishd
@@ -26,14 +29,17 @@ FIND_LIBRARY(LibSquish_LIBRARY_DEBUG
 
 include(FindPackageHandleStandardArgs)
 find_package_handle_standard_args(LibSquish
-    REQUIRED_VARS LibSquish_INCLUDE_DIR LibSquish_LIBRARY_RELEASE LibSquish_LIBRARY_DEBUG)
+    REQUIRED_VARS LibSquish_INCLUDE_DIR LibSquish_LIBRARY_RELEASE)
 
 if(LibSquish_FOUND)
     if(NOT TARGET LibSquish::Squish)
         add_library(LibSquish::Squish UNKNOWN IMPORTED)
         set_target_properties(LibSquish::Squish PROPERTIES
             IMPORTED_LOCATION "${LibSquish_LIBRARY_RELEASE}"
-            IMPORTED_LOCATION_DEBUG "${LibSquish_LIBRARY_DEBUG}"
             INTERFACE_INCLUDE_DIRECTORIES "${LibSquish_INCLUDE_DIR}")
+        if(LibSquish_LIBRARY_DEBUG)
+            set_property(TARGET LibSquish::Squish PROPERTY
+                IMPORTED_LOCATION_DEBUG "${LibSquish_LIBRARY_DEBUG}")
+        endif()
     endif()
 endif()

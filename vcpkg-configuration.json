@@ -4,7 +4,8 @@
         "./ports/d3d8to9",
         "./ports/detours",
         "./ports/quickjs-ng",
-        "./ports/dear-bindings"
+        "./ports/dear-bindings",
+        "./ports/libspng"
     ],
     "overlay-triplets": [
         "./cmake/vcpkg-triplets/"
