@@ -1,0 +1,18 @@
+llvm-rc (used by clang-cl+lld-link cross builds, e.g. cmake/xwin-toolchain.cmake) fails to
+parse a non-ASCII byte inside a VERSIONINFO string regardless of the declared/forced
+codepage - it errors on this file's UTF-8 "\xc2\xa9" (c) even with --codepage=65001, which is
+what the file's own `#pragma code_page(65001)` already requests. Confirmed against llvm-rc
+20 and 21: dropping the character is what actually gets a complete .res out the other end
+(370 bytes of truncated resource data on failure vs. 716 bytes once patched), not a codepage
+flag. Real link.exe/rc.exe read this file fine as-is; this only matters cross-compiling.
+--- a/res/d3d8to9.rc
++++ b/res/d3d8to9.rc
+@@ -71,7 +71,7 @@
+             VALUE "CompanyName", "crosire"
+             VALUE "FileDescription", "d3d8to9"
+             VALUE "FileVersion", "1.13.0.0"
+-            VALUE "LegalCopyright", "Copyright © 2015. All rights reserved."
++            VALUE "LegalCopyright", "Copyright (c) 2015. All rights reserved."
+             VALUE "OriginalFilename", "d3d8.dll"
+             VALUE "ProductName", "ReShade"
+             VALUE "ProductVersion", "3.0.0"

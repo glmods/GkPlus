@@ -127,6 +127,15 @@ target_link_libraries(GkPlus PRIVATE huffman detours imgui::imgui d3d8to9 d3d9 q
 # (src/VkContext.cpp). `delayimp` above is the helper the stubs jump through.
 target_link_options(GkPlus PRIVATE "LINKER:/DELAYLOAD:vulkan-1.dll")
 
+# Only load-bearing under cmake/xwin-toolchain.cmake, harmless (a linker already finds both
+# some other way) everywhere else: clang-cl's own dependent-lib emission for a /MD (dynamic
+# CRT) target - what GkPlus is, by CMake's own default - never requests vcruntime.lib or
+# ucrt.lib the way it does msvcrt/oldnames/uuid/msvcprt, and the toolchain can't add them on
+# GkPlus's behalf because CMAKE_MODULE_LINKER_FLAGS doesn't evaluate generator expressions,
+# which is what a conditional add would need to avoid breaking any dependency (vulkan-loader,
+# in particular) that forces static CRT linkage on itself instead.
+target_link_options(GkPlus PRIVATE "LINKER:-defaultlib:vcruntime" "LINKER:-defaultlib:ucrt")
+
 if(GKPLUS_RENDERDOC_INTEGRATION)
     find_package(RenderDoc REQUIRED)
     target_link_libraries(GkPlus PRIVATE RenderDoc::Header)

@@ -5,5 +5,8 @@
         "./ports/detours",
         "./ports/quickjs-ng",
         "./ports/dear-bindings"
+    ],
+    "overlay-triplets": [
+        "./cmake/vcpkg-triplets/"
     ]
 }

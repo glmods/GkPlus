@@ -6,6 +6,8 @@ vcpkg_from_github(
     REF "v${VERSION}"
     SHA512 6633eacc755c1ef3ddaefa5fe09c817d9c918b586b1845edc782ec08b760ada2cb128a5be26d7e178a4feeb9f8fe2bdf1e1ad893c3ace2fc199bb4217ea1bacd
     HEAD_REF main
+    PATCHES
+        fix-rc-non-ascii-copyright.patch
 )
 
 file(COPY "${CMAKE_CURRENT_LIST_DIR}/CMakeLists.txt" DESTINATION "${SOURCE_PATH}")

@@ -26,3 +26,5 @@ CMakeUserPresets.json
 # generated API trees exactly rather than the whole of docs/static/.
 # `npm pack` writes its tarball beside types/package.json.
 /types/*.tgz
+/xwin-root/
+.xwin-cache/
