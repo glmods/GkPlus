@@ -38,7 +38,8 @@
             "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
             "cacheVariables": {
                 "VCPKG_TARGET_TRIPLET": "x86-windows-static-md-xwin",
-                "VCPKG_MANIFEST_FEATURES": "rimutil"
+                "VCPKG_MANIFEST_FEATURES": "rimutil",
+                "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/xwin-toolchain.cmake"
             },
             "environment": {
                 "XWIN_ROOT": "${sourceDir}/xwin-root",
